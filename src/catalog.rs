@@ -41,6 +41,15 @@ impl CatalogModel {
                 | "google-generative-ai"
         )
     }
+
+    pub fn context_window(&self) -> usize {
+        self.metadata
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(128_000)
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -650,5 +659,18 @@ mod tests {
         let (merged, warnings) = merge_catalog(&store, &ModelsFile::default());
         assert!(warnings.is_empty());
         assert_eq!(merged["azure-openai-responses"].len(), 1);
+    }
+
+    #[test]
+    fn context_window_uses_pi_metadata_with_a_safe_fallback() {
+        let mut model: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "one", "name": "One", "api": "openai-responses",
+            "provider": "openai", "baseUrl": "https://example.test/v1",
+            "contextWindow": 131072
+        }))
+        .unwrap();
+        assert_eq!(model.context_window(), 131_072);
+        model.metadata.remove("contextWindow");
+        assert_eq!(model.context_window(), 128_000);
     }
 }

@@ -2,18 +2,22 @@ use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillSnapshot {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct SkillProtocol {
     protocol: String,
-    name: String,
-    description: String,
-    root: PathBuf,
-    skill_md: String,
+    snapshot: SkillSnapshot,
 }
 
 #[derive(Deserialize)]
@@ -33,17 +37,30 @@ impl SkillProtocol {
         if name.is_empty() || description.is_empty() {
             bail!("skill name and description cannot be empty");
         }
-        let root = skill_md_path
-            .parent()
-            .ok_or_else(|| anyhow!("SKILL.md has no parent directory"))?
-            .canonicalize()?;
+        let path = skill_md_path.canonicalize()?;
         Ok(Self {
             protocol: skill_protocol_name(&name)?,
-            name,
-            description,
-            root,
-            skill_md,
+            snapshot: SkillSnapshot {
+                name,
+                description,
+                path,
+            },
         })
+    }
+
+    pub fn from_snapshot(snapshot: SkillSnapshot) -> Result<Self> {
+        let protocol = skill_protocol_name(&snapshot.name)?;
+        if snapshot.description.trim().is_empty() {
+            bail!("skill description cannot be empty");
+        }
+        if !snapshot.path.is_absolute() {
+            bail!("skill path must be absolute: {}", snapshot.path.display());
+        }
+        Ok(Self { protocol, snapshot })
+    }
+
+    pub fn snapshot(&self) -> SkillSnapshot {
+        self.snapshot.clone()
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -51,7 +68,7 @@ impl SkillProtocol {
     }
 
     pub fn display_name(&self) -> &str {
-        &self.name
+        &self.snapshot.name
     }
 }
 
@@ -60,7 +77,10 @@ impl Protocol for SkillProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: self.protocol.clone(),
-            description: format!("Skill “{}”: {}", self.name, self.description),
+            description: format!(
+                "Skill “{}”: {}",
+                self.snapshot.name, self.snapshot.description
+            ),
             can_read: true,
             can_exec: false,
         }
@@ -71,19 +91,32 @@ impl Protocol for SkillProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        let root = self
+            .snapshot
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("saved SKILL.md path has no parent directory"))?;
         if request.target == "help" {
-            return Ok(prompts::skill_help(&self.skill_md, &self.root).into_bytes());
+            let skill_md = fs::read_to_string(&self.snapshot.path).with_context(|| {
+                format!(
+                    "skill {} is no longer available at {}",
+                    self.snapshot.name,
+                    self.snapshot.path.display()
+                )
+            })?;
+            return Ok(prompts::skill_help(&skill_md, root).into_bytes());
         }
         let relative = Path::new(request.target);
         if relative.is_absolute() {
             bail!("skill resource paths must be relative");
         }
-        let candidate = self
-            .root
-            .join(relative)
-            .canonicalize()
-            .with_context(|| format!("skill resource not found: {}", request.target))?;
-        if !candidate.starts_with(&self.root) {
+        let candidate = root.join(relative).canonicalize().with_context(|| {
+            format!(
+                "skill resource is no longer available at {}",
+                root.join(relative).display()
+            )
+        })?;
+        if !candidate.starts_with(root) {
             bail!("skill resource escapes its skill directory");
         }
         let metadata = fs::metadata(&candidate)?;
@@ -129,10 +162,10 @@ fn discover_in(roots: Vec<PathBuf>) -> (Vec<SkillProtocol>, Vec<String>) {
     let mut protocols = HashSet::new();
     for path in skill_files {
         match SkillProtocol::load(&path) {
-            Ok(skill) if protocols.insert(skill.protocol.clone()) => skills.push(skill),
+            Ok(skill) if protocols.insert(skill.protocol_name().to_string()) => skills.push(skill),
             Ok(skill) => warnings.push(format!(
                 "skipped duplicate skill protocol {}:// from {}",
-                skill.protocol,
+                skill.protocol_name(),
                 path.display()
             )),
             Err(error) => warnings.push(format!("skipped skill {}: {error:#}", path.display())),
@@ -238,6 +271,14 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].protocol_name(), "review-skill");
+        assert_eq!(
+            skills[0].snapshot(),
+            SkillSnapshot {
+                name: "Review".to_string(),
+                description: "Review code.".to_string(),
+                path: review.join("SKILL.md").canonicalize().unwrap(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -293,7 +334,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("not found") || error.to_string().contains("escapes"));
+        assert!(
+            error.to_string().contains("no longer available")
+                || error.to_string().contains("escapes")
+        );
 
         #[cfg(unix)]
         {
@@ -315,5 +359,74 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("escapes"));
         }
+    }
+
+    #[tokio::test]
+    async fn saved_metadata_does_not_cache_or_rebind_skill_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("SKILL.md");
+        fs::write(
+            &path,
+            "---\nname: Review\ndescription: First description.\n---\nfirst body\n",
+        )
+        .unwrap();
+        let discovered = SkillProtocol::load(&path).unwrap();
+        let saved = discovered.snapshot();
+        fs::write(
+            &path,
+            "---\nname: Review\ndescription: Changed description.\n---\nchanged body\n",
+        )
+        .unwrap();
+        let restored = SkillProtocol::from_snapshot(saved).unwrap();
+
+        assert!(
+            restored
+                .descriptor()
+                .description
+                .contains("First description")
+        );
+        let help = restored
+            .read(
+                ProtocolRequest {
+                    uri: "review-skill://help",
+                    target: "help",
+                    body: None,
+                },
+                ProtocolContext {
+                    tasks: crate::task::TaskManager::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(String::from_utf8(help).unwrap().contains("changed body"));
+
+        fs::remove_file(path).unwrap();
+        let replacement_directory = directory.path().join("replacement");
+        fs::create_dir(&replacement_directory).unwrap();
+        fs::write(
+            replacement_directory.join("SKILL.md"),
+            "---\nname: Review\ndescription: Replacement.\n---\nreplacement body\n",
+        )
+        .unwrap();
+        assert_eq!(
+            SkillProtocol::load(&replacement_directory.join("SKILL.md"))
+                .unwrap()
+                .protocol_name(),
+            restored.protocol_name()
+        );
+        let error = restored
+            .read(
+                ProtocolRequest {
+                    uri: "review-skill://help",
+                    target: "help",
+                    body: None,
+                },
+                ProtocolContext {
+                    tasks: crate::task::TaskManager::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no longer available"));
     }
 }

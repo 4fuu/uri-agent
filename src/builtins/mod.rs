@@ -2,7 +2,7 @@ mod edit;
 mod file;
 mod shell;
 
-use crate::protocol::ProtocolRegistry;
+use crate::protocol::{Protocol, ProtocolRegistry};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Result, anyhow, bail};
 use std::fmt::Write as _;
@@ -12,11 +12,22 @@ pub use edit::EditProtocol;
 pub use file::FileProtocol;
 pub use shell::{ShellProtocol, discover_shells};
 
+pub fn available(cwd: &Path) -> Vec<Box<dyn Protocol>> {
+    let mut protocols: Vec<Box<dyn Protocol>> = vec![
+        Box::new(FileProtocol::new(cwd)),
+        Box::new(EditProtocol::new(cwd)),
+    ];
+    protocols.extend(
+        discover_shells(cwd)
+            .into_iter()
+            .map(|shell| Box::new(shell) as Box<dyn Protocol>),
+    );
+    protocols
+}
+
 pub fn register(registry: &mut ProtocolRegistry, cwd: &Path) -> Result<()> {
-    registry.register(FileProtocol::new(cwd))?;
-    registry.register(EditProtocol::new(cwd))?;
-    for shell in discover_shells(cwd) {
-        registry.register(shell)?;
+    for protocol in available(cwd) {
+        registry.register_boxed(protocol)?;
     }
     Ok(())
 }

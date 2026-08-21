@@ -1,3 +1,4 @@
+use crate::skill::SkillSnapshot;
 use crate::task::TaskStatus;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -30,12 +31,21 @@ pub struct SessionEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionContext {
+    pub system_prompt: String,
+    pub skills: Vec<SkillSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
     SessionCreated {
         cwd: PathBuf,
         provider: String,
         model: String,
+    },
+    SessionContext {
+        context: SessionContext,
     },
     User {
         text: String,
@@ -72,6 +82,12 @@ pub enum EventKind {
     Error {
         text: String,
     },
+    Compaction {
+        summary: String,
+        tokens_before: usize,
+        replacement_history: Vec<Message>,
+        manual: bool,
+    },
     TurnFinished,
 }
 
@@ -82,6 +98,7 @@ struct State {
 #[derive(Clone)]
 pub struct Session {
     id: String,
+    created: bool,
     directory: PathBuf,
     database_path: PathBuf,
     connection: Connection,
@@ -95,8 +112,17 @@ impl Session {
         cwd: &Path,
         provider: &str,
         model: &str,
+        context: SessionContext,
     ) -> Result<Self> {
-        Self::open_at(session_database_path(cwd), requested, cwd, provider, model).await
+        Self::open_at(
+            session_database_path(cwd),
+            requested,
+            cwd,
+            provider,
+            model,
+            context,
+        )
+        .await
     }
 
     pub(crate) async fn open_at(
@@ -105,6 +131,7 @@ impl Session {
         cwd: &Path,
         provider: &str,
         model: &str,
+        context: SessionContext,
     ) -> Result<Self> {
         let (directory, connection) = open_database(database_path.clone()).await?;
         let project = cwd
@@ -199,47 +226,96 @@ impl Session {
             .await
             .context("cannot restore session events")?;
 
+        let mut existing = existing;
+        let created_session = existing.is_empty();
+        if created_session {
+            let at = Utc::now();
+            let at_text = at.to_rfc3339();
+            let created = EventKind::SessionCreated {
+                cwd: cwd.to_path_buf(),
+                provider: provider.to_string(),
+                model: model.to_string(),
+            };
+            let frozen = EventKind::SessionContext { context };
+            let created_payload =
+                serde_json::to_string(&created).context("cannot serialize session creation")?;
+            let context_payload =
+                serde_json::to_string(&frozen).context("cannot serialize session context")?;
+            let id_for_create = id.clone();
+            let project_for_create = project.clone();
+            let provider_for_create = provider.to_string();
+            let model_for_create = model.to_string();
+            let at_for_create = at_text.clone();
+            connection
+                .call(move |db| {
+                    let transaction = db.transaction()?;
+                    transaction.execute(
+                        "INSERT INTO sessions
+                         (id, created_at, updated_at, cwd, provider, model, head_sequence)
+                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1)",
+                        params![
+                            id_for_create,
+                            at_for_create,
+                            project_for_create,
+                            provider_for_create,
+                            model_for_create
+                        ],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO events (session_id, sequence, at, kind, payload_json)
+                         VALUES (?1, 0, ?2, 'session_created', ?3)",
+                        params![id_for_create, at_for_create, created_payload],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO events (session_id, sequence, at, kind, payload_json)
+                         VALUES (?1, 1, ?2, 'session_context', ?3)",
+                        params![id_for_create, at_for_create, context_payload],
+                    )?;
+                    transaction.commit()?;
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                })
+                .await
+                .context("cannot create session")?;
+            existing.extend([
+                SessionEvent {
+                    sequence: 0,
+                    at,
+                    kind: created,
+                },
+                SessionEvent {
+                    sequence: 1,
+                    at,
+                    kind: frozen,
+                },
+            ]);
+        }
+        if !existing
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
+        {
+            return Err(anyhow!(
+                "session {id} has no frozen context and cannot be resumed"
+            ));
+        }
+
         let (events, _) = broadcast::channel(512);
         let session = Self {
             id,
+            created: created_session,
             directory,
             database_path,
             connection,
             state: Arc::new(Mutex::new(State { events: existing })),
             events,
         };
-        if session.snapshot().await.is_empty() {
-            let now = Utc::now().to_rfc3339();
-            let id = session.id.clone();
-            let cwd_string = project;
-            let provider_string = provider.to_string();
-            let model_string = model.to_string();
-            session
-                .connection
-                .call(move |db| {
-                    db.execute(
-                        "INSERT OR IGNORE INTO sessions
-                     (id, created_at, updated_at, cwd, provider, model, head_sequence)
-                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, -1)",
-                        params![id, now, cwd_string, provider_string, model_string],
-                    )?;
-                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-                })
-                .await
-                .context("cannot create session")?;
-            session
-                .append(EventKind::SessionCreated {
-                    cwd: cwd.to_path_buf(),
-                    provider: provider.to_string(),
-                    model: model.to_string(),
-                })
-                .await?;
-        }
         Ok(session)
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+    pub fn is_new(&self) -> bool {
+        self.created
     }
     pub fn directory(&self) -> &Path {
         &self.directory
@@ -254,17 +330,61 @@ impl Session {
         self.state.lock().await.events.clone()
     }
 
-    pub async fn model_history(&self) -> Vec<Message> {
+    pub async fn context(&self) -> SessionContext {
         self.state
             .lock()
             .await
             .events
             .iter()
-            .filter_map(|event| match &event.kind {
-                EventKind::ModelMessage { message } => Some(message.clone()),
+            .find_map(|event| match &event.kind {
+                EventKind::SessionContext { context } => Some(context.clone()),
                 _ => None,
             })
-            .collect()
+            .expect("session context is validated when the session opens")
+    }
+
+    pub async fn model_history(&self) -> Vec<Message> {
+        let state = self.state.lock().await;
+        let latest_compaction = state
+            .events
+            .iter()
+            .rposition(|event| matches!(event.kind, EventKind::Compaction { .. }));
+        let mut history = latest_compaction
+            .and_then(|index| match &state.events[index].kind {
+                EventKind::Compaction {
+                    replacement_history,
+                    ..
+                } => Some(replacement_history.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        history.extend(
+            state
+                .events
+                .iter()
+                .skip(latest_compaction.map_or(0, |index| index + 1))
+                .filter_map(|event| match &event.kind {
+                    EventKind::ModelMessage { message } => Some(message.clone()),
+                    _ => None,
+                }),
+        );
+        history
+    }
+
+    pub async fn append_compaction(
+        &self,
+        summary: String,
+        tokens_before: usize,
+        replacement_history: Vec<Message>,
+        manual: bool,
+    ) -> Result<SessionEvent> {
+        self.append(EventKind::Compaction {
+            summary,
+            tokens_before,
+            replacement_history,
+            manual,
+        })
+        .await
     }
 
     pub async fn update_model(&self, provider: &str, model: &str) -> Result<()> {
@@ -380,6 +500,7 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
 fn payload_kind(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::SessionCreated { .. } => "session_created",
+        EventKind::SessionContext { .. } => "session_context",
         EventKind::User { .. } => "user",
         EventKind::AssistantText { .. } => "assistant_text",
         EventKind::AssistantReasoning { .. } => "assistant_reasoning",
@@ -389,6 +510,7 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::Task { .. } => "task",
         EventKind::Notice { .. } => "notice",
         EventKind::Error { .. } => "error",
+        EventKind::Compaction { .. } => "compaction",
         EventKind::TurnFinished => "turn_finished",
     }
 }
@@ -412,6 +534,17 @@ fn new_session_id() -> String {
 mod tests {
     use super::*;
 
+    fn context(label: &str) -> SessionContext {
+        SessionContext {
+            system_prompt: format!("system {label}"),
+            skills: vec![SkillSnapshot {
+                name: "Review".to_string(),
+                description: format!("description {label}"),
+                path: PathBuf::from(format!("/skills/{label}/SKILL.md")),
+            }],
+        }
+    }
+
     async fn session(path: &Path, requested: Option<&str>) -> Session {
         Session::open_at(
             path.to_path_buf(),
@@ -419,6 +552,7 @@ mod tests {
             Path::new("/work"),
             "test",
             "model",
+            context("initial"),
         )
         .await
         .unwrap()
@@ -444,9 +578,9 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![0, 1, 2, 3]
         );
-        assert!(matches!(events[2].kind, EventKind::TurnFinished));
+        assert!(matches!(events[3].kind, EventKind::TurnFinished));
     }
 
     #[tokio::test]
@@ -469,6 +603,114 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn session_context_is_frozen_on_creation_and_reused_on_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let original = Session::open_at(
+            path.clone(),
+            Some("frozen"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("original"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(original.context().await.system_prompt, "system original");
+        drop(original);
+
+        let resumed = Session::open_at(
+            path,
+            Some("frozen"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("changed"),
+        )
+        .await
+        .unwrap();
+        let frozen = resumed.context().await;
+        assert_eq!(frozen.system_prompt, "system original");
+        assert_eq!(frozen.skills[0].description, "description original");
+        assert_eq!(
+            frozen.skills[0].path,
+            Path::new("/skills/original/SKILL.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_without_a_frozen_context_is_not_reinterpreted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let original = session(&path, Some("legacy")).await;
+        original
+            .connection
+            .call(|database| {
+                database.execute(
+                    "DELETE FROM events WHERE session_id = 'legacy' AND kind = 'session_context'",
+                    [],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        drop(original);
+
+        let error = match Session::open_at(
+            path,
+            Some("legacy"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("current-disk-state"),
+        )
+        .await
+        {
+            Ok(_) => panic!("session without a frozen context was resumed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("has no frozen context"));
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_model_replay_without_deleting_raw_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let compacted = session(&path, Some("compacted")).await;
+        compacted
+            .append(EventKind::ModelMessage {
+                message: Message::user("old history"),
+            })
+            .await
+            .unwrap();
+        let replacement = vec![Message::user("durable summary")];
+        compacted
+            .append_compaction("summary".to_string(), 42, replacement.clone(), false)
+            .await
+            .unwrap();
+        compacted
+            .append(EventKind::ModelMessage {
+                message: Message::user("new history"),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(compacted.model_history().await.len(), 2);
+        assert_eq!(compacted.model_history().await[0], replacement[0]);
+        assert!(compacted.snapshot().await.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ModelMessage { message } if message == &Message::user("old history")
+            )
+        }));
+
+        drop(compacted);
+        let reopened = session(&path, Some("compacted")).await;
+        assert_eq!(reopened.model_history().await.len(), 2);
     }
 
     #[tokio::test]
@@ -511,6 +753,7 @@ mod tests {
             Path::new("/projects/other"),
             "test",
             "model",
+            context("other"),
         )
         .await
         .unwrap();
@@ -521,6 +764,7 @@ mod tests {
             Path::new("/projects/current"),
             "test",
             "model",
+            context("current"),
         )
         .await
         {

@@ -26,6 +26,7 @@ pub enum ModelDelta {
 pub struct ModelRequest {
     pub system: String,
     pub history: Vec<Message>,
+    pub tools: bool,
 }
 
 pub struct ModelResponse {
@@ -183,14 +184,14 @@ where
     let prompt = history
         .pop()
         .ok_or_else(|| anyhow::anyhow!("model request has no user or tool-result message"))?;
-    let mut stream = model
+    let mut completion = model
         .completion_request(prompt)
         .preamble(request.system)
-        .messages(history)
-        .tools(tool_definitions())
-        .stream()
-        .await
-        .context("model request failed")?;
+        .messages(history);
+    if request.tools {
+        completion = completion.tools(tool_definitions());
+    }
+    let mut stream = completion.stream().await.context("model request failed")?;
     let mut reasoning_deltas = HashSet::new();
     while let Some(event) = stream.next().await {
         match event.context("model stream failed")? {

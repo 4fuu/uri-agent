@@ -18,7 +18,7 @@ uri-agent keeps the model-facing contract stable:
 - **Arbitrary bodies** — `body` may be any JSON value and is passed to the protocol unchanged.
 - **Async execution** — protocols can return managed tasks immediately. Waiting is protocol-owned, not a generic `exec` or URI behavior.
 - **One Skill, one protocol** — every Skill receives its own model-visible protocol name.
-- **Recoverable sessions** — model messages and tool-call identity are stored in SQLite, while oversized output remains available through `file://`.
+- **Stable sessions** — each session freezes its complete system prompt and Skill metadata. Model messages, tool-call identity, and compaction checkpoints are stored in SQLite, while oversized output remains available through `file://`.
 
 ## Tool protocol
 
@@ -97,7 +97,19 @@ Skills are scanned in this order:
 ~/.codex/skills
 ```
 
-Discovery runs once at process startup. Each scan root contributes its own `SKILL.md` or direct child directories containing `SKILL.md`; discovered protocols are built in memory and are never compiled into the binary or copied into configuration. If two Skills normalize to the same protocol, the higher-priority location wins.
+Discovery runs once at process startup. Each scan root contributes its own `SKILL.md` or direct child directories containing `SKILL.md`; the binary never contains a developer machine's Skill list. If two Skills normalize to the same protocol, the higher-priority location wins.
+
+Creating a session stores only each selected Skill's `name`, `description`, and canonical `SKILL.md` path, together with the complete generated system prompt. Resuming that session uses this frozen snapshot instead of rebuilding the prompt from the current filesystem. `://help` and resource reads still load from the saved path, so edits to the Skill body are visible; removing the saved file produces an explicit error. A new same-named Skill elsewhere does not rebind an old session.
+
+### Extension registration
+
+The Rust extension surface groups model and interface contributions through [`PluginHost`](src/plugin.rs):
+
+- register one or more [`Protocol`](src/protocol.rs) implementations;
+- register stable command IDs, titles, descriptions, and colon aliases for the command palette and Rhai keymaps;
+- register asynchronous TUI panel providers whose returned documents support scrolling, mouse selection, and OSC52 copy.
+
+Protocol contributions remain behind `read` and `exec`; command and panel registration never adds model-facing tools. The built-in protocols use the same protocol contract. URI Agent does not currently load native dynamic libraries: third-party Rust plugins are linked and registered during application assembly.
 
 ### Complete large output
 
@@ -258,6 +270,8 @@ SQLite WAL mode and transactional sequence allocation keep event order and model
 
 No JSONL compatibility layer is included because the SQLite format is the initial public persistence format.
 
+The append-only event stream retains original model messages after context compaction. When the estimated replay approaches the active model's pi catalog `contextWindow`, uri-agent asks the model for a durable summary, writes a compaction checkpoint to SQLite, and replays that summary plus complete recent user turns. Tool calls and their results are never split across the checkpoint boundary. Run `:compact` from the command line or command palette to create a checkpoint early; manual compaction requires at least one completed older turn.
+
 The canonical launch directory is the project boundary. A normal launch creates a new session for that project. `--continue-session` resumes the most recently updated session whose stored directory matches the current project, and `--session <id>` rejects sessions belonging to another project. There is no cross-project session overview or directory picker in the TUI.
 
 ## TUI
@@ -272,7 +286,7 @@ The Ratatui interface separates event browsing, message input, and detailed insp
 | Embedded terminal | normal program keys, double `Esc`, Shift-drag | Operate the editor/picker, close its PTY, or select terminal text |
 | Global | `F1`, `F2`, `Ctrl+P`, `Ctrl+T`, `Ctrl+Shift+C`, `Ctrl+C` | Help, Settings, protocols, tasks, copy, and quit |
 
-Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. The header always identifies the active mode. Help renders the active keymap rather than a fixed key table. The low-noise dither animation remains visible while a model turn is running.
+Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compact`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. Registered plugin commands appear in the same palette and help panel. The header always identifies the active mode. Help renders the active keymap rather than a fixed key table. The low-noise dither animation remains visible while a model turn is running.
 
 Read-only floats support direct mouse drag selection. Use Shift-drag in interactive panels and embedded terminals so normal clicks still reach the application. Press `y` or `Ctrl+Shift+C` to copy the selection through OSC52; with no selection, the same action copies the visible panel.
 
@@ -294,7 +308,7 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
+Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. A registered command ID is also a stable action ID, so `map("browse", "c", "compact")` or a plugin command ID can be bound directly. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
 
 ### External editor and finder
 

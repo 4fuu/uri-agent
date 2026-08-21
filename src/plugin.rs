@@ -1,0 +1,359 @@
+use crate::protocol::ProtocolRegistry;
+use anyhow::{Result, bail};
+use async_trait::async_trait;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoreCommand {
+    Compose,
+    Detail,
+    Editor,
+    Finder,
+    Copy,
+    Tasks,
+    Protocols,
+    Settings,
+    Compact,
+    Help,
+    Quit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandTarget {
+    Core(CoreCommand),
+    Panel(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandSpec {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub aliases: Vec<String>,
+    pub target: CommandTarget,
+}
+
+impl CommandSpec {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        aliases: impl IntoIterator<Item = impl Into<String>>,
+        target: CommandTarget,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: description.into(),
+            aliases: aliases.into_iter().map(Into::into).collect(),
+            target,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedCommand {
+    pub spec: CommandSpec,
+    pub arguments: String,
+}
+
+#[derive(Default)]
+pub struct CommandRegistry {
+    commands: BTreeMap<String, CommandSpec>,
+    names: HashMap<String, String>,
+}
+
+impl CommandRegistry {
+    pub fn with_core_commands() -> Self {
+        let mut registry = Self::default();
+        for spec in core_commands() {
+            registry
+                .register(spec)
+                .expect("built-in command names are valid and unique");
+        }
+        registry
+    }
+
+    pub fn register(&mut self, spec: CommandSpec) -> Result<()> {
+        validate_name(&spec.id)?;
+        if spec.title.trim().is_empty() || spec.description.trim().is_empty() {
+            bail!("command {} requires a title and description", spec.id);
+        }
+        let mut names = Vec::with_capacity(spec.aliases.len() + 1);
+        names.push(spec.id.clone());
+        for alias in &spec.aliases {
+            validate_name(alias)?;
+            names.push(alias.clone());
+        }
+        let mut unique = HashSet::new();
+        for name in &names {
+            if !unique.insert(name) {
+                bail!("command {} repeats name or alias {name:?}", spec.id);
+            }
+            if let Some(owner) = self.names.get(name) {
+                bail!("command name or alias {name:?} is already registered by {owner}");
+            }
+        }
+        let id = spec.id.clone();
+        for name in names {
+            self.names.insert(name, id.clone());
+        }
+        self.commands.insert(id, spec);
+        Ok(())
+    }
+
+    pub fn resolve(&self, input: &str) -> Option<ResolvedCommand> {
+        let input = input.trim().trim_start_matches(':').trim_start();
+        let split = input.find(char::is_whitespace).unwrap_or(input.len());
+        let name = &input[..split];
+        let id = self.names.get(name)?;
+        Some(ResolvedCommand {
+            spec: self.commands.get(id)?.clone(),
+            arguments: input[split..].trim().to_string(),
+        })
+    }
+
+    pub fn target_for_action(&self, action: &str) -> Option<CommandTarget> {
+        self.commands.get(action).map(|spec| spec.target.clone())
+    }
+
+    pub fn list(&self) -> Vec<CommandSpec> {
+        self.commands.values().cloned().collect()
+    }
+}
+
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        bail!("invalid command name or alias: {name:?}");
+    }
+    Ok(())
+}
+
+fn core_commands() -> Vec<CommandSpec> {
+    use CoreCommand::*;
+    vec![
+        CommandSpec::new(
+            "compose",
+            "Compose message",
+            "enter Insert mode",
+            ["insert"],
+            CommandTarget::Core(Compose),
+        ),
+        CommandSpec::new(
+            "detail",
+            "Open event detail",
+            "inspect the selected event",
+            ["open"],
+            CommandTarget::Core(Detail),
+        ),
+        CommandSpec::new(
+            "editor",
+            "Open in editor",
+            "use the configured external editor",
+            ["edit"],
+            CommandTarget::Core(Editor),
+        ),
+        CommandSpec::new(
+            "find",
+            "Find conversation event",
+            "search previews with the configured picker",
+            ["search", "picker"],
+            CommandTarget::Core(Finder),
+        ),
+        CommandSpec::new(
+            "copy",
+            "Copy panel",
+            "copy the selection or visible panel with OSC52",
+            ["yank"],
+            CommandTarget::Core(Copy),
+        ),
+        CommandSpec::new(
+            "tasks",
+            "Managed tasks",
+            "inspect asynchronous protocol work",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Tasks),
+        ),
+        CommandSpec::new(
+            "protocols",
+            "Protocols",
+            "show registered read and exec routes",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Protocols),
+        ),
+        CommandSpec::new(
+            "settings",
+            "Settings",
+            "models, limits, editor, picker, and display modes",
+            ["model", "login"],
+            CommandTarget::Core(Settings),
+        ),
+        CommandSpec::new(
+            "compact",
+            "Compact context",
+            "summarize older model context and keep raw history",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Compact),
+        ),
+        CommandSpec::new(
+            "help",
+            "Help",
+            "active keymap and command reference",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Help),
+        ),
+        CommandSpec::new(
+            "quit",
+            "Quit",
+            "close URI Agent",
+            ["q"],
+            CommandTarget::Core(Quit),
+        ),
+    ]
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiDocument {
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TuiPanelContext {
+    pub cwd: PathBuf,
+    pub session_id: String,
+    pub arguments: String,
+}
+
+#[async_trait]
+pub trait TuiPanelProvider: Send + Sync {
+    async fn open(&self, context: TuiPanelContext) -> Result<TuiDocument>;
+}
+
+#[derive(Clone)]
+pub struct TuiPanelSpec {
+    pub id: String,
+    pub provider: Arc<dyn TuiPanelProvider>,
+}
+
+#[derive(Default)]
+pub struct TuiRegistry {
+    panels: BTreeMap<String, TuiPanelSpec>,
+}
+
+impl TuiRegistry {
+    pub fn register_panel(
+        &mut self,
+        id: impl Into<String>,
+        provider: impl TuiPanelProvider + 'static,
+    ) -> Result<()> {
+        let id = id.into();
+        validate_name(&id)?;
+        if self.panels.contains_key(&id) {
+            bail!("TUI panel is already registered: {id}");
+        }
+        self.panels.insert(
+            id.clone(),
+            TuiPanelSpec {
+                id,
+                provider: Arc::new(provider),
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn open_panel(&self, id: &str, context: TuiPanelContext) -> Result<TuiDocument> {
+        let Some(panel) = self.panels.get(id) else {
+            bail!("unknown TUI panel: {id}");
+        };
+        panel.provider.open(context).await
+    }
+}
+
+pub struct PluginHost<'a> {
+    pub protocols: &'a mut ProtocolRegistry,
+    pub commands: &'a mut CommandRegistry,
+    pub tui: &'a mut TuiRegistry,
+}
+
+pub trait Plugin {
+    fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StaticPanel;
+
+    #[async_trait]
+    impl TuiPanelProvider for StaticPanel {
+        async fn open(&self, context: TuiPanelContext) -> Result<TuiDocument> {
+            Ok(TuiDocument {
+                title: "Plugin panel".to_string(),
+                body: format!("{} {}", context.session_id, context.arguments),
+            })
+        }
+    }
+
+    #[test]
+    fn command_ids_and_aliases_resolve_through_one_registry() {
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.resolve(":model").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Settings)
+        );
+        assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
+    }
+
+    #[test]
+    fn command_conflicts_are_rejected_before_the_tui_starts() {
+        let mut registry = CommandRegistry::with_core_commands();
+        let error = registry
+            .register(CommandSpec::new(
+                "other",
+                "Other",
+                "Other command",
+                ["settings"],
+                CommandTarget::Panel("other".to_string()),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("already registered"));
+
+        let error = CommandRegistry::default()
+            .register(CommandSpec::new(
+                "duplicate",
+                "Duplicate",
+                "Duplicate command",
+                ["duplicate"],
+                CommandTarget::Panel("duplicate".to_string()),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("repeats"));
+    }
+
+    #[tokio::test]
+    async fn registered_tui_panels_receive_session_context_and_arguments() {
+        let mut registry = TuiRegistry::default();
+        registry.register_panel("demo", StaticPanel).unwrap();
+        let document = registry
+            .open_panel(
+                "demo",
+                TuiPanelContext {
+                    cwd: PathBuf::from("/work"),
+                    session_id: "session".to_string(),
+                    arguments: "argument".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(document.title, "Plugin panel");
+        assert_eq!(document.body, "session argument");
+    }
+}

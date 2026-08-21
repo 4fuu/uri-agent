@@ -18,7 +18,7 @@ uri-agent 将模型面对的契约保持稳定：
 - **任意 body** — `body` 可以是任意 JSON 值，并原样交给协议。
 - **异步执行** — 协议可以立即返回系统管理的任务。等待由协议自行实现，不是 `exec` 或 URI 的通用行为。
 - **一个 Skill，一个协议** — 每个 Skill 都拥有独立且对模型可见的协议名。
-- **可恢复会话** — 模型消息和工具调用身份保存在 SQLite；超长输出仍可通过 `file://` 完整读取。
+- **稳定会话** — 每个会话都会固化完整系统提示词和 Skill 元数据；模型消息、工具调用身份与压缩 checkpoint 保存在 SQLite，超长输出仍可通过 `file://` 完整读取。
 
 ## 工具协议
 
@@ -97,7 +97,19 @@ Skills 按以下顺序扫描：
 ~/.codex/skills
 ```
 
-发现过程在进程启动时执行一次。每个扫描根目录可以直接包含 `SKILL.md`，也可以在其一级子目录中包含 `SKILL.md`；发现结果只在内存中生成协议，不会编译进二进制或写入配置。两个 Skill 规范化为相同协议名时，优先级更高的位置生效。
+发现过程在进程启动时执行一次。每个扫描根目录可以直接包含 `SKILL.md`，也可以在其一级子目录中包含 `SKILL.md`；二进制不会固化开发者机器上的 Skill 列表。两个 Skill 规范化为相同协议名时，优先级更高的位置生效。
+
+创建会话时只保存每个选中 Skill 的 `name`、`description` 和规范化后的 `SKILL.md` 路径，同时保存完整系统提示词。恢复会话时直接使用该快照，不会根据当前文件系统重新生成提示词。`://help` 和资源读取仍会访问保存的路径，因此 Skill 正文的后续修改可见；保存的文件被移除时会明确报错。其他位置后来出现的同名 Skill 不会让旧会话重新绑定。
+
+### 扩展注册
+
+Rust 扩展接口通过 [`PluginHost`](src/plugin.rs) 统一模型与界面贡献：
+
+- 注册一个或多个 [`Protocol`](src/protocol.rs) 实现；
+- 注册稳定的命令 ID、标题、描述与冒号别名，自动进入命令面板并可由 Rhai keymap 绑定；
+- 注册异步 TUI panel provider，返回的文档支持滚动、鼠标选择与 OSC52 复制。
+
+协议贡献仍隐藏在 `read` 和 `exec` 后面，注册命令或面板不会增加模型可见工具。内置协议使用相同的协议契约。URI Agent 当前不加载原生动态库；第三方 Rust 插件需要在应用组装阶段链接并注册。
 
 ### 完整保留大型输出
 
@@ -258,6 +270,8 @@ SQLite WAL 模式和事务内 sequence 分配保证事件顺序与模型历史�
 
 SQLite 是项目最初公开的持久化格式，因此不包含 JSONL 兼容层。
 
+上下文压缩后，append-only 事件流仍保留原始模型消息。当预计重放内容接近当前模型在 pi 目录中的 `contextWindow` 时，uri-agent 会让模型生成可持久化摘要，将压缩 checkpoint 写入 SQLite，后续使用该摘要加完整的近期用户 turn。工具调用与对应结果不会被拆到 checkpoint 两侧。可以从命令行或命令面板运行 `:compact` 提前压缩；手动压缩至少需要一个已完成的旧 turn。
+
 规范化后的启动目录就是项目边界。普通启动会为该项目创建新会话；`--continue-session` 只恢复存储目录与当前项目相同的最近会话；`--session <id>` 会拒绝属于其他项目的会话。TUI 暂不提供跨项目会话总览或目录选择器。
 
 ## TUI
@@ -272,7 +286,7 @@ Ratatui 界面将事件浏览、消息输入和详细查看分开。对话区为
 | 内嵌终端 | 外部程序正常按键、双 `Esc`、Shift 拖选 | 操作编辑器/选取器、关闭 PTY 或选取终端文本 |
 | Global | `F1`、`F2`、`Ctrl+P`、`Ctrl+T`、`Ctrl+Shift+C`、`Ctrl+C` | 帮助、Settings、协议、任务、复制和退出 |
 
-Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行，`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`。顶栏始终标明当前模式；帮助浮窗展示实际生效的 keymap，而不是固定按键表。模型工作时仍会显示低噪声抖动动画。
+Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行，`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compact`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`；插件注册的命令也会出现在同一个命令面板和帮助浮窗。顶栏始终标明当前模式；帮助浮窗展示实际生效的 keymap，而不是固定按键表。模型工作时仍会显示低噪声抖动动画。
 
 只读浮窗可以直接用鼠标拖选。交互式面板和内嵌终端使用 Shift 拖选，使普通点击仍能交给程序处理。按 `y` 或 `Ctrl+Shift+C` 通过 OSC52 复制选区；没有选区时，同一操作会复制当前可见面板。
 
@@ -294,7 +308,7 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
+可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。注册命令的 ID 同时也是稳定的 action ID，因此可直接绑定 `map("browse", "c", "compact")` 或插件命令 ID。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
 
 ### 外部编辑器与选取器
 

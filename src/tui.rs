@@ -3,6 +3,9 @@ use crate::config::{ActiveSettings, ConfigManager, ExternalMode};
 use crate::keymap::Keymap;
 use crate::model::configured_backend;
 use crate::output::OutputStore;
+use crate::plugin::{
+    CommandRegistry, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext, TuiRegistry,
+};
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
 use crate::session::{EventKind, SessionEvent};
@@ -61,6 +64,7 @@ enum BlockKind {
     Assistant,
     Reasoning,
     Tool,
+    Compaction,
     Notice,
     Error,
 }
@@ -82,80 +86,8 @@ enum Overlay {
     Settings,
     Palette,
     Command,
+    Plugin,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UiCommand {
-    Compose,
-    Detail,
-    Editor,
-    Finder,
-    Copy,
-    Tasks,
-    Protocols,
-    Settings,
-    Help,
-    Quit,
-}
-
-struct PaletteItem {
-    command: UiCommand,
-    name: &'static str,
-    description: &'static str,
-}
-
-const PALETTE_ITEMS: [PaletteItem; 10] = [
-    PaletteItem {
-        command: UiCommand::Compose,
-        name: "Compose message",
-        description: "enter Insert mode",
-    },
-    PaletteItem {
-        command: UiCommand::Detail,
-        name: "Open event detail",
-        description: "inspect the selected event",
-    },
-    PaletteItem {
-        command: UiCommand::Editor,
-        name: "Open in Helix",
-        description: "use the configured external editor",
-    },
-    PaletteItem {
-        command: UiCommand::Finder,
-        name: "Find conversation event",
-        description: "search previews with the configured picker",
-    },
-    PaletteItem {
-        command: UiCommand::Copy,
-        name: "Copy panel",
-        description: "copy the selection or visible panel with OSC52",
-    },
-    PaletteItem {
-        command: UiCommand::Tasks,
-        name: "Managed tasks",
-        description: "inspect asynchronous protocol work",
-    },
-    PaletteItem {
-        command: UiCommand::Protocols,
-        name: "Protocols",
-        description: "show registered read and exec routes",
-    },
-    PaletteItem {
-        command: UiCommand::Settings,
-        name: "Settings",
-        description: "models, limits, editor, picker, and display modes",
-    },
-    PaletteItem {
-        command: UiCommand::Help,
-        name: "Help",
-        description: "active keymap and command reference",
-    },
-    PaletteItem {
-        command: UiCommand::Quit,
-        name: "Quit",
-        description: "close URI Agent",
-    },
-];
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum EditingSetting {
@@ -368,10 +300,19 @@ struct App {
     selectable: Option<SelectableSurface>,
     selection: Option<TextSelection>,
     external: Option<ExternalProcess>,
+    commands: Arc<CommandRegistry>,
+    tui: Arc<TuiRegistry>,
+    tui_document: Option<TuiDocument>,
 }
 
 impl App {
-    fn new(protocols: Vec<ProtocolDescriptor>, info: TuiInfo, keymap: Keymap) -> Self {
+    fn new(
+        protocols: Vec<ProtocolDescriptor>,
+        commands: Arc<CommandRegistry>,
+        tui: Arc<TuiRegistry>,
+        info: TuiInfo,
+        keymap: Keymap,
+    ) -> Self {
         let mut input = TextArea::default();
         style_input(&mut input, false);
         Self {
@@ -399,6 +340,9 @@ impl App {
             selectable: None,
             selection: None,
             external: None,
+            commands,
+            tui,
+            tui_document: None,
         }
     }
 
@@ -413,7 +357,9 @@ impl App {
         let follow =
             self.blocks.is_empty() || self.selected_block == self.blocks.len().saturating_sub(1);
         match event.kind {
-            EventKind::SessionCreated { .. } | EventKind::ModelMessage { .. } => {}
+            EventKind::SessionCreated { .. }
+            | EventKind::SessionContext { .. }
+            | EventKind::ModelMessage { .. } => {}
             EventKind::User { text } => {
                 self.busy = true;
                 self.push(BlockKind::User, "YOU", text, None, false);
@@ -481,6 +427,26 @@ impl App {
             EventKind::Error { text } => {
                 self.busy = false;
                 self.push(BlockKind::Error, "ERROR", text, None, true);
+            }
+            EventKind::Compaction {
+                summary,
+                tokens_before,
+                manual,
+                ..
+            } => {
+                if manual {
+                    self.busy = false;
+                    self.flash = Some("Context compacted; original events retained".to_string());
+                }
+                self.push(
+                    BlockKind::Compaction,
+                    "COMPACTION",
+                    format!(
+                        "Estimated context before compaction: {tokens_before} tokens\n\n{summary}"
+                    ),
+                    None,
+                    false,
+                );
             }
             EventKind::TurnFinished => self.busy = false,
         }
@@ -568,19 +534,34 @@ fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: 
     repeated
 }
 
-pub async fn run(
-    runtime: Arc<AgentRuntime>,
-    protocols: Vec<ProtocolDescriptor>,
-    tasks: TaskManager,
-    manager: Arc<ConfigManager>,
-    catalog: Arc<ModelCatalog>,
-    output: Arc<OutputStore>,
-    info: TuiInfo,
-) -> Result<()> {
+pub struct TuiServices {
+    pub runtime: Arc<AgentRuntime>,
+    pub protocols: Vec<ProtocolDescriptor>,
+    pub commands: Arc<CommandRegistry>,
+    pub tui: Arc<TuiRegistry>,
+    pub tasks: TaskManager,
+    pub manager: Arc<ConfigManager>,
+    pub catalog: Arc<ModelCatalog>,
+    pub output: Arc<OutputStore>,
+    pub info: TuiInfo,
+}
+
+pub async fn run(services: TuiServices) -> Result<()> {
+    let TuiServices {
+        runtime,
+        protocols,
+        commands,
+        tui,
+        tasks,
+        manager,
+        catalog,
+        output,
+        info,
+    } = services;
     let session = runtime.session().clone();
     let mut receiver = session.subscribe();
     let keymap = Keymap::load(Some(&info.cwd)).await?;
-    let mut app = App::new(protocols, info, keymap);
+    let mut app = App::new(protocols, commands, tui, info, keymap);
     for event in session.snapshot().await {
         app.apply(event);
     }
@@ -588,7 +569,7 @@ pub async fn run(
     let mut terminal = ratatui::try_init()?;
     let _restore = RestoreTerminal;
     execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    let services = TuiServices {
+    let services = LoopServices {
         runtime,
         tasks,
         manager,
@@ -598,7 +579,7 @@ pub async fn run(
     run_loop(&mut terminal, &mut app, services, &mut receiver).await
 }
 
-struct TuiServices {
+struct LoopServices {
     runtime: Arc<AgentRuntime>,
     tasks: TaskManager,
     manager: Arc<ConfigManager>,
@@ -609,7 +590,7 @@ struct TuiServices {
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
-    services: TuiServices,
+    services: LoopServices,
     receiver: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
@@ -637,6 +618,7 @@ async fn run_loop(
                                     let _ = runtime.run_turn(prompt).await;
                                 });
                             }
+                            Action::Compact => start_compaction(app, services.runtime.clone()),
                             Action::OpenSettings => {
                                 app.settings = Some(SettingsState::load(&services.manager, &services.catalog).await);
                                 app.overlay = Some(Overlay::Settings);
@@ -716,6 +698,7 @@ async fn run_loop(
                                     let _ = runtime.run_turn(prompt).await;
                                 });
                             }
+                            Action::Compact => start_compaction(app, services.runtime.clone()),
                             Action::OpenSettings => {
                                 app.settings = Some(SettingsState::load(&services.manager, &services.catalog).await);
                                 app.overlay = Some(Overlay::Settings);
@@ -774,6 +757,7 @@ enum Action {
     Continue,
     Quit,
     Submit(String),
+    Compact,
     OpenSettings,
     SaveSettings,
     RefreshCatalog,
@@ -785,36 +769,41 @@ enum Action {
     OpenPicker,
 }
 
-fn parse_ui_command(command: &str) -> Option<UiCommand> {
-    match command
-        .trim()
-        .trim_start_matches(':')
-        .split_whitespace()
-        .next()?
-    {
-        "compose" | "insert" => Some(UiCommand::Compose),
-        "detail" | "open" => Some(UiCommand::Detail),
-        "edit" | "editor" => Some(UiCommand::Editor),
-        "find" | "search" | "picker" => Some(UiCommand::Finder),
-        "copy" | "yank" => Some(UiCommand::Copy),
-        "tasks" => Some(UiCommand::Tasks),
-        "protocols" => Some(UiCommand::Protocols),
-        "settings" | "model" | "login" => Some(UiCommand::Settings),
-        "help" => Some(UiCommand::Help),
-        "quit" | "q" => Some(UiCommand::Quit),
-        _ => None,
-    }
-}
-
-async fn dispatch_ui_command(app: &mut App, command: UiCommand, tasks: &TaskManager) -> Action {
+async fn dispatch_ui_command(
+    app: &mut App,
+    target: CommandTarget,
+    arguments: String,
+    tasks: &TaskManager,
+) -> Action {
     app.overlay = None;
+    let command = match target {
+        CommandTarget::Core(command) => command,
+        CommandTarget::Panel(panel) => {
+            let context = TuiPanelContext {
+                cwd: app.info.cwd.clone(),
+                session_id: app.info.session_id.clone(),
+                arguments,
+            };
+            match app.tui.open_panel(&panel, context).await {
+                Ok(document) => {
+                    app.tui_document = Some(document);
+                    app.overlay_scroll = 0;
+                    app.overlay = Some(Overlay::Plugin);
+                }
+                Err(error) => {
+                    app.flash = Some(format!("Plugin panel failed: {error:#}"));
+                }
+            }
+            return Action::Continue;
+        }
+    };
     match command {
-        UiCommand::Compose => {
+        CoreCommand::Compose => {
             app.mode = Mode::Insert;
             app.flash = None;
             Action::Continue
         }
-        UiCommand::Detail => {
+        CoreCommand::Detail => {
             if app.selected_block().is_some() {
                 app.overlay_scroll = 0;
                 app.overlay = Some(Overlay::Detail);
@@ -823,7 +812,7 @@ async fn dispatch_ui_command(app: &mut App, command: UiCommand, tasks: &TaskMana
             }
             Action::Continue
         }
-        UiCommand::Editor => {
+        CoreCommand::Editor => {
             if let Some(block) = app.selected_block() {
                 Action::OpenEditor {
                     content: block_document(block),
@@ -834,31 +823,51 @@ async fn dispatch_ui_command(app: &mut App, command: UiCommand, tasks: &TaskMana
                 Action::Continue
             }
         }
-        UiCommand::Finder => Action::OpenPicker,
-        UiCommand::Copy => {
+        CoreCommand::Finder => Action::OpenPicker,
+        CoreCommand::Copy => {
             copy_current_surface(app);
             Action::Continue
         }
-        UiCommand::Tasks => {
+        CoreCommand::Tasks => {
             app.task_records = tasks.list().await;
             app.selected_task = 0;
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Tasks);
             Action::Continue
         }
-        UiCommand::Protocols => {
+        CoreCommand::Protocols => {
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Protocols);
             Action::Continue
         }
-        UiCommand::Settings => Action::OpenSettings,
-        UiCommand::Help => {
+        CoreCommand::Settings => Action::OpenSettings,
+        CoreCommand::Compact => Action::Compact,
+        CoreCommand::Help => {
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Help);
             Action::Continue
         }
-        UiCommand::Quit => Action::Quit,
+        CoreCommand::Quit => Action::Quit,
     }
+}
+
+async fn dispatch_core(app: &mut App, command: CoreCommand, tasks: &TaskManager) -> Action {
+    dispatch_ui_command(app, CommandTarget::Core(command), String::new(), tasks).await
+}
+
+fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
+    app.busy = true;
+    app.flash = Some("Compacting older model context…".to_string());
+    tokio::spawn(async move {
+        if let Err(error) = runtime.compact().await {
+            let _ = runtime
+                .session()
+                .append(EventKind::Error {
+                    text: format!("Context compaction failed: {error:#}"),
+                })
+                .await;
+        }
+    });
 }
 
 async fn handle_key(
@@ -877,12 +886,12 @@ async fn handle_key(
         return Action::Continue;
     }
     match app.keymap.action_chain(&[], &key_name).as_deref() {
-        Some("quit") => return dispatch_ui_command(app, UiCommand::Quit, tasks).await,
-        Some("help") => return dispatch_ui_command(app, UiCommand::Help, tasks).await,
-        Some("settings") => return dispatch_ui_command(app, UiCommand::Settings, tasks).await,
-        Some("protocols") => return dispatch_ui_command(app, UiCommand::Protocols, tasks).await,
-        Some("tasks") => return dispatch_ui_command(app, UiCommand::Tasks, tasks).await,
-        Some("copy") => return dispatch_ui_command(app, UiCommand::Copy, tasks).await,
+        Some("quit") => return dispatch_core(app, CoreCommand::Quit, tasks).await,
+        Some("help") => return dispatch_core(app, CoreCommand::Help, tasks).await,
+        Some("settings") => return dispatch_core(app, CoreCommand::Settings, tasks).await,
+        Some("protocols") => return dispatch_core(app, CoreCommand::Protocols, tasks).await,
+        Some("tasks") => return dispatch_core(app, CoreCommand::Tasks, tasks).await,
+        Some("copy") => return dispatch_core(app, CoreCommand::Copy, tasks).await,
         _ => {}
     }
     if let Some(overlay) = app.overlay {
@@ -895,11 +904,17 @@ async fn handle_key(
                     app.palette_selected = app
                         .palette_selected
                         .saturating_add(1)
-                        .min(PALETTE_ITEMS.len().saturating_sub(1));
+                        .min(app.commands.list().len().saturating_sub(1));
                 }
                 Some("confirm") => {
-                    let command = PALETTE_ITEMS[app.palette_selected].command;
-                    return dispatch_ui_command(app, command, tasks).await;
+                    if let Some(target) = app
+                        .commands
+                        .list()
+                        .get(app.palette_selected)
+                        .map(|command| command.target.clone())
+                    {
+                        return dispatch_ui_command(app, target, String::new(), tasks).await;
+                    }
                 }
                 _ => {}
             },
@@ -915,8 +930,14 @@ async fn handle_key(
                 Some("confirm") => {
                     let entered = std::mem::take(&mut app.command_line);
                     app.overlay = None;
-                    if let Some(command) = parse_ui_command(&entered) {
-                        return dispatch_ui_command(app, command, tasks).await;
+                    if let Some(command) = app.commands.resolve(&entered) {
+                        return dispatch_ui_command(
+                            app,
+                            command.spec.target,
+                            command.arguments,
+                            tasks,
+                        )
+                        .await;
                     }
                     app.flash = Some(format!(
                         "Unknown command :{} · press Space for commands",
@@ -986,7 +1007,7 @@ async fn handle_key(
                 Some("page_down") => app.overlay_scroll = app.overlay_scroll.saturating_add(8),
                 _ => {}
             },
-            Overlay::Help | Overlay::Protocols => {
+            Overlay::Help | Overlay::Protocols | Overlay::Plugin => {
                 match app.keymap.action("list", &key_name).as_deref() {
                     Some("quit") => return Action::Quit,
                     Some("close") => app.overlay = None,
@@ -1157,7 +1178,7 @@ async fn handle_key(
             app.overlay = Some(Overlay::Protocols);
         }
         Some("tasks") => {
-            return dispatch_ui_command(app, UiCommand::Tasks, tasks).await;
+            return dispatch_core(app, CoreCommand::Tasks, tasks).await;
         }
         action if app.mode == Mode::Insert => match action {
             Some("browse") => app.mode = Mode::Browse,
@@ -1197,18 +1218,23 @@ async fn handle_key(
             app.command_line.clear();
             app.overlay = Some(Overlay::Command);
         }
-        Some("insert") => return dispatch_ui_command(app, UiCommand::Compose, tasks).await,
+        Some("insert") => return dispatch_core(app, CoreCommand::Compose, tasks).await,
         Some("next") => app.move_selection(1),
         Some("previous") => app.move_selection(-1),
         Some("page_down") => app.move_selection(10),
         Some("page_up") => app.move_selection(-10),
         Some("first") => app.selected_block = 0,
         Some("last") => app.selected_block = app.blocks.len().saturating_sub(1),
-        Some("detail") => return dispatch_ui_command(app, UiCommand::Detail, tasks).await,
-        Some("editor") => return dispatch_ui_command(app, UiCommand::Editor, tasks).await,
-        Some("finder") => return dispatch_ui_command(app, UiCommand::Finder, tasks).await,
-        Some("copy") => return dispatch_ui_command(app, UiCommand::Copy, tasks).await,
-        _ => {}
+        Some("detail") => return dispatch_core(app, CoreCommand::Detail, tasks).await,
+        Some("editor") => return dispatch_core(app, CoreCommand::Editor, tasks).await,
+        Some("finder") => return dispatch_core(app, CoreCommand::Finder, tasks).await,
+        Some("copy") => return dispatch_core(app, CoreCommand::Copy, tasks).await,
+        Some(action) => {
+            if let Some(target) = app.commands.target_for_action(action) {
+                return dispatch_ui_command(app, target, String::new(), tasks).await;
+            }
+        }
+        None => {}
     }
     Action::Continue
 }
@@ -1216,7 +1242,7 @@ async fn handle_key(
 async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> Action {
     let require_shift = !matches!(
         app.overlay,
-        Some(Overlay::Detail | Overlay::Help | Overlay::Protocols)
+        Some(Overlay::Detail | Overlay::Help | Overlay::Protocols | Overlay::Plugin)
     );
     if update_mouse_selection(app, mouse, require_shift) {
         return Action::Continue;
@@ -1243,7 +1269,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
                 app.palette_selected = app
                     .palette_selected
                     .saturating_add(1)
-                    .min(PALETTE_ITEMS.len().saturating_sub(1));
+                    .min(app.commands.list().len().saturating_sub(1));
             }
             Some(Overlay::Tasks) => {
                 app.selected_task = app
@@ -1269,15 +1295,22 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
                 AppHit::Transcript(index) => {
                     app.selected_block = index;
                     if activate {
-                        return dispatch_ui_command(app, UiCommand::Detail, tasks).await;
+                        return dispatch_core(app, CoreCommand::Detail, tasks).await;
                     }
                 }
                 AppHit::Composer => {
-                    return dispatch_ui_command(app, UiCommand::Compose, tasks).await;
+                    return dispatch_core(app, CoreCommand::Compose, tasks).await;
                 }
                 AppHit::Palette(index) => {
                     app.palette_selected = index;
-                    return dispatch_ui_command(app, PALETTE_ITEMS[index].command, tasks).await;
+                    if let Some(target) = app
+                        .commands
+                        .list()
+                        .get(index)
+                        .map(|command| command.target.clone())
+                    {
+                        return dispatch_ui_command(app, target, String::new(), tasks).await;
+                    }
                 }
                 AppHit::Task(index) => app.selected_task = index,
                 AppHit::Setting(index) => {
@@ -1468,7 +1501,11 @@ async fn apply_active(
     active: &ActiveSettings,
 ) -> Result<()> {
     let backend = configured_backend(active, catalog).await?;
-    runtime.set_backend(backend).await;
+    let context_window = active
+        .catalog_model(catalog)
+        .await
+        .map_or(128_000, |model| model.context_window());
+    runtime.set_backend(backend, context_window).await;
     runtime
         .session()
         .update_model(&active.provider, &active.model)
@@ -2251,6 +2288,7 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 BlockKind::Assistant => TEXT,
                 BlockKind::Reasoning => MUTED,
                 BlockKind::Tool => WARM,
+                BlockKind::Compaction => ACCENT,
                 BlockKind::Notice => MUTED,
                 BlockKind::Error => ERROR,
             }
@@ -2387,6 +2425,21 @@ fn keymap_help(keymap: &Keymap) -> String {
     output
 }
 
+fn command_help(commands: &CommandRegistry) -> String {
+    commands
+        .list()
+        .into_iter()
+        .map(|command| {
+            let aliases = if command.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", command.aliases.join(", "))
+            };
+            format!("  :{:<14} {}{}\n", command.id, command.description, aliases)
+        })
+        .collect()
+}
+
 fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
     if overlay == Overlay::Command {
         Rect::new(
@@ -2426,8 +2479,9 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         }
         Overlay::Help => {
             let text = format!(
-                "ACTIVE KEYMAP\n\n{}COMMANDS\n  :settings · :model · :login · :find · :copy · :tasks\n  :protocols · :compose · :detail · :editor · :help · :quit\n\nDrag to select read-only floats; Shift-drag selects interactive panels and embedded terminals. Press y or Ctrl+Shift+C to copy with OSC52.\n\nSlash commands remain available while composing.\n\nSESSION\n{}\n{}\n\nPROJECT\n{}",
+                "ACTIVE KEYMAP\n\n{}COMMANDS\n{}\nDrag to select read-only floats; Shift-drag selects interactive panels and embedded terminals. Press y or Ctrl+Shift+C to copy with OSC52.\n\nSlash commands remain available while composing.\n\nSESSION\n{}\n{}\n\nPROJECT\n{}",
                 keymap_help(&app.keymap),
+                command_help(&app.commands),
                 app.info.session_id,
                 app.info.model,
                 app.info.cwd.display()
@@ -2474,6 +2528,22 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
                 Paragraph::new(format!(":{}█", app.command_line))
                     .block(block.title(" COMMAND · Enter run · Esc cancel "))
                     .style(Style::default().fg(TEXT)),
+                area,
+            );
+        }
+        Overlay::Plugin => {
+            let document = app.tui_document.as_ref();
+            let title = document
+                .map(|document| format!(" {} · ↑/↓ scroll · Esc close ", document.title))
+                .unwrap_or_else(|| " PLUGIN PANEL ".to_string());
+            let body = document
+                .map(|document| document.body.as_str())
+                .unwrap_or("Plugin panel did not return content.");
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(block.title(title))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
                 area,
             );
         }
@@ -2714,7 +2784,8 @@ fn render_palette(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
         block.title(" COMMANDS · ↑/↓ select · Enter or click run · Esc close "),
         area,
     );
-    let items = PALETTE_ITEMS.iter().enumerate().map(|(index, item)| {
+    let commands = app.commands.list();
+    let items = commands.iter().enumerate().map(|(index, item)| {
         let selected = index == app.palette_selected;
         ListItem::new(Line::from(vec![
             Span::styled(
@@ -2722,7 +2793,7 @@ fn render_palette(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!("{:<24}", item.name),
+                format!("{:<24}", item.title),
                 Style::default()
                     .fg(if selected { ACCENT } else { TEXT })
                     .add_modifier(if selected {
@@ -2731,13 +2802,13 @@ fn render_palette(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
                         Modifier::empty()
                     }),
             ),
-            Span::styled(item.description, Style::default().fg(MUTED)),
+            Span::styled(item.description.clone(), Style::default().fg(MUTED)),
         ]))
         .style(Style::default().bg(if selected { BG } else { SURFACE }))
     });
     let mut state = ListState::default().with_selected(Some(app.palette_selected));
     frame.render_stateful_widget(List::new(items), inner, &mut state);
-    for index in state.offset()..PALETTE_ITEMS.len() {
+    for index in state.offset()..commands.len() {
         let y = inner.y.saturating_add((index - state.offset()) as u16);
         if y >= inner.y.saturating_add(inner.height) {
             break;
@@ -2820,6 +2891,8 @@ mod tests {
     fn test_app() -> App {
         App::new(
             Vec::new(),
+            Arc::new(CommandRegistry::with_core_commands()),
+            Arc::new(TuiRegistry::default()),
             TuiInfo {
                 cwd: PathBuf::from("/workspace"),
                 provider: "test".to_string(),
@@ -2866,6 +2939,8 @@ mod tests {
         };
         let mut app = App::new(
             Vec::new(),
+            Arc::new(CommandRegistry::with_core_commands()),
+            Arc::new(TuiRegistry::default()),
             TuiInfo {
                 cwd: PathBuf::from("/workspace"),
                 provider: active.provider.clone(),
@@ -2947,6 +3022,29 @@ mod tests {
     }
 
     #[test]
+    fn automatic_compaction_keeps_the_turn_busy_but_manual_compaction_finishes() {
+        let mut app = test_app();
+        app.busy = true;
+        let compaction = |sequence, manual| SessionEvent {
+            sequence,
+            at: chrono::Utc::now(),
+            kind: EventKind::Compaction {
+                summary: "checkpoint".to_string(),
+                tokens_before: 100,
+                replacement_history: Vec::new(),
+                manual,
+            },
+        };
+
+        app.apply(compaction(1, false));
+        assert!(app.busy);
+
+        app.apply(compaction(2, true));
+        assert!(!app.busy);
+        assert!(app.flash.as_deref().unwrap().contains("retained"));
+    }
+
+    #[test]
     fn key_events_have_stable_rhai_names() {
         assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
@@ -2964,15 +3062,25 @@ mod tests {
 
     #[test]
     fn colon_commands_share_the_palette_command_set() {
-        assert_eq!(parse_ui_command(":settings"), Some(UiCommand::Settings));
-        assert_eq!(parse_ui_command("model"), Some(UiCommand::Settings));
-        assert_eq!(parse_ui_command("compose"), Some(UiCommand::Compose));
-        assert_eq!(parse_ui_command("editor"), Some(UiCommand::Editor));
-        assert_eq!(parse_ui_command("find"), Some(UiCommand::Finder));
-        assert_eq!(parse_ui_command("copy"), Some(UiCommand::Copy));
-        assert_eq!(parse_ui_command("sessions"), None);
-        assert_eq!(parse_ui_command("q"), Some(UiCommand::Quit));
-        assert_eq!(parse_ui_command("unknown"), None);
+        let commands = CommandRegistry::with_core_commands();
+        assert_eq!(
+            commands.resolve(":settings").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Settings)
+        );
+        assert_eq!(
+            commands.resolve("model").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Settings)
+        );
+        assert_eq!(
+            commands.resolve("compact").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Compact)
+        );
+        assert!(commands.resolve("sessions").is_none());
+        assert_eq!(
+            commands.resolve("q").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Quit)
+        );
+        assert!(commands.resolve("unknown").is_none());
     }
 
     #[test]
@@ -2993,13 +3101,13 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("COMMANDS"));
-        assert!(rendered.contains("Open in Helix"));
+        assert!(rendered.contains("Open in editor"));
         assert_eq!(
             app.hit_regions
                 .iter()
                 .filter(|region| matches!(region.target, AppHit::Palette(_)))
                 .count(),
-            PALETTE_ITEMS.len()
+            app.commands.list().len()
         );
     }
 

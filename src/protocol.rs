@@ -63,7 +63,14 @@ impl ProtocolRegistry {
     }
 
     pub fn register(&mut self, protocol: impl Protocol + 'static) -> Result<()> {
-        let protocol = Arc::new(protocol);
+        self.register_arc(Arc::new(protocol))
+    }
+
+    pub fn register_boxed(&mut self, protocol: Box<dyn Protocol>) -> Result<()> {
+        self.register_arc(Arc::from(protocol))
+    }
+
+    fn register_arc(&mut self, protocol: Arc<dyn Protocol>) -> Result<()> {
         let descriptor = protocol.descriptor();
         if descriptor.name.is_empty() || descriptor.name.contains("://") {
             bail!("invalid protocol name: {:?}", descriptor.name);
