@@ -1,5 +1,5 @@
 use super::file::resolve_path;
-use super::{render_task, render_task_list, split_wait, task_response};
+use super::{render_task, render_task_list};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
@@ -55,12 +55,11 @@ impl Protocol for EditProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let (target, wait) = split_wait(request.target)?;
-        if target.is_empty() {
+        if request.target.is_empty() {
             bail!("edit target path cannot be empty");
         }
         let body = request.body.cloned();
-        let path = resolve_path(&self.cwd, target);
+        let path = resolve_path(&self.cwd, request.target);
         let label = format!("edit {}", path.display());
         let record = context.tasks.allocate("edit", label).await;
         let id = record.id.clone();
@@ -72,7 +71,7 @@ impl Protocol for EditProtocol {
                 Ok(format!("Updated {}\n", path.display()).into_bytes())
             })
             .await;
-        task_response(&context.tasks, "edit", &id, wait).await
+        Ok(prompts::task_accepted("edit", &id).into_bytes())
     }
 }
 

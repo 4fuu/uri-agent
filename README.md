@@ -16,7 +16,7 @@ uri-agent keeps the model-facing contract stable:
 - **Progressive disclosure** — the system prompt lists protocol names and purposes; operational instructions live at `<protocol>://help`.
 - **Opaque addresses** — the router splits at the first `://`; the remaining target is not URL-decoded or normalized.
 - **Arbitrary bodies** — `body` may be any JSON value and is passed to the protocol unchanged.
-- **Async execution** — `exec` returns a managed task by default; `?wait=N` requests a bounded wait when an immediate result is useful.
+- **Async execution** — protocols can return managed tasks immediately. Waiting is protocol-owned, not a generic `exec` or URI behavior.
 - **One Skill, one protocol** — every Skill receives its own model-visible protocol name.
 - **Recoverable sessions** — model messages and tool-call identity are stored in SQLite, while oversized output remains available through `file://`.
 
@@ -48,13 +48,13 @@ exec("bash://run", "cargo test")
 → Read status: bash://tasks/<id>
 ```
 
-Use `?wait=N` to wait for up to 300 seconds:
+The built-in shell protocols accept `?wait=N` to wait for up to 300 seconds:
 
 ```text
 exec("bash://?wait=30", "cargo test")
 ```
 
-If the wait expires, the task continues in the background. Read its status and complete result from `<protocol>://tasks/<id>`.
+If the wait expires, the task continues in the background. Read its status and complete result from `<protocol>://tasks/<id>`. This option is implemented by `bash` and `pwsh` themselves: the router passes the opaque target unchanged, and does not interpret `wait` for other protocols. Protocol implementations may expose their own waiting syntax by calling the URI-independent task waiting API.
 
 ### Built-in protocols
 

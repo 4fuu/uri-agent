@@ -158,11 +158,24 @@ mod tests {
                 name: "capture".to_string(),
                 description: "test".to_string(),
                 can_read: true,
-                can_exec: false,
+                can_exec: true,
             }
         }
 
         async fn read(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            *self.capture.lock().unwrap() = Some(CapturedRequest {
+                uri: request.uri.to_string(),
+                target: request.target.to_string(),
+                body: request.body.cloned(),
+            });
+            Ok(b"ok".to_vec())
+        }
+
+        async fn exec(
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
@@ -215,6 +228,37 @@ mod tests {
             &CapturedRequest {
                 uri: "capture://a://b?not=a url".to_string(),
                 target: "a://b?not=a url".to_string(),
+                body: Some(body),
+            }
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn registry_does_not_interpret_exec_query_options() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let capture = Arc::new(Mutex::new(None));
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(CaptureProtocol {
+                capture: capture.clone(),
+            })
+            .unwrap();
+        let body = serde_json::json!("unchanged");
+
+        let result = registry
+            .exec("capture://run?wait=30", Some(&body))
+            .await
+            .unwrap();
+
+        assert_eq!(result, "ok");
+        assert_eq!(
+            capture.lock().unwrap().as_ref().unwrap(),
+            &CapturedRequest {
+                uri: "capture://run?wait=30".to_string(),
+                target: "run?wait=30".to_string(),
                 body: Some(body),
             }
         );

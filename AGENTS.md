@@ -10,7 +10,7 @@ Keep these product invariants intact:
 - Split addresses only at the first `://`. Treat the remainder as an opaque target; do not introduce RFC URL parsing, decoding, or normalization.
 - Accept any JSON value as `body` and pass it to the selected protocol unchanged.
 - Protocol names are unique. A protocol may implement read, exec, or both.
-- Exec is asynchronous by default. `?wait=N` is an explicit bounded wait of at most 300 seconds; a timeout must leave the task running.
+- Exec protocols may use system-managed asynchronous tasks. URI options such as the shell protocols' `?wait=N` belong to each protocol: the registry must pass them through unchanged and never apply a generic wait. The task manager exposes URI-independent waiting; a timeout must leave the task running.
 - Preserve oversized output in the session output directory and return a readable `file://` address.
 - Give every discovered Skill its own `<normalized-name>-skill` protocol. `://help` returns its `SKILL.md` plus the real Skill directory; resource routes must not escape that directory.
 - Register `bash` and `pwsh` only when an executable is present in the environment.

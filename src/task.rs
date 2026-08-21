@@ -160,6 +160,8 @@ impl TaskManager {
         self.inner.read().await.get(id).cloned()
     }
 
+    /// Waits for a task to finish for at most `duration` without cancelling it on timeout.
+    /// Protocols decide whether and how to expose this operation in their own targets.
     pub async fn wait(&self, id: &str, duration: Duration) -> Option<TaskRecord> {
         let mut notices = self.subscribe();
         let current = self.get(id).await?;
@@ -201,5 +203,30 @@ impl TaskManager {
         }
         record.cancellation.cancel();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_wait_is_uri_independent_and_does_not_cancel_on_timeout() {
+        let tasks = TaskManager::new();
+        let record = tasks.allocate("test", "slow task").await;
+        let id = record.id.clone();
+        tasks
+            .spawn(record, async {
+                time::sleep(Duration::from_millis(100)).await;
+                Ok(b"done".to_vec())
+            })
+            .await;
+
+        let running = tasks.wait(&id, Duration::from_millis(5)).await.unwrap();
+        assert_eq!(running.status, TaskStatus::Running);
+
+        let completed = tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.content, b"done");
     }
 }

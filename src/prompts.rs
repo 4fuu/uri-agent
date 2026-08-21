@@ -67,9 +67,8 @@ Call `exec` with `edit://path` and one of these bodies:
 ```
 
 The first form requires exactly one match. The second form atomically creates or
-replaces the file. Add `?wait=N` to the target path to wait up to N seconds
-(maximum 300), for example `edit://src/main.rs?wait=10`. Otherwise the immediate
-result contains a task URI. Read that URI to inspect completion or failure.
+replaces the file. The immediate result contains a task URI. Read that URI to
+inspect completion or failure.
 "#;
 
 pub const BASH_HELP: &str = r#"# bash

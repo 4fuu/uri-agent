@@ -1,4 +1,4 @@
-use super::{render_task, render_task_list, split_wait, task_response};
+use super::{render_record, render_task, render_task_list};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Result, anyhow, bail};
@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -88,7 +89,7 @@ impl Protocol for ShellProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let (target, wait) = split_wait(request.target)?;
+        let (target, wait) = parse_target(request.target)?;
         if !matches!(target, "" | "run") {
             bail!(
                 "expected {}://run or {}://?wait=<seconds>",
@@ -112,8 +113,38 @@ impl Protocol for ShellProtocol {
                 execute(&protocol, &executable, &cwd, command).await
             })
             .await;
-        task_response(&context.tasks, self.name, &id, wait).await
+        let Some(wait) = wait else {
+            return Ok(prompts::task_accepted(self.name, &id).into_bytes());
+        };
+        let record = context
+            .tasks
+            .wait(&id, wait)
+            .await
+            .ok_or_else(|| anyhow!("task disappeared: {id}"))?;
+        if record.status.terminal() {
+            return Ok(render_record(&record).into_bytes());
+        }
+        Ok(format!(
+            "{}\nWait window elapsed; the task is still {}.",
+            prompts::task_accepted(self.name, &id),
+            record.status.as_str()
+        )
+        .into_bytes())
     }
+}
+
+fn parse_target(target: &str) -> Result<(&str, Option<Duration>)> {
+    let Some((target, query)) = target.rsplit_once('?') else {
+        return Ok((target, None));
+    };
+    let seconds = query
+        .strip_prefix("wait=")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("shell wait must be an integer number of seconds"))?;
+    if seconds > 300 {
+        bail!("shell wait cannot exceed 300 seconds");
+    }
+    Ok((target, Some(Duration::from_secs(seconds))))
 }
 
 fn command_from_body(body: Option<&Value>) -> Result<&str> {
@@ -221,6 +252,18 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn shell_plugin_parses_its_own_wait_option() {
+        assert_eq!(parse_target("run").unwrap(), ("run", None));
+        assert_eq!(
+            parse_target("?wait=30").unwrap(),
+            ("", Some(Duration::from_secs(30)))
+        );
+        assert!(parse_target("run?wait=not-a-number").is_err());
+        assert!(parse_target("run?wait=301").is_err());
+        assert!(parse_target("run?other=30").is_err());
+    }
 
     #[tokio::test]
     async fn shell_is_async_by_default_and_can_opt_into_a_bounded_wait() {
