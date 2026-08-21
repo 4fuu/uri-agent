@@ -2928,14 +2928,14 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         areas[0]
     } else {
         render_transcript(frame, app, areas[0]);
-        render_footer(frame, app, areas[1]);
+        let footer_area = if notice.is_some() { areas[2] } else { areas[1] };
+        render_footer(frame, app, footer_area);
         areas[0]
     };
     if let Some((message, color)) = notice {
-        let notice_area = if idle { areas[1] } else { areas[2] };
         frame.render_widget(
             Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)),
-            notice_area,
+            areas[1],
         );
     }
     let selectable_area = if let Some(overlay) = app.overlay {
@@ -3035,143 +3035,39 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ]
 }
 
-struct StatusSegment {
-    text: String,
-    style: Style,
-}
-
-impl StatusSegment {
-    fn new(text: impl Into<String>, style: Style) -> Self {
-        Self {
-            text: text.into(),
-            style,
-        }
-    }
-}
-
-/// Compact URI Agent footer. The richer project, usage, and extension details
-/// stay available through the bottom-anchored status panel.
+/// Minimal conversation footer. Project, usage, and extension details stay
+/// available through the bottom-anchored status panel.
 fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let width = area.width as usize;
-    let branch = current_branch(app);
     let percent = context_percent(app);
-    let path = footer_cwd(&app.info.cwd);
-    let path_min = path.chars().count().min(12);
-    let mut middle = Vec::new();
-    let mut tail = vec![
-        StatusSegment::new(
-            format!("ctx {percent:.1}%"),
-            Style::default()
-                .fg(context_color(percent))
-                .add_modifier(Modifier::BOLD),
-        ),
-        StatusSegment::new(
-            format!("{} more", status_key(app)),
-            Style::default().fg(MUTED),
-        ),
-    ];
-    let model = StatusSegment::new(
-        compact_model(app),
-        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    let context = format!(
+        "{} {percent:.1}%/{}",
+        animation::progress(app.frame, 8, percent / 100.0),
+        format_tokens(app.info.context_window as u64),
     );
-    if compact_footer_width(path_min, &middle, &tail) + model.text.chars().count() + 3 <= width {
-        tail.insert(1, model);
-    }
-
-    let mut candidates = vec![StatusSegment::new(
-        compact_usage(app),
-        Style::default().fg(TEXT),
-    )];
-    if let Some(branch) = branch {
-        candidates.push(StatusSegment::new(
-            format!("git:{branch}"),
-            Style::default().fg(WARM),
-        ));
-    }
-    candidates.extend(plugin_status_items(app, false).into_iter().map(|item| {
-        StatusSegment::new(
-            single_line_preview(&format!("{} {}", item.label, item.value), 32),
-            status_tone_style(item.tone),
-        )
-    }));
-    for candidate in candidates {
-        let projected =
-            compact_footer_width(path_min, &middle, &tail) + candidate.text.chars().count() + 3;
-        if projected <= width {
-            middle.push(candidate);
-        }
-    }
-
-    let fixed = compact_footer_width(0, &middle, &tail);
-    let path = single_line_preview(&path, width.saturating_sub(fixed));
-    let mut segments = vec![
-        StatusSegment::new(
-            " URI ",
-            Style::default()
-                .fg(BG)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        StatusSegment::new(
-            path,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    segments.extend(middle);
-    segments.extend(tail);
+    let context_width = context.chars().count();
+    let model_width = (area.width as usize).saturating_sub(context_width + 2);
     let mut spans = Vec::new();
-    for (index, segment) in segments.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
-        }
-        spans.push(Span::styled(segment.text, segment.style));
+    if model_width > 0 {
+        spans.push(Span::styled(
+            single_line_preview(&compact_model(app), model_width),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
-        area,
-    );
+    spans.push(Span::styled(
+        context,
+        Style::default()
+            .fg(context_color(percent))
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
     app.hit_regions.push(HitRegion {
         area,
         target: AppHit::Status,
     });
-}
-
-fn compact_footer_width(
-    path_width: usize,
-    middle: &[StatusSegment],
-    tail: &[StatusSegment],
-) -> usize {
-    let segment_count = 2 + middle.len() + tail.len();
-    5 + path_width
-        + middle
-            .iter()
-            .chain(tail)
-            .map(|segment| segment.text.chars().count())
-            .sum::<usize>()
-        + segment_count.saturating_sub(1) * 3
-}
-
-fn compact_usage(app: &App) -> String {
-    let mut parts = if app.usage.input == 0 && app.usage.output == 0 {
-        vec!["tokens 0".to_string()]
-    } else {
-        vec![
-            format!("↑{}", format_tokens(app.usage.input)),
-            format!("↓{}", format_tokens(app.usage.output)),
-        ]
-    };
-    let subscription = app.info.provider == "kimi-coding";
-    if app.usage.cost > 0.0 || subscription {
-        parts.push(format!(
-            "${:.3}{}",
-            app.usage.cost,
-            if subscription { " sub" } else { "" }
-        ));
-    }
-    parts.join(" ")
 }
 
 fn compact_model(app: &App) -> String {
@@ -4565,7 +4461,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_footer_is_one_highlighted_project_status_line() {
+    fn conversation_footer_only_shows_context_and_model() {
         let mut app = test_app();
         app.push(
             BlockKind::Assistant,
@@ -4578,17 +4474,20 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 24);
         let footer = rendered
             .lines()
-            .find(|line| line.contains(" URI "))
-            .expect("compact URI footer");
-        // Once records exist the header and its animation are gone. Project,
-        // usage, context, model, and the expansion hint share one footer row.
+            .find(|line| line.contains("········ 0.0%/128k"))
+            .expect("minimal conversation footer");
+        // Once records exist the header and its animation are gone. The footer
+        // leaves richer project and usage details to the expanded status panel.
         assert!(!rendered.contains("URI Agent"));
         assert!(!rendered.contains("ready"));
-        assert!(footer.contains("/workspace"));
-        assert!(footer.contains("tokens 0"));
-        assert!(footer.contains("ctx 0.0%"));
+        assert!(footer.trim_start().starts_with("model  ········ 0.0%/128k"));
+        assert!(!footer.contains("ctx"));
         assert!(footer.contains("model"));
-        assert!(footer.contains("F4 more"));
+        assert!(!footer.contains("URI"));
+        assert!(!footer.contains("/workspace"));
+        assert!(!footer.contains("tokens"));
+        assert!(!footer.contains("F4"));
+        assert!(!footer.contains('│'));
         assert!(!rendered.contains("i compose"));
         assert!(!rendered.contains(": command"));
         assert!(!rendered.contains("r thinking"));
@@ -4599,12 +4498,13 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let badge = &terminal.backend().buffer()[(1, 23)];
-        let project = &terminal.backend().buffer()[(8, 23)];
-        assert_eq!((badge.fg, badge.bg), (BG, ACCENT));
-        assert!(badge.modifier.contains(Modifier::BOLD));
-        assert_eq!(project.fg, ACCENT);
-        assert!(project.modifier.contains(Modifier::BOLD));
+        let model = &terminal.backend().buffer()[(0, 23)];
+        let context = &terminal.backend().buffer()[(7, 23)];
+        assert_eq!((context.fg, context.bg), (ACCENT, BG));
+        assert!(context.modifier.contains(Modifier::BOLD));
+        assert_eq!((model.fg, model.bg), (TEXT, BG));
+        assert!(model.modifier.contains(Modifier::BOLD));
+        assert_eq!(terminal.backend().buffer()[(99, 23)].bg, BG);
 
         let status_region = app
             .hit_regions
@@ -4625,10 +4525,11 @@ mod tests {
     }
 
     #[test]
-    fn compact_and_expanded_status_show_usage_at_the_right_level_of_detail() {
+    fn compact_footer_stays_minimal_while_expanded_status_keeps_usage_details() {
         let mut app = test_app();
         app.info.provider_count = 2;
-        app.info.context_tokens = 12_800;
+        app.info.context_window = 262_144;
+        app.info.context_tokens = 26_214;
         app.push(
             BlockKind::User,
             "YOU",
@@ -4649,20 +4550,19 @@ mod tests {
             },
         });
         let rendered = render_to_string(&mut app, 100, 24);
-        assert!(rendered.contains("↑1.5k"));
-        assert!(rendered.contains("↓600"));
-        assert!(rendered.contains("$0.012"));
-        assert!(rendered.contains("ctx 10.0%"));
-        assert!(rendered.contains("test/model"));
+        assert!(!rendered.contains("↑1.5k"));
+        assert!(!rendered.contains("↓600"));
+        assert!(!rendered.contains("$0.012"));
+        assert!(rendered.contains("test/model  ▓······· 10.0%/262k"));
         assert!(!rendered.contains("last hit 25.0%"));
 
         app.overlay = Some(Overlay::Status);
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("STATUS · F4 toggle"));
-        assert!(rendered.contains("12k / 128k · 10.0%"));
+        assert!(rendered.contains("26k / 262k · 10.0%"));
         assert!(rendered.contains("read 500 · write 0 · last hit 25.0%"));
         assert!(rendered.contains("$0.0123"));
-        // Usage events update the footer without adding transcript blocks.
+        // Usage events remain available in status without adding transcript blocks.
         assert_eq!(app.blocks.len(), 1);
     }
 
@@ -4696,9 +4596,9 @@ mod tests {
         let rendered = render_to_string(&mut app, 140, 24);
         let footer = rendered
             .lines()
-            .find(|line| line.contains(" URI "))
-            .expect("compact URI footer");
-        assert!(footer.contains("build clean"));
+            .find(|line| line.contains("········ 0.0%/128k"))
+            .expect("minimal conversation footer");
+        assert!(!footer.contains("build clean"));
 
         assert_eq!(
             overlay_area(Rect::new(0, 0, 100, 24), Overlay::Status),
@@ -5095,6 +4995,10 @@ mod tests {
             },
         });
         assert!(app.busy);
+        let rendered = render_to_string(&mut app, 100, 24);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        assert!(rows[22].contains("thinking"));
+        assert!(rows[23].contains("model  ········ 0.0%/128k"));
         app.apply(SessionEvent {
             sequence: 2,
             at: chrono::Utc::now(),

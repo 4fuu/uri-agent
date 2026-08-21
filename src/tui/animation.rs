@@ -73,6 +73,30 @@ pub(super) fn activity(frame: usize, width: usize) -> String {
         .collect()
 }
 
+pub(super) fn progress(frame: usize, width: usize, ratio: f64) -> String {
+    let filled = ratio.clamp(0.0, 1.0) * width as f64;
+    activity(frame, width)
+        .chars()
+        .enumerate()
+        .map(|(x, level)| {
+            let remaining = filled - x as f64;
+            if remaining <= 0.0 {
+                '·'
+            } else if remaining < 1.0 / 3.0 {
+                '░'
+            } else if remaining < 2.0 / 3.0 {
+                '▒'
+            } else if remaining < 1.0 {
+                '▓'
+            } else if level == '·' {
+                '░'
+            } else {
+                level
+            }
+        })
+        .collect()
+}
+
 pub(super) fn spinner(frame: usize) -> char {
     const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
     FRAMES[frame % FRAMES.len()]
@@ -103,5 +127,16 @@ mod tests {
         assert_eq!(activity(0, 18).chars().count(), 18);
         assert_eq!(activity(0, 18), activity(0, 18));
         assert_ne!(activity(0, 18), activity(1, 18));
+    }
+
+    #[test]
+    fn progress_has_a_stable_width_and_tracks_the_ratio() {
+        assert_eq!(progress(0, 8, 0.0), "········");
+        assert_eq!(progress(0, 8, 1.0).chars().count(), 8);
+        assert!(!progress(0, 8, 1.0).contains('·'));
+        assert_eq!(progress(0, 8, 0.5).matches('·').count(), 4);
+        assert_ne!(progress(0, 8, 0.5), progress(1, 8, 0.5));
+        assert_eq!(progress(0, 8, -1.0), progress(0, 8, 0.0));
+        assert_eq!(progress(0, 8, 2.0), progress(0, 8, 1.0));
     }
 }

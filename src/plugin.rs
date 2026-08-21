@@ -319,8 +319,8 @@ impl TuiStatusItem {
 pub struct TuiStatusContext {
     pub cwd: PathBuf,
     pub session_id: String,
-    /// Providers may return a concise value for the footer and a richer value
-    /// for the expanded bottom panel.
+    /// Providers may return a richer value when the expanded status panel
+    /// requests one.
     pub expanded: bool,
 }
 
