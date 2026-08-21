@@ -92,15 +92,12 @@ Skills 按以下顺序扫描：
 <cwd>/.agents/skills
 <cwd>/.claude/skills
 <cwd>/.codex/skills
-<cwd>/.amp/skills
 ~/.agents/skills
 ~/.claude/skills
 ~/.codex/skills
-~/.config/amp/skills
-~/.cache/amp/global-skills
 ```
 
-两个 Skill 规范化为相同协议名时，优先级更高的位置生效。
+发现过程在进程启动时执行一次。每个扫描根目录可以直接包含 `SKILL.md`，也可以在其一级子目录中包含 `SKILL.md`；发现结果只在内存中生成协议，不会编译进二进制或写入配置。两个 Skill 规范化为相同协议名时，优先级更高的位置生效。
 
 ### 完整保留大型输出
 
@@ -128,7 +125,7 @@ https://pi.dev/api/models/providers/<provider-id>
 
 ## 配置
 
-没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、Space 命令面板或 `:settings` 打开设置浮窗；Insert 模式仍支持 `/settings`、`/model` 和 `/login`。浮窗可以编辑 Provider、模型、当前 Provider 凭据、内联输出上限和外部编辑器命令。保存后立即生效，不会丢弃当前会话。
+没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、Space 命令面板或 `:settings` 打开设置浮窗；Insert 模式仍支持 `/settings`、`/model` 和 `/login`。浮窗可以编辑 Provider、模型、当前 Provider 凭据、内联输出上限、编辑器与选取器命令，以及两者使用内嵌浮窗还是接管整个终端。保存后立即生效，不会丢弃当前会话。
 
 ### 文本文件
 
@@ -144,7 +141,7 @@ uri-agent 保持普通配置可编辑，并将程序生成数据与用户覆盖�
 | `<cwd>/.uri-agent/settings.json` | 用户 | 可选的项目设置，覆盖全局设置 |
 | `<cwd>/.uri-agent/keymap.rhai` | 用户 | 覆盖全局映射的可选项目快捷键 |
 
-项目设置文件已存在时，TUI 会将 Provider、模型、输出上限和编辑器写入项目文件；否则写入全局设置。凭据始终写入全局 `auth.json`。
+项目设置文件已存在时，TUI 会将 Provider、模型、输出上限、编辑器和选取器设置写入项目文件；否则写入全局设置。凭据始终写入全局 `auth.json`。
 
 `settings.json` 示例：
 
@@ -153,7 +150,10 @@ uri-agent 保持普通配置可编辑，并将程序生成数据与用户覆盖�
   "defaultProvider": "openai",
   "defaultModel": "gpt-5.2",
   "outputLimit": 32768,
-  "editor": "hx"
+  "editor": "hx",
+  "editorMode": "float",
+  "picker": "fzf",
+  "pickerMode": "float"
 }
 ```
 
@@ -232,6 +232,9 @@ uri-agent \
 | `--api-key` | `URI_AGENT_API_KEY` | 设置只对当前进程生效的凭据 |
 | `--output-limit` | `URI_AGENT_OUTPUT_LIMIT` | 设置内联输出字节数，最小 1024 |
 | `--editor` | `URI_AGENT_EDITOR`, `VISUAL`, `EDITOR` | 设置外部编辑器命令 |
+| `--editor-mode` | `URI_AGENT_EDITOR_MODE` | 选择 `float` 或 `fullscreen` 编辑器集成 |
+| `--picker` | `URI_AGENT_PICKER` | 设置会话内容模糊选取器命令 |
+| `--picker-mode` | `URI_AGENT_PICKER_MODE` | 选择 `float` 或 `fullscreen` 选取器集成 |
 | `--offline` | `URI_AGENT_OFFLINE`, `PI_OFFLINE` | 只使用本地模型缓存 |
 | `--cwd` | — | 设置内置协议可访问的工作目录 |
 | `--continue-session` | — | 恢复最近更新的会话 |
@@ -255,31 +258,23 @@ SQLite WAL 模式和事务内 sequence 分配保证事件顺序与模型历史�
 
 SQLite 是项目最初公开的持久化格式，因此不包含 JSONL 兼容层。
 
-没有传入 `--cwd`、`--session` 或 `--continue-session` 时，uri-agent 首先打开 Sessions 界面，而不是将 Agent 绑定到启动目录。已有会话会保留自己的项目目录。创建会话时使用目录浏览器：通过 `↑/↓` 和 `Enter` 导航，以 `←` 或 `Backspace` 返回父目录，用 `/` 筛选当前层级，再按 `Space` 选择当前显示目录。也可以用鼠标选择、滚轮滚动、双击会话或子目录，以及点击“选择当前目录”。`j/k/h/l` 只是可选兼容键，并非必学操作。
-
-在目录浏览器按 `f` 可以通过 [fzf](https://github.com/junegunn/fzf) 递归模糊搜索目录。内置浏览器无需外部依赖；安装 `fzf` 后才会启用该快捷键：
-
-```bash
-# Debian/Ubuntu
-sudo apt install fzf
-
-# macOS
-brew install fzf
-```
+规范化后的启动目录就是项目边界。普通启动会为该项目创建新会话；`--continue-session` 只恢复存储目录与当前项目相同的最近会话；`--session <id>` 会拒绝属于其他项目的会话。TUI 暂不提供跨项目会话总览或目录选择器。
 
 ## TUI
 
-Ratatui 界面将会话选择、事件浏览和消息输入分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。`Enter` 在可滚动浮窗中打开完整事件，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
+Ratatui 界面将事件浏览、消息输入和详细查看分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。`Enter` 在可滚动浮窗中打开完整事件，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
 
 | 模式 | 默认按键 | 行为 |
 | --- | --- | --- |
-| Sessions | `↑/↓`、`Enter`、`n`、鼠标 | 选择/打开会话，或为新会话选择项目 |
-| Browse | `↑/↓`、`Enter`、`i`、`e`、`Space`、`:`、鼠标 | 选择预览、查看详情、输入、执行命令或切换会话 |
+| Browse | `↑/↓`、`Enter`、`i`、`e`、`/`、`y`、`Space`、`:`、鼠标 | 选择预览、查看详情、输入、查找事件、复制或执行命令 |
 | Insert | `Enter`、`Shift+Enter`、`Ctrl+E`、`Esc` | 发送、换行、在外部编辑器编辑草稿或返回 Browse |
-| Detail | `↑/↓`、`PageUp/PageDown`、`e`、`Esc`、滚轮 | 查看完整 reasoning、工具或消息内容，或用编辑器打开 |
-| Global | `F1`、`F2`、`Ctrl+P`、`Ctrl+T`、`Ctrl+C` | 帮助、Settings、协议、任务和退出 |
+| Detail | `↑/↓`、`PageUp/PageDown`、`e`、`Esc`、拖选、滚轮 | 查看、选取、复制完整内容，或用编辑器打开 |
+| 内嵌终端 | 外部程序正常按键、双 `Esc`、Shift 拖选 | 操作编辑器/选取器、关闭 PTY 或选取终端文本 |
+| Global | `F1`、`F2`、`Ctrl+P`、`Ctrl+T`、`Ctrl+Shift+C`、`Ctrl+C` | 帮助、Settings、协议、任务、复制和退出 |
 
-Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行。命令包括 `:settings`、`:model`、`:login`、`:sessions`、`:tasks`、`:protocols`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`。顶栏始终标明当前模式；帮助浮窗展示实际生效的 keymap，而不是固定按键表。模型工作时仍会显示低噪声抖动动画。
+Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行，`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`。顶栏始终标明当前模式；帮助浮窗展示实际生效的 keymap，而不是固定按键表。模型工作时仍会显示低噪声抖动动画。
+
+只读浮窗可以直接用鼠标拖选。交互式面板和内嵌终端使用 Shift 拖选，使普通点击仍能交给程序处理。按 `y` 或 `Ctrl+Shift+C` 通过 OSC52 复制选区；没有选区时，同一操作会复制当前可见面板。
 
 ### Rhai 快捷键
 
@@ -299,9 +294,9 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-可用模式包括 `global`、`sessions`、`directory`、`browse`、`insert`、`detail`、`list`、`tasks`、`settings`、`palette`、`command` 和 `text`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`open`、`select`、`search`、`fzf`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`sessions`、`settings`、`protocols`、`tasks`、`close` 和 `quit`。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
+可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
 
-### 外部编辑器
+### 外部编辑器与选取器
 
 [Helix](https://github.com/helix-editor/helix) 是默认外部编辑器，其可执行文件名为 `hx`。它不是强依赖：未安装时其余 TUI 仍可使用，URI Agent 会提示如何更改编辑器，而不会退出。请参考 [Helix 官方安装说明](https://docs.helix-editor.com/install.html)，例如：
 
@@ -313,7 +308,17 @@ brew install helix
 sudo pacman -S helix
 ```
 
-可以在 Settings 或 `settings.json` 中设置 `editor`，也可以依次通过 `EDITOR`、`VISUAL`、`URI_AGENT_EDITOR` 或 `--editor` 提高优先级覆盖。终端编辑器会直接阻塞运行；GUI 客户端应使用等待参数，保证临时文件在查看期间仍然存在，例如 `code --wait`。
+[fzf](https://github.com/junegunn/fzf) 是默认的会话内容选取器。安装后即可使用 `/`、`:find` 或命令面板中的查找操作：
+
+```bash
+# Debian/Ubuntu
+sudo apt install fzf
+
+# macOS
+brew install fzf
+```
+
+两者默认都运行在真实 PTY 中，并渲染为 Ratatui 浮窗。需要让程序临时接管整个终端时，可在 Settings 或 `settings.json` 中将 `editorMode`、`pickerMode` 改为 `fullscreen`；程序返回后 URI Agent 会恢复 raw mode、鼠标捕获和 bracketed paste。命令本身可以在 Settings 中设置，也可用 `EDITOR`/`VISUAL`/`URI_AGENT_EDITOR` 与 `URI_AGENT_PICKER` 覆盖。GUI 编辑器应附带等待参数（例如 `code --wait`）并使用 fullscreen 模式。
 
 ## 安装
 

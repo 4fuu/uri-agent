@@ -1,13 +1,15 @@
 use crate::catalog::{CatalogModel, ModelCatalog};
-use crate::config::{ActiveSettings, ConfigManager};
+use crate::config::{ActiveSettings, ConfigManager, ExternalMode};
 use crate::keymap::Keymap;
 use crate::model::configured_backend;
 use crate::output::OutputStore;
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
-use crate::session::{EventKind, Session, SessionChoice, SessionEvent, SessionSummary};
+use crate::session::{EventKind, SessionEvent};
 use crate::task::{TaskManager, TaskRecord, TaskStatus};
+use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -15,6 +17,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use futures_util::StreamExt;
+use portable_pty::CommandBuilder;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,12 +27,12 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::env;
-use std::io::stdout;
+use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{fs, io::AsyncWriteExt, process::Command, time};
+use tokio::{fs, process::Command, time};
+use tui_term::widget::PseudoTerminal;
 use tui_textarea::TextArea;
 use uuid::Uuid;
 
@@ -47,6 +50,9 @@ pub struct TuiInfo {
     pub model: String,
     pub session_id: String,
     pub editor: Option<String>,
+    pub editor_mode: ExternalMode,
+    pub picker: Option<String>,
+    pub picker_mode: ExternalMode,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -83,7 +89,8 @@ enum UiCommand {
     Compose,
     Detail,
     Editor,
-    Sessions,
+    Finder,
+    Copy,
     Tasks,
     Protocols,
     Settings,
@@ -97,7 +104,7 @@ struct PaletteItem {
     description: &'static str,
 }
 
-const PALETTE_ITEMS: [PaletteItem; 9] = [
+const PALETTE_ITEMS: [PaletteItem; 10] = [
     PaletteItem {
         command: UiCommand::Compose,
         name: "Compose message",
@@ -114,9 +121,14 @@ const PALETTE_ITEMS: [PaletteItem; 9] = [
         description: "use the configured external editor",
     },
     PaletteItem {
-        command: UiCommand::Sessions,
-        name: "Switch session",
-        description: "return to the Sessions screen",
+        command: UiCommand::Finder,
+        name: "Find conversation event",
+        description: "search previews with the configured picker",
+    },
+    PaletteItem {
+        command: UiCommand::Copy,
+        name: "Copy panel",
+        description: "copy the selection or visible panel with OSC52",
     },
     PaletteItem {
         command: UiCommand::Tasks,
@@ -131,7 +143,7 @@ const PALETTE_ITEMS: [PaletteItem; 9] = [
     PaletteItem {
         command: UiCommand::Settings,
         name: "Settings",
-        description: "provider, model, credential, limits, editor",
+        description: "models, limits, editor, picker, and display modes",
     },
     PaletteItem {
         command: UiCommand::Help,
@@ -152,6 +164,7 @@ enum EditingSetting {
     ApiKey,
     OutputLimit,
     Editor,
+    Picker,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -167,13 +180,6 @@ enum AppHit {
     Palette(usize),
     Task(usize),
     Setting(usize),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PickerHit {
-    Session(usize),
-    Directory(usize),
-    ChooseDirectory,
 }
 
 #[derive(Clone, Copy)]
@@ -194,6 +200,9 @@ struct SettingsState {
     api_key_changed: bool,
     output_limit: String,
     editor: String,
+    editor_mode: ExternalMode,
+    picker: String,
+    picker_mode: ExternalMode,
     search: String,
 }
 
@@ -216,6 +225,9 @@ impl SettingsState {
             .unwrap_or(0);
         let output_limit = active.output_limit.to_string();
         let editor = active.editor.clone().unwrap_or_default();
+        let editor_mode = active.editor_mode;
+        let picker = active.picker.clone().unwrap_or_default();
+        let picker_mode = active.picker_mode;
         Self {
             active,
             providers,
@@ -228,6 +240,9 @@ impl SettingsState {
             api_key_changed: false,
             output_limit,
             editor,
+            editor_mode,
+            picker,
+            picker_mode,
             search: String::new(),
         }
     }
@@ -295,6 +310,37 @@ impl SettingsState {
                 })
             })
     }
+
+    fn cycle_external_mode(mode: &mut ExternalMode) {
+        *mode = match mode {
+            ExternalMode::Float => ExternalMode::Fullscreen,
+            ExternalMode::Fullscreen => ExternalMode::Float,
+        };
+    }
+}
+
+struct SelectableSurface {
+    area: Rect,
+    cells: Vec<Vec<String>>,
+}
+
+#[derive(Clone, Copy)]
+struct TextSelection {
+    start: (u16, u16),
+    end: (u16, u16),
+}
+
+enum ExternalPurpose {
+    Editor { path: PathBuf, read_back: bool },
+    Picker { input: PathBuf, result: PathBuf },
+}
+
+struct ExternalProcess {
+    terminal: EmbeddedTerminal,
+    purpose: ExternalPurpose,
+    area: Rect,
+    title: &'static str,
+    last_escape: Option<Instant>,
 }
 
 struct App {
@@ -319,6 +365,9 @@ struct App {
     command_line: String,
     hit_regions: Vec<HitRegion<AppHit>>,
     last_click: Option<(AppHit, Instant)>,
+    selectable: Option<SelectableSurface>,
+    selection: Option<TextSelection>,
+    external: Option<ExternalProcess>,
 }
 
 impl App {
@@ -347,6 +396,9 @@ impl App {
             command_line: String::new(),
             hit_regions: Vec::new(),
             last_click: None,
+            selectable: None,
+            selection: None,
+            external: None,
         }
     }
 
@@ -495,93 +547,6 @@ impl App {
     }
 }
 
-pub struct SessionLaunch {
-    pub cwd: PathBuf,
-    pub session: SessionChoice,
-}
-
-pub enum TuiExit {
-    Quit,
-    Sessions,
-}
-
-struct SessionPicker {
-    sessions: Vec<SessionSummary>,
-    selected: usize,
-    directory: Option<DirectoryPicker>,
-    base: PathBuf,
-    flash: Option<String>,
-    keymap: Keymap,
-    hit_regions: Vec<HitRegion<PickerHit>>,
-    last_click: Option<(PickerHit, Instant)>,
-}
-
-struct DirectoryPicker {
-    current: PathBuf,
-    entries: Vec<PathBuf>,
-    selected: usize,
-    searching: bool,
-    query: String,
-}
-
-impl DirectoryPicker {
-    async fn open(current: PathBuf) -> Result<Self> {
-        let mut picker = Self {
-            current,
-            entries: Vec::new(),
-            selected: 0,
-            searching: false,
-            query: String::new(),
-        };
-        picker.reload().await?;
-        Ok(picker)
-    }
-
-    async fn reload(&mut self) -> Result<()> {
-        let mut directory = fs::read_dir(&self.current)
-            .await
-            .with_context(|| format!("cannot read {}", self.current.display()))?;
-        let mut entries = Vec::new();
-        while let Some(entry) = directory.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
-                entries.push(entry.path());
-            }
-        }
-        entries.sort_by(|left, right| {
-            left.file_name()
-                .unwrap_or_default()
-                .cmp(right.file_name().unwrap_or_default())
-        });
-        self.entries = entries;
-        self.selected = self.selected.min(self.visible_len().saturating_sub(1));
-        Ok(())
-    }
-
-    fn visible(&self) -> Vec<&PathBuf> {
-        let query = self.query.to_ascii_lowercase();
-        self.entries
-            .iter()
-            .filter(|path| {
-                query.is_empty()
-                    || path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.to_ascii_lowercase().contains(&query))
-            })
-            .collect()
-    }
-
-    fn visible_len(&self) -> usize {
-        self.visible().len()
-    }
-
-    fn selected_path(&self) -> Option<PathBuf> {
-        self.visible()
-            .get(self.selected)
-            .map(|path| (*path).clone())
-    }
-}
-
 fn hit_target<T: Copy>(regions: &[HitRegion<T>], mouse: MouseEvent) -> Option<T> {
     regions
         .iter()
@@ -603,341 +568,6 @@ fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: 
     repeated
 }
 
-async fn selected_session_launch(picker: &mut SessionPicker) -> Result<Option<SessionLaunch>> {
-    let Some(session) = picker.sessions.get(picker.selected) else {
-        picker.directory = Some(DirectoryPicker::open(picker.base.clone()).await?);
-        return Ok(None);
-    };
-    match session.cwd.canonicalize() {
-        Ok(cwd) if cwd.is_dir() => Ok(Some(SessionLaunch {
-            cwd,
-            session: SessionChoice::Existing(session.id.clone()),
-        })),
-        _ => {
-            picker.flash = Some(format!(
-                "Project directory is unavailable: {}",
-                session.cwd.display()
-            ));
-            Ok(None)
-        }
-    }
-}
-
-pub async fn select_session(base: &Path) -> Result<Option<SessionLaunch>> {
-    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    let mut picker = SessionPicker {
-        sessions: Session::list(&base).await?,
-        selected: 0,
-        directory: None,
-        base,
-        flash: None,
-        keymap: Keymap::load(None).await?,
-        hit_regions: Vec::new(),
-        last_click: None,
-    };
-    let mut terminal = ratatui::try_init()?;
-    let _restore = RestoreTerminal;
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    let mut events = EventStream::new();
-    loop {
-        terminal.draw(|frame| render_session_picker(frame, &mut picker))?;
-        let Some(event) = events.next().await else {
-            return Ok(None);
-        };
-        match event? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                let key_name = key_name(key);
-                if picker.directory.is_some() {
-                    let searching = picker
-                        .directory
-                        .as_ref()
-                        .is_some_and(|directory| directory.searching);
-                    let action = picker
-                        .keymap
-                        .action(if searching { "text" } else { "directory" }, &key_name);
-                    if searching {
-                        let directory = picker.directory.as_mut().unwrap();
-                        match action.as_deref() {
-                            Some("confirm" | "cancel") => directory.searching = false,
-                            Some("backspace") => {
-                                directory.query.pop();
-                                directory.selected = 0;
-                            }
-                            Some("quit") => return Ok(None),
-                            _ => {
-                                if let KeyCode::Char(character) = key.code
-                                    && !key.modifiers.intersects(
-                                        KeyModifiers::CONTROL
-                                            | KeyModifiers::ALT
-                                            | KeyModifiers::SUPER,
-                                    )
-                                {
-                                    directory.query.push(character);
-                                    directory.selected = 0;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    match action.as_deref() {
-                        Some("quit") => return Ok(None),
-                        Some("cancel" | "close") => picker.directory = None,
-                        Some("next") => {
-                            let directory = picker.directory.as_mut().unwrap();
-                            directory.selected = directory
-                                .selected
-                                .saturating_add(1)
-                                .min(directory.visible_len().saturating_sub(1));
-                        }
-                        Some("previous") => {
-                            let directory = picker.directory.as_mut().unwrap();
-                            directory.selected = directory.selected.saturating_sub(1);
-                        }
-                        Some("search") => {
-                            let directory = picker.directory.as_mut().unwrap();
-                            directory.searching = true;
-                            directory.query.clear();
-                            directory.selected = 0;
-                        }
-                        Some("parent") => {
-                            let directory = picker.directory.as_mut().unwrap();
-                            if let Some(parent) = directory.current.parent() {
-                                directory.current = parent.to_path_buf();
-                                directory.query.clear();
-                                directory.reload().await?;
-                            }
-                        }
-                        Some("open") => {
-                            let selected = picker
-                                .directory
-                                .as_ref()
-                                .and_then(DirectoryPicker::selected_path);
-                            if let Some(selected) = selected {
-                                picker.directory = Some(DirectoryPicker::open(selected).await?);
-                            }
-                        }
-                        Some("select") => {
-                            let cwd = picker.directory.as_ref().unwrap().current.clone();
-                            return Ok(Some(SessionLaunch {
-                                cwd,
-                                session: SessionChoice::New,
-                            }));
-                        }
-                        Some("fzf") => {
-                            let root = picker.directory.as_ref().unwrap().current.clone();
-                            drop(events);
-                            let selected = pick_directory_with_fzf(&mut terminal, &root).await;
-                            events = EventStream::new();
-                            match selected {
-                                Ok(Some(cwd)) => {
-                                    return Ok(Some(SessionLaunch {
-                                        cwd,
-                                        session: SessionChoice::New,
-                                    }));
-                                }
-                                Ok(None) => picker.flash = Some("fzf cancelled".to_string()),
-                                Err(error) => {
-                                    picker.flash = Some(format!("fzf unavailable: {error:#}"))
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                match picker.keymap.action("sessions", &key_name).as_deref() {
-                    Some("quit") => return Ok(None),
-                    Some("new") => {
-                        picker.directory = Some(DirectoryPicker::open(picker.base.clone()).await?);
-                        picker.flash = None;
-                    }
-                    Some("next") => {
-                        picker.selected = picker
-                            .selected
-                            .saturating_add(1)
-                            .min(picker.sessions.len().saturating_sub(1));
-                    }
-                    Some("previous") => {
-                        picker.selected = picker.selected.saturating_sub(1);
-                    }
-                    Some("first") => picker.selected = 0,
-                    Some("last") => {
-                        picker.selected = picker.sessions.len().saturating_sub(1);
-                    }
-                    Some("refresh") => {
-                        picker.sessions = Session::list(&picker.base).await?;
-                        picker.selected =
-                            picker.selected.min(picker.sessions.len().saturating_sub(1));
-                    }
-                    Some("open") => {
-                        if let Some(launch) = selected_session_launch(&mut picker).await? {
-                            return Ok(Some(launch));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Event::Paste(text)
-                if picker
-                    .directory
-                    .as_ref()
-                    .is_some_and(|directory| directory.searching) =>
-            {
-                let directory = picker.directory.as_mut().unwrap();
-                directory.query.push_str(text.trim());
-                directory.selected = 0;
-            }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    if let Some(directory) = picker.directory.as_mut() {
-                        directory.selected = directory.selected.saturating_sub(3);
-                    } else {
-                        picker.selected = picker.selected.saturating_sub(3);
-                    }
-                }
-                MouseEventKind::ScrollDown => {
-                    if let Some(directory) = picker.directory.as_mut() {
-                        directory.selected = directory
-                            .selected
-                            .saturating_add(3)
-                            .min(directory.visible_len().saturating_sub(1));
-                    } else {
-                        picker.selected = picker
-                            .selected
-                            .saturating_add(3)
-                            .min(picker.sessions.len().saturating_sub(1));
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(target) = hit_target(&picker.hit_regions, mouse) {
-                        let activate = is_double_click(&mut picker.last_click, target);
-                        match target {
-                            PickerHit::Session(index) => {
-                                picker.selected = index;
-                                if activate
-                                    && let Some(launch) =
-                                        selected_session_launch(&mut picker).await?
-                                {
-                                    return Ok(Some(launch));
-                                }
-                            }
-                            PickerHit::Directory(index) => {
-                                let selected = picker.directory.as_mut().and_then(|directory| {
-                                    directory.selected = index;
-                                    activate.then(|| directory.selected_path()).flatten()
-                                });
-                                if let Some(selected) = selected {
-                                    picker.directory = Some(DirectoryPicker::open(selected).await?);
-                                }
-                            }
-                            PickerHit::ChooseDirectory => {
-                                let cwd = picker.directory.as_ref().unwrap().current.clone();
-                                return Ok(Some(SessionLaunch {
-                                    cwd,
-                                    session: SessionChoice::New,
-                                }));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::FocusGained
-            | Event::FocusLost
-            | Event::Paste(_)
-            | Event::Resize(_, _)
-            | Event::Key(_) => {}
-        }
-    }
-}
-
-async fn pick_directory_with_fzf(
-    terminal: &mut DefaultTerminal,
-    root: &Path,
-) -> Result<Option<PathBuf>> {
-    Command::new("fzf")
-        .arg("--version")
-        .output()
-        .await
-        .context("install fzf to use recursive directory search")?;
-    let candidates = directory_candidates(root).await?;
-    execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
-    ratatui::try_restore()?;
-    let result = async {
-        let mut child = Command::new("fzf")
-            .args(["--read0", "--print0", "--scheme=path", "--prompt=project> "])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("cannot open fzf input"))?
-            .write_all(&candidates)
-            .await?;
-        Ok::<_, anyhow::Error>(child.wait_with_output().await?)
-    }
-    .await;
-    *terminal = ratatui::try_init()?;
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    terminal.clear()?;
-
-    let output = result.context("cannot run fzf directory search")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let selected = String::from_utf8(output.stdout)?
-        .trim_end_matches('\0')
-        .to_string();
-    if selected.is_empty() {
-        return Ok(None);
-    }
-    let path = PathBuf::from(selected);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    Ok(Some(path.canonicalize()?))
-}
-
-async fn directory_candidates(root: &Path) -> Result<Vec<u8>> {
-    let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut output = Vec::new();
-        let mut pending = vec![root];
-        let mut count = 0usize;
-        while let Some(directory) = pending.pop() {
-            output.extend_from_slice(directory.to_string_lossy().as_bytes());
-            output.push(0);
-            count += 1;
-            if count >= 100_000 {
-                break;
-            }
-            let Ok(entries) = std::fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let name = entry.file_name();
-                if matches!(name.to_str(), Some(".git" | "node_modules" | "target")) {
-                    continue;
-                }
-                pending.push(entry.path());
-            }
-        }
-        output
-    })
-    .await
-    .context("directory search worker failed")
-}
-
 pub async fn run(
     runtime: Arc<AgentRuntime>,
     protocols: Vec<ProtocolDescriptor>,
@@ -946,7 +576,7 @@ pub async fn run(
     catalog: Arc<ModelCatalog>,
     output: Arc<OutputStore>,
     info: TuiInfo,
-) -> Result<TuiExit> {
+) -> Result<()> {
     let session = runtime.session().clone();
     let mut receiver = session.subscribe();
     let keymap = Keymap::load(Some(&info.cwd)).await?;
@@ -981,7 +611,7 @@ async fn run_loop(
     app: &mut App,
     services: TuiServices,
     receiver: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
-) -> Result<TuiExit> {
+) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
     loop {
@@ -989,13 +619,18 @@ async fn run_loop(
         tokio::select! {
             _ = animation.tick() => app.frame = app.frame.wrapping_add(1),
             event = terminal_events.next() => {
-                let Some(event) = event else { return Ok(TuiExit::Quit); };
+                let Some(event) = event else { return Ok(()); };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if app.external.is_some() {
+                            if handle_external_key(app, key)? {
+                                cancel_external(app).await;
+                            }
+                            continue;
+                        }
                         match handle_key(app, key, &services.tasks, &services.catalog).await {
                             Action::Continue => {}
-                            Action::Quit => return Ok(TuiExit::Quit),
-                            Action::Sessions => return Ok(TuiExit::Sessions),
+                            Action::Quit => return Ok(()),
                             Action::Submit(prompt) => {
                                 let runtime = services.runtime.clone();
                                 tokio::spawn(async move {
@@ -1016,23 +651,33 @@ async fn run_loop(
                                 clear_api_key(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
                             }
                             Action::OpenEditor { content, replace_input } => {
-                                drop(terminal_events);
-                                let result = open_editor(terminal, app.info.editor.as_deref(), &content, replace_input).await;
-                                terminal_events = EventStream::new();
-                                match result {
-                                    Ok(Some(content)) => {
-                                        app.input = TextArea::new(content.split('\n').map(str::to_owned).collect());
-                                        style_input(&mut app.input, app.busy);
-                                        app.mode = Mode::Insert;
-                                    }
-                                    Ok(None) => app.flash = Some("Editor closed".to_string()),
-                                    Err(error) => app.flash = Some(format!("Editor failed: {error:#}")),
+                                if app.info.editor_mode == ExternalMode::Fullscreen {
+                                    drop(terminal_events);
+                                    let result = open_editor(terminal, app.info.editor.as_deref(), &content, replace_input).await;
+                                    terminal_events = EventStream::new();
+                                    apply_editor_result(app, result);
+                                } else if let Err(error) = open_embedded_editor(app, &content, replace_input, terminal.size()?.into()).await {
+                                    app.flash = Some(format!("Editor failed: {error:#}"));
+                                }
+                            }
+                            Action::OpenPicker => {
+                                if app.info.picker_mode == ExternalMode::Fullscreen {
+                                    drop(terminal_events);
+                                    let result = open_fullscreen_picker(terminal, app).await;
+                                    terminal_events = EventStream::new();
+                                    apply_picker_result(app, result);
+                                } else if let Err(error) = open_embedded_picker(app, terminal.size()?.into()).await {
+                                    app.flash = Some(format!("Picker failed: {error:#}"));
                                 }
                             }
                         }
                     }
                     Event::Paste(text) => {
-                        if let Some(settings) = app.settings.as_mut()
+                        if let Some(external) = app.external.as_mut() {
+                            if let Err(error) = external.terminal.send_paste(&text) {
+                                app.flash = Some(format!("Terminal input failed: {error:#}"));
+                            }
+                        } else if let Some(settings) = app.settings.as_mut()
                             && let Some(editing) = settings.editing
                         {
                             match editing {
@@ -1044,6 +689,7 @@ async fn run_loop(
                                     .output_limit
                                     .extend(text.chars().filter(char::is_ascii_digit)),
                                 EditingSetting::Editor => settings.editor.push_str(text.trim()),
+                                EditingSetting::Picker => settings.picker.push_str(text.trim()),
                                 EditingSetting::ProviderSearch | EditingSetting::ModelSearch => {
                                     settings.search.push_str(text.trim());
                                 }
@@ -1055,10 +701,15 @@ async fn run_loop(
                         }
                     }
                     Event::Mouse(mouse) => {
+                        if app.external.is_some() {
+                            if let Err(error) = handle_external_mouse(app, mouse) {
+                                app.flash = Some(format!("Terminal mouse input failed: {error:#}"));
+                            }
+                            continue;
+                        }
                         match handle_mouse(app, mouse, &services.tasks).await {
                             Action::Continue => {}
-                            Action::Quit => return Ok(TuiExit::Quit),
-                            Action::Sessions => return Ok(TuiExit::Sessions),
+                            Action::Quit => return Ok(()),
                             Action::Submit(prompt) => {
                                 let runtime = services.runtime.clone();
                                 tokio::spawn(async move {
@@ -1079,17 +730,23 @@ async fn run_loop(
                                 clear_api_key(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
                             }
                             Action::OpenEditor { content, replace_input } => {
-                                drop(terminal_events);
-                                let result = open_editor(terminal, app.info.editor.as_deref(), &content, replace_input).await;
-                                terminal_events = EventStream::new();
-                                match result {
-                                    Ok(Some(content)) => {
-                                        app.input = TextArea::new(content.split('\n').map(str::to_owned).collect());
-                                        style_input(&mut app.input, app.busy);
-                                        app.mode = Mode::Insert;
-                                    }
-                                    Ok(None) => app.flash = Some("Editor closed".to_string()),
-                                    Err(error) => app.flash = Some(format!("Editor failed: {error:#}")),
+                                if app.info.editor_mode == ExternalMode::Fullscreen {
+                                    drop(terminal_events);
+                                    let result = open_editor(terminal, app.info.editor.as_deref(), &content, replace_input).await;
+                                    terminal_events = EventStream::new();
+                                    apply_editor_result(app, result);
+                                } else if let Err(error) = open_embedded_editor(app, &content, replace_input, terminal.size()?.into()).await {
+                                    app.flash = Some(format!("Editor failed: {error:#}"));
+                                }
+                            }
+                            Action::OpenPicker => {
+                                if app.info.picker_mode == ExternalMode::Fullscreen {
+                                    drop(terminal_events);
+                                    let result = open_fullscreen_picker(terminal, app).await;
+                                    terminal_events = EventStream::new();
+                                    apply_picker_result(app, result);
+                                } else if let Err(error) = open_embedded_picker(app, terminal.size()?.into()).await {
+                                    app.flash = Some(format!("Picker failed: {error:#}"));
                                 }
                             }
                         }
@@ -1104,8 +761,11 @@ async fn run_loop(
                         app.apply(event);
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(TuiExit::Quit),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             }
+        }
+        if external_finished(app)? {
+            finish_external(app).await;
         }
     }
 }
@@ -1113,7 +773,6 @@ async fn run_loop(
 enum Action {
     Continue,
     Quit,
-    Sessions,
     Submit(String),
     OpenSettings,
     SaveSettings,
@@ -1123,6 +782,7 @@ enum Action {
         content: String,
         replace_input: bool,
     },
+    OpenPicker,
 }
 
 fn parse_ui_command(command: &str) -> Option<UiCommand> {
@@ -1135,7 +795,8 @@ fn parse_ui_command(command: &str) -> Option<UiCommand> {
         "compose" | "insert" => Some(UiCommand::Compose),
         "detail" | "open" => Some(UiCommand::Detail),
         "edit" | "editor" => Some(UiCommand::Editor),
-        "sessions" => Some(UiCommand::Sessions),
+        "find" | "search" | "picker" => Some(UiCommand::Finder),
+        "copy" | "yank" => Some(UiCommand::Copy),
         "tasks" => Some(UiCommand::Tasks),
         "protocols" => Some(UiCommand::Protocols),
         "settings" | "model" | "login" => Some(UiCommand::Settings),
@@ -1173,13 +834,10 @@ async fn dispatch_ui_command(app: &mut App, command: UiCommand, tasks: &TaskMana
                 Action::Continue
             }
         }
-        UiCommand::Sessions => {
-            if app.busy {
-                app.flash = Some("Wait for the active turn before switching sessions".to_string());
-                Action::Continue
-            } else {
-                Action::Sessions
-            }
+        UiCommand::Finder => Action::OpenPicker,
+        UiCommand::Copy => {
+            copy_current_surface(app);
+            Action::Continue
         }
         UiCommand::Tasks => {
             app.task_records = tasks.list().await;
@@ -1210,12 +868,21 @@ async fn handle_key(
     catalog: &ModelCatalog,
 ) -> Action {
     let key_name = key_name(key);
+    if app.selection.is_some() {
+        match app.keymap.action("selection", &key_name).as_deref() {
+            Some("copy") => copy_current_surface(app),
+            Some("close") => app.selection = None,
+            _ => {}
+        }
+        return Action::Continue;
+    }
     match app.keymap.action_chain(&[], &key_name).as_deref() {
         Some("quit") => return dispatch_ui_command(app, UiCommand::Quit, tasks).await,
         Some("help") => return dispatch_ui_command(app, UiCommand::Help, tasks).await,
         Some("settings") => return dispatch_ui_command(app, UiCommand::Settings, tasks).await,
         Some("protocols") => return dispatch_ui_command(app, UiCommand::Protocols, tasks).await,
         Some("tasks") => return dispatch_ui_command(app, UiCommand::Tasks, tasks).await,
+        Some("copy") => return dispatch_ui_command(app, UiCommand::Copy, tasks).await,
         _ => {}
     }
     if let Some(overlay) = app.overlay {
@@ -1366,7 +1033,8 @@ async fn handle_key(
                                 }
                                 EditingSetting::ApiKey
                                 | EditingSetting::OutputLimit
-                                | EditingSetting::Editor => {}
+                                | EditingSetting::Editor
+                                | EditingSetting::Picker => {}
                             }
                             settings.editing = None;
                             settings.search.clear();
@@ -1384,6 +1052,9 @@ async fn handle_key(
                             }
                             EditingSetting::Editor => {
                                 settings.editor.pop();
+                            }
+                            EditingSetting::Picker => {
+                                settings.picker.pop();
                             }
                         },
                         _ => {
@@ -1406,6 +1077,7 @@ async fn handle_key(
                                     }
                                     EditingSetting::OutputLimit => {}
                                     EditingSetting::Editor => settings.editor.push(character),
+                                    EditingSetting::Picker => settings.picker.push(character),
                                 }
                             }
                         }
@@ -1416,7 +1088,7 @@ async fn handle_key(
                     Some("quit") => return Action::Quit,
                     Some("close") => app.overlay = None,
                     Some("previous") => settings.selected = settings.selected.saturating_sub(1),
-                    Some("next") => settings.selected = (settings.selected + 1).min(4),
+                    Some("next") => settings.selected = (settings.selected + 1).min(7),
                     Some("left") if settings.selected == 0 => {
                         settings.cycle_provider(-1, catalog).await;
                     }
@@ -1425,19 +1097,37 @@ async fn handle_key(
                     }
                     Some("left") if settings.selected == 1 => settings.cycle_model(-1),
                     Some("right") if settings.selected == 1 => settings.cycle_model(1),
+                    Some("left" | "right") if settings.selected == 5 => {
+                        SettingsState::cycle_external_mode(&mut settings.editor_mode);
+                    }
+                    Some("left" | "right") if settings.selected == 7 => {
+                        SettingsState::cycle_external_mode(&mut settings.picker_mode);
+                    }
                     Some("edit") => {
+                        if settings.selected == 5 {
+                            SettingsState::cycle_external_mode(&mut settings.editor_mode);
+                            return Action::Continue;
+                        }
+                        if settings.selected == 7 {
+                            SettingsState::cycle_external_mode(&mut settings.picker_mode);
+                            return Action::Continue;
+                        }
                         settings.editing = Some(match settings.selected {
                             0 => EditingSetting::ProviderSearch,
                             1 => EditingSetting::ModelSearch,
                             2 => EditingSetting::ApiKey,
                             3 => EditingSetting::OutputLimit,
-                            _ => EditingSetting::Editor,
+                            4 => EditingSetting::Editor,
+                            6 => EditingSetting::Picker,
+                            _ => unreachable!(),
                         });
                         match settings.selected {
                             0 | 1 => settings.search.clear(),
                             2 => settings.api_key.clear(),
                             3 => settings.output_limit.clear(),
-                            _ => settings.editor.clear(),
+                            4 => settings.editor.clear(),
+                            6 => settings.picker.clear(),
+                            _ => {}
                         }
                     }
                     Some("save") => return Action::SaveSettings,
@@ -1516,13 +1206,21 @@ async fn handle_key(
         Some("last") => app.selected_block = app.blocks.len().saturating_sub(1),
         Some("detail") => return dispatch_ui_command(app, UiCommand::Detail, tasks).await,
         Some("editor") => return dispatch_ui_command(app, UiCommand::Editor, tasks).await,
-        Some("sessions") => return dispatch_ui_command(app, UiCommand::Sessions, tasks).await,
+        Some("finder") => return dispatch_ui_command(app, UiCommand::Finder, tasks).await,
+        Some("copy") => return dispatch_ui_command(app, UiCommand::Copy, tasks).await,
         _ => {}
     }
     Action::Continue
 }
 
 async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> Action {
+    let require_shift = !matches!(
+        app.overlay,
+        Some(Overlay::Detail | Overlay::Help | Overlay::Protocols)
+    );
+    if update_mouse_selection(app, mouse, require_shift) {
+        return Action::Continue;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => match app.overlay {
             Some(Overlay::Palette) => {
@@ -1555,7 +1253,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = settings.selected.saturating_add(1).min(4);
+                    settings.selected = settings.selected.saturating_add(1).min(7);
                 }
             }
             Some(Overlay::Command) => {}
@@ -1669,6 +1367,9 @@ async fn save_settings(
         .model()
         .map(|model| (settings.provider().to_string(), model.id.clone()));
     let editor = settings.editor.clone();
+    let editor_mode = settings.editor_mode;
+    let picker = settings.picker.clone();
+    let picker_mode = settings.picker_mode;
     let output_limit = match settings.output_limit.parse::<usize>() {
         Ok(limit) if limit >= 1024 => limit,
         Ok(_) => {
@@ -1693,7 +1394,9 @@ async fn save_settings(
             }
         }
         manager.set_output_limit(output_limit).await?;
-        manager.set_editor(Some(editor)).await?;
+        manager
+            .set_external_tools(Some(editor), editor_mode, Some(picker), picker_mode)
+            .await?;
         if let Some((provider, model)) = selection {
             manager.set_model(&provider, &model).await?;
         }
@@ -1774,6 +1477,9 @@ async fn apply_active(
     app.info.provider.clone_from(&active.provider);
     app.info.model.clone_from(&active.model);
     app.info.editor.clone_from(&active.editor);
+    app.info.editor_mode = active.editor_mode;
+    app.info.picker.clone_from(&active.picker);
+    app.info.picker_mode = active.picker_mode;
     Ok(())
 }
 
@@ -1801,6 +1507,486 @@ fn task_document(task: &TaskRecord) -> String {
     )
 }
 
+async fn temporary_document(content: &str) -> Result<PathBuf> {
+    let directory = env::temp_dir().join("uri-agent");
+    fs::create_dir_all(&directory).await?;
+    let path = directory.join(format!("view-{}.md", Uuid::now_v7().simple()));
+    fs::write(&path, content).await?;
+    Ok(path)
+}
+
+fn command_builder(command: &str, trailing: Option<&Path>) -> Result<CommandBuilder> {
+    let mut arguments = shell_words::split(command).context("cannot parse command")?;
+    if arguments.is_empty() {
+        bail!("command is empty");
+    }
+    let executable = arguments.remove(0);
+    if let Some(path) = trailing {
+        arguments.push(path.to_string_lossy().into_owned());
+    }
+    let mut builder = CommandBuilder::new(executable);
+    builder.args(arguments);
+    Ok(builder)
+}
+
+async fn open_embedded_editor(
+    app: &mut App,
+    content: &str,
+    read_back: bool,
+    terminal_area: Rect,
+) -> Result<()> {
+    let editor = app
+        .info
+        .editor
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("configure Editor in Settings first"))?;
+    let path = temporary_document(content).await?;
+    let area = centered(terminal_area, 92, 88);
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let command = command_builder(editor, Some(&path))?;
+    let terminal = match EmbeddedTerminal::start(command, &app.info.cwd, inner.height, inner.width)
+    {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = fs::remove_file(&path).await;
+            return Err(error).with_context(|| {
+                if editor.split_whitespace().next() == Some("hx") {
+                    "cannot start `hx`; install Helix or change Editor in Settings"
+                } else {
+                    "cannot start configured editor"
+                }
+            });
+        }
+    };
+    app.overlay = None;
+    app.selection = None;
+    app.external = Some(ExternalProcess {
+        terminal,
+        purpose: ExternalPurpose::Editor { path, read_back },
+        area,
+        title: " EDITOR · double Esc close · Shift-drag select · Ctrl+Shift+C copy ",
+        last_escape: None,
+    });
+    Ok(())
+}
+
+async fn picker_files(app: &App) -> Result<(PathBuf, PathBuf)> {
+    if app.blocks.is_empty() {
+        bail!("there are no conversation events to search");
+    }
+    let directory = env::temp_dir().join("uri-agent");
+    fs::create_dir_all(&directory).await?;
+    let id = Uuid::now_v7().simple();
+    let input = directory.join(format!("picker-{id}.txt"));
+    let result = directory.join(format!("picker-{id}.result"));
+    let lines = app
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            format!(
+                "{index}\t{}\t{}",
+                block.title,
+                single_line_preview(&block.text, 180)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&input, lines).await?;
+    Ok((input, result))
+}
+
+fn picker_wrapper(command: &str, input: &Path, result: &Path) -> Result<Vec<String>> {
+    let mut picker = shell_words::split(command).context("cannot parse picker command")?;
+    if picker.is_empty() {
+        bail!("picker command is empty");
+    }
+    #[cfg(unix)]
+    {
+        let mut arguments = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "input=$1; output=$2; shift 2; exec \"$@\" < \"$input\" > \"$output\"".to_string(),
+            "uri-agent-picker".to_string(),
+            input.to_string_lossy().into_owned(),
+            result.to_string_lossy().into_owned(),
+        ];
+        arguments.append(&mut picker);
+        Ok(arguments)
+    }
+    #[cfg(windows)]
+    {
+        let mut arguments = vec![
+            "pwsh".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "$inputPath=$args[0]; $outputPath=$args[1]; $exe=$args[2]; $rest=$args[3..($args.Length-1)]; Get-Content -LiteralPath $inputPath | & $exe @rest | Set-Content -NoNewline -LiteralPath $outputPath".to_string(),
+            input.to_string_lossy().into_owned(),
+            result.to_string_lossy().into_owned(),
+        ];
+        arguments.append(&mut picker);
+        Ok(arguments)
+    }
+}
+
+fn builder_from_arguments(mut arguments: Vec<String>) -> Result<CommandBuilder> {
+    if arguments.is_empty() {
+        bail!("command is empty");
+    }
+    let executable = arguments.remove(0);
+    let mut builder = CommandBuilder::new(executable);
+    builder.args(arguments);
+    Ok(builder)
+}
+
+async fn open_embedded_picker(app: &mut App, terminal_area: Rect) -> Result<()> {
+    let picker = app
+        .info
+        .picker
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("configure Picker in Settings first"))?;
+    let (input, result) = picker_files(app).await?;
+    let arguments = picker_wrapper(picker, &input, &result)?;
+    let area = centered(terminal_area, 88, 76);
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let terminal = match EmbeddedTerminal::start(
+        builder_from_arguments(arguments)?,
+        &app.info.cwd,
+        inner.height,
+        inner.width,
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = fs::remove_file(&input).await;
+            let _ = fs::remove_file(&result).await;
+            return Err(error)
+                .context("cannot start picker; install fzf or change Picker in Settings");
+        }
+    };
+    app.overlay = None;
+    app.selection = None;
+    app.external = Some(ExternalProcess {
+        terminal,
+        purpose: ExternalPurpose::Picker { input, result },
+        area,
+        title: " FIND EVENT · Enter choose · Esc cancel · Shift-drag select ",
+        last_escape: None,
+    });
+    Ok(())
+}
+
+async fn open_fullscreen_picker(
+    terminal: &mut DefaultTerminal,
+    app: &App,
+) -> Result<Option<usize>> {
+    let picker = app
+        .info
+        .picker
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("configure Picker in Settings first"))?;
+    let (input, result) = picker_files(app).await?;
+    let arguments = picker_wrapper(picker, &input, &result)?;
+    execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
+    ratatui::try_restore()?;
+    let command_result = Command::new(&arguments[0])
+        .args(&arguments[1..])
+        .current_dir(&app.info.cwd)
+        .status()
+        .await;
+    *terminal = ratatui::try_init()?;
+    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    clear_terminal_screen()?;
+
+    let selection = match command_result {
+        Ok(_) => read_picker_result(&result).await,
+        Err(error) => {
+            Err(error).context("cannot start picker; install fzf or change Picker in Settings")
+        }
+    };
+    let _ = fs::remove_file(input).await;
+    let _ = fs::remove_file(result).await;
+    selection
+}
+
+async fn read_picker_result(path: &Path) -> Result<Option<usize>> {
+    let result = match fs::read_to_string(path).await {
+        Ok(result) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(index) = result.split('\t').next().filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        index.parse().context("picker returned an invalid event")?,
+    ))
+}
+
+fn apply_editor_result(app: &mut App, result: Result<Option<String>>) {
+    match result {
+        Ok(Some(content)) => {
+            app.input = TextArea::new(content.split('\n').map(str::to_owned).collect());
+            style_input(&mut app.input, app.busy);
+            app.mode = Mode::Insert;
+            app.flash = Some("Draft updated from editor".to_string());
+        }
+        Ok(None) => app.flash = Some("Editor closed".to_string()),
+        Err(error) => app.flash = Some(format!("Editor failed: {error:#}")),
+    }
+}
+
+fn apply_picker_result(app: &mut App, result: Result<Option<usize>>) {
+    match result {
+        Ok(Some(index)) if index < app.blocks.len() => {
+            app.selected_block = index;
+            app.overlay_scroll = 0;
+            app.overlay = Some(Overlay::Detail);
+            app.flash = Some(format!("Selected event {}", index + 1));
+        }
+        Ok(Some(_)) => app.flash = Some("Picker selected an unknown event".to_string()),
+        Ok(None) => app.flash = Some("Picker closed".to_string()),
+        Err(error) => app.flash = Some(format!("Picker failed: {error:#}")),
+    }
+}
+
+fn external_finished(app: &mut App) -> Result<bool> {
+    app.external
+        .as_mut()
+        .map(|external| external.terminal.try_wait().map(|status| status.is_some()))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+async fn finish_external(app: &mut App) {
+    let Some(external) = app.external.take() else {
+        return;
+    };
+    let ExternalProcess {
+        terminal, purpose, ..
+    } = external;
+    drop(terminal);
+    app.selection = None;
+    match purpose {
+        ExternalPurpose::Editor { path, read_back } => {
+            let result = if read_back {
+                fs::read_to_string(&path)
+                    .await
+                    .map(Some)
+                    .map_err(Into::into)
+            } else {
+                Ok(None)
+            };
+            let _ = fs::remove_file(path).await;
+            apply_editor_result(app, result);
+        }
+        ExternalPurpose::Picker { input, result } => {
+            let selection = read_picker_result(&result).await;
+            let _ = fs::remove_file(input).await;
+            let _ = fs::remove_file(result).await;
+            apply_picker_result(app, selection);
+        }
+    }
+}
+
+async fn cancel_external(app: &mut App) {
+    let Some(external) = app.external.take() else {
+        return;
+    };
+    let ExternalProcess {
+        terminal, purpose, ..
+    } = external;
+    drop(terminal);
+    app.selection = None;
+    match purpose {
+        ExternalPurpose::Editor { path, .. } => {
+            let _ = fs::remove_file(path).await;
+        }
+        ExternalPurpose::Picker { input, result } => {
+            let _ = fs::remove_file(input).await;
+            let _ = fs::remove_file(result).await;
+        }
+    }
+    app.flash = Some("Embedded terminal closed".to_string());
+}
+
+fn handle_external_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if app.selection.is_some() {
+        match app.keymap.action("selection", &key_name(key)).as_deref() {
+            Some("copy") => copy_current_surface(app),
+            Some("close") => app.selection = None,
+            _ => {}
+        }
+        return Ok(false);
+    }
+    match app.keymap.action("terminal", &key_name(key)).as_deref() {
+        Some("copy") => {
+            copy_current_surface(app);
+            return Ok(false);
+        }
+        Some("close") => return Ok(true),
+        Some("escape") => {
+            let now = Instant::now();
+            let external = app.external.as_mut().expect("checked by caller");
+            if external
+                .last_escape
+                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(500))
+            {
+                return Ok(true);
+            }
+            external.last_escape = Some(now);
+            external.terminal.send_key(key)?;
+            return Ok(false);
+        }
+        _ => {}
+    }
+    let external = app.external.as_mut().expect("checked by caller");
+    external.last_escape = None;
+    external.terminal.send_key(key)?;
+    Ok(false)
+}
+
+fn handle_external_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    if update_mouse_selection(app, mouse, true) {
+        return Ok(());
+    }
+    let external = app.external.as_mut().expect("checked by caller");
+    let inner = external.area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if mouse.column >= inner.x
+        && mouse.column < inner.right()
+        && mouse.row >= inner.y
+        && mouse.row < inner.bottom()
+    {
+        external.terminal.send_mouse(
+            mouse,
+            mouse.column.saturating_sub(inner.x),
+            mouse.row.saturating_sub(inner.y),
+        )?;
+    }
+    Ok(())
+}
+
+fn update_mouse_selection(app: &mut App, mouse: MouseEvent, require_shift: bool) -> bool {
+    let Some(surface) = app.selectable.as_ref() else {
+        return false;
+    };
+    let point = (
+        mouse
+            .column
+            .clamp(surface.area.x, surface.area.right().saturating_sub(1)),
+        mouse
+            .row
+            .clamp(surface.area.y, surface.area.bottom().saturating_sub(1)),
+    );
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)
+            if (!require_shift || mouse.modifiers.contains(KeyModifiers::SHIFT))
+                && surface.area.contains(point.into()) =>
+        {
+            app.selection = Some(TextSelection {
+                start: point,
+                end: point,
+            });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.selection.is_some() => {
+            if let Some(selection) = app.selection.as_mut() {
+                selection.end = point;
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.selection.is_some() => {
+            if let Some(selection) = app.selection.as_mut() {
+                selection.end = point;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn copy_current_surface(app: &mut App) {
+    let Some(surface) = app.selectable.as_ref() else {
+        app.flash = Some("Nothing visible can be copied".to_string());
+        return;
+    };
+    let text = if let Some(selection) = app.selection {
+        selected_surface_text(surface, selection)
+    } else {
+        complete_surface_text(surface)
+    };
+    if text.trim().is_empty() {
+        app.flash = Some("The selection is empty".to_string());
+        return;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let result = write!(stdout(), "\x1b]52;c;{encoded}\x07").and_then(|()| stdout().flush());
+    app.flash = Some(if result.is_ok() {
+        format!("Copied {} characters with OSC52", text.chars().count())
+    } else {
+        "Could not write OSC52 clipboard data".to_string()
+    });
+    app.selection = None;
+}
+
+fn selected_surface_text(surface: &SelectableSurface, selection: TextSelection) -> String {
+    let relative = |point: (u16, u16)| {
+        (
+            point.0.saturating_sub(surface.area.x) as usize,
+            point.1.saturating_sub(surface.area.y) as usize,
+        )
+    };
+    let first = relative(selection.start);
+    let second = relative(selection.end);
+    let ((start_x, start_y), (end_x, end_y)) = if (first.1, first.0) <= (second.1, second.0) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    surface
+        .cells
+        .iter()
+        .enumerate()
+        .skip(start_y)
+        .take(end_y.saturating_sub(start_y) + 1)
+        .map(|(row, cells)| {
+            let from = if row == start_y { start_x } else { 0 };
+            let to = if row == end_y {
+                end_x.saturating_add(1)
+            } else {
+                cells.len()
+            };
+            cells[from.min(cells.len())..to.min(cells.len())]
+                .concat()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn complete_surface_text(surface: &SelectableSurface) -> String {
+    surface
+        .cells
+        .iter()
+        .map(|cells| cells.concat().trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 async fn open_editor(
     terminal: &mut DefaultTerminal,
     editor: Option<&str>,
@@ -1815,10 +2001,7 @@ async fn open_editor(
         bail!("editor command is empty");
     }
     let executable = arguments.remove(0);
-    let directory = env::temp_dir().join("uri-agent");
-    fs::create_dir_all(&directory).await?;
-    let path = directory.join(format!("view-{}.md", Uuid::now_v7().simple()));
-    fs::write(&path, content).await?;
+    let path = temporary_document(content).await?;
     arguments.push(path.to_string_lossy().into_owned());
 
     execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
@@ -1826,7 +2009,7 @@ async fn open_editor(
     let editor_result = Command::new(&executable).args(arguments).status().await;
     *terminal = ratatui::try_init()?;
     execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    terminal.clear()?;
+    clear_terminal_screen()?;
 
     let status = match editor_result {
         Ok(status) => status,
@@ -1853,221 +2036,18 @@ async fn open_editor(
     Ok(updated)
 }
 
-fn render_session_picker(frame: &mut Frame<'_>, picker: &mut SessionPicker) {
-    picker.hit_regions.clear();
-    let area = frame.area();
-    frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
-    let outer = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(8),
-        Constraint::Length(2),
-    ])
-    .margin(1)
-    .split(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " URI/AGENT ",
-                Style::default()
-                    .fg(BG)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  SESSIONS", Style::default().fg(MUTED)),
-        ])),
-        outer[0],
-    );
-    let columns = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(outer[1]);
-    let directory_mode = picker.directory.is_some();
-    let (title, items, selected, item_count) = if let Some(directory) = &picker.directory {
-        let items = directory
-            .visible()
-            .into_iter()
-            .enumerate()
-            .map(|(index, path)| {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("?");
-                ListItem::new(format!(
-                    "{} {name}/",
-                    if index == directory.selected {
-                        "›"
-                    } else {
-                        " "
-                    }
-                ))
-                .style(Style::default().fg(if index == directory.selected {
-                    ACCENT
-                } else {
-                    TEXT
-                }))
-            })
-            .collect::<Vec<_>>();
-        (
-            format!(
-                " DIRECTORIES · {}/{} select · {} descend ",
-                key_hint(&picker.keymap, "directory", "previous"),
-                key_hint(&picker.keymap, "directory", "next"),
-                key_hint(&picker.keymap, "directory", "open")
-            ),
-            if items.is_empty() {
-                vec![ListItem::new("No matching child directories.")]
-            } else {
-                items
-            },
-            (!directory.visible().is_empty()).then_some(directory.selected),
-            directory.visible_len(),
-        )
-    } else {
-        let items = if picker.sessions.is_empty() {
-            vec![ListItem::new(
-                "No sessions yet. Press n to choose a project.",
-            )]
-        } else {
-            picker
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(index, session)| {
-                    let marker = if index == picker.selected { "›" } else { " " };
-                    ListItem::new(vec![
-                        Line::styled(
-                            format!("{marker} {}", session.cwd.display()),
-                            Style::default()
-                                .fg(if index == picker.selected {
-                                    ACCENT
-                                } else {
-                                    TEXT
-                                })
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Line::styled(
-                            format!(
-                                "  {} · {}/{}",
-                                session.updated_at.format("%Y-%m-%d %H:%M"),
-                                session.provider,
-                                session.model
-                            ),
-                            Style::default().fg(MUTED),
-                        ),
-                    ])
-                })
-                .collect()
-        };
-        (
-            format!(
-                " RECENT · {}/{} select · {} open ",
-                key_hint(&picker.keymap, "sessions", "previous"),
-                key_hint(&picker.keymap, "sessions", "next"),
-                key_hint(&picker.keymap, "sessions", "open")
-            ),
-            items,
-            (!picker.sessions.is_empty()).then_some(picker.selected),
-            picker.sessions.len(),
-        )
-    };
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .title(title)
-        .padding(Padding::horizontal(1));
-    let list_inner = list_block.inner(columns[0]);
-    let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(List::new(items).block(list_block), columns[0], &mut state);
-    let item_height = if directory_mode { 1 } else { 2 };
-    for index in state.offset()..item_count {
-        let y = list_inner
-            .y
-            .saturating_add(((index - state.offset()) * item_height) as u16);
-        if y.saturating_add(item_height as u16) > list_inner.y.saturating_add(list_inner.height) {
-            break;
-        }
-        picker.hit_regions.push(HitRegion {
-            area: Rect::new(list_inner.x, y, list_inner.width, item_height as u16),
-            target: if directory_mode {
-                PickerHit::Directory(index)
-            } else {
-                PickerHit::Session(index)
-            },
-        });
-    }
-
-    let detail = if let Some(directory) = &picker.directory {
-        format!(
-            "PROJECT DIRECTORY\n{}\n\nFILTER\n{}{}\n\n{} descend\n{} parent\n{} choose current\n{} filter this level\n{} recursive fzf search\n{} sessions",
-            directory.current.display(),
-            directory.query,
-            if directory.searching { "█" } else { "" },
-            key_hint(&picker.keymap, "directory", "open"),
-            key_hint(&picker.keymap, "directory", "parent"),
-            key_hint(&picker.keymap, "directory", "select"),
-            key_hint(&picker.keymap, "directory", "search"),
-            key_hint(&picker.keymap, "directory", "fzf"),
-            key_hint(&picker.keymap, "directory", "cancel")
-        )
-    } else if let Some(session) = picker.sessions.get(picker.selected) {
-        format!(
-            "PROJECT\n{}\n\nSESSION\n{}\n\nCREATED\n{}\n\nMODEL\n{} / {}\n\n{} choose project · {} refresh · {} quit",
-            session.cwd.display(),
-            session.id,
-            session.created_at.format("%Y-%m-%d %H:%M"),
-            session.provider,
-            session.model,
-            key_hint(&picker.keymap, "sessions", "new"),
-            key_hint(&picker.keymap, "sessions", "refresh"),
-            key_hint(&picker.keymap, "sessions", "quit")
-        )
-    } else {
-        format!(
-            "NEW WORKSPACE\n\nPress {} to browse for a project directory.\n\nThe application may be launched from any directory, including {}.",
-            key_hint(&picker.keymap, "sessions", "new"),
-            picker.base.display()
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(detail)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(MUTED))
-                    .padding(Padding::uniform(1)),
-            )
-            .style(Style::default().fg(TEXT))
-            .wrap(Wrap { trim: false }),
-        columns[1],
-    );
-    if directory_mode {
-        picker.hit_regions.push(HitRegion {
-            area: Rect::new(
-                columns[1].x.saturating_add(2),
-                columns[1].y.saturating_add(10),
-                columns[1].width.saturating_sub(4),
-                1,
-            ),
-            target: PickerHit::ChooseDirectory,
-        });
-    }
-    frame.render_widget(
-        Paragraph::new(
-            picker
-                .flash
-                .as_deref()
-                .unwrap_or(if picker.directory.is_some() {
-                    "DIRECTORY  ·  choose current  ·  filter  ·  recursive fzf  ·  cancel"
-                } else {
-                    "SESSIONS  ·  choose project  ·  open session  ·  quit"
-                }),
-        )
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(if picker.flash.is_some() { ERROR } else { MUTED })),
-        outer[2],
-    );
+fn clear_terminal_screen() -> Result<()> {
+    execute!(
+        stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )?;
+    Ok(())
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_regions.clear();
+    app.selectable = None;
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
     let input_height = if app.mode == Mode::Insert {
@@ -2105,9 +2085,94 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         });
     }
     render_footer(frame, app, areas[3]);
-    if let Some(overlay) = app.overlay {
+    let selectable_area = if app.external.is_some() {
+        app.hit_regions.clear();
+        render_external(frame, app)
+    } else if let Some(overlay) = app.overlay {
         app.hit_regions.clear();
         render_overlay(frame, app, overlay);
+        Some(overlay_area(frame.area(), overlay).inner(Margin {
+            horizontal: 2,
+            vertical: 2,
+        }))
+    } else {
+        Some(areas[1])
+    };
+    if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
+        capture_surface(frame, app, selectable_area);
+        render_selection(frame, app);
+    }
+}
+
+fn render_external(frame: &mut Frame<'_>, app: &mut App) -> Option<Rect> {
+    let external = app.external.as_mut()?;
+    external.area = centered(frame.area(), 92, 88);
+    let inner = external.area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if let Err(error) = external.terminal.resize(inner.height, inner.width) {
+        app.flash = Some(format!("Embedded terminal resize failed: {error:#}"));
+    }
+    frame.render_widget(Clear, external.area);
+    let parser = external.terminal.screen();
+    frame.render_widget(
+        PseudoTerminal::new(parser.screen()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(SURFACE))
+                .title(external.title),
+        ),
+        external.area,
+    );
+    Some(inner)
+}
+
+fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let cells = (area.y..area.bottom())
+        .map(|row| {
+            (area.x..area.right())
+                .map(|column| {
+                    frame
+                        .buffer_mut()
+                        .cell((column, row))
+                        .map(|cell| cell.symbol().to_string())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    app.selectable = Some(SelectableSurface { area, cells });
+}
+
+fn render_selection(frame: &mut Frame<'_>, app: &App) {
+    let (Some(surface), Some(selection)) = (&app.selectable, app.selection) else {
+        return;
+    };
+    let first = selection.start;
+    let second = selection.end;
+    let (start, end) = if (first.1, first.0) <= (second.1, second.0) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    for row in start.1..=end.1 {
+        let from = if row == start.1 {
+            start.0
+        } else {
+            surface.area.x
+        };
+        let to = if row == end.1 {
+            end.0
+        } else {
+            surface.area.right().saturating_sub(1)
+        };
+        for column in from..=to {
+            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
     }
 }
 
@@ -2257,12 +2322,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )
     } else if area.width > 90 {
         format!(
-            "BROWSE  ·  {}/{} select  ·  {} detail  ·  {} compose  ·  Space commands  ·  : command  ·  {} sessions",
+            "BROWSE  ·  {}/{} select  ·  {} detail  ·  {} compose  ·  / find  ·  y copy  ·  Space commands",
             key_hint(&app.keymap, "browse", "previous"),
             key_hint(&app.keymap, "browse", "next"),
             key_hint(&app.keymap, "browse", "detail"),
-            key_hint(&app.keymap, "browse", "insert"),
-            key_hint(&app.keymap, "browse", "sessions")
+            key_hint(&app.keymap, "browse", "insert")
         )
     } else {
         format!(
@@ -2300,8 +2364,6 @@ fn key_hint(keymap: &Keymap, mode: &str, action: &str) -> String {
 fn keymap_help(keymap: &Keymap) -> String {
     let mut output = String::new();
     for (title, mode) in [
-        ("SESSIONS", "sessions"),
-        ("DIRECTORY", "directory"),
         ("BROWSE", "browse"),
         ("INSERT", "insert"),
         ("DETAIL", "detail"),
@@ -2311,6 +2373,8 @@ fn keymap_help(keymap: &Keymap) -> String {
         ("COMMAND PANEL", "palette"),
         ("COMMAND LINE", "command"),
         ("TEXT FIELDS", "text"),
+        ("SELECTION", "selection"),
+        ("EMBEDDED TERMINAL", "terminal"),
         ("GLOBAL", "global"),
     ] {
         output.push_str(title);
@@ -2323,17 +2387,23 @@ fn keymap_help(keymap: &Keymap) -> String {
     output
 }
 
-fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
-    let area = if overlay == Overlay::Command {
+fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
+    if overlay == Overlay::Command {
         Rect::new(
             1,
-            frame.area().height.saturating_sub(6),
-            frame.area().width.saturating_sub(2),
+            frame.height.saturating_sub(6),
+            frame.width.saturating_sub(2),
             5,
         )
+    } else if overlay == Overlay::Settings {
+        centered(frame, 82, 96)
     } else {
-        centered(frame.area(), 78, 72)
-    };
+        centered(frame, 78, 82)
+    }
+}
+
+fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
+    let area = overlay_area(frame.area(), overlay);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2356,7 +2426,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         }
         Overlay::Help => {
             let text = format!(
-                "ACTIVE KEYMAP\n\n{}COMMANDS\n  :settings · :model · :login · :sessions · :tasks\n  :protocols · :compose · :detail · :editor · :help · :quit\n\nSlash commands remain available while composing.\n\nSESSION\n{}\n{}\n\nPROJECT\n{}",
+                "ACTIVE KEYMAP\n\n{}COMMANDS\n  :settings · :model · :login · :find · :copy · :tasks\n  :protocols · :compose · :detail · :editor · :help · :quit\n\nDrag to select read-only floats; Shift-drag selects interactive panels and embedded terminals. Press y or Ctrl+Shift+C to copy with OSC52.\n\nSlash commands remain available while composing.\n\nSESSION\n{}\n{}\n\nPROJECT\n{}",
                 keymap_help(&app.keymap),
                 app.info.session_id,
                 app.info.model,
@@ -2471,12 +2541,22 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
     } else {
         settings.editor.clone()
     };
+    let picker = if settings.editing == Some(EditingSetting::Picker) {
+        format!("{}█", settings.picker)
+    } else if settings.picker.is_empty() {
+        "not configured".to_string()
+    } else {
+        settings.picker.clone()
+    };
     let rows = [
         ("Provider", provider),
         ("Model", model),
         ("API key", key),
         ("Output limit", output_limit),
         ("Editor", editor),
+        ("Editor mode", format!("‹  {}  ›", settings.editor_mode)),
+        ("Picker", picker),
+        ("Picker mode", format!("‹  {}  ›", settings.picker_mode)),
     ];
     let mut lines = vec![
         Line::styled(
@@ -2513,11 +2593,14 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
         ),
         Line::styled(
             format!(
-                "provider {}  ·  model {}  ·  limit {}  ·  editor {}",
+                "provider {} · model {} · limit {} · editor {} / {} · picker {} / {}",
                 settings.active.provider_source.label(),
                 settings.active.model_source.label(),
                 settings.active.output_limit_source.label(),
-                settings.active.editor_source.label()
+                settings.active.editor_source.label(),
+                settings.active.editor_mode_source.label(),
+                settings.active.picker_source.label(),
+                settings.active.picker_mode_source.label()
             ),
             Style::default().fg(MUTED),
         ),
@@ -2543,7 +2626,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
             .wrap(Wrap { trim: false }),
         area,
     );
-    for index in 0..5 {
+    for index in 0..8 {
         app.hit_regions.push(HitRegion {
             area: Rect::new(
                 inner.x,
@@ -2743,6 +2826,9 @@ mod tests {
                 model: "model".to_string(),
                 session_id: "session".to_string(),
                 editor: None,
+                editor_mode: ExternalMode::Float,
+                picker: Some("fzf".to_string()),
+                picker_mode: ExternalMode::Float,
             },
             Keymap::default(),
         )
@@ -2756,11 +2842,17 @@ mod tests {
             api_key: Some("super-secret-value".to_string()),
             output_limit: 32 * 1024,
             editor: Some("nvim -f".to_string()),
+            editor_mode: ExternalMode::Float,
+            picker: Some("fzf".to_string()),
+            picker_mode: ExternalMode::Float,
             provider_source: ValueSource::Global,
             model_source: ValueSource::Global,
             api_key_source: ValueSource::Global,
             output_limit_source: ValueSource::Global,
             editor_source: ValueSource::Global,
+            editor_mode_source: ValueSource::Global,
+            picker_source: ValueSource::Global,
+            picker_mode_source: ValueSource::Global,
             credential_environment: BTreeMap::new(),
         };
         let model = CatalogModel {
@@ -2780,6 +2872,9 @@ mod tests {
                 model: active.model.clone(),
                 session_id: "session".to_string(),
                 editor: active.editor.clone(),
+                editor_mode: active.editor_mode,
+                picker: active.picker.clone(),
+                picker_mode: active.picker_mode,
             },
             Keymap::default(),
         );
@@ -2796,6 +2891,9 @@ mod tests {
             api_key_changed: false,
             output_limit: "32768".to_string(),
             editor: "nvim -f".to_string(),
+            editor_mode: ExternalMode::Float,
+            picker: "fzf".to_string(),
+            picker_mode: ExternalMode::Float,
             search: String::new(),
         });
         let backend = TestBackend::new(120, 40);
@@ -2870,6 +2968,9 @@ mod tests {
         assert_eq!(parse_ui_command("model"), Some(UiCommand::Settings));
         assert_eq!(parse_ui_command("compose"), Some(UiCommand::Compose));
         assert_eq!(parse_ui_command("editor"), Some(UiCommand::Editor));
+        assert_eq!(parse_ui_command("find"), Some(UiCommand::Finder));
+        assert_eq!(parse_ui_command("copy"), Some(UiCommand::Copy));
+        assert_eq!(parse_ui_command("sessions"), None);
         assert_eq!(parse_ui_command("q"), Some(UiCommand::Quit));
         assert_eq!(parse_ui_command("unknown"), None);
     }
@@ -2943,32 +3044,26 @@ mod tests {
         assert_eq!(hit_target(&regions, outside), None);
     }
 
-    #[tokio::test]
-    async fn directory_browser_filters_folders_without_path_entry() {
-        let temporary = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir(temporary.path().join("alpha"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir(temporary.path().join("beta"))
-            .await
-            .unwrap();
-        tokio::fs::write(temporary.path().join("not-a-directory"), b"file")
-            .await
-            .unwrap();
-        let mut picker = DirectoryPicker::open(temporary.path().to_path_buf())
-            .await
-            .unwrap();
-
-        assert_eq!(picker.visible_len(), 2);
-        picker.query = "bet".to_string();
-        assert_eq!(
-            picker
-                .selected_path()
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_str(),
-            Some("beta")
-        );
+    #[test]
+    fn cell_selection_preserves_lines_and_trims_padding() {
+        let surface = SelectableSurface {
+            area: Rect::new(10, 5, 5, 2),
+            cells: vec![
+                ["a", "b", "c", " ", " "]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ["d", "e", "f", " ", " "]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ],
+        };
+        let selection = TextSelection {
+            start: (11, 5),
+            end: (12, 6),
+        };
+        assert_eq!(selected_surface_text(&surface, selection), "bc\ndef");
+        assert_eq!(complete_surface_text(&surface), "abc\ndef");
     }
 }

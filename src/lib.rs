@@ -10,4 +10,5 @@ pub mod runtime;
 pub mod session;
 pub mod skill;
 pub mod task;
+pub mod terminal;
 pub mod tui;

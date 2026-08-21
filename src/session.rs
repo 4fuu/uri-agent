@@ -21,16 +21,6 @@ pub enum SessionChoice {
     Existing(String),
 }
 
-#[derive(Clone, Debug)]
-pub struct SessionSummary {
-    pub id: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub cwd: PathBuf,
-    pub provider: String,
-    pub model: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionEvent {
     pub sequence: u64,
@@ -100,47 +90,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub async fn list(fallback: &Path) -> Result<Vec<SessionSummary>> {
-        let database_path = session_database_path(fallback);
-        Self::list_at(database_path).await
-    }
-
-    async fn list_at(database_path: PathBuf) -> Result<Vec<SessionSummary>> {
-        let (_, connection) = open_database(database_path).await?;
-        connection
-            .call(|db| {
-                let mut statement = db.prepare(
-                    "SELECT id, created_at, updated_at, cwd, provider, model
-                     FROM sessions ORDER BY updated_at DESC, id DESC",
-                )?;
-                let rows = statement.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?;
-                let mut sessions = Vec::new();
-                for row in rows {
-                    let (id, created_at, updated_at, cwd, provider, model) = row?;
-                    sessions.push(SessionSummary {
-                        id,
-                        created_at: parse_database_time(created_at, 1)?,
-                        updated_at: parse_database_time(updated_at, 2)?,
-                        cwd: PathBuf::from(cwd),
-                        provider,
-                        model,
-                    });
-                }
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(sessions)
-            })
-            .await
-            .context("cannot list sessions")
-    }
-
     pub async fn open(
         requested: Option<&str>,
         cwd: &Path,
@@ -158,18 +107,25 @@ impl Session {
         model: &str,
     ) -> Result<Self> {
         let (directory, connection) = open_database(database_path.clone()).await?;
+        let project = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
 
         if let Some(id) = requested.filter(|id| *id != "latest") {
             validate_session_id(id)?;
         }
         let requested = requested.map(str::to_owned);
+        let project_for_selection = project.clone();
         let id = connection
             .call(move |db| {
                 if requested.as_deref() == Some("latest") {
                     Ok::<_, tokio_rusqlite::rusqlite::Error>(
                         db.query_row(
-                            "SELECT id FROM sessions ORDER BY updated_at DESC, id DESC LIMIT 1",
-                            [],
+                            "SELECT id FROM sessions WHERE cwd = ?1
+                             ORDER BY updated_at DESC, id DESC LIMIT 1",
+                            [project_for_selection],
                             |row| row.get(0),
                         )
                         .optional()?
@@ -183,6 +139,23 @@ impl Session {
             })
             .await
             .context("cannot select session")?;
+
+        let project_for_lookup = project.clone();
+        let id_for_lookup = id.clone();
+        let belongs_to_project = connection
+            .call(move |db| {
+                db.query_row(
+                    "SELECT cwd = ?2 FROM sessions WHERE id = ?1",
+                    params![id_for_lookup, project_for_lookup],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+            })
+            .await
+            .context("cannot validate session project")?;
+        if belongs_to_project == Some(false) {
+            return Err(anyhow!("session {id} belongs to a different project"));
+        }
 
         let lookup_id = id.clone();
         let existing = connection
@@ -238,7 +211,7 @@ impl Session {
         if session.snapshot().await.is_empty() {
             let now = Utc::now().to_rfc3339();
             let id = session.id.clone();
-            let cwd_string = cwd.to_string_lossy().into_owned();
+            let cwd_string = project;
             let provider_string = provider.to_string();
             let model_string = model.to_string();
             session
@@ -404,21 +377,6 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
     Ok((directory, connection))
 }
 
-fn parse_database_time(
-    value: String,
-    column: usize,
-) -> std::result::Result<DateTime<Utc>, tokio_rusqlite::rusqlite::Error> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| {
-            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                column,
-                tokio_rusqlite::rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })
-}
-
 fn payload_kind(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::SessionCreated { .. } => "session_created",
@@ -544,39 +502,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_can_be_listed_with_their_projects() {
+    async fn an_explicit_session_cannot_cross_project_boundaries() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
-        let first = Session::open_at(
+        Session::open_at(
             path.clone(),
-            Some("first"),
-            Path::new("/projects/one"),
-            "provider-one",
-            "model-one",
+            Some("other-project"),
+            Path::new("/projects/other"),
+            "test",
+            "model",
         )
         .await
         .unwrap();
-        let second = Session::open_at(
-            path.clone(),
-            Some("second"),
-            Path::new("/projects/two"),
-            "provider-two",
-            "model-two",
-        )
-        .await
-        .unwrap();
-        first
-            .append(EventKind::Notice {
-                text: "most recent".to_string(),
-            })
-            .await
-            .unwrap();
 
-        let sessions = Session::list_at(path).await.unwrap();
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].id, "first");
-        assert_eq!(sessions[0].cwd, Path::new("/projects/one"));
-        assert_eq!(sessions[1].id, "second");
-        drop(second);
+        let error = match Session::open_at(
+            path,
+            Some("other-project"),
+            Path::new("/projects/current"),
+            "test",
+            "model",
+        )
+        .await
+        {
+            Ok(_) => panic!("cross-project session unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("different project"));
     }
 }

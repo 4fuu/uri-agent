@@ -92,15 +92,12 @@ Skills are scanned in this order:
 <cwd>/.agents/skills
 <cwd>/.claude/skills
 <cwd>/.codex/skills
-<cwd>/.amp/skills
 ~/.agents/skills
 ~/.claude/skills
 ~/.codex/skills
-~/.config/amp/skills
-~/.cache/amp/global-skills
 ```
 
-If two Skills normalize to the same protocol, the higher-priority location wins.
+Discovery runs once at process startup. Each scan root contributes its own `SKILL.md` or direct child directories containing `SKILL.md`; discovered protocols are built in memory and are never compiled into the binary or copied into configuration. If two Skills normalize to the same protocol, the higher-priority location wins.
 
 ### Complete large output
 
@@ -128,7 +125,7 @@ The complete remote catalog is cached, while the Settings picker shows models fr
 
 ## Configuration
 
-Start uri-agent without an API key and open Settings with `F2`, `Ctrl+,`, the Space command panel, or `:settings`. `/settings`, `/model`, and `/login` remain available from Insert mode. The overlay edits provider, model, the selected provider's credential, inline output limit, and external editor command. Saving applies changes immediately without discarding the current session.
+Start uri-agent without an API key and open Settings with `F2`, `Ctrl+,`, the Space command panel, or `:settings`. `/settings`, `/model`, and `/login` remain available from Insert mode. The overlay edits provider, model, the selected provider's credential, inline output limit, editor and picker commands, and whether each external program uses an embedded float or the full terminal. Saving applies changes immediately without discarding the current session.
 
 ### Text files
 
@@ -144,7 +141,7 @@ uri-agent keeps ordinary configuration editable and separates generated data fro
 | `<cwd>/.uri-agent/settings.json` | user | optional project settings overlaid on global settings |
 | `<cwd>/.uri-agent/keymap.rhai` | user | optional project key mappings layered over the global keymap |
 
-When project settings already exist, the TUI writes provider, model, output-limit, and editor changes there; otherwise it writes global settings. Credentials always go to global `auth.json`.
+When project settings already exist, the TUI writes provider, model, output-limit, editor, and picker changes there; otherwise it writes global settings. Credentials always go to global `auth.json`.
 
 Example `settings.json`:
 
@@ -153,7 +150,10 @@ Example `settings.json`:
   "defaultProvider": "openai",
   "defaultModel": "gpt-5.2",
   "outputLimit": 32768,
-  "editor": "hx"
+  "editor": "hx",
+  "editorMode": "float",
+  "picker": "fzf",
+  "pickerMode": "float"
 }
 ```
 
@@ -232,6 +232,9 @@ uri-agent \
 | `--api-key` | `URI_AGENT_API_KEY` | Set a process-only credential |
 | `--output-limit` | `URI_AGENT_OUTPUT_LIMIT` | Set inline output bytes; minimum 1024 |
 | `--editor` | `URI_AGENT_EDITOR`, `VISUAL`, `EDITOR` | Set the external editor command |
+| `--editor-mode` | `URI_AGENT_EDITOR_MODE` | Use `float` or `fullscreen` editor integration |
+| `--picker` | `URI_AGENT_PICKER` | Set the conversation fuzzy-picker command |
+| `--picker-mode` | `URI_AGENT_PICKER_MODE` | Use `float` or `fullscreen` picker integration |
 | `--offline` | `URI_AGENT_OFFLINE`, `PI_OFFLINE` | Use the local model cache only |
 | `--cwd` | — | Set the working directory exposed to built-in protocols |
 | `--continue-session` | — | Resume the most recently updated session |
@@ -255,31 +258,23 @@ SQLite WAL mode and transactional sequence allocation keep event order and model
 
 No JSONL compatibility layer is included because the SQLite format is the initial public persistence format.
 
-With no `--cwd`, `--session`, or `--continue-session` option, uri-agent opens the Sessions screen instead of binding the agent to the launch directory. Existing sessions retain their project directory. Creating a session opens a directory browser: use `↑/↓` and `Enter` to navigate, `←` or `Backspace` to return to the parent, `/` to filter the current level, and `Space` to choose the displayed directory. Mouse selection, wheel scrolling, double-clicking a session or child directory, and clicking “choose current” are also supported. `j/k/h/l` remain optional aliases rather than required navigation.
-
-Press `f` in the directory browser for recursive fuzzy search through [fzf](https://github.com/junegunn/fzf). The built-in browser works without it; install `fzf` to enable this shortcut:
-
-```bash
-# Debian/Ubuntu
-sudo apt install fzf
-
-# macOS
-brew install fzf
-```
+The canonical launch directory is the project boundary. A normal launch creates a new session for that project. `--continue-session` resumes the most recently updated session whose stored directory matches the current project, and `--session <id>` rejects sessions belonging to another project. There is no cross-project session overview or directory picker in the TUI.
 
 ## TUI
 
-The Ratatui interface separates session selection, event browsing, and message input. The conversation surface shows one selectable preview per user message, response, reasoning segment, or tool call. A tool call and its result share one row, so streaming reasoning and large tool output never force the useful conversation off-screen. `Enter` opens the complete selected event in a scrollable panel; `e` opens it in the configured editor. The same lists support wheel scrolling and mouse selection; double-click an event to inspect it.
+The Ratatui interface separates event browsing, message input, and detailed inspection. The conversation surface shows one selectable preview per user message, response, reasoning segment, or tool call. A tool call and its result share one row, so streaming reasoning and large tool output never force the useful conversation off-screen. `Enter` opens the complete selected event in a scrollable panel; `e` opens it in the configured editor. The same lists support wheel scrolling and mouse selection; double-click an event to inspect it.
 
 | Mode | Default keys | Action |
 | --- | --- | --- |
-| Sessions | `↑/↓`, `Enter`, `n`, mouse | Select/open a session or choose a project for a new one |
-| Browse | `↑/↓`, `Enter`, `i`, `e`, `Space`, `:`, mouse | Select previews, inspect details, compose, run a command, or switch session |
+| Browse | `↑/↓`, `Enter`, `i`, `e`, `/`, `y`, `Space`, `:`, mouse | Select previews, inspect details, compose, find an event, copy, or run a command |
 | Insert | `Enter`, `Shift+Enter`, `Ctrl+E`, `Esc` | Send, add a line, edit the draft externally, or return to Browse |
-| Detail | `↑/↓`, `PageUp/PageDown`, `e`, `Esc`, wheel | Inspect or externally view complete reasoning/tool/message content |
-| Global | `F1`, `F2`, `Ctrl+P`, `Ctrl+T`, `Ctrl+C` | Help, Settings, protocols, tasks, and quit |
+| Detail | `↑/↓`, `PageUp/PageDown`, `e`, `Esc`, drag, wheel | Inspect, select, copy, or externally view complete content |
+| Embedded terminal | normal program keys, double `Esc`, Shift-drag | Operate the editor/picker, close its PTY, or select terminal text |
+| Global | `F1`, `F2`, `Ctrl+P`, `Ctrl+T`, `Ctrl+Shift+C`, `Ctrl+C` | Help, Settings, protocols, tasks, copy, and quit |
 
-Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. Commands include `:settings`, `:model`, `:login`, `:sessions`, `:tasks`, `:protocols`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. The header always identifies the active mode. Help renders the active keymap rather than a fixed key table. The low-noise dither animation remains visible while a model turn is running.
+Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. The header always identifies the active mode. Help renders the active keymap rather than a fixed key table. The low-noise dither animation remains visible while a model turn is running.
+
+Read-only floats support direct mouse drag selection. Use Shift-drag in interactive panels and embedded terminals so normal clicks still reach the application. Press `y` or `Ctrl+Shift+C` to copy the selection through OSC52; with no selection, the same action copies the visible panel.
 
 ### Rhai keymaps
 
@@ -299,9 +294,9 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-Modes are `global`, `sessions`, `directory`, `browse`, `insert`, `detail`, `list`, `tasks`, `settings`, `palette`, `command`, and `text`. Available actions are the names shown by `F1`, including `next`, `previous`, `open`, `select`, `search`, `fzf`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `sessions`, `settings`, `protocols`, `tasks`, `close`, and `quit`. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
+Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
 
-### External editor
+### External editor and finder
 
 [Helix](https://github.com/helix-editor/helix) is the default external editor; its executable is `hx`. It is optional—the rest of the TUI remains usable when it is absent, and URI Agent reports how to change the editor instead of exiting. Install it through the [official Helix installation instructions](https://docs.helix-editor.com/install.html), for example:
 
@@ -313,7 +308,17 @@ brew install helix
 sudo pacman -S helix
 ```
 
-Set `editor` in Settings or `settings.json`, or override it with `EDITOR`, `VISUAL`, `URI_AGENT_EDITOR`, or `--editor` (in that precedence order). Terminal editors block directly; GUI clients should use a wait option so the temporary view remains available, for example `code --wait`.
+[fzf](https://github.com/junegunn/fzf) is the default conversation finder. Install it to use `/`, `:find`, or the command-panel action:
+
+```bash
+# Debian/Ubuntu
+sudo apt install fzf
+
+# macOS
+brew install fzf
+```
+
+Both programs default to real PTYs rendered inside Ratatui floats. `editorMode` and `pickerMode` can be changed to `fullscreen` in Settings or `settings.json` when a program should temporarily take over the terminal instead. URI Agent restores raw mode, mouse capture, and bracketed paste after a fullscreen command returns. Set the commands in Settings, or override them with `EDITOR`/`VISUAL`/`URI_AGENT_EDITOR` and `URI_AGENT_PICKER`. GUI editors should include a wait option, such as `code --wait`, and use fullscreen mode.
 
 ## Installation
 

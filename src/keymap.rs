@@ -13,35 +13,11 @@ map("global", "f2", "settings");
 map("global", "ctrl+,", "settings");
 map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");
-
-map("sessions", "j", "next");
-map("sessions", "down", "next");
-map("sessions", "k", "previous");
-map("sessions", "up", "previous");
-map("sessions", "g", "first");
-map("sessions", "shift+g", "last");
-map("sessions", "enter", "open");
-map("sessions", "n", "new");
-map("sessions", "r", "refresh");
-map("sessions", "q", "quit");
-map("sessions", "esc", "quit");
-
-map("directory", "j", "next");
-map("directory", "down", "next");
-map("directory", "k", "previous");
-map("directory", "up", "previous");
-map("directory", "enter", "open");
-map("directory", "l", "open");
-map("directory", "h", "parent");
-map("directory", "left", "parent");
-map("directory", "backspace", "parent");
-map("directory", "space", "select");
-map("directory", "f", "fzf");
-map("directory", "/", "search");
-map("directory", "esc", "cancel");
+map("global", "ctrl+shift+c", "copy");
 
 map("browse", "space", "palette");
 map("browse", ":", "command");
+map("browse", "/", "finder");
 map("browse", "i", "insert");
 map("browse", "j", "next");
 map("browse", "down", "next");
@@ -58,7 +34,7 @@ map("browse", "end", "last");
 map("browse", "enter", "detail");
 map("browse", "o", "detail");
 map("browse", "e", "editor");
-map("browse", "s", "sessions");
+map("browse", "y", "copy");
 map("browse", "q", "quit");
 
 map("insert", "esc", "browse");
@@ -115,6 +91,13 @@ map("settings", "esc", "close");
 map("text", "enter", "confirm");
 map("text", "esc", "cancel");
 map("text", "backspace", "backspace");
+
+map("selection", "y", "copy");
+map("selection", "ctrl+shift+c", "copy");
+map("selection", "esc", "close");
+
+map("terminal", "esc", "escape");
+map("terminal", "ctrl+shift+c", "copy");
 "#;
 
 #[derive(Clone, Default)]
@@ -263,13 +246,13 @@ mod tests {
         keymap
             .evaluate(
                 r#"
-                map("browse", "x", "sessions");
+                map("browse", "x", "finder");
                 unmap("browse", "j");
                 "#,
                 "test",
             )
             .unwrap();
-        assert_eq!(keymap.action("browse", "x").as_deref(), Some("sessions"));
+        assert_eq!(keymap.action("browse", "x").as_deref(), Some("finder"));
         assert_eq!(keymap.action("browse", "j"), None);
         assert_eq!(keymap.action("browse", "f1").as_deref(), Some("help"));
     }

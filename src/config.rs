@@ -1,7 +1,7 @@
 use crate::catalog::{CatalogModel, ModelCatalog, api_key_environment};
 use crate::session::SessionChoice;
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -16,6 +16,24 @@ use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const DEFAULT_EDITOR: &str = "hx";
+const DEFAULT_PICKER: &str = "fzf";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalMode {
+    #[default]
+    Float,
+    Fullscreen,
+}
+
+impl std::fmt::Display for ExternalMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Float => "float",
+            Self::Fullscreen => "fullscreen",
+        })
+    }
+}
 
 #[derive(Clone, Parser, Debug)]
 #[command(name = "uri-agent", version, about)]
@@ -39,6 +57,18 @@ pub struct Cli {
     /// External editor command used for drafts and event details.
     #[arg(long, value_name = "COMMAND")]
     pub editor: Option<String>,
+
+    /// Run the editor in an embedded float or by temporarily taking over the terminal.
+    #[arg(long, value_enum)]
+    pub editor_mode: Option<ExternalMode>,
+
+    /// Fuzzy-picker command used to search the current conversation.
+    #[arg(long, value_name = "COMMAND")]
+    pub picker: Option<String>,
+
+    /// Run the fuzzy picker in an embedded float or by temporarily taking over the terminal.
+    #[arg(long, value_enum)]
+    pub picker_mode: Option<ExternalMode>,
 
     /// Disable pi.dev model-catalog network requests and use the local cache only.
     #[arg(long)]
@@ -89,6 +119,9 @@ impl Config {
                     api_key: cli.api_key,
                     output_limit: cli.output_limit,
                     editor: cli.editor,
+                    editor_mode: cli.editor_mode,
+                    picker: cli.picker,
+                    picker_mode: cli.picker_mode,
                 },
             )
             .await?,
@@ -143,11 +176,17 @@ pub struct ActiveSettings {
     pub api_key: Option<String>,
     pub output_limit: usize,
     pub editor: Option<String>,
+    pub editor_mode: ExternalMode,
+    pub picker: Option<String>,
+    pub picker_mode: ExternalMode,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
     pub api_key_source: ValueSource,
     pub output_limit_source: ValueSource,
     pub editor_source: ValueSource,
+    pub editor_mode_source: ValueSource,
+    pub picker_source: ValueSource,
+    pub picker_mode_source: ValueSource,
     pub credential_environment: BTreeMap<String, String>,
 }
 
@@ -164,6 +203,9 @@ struct InvocationOverrides {
     api_key: Option<String>,
     output_limit: Option<usize>,
     editor: Option<String>,
+    editor_mode: Option<ExternalMode>,
+    picker: Option<String>,
+    picker_mode: Option<ExternalMode>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -177,6 +219,12 @@ struct SettingsFile {
     output_limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor_mode: Option<ExternalMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    picker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    picker_mode: Option<ExternalMode>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -234,6 +282,9 @@ impl ConfigManager {
             global.default_model = Some("gpt-5.2".to_string());
             global.output_limit = Some(DEFAULT_OUTPUT_LIMIT);
             global.editor = Some(DEFAULT_EDITOR.to_string());
+            global.editor_mode = Some(ExternalMode::Float);
+            global.picker = Some(DEFAULT_PICKER.to_string());
+            global.picker_mode = Some(ExternalMode::Float);
             write_json(&global_path, &global, false).await?;
         }
         if !auth_path.exists() {
@@ -301,18 +352,29 @@ impl ConfigManager {
         self.recalculate(&files).await
     }
 
-    pub async fn set_editor(&self, editor: Option<String>) -> Result<ActiveSettings> {
-        let editor = editor.and_then(|value| {
-            let value = value.trim().to_string();
-            (!value.is_empty()).then_some(value)
-        });
+    pub async fn set_external_tools(
+        &self,
+        editor: Option<String>,
+        editor_mode: ExternalMode,
+        picker: Option<String>,
+        picker_mode: ExternalMode,
+    ) -> Result<ActiveSettings> {
+        let normalize = |value: Option<String>| {
+            value.and_then(|value| {
+                let value = value.trim().to_string();
+                (!value.is_empty()).then_some(value)
+            })
+        };
         let mut files = self.files.lock().await;
         let (settings, path) = if self.project_path.exists() {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
         };
-        settings.editor = editor;
+        settings.editor = normalize(editor);
+        settings.editor_mode = Some(editor_mode);
+        settings.picker = normalize(picker);
+        settings.picker_mode = Some(picker_mode);
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
     }
@@ -453,6 +515,50 @@ async fn calculate_active(
         editor_source = ValueSource::CommandLine;
     }
 
+    let (mut editor_mode, mut editor_mode_source) = setting(
+        ExternalMode::Float,
+        files.global.editor_mode,
+        files.project.editor_mode,
+    );
+    if let Some(value) = external_mode_environment("URI_AGENT_EDITOR_MODE")? {
+        editor_mode = value;
+        editor_mode_source = ValueSource::Environment("URI_AGENT_EDITOR_MODE".to_string());
+    }
+    if let Some(value) = invocation.editor_mode {
+        editor_mode = value;
+        editor_mode_source = ValueSource::CommandLine;
+    }
+
+    let (mut picker, mut picker_source) = setting(
+        Some(DEFAULT_PICKER.to_string()),
+        files.global.picker.clone().map(Some),
+        files.project.picker.clone().map(Some),
+    );
+    if let Ok(value) = env::var("URI_AGENT_PICKER")
+        && !value.trim().is_empty()
+    {
+        picker = Some(value);
+        picker_source = ValueSource::Environment("URI_AGENT_PICKER".to_string());
+    }
+    if let Some(value) = &invocation.picker {
+        picker = (!value.trim().is_empty()).then(|| value.trim().to_string());
+        picker_source = ValueSource::CommandLine;
+    }
+
+    let (mut picker_mode, mut picker_mode_source) = setting(
+        ExternalMode::Float,
+        files.global.picker_mode,
+        files.project.picker_mode,
+    );
+    if let Some(value) = external_mode_environment("URI_AGENT_PICKER_MODE")? {
+        picker_mode = value;
+        picker_mode_source = ValueSource::Environment("URI_AGENT_PICKER_MODE".to_string());
+    }
+    if let Some(value) = invocation.picker_mode {
+        picker_mode = value;
+        picker_mode_source = ValueSource::CommandLine;
+    }
+
     let configured_entry = files
         .auth
         .0
@@ -492,13 +598,31 @@ async fn calculate_active(
         api_key,
         output_limit,
         editor,
+        editor_mode,
+        picker,
+        picker_mode,
         provider_source,
         model_source,
         api_key_source,
         output_limit_source,
         editor_source,
+        editor_mode_source,
+        picker_source,
+        picker_mode_source,
         credential_environment,
     })
+}
+
+fn external_mode_environment(name: &str) -> Result<Option<ExternalMode>> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "float" => Ok(Some(ExternalMode::Float)),
+        "fullscreen" => Ok(Some(ExternalMode::Fullscreen)),
+        _ => bail!("{name} must be `float` or `fullscreen`"),
+    }
 }
 
 fn setting<T: Clone>(default: T, global: Option<T>, project: Option<T>) -> (T, ValueSource) {

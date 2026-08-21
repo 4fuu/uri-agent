@@ -99,7 +99,6 @@ pub fn discover(cwd: &Path) -> (Vec<SkillProtocol>, Vec<String>) {
         cwd.join(".agents/skills"),
         cwd.join(".claude/skills"),
         cwd.join(".codex/skills"),
-        cwd.join(".amp/skills"),
     ];
     if let Some(home) = dirs::home_dir() {
         roots.extend([
@@ -108,18 +107,14 @@ pub fn discover(cwd: &Path) -> (Vec<SkillProtocol>, Vec<String>) {
             home.join(".codex/skills"),
         ]);
     }
-    if let Some(config) = dirs::config_dir() {
-        roots.push(config.join("amp/skills"));
-    }
-    if let Some(cache) = dirs::cache_dir() {
-        roots.push(cache.join("amp/global-skills"));
-    }
+    discover_in(roots)
+}
 
+fn discover_in(roots: Vec<PathBuf>) -> (Vec<SkillProtocol>, Vec<String>) {
     let mut skill_files = Vec::new();
     let mut seen_paths = HashSet::new();
     for root in roots.into_iter().filter(|root| root.is_dir()) {
-        let mut files = Vec::new();
-        find_skill_files(&root, 0, &mut files);
+        let mut files = skill_files_in(&root);
         files.sort();
         for path in files {
             let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -146,24 +141,27 @@ pub fn discover(cwd: &Path) -> (Vec<SkillProtocol>, Vec<String>) {
     (skills, warnings)
 }
 
-fn find_skill_files(root: &Path, depth: usize, output: &mut Vec<PathBuf>) {
-    if depth > 6 {
-        return;
+fn skill_files_in(root: &Path) -> Vec<PathBuf> {
+    let mut output = Vec::new();
+    let direct = root.join("SKILL.md");
+    if direct.is_file() {
+        output.push(direct);
     }
     let Ok(entries) = fs::read_dir(root) else {
-        return;
+        return output;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if file_type.is_file() && entry.file_name() == "SKILL.md" {
-            output.push(path);
-        } else if file_type.is_dir() {
-            find_skill_files(&path, depth + 1, output);
+        if file_type.is_dir() {
+            let skill_md = entry.path().join("SKILL.md");
+            if skill_md.is_file() {
+                output.push(skill_md);
+            }
         }
     }
+    output
 }
 
 fn parse_frontmatter(content: &str) -> Result<Frontmatter> {
@@ -216,6 +214,30 @@ mod tests {
             skill_protocol_name("code-review-skill").unwrap(),
             "code-review-skill"
         );
+    }
+
+    #[test]
+    fn discovery_generates_protocols_from_one_directory_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let review = root.path().join("review");
+        let nested = root.path().join("category/nested");
+        fs::create_dir_all(&review).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            review.join("SKILL.md"),
+            "---\nname: Review\ndescription: Review code.\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: Nested\ndescription: Must not leak in recursively.\n---\n",
+        )
+        .unwrap();
+
+        let (skills, warnings) = discover_in(vec![root.path().to_path_buf()]);
+        assert!(warnings.is_empty());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].protocol_name(), "review-skill");
     }
 
     #[tokio::test]
