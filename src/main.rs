@@ -1,29 +1,28 @@
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use uri_agent::config::Cli;
-use uri_agent::model::RigBackend;
+use uri_agent::config::{Cli, Config};
+use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
 use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, forward_task_notices};
-use uri_agent::session::{EventKind, Session};
+use uri_agent::session::{EventKind, Session, SessionChoice};
 use uri_agent::task::TaskManager;
 use uri_agent::tui::TuiInfo;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Cli::parse().resolve()?;
-    let provider = config.provider.as_str();
-    let session = Session::open(
-        config.session.as_deref(),
-        &config.cwd,
-        provider,
-        &config.model,
-    )
-    .await?;
+    let config = Config::load(Cli::parse()).await?;
+    let initial = config.manager.current().await;
+    let requested = match &config.session {
+        SessionChoice::New => None,
+        SessionChoice::Latest => Some("latest"),
+        SessionChoice::Existing(id) => Some(id.as_str()),
+    };
+    let session = Session::open(requested, &config.cwd, &initial.provider, &initial.model).await?;
     let tasks = TaskManager::new();
-    let output = Arc::new(OutputStore::new(session.id(), config.output_limit).await?);
-    let mut protocols = ProtocolRegistry::new(output, tasks.clone());
+    let output = Arc::new(OutputStore::new(session.id(), initial.output_limit).await?);
+    let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
     uri_agent::builtins::register(&mut protocols, &config.cwd)?;
 
     let (skills, mut notices) = uri_agent::skill::discover(&config.cwd);
@@ -37,14 +36,18 @@ async fn main() -> Result<()> {
             notices.push(format!("skipped {description}: {error}"));
         }
     }
+    notices.extend(config.catalog.warnings().await);
 
     let descriptors = protocols.descriptors();
     let system_prompt =
         uri_agent::prompts::system_prompt(&config.cwd, &protocols.prompt_protocols());
-    let backend = Arc::new(RigBackend::from_environment(
-        config.provider,
-        &config.model,
-    )?);
+    let backend = match configured_backend(&initial, &config.catalog).await {
+        Ok(backend) => backend,
+        Err(error) => {
+            notices.push(format!("model configuration is not usable: {error:#}"));
+            None
+        }
+    };
     let protocols = Arc::new(protocols);
     for notice in notices {
         session.append(EventKind::Notice { text: notice }).await?;
@@ -61,10 +64,13 @@ async fn main() -> Result<()> {
         runtime,
         descriptors,
         tasks,
+        config.manager,
+        config.catalog,
+        output,
         TuiInfo {
             cwd: config.cwd,
-            provider: provider.to_string(),
-            model: config.model,
+            provider: initial.provider,
+            model: initial.model,
             session_id: session.id().to_string(),
         },
     )

@@ -1,12 +1,12 @@
 use crate::prompts;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
 
 pub struct OutputStore {
     directory: PathBuf,
-    limit: usize,
+    limit: AtomicUsize,
     sequence: AtomicU64,
 }
 
@@ -23,7 +23,7 @@ impl OutputStore {
         let sequence = next_sequence(&base).await?;
         Ok(Self {
             directory: base,
-            limit,
+            limit: AtomicUsize::new(limit),
             sequence: AtomicU64::new(sequence),
         })
     }
@@ -32,8 +32,17 @@ impl OutputStore {
         &self.directory
     }
 
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.store(limit.max(1024), Ordering::Relaxed);
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.load(Ordering::Relaxed)
+    }
+
     pub async fn present(&self, content: Vec<u8>, hint: &str) -> Result<String> {
-        if content.len() <= self.limit {
+        let limit = self.limit();
+        if content.len() <= limit {
             return Ok(String::from_utf8_lossy(&content).into_owned());
         }
 
@@ -44,8 +53,8 @@ impl OutputStore {
             .await
             .with_context(|| format!("failed to preserve complete output: {}", path.display()))?;
 
-        let head = self.limit.saturating_mul(3) / 4;
-        let tail = self.limit.saturating_sub(head);
+        let head = limit.saturating_mul(3) / 4;
+        let tail = limit.saturating_sub(head);
         let mut preview = String::from_utf8_lossy(&content[..head]).into_owned();
         if tail > 0 {
             preview.push_str("\n…\n");
@@ -99,7 +108,7 @@ mod tests {
     async fn oversized_output_is_preserved_and_linked() {
         let store = OutputStore {
             directory: tempfile::tempdir().unwrap().keep(),
-            limit: 16,
+            limit: AtomicUsize::new(16),
             sequence: AtomicU64::new(0),
         };
         let rendered = store.present(vec![b'x'; 100], "test").await.unwrap();

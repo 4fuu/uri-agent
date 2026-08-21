@@ -1,4 +1,5 @@
 pub mod builtins;
+pub mod catalog;
 pub mod config;
 pub mod model;
 pub mod output;

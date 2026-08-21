@@ -18,7 +18,8 @@ Keep these product invariants intact:
 ## Code Map
 
 - `src/main.rs`: application assembly and protocol registration.
-- `src/config.rs`: CLI options, provider selection, and defaults.
+- `src/catalog.rs`: pi.dev model catalog, cache, and `models.json` overlays.
+- `src/config.rs`: layered text configuration, credentials, CLI, and environment overrides.
 - `src/model.rs`: Rig provider adapter and the two model-facing tool schemas.
 - `src/runtime.rs`: model/tool loop and tool-call correlation.
 - `src/protocol.rs`: protocol contract, registry, dispatch, and output presentation.
@@ -26,7 +27,7 @@ Keep these product invariants intact:
 - `src/task.rs`: asynchronous task lifecycle, waiting, cancellation, and notices.
 - `src/output.rs`: output limits and complete-output persistence.
 - `src/skill.rs`: Skill discovery, metadata parsing, and resource containment.
-- `src/session.rs`: append-only JSONL persistence and replay.
+- `src/session.rs`: SQLite event persistence and replay.
 - `src/prompts.rs`: model-facing system, tool, and protocol help text.
 - `src/tui.rs`: Ratatui state, input handling, overlays, and rendering.
 

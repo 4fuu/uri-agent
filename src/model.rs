@@ -1,15 +1,19 @@
-use crate::config::Provider;
+use crate::catalog::CatalogModel;
+use crate::catalog::ModelCatalog;
+use crate::config::{ActiveSettings, resolve_config_value};
 use crate::prompts;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rig::client::{CompletionClient, ProviderClient};
+use http::{HeaderMap, HeaderName, HeaderValue};
+use rig::client::CompletionClient;
 use rig::completion::{CompletionModel as RigCompletionModel, ToolDefinition};
 use rig::message::{AssistantContent, Message};
 use rig::providers::{anthropic, gemini, openai};
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -38,31 +42,117 @@ pub trait ModelBackend: Send + Sync {
 }
 
 pub enum RigBackend {
-    OpenAi(openai::responses_api::ResponsesCompletionModel),
+    OpenAiResponses(openai::responses_api::ResponsesCompletionModel),
+    OpenAiCompletions(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
 }
 
 impl RigBackend {
-    pub fn from_environment(provider: Provider, model: &str) -> Result<Self> {
-        Ok(match provider {
-            Provider::Openai => Self::OpenAi(
-                openai::Client::from_env()
+    pub async fn new(
+        model: &CatalogModel,
+        api_key: &str,
+        environment: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let mut headers = resolved_headers(model, environment).await?;
+        if model
+            .metadata
+            .get("authHeader")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            headers.entry(http::header::AUTHORIZATION).or_insert(
+                HeaderValue::from_str(&format!("Bearer {api_key}"))
+                    .context("invalid API key for Authorization header")?,
+            );
+        }
+        Ok(match model.api.as_str() {
+            "openai-responses" => Self::OpenAiResponses(
+                openai::Client::builder()
+                    .api_key(api_key)
+                    .base_url(&model.base_url)
+                    .http_headers(headers)
+                    .build()
                     .context("cannot initialize OpenAI provider")?
-                    .completion_model(model),
+                    .completion_model(&model.id),
             ),
-            Provider::Anthropic => Self::Anthropic(
-                anthropic::Client::from_env()
+            "openai-completions" => Self::OpenAiCompletions(
+                openai::CompletionsClient::builder()
+                    .api_key(api_key)
+                    .base_url(&model.base_url)
+                    .http_headers(headers)
+                    .build()
+                    .context("cannot initialize OpenAI-compatible provider")?
+                    .completion_model(&model.id),
+            ),
+            "anthropic-messages" => Self::Anthropic(
+                anthropic::Client::builder()
+                    .api_key(api_key)
+                    .base_url(&model.base_url)
+                    .http_headers(headers)
+                    .build()
                     .context("cannot initialize Anthropic provider")?
-                    .completion_model(model),
+                    .completion_model(&model.id),
             ),
-            Provider::Gemini => Self::Gemini(
-                gemini::Client::from_env()
+            "google-generative-ai" => Self::Gemini(
+                gemini::Client::builder()
+                    .api_key(api_key)
+                    .base_url(normalize_gemini_base_url(&model.base_url))
+                    .http_headers(headers)
+                    .build()
                     .context("cannot initialize Gemini provider")?
-                    .completion_model(model),
+                    .completion_model(&model.id),
             ),
+            api => bail!("Pi catalog API {api:?} is not supported by the Rust backend"),
         })
     }
+}
+
+pub async fn configured_backend(
+    settings: &ActiveSettings,
+    catalog: &ModelCatalog,
+) -> Result<Option<Arc<dyn ModelBackend>>> {
+    let Some(api_key) = settings.api_key.as_deref() else {
+        return Ok(None);
+    };
+    let model = settings.catalog_model(catalog).await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "model {}/{} is not available in the runnable Pi catalog",
+            settings.provider,
+            settings.model
+        )
+    })?;
+    Ok(Some(Arc::new(
+        RigBackend::new(&model, api_key, &settings.credential_environment).await?,
+    )))
+}
+
+async fn resolved_headers(
+    model: &CatalogModel,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &model.headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).with_context(|| {
+            format!(
+                "invalid header name {name:?} for {}/{}",
+                model.provider, model.id
+            )
+        })?;
+        let value = resolve_config_value(value, environment).await?;
+        headers.insert(
+            name,
+            HeaderValue::from_str(&value).context("invalid configured model header value")?,
+        );
+    }
+    Ok(headers)
+}
+
+fn normalize_gemini_base_url(base_url: &str) -> &str {
+    base_url
+        .trim_end_matches('/')
+        .strip_suffix("/v1beta")
+        .unwrap_or_else(|| base_url.trim_end_matches('/'))
 }
 
 #[async_trait]
@@ -73,7 +163,8 @@ impl ModelBackend for RigBackend {
         deltas: mpsc::UnboundedSender<ModelDelta>,
     ) -> Result<ModelResponse> {
         match self {
-            Self::OpenAi(model) => complete_with(model, request, deltas).await,
+            Self::OpenAiResponses(model) => complete_with(model, request, deltas).await,
+            Self::OpenAiCompletions(model) => complete_with(model, request, deltas).await,
             Self::Anthropic(model) => complete_with(model, request, deltas).await,
             Self::Gemini(model) => complete_with(model, request, deltas).await,
         }

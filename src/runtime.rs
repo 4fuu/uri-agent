@@ -6,12 +6,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use rig::message::{AssistantContent, Message, Text, ToolCall, ToolResultContent, UserContent};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 const MAX_TOOL_ROUNDS: usize = 32;
 
 pub struct AgentRuntime {
-    backend: Arc<dyn ModelBackend>,
+    backend: RwLock<Option<Arc<dyn ModelBackend>>>,
     protocols: Arc<ProtocolRegistry>,
     session: Session,
     system_prompt: String,
@@ -20,13 +20,13 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub fn new(
-        backend: Arc<dyn ModelBackend>,
+        backend: Option<Arc<dyn ModelBackend>>,
         protocols: Arc<ProtocolRegistry>,
         session: Session,
         system_prompt: String,
     ) -> Self {
         Self {
-            backend,
+            backend: RwLock::new(backend),
             protocols,
             session,
             system_prompt,
@@ -38,12 +38,32 @@ impl AgentRuntime {
         &self.session
     }
 
+    pub async fn set_backend(&self, backend: Option<Arc<dyn ModelBackend>>) {
+        *self.backend.write().await = backend;
+    }
+
+    pub async fn has_backend(&self) -> bool {
+        self.backend.read().await.is_some()
+    }
+
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
         let _turn = self.turn.lock().await;
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Ok(());
         }
+        let backend = match self.backend.read().await.clone() {
+            Some(backend) => backend,
+            None => {
+                let text = "no API key configured; open Settings with F2 or enter /login";
+                self.session
+                    .append(EventKind::Error {
+                        text: text.to_string(),
+                    })
+                    .await?;
+                return Err(anyhow!(text));
+            }
+        };
         self.session
             .append(EventKind::User {
                 text: prompt.to_string(),
@@ -51,7 +71,7 @@ impl AgentRuntime {
             .await?;
         self.append_model_message(Message::user(prompt)).await?;
 
-        let result = self.run_tool_loop().await;
+        let result = self.run_tool_loop(backend).await;
         match result {
             Ok(()) => {
                 self.session.append(EventKind::TurnFinished).await?;
@@ -67,9 +87,9 @@ impl AgentRuntime {
         }
     }
 
-    async fn run_tool_loop(&self) -> Result<()> {
+    async fn run_tool_loop(&self, backend: Arc<dyn ModelBackend>) -> Result<()> {
         for _ in 0..MAX_TOOL_ROUNDS {
-            let response = self.complete_once().await?;
+            let response = self.complete_once(backend.as_ref()).await?;
             let assistant_message = Message::Assistant {
                 id: None,
                 content: response.content.clone(),
@@ -94,13 +114,13 @@ impl AgentRuntime {
         bail!("model exceeded {MAX_TOOL_ROUNDS} consecutive tool rounds")
     }
 
-    async fn complete_once(&self) -> Result<ModelResponse> {
+    async fn complete_once(&self, backend: &dyn ModelBackend) -> Result<ModelResponse> {
         let request = ModelRequest {
             system: self.system_prompt.clone(),
             history: self.session.model_history().await,
         };
         let (deltas, mut receiver) = mpsc::unbounded_channel();
-        let completion = self.backend.complete(request, deltas);
+        let completion = backend.complete(request, deltas);
         tokio::pin!(completion);
         loop {
             tokio::select! {
@@ -261,10 +281,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_backend_reports_an_error_without_polluting_model_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "openai",
+            "gpt-5.2",
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(session.id(), 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let protocols = ProtocolRegistry::new(output.clone(), TaskManager::new());
+        let runtime = AgentRuntime::new(
+            None,
+            Arc::new(protocols),
+            session.clone(),
+            "system".to_string(),
+        );
+
+        assert!(runtime.run_turn("hello".to_string()).await.is_err());
+        assert!(session.model_history().await.is_empty());
+        let events = session.snapshot().await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::User { .. }))
+        );
+        assert!(
+            matches!(events.last().map(|event| &event.kind), Some(EventKind::Error { text }) if text.contains("F2"))
+        );
+
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test]
     async fn fake_backend_completes_a_read_tool_loop_end_to_end() {
         let workspace = tempfile::tempdir().unwrap();
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
-        let session = crate::session::Session::open(
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
             Some(&session_id),
             workspace.path(),
             "fake",
@@ -297,7 +359,7 @@ mod tests {
             ])),
         });
         let runtime = AgentRuntime::new(
-            backend,
+            Some(backend),
             Arc::new(protocols),
             session.clone(),
             "test system prompt".to_string(),
@@ -317,10 +379,8 @@ mod tests {
         ));
         assert_eq!(session.model_history().await.len(), 4);
 
-        let session_directory = session.directory().to_path_buf();
         drop(runtime);
         drop(session);
-        let _ = tokio::fs::remove_dir_all(session_directory).await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 }
