@@ -133,11 +133,13 @@ The Rust/Rig backend currently runs these pi API families:
 - `anthropic-messages`
 - `google-generative-ai`
 
-The complete remote catalog is cached, while the Settings picker shows models from runnable API families. Provider entries that require OAuth or ambient cloud credentials may appear when their API family is supported, but uri-agent currently implements API-key authentication only. Bedrock, Vertex, Azure Responses, Codex OAuth, and Mistral Conversations need dedicated Rust adapters before they can run.
+The complete remote catalog is cached, while the model picker shows models from runnable API families. Open it with `F3`, `:model`, the command palette, or `/model [query]`. It searches provider IDs, model IDs, display names, and API families; provider grouping, current selection, context size, reasoning support, API family, and current credential state remain visible while browsing. Arrow keys, mouse clicks, and double-click selection work alongside typed search. `Ctrl+R` refreshes the pi catalog in the background without freezing the animation or input loop.
+
+Provider entries that require OAuth or ambient cloud credentials may appear when their API family is supported, but uri-agent currently implements API-key authentication only. Bedrock, Vertex, Azure Responses, Codex OAuth, and Mistral Conversations need dedicated Rust adapters before they can run.
 
 ## Configuration
 
-Start uri-agent without an API key and open Settings with `F2`, `Ctrl+,`, the Space command panel, or `:settings`. `/settings`, `/model`, and `/login` remain available from Insert mode. The overlay edits provider, model, the selected provider's credential, inline output limit, editor and picker commands, and whether each external program uses an embedded float or the full terminal. Saving applies changes immediately without discarding the current session.
+Start uri-agent without an API key and open Settings with `F2`, `Ctrl+,`, the Space command panel, or `:settings`. `/settings`, `/model`, and `/login` remain available from Insert mode. Provider and model rows open the searchable model picker; Settings edits the active provider's credential, inline output limit, editor and picker commands, and whether each external program uses an embedded float or the full terminal. Saving applies changes immediately without discarding the current session.
 
 ### Text files
 
@@ -278,15 +280,17 @@ The canonical launch directory is the project boundary. A normal launch creates 
 
 The Ratatui interface separates event browsing, message input, and detailed inspection. The conversation surface shows one selectable preview per user message, response, reasoning segment, or tool call. A tool call and its result share one row, so streaming reasoning and large tool output never force the useful conversation off-screen. `Enter` opens the complete selected event in a scrollable panel; `e` opens it in the configured editor. The same lists support wheel scrolling and mouse selection; double-click an event to inspect it.
 
+An empty session opens with a compact ordered-dither pixel mark, project and model facts, and the available entry points. During a turn, a fixed-height activity strip identifies reasoning, response streaming, tool execution, or compaction and shows elapsed time. The status area keeps the active mode, provider/model readiness, estimated context use, running task count, protocol count, project, session, and transient notices visible without expanding streamed content. The shimmer and activity waves are deterministic, low-noise animations that do not move the layout; narrow terminals fall back to a compact welcome.
+
 | Mode | Default keys | Action |
 | --- | --- | --- |
 | Browse | `↑/↓`, `Enter`, `i`, `e`, `/`, `y`, `Space`, `:`, mouse | Select previews, inspect details, compose, find an event, copy, or run a command |
 | Insert | `Enter`, `Shift+Enter`, `Ctrl+E`, `Esc` | Send, add a line, edit the draft externally, or return to Browse |
 | Detail | `↑/↓`, `PageUp/PageDown`, `e`, `Esc`, drag, wheel | Inspect, select, copy, or externally view complete content |
 | Embedded terminal | normal program keys, double `Esc`, Shift-drag | Operate the editor/picker, close its PTY, or select terminal text |
-| Global | `F1`, `F2`, `Ctrl+P`, `Ctrl+T`, `Ctrl+Shift+C`, `Ctrl+C` | Help, Settings, protocols, tasks, copy, and quit |
+| Global | `F1`, `F2`, `F3`, `Ctrl+P`, `Ctrl+T`, `Ctrl+Shift+C`, `Ctrl+C` | Help, Settings, model picker, protocols, tasks, copy, and quit |
 
-Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compact`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. Registered plugin commands appear in the same palette and help panel. The header always identifies the active mode. Help renders the active keymap rather than a fixed key table. The low-noise dither animation remains visible while a model turn is running.
+Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compact`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. Registered plugin commands appear in the same palette and help panel. Help renders the active keymap rather than a fixed key table.
 
 Read-only floats support direct mouse drag selection. Use Shift-drag in interactive panels and embedded terminals so normal clicks still reach the application. Press `y` or `Ctrl+Shift+C` to copy the selection through OSC52; with no selection, the same action copies the visible panel.
 
@@ -308,7 +312,7 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. A registered command ID is also a stable action ID, so `map("browse", "c", "compact")` or a plugin command ID can be bound directly. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
+Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `models`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `model`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. A registered command ID is also a stable action ID, so `map("browse", "c", "compact")` or a plugin command ID can be bound directly. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
 
 ### External editor and finder
 

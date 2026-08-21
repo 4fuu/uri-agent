@@ -14,6 +14,7 @@ pub enum CoreCommand {
     Copy,
     Tasks,
     Protocols,
+    Models,
     Settings,
     Compact,
     Help,
@@ -188,10 +189,17 @@ fn core_commands() -> Vec<CommandSpec> {
             CommandTarget::Core(Protocols),
         ),
         CommandSpec::new(
+            "model",
+            "Select model",
+            "search all runnable models from the Pi catalog",
+            ["models"],
+            CommandTarget::Core(Models),
+        ),
+        CommandSpec::new(
             "settings",
             "Settings",
-            "models, limits, editor, picker, and display modes",
-            ["model", "login"],
+            "credentials, limits, editor, picker, and display modes",
+            ["login"],
             CommandTarget::Core(Settings),
         ),
         CommandSpec::new(
@@ -307,7 +315,7 @@ mod tests {
         let registry = CommandRegistry::with_core_commands();
         assert_eq!(
             registry.resolve(":model").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Settings)
+            CommandTarget::Core(CoreCommand::Models)
         );
         assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
     }

@@ -120,6 +120,8 @@ async fn run_session(config: Config) -> Result<()> {
         .catalog_model(&config.catalog)
         .await
         .map_or(128_000, |model| model.context_window());
+    let system_prompt_tokens = frozen_context.system_prompt.len().div_ceil(4);
+    let model_ready = backend.is_some();
     let runtime = Arc::new(AgentRuntime::new(
         backend,
         protocols,
@@ -144,6 +146,9 @@ async fn run_session(config: Config) -> Result<()> {
             provider: initial.provider,
             model: initial.model,
             session_id: session.id().to_string(),
+            context_window,
+            system_prompt_tokens,
+            model_ready,
             editor: initial.editor,
             editor_mode: initial.editor_mode,
             picker: initial.picker,

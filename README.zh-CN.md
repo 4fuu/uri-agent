@@ -133,11 +133,13 @@ https://pi.dev/api/models/providers/<provider-id>
 - `anthropic-messages`
 - `google-generative-ai`
 
-完整远端目录都会缓存，Settings 选择器只展示可运行 API family 中的模型。如果某个 Provider 使用受支持的 API family，但需要 OAuth 或云环境凭据，它仍可能出现在界面中；uri-agent 当前只实现 API key 认证。Bedrock、Vertex、Azure Responses、Codex OAuth 和 Mistral Conversations 仍需要专用 Rust 适配器。
+完整远端目录都会缓存，模型选择器只展示可运行 API family 中的模型。可以用 `F3`、`:model`、命令面板或 `/model [query]` 打开。搜索会同时匹配 Provider ID、模型 ID、显示名和 API family，并在浏览时保留 Provider 分组、当前模型、上下文长度、reasoning 支持、API family 与当前凭据状态。方向键、鼠标点击和双击选择都可与直接输入搜索配合使用。`Ctrl+R` 在后台刷新 pi 目录，不会冻结动画或输入循环。
+
+如果某个 Provider 使用受支持的 API family，但需要 OAuth 或云环境凭据，它仍可能出现在界面中；uri-agent 当前只实现 API key 认证。Bedrock、Vertex、Azure Responses、Codex OAuth 和 Mistral Conversations 仍需要专用 Rust 适配器。
 
 ## 配置
 
-没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、Space 命令面板或 `:settings` 打开设置浮窗；Insert 模式仍支持 `/settings`、`/model` 和 `/login`。浮窗可以编辑 Provider、模型、当前 Provider 凭据、内联输出上限、编辑器与选取器命令，以及两者使用内嵌浮窗还是接管整个终端。保存后立即生效，不会丢弃当前会话。
+没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、Space 命令面板或 `:settings` 打开设置浮窗；Insert 模式仍支持 `/settings`、`/model` 和 `/login`。Provider 和模型字段会打开可搜索的模型选择器；Settings 可编辑当前 Provider 凭据、内联输出上限、编辑器与选取器命令，以及两者使用内嵌浮窗还是接管整个终端。保存后立即生效，不会丢弃当前会话。
 
 ### 文本文件
 
@@ -278,15 +280,17 @@ SQLite 是项目最初公开的持久化格式，因此不包含 JSONL 兼容层
 
 Ratatui 界面将事件浏览、消息输入和详细查看分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。`Enter` 在可滚动浮窗中打开完整事件，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
 
+空会话会展示紧凑的 ordered-dither 像素标记、项目与模型信息，以及常用入口。模型工作时，固定高度的活动条会区分 reasoning、回复流式输出、工具执行和上下文压缩，并显示耗时。状态区持续展示模式、Provider/模型可用状态、估算上下文占用、运行任务数、协议数、项目、会话和临时通知，不会因流式内容扩张。抖动与活动波形是确定性、低噪声且不改变布局的动画；窄终端会退化为紧凑欢迎界面。
+
 | 模式 | 默认按键 | 行为 |
 | --- | --- | --- |
 | Browse | `↑/↓`、`Enter`、`i`、`e`、`/`、`y`、`Space`、`:`、鼠标 | 选择预览、查看详情、输入、查找事件、复制或执行命令 |
 | Insert | `Enter`、`Shift+Enter`、`Ctrl+E`、`Esc` | 发送、换行、在外部编辑器编辑草稿或返回 Browse |
 | Detail | `↑/↓`、`PageUp/PageDown`、`e`、`Esc`、拖选、滚轮 | 查看、选取、复制完整内容，或用编辑器打开 |
 | 内嵌终端 | 外部程序正常按键、双 `Esc`、Shift 拖选 | 操作编辑器/选取器、关闭 PTY 或选取终端文本 |
-| Global | `F1`、`F2`、`Ctrl+P`、`Ctrl+T`、`Ctrl+Shift+C`、`Ctrl+C` | 帮助、Settings、协议、任务、复制和退出 |
+| Global | `F1`、`F2`、`F3`、`Ctrl+P`、`Ctrl+T`、`Ctrl+Shift+C`、`Ctrl+C` | 帮助、Settings、模型选择、协议、任务、复制和退出 |
 
-Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行，`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compact`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`；插件注册的命令也会出现在同一个命令面板和帮助浮窗。顶栏始终标明当前模式；帮助浮窗展示实际生效的 keymap，而不是固定按键表。模型工作时仍会显示低噪声抖动动画。
+Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行，`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compact`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`；插件注册的命令也会出现在同一个命令面板和帮助浮窗。帮助浮窗展示实际生效的 keymap，而不是固定按键表。
 
 只读浮窗可以直接用鼠标拖选。交互式面板和内嵌终端使用 Shift 拖选，使普通点击仍能交给程序处理。按 `y` 或 `Ctrl+Shift+C` 通过 OSC52 复制选区；没有选区时，同一操作会复制当前可见面板。
 
@@ -308,7 +312,7 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。注册命令的 ID 同时也是稳定的 action ID，因此可直接绑定 `map("browse", "c", "compact")` 或插件命令 ID。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
+可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`models`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`model`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。注册命令的 ID 同时也是稳定的 action ID，因此可直接绑定 `map("browse", "c", "compact")` 或插件命令 ID。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
 
 ### 外部编辑器与选取器
 

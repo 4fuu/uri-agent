@@ -10,6 +10,7 @@ const DEFAULT_KEYMAP: &str = r#"
 map("global", "ctrl+c", "quit");
 map("global", "f1", "help");
 map("global", "f2", "settings");
+map("global", "f3", "model");
 map("global", "ctrl+,", "settings");
 map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");
@@ -87,6 +88,17 @@ map("settings", "s", "save");
 map("settings", "r", "refresh");
 map("settings", "x", "clear");
 map("settings", "esc", "close");
+
+map("models", "up", "previous");
+map("models", "down", "next");
+map("models", "pageup", "page_up");
+map("models", "pagedown", "page_down");
+map("models", "home", "first");
+map("models", "end", "last");
+map("models", "enter", "confirm");
+map("models", "esc", "close");
+map("models", "backspace", "backspace");
+map("models", "ctrl+r", "refresh");
 
 map("text", "enter", "confirm");
 map("text", "esc", "cancel");
@@ -271,5 +283,7 @@ mod tests {
             keymap.action("palette", "enter").as_deref(),
             Some("confirm")
         );
+        assert_eq!(keymap.action("global", "f3").as_deref(), Some("model"));
+        assert_eq!(keymap.action("models", "down").as_deref(), Some("next"));
     }
 }
