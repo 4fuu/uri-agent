@@ -227,16 +227,16 @@ As model replay approaches the selected model's context window, URI Agent create
 
 ## Terminal interface
 
-Startup shows a short splash, then a single conversation surface. An empty conversation keeps the animated brand view. Once records appear, the surface is folded history plus a pi-style footer at the bottom: `cwd (branch)` on the first line, then cumulative token usage, cost, a context meter, and the active model on the second, with hints on the last line.
+Startup shows a short splash, then a single conversation surface. An empty conversation keeps the animated brand view. Once records appear, the surface is folded history plus a highlighted one-line URI footer for the project, branch, token usage, context pressure, active model, and plugin status. Click the footer, press `F4`, or run `:status` to open the detailed project/session/usage view; its float expands upward from the bottom.
 
 | Surface | Useful defaults |
 | --- | --- |
 | Conversation | `i` compose, `:` commands, `?` help, `Enter` open/fold, `r`/`t`/`h` jump thinking/tools/you |
 | Composer | `Enter` send, `Shift+Enter` newline, `Esc` keep draft |
 | Command | type to filter, `Tab` complete, `Enter` run, `Esc` close |
-| Global | `F1` help, `F2` settings, `F3` models, `Ctrl+C` quit |
+| Global | `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+C` quit |
 
-Useful colon commands: `:login`, `:logout`, `:model`, `:resume`, `:new`, `:set-terminal`, `:terminal`, `:compact`, `:help`, `:q`.
+Useful colon commands: `:login`, `:logout`, `:model`, `:status`, `:resume`, `:new`, `:set-terminal`, `:terminal`, `:compact`, `:help`, `:q`.
 
 `:set-terminal` saves the command for the floating terminal (`pwsh`, `bash`, …). `:terminal` opens it as a PTY float; double `Esc` closes it. Shift-drag selects text so ordinary clicks still reach the program.
 
@@ -252,7 +252,7 @@ map("composer", "ctrl+j", "newline");
 
 ## Extending URI Agent
 
-Rust extensions declare their protocol descriptors and register protocols, commands, and generic TUI panel providers through [`PluginRegistry`](src/plugin.rs) and `PluginHost`. The first-party `file`, `replace`, `apply_patch`, `bash`, and `pwsh` capabilities use this same plugin path rather than being assembled directly by the application. Protocols remain behind `read` and `exec`; commands join the command palette, colon command line, and keymap action registry. URI Agent does not currently load native dynamic libraries, so third-party Rust extensions must be linked during application assembly.
+Rust extensions declare their protocol descriptors and register protocols, commands, generic TUI panel providers, and status providers through [`PluginRegistry`](src/plugin.rs) and `PluginHost`. `host.tui.register_status(...)` accepts a fast, non-blocking provider that returns a `TuiStatusItem`. The provider receives `TuiStatusContext`; use its `expanded` field to return more detail for the bottom panel. Semantic tones keep color rendering in the generic TUI. The first-party `file`, `replace`, `apply_patch`, `bash`, and `pwsh` capabilities use this same plugin path rather than being assembled directly by the application. Protocols remain behind `read` and `exec`; commands join the command palette, colon command line, and keymap action registry. URI Agent does not currently load native dynamic libraries, so third-party Rust extensions must be linked during application assembly.
 
 ## Development
 

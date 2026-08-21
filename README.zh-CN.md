@@ -227,16 +227,16 @@ models.json apiKey
 
 ## 终端界面
 
-启动时先播放短动画，随后进入单一会话界面。空会话保留动画品牌页；一旦出现记录，界面变为默认折叠的历史，底部是 pi 风格的页脚：第一行 `cwd (分支)`，第二行是累计 token 用量、成本、上下文占用和当前模型，最后一行是提示。
+启动时先播放短动画，随后进入单一会话界面。空会话保留动画品牌页；一旦出现记录，界面变为默认折叠的历史，底部是一行带高亮的 URI 状态栏，展示项目、分支、token 用量、上下文压力、当前模型和插件状态。点击状态栏、按 `F4` 或运行 `:status` 可打开项目、会话和用量详情；浮窗从底部向上展开。
 
 | 界面 | 常用默认按键 |
 | --- | --- |
 | 会话 | `i` 输入，`:` 命令，`?` 帮助，`Enter` 展开/折叠，`r`/`t`/`h` 在思维链/工具/用户消息间跳转 |
 | 输入浮窗 | `Enter` 发送，`Shift+Enter` 换行，`Esc` 保留草稿 |
 | 命令面板 | 输入过滤，`Tab` 补全，`Enter` 执行，`Esc` 关闭 |
-| 全局 | `F1` 帮助，`F2` 设置，`F3` 模型，`Ctrl+C` 退出 |
+| 全局 | `F1` 帮助，`F2` 设置，`F3` 模型，`F4` 状态，`Ctrl+C` 退出 |
 
-常用冒号命令：`:login`、`:logout`、`:model`、`:resume`、`:new`、`:set-terminal`、`:terminal`、`:compact`、`:help`、`:q`。
+常用冒号命令：`:login`、`:logout`、`:model`、`:status`、`:resume`、`:new`、`:set-terminal`、`:terminal`、`:compact`、`:help`、`:q`。
 
 `:set-terminal` 保存浮窗终端命令（如 `pwsh`、`bash`）。`:terminal` 以 PTY 浮窗打开；连按两次 `Esc` 关闭。Shift 拖选文字，普通点击仍交给终端程序。
 
@@ -252,7 +252,7 @@ map("composer", "ctrl+j", "newline");
 
 ## 扩展 URI Agent
 
-Rust 扩展通过 [`PluginRegistry`](src/plugin.rs) 声明协议描述，并通过 `PluginHost` 注册协议、命令和通用 TUI panel provider。第一方的 `file`、`replace`、`apply_patch`、`bash` 和 `pwsh` 能力也走同一插件路径，不再由应用直接组装。协议始终位于 `read` 和 `exec` 之后；命令会进入命令面板、冒号命令行和快捷键 action 注册表。URI Agent 当前不加载原生动态库，因此第三方 Rust 扩展必须在应用组装阶段链接。
+Rust 扩展通过 [`PluginRegistry`](src/plugin.rs) 声明协议描述，并通过 `PluginHost` 注册协议、命令、通用 TUI panel provider 和状态 provider。`host.tui.register_status(...)` 接受快速、非阻塞的 provider 并返回 `TuiStatusItem`。该 provider 会收到 `TuiStatusContext`；可根据其中的 `expanded` 字段为底部浮窗返回更完整的信息。语义色调由通用 TUI 统一渲染。第一方的 `file`、`replace`、`apply_patch`、`bash` 和 `pwsh` 能力也走同一插件路径，不再由应用直接组装。协议始终位于 `read` 和 `exec` 之后；命令会进入命令面板、冒号命令行和快捷键 action 注册表。URI Agent 当前不加载原生动态库，因此第三方 Rust 扩展必须在应用组装阶段链接。
 
 ## 开发
 

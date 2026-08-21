@@ -11,6 +11,7 @@ pub enum CoreCommand {
     Copy,
     Tasks,
     Protocols,
+    Status,
     Models,
     Settings,
     Login,
@@ -171,6 +172,13 @@ fn core_commands() -> Vec<CommandSpec> {
             CommandTarget::Core(Protocols),
         ),
         CommandSpec::new(
+            "status",
+            "Session status",
+            "expand project, model, usage, and plugin status",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Status),
+        ),
+        CommandSpec::new(
             "model",
             "Select model",
             "search all runnable models from the Pi catalog",
@@ -268,6 +276,61 @@ pub trait TuiPanelProvider: Send + Sync {
     async fn open(&self, context: TuiPanelContext) -> Result<TuiDocument>;
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TuiStatusTone {
+    #[default]
+    Default,
+    Accent,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiStatusItem {
+    pub label: String,
+    pub value: String,
+    pub tone: TuiStatusTone,
+}
+
+impl TuiStatusItem {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+            tone: TuiStatusTone::Default,
+        }
+    }
+
+    pub fn with_tone(mut self, tone: TuiStatusTone) -> Self {
+        self.tone = tone;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TuiStatusContext {
+    pub cwd: PathBuf,
+    pub session_id: String,
+    /// Providers may return a concise value for the footer and a richer value
+    /// for the expanded bottom panel.
+    pub expanded: bool,
+}
+
+/// Keep status providers fast and non-blocking: the TUI evaluates them while
+/// drawing each frame. Providers can own shared state when their value changes.
+pub trait TuiStatusProvider: Send + Sync {
+    fn status(&self, context: &TuiStatusContext) -> Option<TuiStatusItem>;
+}
+
+impl<F> TuiStatusProvider for F
+where
+    F: Fn(&TuiStatusContext) -> Option<TuiStatusItem> + Send + Sync,
+{
+    fn status(&self, context: &TuiStatusContext) -> Option<TuiStatusItem> {
+        self(context)
+    }
+}
+
 #[derive(Clone)]
 pub struct TuiPanelSpec {
     pub id: String,
@@ -277,6 +340,7 @@ pub struct TuiPanelSpec {
 #[derive(Default)]
 pub struct TuiRegistry {
     panels: BTreeMap<String, TuiPanelSpec>,
+    status: BTreeMap<String, Arc<dyn TuiStatusProvider>>,
 }
 
 impl TuiRegistry {
@@ -305,6 +369,27 @@ impl TuiRegistry {
             bail!("unknown TUI panel: {id}");
         };
         panel.provider.open(context).await
+    }
+
+    pub fn register_status(
+        &mut self,
+        id: impl Into<String>,
+        provider: impl TuiStatusProvider + 'static,
+    ) -> Result<()> {
+        let id = id.into();
+        validate_name(&id)?;
+        if self.status.contains_key(&id) {
+            bail!("TUI status provider is already registered: {id}");
+        }
+        self.status.insert(id, Arc::new(provider));
+        Ok(())
+    }
+
+    pub fn status_items(&self, context: &TuiStatusContext) -> Vec<TuiStatusItem> {
+        self.status
+            .values()
+            .filter_map(|provider| provider.status(context))
+            .collect()
     }
 }
 
@@ -421,6 +506,10 @@ mod tests {
             registry.resolve("：login").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Login)
         );
+        assert_eq!(
+            registry.resolve(":status").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Status)
+        );
         assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
     }
 
@@ -467,6 +556,40 @@ mod tests {
             .unwrap();
         assert_eq!(document.title, "Plugin panel");
         assert_eq!(document.body, "session argument");
+    }
+
+    #[test]
+    fn registered_status_providers_receive_context_and_reject_collisions() {
+        let mut registry = TuiRegistry::default();
+        registry
+            .register_status("build", |context: &TuiStatusContext| {
+                Some(
+                    TuiStatusItem::new(
+                        "build",
+                        if context.expanded {
+                            format!("clean · {}", context.session_id)
+                        } else {
+                            "clean".to_string()
+                        },
+                    )
+                    .with_tone(TuiStatusTone::Accent),
+                )
+            })
+            .unwrap();
+        let context = TuiStatusContext {
+            cwd: PathBuf::from("/work"),
+            session_id: "session".to_string(),
+            expanded: true,
+        };
+        assert_eq!(
+            registry.status_items(&context),
+            vec![TuiStatusItem::new("build", "clean · session").with_tone(TuiStatusTone::Accent)]
+        );
+
+        let error = registry
+            .register_status("build", |_context: &TuiStatusContext| None)
+            .unwrap_err();
+        assert!(error.to_string().contains("already registered"));
     }
 
     #[derive(Clone)]

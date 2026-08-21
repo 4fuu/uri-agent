@@ -10,7 +10,7 @@ use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
     CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext,
-    TuiRegistry,
+    TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
 };
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
@@ -97,6 +97,7 @@ struct DisplayBlock {
 enum Overlay {
     Composer,
     Command,
+    Status,
     Help,
     Protocols,
     Tasks,
@@ -131,6 +132,7 @@ enum AppHit {
     Model(usize),
     Setting(usize),
     Selector(usize),
+    Status,
     Help,
 }
 
@@ -1246,6 +1248,7 @@ async fn dispatch_ui_command(
     arguments: String,
     services: &LoopServices,
 ) -> Action {
+    let previous_overlay = app.overlay;
     app.overlay = None;
     let command = match target {
         CommandTarget::Core(command) => command,
@@ -1286,6 +1289,12 @@ async fn dispatch_ui_command(
         CoreCommand::Protocols => {
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Protocols);
+            Action::Continue
+        }
+        CoreCommand::Status => {
+            if previous_overlay != Some(Overlay::Status) {
+                open_status(app);
+            }
             Action::Continue
         }
         CoreCommand::Models => Action::OpenModels(arguments),
@@ -1363,6 +1372,15 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             return dispatch_ui_command(
                 app,
                 CommandTarget::Core(CoreCommand::Tasks),
+                String::new(),
+                services,
+            )
+            .await;
+        }
+        Some("status") => {
+            return dispatch_ui_command(
+                app,
+                CommandTarget::Core(CoreCommand::Status),
                 String::new(),
                 services,
             )
@@ -1646,7 +1664,7 @@ async fn handle_overlay_key(
             _ => Action::Continue,
         },
         Overlay::Terminal => Action::Continue,
-        Overlay::Help | Overlay::Protocols | Overlay::Plugin => {
+        Overlay::Status | Overlay::Help | Overlay::Protocols | Overlay::Plugin => {
             match app.keymap.action("list", key_name).as_deref() {
                 Some("quit") => Action::Quit,
                 Some("close") => {
@@ -2043,6 +2061,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                         return confirm_selector(app, services).await;
                     }
                 }
+                AppHit::Status => open_status(app),
                 AppHit::Help => {
                     app.overlay_scroll = 0;
                     app.overlay = Some(Overlay::Help);
@@ -2052,6 +2071,11 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         _ => {}
     }
     Action::Continue
+}
+
+fn open_status(app: &mut App) {
+    app.overlay_scroll = 0;
+    app.overlay = Some(Overlay::Status);
 }
 
 async fn open_login(app: &mut App, catalog: &ModelCatalog, arguments: String) -> Action {
@@ -2772,7 +2796,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         } else {
             [
                 Constraint::Min(3),
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Length(1),
             ]
             .as_slice()
@@ -2851,103 +2875,196 @@ fn render_brand(frame: &mut Frame<'_>, app: &App, area: Rect, splash: bool) {
     );
 }
 
-/// Pi-style footer: `cwd (branch)` over a stats row with cumulative tokens,
-/// cost, the live context meter, and the model right-aligned.
+struct StatusSegment {
+    text: String,
+    style: Style,
+}
+
+impl StatusSegment {
+    fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
+/// Compact URI Agent footer. The richer project, usage, and extension details
+/// stay available through the bottom-anchored status panel.
 fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    if area.height < 2 || area.width == 0 {
+    if area.height == 0 || area.width == 0 {
         return;
     }
     let width = area.width as usize;
-    let mut pwd = footer_cwd(&app.info.cwd);
-    if let Some(branch) = current_branch(app) {
-        pwd = format!("{pwd} ({branch})");
-    }
-    let location = Line::styled(
-        single_line_preview(&pwd, width.saturating_sub(1)),
-        Style::default().fg(MUTED),
+    let branch = current_branch(app);
+    let percent = context_percent(app);
+    let path = footer_cwd(&app.info.cwd);
+    let path_min = path.chars().count().min(12);
+    let mut middle = Vec::new();
+    let mut tail = vec![
+        StatusSegment::new(
+            format!("ctx {percent:.1}%"),
+            Style::default()
+                .fg(context_color(percent))
+                .add_modifier(Modifier::BOLD),
+        ),
+        StatusSegment::new(
+            format!("{} more", status_key(app)),
+            Style::default().fg(MUTED),
+        ),
+    ];
+    let model = StatusSegment::new(
+        compact_model(app),
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
     );
+    if compact_footer_width(path_min, &middle, &tail) + model.text.chars().count() + 3 <= width {
+        tail.insert(1, model);
+    }
 
-    let mut stats = Vec::new();
-    if app.usage.input > 0 {
-        stats.push(format!("↑{}", format_tokens(app.usage.input)));
+    let mut candidates = vec![StatusSegment::new(
+        compact_usage(app),
+        Style::default().fg(TEXT),
+    )];
+    if let Some(branch) = branch {
+        candidates.push(StatusSegment::new(
+            format!("git:{branch}"),
+            Style::default().fg(WARM),
+        ));
     }
-    if app.usage.output > 0 {
-        stats.push(format!("↓{}", format_tokens(app.usage.output)));
-    }
-    if app.usage.cache_read > 0 {
-        stats.push(format!("R{}", format_tokens(app.usage.cache_read)));
-    }
-    if app.usage.cache_write > 0 {
-        stats.push(format!("W{}", format_tokens(app.usage.cache_write)));
-    }
-    if (app.usage.cache_read > 0 || app.usage.cache_write > 0)
-        && let Some(rate) = app.last_cache_hit
-    {
-        stats.push(format!("CH{rate:.1}%"));
-    }
-    let subscription = app.info.provider == "kimi-coding";
-    if app.usage.cost > 0.0 || subscription {
-        let suffix = if subscription { " (sub)" } else { "" };
-        stats.push(format!("${:.3}{suffix}", app.usage.cost));
-    }
-    let window = app.info.context_window;
-    let percent = if window > 0 {
-        app.info.context_tokens as f64 / window as f64 * 100.0
-    } else {
-        0.0
-    };
-    let context_display = format!("{percent:.1}%/{} (auto)", format_tokens(window as u64));
-    let plain_width = stats.iter().map(|part| part.chars().count()).sum::<usize>()
-        + stats.len()
-        + context_display.chars().count();
-    let mut stats_text = stats.join(" ");
-    if plain_width > width {
-        stats_text = single_line_preview(&stats_text, width);
-    }
-    let stats_width = stats_text.chars().count()
-        + usize::from(!stats_text.is_empty())
-        + context_display.chars().count();
-
-    let model_name = if app.info.model_ready && !app.info.model.is_empty() {
-        app.info.model.clone()
-    } else {
-        "no-model".to_string()
-    };
-    let mut right = model_name.clone();
-    if app.info.provider_count > 1 && app.info.model_ready {
-        let with_provider = format!("({}) {model_name}", app.info.provider);
-        if stats_width + 2 + with_provider.chars().count() <= width {
-            right = with_provider;
+    candidates.extend(plugin_status_items(app, false).into_iter().map(|item| {
+        StatusSegment::new(
+            single_line_preview(&format!("{} {}", item.label, item.value), 32),
+            status_tone_style(item.tone),
+        )
+    }));
+    for candidate in candidates {
+        let projected =
+            compact_footer_width(path_min, &middle, &tail) + candidate.text.chars().count() + 3;
+        if projected <= width {
+            middle.push(candidate);
         }
     }
-    let available_right = width.saturating_sub(stats_width + 2);
-    if right.chars().count() > available_right {
-        right = right.chars().take(available_right).collect();
+
+    let fixed = compact_footer_width(0, &middle, &tail);
+    let path = single_line_preview(&path, width.saturating_sub(fixed));
+    let mut segments = vec![
+        StatusSegment::new(
+            " URI ",
+            Style::default()
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        StatusSegment::new(
+            path,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    segments.extend(middle);
+    segments.extend(tail);
+    let mut spans = Vec::new();
+    for (index, segment) in segments.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" │ ", Style::default().fg(MUTED)));
+        }
+        spans.push(Span::styled(segment.text, segment.style));
     }
-    let right_width = right.chars().count();
-    let padding = " ".repeat(width.saturating_sub(stats_width + right_width));
-    let context_color = if percent > 90.0 {
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
+        area,
+    );
+    app.hit_regions.push(HitRegion {
+        area,
+        target: AppHit::Status,
+    });
+}
+
+fn compact_footer_width(
+    path_width: usize,
+    middle: &[StatusSegment],
+    tail: &[StatusSegment],
+) -> usize {
+    let segment_count = 2 + middle.len() + tail.len();
+    5 + path_width
+        + middle
+            .iter()
+            .chain(tail)
+            .map(|segment| segment.text.chars().count())
+            .sum::<usize>()
+        + segment_count.saturating_sub(1) * 3
+}
+
+fn compact_usage(app: &App) -> String {
+    let mut parts = if app.usage.input == 0 && app.usage.output == 0 {
+        vec!["tokens 0".to_string()]
+    } else {
+        vec![
+            format!("↑{}", format_tokens(app.usage.input)),
+            format!("↓{}", format_tokens(app.usage.output)),
+        ]
+    };
+    let subscription = app.info.provider == "kimi-coding";
+    if app.usage.cost > 0.0 || subscription {
+        parts.push(format!(
+            "${:.3}{}",
+            app.usage.cost,
+            if subscription { " sub" } else { "" }
+        ));
+    }
+    parts.join(" ")
+}
+
+fn compact_model(app: &App) -> String {
+    if !app.info.model_ready || app.info.model.is_empty() {
+        return "no-model".to_string();
+    }
+    if app.info.provider_count > 1 {
+        format!("{}/{}", app.info.provider, app.info.model)
+    } else {
+        app.info.model.clone()
+    }
+}
+
+fn context_percent(app: &App) -> f64 {
+    if app.info.context_window > 0 {
+        app.info.context_tokens as f64 / app.info.context_window as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
+fn context_color(percent: f64) -> Color {
+    if percent > 90.0 {
         ERROR
     } else if percent > 70.0 {
         WARM
     } else {
-        MUTED
-    };
-    // The context meter keeps its severity color; everything else stays dim.
-    let mut spans = Vec::new();
-    if !stats_text.is_empty() {
-        spans.push(Span::styled(stats_text, Style::default().fg(MUTED)));
-        spans.push(Span::raw(" "));
+        ACCENT
     }
-    spans.push(Span::styled(
-        context_display,
-        Style::default().fg(context_color),
-    ));
-    spans.push(Span::styled(
-        format!("{padding}{right}"),
-        Style::default().fg(MUTED),
-    ));
-    frame.render_widget(Paragraph::new(vec![location, Line::from(spans)]), area);
+}
+
+fn status_key(app: &App) -> String {
+    app.keymap
+        .key_for("global", "status")
+        .unwrap_or_else(|| ":status".to_string())
+        .to_ascii_uppercase()
+}
+
+fn plugin_status_items(app: &App, expanded: bool) -> Vec<TuiStatusItem> {
+    app.tui.status_items(&TuiStatusContext {
+        cwd: app.info.cwd.clone(),
+        session_id: app.info.session_id.clone(),
+        expanded,
+    })
+}
+
+fn status_tone_style(tone: TuiStatusTone) -> Style {
+    Style::default().fg(match tone {
+        TuiStatusTone::Default => TEXT,
+        TuiStatusTone::Accent => ACCENT,
+        TuiStatusTone::Warning => WARM,
+        TuiStatusTone::Error => ERROR,
+    })
 }
 
 fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -3218,6 +3335,7 @@ fn command_help(commands: &CommandRegistry) -> String {
 fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
+        Overlay::Status => bottom_float(frame, 14),
         Overlay::Composer | Overlay::Text | Overlay::Oauth => Rect::new(
             2,
             frame.height.saturating_sub(12).max(2),
@@ -3228,6 +3346,18 @@ fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
         Overlay::Models | Overlay::Settings | Overlay::Selector => centered(frame, 82, 78),
         _ => centered(frame, 78, 72),
     }
+}
+
+fn bottom_float(frame: Rect, desired_height: u16) -> Rect {
+    let horizontal_margin = u16::from(frame.width > 4) * 2;
+    let width = frame.width.saturating_sub(horizontal_margin * 2);
+    let height = desired_height.min(frame.height).max(1);
+    Rect::new(
+        frame.x.saturating_add(horizontal_margin),
+        frame.bottom().saturating_sub(height),
+        width,
+        height,
+    )
 }
 
 fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
@@ -3244,6 +3374,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
             frame.render_widget(&app.input, area);
         }
         Overlay::Command => render_command(frame, app, area, block),
+        Overlay::Status => render_status(frame, app, area, block),
         Overlay::Help => {
             let text = format!(
                 "KEYS\n\n{}COMMANDS\n{}\nSESSION\n{}\n{}\n\nPROJECT\n{}",
@@ -3405,6 +3536,123 @@ fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if let Some(error) = resize_error {
         app.set_flash(format!("Embedded terminal resize failed: {error:#}"));
     }
+}
+
+fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let branch = current_branch(app);
+    let percent = context_percent(app);
+    let project = branch.map_or_else(
+        || display_cwd(&app.info.cwd),
+        |branch| format!("{} · git:{branch}", display_cwd(&app.info.cwd)),
+    );
+    let state = app
+        .activity
+        .as_ref()
+        .map(Activity::label)
+        .unwrap_or_else(|| "ready".to_string());
+    let cache_hit = app
+        .last_cache_hit
+        .map(|rate| format!("{rate:.1}%"))
+        .unwrap_or_else(|| "—".to_string());
+    let subscription = app.info.provider == "kimi-coding";
+    let mut lines = vec![
+        status_row("PROJECT", project, Style::default().fg(ACCENT)),
+        status_row(
+            "SESSION",
+            app.info.session_id.clone(),
+            Style::default().fg(TEXT),
+        ),
+        status_row(
+            "MODEL",
+            if app.info.model_ready {
+                format!("{} / {}", app.info.provider, app.info.model)
+            } else {
+                "not configured · :login".to_string()
+            },
+            Style::default().fg(if app.info.model_ready { TEXT } else { WARM }),
+        ),
+        status_row("STATE", state, Style::default().fg(ACCENT)),
+        status_row(
+            "CONTEXT",
+            format!(
+                "{} / {} · {percent:.1}% · automatic compaction",
+                format_tokens(app.info.context_tokens as u64),
+                format_tokens(app.info.context_window as u64),
+            ),
+            Style::default()
+                .fg(context_color(percent))
+                .add_modifier(Modifier::BOLD),
+        ),
+        status_row(
+            "TOKENS",
+            format!(
+                "input {} · output {} · total {}",
+                format_tokens(app.usage.input),
+                format_tokens(app.usage.output),
+                format_tokens(app.usage.input.saturating_add(app.usage.output)),
+            ),
+            Style::default().fg(TEXT),
+        ),
+        status_row(
+            "CACHE",
+            format!(
+                "read {} · write {} · last hit {cache_hit}",
+                format_tokens(app.usage.cache_read),
+                format_tokens(app.usage.cache_write),
+            ),
+            Style::default().fg(TEXT),
+        ),
+        status_row(
+            "COST",
+            format!(
+                "${:.4}{}",
+                app.usage.cost,
+                if subscription { " · subscription" } else { "" }
+            ),
+            Style::default().fg(if subscription { ACCENT } else { TEXT }),
+        ),
+        status_row(
+            "PROTOCOLS",
+            format!("{} registered", app.protocols.len()),
+            Style::default().fg(TEXT),
+        ),
+    ];
+    let plugin_items = plugin_status_items(app, true);
+    if !plugin_items.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "EXTENSIONS",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        lines.extend(plugin_items.into_iter().map(|item| {
+            status_row(
+                single_line_preview(&item.label, 18),
+                single_line_preview(&item.value, 256),
+                status_tone_style(item.tone),
+            )
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block.title(format!(" STATUS · {} toggle · Esc close ", status_key(app))))
+            .wrap(Wrap { trim: false })
+            .scroll((app.overlay_scroll, 0)),
+        area,
+    );
+}
+
+fn status_row(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    value_style: Style,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<11}", label.into()),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value.into(), value_style),
+    ])
 }
 
 fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
@@ -4077,9 +4325,10 @@ mod tests {
             .backend()
             .buffer()
             .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -4099,7 +4348,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_chrome_has_no_vim_modes_or_status_bar() {
+    fn conversation_footer_is_one_highlighted_project_status_line() {
         let mut app = test_app();
         app.push(
             BlockKind::Assistant,
@@ -4110,13 +4359,19 @@ mod tests {
             false,
         );
         let rendered = render_to_string(&mut app, 100, 24);
-        // Once records exist the header and its animation are gone; the
-        // pi-style footer owns the bottom two lines.
+        let footer = rendered
+            .lines()
+            .find(|line| line.contains(" URI "))
+            .expect("compact URI footer");
+        // Once records exist the header and its animation are gone. Project,
+        // usage, context, model, and the expansion hint share one footer row.
         assert!(!rendered.contains("URI Agent"));
         assert!(!rendered.contains("ready"));
-        assert!(rendered.contains("/workspace"));
-        assert!(rendered.contains("0.0%/128k (auto)"));
-        assert!(rendered.contains("model"));
+        assert!(footer.contains("/workspace"));
+        assert!(footer.contains("tokens 0"));
+        assert!(footer.contains("ctx 0.0%"));
+        assert!(footer.contains("model"));
+        assert!(footer.contains("F4 more"));
         assert!(rendered.contains(": command"));
         assert!(rendered.contains("?"));
         assert!(
@@ -4128,10 +4383,37 @@ mod tests {
         assert!(!rendered.contains("BROWSE"));
         assert!(!rendered.contains("INSERT"));
         assert!(!rendered.contains("event 1/1"));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let badge = &terminal.backend().buffer()[(1, 22)];
+        let project = &terminal.backend().buffer()[(8, 22)];
+        assert_eq!((badge.fg, badge.bg), (BG, ACCENT));
+        assert!(badge.modifier.contains(Modifier::BOLD));
+        assert_eq!(project.fg, ACCENT);
+        assert!(project.modifier.contains(Modifier::BOLD));
+
+        let status_region = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == AppHit::Status)
+            .copied()
+            .expect("footer mouse target");
+        assert_eq!(status_region.area, Rect::new(0, 22, 100, 1));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: status_region.area.x,
+            row: status_region.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(hit_target(&app.hit_regions, click), Some(AppHit::Status));
+        open_status(&mut app);
+        assert!(app.overlay == Some(Overlay::Status));
     }
 
     #[test]
-    fn footer_accumulates_usage_events_and_right_aligns_the_model() {
+    fn compact_and_expanded_status_show_usage_at_the_right_level_of_detail() {
         let mut app = test_app();
         app.info.provider_count = 2;
         app.info.context_tokens = 12_800;
@@ -4157,13 +4439,64 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("↑1.5k"));
         assert!(rendered.contains("↓600"));
-        assert!(rendered.contains("R500"));
-        assert!(rendered.contains("CH25.0%"));
         assert!(rendered.contains("$0.012"));
-        assert!(rendered.contains("10.0%/128k (auto)"));
-        assert!(rendered.contains("(test) model"));
+        assert!(rendered.contains("ctx 10.0%"));
+        assert!(rendered.contains("test/model"));
+        assert!(!rendered.contains("last hit 25.0%"));
+
+        app.overlay = Some(Overlay::Status);
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("STATUS · F4 toggle"));
+        assert!(rendered.contains("12k / 128k · 10.0%"));
+        assert!(rendered.contains("read 500 · write 0 · last hit 25.0%"));
+        assert!(rendered.contains("$0.0123"));
         // Usage events update the footer without adding transcript blocks.
         assert_eq!(app.blocks.len(), 1);
+    }
+
+    #[test]
+    fn expanded_status_is_bottom_anchored_and_includes_plugin_rows() {
+        let mut tui = TuiRegistry::default();
+        tui.register_status("build", |context: &TuiStatusContext| {
+            Some(
+                TuiStatusItem::new(
+                    "build",
+                    if context.expanded {
+                        format!("clean · session {}", context.session_id)
+                    } else {
+                        "clean".to_string()
+                    },
+                )
+                .with_tone(TuiStatusTone::Accent),
+            )
+        })
+        .unwrap();
+        let mut app = test_app();
+        app.tui = Arc::new(tui);
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            false,
+        );
+        let rendered = render_to_string(&mut app, 140, 24);
+        let footer = rendered
+            .lines()
+            .find(|line| line.contains(" URI "))
+            .expect("compact URI footer");
+        assert!(footer.contains("build clean"));
+
+        assert_eq!(
+            overlay_area(Rect::new(0, 0, 100, 24), Overlay::Status),
+            Rect::new(2, 10, 96, 14)
+        );
+        app.overlay = Some(Overlay::Status);
+        app.overlay_scroll = 6;
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("EXTENSIONS"));
+        assert!(rendered.contains("clean · session session"));
     }
 
     #[test]

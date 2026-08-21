@@ -11,6 +11,7 @@ map("global", "ctrl+c", "quit");
 map("global", "f1", "help");
 map("global", "f2", "settings");
 map("global", "f3", "model");
+map("global", "f4", "status");
 map("global", "ctrl+,", "settings");
 map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");
@@ -312,6 +313,7 @@ mod tests {
         );
         assert_eq!(keymap.action("command", "tab").as_deref(), Some("complete"));
         assert_eq!(keymap.action("global", "f3").as_deref(), Some("model"));
+        assert_eq!(keymap.action("global", "f4").as_deref(), Some("status"));
         assert_eq!(keymap.action("models", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("selector", "k"), None);
