@@ -35,6 +35,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-rusqlite = { version = "0.7", features = ["bundled"] }
 tui-term = "0.3"
 tui-textarea = { package = "tui-textarea-2", version = "0.9" }
+unicode-width = "0.2"
 uuid = { version = "1", features = ["serde", "v7"] }
 vt100 = "0.16"
 

@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tui_term::widget::PseudoTerminal;
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthChar;
 
 const BG: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(21, 24, 28);
@@ -133,7 +134,6 @@ enum AppHit {
     Setting(usize),
     Selector(usize),
     Status,
-    Help,
 }
 
 #[derive(Clone)]
@@ -320,6 +320,7 @@ struct App {
     activity: Option<Activity>,
     busy_since: Option<Instant>,
     frame: usize,
+    composer_scroll: (u16, u16),
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
@@ -378,6 +379,7 @@ impl App {
             activity: None,
             busy_since: None,
             frame: 0,
+            composer_scroll: (0, 0),
             started: Instant::now(),
             splash_skipped: false,
             last_sequence: None,
@@ -415,6 +417,10 @@ impl App {
 
     fn skip_splash(&mut self) {
         self.splash_skipped = true;
+    }
+
+    fn animations_paused(&self) -> bool {
+        self.overlay == Some(Overlay::Composer)
     }
 
     fn apply(&mut self, event: SessionEvent) {
@@ -623,6 +629,7 @@ impl App {
             return None;
         }
         self.input = TextArea::default();
+        self.composer_scroll = (0, 0);
         style_input(&mut self.input, true);
         self.busy = true;
         self.busy_since = Some(Instant::now());
@@ -633,13 +640,6 @@ impl App {
 
     fn draft_text(&self) -> String {
         self.input.lines().join("\n")
-    }
-
-    fn has_draft(&self) -> bool {
-        self.input
-            .lines()
-            .iter()
-            .any(|line| !line.trim().is_empty())
     }
 
     fn set_flash(&mut self, message: impl Into<String>) {
@@ -977,12 +977,15 @@ async fn run_loop(
 ) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
+    animation.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
     loop {
         app.info.context_tokens = services.runtime.estimated_context();
         terminal.draw(|frame| render(frame, app))?;
         tokio::select! {
-            _ = animation.tick() => app.frame = app.frame.wrapping_add(1),
+            _ = animation.tick(), if !app.animations_paused() => {
+                app.frame = app.frame.wrapping_add(1);
+            },
             event = terminal_events.next() => {
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
                 match event? {
@@ -2062,10 +2065,6 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                     }
                 }
                 AppHit::Status => open_status(app),
-                AppHit::Help => {
-                    app.overlay_scroll = 0;
-                    app.overlay = Some(Overlay::Help);
-                }
             }
         }
         _ => {}
@@ -2789,28 +2788,35 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
     let idle = app.blocks.is_empty();
+    let notice = status_notice(app);
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if idle {
-            [Constraint::Min(3), Constraint::Length(1)].as_slice()
-        } else {
-            [
+        .constraints(match (idle, notice.is_some()) {
+            (true, false) => [Constraint::Min(3)].as_slice(),
+            (true, true) | (false, false) => [Constraint::Min(3), Constraint::Length(1)].as_slice(),
+            (false, true) => [
                 Constraint::Min(3),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ]
-            .as_slice()
+            .as_slice(),
         })
         .split(area);
     let content = if idle {
-        render_brand(frame, app, area, false);
+        render_brand(frame, app, areas[0], false);
         areas[0]
     } else {
         render_transcript(frame, app, areas[0]);
         render_footer(frame, app, areas[1]);
         areas[0]
     };
-    render_hints(frame, app, *areas.last().expect("hints"));
+    if let Some((message, color)) = notice {
+        let notice_area = if idle { areas[1] } else { areas[2] };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)),
+            notice_area,
+        );
+    }
     let selectable_area = if let Some(overlay) = app.overlay {
         app.hit_regions.clear();
         render_overlay(frame, app, overlay);
@@ -2841,7 +2847,8 @@ fn wordmark_box(area: Rect) -> Rect {
     )
 }
 
-fn render_brand(frame: &mut Frame<'_>, app: &App, area: Rect, splash: bool) {
+fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, splash: bool) {
+    let brand_area = wordmark_box(area);
     let progress = (app.started.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()) * 1.25;
     let mut lines = if splash && progress < 1.0 {
         animation::wordmark_reveal(app.frame, progress)
@@ -2851,28 +2858,52 @@ fn render_brand(frame: &mut Frame<'_>, app: &App, area: Rect, splash: bool) {
     .into_iter()
     .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
     .collect::<Vec<_>>();
-    lines.extend([
-        Line::default(),
-        Line::styled(
-            "URI AGENT",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-    ]);
     if splash {
         lines.extend([
             Line::default(),
             Line::styled("press any key", Style::default().fg(MUTED)),
         ]);
-    } else if !app.info.model_ready {
-        lines.extend([
-            Line::default(),
-            Line::styled("尚未配置，请运行 :login", Style::default().fg(WARM)),
-        ]);
+    } else {
+        lines.push(Line::default());
+        lines.extend(brand_status_lines(app, brand_area.width as usize));
+        if !app.info.model_ready {
+            lines.extend([
+                Line::default(),
+                Line::styled("尚未配置，请运行 :login", Style::default().fg(WARM)),
+            ]);
+        }
     }
     frame.render_widget(
         Paragraph::new(lines).alignment(Alignment::Center),
-        wordmark_box(area),
+        brand_area,
     );
+}
+
+fn brand_status_lines(app: &mut App, width: usize) -> Vec<Line<'static>> {
+    let mut project = footer_cwd(&app.info.cwd);
+    if let Some(branch) = current_branch(app) {
+        project = format!("{project} ({branch})");
+    }
+    let mut details = vec![
+        compact_usage(app),
+        format!("ctx {:.1}%", context_percent(app)),
+        compact_model(app),
+    ];
+    details.extend(
+        plugin_status_items(app, false)
+            .into_iter()
+            .map(|item| format!("{} {}", item.label, item.value)),
+    );
+    vec![
+        Line::styled(
+            single_line_preview(&project, width.saturating_sub(1)),
+            Style::default().fg(MUTED),
+        ),
+        Line::styled(
+            single_line_preview(&details.join(" │ "), width.saturating_sub(1)),
+            Style::default().fg(TEXT),
+        ),
+    ]
 }
 
 struct StatusSegment {
@@ -3212,7 +3243,7 @@ fn expanded_lines(block: &DisplayBlock, width: usize) -> Vec<ListItem<'static>> 
         .collect()
 }
 
-fn render_hints(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn status_notice(app: &App) -> Option<(String, Color)> {
     let (message, color) = if app.busy {
         let activity = app
             .activity
@@ -3256,31 +3287,10 @@ fn render_hints(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             ),
             WARM,
         )
-    } else if app.has_draft() {
-        (" draft kept · i to continue".to_string(), WARM)
     } else {
-        (" i compose   : command".to_string(), MUTED)
+        return None;
     };
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(area);
-    frame.render_widget(
-        Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)),
-        columns[0],
-    );
-    frame.render_widget(
-        Paragraph::new("?")
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(MUTED).bg(SURFACE)),
-        columns[1],
-    );
-    if !columns[1].is_empty() {
-        app.hit_regions.push(HitRegion {
-            area: columns[1],
-            target: AppHit::Help,
-        });
-    }
+    Some((message, color))
 }
 
 fn flash_is_error(flash: &str) -> bool {
@@ -3372,6 +3382,11 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         Overlay::Composer => {
             style_input(&mut app.input, app.busy);
             frame.render_widget(&app.input, area);
+            if let Some(position) =
+                composer_cursor_position(&app.input, area, &mut app.composer_scroll)
+            {
+                frame.set_cursor_position(position);
+            }
         }
         Overlay::Command => render_command(frame, app, area, block),
         Overlay::Status => render_status(frame, app, area, block),
@@ -4001,6 +4016,54 @@ fn style_input(input: &mut TextArea<'static>, busy: bool) {
     input.set_cursor_style(Style::default().fg(BG).bg(ACCENT));
 }
 
+fn composer_cursor_position(
+    input: &TextArea<'_>,
+    area: Rect,
+    scroll: &mut (u16, u16),
+) -> Option<(u16, u16)> {
+    let inner = input.block().map_or(area, |block| block.inner(area));
+    if inner.is_empty() {
+        return None;
+    }
+    let (logical_row, col) = input.cursor();
+    let display_col = input
+        .lines()
+        .get(logical_row)
+        .map(|line| input_line_width(line, col, input.tab_length()))
+        .unwrap_or(0);
+    let row = u16::try_from(logical_row).unwrap_or(u16::MAX);
+    let top_row = scroll_to_cursor(scroll.0, row, inner.height);
+    let top_col = scroll_to_cursor(scroll.1, display_col, inner.width);
+    *scroll = (top_row, top_col);
+    Some((
+        inner.x.saturating_add(display_col.saturating_sub(top_col)),
+        inner.y.saturating_add(row.saturating_sub(top_row)),
+    ))
+}
+
+fn input_line_width(line: &str, chars: usize, tab_length: u8) -> u16 {
+    let mut width = 0usize;
+    for character in line.chars().take(chars) {
+        if character == '\t' && tab_length > 0 {
+            let tab_length = tab_length as usize;
+            width += tab_length - width % tab_length;
+        } else {
+            width += character.width().unwrap_or(0);
+        }
+    }
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+fn scroll_to_cursor(previous: u16, cursor: u16, length: u16) -> u16 {
+    if cursor < previous {
+        cursor
+    } else if previous.saturating_add(length) <= cursor {
+        cursor.saturating_add(1).saturating_sub(length)
+    } else {
+        previous
+    }
+}
+
 fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -4372,13 +4435,8 @@ mod tests {
         assert!(footer.contains("ctx 0.0%"));
         assert!(footer.contains("model"));
         assert!(footer.contains("F4 more"));
-        assert!(rendered.contains(": command"));
-        assert!(rendered.contains("?"));
-        assert!(
-            app.hit_regions
-                .iter()
-                .any(|region| region.target == AppHit::Help)
-        );
+        assert!(!rendered.contains("i compose"));
+        assert!(!rendered.contains(": command"));
         assert!(!rendered.contains("r thinking"));
         assert!(!rendered.contains("BROWSE"));
         assert!(!rendered.contains("INSERT"));
@@ -4387,8 +4445,8 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let badge = &terminal.backend().buffer()[(1, 22)];
-        let project = &terminal.backend().buffer()[(8, 22)];
+        let badge = &terminal.backend().buffer()[(1, 23)];
+        let project = &terminal.backend().buffer()[(8, 23)];
         assert_eq!((badge.fg, badge.bg), (BG, ACCENT));
         assert!(badge.modifier.contains(Modifier::BOLD));
         assert_eq!(project.fg, ACCENT);
@@ -4400,7 +4458,7 @@ mod tests {
             .find(|region| region.target == AppHit::Status)
             .copied()
             .expect("footer mouse target");
-        assert_eq!(status_region.area, Rect::new(0, 22, 100, 1));
+        assert_eq!(status_region.area, Rect::new(0, 23, 100, 1));
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: status_region.area.x,
@@ -4552,16 +4610,22 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(splash.contains("URI AGENT"));
+        assert!(splash.contains("press any key"));
+        assert!(!splash.contains("URI AGENT"));
         app.skip_splash();
         let rendered = render_to_string(&mut app, 80, 24);
-        assert!(rendered.contains("i compose"));
+        assert!(rendered.contains("/workspace"));
+        assert!(rendered.contains("tokens 0"));
+        assert!(rendered.contains("ctx 0.0%"));
+        assert!(rendered.contains("model"));
+        assert!(!rendered.contains("i compose"));
     }
 
     #[test]
     fn composer_enter_sends_shift_enter_breaks_and_esc_keeps_draft() {
         let mut app = test_app();
         app.overlay = Some(Overlay::Composer);
+        assert!(app.animations_paused());
         app.input.insert_str("first");
         assert_eq!(
             app.keymap.action("composer", "shift+enter").as_deref(),
@@ -4574,8 +4638,36 @@ mod tests {
         app.overlay = Some(Overlay::Composer);
         let prompt = app.submit().unwrap();
         assert_eq!(prompt, "first\nsecond");
-        assert!(!app.has_draft());
+        assert!(app.draft_text().is_empty());
         assert!(app.overlay.is_none());
+        assert!(!app.animations_paused());
+    }
+
+    #[test]
+    fn composer_places_the_terminal_cursor_at_the_unicode_caret() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("你好");
+        app.input.insert_newline();
+        app.input.insert_str("ok");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.backend_mut().assert_cursor_position((5, 14));
+    }
+
+    #[test]
+    fn composer_cursor_tracks_horizontal_scrolling() {
+        let mut input = TextArea::default();
+        style_input(&mut input, false);
+        input.insert_str("123456789");
+        let mut scroll = (0, 0);
+        assert_eq!(
+            composer_cursor_position(&input, Rect::new(2, 12, 10, 10), &mut scroll),
+            Some((10, 13))
+        );
+        assert_eq!(scroll, (0, 2));
     }
 
     #[test]
