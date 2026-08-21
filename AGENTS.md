@@ -14,12 +14,16 @@ Keep these product invariants intact:
 - Preserve oversized output in the session output directory and return a readable `file://` address.
 - Give every discovered Skill its own `<normalized-name>-skill` protocol. `://help` returns its `SKILL.md` plus the real Skill directory; resource routes must not escape that directory.
 - Register `bash` and `pwsh` only when an executable is present in the environment.
+- Keep Sessions, Browse, Insert, and Detail as distinct TUI contexts. Conversation rows are previews; complete reasoning, tool calls/results, and messages remain individually inspectable.
+- Keep arrows and mouse as first-class navigation. `j/k` may remain aliases, but defaults and interface hints must not require Vim knowledge. Browse mode owns the discoverable Space command panel and `:` command line.
+- Resolve keyboard behavior through the layered Rhai keymap. Do not reintroduce modeless hard-coded shortcuts for configurable actions.
 
 ## Code Map
 
 - `src/main.rs`: application assembly and protocol registration.
 - `src/catalog.rs`: pi.dev model catalog, cache, and `models.json` overlays.
 - `src/config.rs`: layered text configuration, credentials, CLI, and environment overrides.
+- `src/keymap.rs`: modern modal defaults and global/project Rhai overlays.
 - `src/model.rs`: Rig provider adapter and the two model-facing tool schemas.
 - `src/runtime.rs`: model/tool loop and tool-call correlation.
 - `src/protocol.rs`: protocol contract, registry, dispatch, and output presentation.
@@ -29,7 +33,7 @@ Keep these product invariants intact:
 - `src/skill.rs`: Skill discovery, metadata parsing, and resource containment.
 - `src/session.rs`: SQLite event persistence and replay.
 - `src/prompts.rs`: model-facing system, tool, and protocol help text.
-- `src/tui.rs`: Ratatui state, input handling, overlays, and rendering.
+- `src/tui.rs`: Sessions/directory selection, Browse/Insert modes, event details, external-editor suspension, overlays, and rendering.
 
 Put behavior in the module that owns it. Avoid wrappers or helpers used by only one call site unless they enforce a named invariant.
 
@@ -55,7 +59,8 @@ Add focused tests beside changed behavior. Shared protocol, task, session, or mo
 - Shell cancellation must terminate child processes, not only the parent future.
 - File edits must remain atomic and exact replacements must reject missing or ambiguous matches.
 - Preserve terminal restoration on every TUI exit and error path.
-- Keep the interface keyboard-complete; mouse support is supplementary.
+- Keep the interface keyboard-complete and preserve mouse hit regions for selectable lists and command panels.
+- Preserve terminal restoration before launching `fzf` or an external editor, then recreate the event stream after returning.
 - Do not add credentials, generated sessions, complete-output files, or `target/` artifacts to Git.
 
 ## Documentation

@@ -8,11 +8,68 @@ use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice};
 use uri_agent::task::TaskManager;
-use uri_agent::tui::TuiInfo;
+use uri_agent::tui::{SessionLaunch, TuiExit, TuiInfo};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::load(Cli::parse()).await?;
+    let cli = Cli::parse();
+    let startup_cwd = cli
+        .cwd
+        .clone()
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()?;
+    let mut launch = initial_launch(&cli, &startup_cwd).await?;
+    while let Some(selected) = launch {
+        let config = Config::load(cli_for_launch(&cli, &selected)).await?;
+        let exit = run_session(config).await?;
+        launch = match exit {
+            TuiExit::Quit => None,
+            TuiExit::Sessions => uri_agent::tui::select_session(&selected.cwd).await?,
+        };
+    }
+    Ok(())
+}
+
+async fn initial_launch(cli: &Cli, startup_cwd: &std::path::Path) -> Result<Option<SessionLaunch>> {
+    if cli.cwd.is_none() && !cli.continue_session && cli.session.is_none() {
+        return uri_agent::tui::select_session(startup_cwd).await;
+    }
+    let session = if cli.continue_session {
+        SessionChoice::Latest
+    } else if let Some(id) = &cli.session {
+        SessionChoice::Existing(id.clone())
+    } else {
+        SessionChoice::New
+    };
+    let cwd = if cli.cwd.is_some() {
+        startup_cwd.to_path_buf()
+    } else {
+        let sessions = Session::list(startup_cwd).await?;
+        let summary = match &session {
+            SessionChoice::Latest => sessions.first(),
+            SessionChoice::Existing(id) => sessions.iter().find(|session| &session.id == id),
+            SessionChoice::New => None,
+        };
+        summary
+            .map(|session| session.cwd.clone())
+            .unwrap_or_else(|| startup_cwd.to_path_buf())
+            .canonicalize()?
+    };
+    Ok(Some(SessionLaunch { cwd, session }))
+}
+
+fn cli_for_launch(cli: &Cli, launch: &SessionLaunch) -> Cli {
+    let mut selected = cli.clone();
+    selected.cwd = Some(launch.cwd.clone());
+    selected.continue_session = matches!(launch.session, SessionChoice::Latest);
+    selected.session = match &launch.session {
+        SessionChoice::Existing(id) => Some(id.clone()),
+        SessionChoice::New | SessionChoice::Latest => None,
+    };
+    selected
+}
+
+async fn run_session(config: Config) -> Result<TuiExit> {
     let initial = config.manager.current().await;
     let requested = match &config.session {
         SessionChoice::New => None,
@@ -72,6 +129,7 @@ async fn main() -> Result<()> {
             provider: initial.provider,
             model: initial.model,
             session_id: session.id().to_string(),
+            editor: initial.editor,
         },
     )
     .await

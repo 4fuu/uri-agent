@@ -1,6 +1,7 @@
 pub mod builtins;
 pub mod catalog;
 pub mod config;
+pub mod keymap;
 pub mod model;
 pub mod output;
 pub mod prompts;

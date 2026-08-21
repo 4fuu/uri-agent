@@ -15,8 +15,9 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
+const DEFAULT_EDITOR: &str = "hx";
 
-#[derive(Parser, Debug)]
+#[derive(Clone, Parser, Debug)]
 #[command(name = "uri-agent", version, about)]
 pub struct Cli {
     /// Provider ID from the Pi model catalog, for example openai or anthropic.
@@ -34,6 +35,10 @@ pub struct Cli {
     /// Override the number of bytes returned inline before URI Agent spills output to a file.
     #[arg(long)]
     pub output_limit: Option<usize>,
+
+    /// External editor command used for drafts and event details.
+    #[arg(long, value_name = "COMMAND")]
+    pub editor: Option<String>,
 
     /// Disable pi.dev model-catalog network requests and use the local cache only.
     #[arg(long)]
@@ -83,6 +88,7 @@ impl Config {
                     model: cli.model,
                     api_key: cli.api_key,
                     output_limit: cli.output_limit,
+                    editor: cli.editor,
                 },
             )
             .await?,
@@ -136,10 +142,12 @@ pub struct ActiveSettings {
     pub model: String,
     pub api_key: Option<String>,
     pub output_limit: usize,
+    pub editor: Option<String>,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
     pub api_key_source: ValueSource,
     pub output_limit_source: ValueSource,
+    pub editor_source: ValueSource,
     pub credential_environment: BTreeMap<String, String>,
 }
 
@@ -155,6 +163,7 @@ struct InvocationOverrides {
     model: Option<String>,
     api_key: Option<String>,
     output_limit: Option<usize>,
+    editor: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -166,6 +175,8 @@ struct SettingsFile {
     default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -222,6 +233,7 @@ impl ConfigManager {
             global.default_provider = Some("openai".to_string());
             global.default_model = Some("gpt-5.2".to_string());
             global.output_limit = Some(DEFAULT_OUTPUT_LIMIT);
+            global.editor = Some(DEFAULT_EDITOR.to_string());
             write_json(&global_path, &global, false).await?;
         }
         if !auth_path.exists() {
@@ -285,6 +297,22 @@ impl ConfigManager {
             (&mut files.global, self.settings_path())
         };
         settings.output_limit = Some(output_limit);
+        write_json(&path, settings, false).await?;
+        self.recalculate(&files).await
+    }
+
+    pub async fn set_editor(&self, editor: Option<String>) -> Result<ActiveSettings> {
+        let editor = editor.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
+        let mut files = self.files.lock().await;
+        let (settings, path) = if self.project_path.exists() {
+            (&mut files.project, self.project_path.clone())
+        } else {
+            (&mut files.global, self.settings_path())
+        };
+        settings.editor = editor;
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
     }
@@ -407,6 +435,24 @@ async fn calculate_active(
         bail!("output limit must be at least 1024 bytes");
     }
 
+    let (mut editor, mut editor_source) = setting(
+        Some(DEFAULT_EDITOR.to_string()),
+        files.global.editor.clone().map(Some),
+        files.project.editor.clone().map(Some),
+    );
+    for environment in ["EDITOR", "VISUAL", "URI_AGENT_EDITOR"] {
+        if let Ok(value) = env::var(environment)
+            && !value.trim().is_empty()
+        {
+            editor = Some(value);
+            editor_source = ValueSource::Environment(environment.to_string());
+        }
+    }
+    if let Some(value) = &invocation.editor {
+        editor = (!value.trim().is_empty()).then(|| value.trim().to_string());
+        editor_source = ValueSource::CommandLine;
+    }
+
     let configured_entry = files
         .auth
         .0
@@ -445,10 +491,12 @@ async fn calculate_active(
         model,
         api_key,
         output_limit,
+        editor,
         provider_source,
         model_source,
         api_key_source,
         output_limit_source,
+        editor_source,
         credential_environment,
     })
 }
@@ -653,6 +701,28 @@ mod tests {
         .unwrap();
         let value = serde_json::to_value(settings).unwrap();
         assert_eq!(value["thinkingLevel"], "high");
+    }
+
+    #[test]
+    fn editor_is_a_text_setting_alongside_pi_fields() {
+        let settings: SettingsFile = serde_json::from_value(serde_json::json!({
+            "defaultProvider": "openai",
+            "editor": "nvim -f"
+        }))
+        .unwrap();
+        assert_eq!(settings.editor.as_deref(), Some("nvim -f"));
+        assert_eq!(serde_json::to_value(settings).unwrap()["editor"], "nvim -f");
+    }
+
+    #[test]
+    fn helix_is_the_default_editor_command() {
+        let (editor, source) = setting(
+            Some(DEFAULT_EDITOR.to_string()),
+            None::<Option<String>>,
+            None,
+        );
+        assert_eq!(editor.as_deref(), Some("hx"));
+        assert_eq!(source, ValueSource::Default);
     }
 
     #[test]

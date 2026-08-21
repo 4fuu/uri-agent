@@ -21,6 +21,16 @@ pub enum SessionChoice {
     Existing(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub cwd: PathBuf,
+    pub provider: String,
+    pub model: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionEvent {
     pub sequence: u64,
@@ -90,23 +100,54 @@ pub struct Session {
 }
 
 impl Session {
+    pub async fn list(fallback: &Path) -> Result<Vec<SessionSummary>> {
+        let database_path = session_database_path(fallback);
+        Self::list_at(database_path).await
+    }
+
+    async fn list_at(database_path: PathBuf) -> Result<Vec<SessionSummary>> {
+        let (_, connection) = open_database(database_path).await?;
+        connection
+            .call(|db| {
+                let mut statement = db.prepare(
+                    "SELECT id, created_at, updated_at, cwd, provider, model
+                     FROM sessions ORDER BY updated_at DESC, id DESC",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?;
+                let mut sessions = Vec::new();
+                for row in rows {
+                    let (id, created_at, updated_at, cwd, provider, model) = row?;
+                    sessions.push(SessionSummary {
+                        id,
+                        created_at: parse_database_time(created_at, 1)?,
+                        updated_at: parse_database_time(updated_at, 2)?,
+                        cwd: PathBuf::from(cwd),
+                        provider,
+                        model,
+                    });
+                }
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(sessions)
+            })
+            .await
+            .context("cannot list sessions")
+    }
+
     pub async fn open(
         requested: Option<&str>,
         cwd: &Path,
         provider: &str,
         model: &str,
     ) -> Result<Self> {
-        let directory = dirs::data_dir()
-            .map(|path| path.join("uri-agent"))
-            .unwrap_or_else(|| cwd.join(".uri-agent"));
-        Self::open_at(
-            directory.join("sessions.db"),
-            requested,
-            cwd,
-            provider,
-            model,
-        )
-        .await
+        Self::open_at(session_database_path(cwd), requested, cwd, provider, model).await
     }
 
     pub(crate) async fn open_at(
@@ -116,50 +157,7 @@ impl Session {
         provider: &str,
         model: &str,
     ) -> Result<Self> {
-        let directory = database_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        fs::create_dir_all(&directory).await.with_context(|| {
-            format!(
-                "cannot create session data directory: {}",
-                directory.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
-        }
-        let connection = Connection::open(&database_path).await.with_context(|| {
-            format!("cannot open session database: {}", database_path.display())
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&database_path, std::fs::Permissions::from_mode(0o600)).await?;
-        }
-        connection
-            .call(|db| {
-                db.execute_batch(
-                    "PRAGMA foreign_keys = ON;
-                 PRAGMA journal_mode = WAL;
-                 CREATE TABLE IF NOT EXISTS sessions (
-                   id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                   cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
-                   head_sequence INTEGER NOT NULL
-                 );
-                 CREATE TABLE IF NOT EXISTS events (
-                   session_id TEXT NOT NULL, sequence INTEGER NOT NULL, at TEXT NOT NULL,
-                   kind TEXT NOT NULL, payload_json TEXT NOT NULL,
-                   PRIMARY KEY(session_id, sequence),
-                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                 );",
-                )?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-            })
-            .await
-            .context("cannot initialize session database")?;
+        let (directory, connection) = open_database(database_path.clone()).await?;
 
         if let Some(id) = requested.filter(|id| *id != "latest") {
             validate_session_id(id)?;
@@ -296,6 +294,23 @@ impl Session {
             .collect()
     }
 
+    pub async fn update_model(&self, provider: &str, model: &str) -> Result<()> {
+        let id = self.id.clone();
+        let provider = provider.to_string();
+        let model = model.to_string();
+        let updated_at = Utc::now().to_rfc3339();
+        self.connection
+            .call(move |db| {
+                db.execute(
+                    "UPDATE sessions SET provider = ?2, model = ?3, updated_at = ?4 WHERE id = ?1",
+                    params![id, provider, model, updated_at],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .context("cannot update session model")
+    }
+
     pub async fn append(&self, kind: EventKind) -> Result<SessionEvent> {
         let mut state = self.state.lock().await;
         let id = self.id.clone();
@@ -333,6 +348,75 @@ impl Session {
         let _ = self.events.send(event.clone());
         Ok(event)
     }
+}
+
+fn session_database_path(fallback: &Path) -> PathBuf {
+    dirs::data_dir()
+        .map(|path| path.join("uri-agent/sessions.db"))
+        .unwrap_or_else(|| fallback.join(".uri-agent/sessions.db"))
+}
+
+async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> {
+    let directory = database_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    fs::create_dir_all(&directory).await.with_context(|| {
+        format!(
+            "cannot create session data directory: {}",
+            directory.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    let connection = Connection::open(&database_path)
+        .await
+        .with_context(|| format!("cannot open session database: {}", database_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&database_path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    connection
+        .call(|db| {
+            db.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS sessions (
+                   id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                   cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                   head_sequence INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS events (
+                   session_id TEXT NOT NULL, sequence INTEGER NOT NULL, at TEXT NOT NULL,
+                   kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+                   PRIMARY KEY(session_id, sequence),
+                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                 );",
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .context("cannot initialize session database")?;
+    Ok((directory, connection))
+}
+
+fn parse_database_time(
+    value: String,
+    column: usize,
+) -> std::result::Result<DateTime<Utc>, tokio_rusqlite::rusqlite::Error> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| {
+            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                column,
+                tokio_rusqlite::rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }
 
 fn payload_kind(kind: &EventKind) -> &'static str {
@@ -457,5 +541,42 @@ mod tests {
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','events')",
             [], |row| row.get(0))).await.unwrap();
         assert_eq!(tables, 2);
+    }
+
+    #[tokio::test]
+    async fn sessions_can_be_listed_with_their_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first = Session::open_at(
+            path.clone(),
+            Some("first"),
+            Path::new("/projects/one"),
+            "provider-one",
+            "model-one",
+        )
+        .await
+        .unwrap();
+        let second = Session::open_at(
+            path.clone(),
+            Some("second"),
+            Path::new("/projects/two"),
+            "provider-two",
+            "model-two",
+        )
+        .await
+        .unwrap();
+        first
+            .append(EventKind::Notice {
+                text: "most recent".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let sessions = Session::list_at(path).await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "first");
+        assert_eq!(sessions[0].cwd, Path::new("/projects/one"));
+        assert_eq!(sessions[1].id, "second");
+        drop(second);
     }
 }

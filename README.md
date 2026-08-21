@@ -128,7 +128,7 @@ The complete remote catalog is cached, while the Settings picker shows models fr
 
 ## Configuration
 
-Start uri-agent without an API key and open Settings with `F2`, `Ctrl+,`, `/settings`, `/model`, or `/login`. The overlay edits provider, model, the selected provider's credential, and the inline output limit. Saving applies the model backend immediately without discarding the current session.
+Start uri-agent without an API key and open Settings with `F2`, `Ctrl+,`, the Space command panel, or `:settings`. `/settings`, `/model`, and `/login` remain available from Insert mode. The overlay edits provider, model, the selected provider's credential, inline output limit, and external editor command. Saving applies changes immediately without discarding the current session.
 
 ### Text files
 
@@ -140,9 +140,11 @@ uri-agent keeps ordinary configuration editable and separates generated data fro
 | `auth.json` | uri-agent and user | pi-compatible provider credential records; mode `0600` on Unix |
 | `models-store.json` | uri-agent | generated cache pulled from `pi.dev` |
 | `models.json` | user | pi-compatible custom providers, models, headers, and model overrides |
+| `keymap.rhai` | user | global Rhai key mappings layered over the modern modal defaults |
 | `<cwd>/.uri-agent/settings.json` | user | optional project settings overlaid on global settings |
+| `<cwd>/.uri-agent/keymap.rhai` | user | optional project key mappings layered over the global keymap |
 
-When project settings already exist, the TUI writes provider, model, and output-limit changes there; otherwise it writes global settings. Credentials always go to global `auth.json`.
+When project settings already exist, the TUI writes provider, model, output-limit, and editor changes there; otherwise it writes global settings. Credentials always go to global `auth.json`.
 
 Example `settings.json`:
 
@@ -150,7 +152,8 @@ Example `settings.json`:
 {
   "defaultProvider": "openai",
   "defaultModel": "gpt-5.2",
-  "outputLimit": 32768
+  "outputLimit": 32768,
+  "editor": "hx"
 }
 ```
 
@@ -228,6 +231,7 @@ uri-agent \
 | `--model` | `URI_AGENT_MODEL` | Select a model ID for that provider |
 | `--api-key` | `URI_AGENT_API_KEY` | Set a process-only credential |
 | `--output-limit` | `URI_AGENT_OUTPUT_LIMIT` | Set inline output bytes; minimum 1024 |
+| `--editor` | `URI_AGENT_EDITOR`, `VISUAL`, `EDITOR` | Set the external editor command |
 | `--offline` | `URI_AGENT_OFFLINE`, `PI_OFFLINE` | Use the local model cache only |
 | `--cwd` | — | Set the working directory exposed to built-in protocols |
 | `--continue-session` | — | Resume the most recently updated session |
@@ -251,24 +255,65 @@ SQLite WAL mode and transactional sequence allocation keep event order and model
 
 No JSONL compatibility layer is included because the SQLite format is the initial public persistence format.
 
+With no `--cwd`, `--session`, or `--continue-session` option, uri-agent opens the Sessions screen instead of binding the agent to the launch directory. Existing sessions retain their project directory. Creating a session opens a directory browser: use `↑/↓` and `Enter` to navigate, `←` or `Backspace` to return to the parent, `/` to filter the current level, and `Space` to choose the displayed directory. Mouse selection, wheel scrolling, double-clicking a session or child directory, and clicking “choose current” are also supported. `j/k/h/l` remain optional aliases rather than required navigation.
+
+Press `f` in the directory browser for recursive fuzzy search through [fzf](https://github.com/junegunn/fzf). The built-in browser works without it; install `fzf` to enable this shortcut:
+
+```bash
+# Debian/Ubuntu
+sudo apt install fzf
+
+# macOS
+brew install fzf
+```
+
 ## TUI
 
-The Ratatui interface supports streaming text and reasoning, multiline and bracketed-paste input, mouse and keyboard scrolling, floating protocol/task/settings panels, task cancellation, session replay, and a low-noise dither animation while the model is working.
+The Ratatui interface separates session selection, event browsing, and message input. The conversation surface shows one selectable preview per user message, response, reasoning segment, or tool call. A tool call and its result share one row, so streaming reasoning and large tool output never force the useful conversation off-screen. `Enter` opens the complete selected event in a scrollable panel; `e` opens it in the configured editor. The same lists support wheel scrolling and mouse selection; double-click an event to inspect it.
 
-| Key | Action |
-| --- | --- |
-| `Enter` | Send the message |
-| `Shift+Enter` | Insert a newline |
-| `F2` | Open Settings |
-| `Ctrl+,` | Open Settings |
-| `PageUp` / `PageDown` | Scroll the conversation or active panel |
-| `F1` | Open help |
-| `Ctrl+P` | Open protocols |
-| `Ctrl+T` | Open managed tasks |
-| `Esc` | Stop editing or close the active panel |
-| `Ctrl+C` | Exit |
+| Mode | Default keys | Action |
+| --- | --- | --- |
+| Sessions | `↑/↓`, `Enter`, `n`, mouse | Select/open a session or choose a project for a new one |
+| Browse | `↑/↓`, `Enter`, `i`, `e`, `Space`, `:`, mouse | Select previews, inspect details, compose, run a command, or switch session |
+| Insert | `Enter`, `Shift+Enter`, `Ctrl+E`, `Esc` | Send, add a line, edit the draft externally, or return to Browse |
+| Detail | `↑/↓`, `PageUp/PageDown`, `e`, `Esc`, wheel | Inspect or externally view complete reasoning/tool/message content |
+| Global | `F1`, `F2`, `Ctrl+P`, `Ctrl+T`, `Ctrl+C` | Help, Settings, protocols, tasks, and quit |
 
-Inside Settings, use `↑/↓` to select a field, `←/→` to browse, `Enter` to search a provider/model or edit a credential/output limit, `x` to clear the selected credential, `s` to save, and `r` to refresh the pi catalog.
+Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. Commands include `:settings`, `:model`, `:login`, `:sessions`, `:tasks`, `:protocols`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. The header always identifies the active mode. Help renders the active keymap rather than a fixed key table. The low-noise dither animation remains visible while a model turn is running.
+
+### Rhai keymaps
+
+Key mappings load in this order:
+
+```text
+built-in defaults
+< <config-dir>/keymap.rhai
+< <project>/.uri-agent/keymap.rhai
+```
+
+Each Rhai script calls `map(mode, key, action)` or `unmap(mode, key)`. Key names use forms such as `enter`, `space`, `shift+g`, and `ctrl+e`:
+
+```rhai
+map("browse", "x", "detail");
+unmap("browse", "e");
+map("insert", "ctrl+j", "newline");
+```
+
+Modes are `global`, `sessions`, `directory`, `browse`, `insert`, `detail`, `list`, `tasks`, `settings`, `palette`, `command`, and `text`. Available actions are the names shown by `F1`, including `next`, `previous`, `open`, `select`, `search`, `fzf`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `sessions`, `settings`, `protocols`, `tasks`, `close`, and `quit`. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
+
+### External editor
+
+[Helix](https://github.com/helix-editor/helix) is the default external editor; its executable is `hx`. It is optional—the rest of the TUI remains usable when it is absent, and URI Agent reports how to change the editor instead of exiting. Install it through the [official Helix installation instructions](https://docs.helix-editor.com/install.html), for example:
+
+```bash
+# macOS
+brew install helix
+
+# Arch Linux
+sudo pacman -S helix
+```
+
+Set `editor` in Settings or `settings.json`, or override it with `EDITOR`, `VISUAL`, `URI_AGENT_EDITOR`, or `--editor` (in that precedence order). Terminal editors block directly; GUI clients should use a wait option so the temporary view remains available, for example `code --wait`.
 
 ## Installation
 
@@ -288,7 +333,7 @@ uri-agent --cwd /path/to/project
 
 ## Security
 
-The built-in file and shell protocols are not a sandbox. The agent has the filesystem and command permissions of the uri-agent process, including access to absolute paths. Run it only in trusted projects and with credentials the agent may use. Treat `auth.json`, `models.json`, project settings, and discovered Skills as trusted input.
+The built-in file and shell protocols are not a sandbox. The agent has the filesystem and command permissions of the uri-agent process, including access to absolute paths. Run it only in trusted projects and with credentials the agent may use. Treat `auth.json`, `models.json`, project settings, Rhai keymaps, editor commands, and discovered Skills as trusted input.
 
 ## Development
 

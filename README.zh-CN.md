@@ -128,7 +128,7 @@ https://pi.dev/api/models/providers/<provider-id>
 
 ## 配置
 
-没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、`/settings`、`/model` 或 `/login` 打开设置浮窗，编辑 Provider、模型、当前 Provider 凭据和内联输出上限。保存后模型后端会立即生效，不会丢弃当前会话。
+没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、Space 命令面板或 `:settings` 打开设置浮窗；Insert 模式仍支持 `/settings`、`/model` 和 `/login`。浮窗可以编辑 Provider、模型、当前 Provider 凭据、内联输出上限和外部编辑器命令。保存后立即生效，不会丢弃当前会话。
 
 ### 文本文件
 
@@ -140,9 +140,11 @@ uri-agent 保持普通配置可编辑，并将程序生成数据与用户覆盖�
 | `auth.json` | uri-agent 和用户 | 与 pi 兼容的 Provider 凭据；Unix 权限为 `0600` |
 | `models-store.json` | uri-agent | 从 `pi.dev` 拉取的程序缓存 |
 | `models.json` | 用户 | 与 pi 兼容的自定义 Provider、模型、headers 和模型覆盖 |
+| `keymap.rhai` | 用户 | 覆盖内置现代模态默认值的全局 Rhai 快捷键 |
 | `<cwd>/.uri-agent/settings.json` | 用户 | 可选的项目设置，覆盖全局设置 |
+| `<cwd>/.uri-agent/keymap.rhai` | 用户 | 覆盖全局映射的可选项目快捷键 |
 
-项目设置文件已存在时，TUI 会将 Provider、模型和输出上限写入项目文件；否则写入全局设置。凭据始终写入全局 `auth.json`。
+项目设置文件已存在时，TUI 会将 Provider、模型、输出上限和编辑器写入项目文件；否则写入全局设置。凭据始终写入全局 `auth.json`。
 
 `settings.json` 示例：
 
@@ -150,7 +152,8 @@ uri-agent 保持普通配置可编辑，并将程序生成数据与用户覆盖�
 {
   "defaultProvider": "openai",
   "defaultModel": "gpt-5.2",
-  "outputLimit": 32768
+  "outputLimit": 32768,
+  "editor": "hx"
 }
 ```
 
@@ -228,6 +231,7 @@ uri-agent \
 | `--model` | `URI_AGENT_MODEL` | 选择该 Provider 的模型 ID |
 | `--api-key` | `URI_AGENT_API_KEY` | 设置只对当前进程生效的凭据 |
 | `--output-limit` | `URI_AGENT_OUTPUT_LIMIT` | 设置内联输出字节数，最小 1024 |
+| `--editor` | `URI_AGENT_EDITOR`, `VISUAL`, `EDITOR` | 设置外部编辑器命令 |
 | `--offline` | `URI_AGENT_OFFLINE`, `PI_OFFLINE` | 只使用本地模型缓存 |
 | `--cwd` | — | 设置内置协议可访问的工作目录 |
 | `--continue-session` | — | 恢复最近更新的会话 |
@@ -251,24 +255,65 @@ SQLite WAL 模式和事务内 sequence 分配保证事件顺序与模型历史�
 
 SQLite 是项目最初公开的持久化格式，因此不包含 JSONL 兼容层。
 
+没有传入 `--cwd`、`--session` 或 `--continue-session` 时，uri-agent 首先打开 Sessions 界面，而不是将 Agent 绑定到启动目录。已有会话会保留自己的项目目录。创建会话时使用目录浏览器：通过 `↑/↓` 和 `Enter` 导航，以 `←` 或 `Backspace` 返回父目录，用 `/` 筛选当前层级，再按 `Space` 选择当前显示目录。也可以用鼠标选择、滚轮滚动、双击会话或子目录，以及点击“选择当前目录”。`j/k/h/l` 只是可选兼容键，并非必学操作。
+
+在目录浏览器按 `f` 可以通过 [fzf](https://github.com/junegunn/fzf) 递归模糊搜索目录。内置浏览器无需外部依赖；安装 `fzf` 后才会启用该快捷键：
+
+```bash
+# Debian/Ubuntu
+sudo apt install fzf
+
+# macOS
+brew install fzf
+```
+
 ## TUI
 
-Ratatui 界面支持流式文本与 reasoning、多行和 bracketed-paste 输入、鼠标与键盘滚动、协议/任务/设置浮窗、任务取消、会话回放，以及模型工作时的低噪声抖动动画。
+Ratatui 界面将会话选择、事件浏览和消息输入分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。`Enter` 在可滚动浮窗中打开完整事件，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
 
-| 按键 | 行为 |
-| --- | --- |
-| `Enter` | 发送消息 |
-| `Shift+Enter` | 插入换行 |
-| `F2` | 打开 Settings |
-| `Ctrl+,` | 打开 Settings |
-| `PageUp` / `PageDown` | 滚动对话或当前浮窗 |
-| `F1` | 打开帮助 |
-| `Ctrl+P` | 打开协议列表 |
-| `Ctrl+T` | 打开受管理任务 |
-| `Esc` | 停止编辑或关闭当前浮窗 |
-| `Ctrl+C` | 退出 |
+| 模式 | 默认按键 | 行为 |
+| --- | --- | --- |
+| Sessions | `↑/↓`、`Enter`、`n`、鼠标 | 选择/打开会话，或为新会话选择项目 |
+| Browse | `↑/↓`、`Enter`、`i`、`e`、`Space`、`:`、鼠标 | 选择预览、查看详情、输入、执行命令或切换会话 |
+| Insert | `Enter`、`Shift+Enter`、`Ctrl+E`、`Esc` | 发送、换行、在外部编辑器编辑草稿或返回 Browse |
+| Detail | `↑/↓`、`PageUp/PageDown`、`e`、`Esc`、滚轮 | 查看完整 reasoning、工具或消息内容，或用编辑器打开 |
+| Global | `F1`、`F2`、`Ctrl+P`、`Ctrl+T`、`Ctrl+C` | 帮助、Settings、协议、任务和退出 |
 
-Settings 内使用 `↑/↓` 选择字段、`←/→` 浏览、`Enter` 搜索 Provider/模型或编辑凭据/输出上限、`x` 清除所选凭据、`s` 保存、`r` 刷新 pi 模型目录。
+Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行。命令包括 `:settings`、`:model`、`:login`、`:sessions`、`:tasks`、`:protocols`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`。顶栏始终标明当前模式；帮助浮窗展示实际生效的 keymap，而不是固定按键表。模型工作时仍会显示低噪声抖动动画。
+
+### Rhai 快捷键
+
+快捷键按以下顺序加载：
+
+```text
+内置默认值
+< <config-dir>/keymap.rhai
+< <project>/.uri-agent/keymap.rhai
+```
+
+每个 Rhai 脚本调用 `map(mode, key, action)` 或 `unmap(mode, key)`。按键名称使用 `enter`、`space`、`shift+g`、`ctrl+e` 等形式：
+
+```rhai
+map("browse", "x", "detail");
+unmap("browse", "e");
+map("insert", "ctrl+j", "newline");
+```
+
+可用模式包括 `global`、`sessions`、`directory`、`browse`、`insert`、`detail`、`list`、`tasks`、`settings`、`palette`、`command` 和 `text`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`open`、`select`、`search`、`fzf`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`sessions`、`settings`、`protocols`、`tasks`、`close` 和 `quit`。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
+
+### 外部编辑器
+
+[Helix](https://github.com/helix-editor/helix) 是默认外部编辑器，其可执行文件名为 `hx`。它不是强依赖：未安装时其余 TUI 仍可使用，URI Agent 会提示如何更改编辑器，而不会退出。请参考 [Helix 官方安装说明](https://docs.helix-editor.com/install.html)，例如：
+
+```bash
+# macOS
+brew install helix
+
+# Arch Linux
+sudo pacman -S helix
+```
+
+可以在 Settings 或 `settings.json` 中设置 `editor`，也可以依次通过 `EDITOR`、`VISUAL`、`URI_AGENT_EDITOR` 或 `--editor` 提高优先级覆盖。终端编辑器会直接阻塞运行；GUI 客户端应使用等待参数，保证临时文件在查看期间仍然存在，例如 `code --wait`。
 
 ## 安装
 
@@ -288,7 +333,7 @@ uri-agent --cwd /path/to/project
 
 ## 安全
 
-内置 file 和 Shell 协议不提供沙箱。Agent 拥有 uri-agent 进程的文件与命令权限，也可以访问绝对路径。请只在可信项目和允许 Agent 使用其中凭据的环境中运行，并将 `auth.json`、`models.json`、项目设置与已发现 Skills 视为可信输入。
+内置 file 和 Shell 协议不提供沙箱。Agent 拥有 uri-agent 进程的文件与命令权限，也可以访问绝对路径。请只在可信项目和允许 Agent 使用其中凭据的环境中运行，并将 `auth.json`、`models.json`、项目设置、Rhai keymap、编辑器命令与已发现 Skills 视为可信输入。
 
 ## 开发
 
