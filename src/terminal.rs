@@ -5,13 +5,15 @@ use portable_pty::{
 };
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
+
+type SharedWriter = Arc<Mutex<BufWriter<Box<dyn Write + Send>>>>;
 
 pub struct EmbeddedTerminal {
     parser: Arc<RwLock<vt100::Parser>>,
     master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<BufWriter<Box<dyn Write + Send>>>,
+    writer: Option<SharedWriter>,
     child: Option<Box<dyn Child + Send + Sync>>,
     reader: Option<JoinHandle<()>>,
     rows: u16,
@@ -40,17 +42,31 @@ impl EmbeddedTerminal {
             .context("cannot start embedded command")?;
         drop(pair.slave);
 
+        let writer = Arc::new(Mutex::new(BufWriter::new(writer)));
         let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 2_000)));
         let reader_parser = parser.clone();
+        let reader_writer = writer.clone();
         let reader = thread::spawn(move || {
             let mut buffer = [0_u8; 8_192];
+            let mut queries = CursorPositionQuery::default();
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(read) => reader_parser
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .process(&buffer[..read]),
+                    Ok(read) => {
+                        let replies = process_output(
+                            &mut reader_parser
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            &mut queries,
+                            &buffer[..read],
+                        );
+                        if !replies.is_empty() {
+                            let mut writer = reader_writer
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = writer.write_all(&replies).and_then(|()| writer.flush());
+                        }
+                    }
                 }
             }
         });
@@ -58,7 +74,7 @@ impl EmbeddedTerminal {
         Ok(Self {
             parser,
             master: Some(pair.master),
-            writer: Some(BufWriter::new(writer)),
+            writer: Some(writer),
             child: Some(child),
             reader: Some(reader),
             rows,
@@ -160,6 +176,9 @@ impl EmbeddedTerminal {
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if let Some(writer) = self.writer.as_mut() {
+            let mut writer = writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             writer
                 .write_all(bytes)
                 .and_then(|()| writer.flush())
@@ -182,6 +201,46 @@ impl EmbeddedTerminal {
             let _ = reader.join();
         }
     }
+}
+
+#[derive(Default)]
+struct CursorPositionQuery {
+    matched: usize,
+}
+
+impl CursorPositionQuery {
+    fn advance(&mut self, byte: u8) -> bool {
+        const QUERY: &[u8] = b"\x1b[6n";
+        if byte == QUERY[self.matched] {
+            self.matched += 1;
+            if self.matched == QUERY.len() {
+                self.matched = 0;
+                return true;
+            }
+        } else {
+            self.matched = usize::from(byte == QUERY[0]);
+        }
+        false
+    }
+}
+
+fn process_output(
+    parser: &mut vt100::Parser,
+    queries: &mut CursorPositionQuery,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut replies = Vec::new();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if queries.advance(byte) {
+            parser.process(&bytes[start..=index]);
+            let (row, col) = parser.screen().cursor_position();
+            replies.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+            start = index + 1;
+        }
+    }
+    parser.process(&bytes[start..]);
+    replies
 }
 
 impl Drop for EmbeddedTerminal {
@@ -271,6 +330,8 @@ fn function_key(number: u8) -> Option<&'static [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     #[test]
     fn keys_are_encoded_for_terminal_programs() {
@@ -293,5 +354,44 @@ mod tests {
             key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), true),
             Some(b"\x1bOA".to_vec())
         );
+    }
+
+    #[test]
+    fn cursor_position_queries_are_answered_across_reads() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut queries = CursorPositionQuery::default();
+
+        assert!(process_output(&mut parser, &mut queries, b"hello\x1b[").is_empty());
+        assert_eq!(
+            process_output(&mut parser, &mut queries, b"6n"),
+            b"\x1b[1;6R"
+        );
+        assert_eq!(parser.screen().contents(), "hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_terminal_reads_command_output() {
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "printf terminal-ready"]);
+        let mut terminal =
+            EmbeddedTerminal::start(command, Path::new(env!("CARGO_MANIFEST_DIR")), 24, 80)
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while Instant::now() < deadline {
+            if terminal
+                .screen()
+                .screen()
+                .contents()
+                .contains("terminal-ready")
+            {
+                return;
+            }
+            let _ = terminal.try_wait().unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        panic!("PTY output was not parsed into the terminal screen");
     }
 }
