@@ -1,5 +1,5 @@
-use crate::protocol::ProtocolRegistry;
-use anyhow::{Result, bail};
+use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -314,13 +314,89 @@ pub struct PluginHost<'a> {
     pub tui: &'a mut TuiRegistry,
 }
 
-pub trait Plugin {
+pub trait Plugin: Send + Sync {
+    /// Protocols contributed by this plugin. These declarations are used to
+    /// freeze a new session's system prompt before the runtime registries exist.
+    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
+        Vec::new()
+    }
+
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
+}
+
+#[derive(Default)]
+pub struct PluginRegistry {
+    plugins: Vec<Box<dyn Plugin>>,
+}
+
+impl PluginRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, plugin: impl Plugin + 'static) {
+        self.plugins.push(Box::new(plugin));
+    }
+
+    pub fn protocol_descriptors(&self) -> Result<Vec<ProtocolDescriptor>> {
+        let mut descriptors = Vec::new();
+        let mut names = HashSet::new();
+        for plugin in &self.plugins {
+            for descriptor in plugin.protocol_descriptors() {
+                validate_descriptor(&descriptor)?;
+                if !names.insert(descriptor.name.clone()) {
+                    bail!(
+                        "plugin protocol name is declared more than once: {}",
+                        descriptor.name
+                    );
+                }
+                descriptors.push(descriptor);
+            }
+        }
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(descriptors)
+    }
+
+    pub fn install(&self, host: &mut PluginHost<'_>) -> Result<()> {
+        let expected = self
+            .protocol_descriptors()?
+            .into_iter()
+            .map(|descriptor| (descriptor.name.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        let before = host
+            .protocols
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<HashSet<_>>();
+        if let Some(name) = expected.keys().find(|name| before.contains(*name)) {
+            bail!("plugin protocol name is already registered: {name}");
+        }
+
+        for plugin in &self.plugins {
+            plugin.register(host).context("failed to register plugin")?;
+        }
+
+        let installed = host
+            .protocols
+            .descriptors()
+            .into_iter()
+            .filter(|descriptor| !before.contains(&descriptor.name))
+            .map(|descriptor| (descriptor.name.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        if installed != expected {
+            bail!("plugin protocol declarations do not match installed protocols");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputStore;
+    use crate::protocol::{Protocol, ProtocolDescriptor};
+    use crate::task::TaskManager;
 
     struct StaticPanel;
 
@@ -391,5 +467,99 @@ mod tests {
             .unwrap();
         assert_eq!(document.title, "Plugin panel");
         assert_eq!(document.body, "session argument");
+    }
+
+    #[derive(Clone)]
+    struct DeclaredProtocolPlugin {
+        declares_protocol: bool,
+    }
+
+    #[async_trait]
+    impl Protocol for DeclaredProtocolPlugin {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "declared".to_string(),
+                description: "Declared test protocol".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+    }
+
+    impl Plugin for DeclaredProtocolPlugin {
+        fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
+            self.declares_protocol
+                .then(|| self.descriptor())
+                .into_iter()
+                .collect()
+        }
+
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            host.protocols.register(self.clone())
+        }
+    }
+
+    async fn empty_host() -> (ProtocolRegistry, CommandRegistry, TuiRegistry, PathBuf) {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let directory = output.directory().to_path_buf();
+        (
+            ProtocolRegistry::new(output, TaskManager::new()),
+            CommandRegistry::with_core_commands(),
+            TuiRegistry::default(),
+            directory,
+        )
+    }
+
+    #[tokio::test]
+    async fn plugins_declare_protocols_before_installing_the_same_runtime_contract() {
+        let mut plugins = PluginRegistry::new();
+        plugins.add(DeclaredProtocolPlugin {
+            declares_protocol: true,
+        });
+        assert_eq!(
+            plugins.protocol_descriptors().unwrap(),
+            vec![
+                DeclaredProtocolPlugin {
+                    declares_protocol: true,
+                }
+                .descriptor()
+            ]
+        );
+        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+
+        plugins
+            .install(&mut PluginHost {
+                protocols: &mut protocols,
+                commands: &mut commands,
+                tui: &mut tui,
+            })
+            .unwrap();
+
+        assert_eq!(
+            protocols.descriptors(),
+            plugins.protocol_descriptors().unwrap()
+        );
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugin_install_rejects_an_undeclared_protocol() {
+        let mut plugins = PluginRegistry::new();
+        plugins.add(DeclaredProtocolPlugin {
+            declares_protocol: false,
+        });
+        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+
+        let error = plugins
+            .install(&mut PluginHost {
+                protocols: &mut protocols,
+                commands: &mut commands,
+                tui: &mut tui,
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("declarations do not match"));
+        let _ = tokio::fs::remove_dir_all(output).await;
     }
 }

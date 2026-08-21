@@ -1,3 +1,4 @@
+use crate::plugin::{Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,15 +10,26 @@ use tokio::fs;
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 2_000;
 
-pub struct FileProtocol {
+#[derive(Clone)]
+pub(super) struct FileProtocol {
     cwd: PathBuf,
 }
 
 impl FileProtocol {
-    pub fn new(cwd: &Path) -> Self {
+    pub(super) fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
         }
+    }
+}
+
+impl Plugin for FileProtocol {
+    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
+        vec![self.descriptor()]
+    }
+
+    fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+        host.protocols.register(self.clone())
     }
 }
 

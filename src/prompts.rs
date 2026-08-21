@@ -52,23 +52,50 @@ Read files and directories.
 The body is passed through but is not required by this built-in protocol.
 "#;
 
-pub const EDIT_HELP: &str = r#"# edit
+pub const REPLACE_HELP: &str = r#"# replace
 
-Submit an asynchronous file edit.
+Replace one exact text match asynchronously.
 
-Call `exec` with `edit://path` and one of these bodies:
+Call `exec` with `replace://path` and this body:
 
 ```json
 {"old_text":"unique text to replace","new_text":"replacement"}
 ```
 
-```json
-{"content":"complete replacement file content"}
+Relative paths resolve from the startup working directory; absolute paths are
+accepted. `old_text` must be nonempty and occur exactly once. The file is
+replaced atomically. The immediate result contains a task URI; read that URI to
+inspect completion or failure.
+"#;
+
+pub const APPLY_PATCH_HELP: &str = r#"# apply_patch
+
+Apply a Codex-style multi-file patch asynchronously.
+
+Call `exec` with `apply_patch://apply`. The body must be the patch string itself:
+
+```text
+*** Begin Patch
+*** Add File: path/to/new.txt
++new content
+*** Update File: path/to/existing.txt
+@@ optional landmark
+-old line
++new line
+*** Delete File: path/to/remove.txt
+*** End Patch
 ```
 
-The first form requires exactly one match. The second form atomically creates or
-replaces the file. The immediate result contains a task URI. Read that URI to
-inspect completion or failure.
+An Update File may put `*** Move to: new/path` immediately after its header.
+Update lines begin with a space for context, `-` for removal, or `+` for
+addition. `*** End of File` anchors the preceding chunk at EOF. Add File content
+lines must all begin with `+`. Relative paths resolve from the startup working
+directory; absolute paths are accepted.
+
+Operations run in patch order and each write is atomic, but the complete patch
+is not transactional: a later failure does not undo earlier operations. The
+immediate result contains a task URI; read that URI for the final summary or
+error.
 "#;
 
 pub const BASH_HELP: &str = r#"# bash

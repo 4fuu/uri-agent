@@ -12,7 +12,7 @@ pub struct ProtocolContext {
     pub tasks: TaskManager,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolDescriptor {
     pub name: String,
     pub description: String,
@@ -72,9 +72,7 @@ impl ProtocolRegistry {
 
     fn register_arc(&mut self, protocol: Arc<dyn Protocol>) -> Result<()> {
         let descriptor = protocol.descriptor();
-        if descriptor.name.is_empty() || descriptor.name.contains("://") {
-            bail!("invalid protocol name: {:?}", descriptor.name);
-        }
+        validate_descriptor(&descriptor)?;
         if self.protocols.contains_key(&descriptor.name) {
             bail!("protocol name is already registered: {}", descriptor.name);
         }
@@ -130,6 +128,13 @@ impl ProtocolRegistry {
             .await?;
         self.output.present(content, name).await
     }
+}
+
+pub(crate) fn validate_descriptor(descriptor: &ProtocolDescriptor) -> Result<()> {
+    if descriptor.name.is_empty() || descriptor.name.contains("://") {
+        bail!("invalid protocol name: {:?}", descriptor.name);
+    }
+    Ok(())
 }
 
 pub fn split_address(uri: &str) -> Result<(&str, &str)> {

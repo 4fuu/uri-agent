@@ -1,35 +1,25 @@
-mod edit;
+mod apply_patch;
 mod file;
+mod replace;
 mod shell;
 
-use crate::protocol::{Protocol, ProtocolRegistry};
+use crate::plugin::PluginRegistry;
 use crate::task::{TaskManager, TaskRecord};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::fmt::Write as _;
 use std::path::Path;
+use tokio::fs;
+use uuid::Uuid;
 
-pub use edit::EditProtocol;
-pub use file::FileProtocol;
-pub use shell::{ShellProtocol, discover_shells};
-
-pub fn available(cwd: &Path) -> Vec<Box<dyn Protocol>> {
-    let mut protocols: Vec<Box<dyn Protocol>> = vec![
-        Box::new(FileProtocol::new(cwd)),
-        Box::new(EditProtocol::new(cwd)),
-    ];
-    protocols.extend(
-        discover_shells(cwd)
-            .into_iter()
-            .map(|shell| Box::new(shell) as Box<dyn Protocol>),
-    );
-    protocols
-}
-
-pub fn register(registry: &mut ProtocolRegistry, cwd: &Path) -> Result<()> {
-    for protocol in available(cwd) {
-        registry.register_boxed(protocol)?;
+pub fn plugins(cwd: &Path) -> PluginRegistry {
+    let mut plugins = PluginRegistry::new();
+    plugins.add(file::FileProtocol::new(cwd));
+    plugins.add(replace::ReplaceProtocol::new(cwd));
+    plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
+    for shell in shell::discover_shells(cwd) {
+        plugins.add(shell);
     }
-    Ok(())
+    plugins
 }
 
 async fn render_task(tasks: &TaskManager, protocol: &str, id: &str) -> Result<Vec<u8>> {
@@ -82,4 +72,50 @@ fn render_record(record: &TaskRecord) -> String {
         output.push_str(&String::from_utf8_lossy(&record.content));
     }
     output
+}
+
+async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("file has no parent directory: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("cannot create {}", parent.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temporary = parent.join(format!(".{filename}.{}.tmp", Uuid::now_v7().simple()));
+    fs::write(&temporary, content)
+        .await
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    if let Ok(metadata) = fs::metadata(path).await {
+        fs::set_permissions(&temporary, metadata.permissions()).await?;
+    }
+    if let Err(error) = fs::rename(&temporary, path).await {
+        let _ = fs::remove_file(&temporary).await;
+        return Err(error).with_context(|| format!("cannot replace {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_distribution_declares_file_replace_and_apply_patch_plugins() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = plugins(directory.path())
+            .protocol_descriptors()
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "file"));
+        assert!(names.iter().any(|name| name == "replace"));
+        assert!(names.iter().any(|name| name == "apply_patch"));
+        assert!(!names.iter().any(|name| name == "edit"));
+    }
 }

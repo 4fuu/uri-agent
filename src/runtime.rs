@@ -487,8 +487,14 @@ mod tests {
         let output_directory = output.directory().to_path_buf();
         let tasks = TaskManager::new();
         let mut protocols = ProtocolRegistry::new(output, tasks);
-        protocols
-            .register(crate::builtins::FileProtocol::new(workspace.path()))
+        let mut commands = crate::plugin::CommandRegistry::with_core_commands();
+        let mut tui = crate::plugin::TuiRegistry::default();
+        crate::builtins::plugins(workspace.path())
+            .install(&mut crate::plugin::PluginHost {
+                protocols: &mut protocols,
+                commands: &mut commands,
+                tui: &mut tui,
+            })
             .unwrap();
         let call = ToolCall::new(
             ToolCallId::new("read-help").unwrap(),

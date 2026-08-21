@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent 是一个终端 coding agent，以精简且稳定的模型接口为核心。模型始终只看到 `read` 和 `exec` 两个工具，并通过 `file://...`、`bash://...` 等协议地址访问文件、Shell、编辑、Skills 及后续扩展。
+URI Agent 是一个终端 coding agent，以精简且稳定的模型接口为核心。模型始终只看到 `read` 和 `exec` 两个工具，并通过 `file://...`、`bash://...` 等协议地址访问文件、Shell、文件修改、Skills 及后续扩展。
 
 这种设计只在能力真正有用时才把对应说明加载到模型上下文。每个协议都在 `<protocol>://help` 提供自身文档；长时间工作由系统管理的任务表示；超长输出不会被丢弃，而是保留为可读取的 `file://` 地址。
 
@@ -71,16 +71,19 @@ URI Agent 只按第一个 `://` 分割地址。剩余 target 是不透明数据�
 | 协议 | 操作 | 用途 |
 | --- | --- | --- |
 | `file` | `read` | 读取文件和有长度限制的目录列表 |
-| `edit` | `read`, `exec` | 原子写入文件，或替换唯一精确匹配 |
+| `replace` | `read`, `exec` | 原子替换一个精确文本匹配 |
+| `apply_patch` | `read`, `exec` | 应用 Codex 风格的新增、删除、更新和移动补丁 |
 | `bash` | `read`, `exec` | 安装 Bash 时，将 Bash 命令作为系统管理的任务运行 |
 | `pwsh` | `read`, `exec` | 安装 `pwsh` 时，将 PowerShell 7 命令作为系统管理的任务运行 |
 | `<name>-skill` | `read` | 加载一个已发现的 Skill 及其附属资源 |
 
 程序会在启动时检测 `bash` 与 `pwsh`，只有找到相应可执行文件时才注册协议。
 
+`replace` 要求非空的 `old_text` 恰好出现一次。`apply_patch` 接受由 `*** Begin Patch` 和 `*** End Patch` 包围的补丁字符串；Codex 风格的文件操作及 hunk 语法详见 `apply_patch://help`。
+
 ### 系统管理的任务与完整输出
 
-执行默认是异步的。Shell 或 edit 请求通常会立即返回任务地址：
+执行默认是异步的。Shell 或文件修改请求通常会立即返回任务地址：
 
 ```text
 exec("bash://run", "cargo test")
@@ -249,7 +252,7 @@ map("composer", "ctrl+j", "newline");
 
 ## 扩展 URI Agent
 
-Rust 扩展通过 [`PluginHost`](src/plugin.rs) 注册协议、命令和通用 TUI panel provider。协议始终位于 `read` 和 `exec` 之后；命令会进入命令面板、冒号命令行和快捷键 action 注册表。URI Agent 当前不加载原生动态库，因此第三方 Rust 扩展必须在应用组装阶段链接。
+Rust 扩展通过 [`PluginRegistry`](src/plugin.rs) 声明协议描述，并通过 `PluginHost` 注册协议、命令和通用 TUI panel provider。第一方的 `file`、`replace`、`apply_patch`、`bash` 和 `pwsh` 能力也走同一插件路径，不再由应用直接组装。协议始终位于 `read` 和 `exec` 之后；命令会进入命令面板、冒号命令行和快捷键 action 注册表。URI Agent 当前不加载原生动态库，因此第三方 Rust 扩展必须在应用组装阶段链接。
 
 ## 开发
 

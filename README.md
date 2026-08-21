@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is a terminal coding agent built around a small, stable model interface. The model always sees two tools—`read` and `exec`—and reaches files, shells, edits, Skills, and future integrations through protocol addresses such as `file://...` and `bash://...`.
+URI Agent is a terminal coding agent built around a small, stable model interface. The model always sees two tools—`read` and `exec`—and reaches files, shells, file modifications, Skills, and future integrations through protocol addresses such as `file://...` and `bash://...`.
 
 This design keeps tool schemas out of the model context until they are useful. Every protocol documents itself at `<protocol>://help`, long-running work is represented by managed tasks, and oversized output remains available through a `file://` address instead of being discarded.
 
@@ -71,16 +71,19 @@ Protocols implement `read`, `exec`, or both through the [`Protocol`](src/protoco
 | Protocol | Operations | Purpose |
 | --- | --- | --- |
 | `file` | `read` | Read files and bounded directory listings |
-| `edit` | `read`, `exec` | Atomically write a file or replace one exact match |
+| `replace` | `read`, `exec` | Atomically replace one exact text match |
+| `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
 | `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash is installed |
 | `pwsh` | `read`, `exec` | Run PowerShell 7 commands as managed tasks when `pwsh` is installed |
 | `<name>-skill` | `read` | Load one discovered Skill and its bundled resources |
 
 `bash` and `pwsh` are detected at startup and registered only when their executables are available.
 
+`replace` requires a nonempty `old_text` that occurs exactly once. `apply_patch` accepts a patch string enclosed by `*** Begin Patch` and `*** End Patch`; read `apply_patch://help` for the Codex-style file-operation and hunk grammar.
+
 ### Managed tasks and complete output
 
-Execution is asynchronous by default. A shell or edit request normally returns a task address immediately:
+Execution is asynchronous by default. A shell or file-modification request normally returns a task address immediately:
 
 ```text
 exec("bash://run", "cargo test")
@@ -249,7 +252,7 @@ map("composer", "ctrl+j", "newline");
 
 ## Extending URI Agent
 
-Rust extensions register protocols, commands, and generic TUI panel providers through [`PluginHost`](src/plugin.rs). Protocols remain behind `read` and `exec`; commands join the command palette, colon command line, and keymap action registry. URI Agent does not currently load native dynamic libraries, so third-party Rust extensions must be linked during application assembly.
+Rust extensions declare their protocol descriptors and register protocols, commands, and generic TUI panel providers through [`PluginRegistry`](src/plugin.rs) and `PluginHost`. The first-party `file`, `replace`, `apply_patch`, `bash`, and `pwsh` capabilities use this same plugin path rather than being assembled directly by the application. Protocols remain behind `read` and `exec`; commands join the command palette, colon command line, and keymap action registry. URI Agent does not currently load native dynamic libraries, so third-party Rust extensions must be linked during application assembly.
 
 ## Development
 

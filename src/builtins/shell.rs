@@ -1,4 +1,5 @@
 use super::{render_record, render_task, render_task_list};
+use crate::plugin::{Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Result, anyhow, bail};
@@ -10,7 +11,8 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-pub struct ShellProtocol {
+#[derive(Clone)]
+pub(super) struct ShellProtocol {
     name: &'static str,
     executable: PathBuf,
     cwd: PathBuf,
@@ -24,13 +26,9 @@ impl ShellProtocol {
             cwd: cwd.to_path_buf(),
         }
     }
-
-    pub fn name(&self) -> &str {
-        self.name
-    }
 }
 
-pub fn discover_shells(cwd: &Path) -> Vec<ShellProtocol> {
+pub(super) fn discover_shells(cwd: &Path) -> Vec<ShellProtocol> {
     let mut shells = Vec::new();
     if let Some(executable) = find_executable("bash") {
         shells.push(ShellProtocol::new("bash", executable, cwd));
@@ -39,6 +37,16 @@ pub fn discover_shells(cwd: &Path) -> Vec<ShellProtocol> {
         shells.push(ShellProtocol::new("pwsh", executable, cwd));
     }
     shells
+}
+
+impl Plugin for ShellProtocol {
+    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
+        vec![self.descriptor()]
+    }
+
+    fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+        host.protocols.register(self.clone())
+    }
 }
 
 #[async_trait]

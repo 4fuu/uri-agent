@@ -6,7 +6,7 @@ use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
 use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
-use uri_agent::plugin::{CommandRegistry, TuiRegistry};
+use uri_agent::plugin::{CommandRegistry, PluginHost, TuiRegistry};
 use uri_agent::prompts::ProtocolPrompt;
 use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, forward_task_notices};
@@ -29,19 +29,17 @@ async fn main() -> Result<()> {
 
 async fn run_session(config: &Config) -> Result<TuiOutcome> {
     let initial = config.manager.current().await;
-    let builtins = uri_agent::builtins::available(&config.cwd);
-    let mut protocol_names = builtins
+    let plugins = uri_agent::builtins::plugins(&config.cwd);
+    let plugin_protocols = plugins.protocol_descriptors()?;
+    let mut protocol_names = plugin_protocols
         .iter()
-        .map(|protocol| protocol.descriptor().name)
+        .map(|descriptor| descriptor.name.clone())
         .collect::<HashSet<_>>();
-    let mut prompt_protocols = builtins
+    let mut prompt_protocols = plugin_protocols
         .iter()
-        .map(|protocol| {
-            let descriptor = protocol.descriptor();
-            ProtocolPrompt {
-                name: descriptor.name,
-                description: descriptor.description,
-            }
+        .map(|descriptor| ProtocolPrompt {
+            name: descriptor.name.clone(),
+            description: descriptor.description.clone(),
         })
         .collect::<Vec<_>>();
     let (discovered_skills, mut notices) = uri_agent::skill::discover(&config.cwd);
@@ -88,9 +86,13 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
     let tasks = TaskManager::new();
     let output = Arc::new(OutputStore::new(session.id(), initial.output_limit).await?);
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
-    for protocol in builtins {
-        protocols.register_boxed(protocol)?;
-    }
+    let mut commands = CommandRegistry::with_core_commands();
+    let mut tui = TuiRegistry::default();
+    plugins.install(&mut PluginHost {
+        protocols: &mut protocols,
+        commands: &mut commands,
+        tui: &mut tui,
+    })?;
     for snapshot in frozen_context.skills.clone() {
         let description = format!("skill {} at {}", snapshot.name, snapshot.path.display());
         let skill = match SkillProtocol::from_snapshot(snapshot) {
@@ -144,8 +146,8 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
         limits,
     ));
     runtime.refresh_context_estimate().await;
-    let commands = Arc::new(CommandRegistry::with_core_commands());
-    let tui = Arc::new(TuiRegistry::default());
+    let commands = Arc::new(commands);
+    let tui = Arc::new(tui);
     let draft = session.draft().await;
     let provider_count = config.catalog.providers().await.len();
 

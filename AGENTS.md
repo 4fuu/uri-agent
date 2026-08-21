@@ -51,14 +51,14 @@ Capabilities are registered as protocols and document their operational contract
 - `src/model.rs` — Rig provider adapters and the two model-facing tool schemas.
 - `src/prompts.rs` — initial system prompt and built-in protocol help.
 - `src/protocol.rs` — protocol trait, registry, dispatch, and output presentation.
-- `src/builtins/` — file, edit, Bash, and PowerShell protocols.
+- `src/builtins/` — built-in plugins for file reads, exact replacement, Codex-style patching, Bash, and PowerShell.
 - `src/task.rs` — task lifecycle, waiting, cancellation, and notices.
 - `src/output.rs` — inline output limits and complete-output persistence.
 - `src/skill.rs` — Skill discovery, metadata parsing, naming, and resource containment.
 - `src/session.rs` — SQLite persistence, frozen context, checkpoints, and replay.
 - `src/compaction.rs` — context estimation and complete-turn checkpoint construction.
 - `src/runtime.rs` — model/tool loop, tool-call correlation, and compaction triggers.
-- `src/plugin.rs` — protocol, command, and generic TUI panel registration.
+- `src/plugin.rs` — plugin declarations plus protocol, command, and generic TUI panel registration.
 - `src/keymap.rs` — default Rhai mappings and global/project overlays.
 - `src/terminal.rs` — embedded PTY lifecycle, emulation, resize, and input encoding.
 - `src/oauth.rs` — Anthropic OAuth login, callback server, and token refresh.
