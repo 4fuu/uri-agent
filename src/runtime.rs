@@ -5,9 +5,13 @@ use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
 use crate::task::TaskManager;
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use rig::completion::Usage;
-use rig::message::{AssistantContent, Message, Text, ToolCall, ToolResultContent, UserContent};
+use rig::message::{
+    AssistantContent, ImageMediaType, Message, Text, ToolCall, ToolResultContent, UserContent,
+};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -108,12 +112,31 @@ impl AgentRuntime {
                 return Err(anyhow!(text));
             }
         };
+        let images = match image_attachments(prompt, self.session.directory()).await {
+            Ok(images) => images,
+            Err(error) => {
+                let text = format!("{error:#}");
+                self.session
+                    .append(EventKind::Error { text: text.clone() })
+                    .await?;
+                return Err(anyhow!(text));
+            }
+        };
+        if !images.is_empty() && !backend.accepts_image_input() {
+            let text = "the active model does not accept image input".to_string();
+            self.session
+                .append(EventKind::Error { text: text.clone() })
+                .await?;
+            return Err(anyhow!(text));
+        }
         self.session
             .append(EventKind::User {
                 text: prompt.to_string(),
             })
             .await?;
-        self.append_model_message(Message::user(prompt)).await?;
+        let mut content = vec![UserContent::text(prompt)];
+        content.extend(images);
+        self.append_model_message(Message::User { content }).await?;
 
         let result = self.run_tool_loop(backend).await;
         match result {
@@ -333,6 +356,70 @@ impl AgentRuntime {
     }
 }
 
+async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>> {
+    let arguments = shell_words::split(prompt).unwrap_or_else(|_| {
+        prompt
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    let mut images = Vec::new();
+    for argument in arguments {
+        let Some(path) = argument.strip_prefix('@').filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
+            continue;
+        }
+        let canonical = tokio::fs::canonicalize(&path)
+            .await
+            .with_context(|| format!("cannot attach image {}", path.display()))?;
+        if !canonical.starts_with(cwd) {
+            bail!(
+                "image attachment is outside the project boundary: {}",
+                canonical.display()
+            );
+        }
+        let bytes = tokio::fs::read(&canonical)
+            .await
+            .with_context(|| format!("cannot read image {}", canonical.display()))?;
+        let media_type = detect_image_type(&bytes).with_context(|| {
+            format!("unsupported or invalid image file: {}", canonical.display())
+        })?;
+        images.push(UserContent::image_base64(
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            Some(media_type),
+            None,
+        ));
+    }
+    Ok(images)
+}
+
+fn detect_image_type(bytes: &[u8]) -> Option<ImageMediaType> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageMediaType::PNG)
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some(ImageMediaType::JPEG)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageMediaType::GIF)
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some(ImageMediaType::WEBP)
+    } else {
+        None
+    }
+}
+
 pub fn forward_task_notices(session: Session, tasks: TaskManager) {
     let mut notices = tasks.subscribe();
     tokio::spawn(async move {
@@ -364,6 +451,7 @@ mod tests {
     use rig::message::{ToolCallId, ToolFunction};
     use std::collections::VecDeque;
 
+    #[derive(Default)]
     struct FakeBackend {
         responses: Mutex<VecDeque<(Vec<AssistantContent>, Option<Usage>)>>,
         requests: Mutex<Vec<ModelRequest>>,
@@ -414,6 +502,93 @@ mod tests {
             ),
         );
         assert_eq!(call.id.as_str(), "call-1");
+    }
+
+    #[tokio::test]
+    async fn at_image_paths_become_binary_model_attachments() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("screen.png");
+        tokio::fs::write(&path, b"\x89PNG\r\n\x1a\nimage-data")
+            .await
+            .unwrap();
+        let attachments = image_attachments("inspect @screen.png", workspace.path())
+            .await
+            .unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert!(matches!(
+            &attachments[0],
+            UserContent::Image(image)
+                if image.media_type == Some(ImageMediaType::PNG)
+                    && matches!(&image.data, rig::message::DocumentSourceKind::Base64(data)
+                        if base64::engine::general_purpose::STANDARD.decode(data).unwrap().starts_with(b"\x89PNG"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_attachments_cannot_escape_the_project_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::with_suffix(".png").unwrap();
+        tokio::fs::write(outside.path(), b"\x89PNG\r\n\x1a\nimage-data")
+            .await
+            .unwrap();
+        let error = image_attachments(
+            &format!("inspect @{}", outside.path().display()),
+            workspace.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("outside the project boundary"));
+    }
+
+    #[tokio::test]
+    async fn text_only_backends_reject_images_before_recording_the_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            workspace.path().join("screen.png"),
+            b"\x89PNG\r\n\x1a\nimage-data",
+        )
+        .await
+        .unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "text-only",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(session.id(), 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = AgentRuntime::new(
+            Some(backend.clone()),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        );
+
+        let error = runtime
+            .run_turn("inspect @screen.png".to_string())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("does not accept image input"));
+        assert!(backend.requests.lock().await.is_empty());
+        assert!(session.model_history().await.is_empty());
+
+        drop(runtime);
+        drop(session);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[tokio::test]
@@ -523,6 +698,7 @@ mod tests {
                     output: 15.0,
                     cache_read: 0.3,
                     cache_write: 3.75,
+                    tiers: Vec::new(),
                 },
             },
         );

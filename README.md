@@ -133,7 +133,7 @@ A new session freezes the complete generated system prompt plus each selected Sk
 
 ## Models and authentication
 
-URI Agent uses the [pi](https://github.com/badlogic/pi-mono) model catalog and currently runs these API families through its Rust/Rig backend:
+URI Agent uses the [pi](https://github.com/earendil-works/pi) model catalog and currently runs these API families through its Rust/Rig backend:
 
 - `openai-responses`
 - `openai-completions`
@@ -144,15 +144,21 @@ The model picker shows only runnable API families. `:login` matches Pi Agent: AP
 
 The catalog is cached for four hours. Use `--offline`, `URI_AGENT_OFFLINE=1`, or `PI_OFFLINE=1` to disable catalog requests and use only local data. `Ctrl+R` refreshes the catalog from the model picker or Settings.
 
+Downloaded model records are cached without dropping fields, including future fields URI Agent does not yet interpret. The active backend applies catalog limits and tiered pricing, input modalities, `reasoning` and `thinkingLevelMap`, `samplingParams`, and request-relevant `compat` settings such as `maxTokensField`, `forceAdaptiveThinking`, role/tool strictness, and provider-specific thinking formats.
+
+Thinking defaults to `off`. Run `:effort` to show the active model's value and supported levels, or `:effort high` to change it. The command and the Thinking row in `:settings` persist per-model defaults in `modelThinkingLevels`, keyed by `provider/model`; switching models restores the matching value. `defaultThinkingLevel` is the file-level fallback, while `--thinking <LEVEL>` and `URI_AGENT_THINKING` override it for the current invocation. Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+
+For a model whose catalog `input` includes `image`, mention a project-relative PNG, JPEG, GIF, or WebP file as a standalone `@path` in the composer, for example `Describe @screenshots/error.png`. The image is sent as binary multimodal content rather than prompt text. Attachments cannot escape the project boundary, and text-only models reject them explicitly.
+
 ## Configuration
 
-Press `:settings` to inspect the active provider, model, credential status, and output limit. Use `:login` / `:logout` for credentials and `:model` to change models. Changes apply to the current session immediately.
+Press `:settings` to inspect the active provider, model, credential status, thinking level, and output limit. Use `:login` / `:logout` for credentials and `:model` to change models. Changes apply to the current session immediately.
 
 On Linux, the default config directory is `~/.config/uri-agent`; set `URI_AGENT_CONFIG_DIR` to use another location.
 
 | File | Purpose |
 | --- | --- |
-| `settings.json` | Global provider, model, output, and terminal settings |
+| `settings.json` | Global provider, model, thinking, output, and terminal settings |
 | `auth.json` | Global provider credentials; created with mode `0600` on Unix |
 | `models.json` | User-defined providers, models, headers, and model overrides |
 | `models-store.json` | Generated pi catalog cache |
@@ -183,6 +189,7 @@ Credential and header values in trusted configuration support pi-style environme
 --cwd <PATH>             Set the project and protocol working directory
 --continue-session       Resume this project's latest session
 --session <ID|latest>    Resume a specific session
+--thinking <LEVEL>       Set model reasoning effort (default: off)
 --output-limit <BYTES>   Set inline output size (minimum 1024)
 --offline                Disable pi catalog network requests
 ```
@@ -236,7 +243,7 @@ Startup shows a short splash, then a single conversation surface. An empty conve
 | Command | type to filter, `Tab` complete, `Enter` run, `Esc` close |
 | Global | `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+C` quit |
 
-Useful colon commands: `:login`, `:logout`, `:model`, `:status`, `:resume`, `:new`, `:set-terminal`, `:terminal`, `:compact`, `:help`, `:q`.
+Useful colon commands: `:login`, `:logout`, `:model`, `:effort`, `:status`, `:resume`, `:new`, `:set-terminal`, `:terminal`, `:compact`, `:help`, `:q`.
 
 `:set-terminal` saves the command for the floating terminal (`pwsh`, `bash`, …). `:terminal` opens it as a PTY float; double `Esc` closes it. Shift-drag selects text so ordinary clicks still reach the program.
 

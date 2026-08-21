@@ -51,8 +51,52 @@ impl CatalogModel {
             .unwrap_or(128_000)
     }
 
-    /// Pi always sends `max_tokens`, sourced from the catalog's `maxTokens`.
-    /// The fallback matches the default pi uses for user-defined models.
+    pub fn reasoning(&self) -> bool {
+        self.metadata
+            .get("reasoning")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn accepts_input(&self, modality: &str) -> bool {
+        self.metadata
+            .get("input")
+            .and_then(Value::as_array)
+            .map_or(modality == "text", |modalities| {
+                modalities.iter().any(|value| value == modality)
+            })
+    }
+
+    pub fn compat(&self, key: &str) -> Option<&Value> {
+        self.metadata.get("compat").and_then(|value| value.get(key))
+    }
+
+    pub fn thinking_level(&self, level: ThinkingLevel) -> Option<&Value> {
+        self.metadata
+            .get("thinkingLevelMap")
+            .and_then(|value| value.get(level.as_str()))
+    }
+
+    pub fn supports_thinking_level(&self, level: ThinkingLevel) -> bool {
+        if !self.reasoning() {
+            return level == ThinkingLevel::Off;
+        }
+        match self.thinking_level(level) {
+            Some(Value::Null) => false,
+            Some(_) => true,
+            None => !matches!(level, ThinkingLevel::Xhigh | ThinkingLevel::Max),
+        }
+    }
+
+    pub fn sampling_params(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.metadata
+            .get("samplingParams")
+            .and_then(Value::as_object)
+    }
+
+    /// Output ceiling from the catalog's `maxTokens`; the provider adapter
+    /// selects the corresponding wire field. The fallback matches pi's default
+    /// for user-defined models.
     pub fn max_tokens(&self) -> u64 {
         self.metadata
             .get("maxTokens")
@@ -69,11 +113,28 @@ impl CatalogModel {
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
         };
+        let tiers = rates
+            .and_then(|cost| cost.get("tiers"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tier| {
+                let rate = |key: &str| tier.get(key).and_then(Value::as_f64);
+                Some(ModelCostTier {
+                    input_tokens_above: tier.get("inputTokensAbove")?.as_u64()?,
+                    input: rate("input")?,
+                    output: rate("output")?,
+                    cache_read: rate("cacheRead")?,
+                    cache_write: rate("cacheWrite")?,
+                })
+            })
+            .collect();
         ModelCost {
             input: rate("input"),
             output: rate("output"),
             cache_read: rate("cacheRead"),
             cache_write: rate("cacheWrite"),
+            tiers,
         }
     }
 
@@ -86,26 +147,122 @@ impl CatalogModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    #[default]
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub const fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub const fn budget(self) -> u64 {
+        match self {
+            Self::Off => 0,
+            Self::Minimal => 1_024,
+            Self::Low => 2_048,
+            Self::Medium => 8_192,
+            Self::High | Self::Xhigh | Self::Max => 16_384,
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ThinkingLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            _ => bail!(
+                "thinking level must be one of off, minimal, low, medium, high, xhigh, or max"
+            ),
+        }
+    }
+}
+
 /// Per-million-token USD rates from the catalog's `cost` object.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub tiers: Vec<ModelCostTier>,
+}
+
+impl ModelCost {
+    pub fn total(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+        let total_input = input.saturating_add(cache_read).saturating_add(cache_write);
+        let rates = self
+            .tiers
+            .iter()
+            .filter(|tier| total_input > tier.input_tokens_above)
+            .max_by_key(|tier| tier.input_tokens_above);
+        let (input_rate, output_rate, cache_read_rate, cache_write_rate) = rates.map_or(
+            (self.input, self.output, self.cache_read, self.cache_write),
+            |tier| (tier.input, tier.output, tier.cache_read, tier.cache_write),
+        );
+        (input as f64 * input_rate
+            + output as f64 * output_rate
+            + cache_read as f64 * cache_read_rate
+            + cache_write as f64 * cache_write_rate)
+            / 1_000_000.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelCostTier {
+    pub input_tokens_above: u64,
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
 }
 
-impl ModelCost {
-    pub fn total(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
-        (input as f64 * self.input
-            + output as f64 * self.output
-            + cache_read as f64 * self.cache_read
-            + cache_write as f64 * self.cache_write)
-            / 1_000_000.0
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ModelLimits {
     pub context_window: usize,
     pub max_tokens: u64,
@@ -737,6 +894,21 @@ mod tests {
         assert_eq!(limits.context_window, 1_048_576);
         assert_eq!(limits.max_tokens, 131_072);
 
+        let tiered: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "tiered", "name": "Tiered", "api": "openai-responses",
+            "provider": "openai", "baseUrl": "https://api.openai.com/v1",
+            "cost": {
+                "input": 1, "output": 2, "cacheRead": 0.1, "cacheWrite": 0.2,
+                "tiers": [{
+                    "inputTokensAbove": 1000,
+                    "input": 3, "output": 4, "cacheRead": 0.3, "cacheWrite": 0.4
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(tiered.cost().total(800, 100, 100, 100), 0.001_03);
+        assert_eq!(tiered.cost().total(801, 100, 100, 100), 0.002_873);
+
         let bare: CatalogModel = serde_json::from_value(serde_json::json!({
             "id": "one", "name": "One", "api": "openai-responses",
             "provider": "openai", "baseUrl": "https://example.test/v1"
@@ -744,6 +916,51 @@ mod tests {
         .unwrap();
         assert_eq!(bare.max_tokens(), 16_384);
         assert_eq!(bare.cost(), ModelCost::default());
+    }
+
+    #[test]
+    fn every_remote_model_field_round_trips_without_loss() {
+        let original = serde_json::json!({
+            "id": "complete",
+            "name": "Complete",
+            "api": "openai-completions",
+            "provider": "test",
+            "baseUrl": "https://example.test/v1",
+            "headers": {"x-custom": "value"},
+            "reasoning": true,
+            "input": ["text", "image"],
+            "cost": {
+                "input": 1,
+                "output": 2,
+                "cacheRead": 0.1,
+                "cacheWrite": 0.2,
+                "tiers": [{
+                    "inputTokensAbove": 200000,
+                    "input": 3,
+                    "output": 4,
+                    "cacheRead": 0.3,
+                    "cacheWrite": 0.4
+                }]
+            },
+            "contextWindow": 262144,
+            "maxTokens": 65536,
+            "compat": {
+                "maxTokensField": "max_tokens",
+                "forceAdaptiveThinking": true,
+                "futureCompatFlag": {"nested": true}
+            },
+            "thinkingLevelMap": {"off": null, "minimal": 512, "high": "max"},
+            "samplingParams": {"top_p": 0.9},
+            "futureTopLevelField": [1, {"opaque": true}]
+        });
+        let model: CatalogModel = serde_json::from_value(original.clone()).unwrap();
+        assert!(model.reasoning());
+        assert!(model.accepts_input("image"));
+        assert_eq!(
+            model.thinking_level(ThinkingLevel::Minimal),
+            Some(&serde_json::json!(512))
+        );
+        assert_eq!(serde_json::to_value(model).unwrap(), original);
     }
 
     #[test]

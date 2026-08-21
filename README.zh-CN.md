@@ -133,7 +133,7 @@ code-review-skill://scripts/check.py
 
 ## 模型与认证
 
-URI Agent 使用 [pi](https://github.com/badlogic/pi-mono) 模型目录，目前通过 Rust/Rig 后端运行以下 API family：
+URI Agent 使用 [pi](https://github.com/earendil-works/pi) 模型目录，目前通过 Rust/Rig 后端运行以下 API family：
 
 - `openai-responses`
 - `openai-completions`
@@ -144,15 +144,21 @@ URI Agent 使用 [pi](https://github.com/badlogic/pi-mono) 模型目录，目前
 
 目录缓存四小时。使用 `--offline`、`URI_AGENT_OFFLINE=1` 或 `PI_OFFLINE=1` 可禁用目录请求，只使用本地数据。在模型选择器或 Settings 中按 `Ctrl+R` 可刷新目录。
 
+下载的模型记录会完整缓存，包括 URI Agent 暂未解释的未来字段。当前后端会应用目录中的限制与阶梯价格、输入模态、`reasoning` 与 `thinkingLevelMap`、`samplingParams`，以及会影响请求的 `compat` 设置，例如 `maxTokensField`、`forceAdaptiveThinking`、role/工具 strict 设置和 Provider 特定的 thinking 格式。
+
+Thinking 默认为 `off`。运行 `:effort` 可查看当前模型的取值和支持等级，运行 `:effort high` 可直接修改。该命令与 `:settings` 中的 Thinking 项都会把各模型默认值持久化到 `modelThinkingLevels`，键为 `provider/model`；切换模型时会恢复对应值。`defaultThinkingLevel` 是配置文件中的兜底值，`--thinking <LEVEL>` 和 `URI_AGENT_THINKING` 则仅覆盖当前启动实例。可选等级为 `off`、`minimal`、`low`、`medium`、`high`、`xhigh` 和 `max`。
+
+当模型目录的 `input` 包含 `image` 时，可在输入浮窗中用独立的 `@path` 引用项目内的 PNG、JPEG、GIF 或 WebP 文件，例如 `描述 @screenshots/error.png`。图片会作为二进制多模态内容发送，而不是作为 prompt 文本。附件不能越出项目边界，纯文本模型会明确拒绝图片附件。
+
 ## 配置
 
-按 `:settings` 可查看当前 Provider、模型、凭据状态和输出上限。凭据用 `:login` / `:logout`，换模型用 `:model`。更改会立即应用到当前会话。
+按 `:settings` 可查看当前 Provider、模型、凭据状态、thinking 等级和输出上限。凭据用 `:login` / `:logout`，换模型用 `:model`。更改会立即应用到当前会话。
 
 Linux 默认配置目录为 `~/.config/uri-agent`；可通过 `URI_AGENT_CONFIG_DIR` 指定其他位置。
 
 | 文件 | 用途 |
 | --- | --- |
-| `settings.json` | 全局 Provider、模型、输出和终端设置 |
+| `settings.json` | 全局 Provider、模型、thinking、输出和终端设置 |
 | `auth.json` | 全局 Provider 凭据；Unix 上创建为 `0600` 权限 |
 | `models.json` | 用户定义的 Provider、模型、header 和模型覆盖 |
 | `models-store.json` | 程序生成的 pi 目录缓存 |
@@ -183,6 +189,7 @@ models.json apiKey
 --cwd <PATH>             设置项目和协议工作目录
 --continue-session       恢复该项目最近的会话
 --session <ID|latest>    恢复指定会话
+--thinking <LEVEL>       设置模型推理强度（默认 off）
 --output-limit <BYTES>   设置内联输出大小（最小 1024）
 --offline                禁用 pi 目录网络请求
 ```
@@ -236,7 +243,7 @@ models.json apiKey
 | 命令面板 | 输入过滤，`Tab` 补全，`Enter` 执行，`Esc` 关闭 |
 | 全局 | `F1` 帮助，`F2` 设置，`F3` 模型，`F4` 状态，`Ctrl+C` 退出 |
 
-常用冒号命令：`:login`、`:logout`、`:model`、`:status`、`:resume`、`:new`、`:set-terminal`、`:terminal`、`:compact`、`:help`、`:q`。
+常用冒号命令：`:login`、`:logout`、`:model`、`:effort`、`:status`、`:resume`、`:new`、`:set-terminal`、`:terminal`、`:compact`、`:help`、`:q`。
 
 `:set-terminal` 保存浮窗终端命令（如 `pwsh`、`bash`）。`:terminal` 以 PTY 浮窗打开；连按两次 `Esc` 关闭。Shift 拖选文字，普通点击仍交给终端程序。
 

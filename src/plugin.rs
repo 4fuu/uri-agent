@@ -13,6 +13,7 @@ pub enum CoreCommand {
     Protocols,
     Status,
     Models,
+    Effort,
     Settings,
     Login,
     Logout,
@@ -186,9 +187,16 @@ fn core_commands() -> Vec<CommandSpec> {
             CommandTarget::Core(Models),
         ),
         CommandSpec::new(
+            "effort",
+            "Thinking effort",
+            "show or set thinking effort for the active model",
+            ["thinking"],
+            CommandTarget::Core(Effort),
+        ),
+        CommandSpec::new(
             "settings",
             "Settings",
-            "model, credential status, and output limit",
+            "model, credential status, thinking, and output limit",
             std::iter::empty::<&str>(),
             CommandTarget::Core(Settings),
         ),
@@ -511,6 +519,11 @@ mod tests {
             CommandTarget::Core(CoreCommand::Status)
         );
         assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
+        assert_eq!(
+            registry.resolve(":thinking high").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Effort)
+        );
+        assert_eq!(registry.resolve(":effort high").unwrap().arguments, "high");
     }
 
     #[test]

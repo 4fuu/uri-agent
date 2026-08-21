@@ -114,7 +114,7 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
     notices.extend(config.catalog.warnings().await);
 
     let descriptors = protocols.descriptors();
-    let configured = match configured_backend(&initial, &config.catalog).await {
+    let configured = match configured_backend(&initial, &config.catalog, Some(session.id())).await {
         Ok(configured) => configured,
         Err(error) => {
             notices.push(format!("model configuration is not usable: {error:#}"));

@@ -1,4 +1,4 @@
-use crate::catalog::{CatalogModel, ModelCatalog, api_key_environment};
+use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel, api_key_environment};
 use crate::oauth::{self, OauthToken};
 use crate::session::SessionChoice;
 use anyhow::{Context, Result, anyhow, bail};
@@ -43,6 +43,10 @@ pub struct Cli {
     /// Override the number of bytes returned inline before URI Agent spills output to a file.
     #[arg(long)]
     pub output_limit: Option<usize>,
+
+    /// Reasoning effort for capable models (off, minimal, low, medium, high, xhigh, or max).
+    #[arg(long, value_name = "LEVEL")]
+    pub thinking: Option<ThinkingLevel>,
 
     /// Disable pi.dev model-catalog network requests and use the local cache only.
     #[arg(long)]
@@ -92,6 +96,7 @@ impl Config {
                     model: cli.model,
                     api_key: cli.api_key,
                     output_limit: cli.output_limit,
+                    thinking: cli.thinking,
                 },
             )
             .await?,
@@ -146,11 +151,13 @@ pub struct ActiveSettings {
     pub api_key: Option<String>,
     pub auth_kind: AuthKind,
     pub output_limit: usize,
+    pub thinking: ThinkingLevel,
     pub terminal: Option<String>,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
     pub api_key_source: ValueSource,
     pub output_limit_source: ValueSource,
+    pub thinking_source: ValueSource,
     pub terminal_source: ValueSource,
     pub credential_environment: BTreeMap<String, String>,
 }
@@ -174,6 +181,7 @@ struct InvocationOverrides {
     model: Option<String>,
     api_key: Option<String>,
     output_limit: Option<usize>,
+    thinking: Option<ThinkingLevel>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -185,6 +193,10 @@ struct SettingsFile {
     default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_limit: Option<usize>,
+    #[serde(alias = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    default_thinking_level: Option<ThinkingLevel>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_thinking_levels: BTreeMap<String, ThinkingLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<String>,
     #[serde(flatten)]
@@ -316,6 +328,28 @@ impl ConfigManager {
             (&mut files.global, self.settings_path())
         };
         settings.output_limit = Some(output_limit);
+        write_json(&path, settings, false).await?;
+        self.recalculate(&files).await
+    }
+
+    pub async fn set_model_thinking(
+        &self,
+        provider: &str,
+        model: &str,
+        thinking: ThinkingLevel,
+    ) -> Result<ActiveSettings> {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            bail!("provider and model are required to save thinking effort");
+        }
+        let mut files = self.files.lock().await;
+        let (settings, path) = if self.project_path.exists() {
+            (&mut files.project, self.project_path.clone())
+        } else {
+            (&mut files.global, self.settings_path())
+        };
+        settings
+            .model_thinking_levels
+            .insert(model_setting_key(provider, model), thinking);
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
     }
@@ -486,6 +520,31 @@ async fn calculate_active(
         bail!("output limit must be at least 1024 bytes");
     }
 
+    let (mut thinking, mut thinking_source) = setting(
+        ThinkingLevel::Off,
+        files.global.default_thinking_level,
+        files.project.default_thinking_level,
+    );
+    let thinking_key = model_setting_key(&provider, &model);
+    if let Some(value) = files.global.model_thinking_levels.get(&thinking_key) {
+        thinking = *value;
+        thinking_source = ValueSource::Global;
+    }
+    if let Some(value) = files.project.model_thinking_levels.get(&thinking_key) {
+        thinking = *value;
+        thinking_source = ValueSource::Project;
+    }
+    if let Ok(value) = env::var("URI_AGENT_THINKING")
+        && !value.trim().is_empty()
+    {
+        thinking = value.parse().context("invalid URI_AGENT_THINKING")?;
+        thinking_source = ValueSource::Environment("URI_AGENT_THINKING".to_string());
+    }
+    if let Some(value) = invocation.thinking {
+        thinking = value;
+        thinking_source = ValueSource::CommandLine;
+    }
+
     let (mut terminal, mut terminal_source) = setting(
         String::new(),
         files.global.terminal.clone(),
@@ -557,11 +616,13 @@ async fn calculate_active(
         api_key,
         auth_kind,
         output_limit,
+        thinking,
         terminal,
         provider_source,
         model_source,
         api_key_source,
         output_limit_source,
+        thinking_source,
         terminal_source,
         credential_environment,
     })
@@ -611,6 +672,10 @@ fn setting<T: Clone>(default: T, global: Option<T>, project: Option<T>) -> (T, V
     } else {
         (default, ValueSource::Default)
     }
+}
+
+fn model_setting_key(provider: &str, model: &str) -> String {
+    format!("{provider}/{model}")
 }
 
 static COMMAND_VALUE_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
@@ -796,15 +861,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_file_preserves_pi_fields_it_does_not_own() {
+    fn settings_file_uses_pi_thinking_fields_and_migrates_the_legacy_name() {
         let settings: SettingsFile = serde_json::from_value(serde_json::json!({
             "defaultProvider": "openai",
             "defaultModel": "gpt-5.2",
-            "thinkingLevel": "high"
+            "thinkingLevel": "high",
+            "modelThinkingLevels": {
+                "openai/gpt-5.2": "medium"
+            }
         }))
         .unwrap();
         let value = serde_json::to_value(settings).unwrap();
-        assert_eq!(value["thinkingLevel"], "high");
+        assert_eq!(value["defaultThinkingLevel"], "high");
+        assert_eq!(value["modelThinkingLevels"]["openai/gpt-5.2"], "medium");
+        assert!(value.get("thinkingLevel").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_thinking_preferences_are_persisted_by_provider_and_model() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(&project).await.unwrap();
+        let catalog = Arc::new(ModelCatalog::load(&directory, true).await.unwrap());
+        let manager = ConfigManager::load(
+            directory.clone(),
+            &project,
+            catalog,
+            InvocationOverrides::default(),
+        )
+        .await
+        .unwrap();
+
+        manager
+            .set_model_thinking("openai", "gpt-5.2", ThinkingLevel::High)
+            .await
+            .unwrap();
+        manager
+            .set_model_thinking("anthropic", "claude-opus-4-6", ThinkingLevel::Medium)
+            .await
+            .unwrap();
+
+        let saved: Value =
+            serde_json::from_slice(&fs::read(directory.join("settings.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(saved["modelThinkingLevels"]["openai/gpt-5.2"], "high");
+        assert_eq!(
+            saved["modelThinkingLevels"]["anthropic/claude-opus-4-6"],
+            "medium"
+        );
+
+        let files = manager.files.lock().await;
+        let openai = calculate_active(
+            &files,
+            &manager.catalog,
+            &InvocationOverrides {
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5.2".to_string()),
+                ..InvocationOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+        let anthropic = calculate_active(
+            &files,
+            &manager.catalog,
+            &InvocationOverrides {
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-opus-4-6".to_string()),
+                ..InvocationOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(openai.thinking, ThinkingLevel::High);
+        assert_eq!(anthropic.thinking, ThinkingLevel::Medium);
     }
 
     #[test]
@@ -821,11 +953,13 @@ mod tests {
             api_key: None,
             auth_kind: AuthKind::None,
             output_limit: DEFAULT_OUTPUT_LIMIT,
+            thinking: ThinkingLevel::Off,
             terminal: None,
             provider_source,
             model_source,
             api_key_source: ValueSource::Default,
             output_limit_source: ValueSource::Default,
+            thinking_source: ValueSource::Default,
             terminal_source: ValueSource::Default,
             credential_environment: BTreeMap::new(),
         };

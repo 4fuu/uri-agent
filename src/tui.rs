@@ -2,10 +2,10 @@ mod animation;
 mod model_selector;
 
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
-use crate::catalog::{CatalogModel, ModelCatalog};
+use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
 use crate::config::{ActiveSettings, AuthKind, ConfigManager};
 use crate::keymap::{Keymap, canonical_key};
-use crate::model::configured_backend;
+use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
@@ -181,6 +181,7 @@ struct SettingsState {
     editing: Option<EditingSetting>,
     api_key: String,
     api_key_changed: bool,
+    thinking: ThinkingLevel,
     output_limit: String,
 }
 
@@ -190,6 +191,7 @@ impl SettingsState {
         let model = active.catalog_model(catalog).await;
         Self {
             output_limit: active.output_limit.to_string(),
+            thinking: active.thinking,
             active,
             model,
             selected: 0,
@@ -205,6 +207,22 @@ impl SettingsState {
 
     fn model(&self) -> Option<&CatalogModel> {
         self.model.as_ref()
+    }
+
+    fn cycle_thinking(&mut self) {
+        let current = ThinkingLevel::ALL
+            .iter()
+            .position(|level| *level == self.thinking)
+            .unwrap_or(0);
+        self.thinking = (1..=ThinkingLevel::ALL.len())
+            .map(|offset| ThinkingLevel::ALL[(current + offset) % ThinkingLevel::ALL.len()])
+            .find(|level| {
+                let Some(model) = self.model() else {
+                    return *level == ThinkingLevel::Off;
+                };
+                model.supports_thinking_level(*level)
+            })
+            .unwrap_or(ThinkingLevel::Off);
     }
 }
 
@@ -1301,6 +1319,10 @@ async fn dispatch_ui_command(
             Action::Continue
         }
         CoreCommand::Models => Action::OpenModels(arguments),
+        CoreCommand::Effort => {
+            handle_effort(app, services, &arguments).await;
+            Action::Continue
+        }
         CoreCommand::Settings => Action::OpenSettings,
         CoreCommand::Login => open_login(app, &services.catalog, arguments).await,
         CoreCommand::Logout => open_logout(app, &services.manager, arguments).await,
@@ -1935,13 +1957,17 @@ fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
             Action::Continue
         }
         Some("next") => {
-            settings.selected = (settings.selected + 1).min(2);
+            settings.selected = (settings.selected + 1).min(3);
             Action::Continue
         }
         Some("edit") => match settings.selected {
             0 => Action::OpenModels(String::new()),
             1 => Action::Continue,
             2 => {
+                settings.cycle_thinking();
+                Action::Continue
+            }
+            3 => {
                 settings.editing = Some(EditingSetting::OutputLimit);
                 settings.output_limit.clear();
                 Action::Continue
@@ -2013,7 +2039,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = settings.selected.saturating_add(1).min(2);
+                    settings.selected = settings.selected.saturating_add(1).min(3);
                 }
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
@@ -2051,8 +2077,16 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                 AppHit::Setting(index) => {
                     if let Some(settings) = app.settings.as_mut() {
                         settings.selected = index;
-                        if activate && index == 0 {
-                            return Action::OpenModels(String::new());
+                        if activate {
+                            match index {
+                                0 => return Action::OpenModels(String::new()),
+                                2 => settings.cycle_thinking(),
+                                3 => {
+                                    settings.editing = Some(EditingSetting::OutputLimit);
+                                    settings.output_limit.clear();
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -2527,6 +2561,87 @@ async fn select_model(
     }
 }
 
+async fn handle_effort(app: &mut App, services: &LoopServices, arguments: &str) {
+    let active = services.manager.current().await;
+    if !active.model_configured() {
+        app.set_flash("No active model; choose one with :model");
+        return;
+    }
+    let Some(model) = active.catalog_model(&services.catalog).await else {
+        app.set_flash(format!(
+            "Model {}/{} is not available in the runnable Pi catalog",
+            active.provider, active.model
+        ));
+        return;
+    };
+    let available = ThinkingLevel::ALL
+        .into_iter()
+        .filter(|level| model.supports_thinking_level(*level))
+        .collect::<Vec<_>>();
+    let available_label = available
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key = format!("{}/{}", active.provider, active.model);
+    let requested = arguments.trim();
+    if requested.is_empty() {
+        let effective = clamp_thinking_level(&model, active.thinking);
+        app.set_flash(if effective == active.thinking {
+            format!("Effort for {key}: {effective} · available: {available_label}")
+        } else {
+            format!(
+                "Effort for {key}: {effective} ({} requested by {}) · available: {available_label}",
+                active.thinking,
+                active.thinking_source.label()
+            )
+        });
+        return;
+    }
+    let requested = match requested.parse::<ThinkingLevel>() {
+        Ok(level) => level,
+        Err(_) => {
+            app.set_flash(format!(
+                "Unknown effort {requested:?} · available for {key}: {available_label}"
+            ));
+            return;
+        }
+    };
+    if !available.contains(&requested) {
+        app.set_flash(format!(
+            "Effort {requested} is not supported by {key} · available: {available_label}"
+        ));
+        return;
+    }
+    let result = async {
+        let active = services
+            .manager
+            .set_model_thinking(&model.provider, &model.id, requested)
+            .await?;
+        apply_active(
+            app,
+            &services.runtime,
+            &services.catalog,
+            &services.output,
+            &active,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(active)
+    }
+    .await;
+    app.set_flash(match result {
+        Ok(active) if active.thinking == requested => {
+            format!("Effort for {key} set to {requested}")
+        }
+        Ok(active) => format!(
+            "Saved {requested} for {key}, but {} keeps {} active",
+            active.thinking_source.label(),
+            active.thinking
+        ),
+        Err(error) => format!("Could not set effort for {key}: {error:#}"),
+    });
+}
+
 fn key_name(key: KeyEvent) -> String {
     let mut modifiers = Vec::new();
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2595,6 +2710,7 @@ async fn save_settings(
     let selection = settings
         .model()
         .map(|model| (settings.provider().to_string(), model.id.clone()));
+    let thinking = settings.thinking;
     let output_limit = match settings.output_limit.parse::<usize>() {
         Ok(limit) if limit >= 1024 => limit,
         Ok(_) => {
@@ -2619,6 +2735,9 @@ async fn save_settings(
         }
         manager.set_output_limit(output_limit).await?;
         if let Some((provider, model)) = selection {
+            manager
+                .set_model_thinking(&provider, &model, thinking)
+                .await?;
             manager.set_model(&provider, &model).await?;
         }
         let active = manager.current().await;
@@ -2731,7 +2850,7 @@ async fn apply_active(
     output: &OutputStore,
     active: &ActiveSettings,
 ) -> Result<()> {
-    let configured = configured_backend(active, catalog).await?;
+    let configured = configured_backend(active, catalog, Some(runtime.session().id())).await?;
     let model_ready = configured.is_some();
     let (backend, limits) = match configured {
         Some((backend, limits)) => (Some(backend), Some(limits)),
@@ -2743,7 +2862,9 @@ async fn apply_active(
                 .map(|model| model.limits()),
         ),
     };
-    let context_window = limits.map_or(128_000, |limits| limits.context_window);
+    let context_window = limits
+        .as_ref()
+        .map_or(128_000, |limits| limits.context_window);
     runtime.set_backend(backend, limits).await;
     runtime
         .session()
@@ -3917,6 +4038,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
     let rows = [
         ("Model", format!("{} / {model}", settings.provider())),
         ("Credential", credential),
+        ("Thinking", settings.thinking.to_string()),
         ("Output limit", output_limit),
     ];
     let mut lines = vec![
@@ -3947,7 +4069,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
             .wrap(Wrap { trim: false }),
         area,
     );
-    for index in 0..3 {
+    for index in 0..4 {
         app.hit_regions.push(HitRegion {
             area: Rect::new(
                 inner.x,
@@ -4840,17 +4962,19 @@ mod tests {
     }
 
     #[test]
-    fn settings_panel_never_renders_the_api_key() {
+    fn settings_panel_hides_the_api_key_and_cycles_thinking() {
         let active = ActiveSettings {
             provider: "openai".to_string(),
             model: "gpt-5.2".to_string(),
             api_key: Some("super-secret-value".to_string()),
             auth_kind: AuthKind::ApiKey,
             output_limit: 32 * 1024,
+            thinking: ThinkingLevel::Off,
             provider_source: ValueSource::Global,
             model_source: ValueSource::Global,
             api_key_source: ValueSource::Global,
             output_limit_source: ValueSource::Global,
+            thinking_source: ValueSource::Global,
             terminal: None,
             terminal_source: ValueSource::Global,
             credential_environment: BTreeMap::new(),
@@ -4864,14 +4988,40 @@ mod tests {
             editing: None,
             api_key: String::new(),
             api_key_changed: false,
+            thinking: ThinkingLevel::Off,
             output_limit: "32768".to_string(),
         });
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("SETTINGS"));
         assert!(rendered.contains("API key"));
+        assert!(rendered.contains("Thinking"));
+        assert!(rendered.contains("off"));
         assert!(!rendered.contains("super-secret-value"));
         assert!(!rendered.contains("Editor"));
         assert!(!rendered.contains("fzf"));
+
+        let settings = app.settings.as_mut().unwrap();
+        settings.model = Some(
+            serde_json::from_value(serde_json::json!({
+                "id": "reasoning-model",
+                "name": "Reasoning model",
+                "api": "openai-responses",
+                "provider": "openai",
+                "baseUrl": "https://example.test/v1",
+                "reasoning": true
+            }))
+            .unwrap(),
+        );
+        settings.selected = 2;
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(
+            handle_settings_key(&mut app, key, &key_name(key)),
+            Action::Continue
+        ));
+        assert_eq!(
+            app.settings.as_ref().unwrap().thinking,
+            ThinkingLevel::Minimal
+        );
     }
 
     #[test]
