@@ -1,0 +1,155 @@
+# Terminal interface and sessions
+
+URI Agent presents one conversation surface with floating controls for composition, commands, settings, selection, and an embedded terminal. It has no Browse, Insert, or Detail modes and no slash-command syntax.
+
+## Startup and conversation surface
+
+Startup may show a short animated splash before the conversation. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
+
+After the first record appears, the transcript uses the available content area and a single highlighted footer shows the project path, optional branch and usage details, model, context pressure, and the key for more status. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel.
+
+Conversation rows stay folded until opened. Select a row with the arrow keys or mouse and press `Enter` to expand or fold it. Reasoning rows are included instead of being placed in a separate mode.
+
+## Composer and commands
+
+Press `i` to open the floating composer:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Send the request |
+| `Shift+Enter` | Insert a newline |
+| `Ctrl+Enter` or `Ctrl+J` | Insert a newline |
+| `Esc` | Close the composer and preserve the draft |
+
+The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
+
+Press `:` from the conversation to open the command panel. Type to filter, use `Tab` or `Shift+Tab` to complete, press `Enter` to run, and press `Esc` to close it. Commands that need a choice or more text open a selector or input float. There are no slash commands or secondary command syntax.
+
+Core commands are registered through `CommandRegistry`:
+
+| Command | Purpose |
+| --- | --- |
+| `:compose` | Open the composer |
+| `:copy` | Copy the current selection or visible panel through OSC52 |
+| `:tasks` | Inspect and cancel managed protocol work |
+| `:protocols` | List registered read and exec routes |
+| `:status` | Show project, model, usage, and extension status |
+| `:model` | Search runnable models |
+| `:effort` | Show or set thinking effort |
+| `:settings` | Inspect and edit active settings |
+| `:login`, `:logout` | Manage provider credentials |
+| `:resume`, `:new` | Switch project sessions or create one |
+| `:compact` | Request a context checkpoint |
+| `:set-terminal`, `:terminal` | Configure and open the embedded terminal |
+| `:help` | Show the active commands and keymap |
+| `:quit` or `:q` | Exit URI Agent |
+
+Extensions register commands through the same registry, so they appear in the panel, colon command line, help, and key-bindable action set without TUI-specific routing.
+
+## Default navigation
+
+| Surface | Useful defaults |
+| --- | --- |
+| Conversation | `Up`/`Down` select, `Enter` open/fold, `PageUp`/`PageDown` page, `Home`/`End` jump |
+| Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
+| Global | `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
+| Copy and exit | `Ctrl+Shift+C` copy, `Ctrl+C` quit |
+
+Arrow keys and mouse input are first-class. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
+
+`F1` and `:help` are more authoritative than this summary because they reflect loaded keymap overrides and registered extension commands.
+
+## Layered keymap
+
+Key bindings are loaded in this order:
+
+```text
+built-in defaults
+< <config>/keymap.rhai
+< <project>/.uri-agent/keymap.rhai
+```
+
+Later files override earlier mappings. Rhai files call `map` and `unmap`:
+
+```rhai
+map("main", "x", "copy");
+unmap("main", "j");
+map("composer", "ctrl+j", "newline");
+```
+
+Bindings belong to surfaces such as `global`, `main`, `composer`, `command`, `list`, `selector`, `settings`, `models`, `document`, `selection`, and `terminal`. A surface binding is checked before a global binding.
+
+Configurable actions must go through the keymap. New commands that should be available from the command panel, colon line, or key bindings must go through `CommandRegistry`; do not add a modeless hard-coded shortcut as a separate path.
+
+## Embedded terminal
+
+`:set-terminal` stores the command used by `:terminal`, such as `bash` or `pwsh -NoLogo`. The `URI_AGENT_TERMINAL` environment variable can override the stored command for an invocation.
+
+`:terminal` opens that command in a PTY float rooted at the project directory. Terminal input, resize, mouse events, and process exit are handled by the embedded terminal layer. Press `Esc` twice within 500 milliseconds to close the float; a single `Esc` is sent to the running terminal program.
+
+Ordinary clicks and drags are sent to the terminal application. Hold `Shift` while dragging to select rendered text. `Ctrl+Shift+C` copies the selection through OSC52.
+
+Read-only URI Agent surfaces use direct drag selection without Shift. Terminal restoration, mouse selection, and OSC52 copy must remain functional on normal exits and error paths.
+
+## Image attachments
+
+For a model whose catalog `input` includes `image`, add a standalone `@path` argument to the composer text:
+
+```text
+Describe @screenshots/error.png and suggest a fix.
+```
+
+URI Agent recognizes PNG, JPEG, GIF, and WebP extensions, validates the file signature, and adds the binary image as multimodal user content. The original text, including the `@path`, remains part of the user message.
+
+Relative paths resolve from the project. Absolute paths are accepted only when their canonical location remains inside the canonical project directory. Symlink escapes are rejected. If the active model is text-only, a request containing a recognized image attachment fails explicitly.
+
+## Sessions and context
+
+Sessions preserve the conversation and the exact startup context used by the model.
+
+### Session storage and project boundaries
+
+Sessions are append-only and stored in SQLite:
+
+```text
+<platform-data-dir>/uri-agent/sessions.db
+```
+
+If a platform data directory cannot be determined, URI Agent falls back to `<project>/.uri-agent/sessions.db`.
+
+The canonical startup directory is the project boundary and is recorded with every session. Session selection cannot cross it:
+
+- a normal launch creates a new session;
+- `--continue-session` resumes the most recently updated session for this project;
+- `--session <id>` resumes that ID only if it belongs to this project;
+- `--session latest` selects the same project-scoped latest session;
+- `:resume` lists sessions for the current project.
+
+`Esc` keeps draft text in the composer. URI Agent writes the current draft to SQLite when the TUI exits or switches sessions, then restores it with that session.
+
+### Frozen startup context
+
+A new session stores a `SessionContext` event containing the complete generated system prompt and selected Skill snapshots. Resume reuses that event. It does not regenerate the prompt or rebind Skills from the current filesystem layout.
+
+This makes model replay stable across application restarts and configuration changes. The detailed Skill rules are in [Frozen session behavior](protocols.md#frozen-session-behavior).
+
+### Append-only events
+
+User messages, model messages, tool calls and results, usage, notices, errors, task notices, turn boundaries, and compaction checkpoints are appended as events. Existing events are not rewritten or deleted during normal operation or context compaction.
+
+Provider tool-call identity is preserved in model history so resumed tool conversations remain valid for the selected backend.
+
+### Context compaction
+
+URI Agent estimates replay size against the selected model's context window. Before an overflowing request, it may ask the model for a durable summary of older history and append a compaction checkpoint. Replay then uses:
+
+```text
+frozen system prompt
++ checkpoint summary of older history
++ complete recent user turns
++ events after the checkpoint
+```
+
+Compaction boundaries are complete user turns. A tool call is never separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
+
+Run `:compact` to request an earlier checkpoint. The command fails clearly when there is not enough completed history to summarize.
