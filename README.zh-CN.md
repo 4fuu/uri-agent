@@ -1,28 +1,57 @@
-# uri-agent
+# URI Agent
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-一个面向终端的协议驱动 coding agent。模型始终只看到 `read` 和 `exec` 两个工具；协议、Skills、任务结果和大型输出都在需要时才加载。
+URI Agent 是一个终端 coding agent，以精简且稳定的模型接口为核心。模型始终只看到 `read` 和 `exec` 两个工具，并通过 `file://...`、`bash://...` 等协议地址访问文件、Shell、编辑、Skills 及后续扩展。
 
-## 设计
+这种设计只在能力真正有用时才把对应说明加载到模型上下文。每个协议都在 `<protocol>://help` 提供自身文档；长时间工作由系统管理的任务表示；超长输出不会被丢弃，而是保留为可读取的 `file://` 地址。
 
-Agent 每增加一种集成，工具列表通常就会继续增长。这些 schema 会在模型判断是否需要对应能力之前占用上下文，每个新工具也会带来另一套调用方式。
+> [!WARNING]
+> URI Agent 不提供沙箱。文件与 Shell 协议使用 `uri-agent` 进程本身的权限运行。请只在可信的项目和环境中使用。
 
-uri-agent 将模型面对的契约保持稳定：
+## 快速开始
 
-- **两个工具** — 所有能力都通过 `read(uri, body?)` 或 `exec(uri, body?)` 访问。
-- **分层加载** — 系统提示词只列出协议名称和用途，操作说明保存在 `<protocol>://help`。
-- **不透明地址** — 路由器只按第一个 `://` 分割，其余 target 不做 URL 解码或规范化。
-- **任意 body** — `body` 可以是任意 JSON 值，并原样交给协议。
-- **异步执行** — 协议可以立即返回系统管理的任务。等待由协议自行实现，不是 `exec` 或 URI 的通用行为。
-- **一个 Skill，一个协议** — 每个 Skill 都拥有独立且对模型可见的协议名。
-- **稳定会话** — 每个会话都会固化完整系统提示词和 Skill 元数据；模型消息、工具调用身份与压缩 checkpoint 保存在 SQLite，超长输出仍可通过 `file://` 完整读取。
+### 环境要求
 
-## 工具协议
+- stable Rust 工具链与 Git；
+- 受支持 Provider 的 API key；
+- 支持标准键盘输入的终端。鼠标支持可选。
 
-模型只会收到以下两个工具定义：
+[Helix](https://helix-editor.com/) 和 [fzf](https://github.com/junegunn/fzf) 不是必需依赖。它们分别用于默认外部编辑器和会话内容查找器；即使未安装，URI Agent 仍可运行。
+
+### 从源码安装
+
+```bash
+git clone https://github.com/4fuu/uri-agent.git
+cd uri-agent
+cargo install --path .
+```
+
+### 启动会话
+
+全新配置默认使用 OpenAI。设置 API key，并让 URI Agent 在目标项目中启动：
+
+```bash
+export OPENAI_API_KEY="<your-api-key>"
+uri-agent --cwd /path/to/project
+```
+
+也可以在没有 key 的情况下启动，按 `F2` 在 Settings 中配置 Provider、模型与凭据。按 `F3` 可搜索当前可运行的模型目录。
+
+发送第一条请求：
+
+1. 按 `i` 进入 Insert 模式。
+2. 输入请求；`Enter` 用于换行。
+3. 按 `Esc` 保留草稿并返回 Browse 模式。
+4. 在 Browse 模式按 `Enter` 提交。
+
+按 `Space` 打开命令面板，或按 `F1` 查看当前生效的快捷键与命令参考。
+
+## 为什么使用协议
+
+增加新能力时，模型可见的工具面不会增长：
 
 ```text
 read(uri: string, body?: any)
@@ -37,40 +66,55 @@ read("code-review-skill://help")
 exec("bash://?wait=30", "cargo test")
 ```
 
-协议通过 [`Protocol`](src/protocol.rs) trait 实现 `read`、`exec` 或二者。注册新协议不会增加模型可见的工具。
+URI Agent 只按第一个 `://` 分割地址。剩余 target 是不透明数据：注册表不会对它进行 URL 解码、规范化或重新解释。`body` 可以是任意 JSON 值，并原样传给选中的协议。
 
-### 系统管理的任务
+协议通过 [`Protocol`](src/protocol.rs) trait 实现 `read`、`exec` 或二者。注册新协议不会增加新的模型可见工具。
 
-Shell 和 edit 执行通常会立即返回任务地址：
+### 内置协议
+
+| 协议 | 操作 | 用途 |
+| --- | --- | --- |
+| `file` | `read` | 读取文件和有长度限制的目录列表 |
+| `edit` | `read`, `exec` | 原子写入文件，或替换唯一精确匹配 |
+| `bash` | `read`, `exec` | 安装 Bash 时，将 Bash 命令作为系统管理的任务运行 |
+| `pwsh` | `read`, `exec` | 安装 `pwsh` 时，将 PowerShell 7 命令作为系统管理的任务运行 |
+| `<name>-skill` | `read` | 加载一个已发现的 Skill 及其附属资源 |
+
+程序会在启动时检测 `bash` 与 `pwsh`，只有找到相应可执行文件时才注册协议。
+
+### 系统管理的任务与完整输出
+
+执行默认是异步的。Shell 或 edit 请求通常会立即返回任务地址：
 
 ```text
 exec("bash://run", "cargo test")
 → Read status: bash://tasks/<id>
 ```
 
-内置 shell 协议支持用 `?wait=N` 等待最多 300 秒：
+Shell 协议支持 `?wait=N`，最多等待 300 秒：
 
 ```text
 exec("bash://?wait=30", "cargo test")
 ```
 
-等待超时后任务仍在后台运行，可以通过 `<protocol>://tasks/<id>` 读取状态和完整结果。该选项由 `bash` 与 `pwsh` 插件自行解析；路由器只原样传递不透明 target，不会为其他协议解释 `wait`。协议实现可以调用与 URI 无关的系统任务等待接口，自行提供所需的等待语法。
+等待超时后任务仍会继续运行。通过 `<protocol>://tasks/<id>` 读取当前状态和最终结果。等待是 Shell 协议自身的功能，不是通用 URI 行为。
 
-### 内置协议
+工具结果超过内联上限时，URI Agent 会返回头尾预览，并将完整字节保存到会话输出目录。预览中包含可读取完整结果的 `file://` 地址。
 
-| 协议 | 操作 | 用途 |
-| --- | --- | --- |
-| `file` | `read` | 按限定行数读取文件或目录列表 |
-| `edit` | `read`, `exec` | 原子写入文件，或替换唯一匹配的文本 |
-| `bash` | `read`, `exec` | 环境存在 Bash 时运行受管理的 Bash 任务 |
-| `pwsh` | `read`, `exec` | 环境存在 `pwsh` 时运行受管理的 PowerShell 7 任务 |
-| `<name>-skill` | `read` | 加载一个 Skill 提示词及其附属资源 |
+## Skills
 
-Bash 和 PowerShell 会在启动时探测，只有找到对应可执行文件才会注册。
+URI Agent 启动时会按以下优先级发现一次 Skills：
 
-### 将 Skills 映射为提示词协议
+```text
+<project>/.agents/skills
+<project>/.claude/skills
+<project>/.codex/skills
+~/.agents/skills
+~/.claude/skills
+~/.codex/skills
+```
 
-每个被发现的 `SKILL.md` 都必须包含 `name` 与 `description` YAML frontmatter。名称会规范化为独立协议：
+每个根目录可以直接包含 `SKILL.md`，也可以在一级子目录中包含 `SKILL.md`。Skill 必须提供 `name` 和 `description` YAML frontmatter；规范化后的名称会成为独立协议：
 
 ```yaml
 ---
@@ -84,105 +128,75 @@ code-review-skill://help
 code-review-skill://scripts/check.py
 ```
 
-help 响应包含完整的 `SKILL.md`，并附上 Skill 文件所在的真实 `file://` 目录，方便模型检查或运行附带脚本。资源路径不能通过 `..` 或符号链接逃出 Skill 目录。
+同一规范化协议名只采用第一个 Skill。与已注册内置协议冲突的 Skill 会被跳过，并产生一条通知。资源读取不能越出 Skill 目录。
 
-Skills 按以下顺序扫描：
+新建会话时，程序会固化完整的系统提示词，以及每个选中 Skill 的名称、描述和规范化 `SKILL.md` 路径。恢复会话时复用该快照。Skill 帮助和资源仍从固化路径读取，因此文件缺失会明确失败，其他位置的同名 Skill 也不能静默替换它。
 
-```text
-<cwd>/.agents/skills
-<cwd>/.claude/skills
-<cwd>/.codex/skills
-~/.agents/skills
-~/.claude/skills
-~/.codex/skills
-```
+## 模型与认证
 
-发现过程在进程启动时执行一次。每个扫描根目录可以直接包含 `SKILL.md`，也可以在其一级子目录中包含 `SKILL.md`；二进制不会固化开发者机器上的 Skill 列表。两个 Skill 规范化为相同协议名时，优先级更高的位置生效。
-
-创建会话时只保存每个选中 Skill 的 `name`、`description` 和规范化后的 `SKILL.md` 路径，同时保存完整系统提示词。恢复会话时直接使用该快照，不会根据当前文件系统重新生成提示词。`://help` 和资源读取仍会访问保存的路径，因此 Skill 正文的后续修改可见；保存的文件被移除时会明确报错。其他位置后来出现的同名 Skill 不会让旧会话重新绑定。
-
-### 扩展注册
-
-Rust 扩展接口通过 [`PluginHost`](src/plugin.rs) 统一模型与界面贡献：
-
-- 注册一个或多个 [`Protocol`](src/protocol.rs) 实现；
-- 注册稳定的命令 ID、标题、描述与冒号别名，自动进入命令面板并可由 Rhai keymap 绑定；
-- 注册异步 TUI panel provider，返回的文档支持滚动、鼠标选择与 OSC52 复制。
-
-协议贡献仍隐藏在 `read` 和 `exec` 后面，注册命令或面板不会增加模型可见工具。内置协议使用相同的协议契约。URI Agent 当前不加载原生动态库；第三方 Rust 插件需要在应用组装阶段链接并注册。
-
-### 完整保留大型输出
-
-工具输出返回模型前会受到长度限制。内容超限时，uri-agent 会返回头尾预览、在平台缓存目录保存完整字节，并提供 `file://` 地址供模型按需筛选读取。
-
-## 模型与 Provider
-
-uri-agent 直接使用当前 [pi](https://github.com/badlogic/pi-mono) 云端模型目录：
-
-```text
-https://pi.dev/api/models/providers
-https://pi.dev/api/models/providers/<provider-id>
-```
-
-程序生成的 `models-store.json` 使用 pi 的缓存 schema，包括 `checkedAt`、`lastModified` 和 `etag`。缓存刷新周期为四小时；刷新失败时仍可使用已有缓存。`--offline`、`URI_AGENT_OFFLINE=1` 或 `PI_OFFLINE=1` 会禁用模型目录网络请求。
-
-当前 Rust/Rig 后端支持以下 pi API family：
+URI Agent 使用 [pi](https://github.com/badlogic/pi-mono) 模型目录，目前通过 Rust/Rig 后端运行以下 API family：
 
 - `openai-responses`
 - `openai-completions`
 - `anthropic-messages`
 - `google-generative-ai`
 
-完整远端目录都会缓存，模型选择器只展示可运行 API family 中的模型。可以用 `F3`、`:model`、命令面板或 `/model [query]` 打开。搜索会同时匹配 Provider ID、模型 ID、显示名和 API family，并在浏览时保留 Provider 分组、当前模型、上下文长度、reasoning 支持、API family 与当前凭据状态。方向键、鼠标点击和双击选择都可与直接输入搜索配合使用。`Ctrl+R` 在后台刷新 pi 目录，不会冻结动画或输入循环。
+模型选择器只展示可运行的 API family。当前仅支持 API key 认证；需要 OAuth 或云环境凭据的 Provider 可能出现在目录中，但没有专用适配器就无法运行。
 
-如果某个 Provider 使用受支持的 API family，但需要 OAuth 或云环境凭据，它仍可能出现在界面中；uri-agent 当前只实现 API key 认证。Bedrock、Vertex、Azure Responses、Codex OAuth 和 Mistral Conversations 仍需要专用 Rust 适配器。
+目录缓存四小时。使用 `--offline`、`URI_AGENT_OFFLINE=1` 或 `PI_OFFLINE=1` 可禁用目录请求，只使用本地数据。在模型选择器或 Settings 中按 `Ctrl+R` 可刷新目录。
 
 ## 配置
 
-没有 API key 也可以启动 uri-agent。使用 `F2`、`Ctrl+,`、Space 命令面板或 `:settings` 打开设置浮窗；Insert 模式仍支持 `/settings`、`/model` 和 `/login`。Provider 和模型字段会打开可搜索的模型选择器；Settings 可编辑当前 Provider 凭据、内联输出上限、编辑器与选取器命令，以及两者使用内嵌浮窗还是接管整个终端。保存后立即生效，不会丢弃当前会话。
+按 `F2` 可编辑当前 Provider、模型、凭据、输出上限、外部编辑器、会话内容查找器及二者的显示模式。更改会立即应用到当前会话。
 
-### 文本文件
+Linux 默认配置目录为 `~/.config/uri-agent`；可通过 `URI_AGENT_CONFIG_DIR` 指定其他位置。
 
-uri-agent 保持普通配置可编辑，并将程序生成数据与用户覆盖分离。Linux 默认配置目录为 `~/.config/uri-agent`；可以用 `URI_AGENT_CONFIG_DIR` 覆盖。
+| 文件 | 用途 |
+| --- | --- |
+| `settings.json` | 全局 Provider、模型、输出、编辑器和查找器设置 |
+| `auth.json` | 全局 Provider 凭据；Unix 上创建为 `0600` 权限 |
+| `models.json` | 用户定义的 Provider、模型、header 和模型覆盖 |
+| `models-store.json` | 程序生成的 pi 目录缓存 |
+| `keymap.rhai` | 全局快捷键覆盖 |
+| `<project>/.uri-agent/settings.json` | 可选的项目设置 |
+| `<project>/.uri-agent/keymap.rhai` | 可选的项目快捷键覆盖 |
 
-| 文件 | 维护者 | 用途 |
-| --- | --- | --- |
-| `settings.json` | uri-agent 和用户 | 与 pi 兼容的全局设置，包括 `defaultProvider` 与 `defaultModel` |
-| `auth.json` | uri-agent 和用户 | 与 pi 兼容的 Provider 凭据；Unix 权限为 `0600` |
-| `models-store.json` | uri-agent | 从 `pi.dev` 拉取的程序缓存 |
-| `models.json` | 用户 | 与 pi 兼容的自定义 Provider、模型、headers 和模型覆盖 |
-| `keymap.rhai` | 用户 | 覆盖内置现代模态默认值的全局 Rhai 快捷键 |
-| `<cwd>/.uri-agent/settings.json` | 用户 | 可选的项目设置，覆盖全局设置 |
-| `<cwd>/.uri-agent/keymap.rhai` | 用户 | 覆盖全局映射的可选项目快捷键 |
+项目设置覆盖全局设置，环境变量覆盖文件，命令行参数覆盖环境变量。凭据从低到高采用以下优先级：
 
-项目设置文件已存在时，TUI 会将 Provider、模型、输出上限、编辑器和选取器设置写入项目文件；否则写入全局设置。凭据始终写入全局 `auth.json`。
-
-`settings.json` 示例：
-
-```json
-{
-  "defaultProvider": "openai",
-  "defaultModel": "gpt-5.2",
-  "outputLimit": 32768,
-  "editor": "hx",
-  "editorMode": "float",
-  "picker": "fzf",
-  "pickerMode": "float"
-}
+```text
+models.json apiKey
+< auth.json
+< Provider 环境变量
+< URI_AGENT_API_KEY
+< --api-key
 ```
 
-`auth.json` 示例：
+已知 Provider 使用常见的环境变量，包括 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`、`OPENROUTER_API_KEY` 和 `GROQ_API_KEY`。
 
-```json
-{
-  "openai": {
-    "type": "api_key",
-    "key": "$OPENAI_API_KEY"
-  }
-}
+可信配置中的凭据与 header 值支持 pi 风格的环境变量展开，以及开头的 `!shell command`。开头的 `!` 会使用 URI Agent 的权限执行命令，因此不要使用不可信项目提供的配置。
+
+### 常用命令行选项
+
+```text
+--provider <ID>          选择 Provider
+--model <ID>             选择该 Provider 的模型
+--api-key <KEY>          设置仅当前进程使用的凭据
+--cwd <PATH>             设置项目和协议工作目录
+--continue-session       恢复该项目最近的会话
+--session <ID|latest>    恢复指定会话
+--output-limit <BYTES>   设置内联输出大小（最小 1024）
+--editor <COMMAND>       设置外部编辑器
+--editor-mode <MODE>     使用 float 或 fullscreen
+--picker <COMMAND>       设置会话内容查找器
+--picker-mode <MODE>     使用 float 或 fullscreen
+--offline                禁用 pi 目录网络请求
 ```
 
-`models.json` 覆盖示例：
+运行 `uri-agent --help` 可查看当前 CLI 参考。
+
+### 自定义 OpenAI 兼容 Provider
+
+如需使用本地或自定义 endpoint，可在 `models.json` 中增加 Provider：
 
 ```json
 {
@@ -204,107 +218,30 @@ uri-agent 保持普通配置可编辑，并将程序生成数据与用户覆盖�
 }
 ```
 
-凭据和 header 值支持 pi 风格的 `$VAR`、`${VAR}`、`$$`、`$!`，以及开头的 `!shell command`。命令会在十秒后超时，成功结果在当前进程内缓存。这些文件属于可信配置：开头的 `!` 会以 uri-agent 的权限执行命令。
+## 会话与上下文
 
-### 优先级
-
-普通设置从低到高按以下顺序合并：
+会话以 append-only 方式保存在 SQLite：
 
 ```text
-内置默认值
-< 全局 settings.json
-< 项目 .uri-agent/settings.json
-< URI_AGENT_* 环境变量
-< 命令行参数
+<platform-data-dir>/uri-agent/sessions.db
 ```
 
-API key 优先级为：
+规范化后的 `--cwd` 目录是项目边界。`--continue-session` 只恢复该项目最近的会话；`--session <id>` 会拒绝为其他项目创建的会话。
 
-```text
-models.json apiKey
-< auth.json
-< Provider 环境变量
-< URI_AGENT_API_KEY
-< --api-key
-```
+模型重放内容接近所选模型的上下文窗口时，URI Agent 会创建摘要 checkpoint，并使用摘要和完整的近期用户 turn 继续重放。原始事件仍保留在 SQLite 中，工具调用绝不会与对应结果分离。运行 `:compact` 可以请求提前创建 checkpoint。
 
-环境变量和命令行参数只覆盖当前进程，不会写回文件。Settings 浮窗会显示实际生效值的来源，避免把已保存值误认为当前覆盖已经消失。
+## 终端界面
 
-### 命令行选项
+| 上下文 | 常用默认按键 |
+| --- | --- |
+| Browse | `↑/↓` 选择，`Enter` 提交/打开，`i` 编辑，`o` 详情，`Space` 命令面板，`:` 命令行 |
+| Insert | `Enter` 换行，`Ctrl+E` 外部编辑器，`Esc` 保留草稿并返回 Browse |
+| Detail | `↑/↓` 和 `PageUp/PageDown` 滚动，`e` 外部编辑器，`Esc` 关闭 |
+| Global | `F1` 帮助，`F2` 设置，`F3` 模型，`Ctrl+P` 协议，`Ctrl+T` 任务，`Ctrl+C` 退出 |
 
-```bash
-uri-agent \
-  --provider anthropic \
-  --model claude-sonnet-4-6 \
-  --cwd /path/to/project
-```
+方向键和鼠标是一等操作，`j`、`k` 只是可选别名。只读面板支持鼠标选择与 OSC52 复制；交互式 PTY 使用 Shift 拖选，使普通点击仍能传给内嵌程序。
 
-| 参数 | 环境变量 | 作用 |
-| --- | --- | --- |
-| `--provider` | `URI_AGENT_PROVIDER` | 选择 pi Provider ID |
-| `--model` | `URI_AGENT_MODEL` | 选择该 Provider 的模型 ID |
-| `--api-key` | `URI_AGENT_API_KEY` | 设置只对当前进程生效的凭据 |
-| `--output-limit` | `URI_AGENT_OUTPUT_LIMIT` | 设置内联输出字节数，最小 1024 |
-| `--editor` | `URI_AGENT_EDITOR`, `VISUAL`, `EDITOR` | 设置外部编辑器命令 |
-| `--editor-mode` | `URI_AGENT_EDITOR_MODE` | 选择 `float` 或 `fullscreen` 编辑器集成 |
-| `--picker` | `URI_AGENT_PICKER` | 设置会话内容模糊选取器命令 |
-| `--picker-mode` | `URI_AGENT_PICKER_MODE` | 选择 `float` 或 `fullscreen` 选取器集成 |
-| `--offline` | `URI_AGENT_OFFLINE`, `PI_OFFLINE` | 只使用本地模型缓存 |
-| `--cwd` | — | 设置内置协议可访问的工作目录 |
-| `--continue-session` | — | 恢复最近更新的会话 |
-| `--session <id>` | — | 按 ID 恢复会话，也接受 `latest` |
-
-已知 Provider 使用标准环境变量，例如 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`、`OPENROUTER_API_KEY` 和 `GROQ_API_KEY`。自定义 Provider ID 会回退到 `<NORMALIZED_PROVIDER>_API_KEY`。
-
-## 会话
-
-所有会话保存在平台数据目录中的一个 SQLite 数据库：
-
-```text
-<data-dir>/uri-agent/sessions.db
-```
-
-SQLite WAL 模式和事务内 sequence 分配保证事件顺序与模型历史一致。超长完整输出仍独立保存在平台缓存目录：
-
-```text
-<cache-dir>/uri-agent/outputs/<session-id>/
-```
-
-SQLite 是项目最初公开的持久化格式，因此不包含 JSONL 兼容层。
-
-上下文压缩后，append-only 事件流仍保留原始模型消息。当预计重放内容接近当前模型在 pi 目录中的 `contextWindow` 时，uri-agent 会让模型生成可持久化摘要，将压缩 checkpoint 写入 SQLite，后续使用该摘要加完整的近期用户 turn。工具调用与对应结果不会被拆到 checkpoint 两侧。可以从命令行或命令面板运行 `:compact` 提前压缩；手动压缩至少需要一个已完成的旧 turn。
-
-规范化后的启动目录就是项目边界。普通启动会为该项目创建新会话；`--continue-session` 只恢复存储目录与当前项目相同的最近会话；`--session <id>` 会拒绝属于其他项目的会话。TUI 暂不提供跨项目会话总览或目录选择器。
-
-## TUI
-
-Ratatui 界面将事件浏览、草稿编辑和详细查看分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。Browse 中没有草稿时，`Enter` 打开完整事件；`o` 始终打开详情，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
-
-空会话会展示紧凑的 ordered-dither 像素标记、项目与模型，以及少量初始入口。受 Helix 启发的单行状态栏只显示当前模式、模型、所选事件位置，以及当前确实需要关注的信息：已保留的草稿、临时通知，或正在进行的 reasoning、工具调用和压缩。快捷键说明和估算计数不会常驻。抖动与工作波形是确定性、低噪声且不改变布局的动画；窄终端会退化为紧凑欢迎界面。
-
-| 模式 | 默认按键 | 行为 |
-| --- | --- | --- |
-| Browse | `↑/↓`、`Enter`、`o`、`i`、`e`、`/`、`y`、`Space`、`:`、鼠标 | 选择预览；`Enter` 有草稿时提交，否则打开详情 |
-| Insert | `Enter`、`Ctrl+E`、`Esc` | 换行、在外部编辑器编辑草稿，或保留草稿并返回 Browse |
-| Detail | `↑/↓`、`PageUp/PageDown`、`e`、`Esc`、拖选、滚轮 | 查看、选取、复制完整内容，或用编辑器打开 |
-| 内嵌终端 | 外部程序正常按键、双 `Esc`、Shift 拖选 | 操作编辑器/选取器、关闭 PTY 或选取终端文本 |
-| Global | `F1`、`F2`、`F3`、`Ctrl+P`、`Ctrl+T`、`Ctrl+Shift+C`、`Ctrl+C` | 帮助、Settings、模型选择、协议、任务、复制和退出 |
-
-Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行。Insert 只负责编辑：`Enter` 插入换行，`Esc` 保留草稿并返回 Browse，随后在 Browse 按 `Enter` 才提交。`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compact`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`；插件注册的命令也会出现在同一个命令面板和帮助浮窗。`F1` 按需展示实际生效的 keymap，不让快捷键提示常驻界面。
-
-只读浮窗可以直接用鼠标拖选。交互式面板和内嵌终端使用 Shift 拖选，使普通点击仍能交给程序处理。按 `y` 或 `Ctrl+Shift+C` 通过 OSC52 复制选区；没有选区时，同一操作会复制当前可见面板。
-
-### Rhai 快捷键
-
-快捷键按以下顺序加载：
-
-```text
-内置默认值
-< <config-dir>/keymap.rhai
-< <project>/.uri-agent/keymap.rhai
-```
-
-每个 Rhai 脚本调用 `map(mode, key, action)` 或 `unmap(mode, key)`。按键名称使用 `enter`、`space`、`shift+g`、`ctrl+e` 等形式：
+快捷键按内置默认值、全局 `keymap.rhai`、项目 `keymap.rhai` 的顺序分层加载。每个文件都可以映射或移除 action：
 
 ```rhai
 map("browse", "x", "detail");
@@ -312,51 +249,11 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`models`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`submit`、`detail`、`editor`、`palette`、`command`、`newline`、`model`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。注册命令的 ID 同时也是稳定的 action ID，因此可直接绑定 `map("browse", "c", "compact")` 或插件命令 ID。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
+Helix（`hx`）和 fzf 默认运行在内嵌 PTY 浮窗中。如果应用需要暂时接管终端，可在 Settings 中将其模式设为 `fullscreen`。GUI 编辑器应带有等待参数，例如 `code --wait`。
 
-### 外部编辑器与选取器
+## 扩展 URI Agent
 
-[Helix](https://github.com/helix-editor/helix) 是默认外部编辑器，其可执行文件名为 `hx`。它不是强依赖：未安装时其余 TUI 仍可使用，URI Agent 会提示如何更改编辑器，而不会退出。请参考 [Helix 官方安装说明](https://docs.helix-editor.com/install.html)，例如：
-
-```bash
-# macOS
-brew install helix
-
-# Arch Linux
-sudo pacman -S helix
-```
-
-[fzf](https://github.com/junegunn/fzf) 是默认的会话内容选取器。安装后即可使用 `/`、`:find` 或命令面板中的查找操作：
-
-```bash
-# Debian/Ubuntu
-sudo apt install fzf
-
-# macOS
-brew install fzf
-```
-
-两者默认都运行在真实 PTY 中，并渲染为 Ratatui 浮窗。需要让程序临时接管整个终端时，可在 Settings 或 `settings.json` 中将 `editorMode`、`pickerMode` 改为 `fullscreen`；程序返回后 URI Agent 会恢复 raw mode、鼠标捕获和 bracketed paste。命令本身可以在 Settings 中设置，也可用 `EDITOR`/`VISUAL`/`URI_AGENT_EDITOR` 与 `URI_AGENT_PICKER` 覆盖。GUI 编辑器应附带等待参数（例如 `code --wait`）并使用 fullscreen 模式。
-
-## 安装
-
-```bash
-git clone https://github.com/4fuu/uri-agent.git
-cd uri-agent
-cargo build --release
-./target/release/uri-agent --cwd /path/to/project
-```
-
-也可以从当前 checkout 安装：
-
-```bash
-cargo install --path .
-uri-agent --cwd /path/to/project
-```
-
-## 安全
-
-内置 file 和 Shell 协议不提供沙箱。Agent 拥有 uri-agent 进程的文件与命令权限，也可以访问绝对路径。请只在可信项目和允许 Agent 使用其中凭据的环境中运行，并将 `auth.json`、`models.json`、项目设置、Rhai keymap、编辑器命令与已发现 Skills 视为可信输入。
+Rust 扩展通过 [`PluginHost`](src/plugin.rs) 注册协议、命令和通用 TUI panel provider。协议始终位于 `read` 和 `exec` 之后；命令会进入命令面板、冒号命令行和快捷键 action 注册表。URI Agent 当前不加载原生动态库，因此第三方 Rust 扩展必须在应用组装阶段链接。
 
 ## 开发
 
@@ -367,7 +264,7 @@ cargo test
 cargo check
 ```
 
-仓库不变量和代码结构记录在 [`AGENTS.md`](AGENTS.md)。
+仓库不变量、模块职责和修改要求记录在 [`AGENTS.md`](AGENTS.md)。
 
 ## 许可证
 

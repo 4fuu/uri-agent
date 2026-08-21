@@ -1,54 +1,104 @@
-# Repository Guide
+# AGENTS.md
 
-## Purpose
+Guidance for coding agents working in this repository.
 
-URI Agent is a Rust coding agent whose entire model-facing tool surface is `read(uri, body?)` and `exec(uri, body?)`. Capabilities are registered as protocols and documented through `<protocol>://help`.
+## Project
 
-Keep these product invariants intact:
+URI Agent is a Rust terminal coding agent. Its defining constraint is a fixed model-facing interface:
+
+```text
+read(uri, body?)
+exec(uri, body?)
+```
+
+Capabilities are registered as protocols and document their operational contract at `<protocol>://help`. Preserve this design instead of adding model-facing tools or embedding every capability in the initial system prompt.
+
+## Non-negotiable product contracts
 
 - The model sees exactly two tool definitions: `read` and `exec`.
-- Split addresses only at the first `://`. Treat the remainder as an opaque target; do not introduce RFC URL parsing, decoding, or normalization.
+- Split protocol addresses only at the first `://`. Treat the remainder as opaque; do not apply RFC URL parsing, decoding, or normalization.
 - Accept any JSON value as `body` and pass it to the selected protocol unchanged.
-- Protocol names are unique. A protocol may implement read, exec, or both.
-- Exec protocols may use system-managed asynchronous tasks. URI options such as the shell protocols' `?wait=N` belong to each protocol: the registry must pass them through unchanged and never apply a generic wait. The task manager exposes URI-independent waiting; a timeout must leave the task running.
+- Protocol names are unique. A protocol may implement `read`, `exec`, or both.
+- Asynchronous task acceptance is not completion. Surface status and final content through the protocol's read route.
+- URI options belong to their protocol. In particular, `bash` and `pwsh` own `?wait=N`; the registry must never interpret it as a generic option.
+- A task wait timeout leaves the task running.
 - Preserve oversized output in the session output directory and return a readable `file://` address.
-- Discover Skills once at startup from the documented project and user roots. Give every discovered Skill its own `<normalized-name>-skill` protocol. Never compile or copy one developer environment's discovered Skill list into the product.
-- Persist only each Skill's name, description, and canonical `SKILL.md` path in the session context. Freeze the complete generated system prompt when the session is created and reuse it unchanged on resume. Skill help and resources read from the frozen path at call time; a missing file must fail explicitly, and a same-named Skill at another path must never rebind the old session.
-- Keep session persistence append-only. Context compaction writes a SQLite checkpoint and changes model replay without deleting original events. Cut only at complete user-turn boundaries so tool calls remain paired with their results.
-- Register `bash` and `pwsh` only when an executable is present in the environment.
-- Treat the canonical launch directory as the project boundary. Session resume and explicit IDs must not cross that boundary; do not add a cross-project session or directory overview unless the product direction changes.
-- Keep Browse, Insert, and Detail as distinct TUI contexts. Conversation rows are previews; complete reasoning, tool calls/results, and messages remain individually inspectable.
-- Treat Insert as draft editing, not submission: `Enter` inserts a newline and `Esc` returns to Browse without losing the draft. In Browse, `Enter` submits a non-empty draft and otherwise opens the selected event.
-- Keep arrows and mouse as first-class navigation. `j/k` may remain aliases, but defaults and interface hints must not require Vim knowledge. Browse mode owns the discoverable Space command panel and `:` command line.
-- Keep external editor and finder commands available as embedded PTY floats and as configurable fullscreen handoffs. Mouse selection and OSC52 copy must remain available without stealing ordinary clicks from interactive programs.
-- Resolve keyboard behavior through the layered Rhai keymap. Do not reintroduce modeless hard-coded shortcuts for configurable actions.
-- Route command-palette, colon-command, and key-bindable command IDs through `CommandRegistry`. Keep plugin panel rendering generic in the TUI; plugin-specific behavior belongs in registered providers.
+- Register `bash` and `pwsh` only when the corresponding executable exists.
+- Discover Skills once at startup from the documented project and user roots. Never compile or copy one machine's discovered Skill list into the product.
+- Give each accepted Skill a normalized `<name>-skill` protocol. Keep first-wins precedence and skip collisions with registered protocol names with a clear notice.
+- Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when a session is created. Resume from that snapshot; never rebind a same-named Skill at another path.
+- A missing frozen Skill file fails explicitly when read. A resumed session without frozen context is invalid.
+- Session events are append-only. Compaction adds a SQLite checkpoint and changes model replay without deleting original events.
+- Compaction boundaries must be complete user turns; never separate a tool call from its result.
+- The canonical launch directory is the project boundary. Latest and explicit session resume must not cross it.
+- Browse, Insert, and Detail remain separate TUI contexts. Conversation rows are previews; complete messages, reasoning, and tool calls/results remain inspectable.
+- Insert edits a draft: `Enter` inserts a newline and `Esc` preserves the draft. Browse submits a non-empty draft with `Enter` and otherwise opens the selected event.
+- Arrow keys and mouse input are first-class. `j`/`k` may be aliases, but defaults and help must not require Vim knowledge.
+- Route configurable keys through the layered Rhai keymap. Do not add modeless hard-coded shortcuts for configurable actions.
+- Route palette entries, colon commands, and key-bindable command IDs through `CommandRegistry`.
+- Keep plugin-specific behavior in registered protocols, commands, or panel providers. TUI panel rendering stays generic.
+- Preserve embedded PTY cleanup, terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
 
-## Code Map
+## Repository map
 
-- `src/main.rs`: application assembly and protocol registration.
-- `src/catalog.rs`: pi.dev model catalog, cache, and `models.json` overlays.
-- `src/config.rs`: layered text configuration, credentials, CLI, and environment overrides.
-- `src/keymap.rs`: modern modal defaults and global/project Rhai overlays.
-- `src/model.rs`: Rig provider adapter and the two model-facing tool schemas.
-- `src/runtime.rs`: model/tool loop, automatic/manual compaction, and tool-call correlation.
-- `src/compaction.rs`: context estimation, complete-turn checkpoint boundaries, and summary handoff construction.
-- `src/plugin.rs`: protocol/command/TUI plugin registration and generic panel providers.
-- `src/protocol.rs`: protocol contract, registry, dispatch, and output presentation.
-- `src/builtins/`: file, edit, Bash, and PowerShell protocols.
-- `src/task.rs`: asynchronous task lifecycle, waiting, cancellation, and notices.
-- `src/output.rs`: output limits and complete-output persistence.
-- `src/skill.rs`: Skill discovery, metadata parsing, and resource containment.
-- `src/session.rs`: SQLite event persistence, frozen session context, compaction checkpoints, and replay.
-- `src/prompts.rs`: model-facing system, tool, and protocol help text.
-- `src/terminal.rs`: embedded PTY lifecycle, terminal emulation, resize, and input encoding.
-- `src/tui.rs`: Browse/Insert modes, event details, editor/finder integration, text selection, overlays, and rendering.
+- `src/main.rs` — application assembly and protocol registration.
+- `src/catalog.rs` — pi.dev model catalog, cache, and `models.json` overlays.
+- `src/config.rs` — CLI, layered settings, credentials, and environment overrides.
+- `src/model.rs` — Rig provider adapters and the two model-facing tool schemas.
+- `src/prompts.rs` — initial system prompt and built-in protocol help.
+- `src/protocol.rs` — protocol trait, registry, dispatch, and output presentation.
+- `src/builtins/` — file, edit, Bash, and PowerShell protocols.
+- `src/task.rs` — task lifecycle, waiting, cancellation, and notices.
+- `src/output.rs` — inline output limits and complete-output persistence.
+- `src/skill.rs` — Skill discovery, metadata parsing, naming, and resource containment.
+- `src/session.rs` — SQLite persistence, frozen context, checkpoints, and replay.
+- `src/compaction.rs` — context estimation and complete-turn checkpoint construction.
+- `src/runtime.rs` — model/tool loop, tool-call correlation, and compaction triggers.
+- `src/plugin.rs` — protocol, command, and generic TUI panel registration.
+- `src/keymap.rs` — default Rhai mappings and global/project overlays.
+- `src/terminal.rs` — embedded PTY lifecycle, emulation, resize, and input encoding.
+- `src/tui.rs` — Browse/Insert/Detail behavior, overlays, editor/finder integration, selection, and rendering.
 
-Put behavior in the module that owns it. Avoid wrappers or helpers used by only one call site unless they enforce a named invariant.
+Put behavior in the module that owns it. Before adding a wrapper, helper, or type, check whether changing the existing source of truth is clearer. Avoid one-use abstractions unless they enforce a named invariant.
 
-## Development
+## Change rules
 
-Use stable Rust. Before completing a code change, run:
+### Protocols, tasks, and output
+
+- Prefer extending `Protocol` over introducing another model-facing concept.
+- Keep a protocol's help in `src/prompts.rs` synchronized with its behavior. State valid URIs, accepted body shapes, async behavior, result routes, limits, and one example.
+- Keep file writes atomic. Exact replacement must reject both missing and ambiguous matches.
+- Shell cancellation must terminate child processes, not only the parent future.
+- Do not add a generic registry wait. Protocols may use the URI-independent task manager to expose their own bounded wait syntax.
+
+### Models, Skills, and sessions
+
+- Keep provider adapters thin and preserve provider tool-call identity during replay.
+- Keep fake-backend tests provider-independent; tests must not require live API keys.
+- Contain Skill resource reads within the frozen Skill directory, including through symlinks.
+- Do not synthesize current prompt or Skill state when resuming a session.
+- Do not delete old events during compaction or split paired tool events at a checkpoint.
+
+### TUI and extensions
+
+- Keep the interface keyboard-complete and preserve mouse hit regions for selectable lists and command panels.
+- Register extension commands and panels through `PluginHost`; do not add extension-specific branches to `src/tui.rs`.
+- External editor and finder commands must work as embedded PTY floats and configurable fullscreen handoffs.
+- Closing an embedded PTY must terminate its child and reader thread.
+- Before a fullscreen handoff, restore the terminal; after return, recreate the event stream and terminal modes.
+- Ordinary clicks must reach interactive programs. Use the existing Shift-selection behavior there and direct drag selection in read-only views.
+
+### Scope and generated data
+
+- Make the smallest change that fully implements the requested behavior.
+- Keep unrelated refactors and formatting out of the patch.
+- Do not commit credentials, generated sessions, complete-output files, `.uri-agent/`, `.amp/`, or `target/` artifacts.
+
+## Verification
+
+Use stable Rust. Add focused tests beside changed behavior. Shared protocol, task, session, compaction, or model-loop changes need both a normal-path test and the affected boundary-condition test. TUI changes should cover the affected mode and input path.
+
+Before completing a code change, run:
 
 ```bash
 cargo fmt --check
@@ -57,25 +107,11 @@ cargo test
 cargo check
 ```
 
-Add focused tests beside changed behavior. Shared protocol, task, session, or model-loop changes require tests for both the normal path and the affected boundary condition. Keep the fake backend tests provider-independent; live API keys are not required for the test suite.
-
-## Change Guidelines
-
-- Prefer extending `Protocol` over adding another model-facing tool.
-- Register extension commands and TUI panels through `PluginHost`; do not add extension-specific branches to `src/tui.rs`.
-- Keep protocol help in `src/prompts.rs` synchronized with behavior.
-- Keep the provider layer thin and preserve provider tool-call identity during replay.
-- Do not treat task acceptance as completion. Surface terminal status and content through the protocol's read route.
-- Shell cancellation must terminate child processes, not only the parent future.
-- File edits must remain atomic and exact replacements must reject missing or ambiguous matches.
-- A resumed session without its frozen context is invalid. Do not silently synthesize a prompt from the current environment.
-- Preserve terminal restoration on every TUI exit and error path.
-- Keep the interface keyboard-complete and preserve mouse hit regions for selectable lists and command panels.
-- Embedded PTYs must terminate their child and reader thread when closed. For fullscreen `fzf` or editor handoffs, restore the terminal before launch and recreate the event stream after returning.
-- Do not add credentials, generated sessions, complete-output files, or `target/` artifacts to Git.
+For documentation-only changes, verify links, examples, CLI names, defaults, and English/Chinese parity; the full Rust suite is unnecessary unless documentation generation or code was changed.
 
 ## Documentation
 
-Write model-facing help as operational documentation: state the valid URI, accepted body shapes, async behavior, result address, limits, and one concrete example. Keep the initial system prompt short; detailed instructions belong behind `://help`.
-
-Keep the English `README.md` and Chinese `README.zh-CN.md` equivalent. Update both when CLI flags, provider defaults, key bindings, scan locations, persistence paths, or public protocol behavior changes.
+- Keep `README.md` and `README.zh-CN.md` equivalent.
+- Update both when public behavior changes, including CLI flags, provider defaults, key bindings, Skill scan roots, persistence paths, configuration, or protocol behavior.
+- Keep the README focused on adoption and first success. Put detailed model-facing operations behind `<protocol>://help`.
+- Use `URI Agent` in prose and `uri-agent` for the binary, crate, commands, and filesystem names.
