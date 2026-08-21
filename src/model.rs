@@ -1,6 +1,6 @@
-use crate::catalog::CatalogModel;
-use crate::catalog::ModelCatalog;
-use crate::config::{ActiveSettings, resolve_config_value};
+use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits};
+use crate::compaction;
+use crate::config::{ActiveSettings, AuthKind, resolve_config_value};
 use crate::prompts;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -8,11 +8,13 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel as RigCompletionModel, ToolDefinition};
+use rig::http_client::HttpClientExt;
 use rig::message::{AssistantContent, Message};
 use rig::providers::{anthropic, gemini, openai};
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -31,6 +33,24 @@ pub struct ModelRequest {
 
 pub struct ModelResponse {
     pub content: Vec<AssistantContent>,
+    pub usage: Option<rig::completion::Usage>,
+}
+
+/// Mirrors pi's `clampMaxTokensToContext`: the catalog's `maxTokens` capped by
+/// the room left in the context window after the estimated prompt and a fixed
+/// safety margin.
+const CONTEXT_SAFETY_TOKENS: usize = 4_096;
+
+fn clamp_max_tokens_to_context(limits: &ModelLimits, estimated_context: usize) -> u64 {
+    if limits.context_window == 0 {
+        return limits.max_tokens.max(1);
+    }
+    let available = limits
+        .context_window
+        .saturating_sub(estimated_context)
+        .saturating_sub(CONTEXT_SAFETY_TOKENS)
+        .max(1);
+    limits.max_tokens.min(available as u64).max(1)
 }
 
 #[async_trait]
@@ -42,10 +62,69 @@ pub trait ModelBackend: Send + Sync {
     ) -> Result<ModelResponse>;
 }
 
-pub enum RigBackend {
+#[derive(Clone)]
+pub(crate) struct AuthClient {
+    inner: reqwest::Client,
+    strip_x_api_key: bool,
+}
+
+impl HttpClientExt for AuthClient {
+    fn send<T, U>(
+        &self,
+        mut req: http::Request<T>,
+    ) -> impl Future<
+        Output = rig::http_client::Result<http::Response<rig::http_client::LazyBody<U>>>,
+    > + Send
+    + 'static
+    where
+        T: Into<bytes::Bytes> + Send,
+        U: From<bytes::Bytes> + Send + 'static,
+    {
+        if self.strip_x_api_key {
+            req.headers_mut().remove("x-api-key");
+        }
+        HttpClientExt::send(&self.inner, req)
+    }
+
+    fn send_multipart<U>(
+        &self,
+        mut req: http::Request<rig::http_client::multipart::MultipartForm>,
+    ) -> impl Future<
+        Output = rig::http_client::Result<http::Response<rig::http_client::LazyBody<U>>>,
+    > + Send
+    + 'static
+    where
+        U: From<bytes::Bytes> + Send + 'static,
+    {
+        if self.strip_x_api_key {
+            req.headers_mut().remove("x-api-key");
+        }
+        HttpClientExt::send_multipart(&self.inner, req)
+    }
+
+    fn send_streaming<T>(
+        &self,
+        mut req: http::Request<T>,
+    ) -> impl Future<Output = rig::http_client::Result<rig::http_client::StreamingResponse>> + Send
+    where
+        T: Into<bytes::Bytes> + Send,
+    {
+        if self.strip_x_api_key {
+            req.headers_mut().remove("x-api-key");
+        }
+        HttpClientExt::send_streaming(&self.inner, req)
+    }
+}
+
+pub(crate) struct RigBackend {
+    client: RigClient,
+    limits: ModelLimits,
+}
+
+pub(crate) enum RigClient {
     OpenAiResponses(openai::responses_api::ResponsesCompletionModel),
     OpenAiCompletions(openai::completion::CompletionModel),
-    Anthropic(anthropic::completion::CompletionModel),
+    Anthropic(anthropic::completion::CompletionModel<AuthClient>),
     Gemini(gemini::completion::CompletionModel),
 }
 
@@ -54,6 +133,7 @@ impl RigBackend {
         model: &CatalogModel,
         api_key: &str,
         environment: &std::collections::BTreeMap<String, String>,
+        auth_kind: AuthKind,
     ) -> Result<Self> {
         let mut headers = resolved_headers(model, environment).await?;
         if model
@@ -67,8 +147,25 @@ impl RigBackend {
                     .context("invalid API key for Authorization header")?,
             );
         }
-        Ok(match model.api.as_str() {
-            "openai-responses" => Self::OpenAiResponses(
+        let anthropic_oauth = auth_kind == AuthKind::Oauth && model.api == "anthropic-messages";
+        if anthropic_oauth {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {api_key}"))
+                    .context("invalid OAuth token for Authorization header")?,
+            );
+            headers.insert(
+                HeaderName::from_static("x-app"),
+                HeaderValue::from_static("cli"),
+            );
+            headers.insert(
+                http::header::USER_AGENT,
+                HeaderValue::from_static("claude-cli/2.1.32"),
+            );
+        }
+        let limits = model.limits();
+        let client = match model.api.as_str() {
+            "openai-responses" => RigClient::OpenAiResponses(
                 openai::Client::builder()
                     .api_key(api_key)
                     .base_url(&model.base_url)
@@ -77,7 +174,7 @@ impl RigBackend {
                     .context("cannot initialize OpenAI provider")?
                     .completion_model(&model.id),
             ),
-            "openai-completions" => Self::OpenAiCompletions(
+            "openai-completions" => RigClient::OpenAiCompletions(
                 openai::CompletionsClient::builder()
                     .api_key(api_key)
                     .base_url(&model.base_url)
@@ -86,16 +183,28 @@ impl RigBackend {
                     .context("cannot initialize OpenAI-compatible provider")?
                     .completion_model(&model.id),
             ),
-            "anthropic-messages" => Self::Anthropic(
-                anthropic::Client::builder()
+            "anthropic-messages" => {
+                let mut builder = anthropic::Client::builder()
                     .api_key(api_key)
                     .base_url(&model.base_url)
                     .http_headers(headers)
-                    .build()
-                    .context("cannot initialize Anthropic provider")?
-                    .completion_model(&model.id),
-            ),
-            "google-generative-ai" => Self::Gemini(
+                    .http_client(AuthClient {
+                        inner: reqwest::Client::new(),
+                        strip_x_api_key: anthropic_oauth,
+                    });
+                if anthropic_oauth {
+                    builder = builder
+                        .anthropic_beta("claude-code-20250219")
+                        .anthropic_beta("oauth-2025-04-20");
+                }
+                RigClient::Anthropic(
+                    builder
+                        .build()
+                        .context("cannot initialize Anthropic provider")?
+                        .completion_model(&model.id),
+                )
+            }
+            "google-generative-ai" => RigClient::Gemini(
                 gemini::Client::builder()
                     .api_key(api_key)
                     .base_url(normalize_gemini_base_url(&model.base_url))
@@ -105,14 +214,18 @@ impl RigBackend {
                     .completion_model(&model.id),
             ),
             api => bail!("Pi catalog API {api:?} is not supported by the Rust backend"),
-        })
+        };
+        Ok(Self { client, limits })
     }
 }
 
 pub async fn configured_backend(
     settings: &ActiveSettings,
     catalog: &ModelCatalog,
-) -> Result<Option<Arc<dyn ModelBackend>>> {
+) -> Result<Option<(Arc<dyn ModelBackend>, ModelLimits)>> {
+    if !settings.model_configured() {
+        return Ok(None);
+    }
     let Some(api_key) = settings.api_key.as_deref() else {
         return Ok(None);
     };
@@ -123,9 +236,15 @@ pub async fn configured_backend(
             settings.model
         )
     })?;
-    Ok(Some(Arc::new(
-        RigBackend::new(&model, api_key, &settings.credential_environment).await?,
-    )))
+    let backend = RigBackend::new(
+        &model,
+        api_key,
+        &settings.credential_environment,
+        settings.auth_kind,
+    )
+    .await?;
+    let limits = backend.limits;
+    Ok(Some((Arc::new(backend), limits)))
 }
 
 async fn resolved_headers(
@@ -163,11 +282,17 @@ impl ModelBackend for RigBackend {
         request: ModelRequest,
         deltas: mpsc::UnboundedSender<ModelDelta>,
     ) -> Result<ModelResponse> {
-        match self {
-            Self::OpenAiResponses(model) => complete_with(model, request, deltas).await,
-            Self::OpenAiCompletions(model) => complete_with(model, request, deltas).await,
-            Self::Anthropic(model) => complete_with(model, request, deltas).await,
-            Self::Gemini(model) => complete_with(model, request, deltas).await,
+        let estimated = compaction::estimate_tokens(&request.system, &request.history);
+        let max_tokens = clamp_max_tokens_to_context(&self.limits, estimated);
+        match &self.client {
+            RigClient::OpenAiResponses(model) => {
+                complete_with(model, request, max_tokens, deltas).await
+            }
+            RigClient::OpenAiCompletions(model) => {
+                complete_with(model, request, max_tokens, deltas).await
+            }
+            RigClient::Anthropic(model) => complete_with(model, request, max_tokens, deltas).await,
+            RigClient::Gemini(model) => complete_with(model, request, max_tokens, deltas).await,
         }
     }
 }
@@ -175,6 +300,7 @@ impl ModelBackend for RigBackend {
 async fn complete_with<M>(
     model: &M,
     request: ModelRequest,
+    max_tokens: u64,
     deltas: mpsc::UnboundedSender<ModelDelta>,
 ) -> Result<ModelResponse>
 where
@@ -187,7 +313,8 @@ where
     let mut completion = model
         .completion_request(prompt)
         .preamble(request.system)
-        .messages(history);
+        .messages(history)
+        .max_tokens(max_tokens);
     if request.tools {
         completion = completion.tools(tool_definitions());
     }
@@ -222,6 +349,7 @@ where
     }
     Ok(ModelResponse {
         content: stream.choice.clone(),
+        usage: stream.response.as_ref().map(|final_| final_.usage),
     })
 }
 
@@ -257,6 +385,25 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_tokens_follows_pi_catalog_and_context_clamping() {
+        let limits = ModelLimits {
+            context_window: 100_000,
+            max_tokens: 32_000,
+            cost: Default::default(),
+        };
+        assert_eq!(clamp_max_tokens_to_context(&limits, 10_000), 32_000);
+        // 100_000 - 80_000 - 4_096 safety margin = 15_904 available.
+        assert_eq!(clamp_max_tokens_to_context(&limits, 80_000), 15_904);
+        // Never drops below one even when the estimate exceeds the window.
+        assert_eq!(clamp_max_tokens_to_context(&limits, 200_000), 1);
+        let unbounded = ModelLimits {
+            context_window: 0,
+            ..limits
+        };
+        assert_eq!(clamp_max_tokens_to_context(&unbounded, 200_000), 32_000);
+    }
 
     #[test]
     fn model_only_sees_two_tools_and_body_is_unconstrained() {

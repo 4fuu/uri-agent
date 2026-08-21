@@ -50,6 +50,76 @@ impl CatalogModel {
             .filter(|value| *value > 0)
             .unwrap_or(128_000)
     }
+
+    /// Pi always sends `max_tokens`, sourced from the catalog's `maxTokens`.
+    /// The fallback matches the default pi uses for user-defined models.
+    pub fn max_tokens(&self) -> u64 {
+        self.metadata
+            .get("maxTokens")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .unwrap_or(16_384)
+    }
+
+    pub fn cost(&self) -> ModelCost {
+        let rates = self.metadata.get("cost");
+        let rate = |key: &str| {
+            rates
+                .and_then(|cost| cost.get(key))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        };
+        ModelCost {
+            input: rate("input"),
+            output: rate("output"),
+            cache_read: rate("cacheRead"),
+            cache_write: rate("cacheWrite"),
+        }
+    }
+
+    pub fn limits(&self) -> ModelLimits {
+        ModelLimits {
+            context_window: self.context_window(),
+            max_tokens: self.max_tokens(),
+            cost: self.cost(),
+        }
+    }
+}
+
+/// Per-million-token USD rates from the catalog's `cost` object.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModelCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl ModelCost {
+    pub fn total(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+        (input as f64 * self.input
+            + output as f64 * self.output
+            + cache_read as f64 * self.cache_read
+            + cache_write as f64 * self.cache_write)
+            / 1_000_000.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ModelLimits {
+    pub context_window: usize,
+    pub max_tokens: u64,
+    pub cost: ModelCost,
+}
+
+impl Default for ModelLimits {
+    fn default() -> Self {
+        Self {
+            context_window: 128_000,
+            max_tokens: 16_384,
+            cost: ModelCost::default(),
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -232,19 +302,6 @@ impl ModelCatalog {
             .await
             .into_iter()
             .find(|entry| entry.id == model)
-    }
-
-    pub async fn default_model(&self, provider: &str) -> Option<CatalogModel> {
-        let models = self.models(provider).await;
-        let preferred = match provider {
-            "openai" => Some("gpt-5.2"),
-            "anthropic" => Some("claude-sonnet-4-6"),
-            "google" => Some("gemini-3-flash-preview"),
-            _ => None,
-        };
-        preferred
-            .and_then(|id| models.iter().find(|model| model.id == id).cloned())
-            .or_else(|| models.last().cloned())
     }
 
     pub async fn configured_api_key(&self, provider: &str) -> Option<String> {
@@ -659,6 +716,34 @@ mod tests {
         let (merged, warnings) = merge_catalog(&store, &ModelsFile::default());
         assert!(warnings.is_empty());
         assert_eq!(merged["azure-openai-responses"].len(), 1);
+    }
+
+    #[test]
+    fn max_tokens_and_cost_come_from_the_remote_catalog_with_safe_fallbacks() {
+        let model: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "k3", "name": "Kimi K3", "api": "anthropic-messages",
+            "provider": "kimi-coding", "baseUrl": "https://api.kimi.com/coding",
+            "contextWindow": 1048576,
+            "maxTokens": 131072,
+            "cost": {"input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 0}
+        }))
+        .unwrap();
+        assert_eq!(model.max_tokens(), 131_072);
+        let cost = model.cost();
+        assert_eq!(cost.input, 3.0);
+        assert_eq!(cost.cache_read, 0.3);
+        assert_eq!(cost.total(1_000_000, 100_000, 0, 0), 4.5);
+        let limits = model.limits();
+        assert_eq!(limits.context_window, 1_048_576);
+        assert_eq!(limits.max_tokens, 131_072);
+
+        let bare: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "one", "name": "One", "api": "openai-responses",
+            "provider": "openai", "baseUrl": "https://example.test/v1"
+        }))
+        .unwrap();
+        assert_eq!(bare.max_tokens(), 16_384);
+        assert_eq!(bare.cost(), ModelCost::default());
     }
 
     #[test]

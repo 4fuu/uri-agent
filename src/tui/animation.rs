@@ -14,6 +14,16 @@ const BAYER_4X4: [[usize; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9]
 /// not change dimensions between frames, so it can animate without moving the
 /// rest of the layout.
 pub(super) fn wordmark(frame: usize) -> Vec<String> {
+    render_mark(frame, MARK[0].len())
+}
+
+/// Reveal the wordmark from left to right during the startup splash.
+pub(super) fn wordmark_reveal(frame: usize, progress: f32) -> Vec<String> {
+    let columns = ((MARK[0].len() as f32) * progress.clamp(0.0, 1.0)).ceil() as usize;
+    render_mark(frame, columns.max(1))
+}
+
+fn render_mark(frame: usize, visible_columns: usize) -> Vec<String> {
     MARK.iter()
         .enumerate()
         .map(|(y, row)| {
@@ -21,7 +31,9 @@ pub(super) fn wordmark(frame: usize) -> Vec<String> {
             let mut rendered = String::with_capacity(cells.len() * 2);
             for (x, cell) in cells.iter().enumerate() {
                 let phase = (BAYER_4X4[y % 4][x % 4] + frame / 2) % 16;
-                let symbol = if *cell == b'1' {
+                let symbol = if x >= visible_columns {
+                    ' '
+                } else if *cell == b'1' {
                     if phase == 0 { '▓' } else { '█' }
                 } else if touches_mark(x, y) && phase < 3 {
                     '·'
@@ -82,6 +94,8 @@ mod tests {
                 .zip(later.iter())
                 .all(|(left, right)| left.chars().count() == right.chars().count())
         );
+        let intro = wordmark_reveal(3, 0.4);
+        assert_eq!(intro.len(), first.len());
     }
 
     #[test]

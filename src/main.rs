@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::collections::HashSet;
 use std::sync::Arc;
+use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
 use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
@@ -12,14 +13,21 @@ use uri_agent::runtime::{AgentRuntime, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice, SessionContext};
 use uri_agent::skill::SkillProtocol;
 use uri_agent::task::TaskManager;
-use uri_agent::tui::{TuiInfo, TuiServices};
+use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run_session(Config::load(Cli::parse()).await?).await
+    let mut config = Config::load(Cli::parse()).await?;
+    loop {
+        match run_session(&config).await? {
+            TuiOutcome::Quit => return Ok(()),
+            TuiOutcome::NewSession => config.session = SessionChoice::New,
+            TuiOutcome::Resume(id) => config.session = SessionChoice::Existing(id),
+        }
+    }
 }
 
-async fn run_session(config: Config) -> Result<()> {
+async fn run_session(config: &Config) -> Result<TuiOutcome> {
     let initial = config.manager.current().await;
     let builtins = uri_agent::builtins::available(&config.cwd);
     let mut protocol_names = builtins
@@ -104,32 +112,42 @@ async fn run_session(config: Config) -> Result<()> {
     notices.extend(config.catalog.warnings().await);
 
     let descriptors = protocols.descriptors();
-    let backend = match configured_backend(&initial, &config.catalog).await {
-        Ok(backend) => backend,
+    let configured = match configured_backend(&initial, &config.catalog).await {
+        Ok(configured) => configured,
         Err(error) => {
             notices.push(format!("model configuration is not usable: {error:#}"));
             None
         }
+    };
+    let model_ready = configured.is_some();
+    let (backend, limits) = match configured {
+        Some((backend, limits)) => (Some(backend), limits),
+        None => (
+            None,
+            initial
+                .catalog_model(&config.catalog)
+                .await
+                .map_or_else(ModelLimits::default, |model| model.limits()),
+        ),
     };
     let protocols = Arc::new(protocols);
     for notice in notices {
         session.append(EventKind::Notice { text: notice }).await?;
     }
     forward_task_notices(session.clone(), tasks.clone());
-    let context_window = initial
-        .catalog_model(&config.catalog)
-        .await
-        .map_or(128_000, |model| model.context_window());
-    let model_ready = backend.is_some();
+    let context_window = limits.context_window;
     let runtime = Arc::new(AgentRuntime::new(
         backend,
         protocols,
         session.clone(),
         frozen_context.system_prompt,
-        context_window,
+        limits,
     ));
+    runtime.refresh_context_estimate().await;
     let commands = Arc::new(CommandRegistry::with_core_commands());
     let tui = Arc::new(TuiRegistry::default());
+    let draft = session.draft().await;
+    let provider_count = config.catalog.providers().await.len();
 
     uri_agent::tui::run(TuiServices {
         runtime,
@@ -137,21 +155,21 @@ async fn run_session(config: Config) -> Result<()> {
         commands,
         tui,
         tasks,
-        manager: config.manager,
-        catalog: config.catalog,
+        manager: config.manager.clone(),
+        catalog: config.catalog.clone(),
         output,
         info: TuiInfo {
-            cwd: config.cwd,
+            cwd: config.cwd.clone(),
             provider: initial.provider,
             model: initial.model,
             session_id: session.id().to_string(),
             context_window,
             model_ready,
-            editor: initial.editor,
-            editor_mode: initial.editor_mode,
-            picker: initial.picker,
-            picker_mode: initial.picker_mode,
+            provider_count,
+            context_tokens: 0,
+            terminal: initial.terminal,
         },
+        draft,
     })
     .await
 }

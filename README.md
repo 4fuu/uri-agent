@@ -19,8 +19,6 @@ This design keeps tool schemas out of the model context until they are useful. E
 - an API key for a supported provider;
 - a terminal with standard keyboard input. Mouse support is optional.
 
-[Helix](https://helix-editor.com/) and [fzf](https://github.com/junegunn/fzf) are optional. They power the default external editor and conversation finder, but URI Agent runs without them.
-
 ### Install from source
 
 ```bash
@@ -31,23 +29,21 @@ cargo install --path .
 
 ### Start a session
 
-A fresh configuration defaults to OpenAI. Set its key and launch URI Agent at the project you want the agent to work in:
+URI Agent does not pick a default model. Launch it in the project you want the agent to work in, then run `:login` and `:model`:
 
 ```bash
-export OPENAI_API_KEY="<your-api-key>"
 uri-agent --cwd /path/to/project
 ```
 
-You can also start without a key, press `F2`, and configure the provider, model, and credential in Settings. Press `F3` to search the runnable model catalog.
+If nothing is configured, the launch view shows `尚未配置，请运行 :login`. `:login` saves an API key or completes Anthropic OAuth; `:model` selects from the runnable catalog.
 
 To send the first request:
 
-1. Press `i` to enter Insert mode.
-2. Type the request. `Enter` inserts a newline.
-3. Press `Esc` to keep the draft and return to Browse mode.
-4. Press `Enter` in Browse mode to submit it.
+1. Press `i` to open the composer float.
+2. Type the request. `Shift+Enter` inserts a newline.
+3. Press `Enter` to send. `Esc` keeps the draft in SQLite.
 
-Press `Space` for the command panel or `F1` for the active keymap and command reference.
+Press `:` for commands, or `F1` for the active keymap and command reference.
 
 ## Why protocols
 
@@ -141,19 +137,19 @@ URI Agent uses the [pi](https://github.com/badlogic/pi-mono) model catalog and c
 - `anthropic-messages`
 - `google-generative-ai`
 
-The model picker shows only runnable API families. Authentication is currently API-key based; providers that require OAuth or ambient cloud credentials may appear in the catalog but cannot run without a dedicated adapter.
+The model picker shows only runnable API families. `:login` matches Pi Agent: API keys, plus OAuth for Anthropic, OpenRouter, OpenAI Codex, GitHub Copilot, Kimi Code, xAI, and Radius. Stored credentials use the same `auth.json` shape (`type: "api_key"` or `type: "oauth"`).
 
 The catalog is cached for four hours. Use `--offline`, `URI_AGENT_OFFLINE=1`, or `PI_OFFLINE=1` to disable catalog requests and use only local data. `Ctrl+R` refreshes the catalog from the model picker or Settings.
 
 ## Configuration
 
-Press `F2` to edit the active provider, model, credential, output limit, external editor, conversation picker, and their display modes. Changes apply to the current session immediately.
+Press `:settings` to inspect the active provider, model, credential status, and output limit. Use `:login` / `:logout` for credentials and `:model` to change models. Changes apply to the current session immediately.
 
 On Linux, the default config directory is `~/.config/uri-agent`; set `URI_AGENT_CONFIG_DIR` to use another location.
 
 | File | Purpose |
 | --- | --- |
-| `settings.json` | Global provider, model, output, editor, and picker settings |
+| `settings.json` | Global provider, model, output, and terminal settings |
 | `auth.json` | Global provider credentials; created with mode `0600` on Unix |
 | `models.json` | User-defined providers, models, headers, and model overrides |
 | `models-store.json` | Generated pi catalog cache |
@@ -185,10 +181,6 @@ Credential and header values in trusted configuration support pi-style environme
 --continue-session       Resume this project's latest session
 --session <ID|latest>    Resume a specific session
 --output-limit <BYTES>   Set inline output size (minimum 1024)
---editor <COMMAND>       Set the external editor
---editor-mode <MODE>     Use float or fullscreen
---picker <COMMAND>       Set the conversation finder
---picker-mode <MODE>     Use float or fullscreen
 --offline                Disable pi catalog network requests
 ```
 
@@ -232,24 +224,28 @@ As model replay approaches the selected model's context window, URI Agent create
 
 ## Terminal interface
 
-| Context | Useful defaults |
-| --- | --- |
-| Browse | `↑/↓` select, `Enter` submit/open, `i` compose, `o` detail, `Space` commands, `:` command line |
-| Insert | `Enter` newline, `Ctrl+E` external editor, `Esc` keep draft and return to Browse |
-| Detail | `↑/↓` and `PageUp/PageDown` scroll, `e` external editor, `Esc` close |
-| Global | `F1` help, `F2` settings, `F3` models, `Ctrl+P` protocols, `Ctrl+T` tasks, `Ctrl+C` quit |
+Startup shows a short splash, then a single conversation surface. An empty conversation keeps the animated brand view. Once records appear, the surface is folded history plus a pi-style footer at the bottom: `cwd (branch)` on the first line, then cumulative token usage, cost, a context meter, and the active model on the second, with hints on the last line.
 
-Arrow keys and mouse input are first-class; `j` and `k` are optional aliases. Read-only panels support mouse selection and OSC52 copy. Interactive PTYs use Shift-drag so normal clicks continue to reach the embedded program.
+| Surface | Useful defaults |
+| --- | --- |
+| Conversation | `i` compose, `:` commands, `?` help, `Enter` open/fold, `r`/`t`/`h` jump thinking/tools/you |
+| Composer | `Enter` send, `Shift+Enter` newline, `Esc` keep draft |
+| Command | type to filter, `Tab` complete, `Enter` run, `Esc` close |
+| Global | `F1` help, `F2` settings, `F3` models, `Ctrl+C` quit |
+
+Useful colon commands: `:login`, `:logout`, `:model`, `:resume`, `:new`, `:set-terminal`, `:terminal`, `:compact`, `:help`, `:q`.
+
+`:set-terminal` saves the command for the floating terminal (`pwsh`, `bash`, …). `:terminal` opens it as a PTY float; double `Esc` closes it. Shift-drag selects text so ordinary clicks still reach the program.
+
+Arrow keys and mouse input are first-class; `j` and `k` are optional aliases. Read-only views support mouse selection and OSC52 copy.
 
 The keymap is layered from built-in defaults through global and project `keymap.rhai` files. Each file can map or remove an action:
 
 ```rhai
-map("browse", "x", "detail");
-unmap("browse", "e");
-map("insert", "ctrl+j", "newline");
+map("main", "x", "copy");
+unmap("main", "j");
+map("composer", "ctrl+j", "newline");
 ```
-
-Helix (`hx`) and fzf run in embedded PTY floats by default. Set their mode to `fullscreen` in Settings when an application should temporarily take over the terminal. GUI editors should include a wait option, such as `code --wait`.
 
 ## Extending URI Agent
 

@@ -22,6 +22,15 @@ pub enum SessionChoice {
     Existing(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionSummary {
+    pub id: String,
+    pub updated_at: DateTime<Utc>,
+    pub provider: String,
+    pub model: String,
+    pub preview: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionEvent {
     pub sequence: u64,
@@ -78,6 +87,14 @@ pub enum EventKind {
     },
     Notice {
         text: String,
+    },
+    /// Token usage and USD cost reported by one model response.
+    Usage {
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: f64,
     },
     Error {
         text: String,
@@ -251,8 +268,8 @@ impl Session {
                     let transaction = db.transaction()?;
                     transaction.execute(
                         "INSERT INTO sessions
-                         (id, created_at, updated_at, cwd, provider, model, head_sequence)
-                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1)",
+                         (id, created_at, updated_at, cwd, provider, model, head_sequence, draft)
+                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1, '')",
                         params![
                             id_for_create,
                             at_for_create,
@@ -323,6 +340,53 @@ impl Session {
     pub fn database_path(&self) -> &Path {
         &self.database_path
     }
+    pub async fn draft(&self) -> String {
+        let id = self.id.clone();
+        self.connection
+            .call(move |db| {
+                db.query_row("SELECT draft FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+            })
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn save_draft(&self, text: &str) -> Result<()> {
+        let id = self.id.clone();
+        let text = text.to_string();
+        self.connection
+            .call(move |db| {
+                db.execute(
+                    "UPDATE sessions SET draft = ?2 WHERE id = ?1",
+                    params![id, text],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .context("cannot save draft")
+    }
+
+    pub async fn list_for_project(&self) -> Result<Vec<SessionSummary>> {
+        list_project_sessions(
+            self.database_path.clone(),
+            Path::new(&self.project_cwd().await),
+        )
+        .await
+    }
+
+    async fn project_cwd(&self) -> String {
+        let id = self.id.clone();
+        self.connection
+            .call(move |db| {
+                db.query_row("SELECT cwd FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+            })
+            .await
+            .unwrap_or_default()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.events.subscribe()
     }
@@ -443,6 +507,59 @@ impl Session {
     }
 }
 
+async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec<SessionSummary>> {
+    let project = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let (_, connection) = open_database(database_path).await?;
+    connection
+        .call(move |db| {
+            let mut statement = db.prepare(
+                "SELECT id, updated_at, provider, model,
+                    (SELECT payload_json FROM events
+                     WHERE events.session_id = sessions.id AND kind = 'user'
+                     ORDER BY sequence DESC LIMIT 1)
+                 FROM sessions WHERE cwd = ?1
+                 ORDER BY updated_at DESC, id DESC",
+            )?;
+            let rows = statement.query_map([project], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                let (id, updated_at, provider, model, payload) = row?;
+                let preview = payload
+                    .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
+                    .and_then(|kind| match kind {
+                        EventKind::User { text } => Some(text),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "empty session".to_string());
+                let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+                    .map(|value| value.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                sessions.push(SessionSummary {
+                    id,
+                    updated_at,
+                    provider,
+                    model,
+                    preview,
+                });
+            }
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(sessions)
+        })
+        .await
+        .context("cannot list sessions")
+}
+
 fn session_database_path(fallback: &Path) -> PathBuf {
     dirs::data_dir()
         .map(|path| path.join("uri-agent/sessions.db"))
@@ -481,7 +598,8 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                  CREATE TABLE IF NOT EXISTS sessions (
                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                    cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
-                   head_sequence INTEGER NOT NULL
+                   head_sequence INTEGER NOT NULL,
+                   draft TEXT NOT NULL DEFAULT ''
                  );
                  CREATE TABLE IF NOT EXISTS events (
                    session_id TEXT NOT NULL, sequence INTEGER NOT NULL, at TEXT NOT NULL,
@@ -490,6 +608,17 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                  );",
             )?;
+            let has_draft = {
+                let mut statement = db.prepare("PRAGMA table_info(sessions)")?;
+                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+                names.filter_map(Result::ok).any(|name| name == "draft")
+            };
+            if !has_draft {
+                db.execute(
+                    "ALTER TABLE sessions ADD COLUMN draft TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
             Ok::<_, tokio_rusqlite::rusqlite::Error>(())
         })
         .await
@@ -509,6 +638,7 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::ModelMessage { .. } => "model_message",
         EventKind::Task { .. } => "task",
         EventKind::Notice { .. } => "notice",
+        EventKind::Usage { .. } => "usage",
         EventKind::Error { .. } => "error",
         EventKind::Compaction { .. } => "compaction",
         EventKind::TurnFinished => "turn_finished",
@@ -772,5 +902,57 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("different project"));
+    }
+
+    #[tokio::test]
+    async fn drafts_persist_without_changing_event_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("drafty")).await;
+        opened.save_draft("keep me").await.unwrap();
+        drop(opened);
+        let reopened = session(&path, Some("drafty")).await;
+        assert_eq!(reopened.draft().await, "keep me");
+        assert_eq!(reopened.snapshot().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn project_session_list_stays_inside_the_launch_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first = session(&path, Some("alpha")).await;
+        first
+            .append(EventKind::User {
+                text: "first question".into(),
+            })
+            .await
+            .unwrap();
+        session(&path, Some("beta")).await;
+        Session::open_at(
+            path.clone(),
+            Some("other"),
+            Path::new("/projects/other"),
+            "test",
+            "model",
+            context("other"),
+        )
+        .await
+        .unwrap();
+        let listed = first.list_for_project().await.unwrap();
+        let ids = listed
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"alpha"));
+        assert!(ids.contains(&"beta"));
+        assert!(!ids.contains(&"other"));
+        assert_eq!(
+            listed
+                .iter()
+                .find(|item| item.id == "alpha")
+                .unwrap()
+                .preview,
+            "first question"
+        );
     }
 }

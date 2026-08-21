@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod config;
 pub mod keymap;
 pub mod model;
+pub mod oauth;
 pub mod output;
 pub mod plugin;
 pub mod prompts;

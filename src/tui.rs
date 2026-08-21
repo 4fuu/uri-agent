@@ -3,16 +3,18 @@ mod model_selector;
 
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
 use crate::catalog::{CatalogModel, ModelCatalog};
-use crate::config::{ActiveSettings, ConfigManager, ExternalMode};
-use crate::keymap::Keymap;
+use crate::config::{ActiveSettings, AuthKind, ConfigManager};
+use crate::keymap::{Keymap, canonical_key};
 use crate::model::configured_backend;
+use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
-    CommandRegistry, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext, TuiRegistry,
+    CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext,
+    TuiRegistry,
 };
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
-use crate::session::{EventKind, SessionEvent};
+use crate::session::{EventKind, SessionEvent, SessionSummary};
 use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,15 +34,14 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
-use std::env;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{fs, process::Command, sync::mpsc, time};
+use tokio::sync::mpsc;
+use tokio::time;
 use tui_term::widget::PseudoTerminal;
 use tui_textarea::TextArea;
-use uuid::Uuid;
 
 const BG: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(21, 24, 28);
@@ -50,6 +51,8 @@ const ACCENT: Color = Color::Rgb(104, 210, 194);
 const WARM: Color = Color::Rgb(239, 173, 104);
 const ERROR: Color = Color::Rgb(239, 108, 120);
 const FLASH_DURATION: Duration = Duration::from_secs(5);
+const SPLASH_DURATION: Duration = Duration::from_millis(1200);
+const EXPANDED_PREVIEW_LINES: usize = 24;
 
 pub struct TuiInfo {
     pub cwd: PathBuf,
@@ -58,13 +61,19 @@ pub struct TuiInfo {
     pub session_id: String,
     pub context_window: usize,
     pub model_ready: bool,
-    pub editor: Option<String>,
-    pub editor_mode: ExternalMode,
-    pub picker: Option<String>,
-    pub picker_mode: ExternalMode,
+    pub provider_count: usize,
+    pub context_tokens: usize,
+    pub terminal: Option<String>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiOutcome {
+    Quit,
+    NewSession,
+    Resume(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockKind {
     User,
     Assistant,
@@ -81,43 +90,48 @@ struct DisplayBlock {
     text: String,
     call_id: Option<String>,
     failed: bool,
+    expanded: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Overlay {
-    Detail,
+    Composer,
+    Command,
     Help,
     Protocols,
     Tasks,
     Models,
     Settings,
-    Palette,
-    Command,
     Plugin,
+    Document,
+    Selector,
+    Text,
+    Oauth,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JumpKind {
+    All,
+    Reasoning,
+    Tool,
+    User,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum EditingSetting {
-    ApiKey,
     OutputLimit,
-    Editor,
-    Picker,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Mode {
-    Browse,
-    Insert,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppHit {
     Transcript(usize),
-    Composer,
     Palette(usize),
     Task(usize),
     Model(usize),
     Setting(usize),
+    Selector(usize),
+    Help,
 }
 
 #[derive(Clone)]
@@ -134,9 +148,9 @@ impl Activity {
         match self {
             Self::Thinking => "thinking".to_string(),
             Self::Reasoning => "reasoning".to_string(),
-            Self::Writing => "writing response".to_string(),
+            Self::Writing => "writing".to_string(),
             Self::Tool(protocol) => format!("running {protocol}"),
-            Self::Compacting => "compacting context".to_string(),
+            Self::Compacting => "compacting".to_string(),
         }
     }
 }
@@ -145,60 +159,6 @@ impl Activity {
 struct HitRegion<T> {
     area: Rect,
     target: T,
-}
-
-struct SettingsState {
-    active: ActiveSettings,
-    model: Option<CatalogModel>,
-    selected: usize,
-    editing: Option<EditingSetting>,
-    api_key: String,
-    api_key_changed: bool,
-    output_limit: String,
-    editor: String,
-    editor_mode: ExternalMode,
-    picker: String,
-    picker_mode: ExternalMode,
-}
-
-impl SettingsState {
-    async fn load(manager: &ConfigManager, catalog: &ModelCatalog) -> Self {
-        let active = manager.current().await;
-        let model = active.catalog_model(catalog).await;
-        let output_limit = active.output_limit.to_string();
-        let editor = active.editor.clone().unwrap_or_default();
-        let editor_mode = active.editor_mode;
-        let picker = active.picker.clone().unwrap_or_default();
-        let picker_mode = active.picker_mode;
-        Self {
-            active,
-            model,
-            selected: 0,
-            editing: None,
-            api_key: String::new(),
-            api_key_changed: false,
-            output_limit,
-            editor,
-            editor_mode,
-            picker,
-            picker_mode,
-        }
-    }
-
-    fn provider(&self) -> &str {
-        &self.active.provider
-    }
-
-    fn model(&self) -> Option<&CatalogModel> {
-        self.model.as_ref()
-    }
-
-    fn cycle_external_mode(mode: &mut ExternalMode) {
-        *mode = match mode {
-            ExternalMode::Float => ExternalMode::Fullscreen,
-            ExternalMode::Fullscreen => ExternalMode::Float,
-        };
-    }
 }
 
 struct SelectableSurface {
@@ -212,17 +172,136 @@ struct TextSelection {
     end: (u16, u16),
 }
 
-enum ExternalPurpose {
-    Editor { path: PathBuf, read_back: bool },
-    Picker { input: PathBuf, result: PathBuf },
+struct SettingsState {
+    active: ActiveSettings,
+    model: Option<CatalogModel>,
+    selected: usize,
+    editing: Option<EditingSetting>,
+    api_key: String,
+    api_key_changed: bool,
+    output_limit: String,
 }
 
-struct ExternalProcess {
+impl SettingsState {
+    async fn load(manager: &ConfigManager, catalog: &ModelCatalog) -> Self {
+        let active = manager.current().await;
+        let model = active.catalog_model(catalog).await;
+        Self {
+            output_limit: active.output_limit.to_string(),
+            active,
+            model,
+            selected: 0,
+            editing: None,
+            api_key: String::new(),
+            api_key_changed: false,
+        }
+    }
+
+    fn provider(&self) -> &str {
+        &self.active.provider
+    }
+
+    fn model(&self) -> Option<&CatalogModel> {
+        self.model.as_ref()
+    }
+}
+
+#[derive(Clone)]
+struct SelectorItem {
+    id: String,
+    title: String,
+    description: String,
+}
+
+enum SelectorKind {
+    LoginProvider,
+    LoginMethod { provider: String },
+    Logout,
+    Resume,
+}
+
+struct SelectorState {
+    kind: SelectorKind,
+    title: String,
+    query: String,
+    items: Vec<SelectorItem>,
+    visible: Vec<usize>,
+    selected: usize,
+}
+
+impl SelectorState {
+    fn new(kind: SelectorKind, title: impl Into<String>, items: Vec<SelectorItem>) -> Self {
+        let mut selector = Self {
+            kind,
+            title: title.into(),
+            query: String::new(),
+            items,
+            visible: Vec::new(),
+            selected: 0,
+        };
+        selector.rebuild();
+        selector
+    }
+
+    fn rebuild(&mut self) {
+        let query = self.query.trim().to_ascii_lowercase();
+        self.visible = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                query.is_empty()
+                    || item.title.to_ascii_lowercase().contains(&query)
+                    || item.description.to_ascii_lowercase().contains(&query)
+                    || item.id.to_ascii_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.selected = self.selected.min(self.visible.len().saturating_sub(1));
+    }
+
+    fn selected_item(&self) -> Option<&SelectorItem> {
+        self.visible
+            .get(self.selected)
+            .and_then(|index| self.items.get(*index))
+    }
+}
+
+enum TextPurpose {
+    ApiKey { provider: String },
+    CopilotDomain,
+    SetTerminal,
+}
+
+struct TextPrompt {
+    title: String,
+    message: String,
+    value: String,
+    secret: bool,
+    purpose: TextPurpose,
+}
+
+struct OauthState {
+    provider: String,
+    login: OauthLogin,
+    paste: String,
+    message: String,
+}
+
+struct FloatTerminal {
     terminal: EmbeddedTerminal,
-    purpose: ExternalPurpose,
     area: Rect,
-    title: &'static str,
     last_escape: Option<Instant>,
+}
+
+/// Cumulative token usage of the whole session, replayed from usage events.
+#[derive(Default)]
+struct UsageTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
 }
 
 struct App {
@@ -232,13 +311,15 @@ struct App {
     task_records: Vec<TaskRecord>,
     selected_task: usize,
     selected_block: usize,
-    mode: Mode,
     overlay: Option<Overlay>,
     overlay_scroll: u16,
+    jump: JumpKind,
     busy: bool,
     activity: Option<Activity>,
     busy_since: Option<Instant>,
     frame: usize,
+    started: Instant,
+    splash_skipped: bool,
     last_sequence: Option<u64>,
     info: TuiInfo,
     flash: Option<String>,
@@ -247,13 +328,21 @@ struct App {
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
     keymap: Keymap,
-    palette_selected: usize,
     command_line: String,
+    command_selected: usize,
+    command_stem: Option<String>,
+    selector: Option<SelectorState>,
+    text_prompt: Option<TextPrompt>,
+    oauth: Option<OauthState>,
+    pty: Option<FloatTerminal>,
+    document: Option<(String, String)>,
     hit_regions: Vec<HitRegion<AppHit>>,
     last_click: Option<(AppHit, Instant)>,
     selectable: Option<SelectableSurface>,
     selection: Option<TextSelection>,
-    external: Option<ExternalProcess>,
+    usage: UsageTotals,
+    last_cache_hit: Option<f64>,
+    branch: Option<(Instant, Option<String>)>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
     tui_document: Option<TuiDocument>,
@@ -266,8 +355,12 @@ impl App {
         tui: Arc<TuiRegistry>,
         info: TuiInfo,
         keymap: Keymap,
+        draft: String,
     ) -> Self {
         let mut input = TextArea::default();
+        if !draft.is_empty() {
+            input.insert_str(&draft);
+        }
         style_input(&mut input, false);
         Self {
             input,
@@ -276,13 +369,15 @@ impl App {
             task_records: Vec::new(),
             selected_task: 0,
             selected_block: 0,
-            mode: Mode::Browse,
             overlay: None,
             overlay_scroll: 0,
+            jump: JumpKind::All,
             busy: false,
             activity: None,
             busy_since: None,
             frame: 0,
+            started: Instant::now(),
+            splash_skipped: false,
             last_sequence: None,
             info,
             flash: None,
@@ -291,17 +386,33 @@ impl App {
             catalog_refreshing: false,
             settings: None,
             keymap,
-            palette_selected: 0,
             command_line: String::new(),
+            command_selected: 0,
+            command_stem: None,
+            selector: None,
+            text_prompt: None,
+            oauth: None,
+            pty: None,
+            document: None,
             hit_regions: Vec::new(),
             last_click: None,
             selectable: None,
             selection: None,
-            external: None,
+            usage: UsageTotals::default(),
+            last_cache_hit: None,
+            branch: None,
             commands,
             tui,
             tui_document: None,
         }
+    }
+
+    fn showing_splash(&self) -> bool {
+        !self.splash_skipped && self.started.elapsed() < SPLASH_DURATION
+    }
+
+    fn skip_splash(&mut self) {
+        self.splash_skipped = true;
     }
 
     fn apply(&mut self, event: SessionEvent) {
@@ -323,15 +434,15 @@ impl App {
                 self.busy = true;
                 self.busy_since.get_or_insert_with(Instant::now);
                 self.activity = Some(Activity::Thinking);
-                self.push(BlockKind::User, "YOU", text, None, false);
+                self.push(BlockKind::User, "YOU", text, None, false, false);
             }
             EventKind::AssistantText { text } => {
                 self.activity = Some(Activity::Writing);
-                self.append_or_push(BlockKind::Assistant, "AGENT", text);
+                self.append_or_push(BlockKind::Assistant, "AGENT", text, true);
             }
             EventKind::AssistantReasoning { text } => {
                 self.activity = Some(Activity::Reasoning);
-                self.append_or_push(BlockKind::Reasoning, "THINKING", text);
+                self.append_or_push(BlockKind::Reasoning, "THINKING", text, true);
             }
             EventKind::ToolCall {
                 call_id,
@@ -348,6 +459,7 @@ impl App {
                     format!("CALL\n{text}"),
                     Some(call_id),
                     false,
+                    true,
                 );
             }
             EventKind::ToolResult {
@@ -369,6 +481,7 @@ impl App {
                         "\n\nRESULT\n"
                     });
                     block.text.push_str(&output);
+                    block.expanded = true;
                 } else {
                     self.push(
                         if failed {
@@ -380,16 +493,35 @@ impl App {
                         output,
                         Some(call_id),
                         failed,
+                        true,
                     );
                 }
                 self.activity = Some(Activity::Thinking);
             }
-            EventKind::Notice { text } => self.push(BlockKind::Notice, "SYSTEM", text, None, false),
+            EventKind::Notice { text } => {
+                self.push(BlockKind::Notice, "SYSTEM", text, None, false, false);
+            }
+            EventKind::Usage {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                cost,
+            } => {
+                self.usage.input += input;
+                self.usage.output += output;
+                self.usage.cache_read += cache_read;
+                self.usage.cache_write += cache_write;
+                self.usage.cost += cost;
+                let prompt_tokens = input + cache_read + cache_write;
+                self.last_cache_hit =
+                    (prompt_tokens > 0).then(|| cache_read as f64 / prompt_tokens as f64 * 100.0);
+            }
             EventKind::Error { text } => {
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
-                self.push(BlockKind::Error, "ERROR", text, None, true);
+                self.push(BlockKind::Error, "ERROR", text, None, true, true);
             }
             EventKind::Compaction {
                 summary,
@@ -413,12 +545,26 @@ impl App {
                     ),
                     None,
                     false,
+                    false,
                 );
             }
             EventKind::TurnFinished => {
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
+                for block in &mut self.blocks {
+                    if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
+                        block.expanded = false;
+                    }
+                }
+                if let Some(block) = self
+                    .blocks
+                    .iter_mut()
+                    .rev()
+                    .find(|block| block.kind == BlockKind::Assistant)
+                {
+                    block.expanded = true;
+                }
             }
         }
         if follow {
@@ -431,6 +577,9 @@ impl App {
         self.busy = false;
         self.activity = None;
         self.busy_since = None;
+        for block in &mut self.blocks {
+            block.expanded = false;
+        }
         style_input(&mut self.input, false);
     }
 
@@ -441,6 +590,7 @@ impl App {
         text: String,
         call_id: Option<String>,
         failed: bool,
+        expanded: bool,
     ) {
         self.blocks.push(DisplayBlock {
             kind,
@@ -448,14 +598,16 @@ impl App {
             text,
             call_id,
             failed,
+            expanded,
         });
     }
 
-    fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String) {
+    fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String, expanded: bool) {
         if let Some(block) = self.blocks.last_mut().filter(|block| block.kind == kind) {
             block.text.push_str(&text);
+            block.expanded = expanded;
         } else {
-            self.push(kind, title, text, None, false);
+            self.push(kind, title, text, None, false, expanded);
         }
     }
 
@@ -473,8 +625,12 @@ impl App {
         self.busy = true;
         self.busy_since = Some(Instant::now());
         self.activity = Some(Activity::Thinking);
-        self.mode = Mode::Browse;
+        self.overlay = None;
         Some(text)
+    }
+
+    fn draft_text(&self) -> String {
+        self.input.lines().join("\n")
     }
 
     fn has_draft(&self) -> bool {
@@ -489,11 +645,6 @@ impl App {
         self.flash_at = Some(Instant::now());
     }
 
-    fn clear_flash(&mut self) {
-        self.flash = None;
-        self.flash_at = None;
-    }
-
     fn visible_flash(&self) -> Option<&str> {
         self.flash.as_deref().filter(|_| {
             self.flash_at
@@ -501,20 +652,242 @@ impl App {
         })
     }
 
-    fn selected_block(&self) -> Option<&DisplayBlock> {
-        self.blocks.get(self.selected_block)
+    fn filtered_indices(&self) -> Vec<usize> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| match self.jump {
+                JumpKind::All => true,
+                JumpKind::Reasoning => block.kind == BlockKind::Reasoning,
+                JumpKind::Tool => block.kind == BlockKind::Tool,
+                JumpKind::User => block.kind == BlockKind::User,
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn move_selection(&mut self, distance: isize) {
-        if distance < 0 {
-            self.selected_block = self.selected_block.saturating_sub(distance.unsigned_abs());
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let current = indices
+            .iter()
+            .position(|index| *index == self.selected_block)
+            .unwrap_or(0);
+        let next = if distance < 0 {
+            current.saturating_sub(distance.unsigned_abs())
         } else {
-            self.selected_block = self
-                .selected_block
+            current
                 .saturating_add(distance as usize)
-                .min(self.blocks.len().saturating_sub(1));
+                .min(indices.len() - 1)
+        };
+        self.selected_block = indices[next];
+    }
+
+    fn jump_to(&mut self, kind: JumpKind) {
+        self.jump = kind;
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
+            self.set_flash(match kind {
+                JumpKind::Reasoning => "No thinking blocks in this session",
+                JumpKind::Tool => "No tool calls in this session",
+                JumpKind::User => "No user messages in this session",
+                JumpKind::All => "No events",
+            });
+            self.jump = JumpKind::All;
+            return;
+        }
+        let current = indices
+            .iter()
+            .position(|index| *index == self.selected_block);
+        let next = match current {
+            Some(index) => (index + 1) % indices.len(),
+            None => indices
+                .iter()
+                .position(|index| *index >= self.selected_block)
+                .unwrap_or(0),
+        };
+        self.selected_block = indices[next];
+    }
+
+    fn toggle_selected(&mut self) {
+        let Some(block) = self.blocks.get_mut(self.selected_block) else {
+            return;
+        };
+        if !block.expanded {
+            block.expanded = true;
+            return;
+        }
+        if block.text.lines().count() > EXPANDED_PREVIEW_LINES {
+            self.document = Some((block.title.clone(), block_document(block)));
+            self.overlay_scroll = 0;
+            self.overlay = Some(Overlay::Document);
+        } else {
+            block.expanded = false;
         }
     }
+
+    fn reset_command_input(&mut self) {
+        self.command_line.clear();
+        self.command_selected = 0;
+        self.command_stem = None;
+    }
+
+    fn command_matches(&self, prefix: &str) -> Vec<CommandSpec> {
+        let prefix = prefix.to_ascii_lowercase();
+        self.commands
+            .list()
+            .into_iter()
+            .filter(|command| {
+                prefix.is_empty()
+                    || command.id.starts_with(&prefix)
+                    || command
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    fn completion_candidates(&self, prefix: &str) -> Vec<CommandSpec> {
+        let prefix = prefix.to_ascii_lowercase();
+        let matches = self.command_matches(&prefix);
+        if prefix.is_empty() {
+            return matches;
+        }
+        let id_matches = matches
+            .iter()
+            .filter(|command| command.id.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if id_matches.is_empty() {
+            matches
+        } else {
+            id_matches
+        }
+    }
+
+    fn command_stem_applies(&self, typed: &str) -> bool {
+        let Some(stem) = self.command_stem.as_deref() else {
+            return false;
+        };
+        typed.starts_with(stem)
+            || self
+                .completion_candidates(stem)
+                .iter()
+                .any(|command| command.id.eq_ignore_ascii_case(typed))
+    }
+
+    fn sync_command_selection(&mut self) {
+        let name = self
+            .command_line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let filtered = self.filtered_commands();
+        self.command_selected = filtered
+            .iter()
+            .position(|command| command.id == name)
+            .or_else(|| {
+                filtered
+                    .iter()
+                    .position(|command| command.aliases.iter().any(|alias| alias == &name))
+            })
+            .unwrap_or(0);
+    }
+
+    fn complete_command(&mut self, reverse: bool) {
+        if self.command_line.chars().any(char::is_whitespace) {
+            return;
+        }
+        let typed = self.command_line.to_ascii_lowercase();
+        if !self.command_stem_applies(&typed) {
+            self.command_stem = Some(typed.clone());
+        }
+        let prefix = self.command_stem.clone().unwrap_or_else(|| typed.clone());
+        let matches = self.completion_candidates(&prefix);
+        if matches.is_empty() {
+            return;
+        }
+        if matches.len() == 1 {
+            self.command_line.clone_from(&matches[0].id);
+            self.sync_command_selection();
+            return;
+        }
+        let ids = matches
+            .iter()
+            .map(|command| command.id.clone())
+            .collect::<Vec<_>>();
+        let common = common_command_prefix(&ids);
+        if common.len() > typed.len() {
+            self.command_line = common;
+            self.sync_command_selection();
+            return;
+        }
+        let current = ids.iter().position(|id| id.eq_ignore_ascii_case(&typed));
+        let next = match current {
+            Some(index) if reverse => (index + ids.len() - 1) % ids.len(),
+            Some(index) => (index + 1) % ids.len(),
+            None if reverse => ids.len() - 1,
+            None => 0,
+        };
+        self.command_line.clone_from(&ids[next]);
+        self.sync_command_selection();
+    }
+
+    fn filtered_commands(&self) -> Vec<CommandSpec> {
+        let query = self.command_line.trim().to_ascii_lowercase();
+        let name = query
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        self.commands
+            .list()
+            .into_iter()
+            .filter(|command| {
+                name.is_empty()
+                    || command.id.contains(&name)
+                    || command.title.to_ascii_lowercase().contains(&name)
+                    || command.description.to_ascii_lowercase().contains(&name)
+                    || command.aliases.iter().any(|alias| alias.contains(&name))
+            })
+            .collect()
+    }
+
+    fn close_floats(&mut self) {
+        if let Some(oauth) = self.oauth.take() {
+            oauth.login.cancel();
+        }
+        self.pty = None;
+        self.selector = None;
+        self.text_prompt = None;
+        self.document = None;
+        self.settings = None;
+        self.model_selector = None;
+        self.tui_document = None;
+        self.overlay = None;
+        self.overlay_scroll = 0;
+    }
+}
+
+fn common_command_prefix(names: &[String]) -> String {
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for name in &names[1..] {
+        end = first
+            .as_bytes()
+            .iter()
+            .take(end)
+            .zip(name.as_bytes())
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+    }
+    first[..end].to_string()
 }
 
 fn hit_target<T: Copy>(regions: &[HitRegion<T>], mouse: MouseEvent) -> Option<T> {
@@ -548,9 +921,10 @@ pub struct TuiServices {
     pub catalog: Arc<ModelCatalog>,
     pub output: Arc<OutputStore>,
     pub info: TuiInfo,
+    pub draft: String,
 }
 
-pub async fn run(services: TuiServices) -> Result<()> {
+pub async fn run(services: TuiServices) -> Result<TuiOutcome> {
     let TuiServices {
         runtime,
         protocols,
@@ -561,11 +935,12 @@ pub async fn run(services: TuiServices) -> Result<()> {
         catalog,
         output,
         info,
+        draft,
     } = services;
     let session = runtime.session().clone();
     let mut receiver = session.subscribe();
     let keymap = Keymap::load(Some(&info.cwd)).await?;
-    let mut app = App::new(protocols, commands, tui, info, keymap);
+    let mut app = App::new(protocols, commands, tui, info, keymap, draft);
     for event in session.snapshot().await {
         app.apply(event);
     }
@@ -597,158 +972,61 @@ async fn run_loop(
     app: &mut App,
     services: LoopServices,
     receiver: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
-) -> Result<()> {
+) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
     loop {
+        app.info.context_tokens = services.runtime.estimated_context();
         terminal.draw(|frame| render(frame, app))?;
         tokio::select! {
             _ = animation.tick() => app.frame = app.frame.wrapping_add(1),
             event = terminal_events.next() => {
-                let Some(event) = event else { return Ok(()); };
+                let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        if app.external.is_some() {
-                            if handle_external_key(app, key)? {
-                                cancel_external(app).await;
+                        if app.showing_splash() {
+                            app.skip_splash();
+                        }
+                        if app.pty.is_some() {
+                            if handle_terminal_key(app, key)? {
+                                close_pty(app, "Terminal closed");
                             }
                             continue;
                         }
-                        match handle_key(app, key, &services.tasks).await {
+                        match handle_key(app, key, &services).await {
                             Action::Continue => {}
-                            Action::Quit => return Ok(()),
-                            Action::Submit(prompt) => {
-                                let runtime = services.runtime.clone();
-                                tokio::spawn(async move {
-                                    let _ = runtime.run_turn(prompt).await;
-                                });
-                            }
-                            Action::Compact => start_compaction(app, services.runtime.clone()),
-                            Action::OpenModels(query) => {
-                                open_models(app, &services.manager, &services.catalog, query).await;
-                            }
-                            Action::SelectModel => {
-                                select_model(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
-                            }
-                            Action::OpenSettings => {
-                                app.settings = Some(SettingsState::load(&services.manager, &services.catalog).await);
-                                app.overlay = Some(Overlay::Settings);
-                            }
-                            Action::SaveSettings => {
-                                save_settings(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
-                            }
-                            Action::RefreshCatalog => {
-                                start_catalog_refresh(app, &services, background_tx.clone());
-                            }
-                            Action::ClearApiKey => {
-                                clear_api_key(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
-                            }
-                            Action::OpenEditor { content, replace_input } => {
-                                if app.info.editor_mode == ExternalMode::Fullscreen {
-                                    drop(terminal_events);
-                                    let result = open_editor(terminal, app.info.editor.as_deref(), &content, replace_input).await;
-                                    terminal_events = EventStream::new();
-                                    apply_editor_result(app, result);
-                                } else if let Err(error) = open_embedded_editor(app, &content, replace_input, terminal.size()?.into()).await {
-                                    app.set_flash(format!("Editor failed: {error:#}"));
-                                }
-                            }
-                            Action::OpenPicker => {
-                                if app.info.picker_mode == ExternalMode::Fullscreen {
-                                    drop(terminal_events);
-                                    let result = open_fullscreen_picker(terminal, app).await;
-                                    terminal_events = EventStream::new();
-                                    apply_picker_result(app, result);
-                                } else if let Err(error) = open_embedded_picker(app, terminal.size()?.into()).await {
-                                    app.set_flash(format!("Picker failed: {error:#}"));
+                            other => {
+                                if let Some(outcome) = apply_action(app, &services, background_tx.clone(), other).await? {
+                                    return persist_and_exit(app, &services, outcome).await;
                                 }
                             }
                         }
                     }
                     Event::Paste(text) => {
-                        if let Some(external) = app.external.as_mut() {
-                            if let Err(error) = external.terminal.send_paste(&text) {
-                                app.set_flash(format!("Terminal input failed: {error:#}"));
+                        if let Some(pty) = app.pty.as_mut() {
+                            if let Err(error) = pty.terminal.send_paste(&text) {
+                                app.set_flash(format!("Terminal paste failed: {error:#}"));
                             }
-                        } else if let Some(settings) = app.settings.as_mut()
-                            && let Some(editing) = settings.editing
-                        {
-                            match editing {
-                                EditingSetting::ApiKey => {
-                                    settings.api_key.push_str(text.trim());
-                                    settings.api_key_changed = true;
-                                }
-                                EditingSetting::OutputLimit => settings
-                                    .output_limit
-                                    .extend(text.chars().filter(char::is_ascii_digit)),
-                                EditingSetting::Editor => settings.editor.push_str(text.trim()),
-                                EditingSetting::Picker => settings.picker.push_str(text.trim()),
-                            }
-                        } else if app.overlay == Some(Overlay::Models) {
-                            if let Some(selector) = app.model_selector.as_mut() {
-                                selector.paste(text.trim());
-                            }
-                        } else if app.overlay == Some(Overlay::Command) {
-                            app.command_line.push_str(text.trim());
-                        } else if app.overlay.is_none() && app.mode == Mode::Insert {
-                            app.input.insert_str(text);
+                        } else {
+                            handle_paste(app, text);
                         }
                     }
                     Event::Mouse(mouse) => {
-                        if app.external.is_some() {
-                            if let Err(error) = handle_external_mouse(app, mouse) {
+                        if app.showing_splash() {
+                            app.skip_splash();
+                        }
+                        if app.pty.is_some() {
+                            if let Err(error) = handle_terminal_mouse(app, mouse) {
                                 app.set_flash(format!("Terminal mouse input failed: {error:#}"));
                             }
                             continue;
                         }
-                        match handle_mouse(app, mouse, &services.tasks).await {
+                        match handle_mouse(app, mouse, &services).await {
                             Action::Continue => {}
-                            Action::Quit => return Ok(()),
-                            Action::Submit(prompt) => {
-                                let runtime = services.runtime.clone();
-                                tokio::spawn(async move {
-                                    let _ = runtime.run_turn(prompt).await;
-                                });
-                            }
-                            Action::Compact => start_compaction(app, services.runtime.clone()),
-                            Action::OpenModels(query) => {
-                                open_models(app, &services.manager, &services.catalog, query).await;
-                            }
-                            Action::SelectModel => {
-                                select_model(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
-                            }
-                            Action::OpenSettings => {
-                                app.settings = Some(SettingsState::load(&services.manager, &services.catalog).await);
-                                app.overlay = Some(Overlay::Settings);
-                            }
-                            Action::SaveSettings => {
-                                save_settings(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
-                            }
-                            Action::RefreshCatalog => {
-                                start_catalog_refresh(app, &services, background_tx.clone());
-                            }
-                            Action::ClearApiKey => {
-                                clear_api_key(app, &services.runtime, &services.manager, &services.catalog, &services.output).await;
-                            }
-                            Action::OpenEditor { content, replace_input } => {
-                                if app.info.editor_mode == ExternalMode::Fullscreen {
-                                    drop(terminal_events);
-                                    let result = open_editor(terminal, app.info.editor.as_deref(), &content, replace_input).await;
-                                    terminal_events = EventStream::new();
-                                    apply_editor_result(app, result);
-                                } else if let Err(error) = open_embedded_editor(app, &content, replace_input, terminal.size()?.into()).await {
-                                    app.set_flash(format!("Editor failed: {error:#}"));
-                                }
-                            }
-                            Action::OpenPicker => {
-                                if app.info.picker_mode == ExternalMode::Fullscreen {
-                                    drop(terminal_events);
-                                    let result = open_fullscreen_picker(terminal, app).await;
-                                    terminal_events = EventStream::new();
-                                    apply_picker_result(app, result);
-                                } else if let Err(error) = open_embedded_picker(app, terminal.size()?.into()).await {
-                                    app.set_flash(format!("Picker failed: {error:#}"));
+                            other => {
+                                if let Some(outcome) = apply_action(app, &services, background_tx.clone(), other).await? {
+                                    return persist_and_exit(app, &services, outcome).await;
                                 }
                             }
                         }
@@ -763,20 +1041,37 @@ async fn run_loop(
                         app.apply(event);
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return persist_and_exit(app, &services, TuiOutcome::Quit).await;
+                }
             },
             Some(event) = background_rx.recv() => {
                 finish_background(app, &services, event).await;
             },
         }
-        if external_finished(app)? {
-            finish_external(app).await;
+        if pty_finished(app)? {
+            close_pty(app, "Terminal exited");
         }
     }
 }
 
+async fn persist_and_exit(
+    app: &mut App,
+    services: &LoopServices,
+    outcome: TuiOutcome,
+) -> Result<TuiOutcome> {
+    let _ = services
+        .runtime
+        .session()
+        .save_draft(&app.draft_text())
+        .await;
+    app.close_floats();
+    Ok(outcome)
+}
+
 enum BackgroundEvent {
     CatalogRefreshed(Result<ActiveSettings>),
+    OauthFinished(Result<OauthToken>),
 }
 
 enum Action {
@@ -789,19 +1084,167 @@ enum Action {
     OpenSettings,
     SaveSettings,
     RefreshCatalog,
-    ClearApiKey,
-    OpenEditor {
-        content: String,
-        replace_input: bool,
+    Resume(String),
+    NewSession,
+    StartOauth {
+        provider: String,
+        method: String,
+        extra: std::collections::BTreeMap<String, String>,
     },
-    OpenPicker,
+    StoreApiKey {
+        provider: String,
+        key: String,
+    },
+    Logout {
+        provider: String,
+    },
+    SaveTerminal(String),
+    OpenTerminal {
+        command: Option<String>,
+    },
+}
+
+async fn apply_action(
+    app: &mut App,
+    services: &LoopServices,
+    background_tx: mpsc::UnboundedSender<BackgroundEvent>,
+    action: Action,
+) -> Result<Option<TuiOutcome>> {
+    match action {
+        Action::Continue => Ok(None),
+        Action::Quit => Ok(Some(TuiOutcome::Quit)),
+        Action::NewSession => Ok(Some(TuiOutcome::NewSession)),
+        Action::Resume(id) => {
+            if id == app.info.session_id {
+                app.set_flash("Already in this session");
+                Ok(None)
+            } else {
+                Ok(Some(TuiOutcome::Resume(id)))
+            }
+        }
+        Action::Submit(prompt) => {
+            let _ = services.runtime.session().save_draft("").await;
+            let runtime = services.runtime.clone();
+            tokio::spawn(async move {
+                let _ = runtime.run_turn(prompt).await;
+            });
+            Ok(None)
+        }
+        Action::Compact => {
+            start_compaction(app, services.runtime.clone());
+            Ok(None)
+        }
+        Action::OpenModels(query) => {
+            open_models(app, &services.manager, &services.catalog, query).await;
+            Ok(None)
+        }
+        Action::SelectModel => {
+            select_model(
+                app,
+                &services.runtime,
+                &services.manager,
+                &services.catalog,
+                &services.output,
+            )
+            .await;
+            Ok(None)
+        }
+        Action::OpenSettings => {
+            app.settings = Some(SettingsState::load(&services.manager, &services.catalog).await);
+            app.overlay = Some(Overlay::Settings);
+            Ok(None)
+        }
+        Action::SaveSettings => {
+            save_settings(
+                app,
+                &services.runtime,
+                &services.manager,
+                &services.catalog,
+                &services.output,
+            )
+            .await;
+            Ok(None)
+        }
+        Action::RefreshCatalog => {
+            start_catalog_refresh(app, services, background_tx);
+            Ok(None)
+        }
+        Action::StartOauth {
+            provider,
+            method,
+            extra,
+        } => {
+            start_oauth(app, provider, method, extra, background_tx);
+            Ok(None)
+        }
+        Action::StoreApiKey { provider, key } => {
+            store_api_key(app, services, &provider, key).await;
+            Ok(None)
+        }
+        Action::Logout { provider } => {
+            logout_provider(app, services, &provider).await;
+            Ok(None)
+        }
+        Action::SaveTerminal(command) => {
+            save_terminal(app, services, command).await;
+            Ok(None)
+        }
+        Action::OpenTerminal { command } => {
+            open_pty(app, command);
+            Ok(None)
+        }
+    }
+}
+
+fn handle_paste(app: &mut App, text: String) {
+    match app.overlay {
+        Some(Overlay::Text) => {
+            if let Some(prompt) = app.text_prompt.as_mut() {
+                prompt.value.push_str(text.trim());
+            }
+        }
+        Some(Overlay::Oauth) => {
+            if let Some(oauth) = app.oauth.as_mut() {
+                oauth.paste.push_str(text.trim());
+            }
+        }
+        Some(Overlay::Models) => {
+            if let Some(selector) = app.model_selector.as_mut() {
+                selector.paste(text.trim());
+            }
+        }
+        Some(Overlay::Command) => {
+            app.command_line.push_str(text.trim());
+            app.command_selected = 0;
+            app.command_stem = None;
+        }
+        Some(Overlay::Selector) => {
+            if let Some(selector) = app.selector.as_mut() {
+                selector.query.push_str(text.trim());
+                selector.rebuild();
+            }
+        }
+        Some(Overlay::Settings) => {
+            if let Some(settings) = app.settings.as_mut()
+                && settings.editing == Some(EditingSetting::OutputLimit)
+            {
+                settings
+                    .output_limit
+                    .extend(text.chars().filter(char::is_ascii_digit));
+            }
+        }
+        Some(Overlay::Composer) => {
+            app.input.insert_str(text);
+        }
+        _ => {}
+    }
 }
 
 async fn dispatch_ui_command(
     app: &mut App,
     target: CommandTarget,
     arguments: String,
-    tasks: &TaskManager,
+    services: &LoopServices,
 ) -> Action {
     app.overlay = None;
     let command = match target {
@@ -818,46 +1261,23 @@ async fn dispatch_ui_command(
                     app.overlay_scroll = 0;
                     app.overlay = Some(Overlay::Plugin);
                 }
-                Err(error) => {
-                    app.set_flash(format!("Plugin panel failed: {error:#}"));
-                }
+                Err(error) => app.set_flash(format!("Plugin panel failed: {error:#}")),
             }
             return Action::Continue;
         }
     };
     match command {
         CoreCommand::Compose => {
-            app.mode = Mode::Insert;
-            app.clear_flash();
+            app.skip_splash();
+            app.overlay = Some(Overlay::Composer);
             Action::Continue
         }
-        CoreCommand::Detail => {
-            if app.selected_block().is_some() {
-                app.overlay_scroll = 0;
-                app.overlay = Some(Overlay::Detail);
-            } else {
-                app.set_flash("No event is selected");
-            }
-            Action::Continue
-        }
-        CoreCommand::Editor => {
-            if let Some(block) = app.selected_block() {
-                Action::OpenEditor {
-                    content: block_document(block),
-                    replace_input: false,
-                }
-            } else {
-                app.set_flash("No event is selected");
-                Action::Continue
-            }
-        }
-        CoreCommand::Finder => Action::OpenPicker,
         CoreCommand::Copy => {
             copy_current_surface(app);
             Action::Continue
         }
         CoreCommand::Tasks => {
-            app.task_records = tasks.list().await;
+            app.task_records = services.tasks.list().await;
             app.selected_task = 0;
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Tasks);
@@ -870,6 +1290,10 @@ async fn dispatch_ui_command(
         }
         CoreCommand::Models => Action::OpenModels(arguments),
         CoreCommand::Settings => Action::OpenSettings,
+        CoreCommand::Login => open_login(app, &services.catalog, arguments).await,
+        CoreCommand::Logout => open_logout(app, &services.manager, arguments).await,
+        CoreCommand::Resume => open_resume(app, &services.runtime, arguments).await,
+        CoreCommand::NewSession => Action::NewSession,
         CoreCommand::Compact => Action::Compact,
         CoreCommand::Help => {
             app.overlay_scroll = 0;
@@ -877,11 +1301,21 @@ async fn dispatch_ui_command(
             Action::Continue
         }
         CoreCommand::Quit => Action::Quit,
+        CoreCommand::SetTerminal => {
+            if arguments.trim().is_empty() {
+                open_set_terminal_prompt(app);
+                Action::Continue
+            } else {
+                Action::SaveTerminal(arguments)
+            }
+        }
+        CoreCommand::Terminal => Action::OpenTerminal {
+            command: {
+                let command = arguments.trim();
+                (!command.is_empty()).then(|| command.to_string())
+            },
+        },
     }
-}
-
-async fn dispatch_core(app: &mut App, command: CoreCommand, tasks: &TaskManager) -> Action {
-    dispatch_ui_command(app, CommandTarget::Core(command), String::new(), tasks).await
 }
 
 fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
@@ -901,31 +1335,7 @@ fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
     });
 }
 
-fn submit_draft(app: &mut App) -> Action {
-    let Some(prompt) = app.submit() else {
-        return Action::Continue;
-    };
-    let command = prompt.split_whitespace().next();
-    if matches!(command, Some("/settings" | "/model" | "/login")) {
-        app.busy = false;
-        app.activity = None;
-        app.busy_since = None;
-        style_input(&mut app.input, false);
-        if command == Some("/model") {
-            let query = prompt
-                .trim_start()
-                .strip_prefix("/model")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            return Action::OpenModels(query);
-        }
-        return Action::OpenSettings;
-    }
-    Action::Submit(prompt)
-}
-
-async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action {
+async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Action {
     let key_name = key_name(key);
     if app.selection.is_some() {
         match app.keymap.action("selection", &key_name).as_deref() {
@@ -936,361 +1346,606 @@ async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action
         return Action::Continue;
     }
     match app.keymap.action_chain(&[], &key_name).as_deref() {
-        Some("quit") => return dispatch_core(app, CoreCommand::Quit, tasks).await,
-        Some("help") => return dispatch_core(app, CoreCommand::Help, tasks).await,
-        Some("settings") => return dispatch_core(app, CoreCommand::Settings, tasks).await,
-        Some("model") => return dispatch_core(app, CoreCommand::Models, tasks).await,
-        Some("protocols") => return dispatch_core(app, CoreCommand::Protocols, tasks).await,
-        Some("tasks") => return dispatch_core(app, CoreCommand::Tasks, tasks).await,
-        Some("copy") => return dispatch_core(app, CoreCommand::Copy, tasks).await,
+        Some("quit") => return Action::Quit,
+        Some("help") => {
+            app.overlay_scroll = 0;
+            app.overlay = Some(Overlay::Help);
+            return Action::Continue;
+        }
+        Some("settings") => return Action::OpenSettings,
+        Some("model") => return Action::OpenModels(String::new()),
+        Some("protocols") => {
+            app.overlay_scroll = 0;
+            app.overlay = Some(Overlay::Protocols);
+            return Action::Continue;
+        }
+        Some("tasks") => {
+            return dispatch_ui_command(
+                app,
+                CommandTarget::Core(CoreCommand::Tasks),
+                String::new(),
+                services,
+            )
+            .await;
+        }
+        Some("copy") => {
+            copy_current_surface(app);
+            return Action::Continue;
+        }
         _ => {}
     }
     if let Some(overlay) = app.overlay {
-        match overlay {
-            Overlay::Palette => match app.keymap.action("palette", &key_name).as_deref() {
-                Some("quit") => return Action::Quit,
-                Some("close") => app.overlay = None,
-                Some("previous") => app.palette_selected = app.palette_selected.saturating_sub(1),
+        return handle_overlay_key(app, key, &key_name, overlay, services).await;
+    }
+    match app.keymap.action("main", &key_name).as_deref() {
+        Some("quit") => Action::Quit,
+        Some("compose") => {
+            app.overlay = Some(Overlay::Composer);
+            Action::Continue
+        }
+        Some("command") => {
+            app.reset_command_input();
+            app.overlay = Some(Overlay::Command);
+            Action::Continue
+        }
+        Some("jump_reasoning") => {
+            app.jump_to(JumpKind::Reasoning);
+            Action::Continue
+        }
+        Some("jump_tools") => {
+            app.jump_to(JumpKind::Tool);
+            Action::Continue
+        }
+        Some("jump_user") => {
+            app.jump_to(JumpKind::User);
+            Action::Continue
+        }
+        Some("next") => {
+            app.move_selection(1);
+            Action::Continue
+        }
+        Some("previous") => {
+            app.move_selection(-1);
+            Action::Continue
+        }
+        Some("page_down") => {
+            app.move_selection(8);
+            Action::Continue
+        }
+        Some("page_up") => {
+            app.move_selection(-8);
+            Action::Continue
+        }
+        Some("first") => {
+            if let Some(index) = app.filtered_indices().first().copied() {
+                app.selected_block = index;
+            }
+            Action::Continue
+        }
+        Some("last") => {
+            if let Some(index) = app.filtered_indices().last().copied() {
+                app.selected_block = index;
+            }
+            Action::Continue
+        }
+        Some("toggle") => {
+            app.toggle_selected();
+            Action::Continue
+        }
+        Some("clear") => {
+            app.jump = JumpKind::All;
+            Action::Continue
+        }
+        Some("copy") => {
+            copy_current_surface(app);
+            Action::Continue
+        }
+        Some(action) => {
+            if let Some(target) = app.commands.target_for_action(action) {
+                dispatch_ui_command(app, target, String::new(), services).await
+            } else {
+                Action::Continue
+            }
+        }
+        None => Action::Continue,
+    }
+}
+
+async fn handle_overlay_key(
+    app: &mut App,
+    key: KeyEvent,
+    key_name: &str,
+    overlay: Overlay,
+    services: &LoopServices,
+) -> Action {
+    match overlay {
+        Overlay::Composer => match app.keymap.action("composer", key_name).as_deref() {
+            Some("submit") => app.submit().map_or(Action::Continue, Action::Submit),
+            Some("newline") => {
+                app.input.insert_newline();
+                Action::Continue
+            }
+            Some("close") => {
+                app.overlay = None;
+                Action::Continue
+            }
+            Some("quit") => Action::Quit,
+            _ => {
+                app.input.input(key);
+                Action::Continue
+            }
+        },
+        Overlay::Command => match app.keymap.action("command", key_name).as_deref() {
+            Some("quit") => Action::Quit,
+            Some("cancel") => {
+                app.reset_command_input();
+                app.overlay = None;
+                Action::Continue
+            }
+            Some("backspace") => {
+                app.command_line.pop();
+                app.command_selected = 0;
+                app.command_stem = None;
+                Action::Continue
+            }
+            Some("previous") => {
+                app.command_selected = app.command_selected.saturating_sub(1);
+                Action::Continue
+            }
+            Some("next") => {
+                let count = app.filtered_commands().len();
+                if count > 0 {
+                    app.command_selected = (app.command_selected + 1).min(count - 1);
+                }
+                Action::Continue
+            }
+            Some("confirm") => confirm_command(app, services).await,
+            Some("complete") => {
+                app.complete_command(false);
+                Action::Continue
+            }
+            Some("complete_previous") => {
+                app.complete_command(true);
+                Action::Continue
+            }
+            _ => {
+                if let KeyCode::Char(character) = key.code
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    app.command_line.push(character);
+                    app.command_selected = 0;
+                    app.command_stem = None;
+                }
+                Action::Continue
+            }
+        },
+        Overlay::Selector => handle_selector_key(app, key, key_name, services).await,
+        Overlay::Text => handle_text_key(app, key, key_name),
+        Overlay::Oauth => handle_oauth_key(app, key, key_name),
+        Overlay::Tasks => match app
+            .keymap
+            .action_chain(&["tasks", "list"], key_name)
+            .as_deref()
+        {
+            Some("quit") => Action::Quit,
+            Some("close") => {
+                app.overlay = None;
+                Action::Continue
+            }
+            Some("previous") => {
+                app.selected_task = app.selected_task.saturating_sub(1);
+                Action::Continue
+            }
+            Some("next") => {
+                app.selected_task = app
+                    .selected_task
+                    .saturating_add(1)
+                    .min(app.task_records.len().saturating_sub(1));
+                Action::Continue
+            }
+            Some("cancel") => {
+                if let Some(id) = app
+                    .task_records
+                    .get(app.selected_task)
+                    .map(|task| task.id.clone())
+                {
+                    let _ = services.tasks.cancel(&id).await;
+                    app.task_records = services.tasks.list().await;
+                }
+                Action::Continue
+            }
+            Some("page_up") => {
+                app.overlay_scroll = app.overlay_scroll.saturating_sub(8);
+                Action::Continue
+            }
+            Some("page_down") => {
+                app.overlay_scroll = app.overlay_scroll.saturating_add(8);
+                Action::Continue
+            }
+            _ => Action::Continue,
+        },
+        Overlay::Models => {
+            let Some(selector) = app.model_selector.as_mut() else {
+                app.overlay = None;
+                return Action::Continue;
+            };
+            match app.keymap.action("models", key_name).as_deref() {
+                Some("quit") => Action::Quit,
+                Some("close") => {
+                    app.overlay = None;
+                    Action::Continue
+                }
+                Some("previous") => {
+                    selector.move_selection(-1);
+                    Action::Continue
+                }
                 Some("next") => {
-                    app.palette_selected = app
-                        .palette_selected
-                        .saturating_add(1)
-                        .min(app.commands.list().len().saturating_sub(1));
+                    selector.move_selection(1);
+                    Action::Continue
                 }
-                Some("confirm") => {
-                    if let Some(target) = app
-                        .commands
-                        .list()
-                        .get(app.palette_selected)
-                        .map(|command| command.target.clone())
-                    {
-                        return dispatch_ui_command(app, target, String::new(), tasks).await;
-                    }
+                Some("page_up") => {
+                    selector.move_selection(-10);
+                    Action::Continue
                 }
-                _ => {}
-            },
-            Overlay::Command => match app.keymap.action("command", &key_name).as_deref() {
-                Some("quit") => return Action::Quit,
-                Some("cancel") => {
-                    app.command_line.clear();
-                    app.overlay = None;
+                Some("page_down") => {
+                    selector.move_selection(10);
+                    Action::Continue
                 }
+                Some("first") => {
+                    selector.first();
+                    Action::Continue
+                }
+                Some("last") => {
+                    selector.last();
+                    Action::Continue
+                }
+                Some("confirm") => Action::SelectModel,
                 Some("backspace") => {
-                    app.command_line.pop();
+                    selector.backspace();
+                    Action::Continue
                 }
-                Some("confirm") => {
-                    let entered = std::mem::take(&mut app.command_line);
-                    app.overlay = None;
-                    if let Some(command) = app.commands.resolve(&entered) {
-                        return dispatch_ui_command(
-                            app,
-                            command.spec.target,
-                            command.arguments,
-                            tasks,
-                        )
-                        .await;
-                    }
-                    app.set_flash(format!(
-                        "Unknown command :{} · press Space for commands",
-                        entered.trim()
-                    ));
-                }
+                Some("refresh") => Action::RefreshCatalog,
                 _ => {
                     if let KeyCode::Char(character) = key.code
                         && !key.modifiers.intersects(
                             KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                         )
                     {
-                        app.command_line.push(character);
+                        selector.push(character);
                     }
-                }
-            },
-            Overlay::Tasks => match app
-                .keymap
-                .action_chain(&["tasks", "list"], &key_name)
-                .as_deref()
-            {
-                Some("quit") => return Action::Quit,
-                Some("close") => app.overlay = None,
-                Some("previous") => app.selected_task = app.selected_task.saturating_sub(1),
-                Some("next") => {
-                    app.selected_task = app
-                        .selected_task
-                        .saturating_add(1)
-                        .min(app.task_records.len().saturating_sub(1));
-                }
-                Some("editor") => {
-                    if let Some(task) = app.task_records.get(app.selected_task) {
-                        return Action::OpenEditor {
-                            content: task_document(task),
-                            replace_input: false,
-                        };
-                    }
-                }
-                Some("cancel") => {
-                    if let Some(id) = app
-                        .task_records
-                        .get(app.selected_task)
-                        .map(|task| task.id.clone())
-                    {
-                        let _ = tasks.cancel(&id).await;
-                        app.task_records = tasks.list().await;
-                    }
-                }
-                Some("page_up") => app.overlay_scroll = app.overlay_scroll.saturating_sub(8),
-                Some("page_down") => app.overlay_scroll = app.overlay_scroll.saturating_add(8),
-                _ => {}
-            },
-            Overlay::Models => {
-                let Some(selector) = app.model_selector.as_mut() else {
-                    app.overlay = None;
-                    return Action::Continue;
-                };
-                match app.keymap.action("models", &key_name).as_deref() {
-                    Some("quit") => return Action::Quit,
-                    Some("close") => app.overlay = None,
-                    Some("previous") => selector.move_selection(-1),
-                    Some("next") => selector.move_selection(1),
-                    Some("page_up") => selector.move_selection(-10),
-                    Some("page_down") => selector.move_selection(10),
-                    Some("first") => selector.first(),
-                    Some("last") => selector.last(),
-                    Some("confirm") => return Action::SelectModel,
-                    Some("backspace") => selector.backspace(),
-                    Some("refresh") => return Action::RefreshCatalog,
-                    _ => {
-                        if let KeyCode::Char(character) = key.code
-                            && !key.modifiers.intersects(
-                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                            )
-                        {
-                            selector.push(character);
-                        }
-                    }
-                }
-            }
-            Overlay::Detail => match app.keymap.action("detail", &key_name).as_deref() {
-                Some("quit") => return Action::Quit,
-                Some("close") => app.overlay = None,
-                Some("scroll_up") => app.overlay_scroll = app.overlay_scroll.saturating_sub(1),
-                Some("scroll_down") => app.overlay_scroll = app.overlay_scroll.saturating_add(1),
-                Some("editor") => {
-                    if let Some(block) = app.selected_block() {
-                        return Action::OpenEditor {
-                            content: block_document(block),
-                            replace_input: false,
-                        };
-                    }
-                }
-                Some("page_up") => app.overlay_scroll = app.overlay_scroll.saturating_sub(8),
-                Some("page_down") => app.overlay_scroll = app.overlay_scroll.saturating_add(8),
-                _ => {}
-            },
-            Overlay::Help | Overlay::Protocols | Overlay::Plugin => {
-                match app.keymap.action("list", &key_name).as_deref() {
-                    Some("quit") => return Action::Quit,
-                    Some("close") => app.overlay = None,
-                    Some("previous") => app.overlay_scroll = app.overlay_scroll.saturating_sub(1),
-                    Some("next") => app.overlay_scroll = app.overlay_scroll.saturating_add(1),
-                    Some("page_up") => app.overlay_scroll = app.overlay_scroll.saturating_sub(8),
-                    Some("page_down") => app.overlay_scroll = app.overlay_scroll.saturating_add(8),
-                    _ => {}
-                }
-            }
-            Overlay::Settings => {
-                let Some(settings) = app.settings.as_mut() else {
-                    app.overlay = None;
-                    return Action::Continue;
-                };
-                if let Some(editing) = settings.editing {
-                    match app.keymap.action("text", &key_name).as_deref() {
-                        Some("quit") => return Action::Quit,
-                        Some("cancel") => {
-                            settings.editing = None;
-                        }
-                        Some("confirm") => {
-                            settings.editing = None;
-                        }
-                        Some("backspace") => match editing {
-                            EditingSetting::ApiKey => {
-                                settings.api_key.pop();
-                                settings.api_key_changed = true;
-                            }
-                            EditingSetting::OutputLimit => {
-                                settings.output_limit.pop();
-                            }
-                            EditingSetting::Editor => {
-                                settings.editor.pop();
-                            }
-                            EditingSetting::Picker => {
-                                settings.picker.pop();
-                            }
-                        },
-                        _ => {
-                            if let KeyCode::Char(character) = key.code
-                                && !key.modifiers.intersects(
-                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                                )
-                            {
-                                match editing {
-                                    EditingSetting::ApiKey => {
-                                        settings.api_key.push(character);
-                                        settings.api_key_changed = true;
-                                    }
-                                    EditingSetting::OutputLimit if character.is_ascii_digit() => {
-                                        settings.output_limit.push(character);
-                                    }
-                                    EditingSetting::OutputLimit => {}
-                                    EditingSetting::Editor => settings.editor.push(character),
-                                    EditingSetting::Picker => settings.picker.push(character),
-                                }
-                            }
-                        }
-                    }
-                    return Action::Continue;
-                }
-                match app.keymap.action("settings", &key_name).as_deref() {
-                    Some("quit") => return Action::Quit,
-                    Some("close") => app.overlay = None,
-                    Some("previous") => settings.selected = settings.selected.saturating_sub(1),
-                    Some("next") => settings.selected = (settings.selected + 1).min(7),
-                    Some("left") if settings.selected == 0 => {
-                        return Action::OpenModels(String::new());
-                    }
-                    Some("right") if settings.selected == 0 => {
-                        return Action::OpenModels(String::new());
-                    }
-                    Some("left" | "right") if settings.selected == 1 => {
-                        return Action::OpenModels(String::new());
-                    }
-                    Some("left" | "right") if settings.selected == 5 => {
-                        SettingsState::cycle_external_mode(&mut settings.editor_mode);
-                    }
-                    Some("left" | "right") if settings.selected == 7 => {
-                        SettingsState::cycle_external_mode(&mut settings.picker_mode);
-                    }
-                    Some("edit") => {
-                        if matches!(settings.selected, 0 | 1) {
-                            return Action::OpenModels(String::new());
-                        }
-                        if settings.selected == 5 {
-                            SettingsState::cycle_external_mode(&mut settings.editor_mode);
-                            return Action::Continue;
-                        }
-                        if settings.selected == 7 {
-                            SettingsState::cycle_external_mode(&mut settings.picker_mode);
-                            return Action::Continue;
-                        }
-                        settings.editing = Some(match settings.selected {
-                            2 => EditingSetting::ApiKey,
-                            3 => EditingSetting::OutputLimit,
-                            4 => EditingSetting::Editor,
-                            6 => EditingSetting::Picker,
-                            _ => unreachable!(),
-                        });
-                        match settings.selected {
-                            2 => settings.api_key.clear(),
-                            3 => settings.output_limit.clear(),
-                            4 => settings.editor.clear(),
-                            6 => settings.picker.clear(),
-                            _ => {}
-                        }
-                    }
-                    Some("save") => return Action::SaveSettings,
-                    Some("refresh") => return Action::RefreshCatalog,
-                    Some("clear") if settings.selected == 2 => return Action::ClearApiKey,
-                    _ => {}
+                    Action::Continue
                 }
             }
         }
-        return Action::Continue;
-    }
-
-    let mode = if app.mode == Mode::Insert {
-        "insert"
-    } else {
-        "browse"
-    };
-    match app.keymap.action(mode, &key_name).as_deref() {
-        Some("quit") => return Action::Quit,
-        Some("help") => {
-            app.overlay_scroll = 0;
-            app.overlay = Some(Overlay::Help);
-        }
-        Some("settings") => return Action::OpenSettings,
-        Some("protocols") => {
-            app.overlay_scroll = 0;
-            app.overlay = Some(Overlay::Protocols);
-        }
-        Some("tasks") => {
-            return dispatch_core(app, CoreCommand::Tasks, tasks).await;
-        }
-        action if app.mode == Mode::Insert => match action {
-            Some("browse") => {
-                app.mode = Mode::Browse;
-                if app.has_draft() {
-                    app.set_flash("Draft kept · Enter submits from Browse");
-                }
+        Overlay::Settings => handle_settings_key(app, key, key_name),
+        Overlay::Document => match app.keymap.action("document", key_name).as_deref() {
+            Some("quit") => Action::Quit,
+            Some("close") => {
+                app.document = None;
+                app.overlay = None;
+                Action::Continue
             }
-            Some("newline") => app.input.insert_newline(),
-            Some("editor") => {
-                return Action::OpenEditor {
-                    content: app.input.lines().join("\n"),
-                    replace_input: true,
-                };
+            Some("scroll_up") => {
+                app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
+                Action::Continue
             }
-            Some("quit_empty") if app.input.lines().iter().all(|line| line.is_empty()) => {
-                return Action::Quit;
+            Some("scroll_down") => {
+                app.overlay_scroll = app.overlay_scroll.saturating_add(1);
+                Action::Continue
             }
-            Some("submit") => return submit_draft(app),
-            _ => {
-                app.clear_flash();
-                app.input.input(key);
+            Some("page_up") => {
+                app.overlay_scroll = app.overlay_scroll.saturating_sub(8);
+                Action::Continue
             }
+            Some("page_down") => {
+                app.overlay_scroll = app.overlay_scroll.saturating_add(8);
+                Action::Continue
+            }
+            _ => Action::Continue,
         },
-        Some("palette") => {
-            app.palette_selected = 0;
-            app.overlay = Some(Overlay::Palette);
-        }
-        Some("command") => {
-            app.command_line.clear();
-            app.overlay = Some(Overlay::Command);
-        }
-        Some("insert") => return dispatch_core(app, CoreCommand::Compose, tasks).await,
-        Some("next") => app.move_selection(1),
-        Some("previous") => app.move_selection(-1),
-        Some("page_down") => app.move_selection(10),
-        Some("page_up") => app.move_selection(-10),
-        Some("first") => app.selected_block = 0,
-        Some("last") => app.selected_block = app.blocks.len().saturating_sub(1),
-        Some("submit") if app.has_draft() => return submit_draft(app),
-        Some("submit") => return dispatch_core(app, CoreCommand::Detail, tasks).await,
-        Some("detail") => return dispatch_core(app, CoreCommand::Detail, tasks).await,
-        Some("editor") => return dispatch_core(app, CoreCommand::Editor, tasks).await,
-        Some("finder") => return dispatch_core(app, CoreCommand::Finder, tasks).await,
-        Some("copy") => return dispatch_core(app, CoreCommand::Copy, tasks).await,
-        Some(action) => {
-            if let Some(target) = app.commands.target_for_action(action) {
-                return dispatch_ui_command(app, target, String::new(), tasks).await;
+        Overlay::Terminal => Action::Continue,
+        Overlay::Help | Overlay::Protocols | Overlay::Plugin => {
+            match app.keymap.action("list", key_name).as_deref() {
+                Some("quit") => Action::Quit,
+                Some("close") => {
+                    app.overlay = None;
+                    Action::Continue
+                }
+                Some("previous") => {
+                    app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
+                    Action::Continue
+                }
+                Some("next") => {
+                    app.overlay_scroll = app.overlay_scroll.saturating_add(1);
+                    Action::Continue
+                }
+                Some("page_up") => {
+                    app.overlay_scroll = app.overlay_scroll.saturating_sub(8);
+                    Action::Continue
+                }
+                Some("page_down") => {
+                    app.overlay_scroll = app.overlay_scroll.saturating_add(8);
+                    Action::Continue
+                }
+                _ => Action::Continue,
             }
         }
-        None => {}
+    }
+}
+
+async fn confirm_command(app: &mut App, services: &LoopServices) -> Action {
+    let filtered = app.filtered_commands();
+    let entered = std::mem::take(&mut app.command_line);
+    app.command_stem = None;
+    app.overlay = None;
+    if let Some(command) = filtered.get(app.command_selected).cloned() {
+        let arguments = entered
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(_, rest)| rest.trim().to_string())
+            .unwrap_or_default();
+        return dispatch_ui_command(app, command.target, arguments, services).await;
+    }
+    if let Some(command) = app.commands.resolve(&entered) {
+        return dispatch_ui_command(app, command.spec.target, command.arguments, services).await;
+    }
+    if !entered.trim().is_empty() {
+        app.set_flash(format!("Unknown command :{}", entered.trim()));
     }
     Action::Continue
 }
 
-async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> Action {
-    let require_shift = !matches!(
-        app.overlay,
-        Some(Overlay::Detail | Overlay::Help | Overlay::Protocols | Overlay::Plugin)
-    );
-    if update_mouse_selection(app, mouse, require_shift) {
+enum SelectorKey {
+    Continue,
+    Confirm,
+    Quit,
+}
+
+async fn handle_selector_key(
+    app: &mut App,
+    key: KeyEvent,
+    key_name: &str,
+    services: &LoopServices,
+) -> Action {
+    match apply_selector_key(app, key, key_name) {
+        SelectorKey::Quit => Action::Quit,
+        SelectorKey::Confirm => confirm_selector(app, services).await,
+        SelectorKey::Continue => Action::Continue,
+    }
+}
+
+fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -> SelectorKey {
+    let Some(selector) = app.selector.as_mut() else {
+        app.overlay = None;
+        return SelectorKey::Continue;
+    };
+    match app.keymap.action("selector", key_name).as_deref() {
+        Some("quit") => SelectorKey::Quit,
+        Some("close") => {
+            app.selector = None;
+            app.overlay = None;
+            SelectorKey::Continue
+        }
+        Some("previous") => {
+            selector.selected = selector.selected.saturating_sub(1);
+            SelectorKey::Continue
+        }
+        Some("next") => {
+            selector.selected = selector
+                .selected
+                .saturating_add(1)
+                .min(selector.visible.len().saturating_sub(1));
+            SelectorKey::Continue
+        }
+        Some("confirm") => SelectorKey::Confirm,
+        Some("backspace") => {
+            selector.query.pop();
+            selector.rebuild();
+            SelectorKey::Continue
+        }
+        _ => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                selector.query.push(character);
+                selector.rebuild();
+            }
+            SelectorKey::Continue
+        }
+    }
+}
+
+async fn confirm_selector(app: &mut App, _services: &LoopServices) -> Action {
+    let Some(selector) = app.selector.take() else {
+        app.overlay = None;
+        return Action::Continue;
+    };
+    let Some(item) = selector.selected_item().cloned() else {
+        app.overlay = None;
+        app.set_flash("Nothing is selected");
+        return Action::Continue;
+    };
+    app.overlay = None;
+    match selector.kind {
+        SelectorKind::LoginProvider => open_login_method(app, item.id),
+        SelectorKind::LoginMethod { provider } => match item.id.as_str() {
+            "api_key" => {
+                open_api_key_prompt(app, provider);
+                Action::Continue
+            }
+            "oauth" if provider == "github-copilot" => {
+                open_copilot_domain_prompt(app);
+                Action::Continue
+            }
+            method => Action::StartOauth {
+                provider,
+                method: method.to_string(),
+                extra: std::collections::BTreeMap::new(),
+            },
+        },
+        SelectorKind::Logout => Action::Logout { provider: item.id },
+        SelectorKind::Resume => Action::Resume(item.id),
+    }
+}
+
+fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
+    let Some(prompt) = app.text_prompt.as_mut() else {
+        app.overlay = None;
+        return Action::Continue;
+    };
+    match app.keymap.action("text", key_name).as_deref() {
+        Some("quit") => Action::Quit,
+        Some("cancel") => {
+            app.text_prompt = None;
+            app.overlay = None;
+            Action::Continue
+        }
+        Some("backspace") => {
+            prompt.value.pop();
+            Action::Continue
+        }
+        Some("confirm") => {
+            let prompt = app.text_prompt.take().expect("checked");
+            app.overlay = None;
+            match prompt.purpose {
+                TextPurpose::ApiKey { provider } => Action::StoreApiKey {
+                    provider,
+                    key: prompt.value,
+                },
+                TextPurpose::CopilotDomain => Action::StartOauth {
+                    provider: "github-copilot".to_string(),
+                    method: "oauth".to_string(),
+                    extra: std::collections::BTreeMap::from([("domain".to_string(), prompt.value)]),
+                },
+                TextPurpose::SetTerminal => Action::SaveTerminal(prompt.value),
+            }
+        }
+        _ => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                prompt.value.push(character);
+            }
+            Action::Continue
+        }
+    }
+}
+
+fn handle_oauth_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
+    let Some(oauth) = app.oauth.as_mut() else {
+        app.overlay = None;
+        return Action::Continue;
+    };
+    match app.keymap.action("oauth", key_name).as_deref() {
+        Some("quit") => Action::Quit,
+        Some("cancel") => {
+            oauth.login.cancel();
+            app.oauth = None;
+            app.overlay = None;
+            app.set_flash("Login cancelled");
+            Action::Continue
+        }
+        Some("backspace") => {
+            oauth.paste.pop();
+            Action::Continue
+        }
+        Some("confirm") => {
+            if !oauth.paste.trim().is_empty() {
+                oauth.login.submit_paste(&oauth.paste);
+                oauth.message = "Exchanging authorization code…".to_string();
+            }
+            Action::Continue
+        }
+        _ => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                oauth.paste.push(character);
+            }
+            Action::Continue
+        }
+    }
+}
+
+fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
+    let Some(settings) = app.settings.as_mut() else {
+        app.overlay = None;
+        return Action::Continue;
+    };
+    if settings.editing.is_some() {
+        match app.keymap.action("text", key_name).as_deref() {
+            Some("quit") => return Action::Quit,
+            Some("cancel" | "confirm") => settings.editing = None,
+            Some("backspace") => {
+                if settings.editing == Some(EditingSetting::OutputLimit) {
+                    settings.output_limit.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(character) = key.code
+                    && character.is_ascii_digit()
+                    && settings.editing == Some(EditingSetting::OutputLimit)
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    settings.output_limit.push(character);
+                }
+            }
+        }
+        return Action::Continue;
+    }
+    match app.keymap.action("settings", key_name).as_deref() {
+        Some("quit") => Action::Quit,
+        Some("close") => {
+            app.overlay = None;
+            Action::Continue
+        }
+        Some("previous") => {
+            settings.selected = settings.selected.saturating_sub(1);
+            Action::Continue
+        }
+        Some("next") => {
+            settings.selected = (settings.selected + 1).min(2);
+            Action::Continue
+        }
+        Some("edit") => match settings.selected {
+            0 => Action::OpenModels(String::new()),
+            1 => Action::Continue,
+            2 => {
+                settings.editing = Some(EditingSetting::OutputLimit);
+                settings.output_limit.clear();
+                Action::Continue
+            }
+            _ => Action::Continue,
+        },
+        Some("save") => Action::SaveSettings,
+        Some("refresh") => Action::RefreshCatalog,
+        _ => Action::Continue,
+    }
+}
+
+async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices) -> Action {
+    if update_mouse_selection(app, mouse, app.overlay.is_none()) {
         return Action::Continue;
     }
     match mouse.kind {
         MouseEventKind::ScrollUp => match app.overlay {
-            Some(Overlay::Palette) => {
-                app.palette_selected = app.palette_selected.saturating_sub(1);
+            Some(Overlay::Command) => {
+                app.command_selected = app.command_selected.saturating_sub(1);
+            }
+            Some(Overlay::Selector) => {
+                if let Some(selector) = app.selector.as_mut() {
+                    selector.selected = selector.selected.saturating_sub(1);
+                }
             }
             Some(Overlay::Tasks) => {
                 app.selected_task = app.selected_task.saturating_sub(1);
@@ -1305,16 +1960,24 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
                     settings.selected = settings.selected.saturating_sub(1);
                 }
             }
-            Some(Overlay::Command) => {}
+            Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
             Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_sub(3),
             None => app.move_selection(-3),
         },
         MouseEventKind::ScrollDown => match app.overlay {
-            Some(Overlay::Palette) => {
-                app.palette_selected = app
-                    .palette_selected
-                    .saturating_add(1)
-                    .min(app.commands.list().len().saturating_sub(1));
+            Some(Overlay::Command) => {
+                let count = app.filtered_commands().len();
+                if count > 0 {
+                    app.command_selected = (app.command_selected + 1).min(count - 1);
+                }
+            }
+            Some(Overlay::Selector) => {
+                if let Some(selector) = app.selector.as_mut() {
+                    selector.selected = selector
+                        .selected
+                        .saturating_add(1)
+                        .min(selector.visible.len().saturating_sub(1));
+                }
             }
             Some(Overlay::Tasks) => {
                 app.selected_task = app
@@ -1329,10 +1992,10 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = settings.selected.saturating_add(1).min(7);
+                    settings.selected = settings.selected.saturating_add(1).min(2);
                 }
             }
-            Some(Overlay::Command) => {}
+            Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
             Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_add(3),
             None => app.move_selection(3),
         },
@@ -1344,23 +2007,16 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
             match target {
                 AppHit::Transcript(index) => {
                     app.selected_block = index;
-                    if activate {
-                        return dispatch_core(app, CoreCommand::Detail, tasks).await;
+                    if let Some(block) = app.blocks.get_mut(index) {
+                        block.expanded = !block.expanded;
                     }
-                }
-                AppHit::Composer => {
-                    return dispatch_core(app, CoreCommand::Compose, tasks).await;
+                    if activate {
+                        app.toggle_selected();
+                    }
                 }
                 AppHit::Palette(index) => {
-                    app.palette_selected = index;
-                    if let Some(target) = app
-                        .commands
-                        .list()
-                        .get(index)
-                        .map(|command| command.target.clone())
-                    {
-                        return dispatch_ui_command(app, target, String::new(), tasks).await;
-                    }
+                    app.command_selected = index;
+                    return confirm_command(app, services).await;
                 }
                 AppHit::Task(index) => app.selected_task = index,
                 AppHit::Model(index) => {
@@ -1374,16 +2030,417 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, tasks: &TaskManager) -> 
                 AppHit::Setting(index) => {
                     if let Some(settings) = app.settings.as_mut() {
                         settings.selected = index;
-                        if activate && matches!(index, 0 | 1) {
+                        if activate && index == 0 {
                             return Action::OpenModels(String::new());
                         }
                     }
+                }
+                AppHit::Selector(index) => {
+                    if let Some(selector) = app.selector.as_mut() {
+                        selector.selected = index;
+                    }
+                    if activate {
+                        return confirm_selector(app, services).await;
+                    }
+                }
+                AppHit::Help => {
+                    app.overlay_scroll = 0;
+                    app.overlay = Some(Overlay::Help);
                 }
             }
         }
         _ => {}
     }
     Action::Continue
+}
+
+async fn open_login(app: &mut App, catalog: &ModelCatalog, arguments: String) -> Action {
+    let provider = arguments.trim().to_string();
+    if !provider.is_empty() {
+        return open_login_method(app, provider);
+    }
+    let current = app.info.provider.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut items = Vec::new();
+    for provider in catalog.providers().await {
+        seen.insert(provider.clone());
+        items.push(login_provider_item(&provider, &current));
+    }
+    for provider in OauthProvider::ALL {
+        if seen.insert(provider.id().to_string()) {
+            items.push(login_provider_item(provider.id(), &current));
+        }
+    }
+    if items.is_empty() {
+        app.set_flash("No providers available to log in");
+        return Action::Continue;
+    }
+    app.selector = Some(SelectorState::new(
+        SelectorKind::LoginProvider,
+        "LOGIN",
+        items,
+    ));
+    app.overlay = Some(Overlay::Selector);
+    Action::Continue
+}
+
+fn login_provider_item(provider: &str, current: &str) -> SelectorItem {
+    let description = match OauthProvider::from_id(provider) {
+        Some(kind) if kind.offers_api_key() => format!("OAuth or API key · {}", kind.name()),
+        Some(kind) => format!("OAuth · {}", kind.name()),
+        None => "API key".to_string(),
+    };
+    SelectorItem {
+        id: provider.to_string(),
+        title: provider.to_string(),
+        description: if provider == current {
+            format!("{description} · current")
+        } else {
+            description
+        },
+    }
+}
+
+fn open_login_method(app: &mut App, provider: String) -> Action {
+    let mut items = Vec::new();
+    if let Some(kind) = OauthProvider::from_id(&provider) {
+        items.extend(kind.methods().iter().map(|method| SelectorItem {
+            id: method.id.to_string(),
+            title: method.label.to_string(),
+            description: method.description.to_string(),
+        }));
+    }
+    let offers_key = OauthProvider::from_id(&provider)
+        .map(OauthProvider::offers_api_key)
+        .unwrap_or(true);
+    if offers_key {
+        items.push(SelectorItem {
+            id: "api_key".to_string(),
+            title: "API key".to_string(),
+            description: format!("Paste an API key for {provider}"),
+        });
+    }
+    if items.len() == 1 && items[0].id == "api_key" {
+        open_api_key_prompt(app, provider);
+        return Action::Continue;
+    }
+    if items.is_empty() {
+        app.set_flash(format!("No login methods for {provider}"));
+        return Action::Continue;
+    }
+    app.selector = Some(SelectorState::new(
+        SelectorKind::LoginMethod {
+            provider: provider.clone(),
+        },
+        format!("LOGIN · {provider}"),
+        items,
+    ));
+    app.overlay = Some(Overlay::Selector);
+    Action::Continue
+}
+
+fn open_api_key_prompt(app: &mut App, provider: String) {
+    app.text_prompt = Some(TextPrompt {
+        title: format!("API KEY · {provider}"),
+        message: format!("Paste the API key for {provider}. Enter saves, Esc cancels."),
+        value: String::new(),
+        secret: true,
+        purpose: TextPurpose::ApiKey { provider },
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+fn open_copilot_domain_prompt(app: &mut App) {
+    app.text_prompt = Some(TextPrompt {
+        title: "GITHUB COPILOT".to_string(),
+        message: "GitHub Enterprise URL/domain (blank for github.com)".to_string(),
+        value: String::new(),
+        secret: false,
+        purpose: TextPurpose::CopilotDomain,
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+fn open_set_terminal_prompt(app: &mut App) {
+    app.text_prompt = Some(TextPrompt {
+        title: "SET TERMINAL".to_string(),
+        message: "Command used by :terminal, for example pwsh or bash. Enter saves, Esc cancels."
+            .to_string(),
+        value: app.info.terminal.clone().unwrap_or_default(),
+        secret: false,
+        purpose: TextPurpose::SetTerminal,
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+async fn save_terminal(app: &mut App, services: &LoopServices, command: String) {
+    let result = services.manager.set_terminal(Some(command.clone())).await;
+    match result {
+        Ok(active) => {
+            app.info.terminal.clone_from(&active.terminal);
+            app.set_flash(match active.terminal.as_deref() {
+                Some(terminal) => format!("Default terminal set to {terminal}"),
+                None => "Default terminal cleared".to_string(),
+            });
+        }
+        Err(error) => app.set_flash(format!("Could not save terminal: {error:#}")),
+    }
+}
+
+fn open_pty(app: &mut App, command: Option<String>) {
+    let command = command
+        .or_else(|| app.info.terminal.clone())
+        .unwrap_or_default();
+    if command.trim().is_empty() {
+        app.set_flash("尚未配置，请运行 :set-terminal");
+        return;
+    }
+    app.close_floats();
+    let size = crossterm::terminal::size().unwrap_or((80, 24));
+    let frame = Rect::new(0, 0, size.0, size.1);
+    let area = overlay_area(frame, Overlay::Terminal);
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    match start_embedded_terminal(&command, &app.info.cwd, inner) {
+        Ok(terminal) => {
+            app.selection = None;
+            app.pty = Some(FloatTerminal {
+                terminal,
+                area,
+                last_escape: None,
+            });
+            app.overlay = Some(Overlay::Terminal);
+        }
+        Err(error) => app.set_flash(format!("Terminal failed: {error:#}")),
+    }
+}
+
+fn start_embedded_terminal(command: &str, cwd: &Path, inner: Rect) -> Result<EmbeddedTerminal> {
+    let builder = terminal_command(command)?;
+    EmbeddedTerminal::start(builder, cwd, inner.height, inner.width)
+        .with_context(|| format!("cannot start `{command}`"))
+}
+
+fn terminal_command(command: &str) -> Result<CommandBuilder> {
+    let mut arguments = shell_words::split(command).context("cannot parse terminal command")?;
+    if arguments.is_empty() {
+        bail!("terminal command is empty");
+    }
+    let executable = arguments.remove(0);
+    let mut builder = CommandBuilder::new(executable);
+    builder.args(arguments);
+    Ok(builder)
+}
+
+fn handle_terminal_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let key_name = key_name(key);
+    if app.selection.is_some() {
+        match app.keymap.action("selection", &key_name).as_deref() {
+            Some("copy") => copy_current_surface(app),
+            Some("close") => app.selection = None,
+            _ => {}
+        }
+        return Ok(false);
+    }
+    match app.keymap.action("terminal", &key_name).as_deref() {
+        Some("copy") => {
+            copy_current_surface(app);
+            return Ok(false);
+        }
+        Some("close") => return Ok(true),
+        Some("escape") => {
+            let now = Instant::now();
+            let pty = app.pty.as_mut().expect("checked by caller");
+            if pty
+                .last_escape
+                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(500))
+            {
+                return Ok(true);
+            }
+            pty.last_escape = Some(now);
+            pty.terminal.send_key(key)?;
+            return Ok(false);
+        }
+        _ => {}
+    }
+    let pty = app.pty.as_mut().expect("checked by caller");
+    pty.last_escape = None;
+    pty.terminal.send_key(key)?;
+    Ok(false)
+}
+
+fn handle_terminal_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    if update_mouse_selection(app, mouse, true) {
+        return Ok(());
+    }
+    let pty = app.pty.as_mut().expect("checked by caller");
+    let inner = pty.area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if mouse.column >= inner.x
+        && mouse.column < inner.right()
+        && mouse.row >= inner.y
+        && mouse.row < inner.bottom()
+    {
+        pty.terminal.send_mouse(
+            mouse,
+            mouse.column.saturating_sub(inner.x),
+            mouse.row.saturating_sub(inner.y),
+        )?;
+    }
+    Ok(())
+}
+
+fn pty_finished(app: &mut App) -> Result<bool> {
+    let Some(pty) = app.pty.as_mut() else {
+        return Ok(false);
+    };
+    Ok(pty.terminal.try_wait()?.is_some())
+}
+
+fn close_pty(app: &mut App, message: &str) {
+    app.pty = None;
+    if app.overlay == Some(Overlay::Terminal) {
+        app.overlay = None;
+    }
+    app.selection = None;
+    app.set_flash(message);
+}
+
+async fn open_logout(app: &mut App, manager: &ConfigManager, arguments: String) -> Action {
+    let provider = arguments.trim().to_string();
+    if !provider.is_empty() {
+        return Action::Logout { provider };
+    }
+    let items = manager
+        .stored_credentials()
+        .await
+        .into_iter()
+        .map(|entry| SelectorItem {
+            id: entry.provider.clone(),
+            title: entry.provider,
+            description: entry.kind,
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        app.set_flash("No stored credentials to remove");
+        return Action::Continue;
+    }
+    app.selector = Some(SelectorState::new(SelectorKind::Logout, "LOGOUT", items));
+    app.overlay = Some(Overlay::Selector);
+    Action::Continue
+}
+
+async fn open_resume(app: &mut App, runtime: &AgentRuntime, arguments: String) -> Action {
+    let id = arguments.trim().to_string();
+    if !id.is_empty() {
+        return Action::Resume(id);
+    }
+    match runtime.session().list_for_project().await {
+        Ok(sessions) => {
+            if sessions.is_empty() {
+                app.set_flash("No sessions in this project");
+                return Action::Continue;
+            }
+            let items = sessions
+                .into_iter()
+                .map(|session| resume_item(&app.info.session_id, session))
+                .collect();
+            app.selector = Some(SelectorState::new(SelectorKind::Resume, "RESUME", items));
+            app.overlay = Some(Overlay::Selector);
+        }
+        Err(error) => app.set_flash(format!("Could not list sessions: {error:#}")),
+    }
+    Action::Continue
+}
+
+fn resume_item(current: &str, session: SessionSummary) -> SelectorItem {
+    let marker = if session.id == current { "● " } else { "" };
+    SelectorItem {
+        id: session.id.clone(),
+        title: format!("{marker}{}", session.id),
+        description: format!(
+            "{}/{} · {}",
+            session.provider,
+            session.model,
+            single_line_preview(&session.preview, 48)
+        ),
+    }
+}
+
+fn start_oauth(
+    app: &mut App,
+    provider: String,
+    method: String,
+    extra: std::collections::BTreeMap<String, String>,
+    sender: mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    match oauth::start_login(&provider, &method, &extra) {
+        Ok((login, done)) => {
+            tokio::spawn(async move {
+                let result = done
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("OAuth login was cancelled")));
+                let _ = sender.send(BackgroundEvent::OauthFinished(result));
+            });
+            let display = login.display();
+            app.oauth = Some(OauthState {
+                message: display.instructions,
+                login,
+                paste: String::new(),
+                provider,
+            });
+            app.overlay = Some(Overlay::Oauth);
+        }
+        Err(error) => app.set_flash(format!("Could not start OAuth: {error:#}")),
+    }
+}
+
+async fn store_api_key(app: &mut App, services: &LoopServices, provider: &str, key: String) {
+    if key.trim().is_empty() {
+        app.set_flash("API key cannot be empty");
+        return;
+    }
+    let result = async {
+        let active = services.manager.set_api_key(provider, key).await?;
+        apply_active(
+            app,
+            &services.runtime,
+            &services.catalog,
+            &services.output,
+            &active,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    app.set_flash(match result {
+        Ok(()) => format!("Saved API key for {provider}"),
+        Err(error) => format!("Could not save API key: {error:#}"),
+    });
+}
+
+async fn logout_provider(app: &mut App, services: &LoopServices, provider: &str) {
+    let result = async {
+        let active = services.manager.clear_api_key(provider).await?;
+        apply_active(
+            app,
+            &services.runtime,
+            &services.catalog,
+            &services.output,
+            &active,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    app.set_flash(match result {
+        Ok(()) => format!("Removed stored credential for {provider}"),
+        Err(error) => format!("Could not log out {provider}: {error:#}"),
+    });
 }
 
 async fn open_models(
@@ -1395,9 +2452,7 @@ async fn open_models(
     let active = manager.current().await;
     let selector = ModelSelector::load(catalog, &active, query).await;
     if selector.model_count() == 0 {
-        app.set_flash(
-            "No runnable models cached · refresh the Pi catalog or add models.json".to_string(),
-        );
+        app.set_flash("No runnable models cached · :settings then refresh, or add models.json");
     }
     app.model_selector = Some(selector);
     app.overlay = Some(Overlay::Models);
@@ -1445,9 +2500,7 @@ async fn select_model(
                 },
             );
         }
-        Err(error) => {
-            app.set_flash(format!("Could not select {requested}: {error:#}"));
-        }
+        Err(error) => app.set_flash(format!("Could not select {requested}: {error:#}")),
     }
 }
 
@@ -1459,7 +2512,9 @@ fn key_name(key: KeyEvent) -> String {
     if key.modifiers.contains(KeyModifiers::ALT) {
         modifiers.push("alt");
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        && !matches!(key.code, KeyCode::Char(character) if !character.is_ascii_alphabetic())
+    {
         modifiers.push("shift");
     }
     if key.modifiers.contains(KeyModifiers::SUPER) {
@@ -1482,7 +2537,10 @@ fn key_name(key: KeyEvent) -> String {
         KeyCode::Insert => "insert".to_string(),
         KeyCode::F(number) => format!("f{number}"),
         KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(character) => character.to_lowercase().collect(),
+        KeyCode::Char(character) => {
+            let name: String = character.to_lowercase().collect();
+            canonical_key(&name).to_string()
+        }
         KeyCode::Null => "null".to_string(),
         KeyCode::Esc => "esc".to_string(),
         KeyCode::CapsLock => "capslock".to_string(),
@@ -1514,10 +2572,6 @@ async fn save_settings(
     let selection = settings
         .model()
         .map(|model| (settings.provider().to_string(), model.id.clone()));
-    let editor = settings.editor.clone();
-    let editor_mode = settings.editor_mode;
-    let picker = settings.picker.clone();
-    let picker_mode = settings.picker_mode;
     let output_limit = match settings.output_limit.parse::<usize>() {
         Ok(limit) if limit >= 1024 => limit,
         Ok(_) => {
@@ -1532,7 +2586,6 @@ async fn save_settings(
     let api_key = settings
         .api_key_changed
         .then(|| (settings.provider().to_string(), settings.api_key.clone()));
-
     let result = async {
         if let Some((provider, api_key)) = api_key {
             if api_key.trim().is_empty() {
@@ -1542,9 +2595,6 @@ async fn save_settings(
             }
         }
         manager.set_output_limit(output_limit).await?;
-        manager
-            .set_external_tools(Some(editor), editor_mode, Some(picker), picker_mode)
-            .await?;
         if let Some((provider, model)) = selection {
             manager.set_model(&provider, &model).await?;
         }
@@ -1570,7 +2620,7 @@ fn start_catalog_refresh(
         return;
     }
     app.catalog_refreshing = true;
-    app.set_flash("Refreshing the Pi model catalog in the background…");
+    app.set_flash("Refreshing the Pi model catalog…");
     let catalog = services.catalog.clone();
     let manager = services.manager.clone();
     tokio::spawn(async move {
@@ -1617,34 +2667,38 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
                 Err(error) => format!("Catalog refresh failed: {error:#}"),
             });
         }
+        BackgroundEvent::OauthFinished(result) => {
+            let provider = app
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.provider.clone())
+                .unwrap_or_else(|| "anthropic".to_string());
+            app.oauth = None;
+            app.overlay = None;
+            match result {
+                Ok(token) => {
+                    let applied = async {
+                        let active = services.manager.set_oauth(&provider, token).await?;
+                        apply_active(
+                            app,
+                            &services.runtime,
+                            &services.catalog,
+                            &services.output,
+                            &active,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    app.set_flash(match applied {
+                        Ok(()) => format!("Logged in to {provider} with OAuth"),
+                        Err(error) => format!("OAuth succeeded but could not apply: {error:#}"),
+                    });
+                }
+                Err(error) => app.set_flash(format!("OAuth failed: {error:#}")),
+            }
+        }
     }
-}
-
-async fn clear_api_key(
-    app: &mut App,
-    runtime: &AgentRuntime,
-    manager: &ConfigManager,
-    catalog: &ModelCatalog,
-    output: &OutputStore,
-) {
-    let Some(provider) = app
-        .settings
-        .as_ref()
-        .map(|settings| settings.provider().to_string())
-    else {
-        return;
-    };
-    let result = async {
-        let active = manager.clear_api_key(&provider).await?;
-        apply_active(app, runtime, catalog, output, &active).await?;
-        app.settings = Some(SettingsState::load(manager, catalog).await);
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    app.set_flash(match result {
-        Ok(()) => format!("Stored credential for {provider} cleared"),
-        Err(error) => format!("Could not clear credential: {error:#}"),
-    });
 }
 
 async fn apply_active(
@@ -1654,13 +2708,20 @@ async fn apply_active(
     output: &OutputStore,
     active: &ActiveSettings,
 ) -> Result<()> {
-    let backend = configured_backend(active, catalog).await?;
-    let model_ready = backend.is_some();
-    let context_window = active
-        .catalog_model(catalog)
-        .await
-        .map_or(128_000, |model| model.context_window());
-    runtime.set_backend(backend, context_window).await;
+    let configured = configured_backend(active, catalog).await?;
+    let model_ready = configured.is_some();
+    let (backend, limits) = match configured {
+        Some((backend, limits)) => (Some(backend), Some(limits)),
+        None => (
+            None,
+            active
+                .catalog_model(catalog)
+                .await
+                .map(|model| model.limits()),
+        ),
+    };
+    let context_window = limits.map_or(128_000, |limits| limits.context_window);
+    runtime.set_backend(backend, limits).await;
     runtime
         .session()
         .update_model(&active.provider, &active.model)
@@ -1670,10 +2731,8 @@ async fn apply_active(
     app.info.model.clone_from(&active.model);
     app.info.context_window = context_window;
     app.info.model_ready = model_ready;
-    app.info.editor.clone_from(&active.editor);
-    app.info.editor_mode = active.editor_mode;
-    app.info.picker.clone_from(&active.picker);
-    app.info.picker_mode = active.picker_mode;
+    app.info.provider_count = catalog.providers().await.len();
+    app.info.terminal.clone_from(&active.terminal);
     Ok(())
 }
 
@@ -1690,385 +2749,1074 @@ fn block_document(block: &DisplayBlock) -> String {
     document
 }
 
-fn task_document(task: &TaskRecord) -> String {
-    format!(
-        "# Task {}\n\nProtocol: {}\nStatus: {}\nLabel: {}\n\n{}\n",
-        task.id,
-        task.protocol,
-        task.status.as_str(),
-        task.label,
-        String::from_utf8_lossy(&task.content)
+fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
+    let uri = arguments.get("uri")?.as_str()?;
+    let separator = uri.find("://").or_else(|| uri.find(':'))?;
+    (separator > 0).then(|| uri[..separator].to_string())
+}
+
+fn render(frame: &mut Frame<'_>, app: &mut App) {
+    app.hit_regions.clear();
+    app.selectable = None;
+    let area = frame.area();
+    frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
+    if app.showing_splash() {
+        render_brand(frame, app, area, true);
+        return;
+    }
+    let idle = app.blocks.is_empty();
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if idle {
+            [Constraint::Min(3), Constraint::Length(1)].as_slice()
+        } else {
+            [
+                Constraint::Min(3),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ]
+            .as_slice()
+        })
+        .split(area);
+    let content = if idle {
+        render_brand(frame, app, area, false);
+        areas[0]
+    } else {
+        render_transcript(frame, app, areas[0]);
+        render_footer(frame, app, areas[1]);
+        areas[0]
+    };
+    render_hints(frame, app, *areas.last().expect("hints"));
+    let selectable_area = if let Some(overlay) = app.overlay {
+        app.hit_regions.clear();
+        render_overlay(frame, app, overlay);
+        Some(overlay_area(frame.area(), overlay).inner(Margin {
+            horizontal: 2,
+            vertical: 2,
+        }))
+    } else {
+        Some(content)
+    };
+    if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
+        capture_surface(frame, app, selectable_area);
+        render_selection(frame, app);
+    }
+}
+
+const WORDMARK_BOX_HEIGHT: u16 = 13;
+const WORDMARK_BOX_WIDTH: u16 = 76;
+
+fn wordmark_box(area: Rect) -> Rect {
+    let width = area.width.clamp(1, WORDMARK_BOX_WIDTH);
+    let height = area.height.clamp(1, WORDMARK_BOX_HEIGHT);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     )
 }
 
-async fn temporary_document(content: &str) -> Result<PathBuf> {
-    let directory = env::temp_dir().join("uri-agent");
-    fs::create_dir_all(&directory).await?;
-    let path = directory.join(format!("view-{}.md", Uuid::now_v7().simple()));
-    fs::write(&path, content).await?;
-    Ok(path)
+fn render_brand(frame: &mut Frame<'_>, app: &App, area: Rect, splash: bool) {
+    let progress = (app.started.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()) * 1.25;
+    let mut lines = if splash && progress < 1.0 {
+        animation::wordmark_reveal(app.frame, progress)
+    } else {
+        animation::wordmark(app.frame)
+    }
+    .into_iter()
+    .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
+    .collect::<Vec<_>>();
+    lines.extend([
+        Line::default(),
+        Line::styled(
+            "URI AGENT",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    if splash {
+        lines.extend([
+            Line::default(),
+            Line::styled("press any key", Style::default().fg(MUTED)),
+        ]);
+    } else if !app.info.model_ready {
+        lines.extend([
+            Line::default(),
+            Line::styled("尚未配置，请运行 :login", Style::default().fg(WARM)),
+        ]);
+    }
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        wordmark_box(area),
+    );
 }
 
-fn command_builder(command: &str, trailing: Option<&Path>) -> Result<CommandBuilder> {
-    let mut arguments = shell_words::split(command).context("cannot parse command")?;
-    if arguments.is_empty() {
-        bail!("command is empty");
+/// Pi-style footer: `cwd (branch)` over a stats row with cumulative tokens,
+/// cost, the live context meter, and the model right-aligned.
+fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if area.height < 2 || area.width == 0 {
+        return;
     }
-    let executable = arguments.remove(0);
-    if let Some(path) = trailing {
-        arguments.push(path.to_string_lossy().into_owned());
+    let width = area.width as usize;
+    let mut pwd = footer_cwd(&app.info.cwd);
+    if let Some(branch) = current_branch(app) {
+        pwd = format!("{pwd} ({branch})");
     }
-    let mut builder = CommandBuilder::new(executable);
-    builder.args(arguments);
-    Ok(builder)
-}
+    let location = Line::styled(
+        single_line_preview(&pwd, width.saturating_sub(1)),
+        Style::default().fg(MUTED),
+    );
 
-async fn open_embedded_editor(
-    app: &mut App,
-    content: &str,
-    read_back: bool,
-    terminal_area: Rect,
-) -> Result<()> {
-    let editor = app
-        .info
-        .editor
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("configure Editor in Settings first"))?;
-    let path = temporary_document(content).await?;
-    let area = centered(terminal_area, 92, 88);
-    let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let command = command_builder(editor, Some(&path))?;
-    let terminal = match EmbeddedTerminal::start(command, &app.info.cwd, inner.height, inner.width)
+    let mut stats = Vec::new();
+    if app.usage.input > 0 {
+        stats.push(format!("↑{}", format_tokens(app.usage.input)));
+    }
+    if app.usage.output > 0 {
+        stats.push(format!("↓{}", format_tokens(app.usage.output)));
+    }
+    if app.usage.cache_read > 0 {
+        stats.push(format!("R{}", format_tokens(app.usage.cache_read)));
+    }
+    if app.usage.cache_write > 0 {
+        stats.push(format!("W{}", format_tokens(app.usage.cache_write)));
+    }
+    if (app.usage.cache_read > 0 || app.usage.cache_write > 0)
+        && let Some(rate) = app.last_cache_hit
     {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let _ = fs::remove_file(&path).await;
-            return Err(error).with_context(|| {
-                if editor.split_whitespace().next() == Some("hx") {
-                    "cannot start `hx`; install Helix or change Editor in Settings"
-                } else {
-                    "cannot start configured editor"
-                }
-            });
+        stats.push(format!("CH{rate:.1}%"));
+    }
+    let subscription = app.info.provider == "kimi-coding";
+    if app.usage.cost > 0.0 || subscription {
+        let suffix = if subscription { " (sub)" } else { "" };
+        stats.push(format!("${:.3}{suffix}", app.usage.cost));
+    }
+    let window = app.info.context_window;
+    let percent = if window > 0 {
+        app.info.context_tokens as f64 / window as f64 * 100.0
+    } else {
+        0.0
+    };
+    let context_display = format!("{percent:.1}%/{} (auto)", format_tokens(window as u64));
+    let plain_width = stats.iter().map(|part| part.chars().count()).sum::<usize>()
+        + stats.len()
+        + context_display.chars().count();
+    let mut stats_text = stats.join(" ");
+    if plain_width > width {
+        stats_text = single_line_preview(&stats_text, width);
+    }
+    let stats_width = stats_text.chars().count()
+        + usize::from(!stats_text.is_empty())
+        + context_display.chars().count();
+
+    let model_name = if app.info.model_ready && !app.info.model.is_empty() {
+        app.info.model.clone()
+    } else {
+        "no-model".to_string()
+    };
+    let mut right = model_name.clone();
+    if app.info.provider_count > 1 && app.info.model_ready {
+        let with_provider = format!("({}) {model_name}", app.info.provider);
+        if stats_width + 2 + with_provider.chars().count() <= width {
+            right = with_provider;
+        }
+    }
+    let available_right = width.saturating_sub(stats_width + 2);
+    if right.chars().count() > available_right {
+        right = right.chars().take(available_right).collect();
+    }
+    let right_width = right.chars().count();
+    let padding = " ".repeat(width.saturating_sub(stats_width + right_width));
+    let context_color = if percent > 90.0 {
+        ERROR
+    } else if percent > 70.0 {
+        WARM
+    } else {
+        MUTED
+    };
+    // The context meter keeps its severity color; everything else stays dim.
+    let mut spans = Vec::new();
+    if !stats_text.is_empty() {
+        spans.push(Span::styled(stats_text, Style::default().fg(MUTED)));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        context_display,
+        Style::default().fg(context_color),
+    ));
+    spans.push(Span::styled(
+        format!("{padding}{right}"),
+        Style::default().fg(MUTED),
+    ));
+    frame.render_widget(Paragraph::new(vec![location, Line::from(spans)]), area);
+}
+
+fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if app.blocks.is_empty() {
+        let unconfigured = app.info.provider.trim().is_empty() || app.info.model.trim().is_empty();
+        let lines = if unconfigured {
+            vec![
+                Line::styled(
+                    "尚未配置，请运行 :login",
+                    Style::default().fg(WARM).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled("i compose   : command   :model", Style::default().fg(MUTED)),
+            ]
+        } else {
+            vec![
+                Line::styled("No messages yet", Style::default().fg(MUTED)),
+                Line::styled("i compose   : command   :login", Style::default().fg(WARM)),
+            ]
+        };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+        return;
+    }
+    let width = area.width.saturating_sub(6) as usize;
+    let mut items = Vec::new();
+    let mut index_for_row = Vec::new();
+    for (index, block) in app.blocks.iter().enumerate() {
+        items.push(block_preview_item(
+            block,
+            index == app.selected_block,
+            width,
+            app,
+        ));
+        index_for_row.push(index);
+        if block.expanded {
+            for line in expanded_lines(block, width) {
+                items.push(line);
+                index_for_row.push(index);
+            }
+        }
+    }
+    let mut state = ListState::default().with_selected(Some(
+        index_for_row
+            .iter()
+            .position(|index| *index == app.selected_block)
+            .unwrap_or(0),
+    ));
+    frame.render_stateful_widget(
+        List::new(items).block(Block::new().padding(Padding::horizontal(1))),
+        area,
+        &mut state,
+    );
+    let offset = state.offset();
+    for (row, index) in index_for_row.into_iter().enumerate().skip(offset) {
+        let y = area.y.saturating_add((row - offset) as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(area.x, y, area.width, 1),
+            target: AppHit::Transcript(index),
+        });
+    }
+}
+
+fn block_preview_item(
+    block: &DisplayBlock,
+    selected: bool,
+    width: usize,
+    app: &App,
+) -> ListItem<'static> {
+    let color = if block.failed {
+        ERROR
+    } else {
+        match block.kind {
+            BlockKind::User => ACCENT,
+            BlockKind::Assistant => TEXT,
+            BlockKind::Reasoning => MUTED,
+            BlockKind::Tool => WARM,
+            BlockKind::Compaction => ACCENT,
+            BlockKind::Notice => MUTED,
+            BlockKind::Error => ERROR,
         }
     };
-    app.overlay = None;
-    app.selection = None;
-    app.external = Some(ExternalProcess {
-        terminal,
-        purpose: ExternalPurpose::Editor { path, read_back },
-        area,
-        title: " EDITOR · double Esc close · Shift-drag select · Ctrl+Shift+C copy ",
-        last_escape: None,
-    });
-    Ok(())
+    let live = selected
+        && app.busy
+        && matches!(
+            block.kind,
+            BlockKind::Assistant | BlockKind::Reasoning | BlockKind::Tool
+        );
+    let marker = if block.expanded { "▾" } else { "▸" };
+    let status = if live {
+        animation::spinner(app.frame).to_string()
+    } else if block.kind == BlockKind::Tool {
+        if block.failed {
+            "×".to_string()
+        } else if block.text.contains("\n\nRESULT\n") {
+            "✓".to_string()
+        } else {
+            "·".to_string()
+        }
+    } else {
+        " ".to_string()
+    };
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            if selected { "› " } else { "  " },
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(
+            format!("{marker} {status} {:<12}", block.title),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            single_line_preview(&block.text, width.saturating_sub(18)),
+            Style::default().fg(if selected { TEXT } else { MUTED }),
+        ),
+    ]))
+    .style(Style::default().bg(if selected { SURFACE } else { BG }))
 }
 
-async fn picker_files(app: &App) -> Result<(PathBuf, PathBuf)> {
-    if app.blocks.is_empty() {
-        bail!("there are no conversation events to search");
+fn expanded_lines(block: &DisplayBlock, width: usize) -> Vec<ListItem<'static>> {
+    let wrapped = textwrap::wrap(&block.text, width.max(8));
+    let extra = wrapped.len().saturating_sub(EXPANDED_PREVIEW_LINES);
+    wrapped
+        .into_iter()
+        .take(EXPANDED_PREVIEW_LINES)
+        .map(|line| {
+            ListItem::new(Line::styled(
+                format!("     {line}"),
+                Style::default().fg(TEXT),
+            ))
+            .style(Style::default().bg(BG))
+        })
+        .chain(if extra > 0 {
+            Some(
+                ListItem::new(Line::styled(
+                    format!("     … {extra} more lines · Enter opens"),
+                    Style::default().fg(MUTED),
+                ))
+                .style(Style::default().bg(BG)),
+            )
+        } else {
+            None
+        })
+        .collect()
+}
+
+fn render_hints(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let (message, color) = if app.busy {
+        let activity = app
+            .activity
+            .as_ref()
+            .map(Activity::label)
+            .unwrap_or_else(|| "working".to_string());
+        let elapsed = app
+            .busy_since
+            .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
+            .unwrap_or_default();
+        (
+            format!(
+                " {} {activity}{elapsed}  {}",
+                animation::spinner(app.frame),
+                animation::activity(app.frame, 8)
+            ),
+            ACCENT,
+        )
+    } else if let Some(flash) = app.visible_flash() {
+        (
+            format!(" {flash}"),
+            if flash_is_error(flash) { ERROR } else { WARM },
+        )
+    } else if app.jump != JumpKind::All {
+        let label = match app.jump {
+            JumpKind::Reasoning => "thinking",
+            JumpKind::Tool => "tools",
+            JumpKind::User => "you",
+            JumpKind::All => "",
+        };
+        let indices = app.filtered_indices();
+        let position = indices
+            .iter()
+            .position(|index| *index == app.selected_block)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        (
+            format!(
+                " {label} {position}/{}   esc clear   enter open",
+                indices.len()
+            ),
+            WARM,
+        )
+    } else if app.has_draft() {
+        (" draft kept · i to continue".to_string(), WARM)
+    } else {
+        (" i compose   : command".to_string(), MUTED)
+    };
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new("?")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED).bg(SURFACE)),
+        columns[1],
+    );
+    if !columns[1].is_empty() {
+        app.hit_regions.push(HitRegion {
+            area: columns[1],
+            target: AppHit::Help,
+        });
     }
-    let directory = env::temp_dir().join("uri-agent");
-    fs::create_dir_all(&directory).await?;
-    let id = Uuid::now_v7().simple();
-    let input = directory.join(format!("picker-{id}.txt"));
-    let result = directory.join(format!("picker-{id}.result"));
-    let lines = app
-        .blocks
+}
+
+fn flash_is_error(flash: &str) -> bool {
+    let flash = flash.to_ascii_lowercase();
+    flash.contains("failed")
+        || flash.contains("error")
+        || flash.contains("invalid")
+        || flash.contains("could not")
+        || flash.contains("unknown")
+}
+
+fn keymap_help(keymap: &Keymap) -> String {
+    let mut output = String::new();
+    for (title, mode) in [
+        ("CONVERSATION", "main"),
+        ("COMPOSER", "composer"),
+        ("COMMAND", "command"),
+        ("LISTS", "list"),
+        ("SELECTOR", "selector"),
+        ("MODELS", "models"),
+        ("SETTINGS", "settings"),
+        ("OAUTH", "oauth"),
+        ("TERMINAL", "terminal"),
+        ("SELECTION", "selection"),
+        ("GLOBAL", "global"),
+    ] {
+        output.push_str(title);
+        output.push('\n');
+        for (key, action) in keymap.bindings_for(mode) {
+            output.push_str(&format!("  {key:<16} {}\n", action.replace('_', " ")));
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn command_help(commands: &CommandRegistry) -> String {
+    commands
+        .list()
+        .into_iter()
+        .map(|command| {
+            let aliases = if command.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", command.aliases.join(", "))
+            };
+            format!("  :{:<14} {}{}\n", command.id, command.description, aliases)
+        })
+        .collect()
+}
+
+fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
+    match overlay {
+        Overlay::Command => centered(frame, 72, 62),
+        Overlay::Composer | Overlay::Text | Overlay::Oauth => Rect::new(
+            2,
+            frame.height.saturating_sub(12).max(2),
+            frame.width.saturating_sub(4),
+            10,
+        ),
+        Overlay::Terminal => centered(frame, 92, 88),
+        Overlay::Models | Overlay::Settings | Overlay::Selector => centered(frame, 82, 78),
+        _ => centered(frame, 78, 72),
+    }
+}
+
+fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
+    let area = overlay_area(frame.area(), overlay);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .padding(Padding::uniform(1));
+    match overlay {
+        Overlay::Composer => {
+            style_input(&mut app.input, app.busy);
+            frame.render_widget(&app.input, area);
+        }
+        Overlay::Command => render_command(frame, app, area, block),
+        Overlay::Help => {
+            let text = format!(
+                "KEYS\n\n{}COMMANDS\n{}\nSESSION\n{}\n{}\n\nPROJECT\n{}",
+                keymap_help(&app.keymap),
+                command_help(&app.commands),
+                app.info.session_id,
+                app.info.model,
+                app.info.cwd.display()
+            );
+            frame.render_widget(
+                Paragraph::new(text)
+                    .block(block.title(" HELP · Esc close "))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Protocols => {
+            let mut lines = Vec::new();
+            for protocol in &app.protocols {
+                let modes = match (protocol.can_read, protocol.can_exec) {
+                    (true, true) => "read · exec",
+                    (true, false) => "read",
+                    (false, true) => "exec",
+                    (false, false) => "—",
+                };
+                lines.extend([
+                    Line::styled(
+                        format!("{}://   {modes}", protocol.name),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::styled(protocol.description.clone(), Style::default().fg(TEXT)),
+                    Line::default(),
+                ]);
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block.title(" PROTOCOLS · read <name>://help "))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Tasks => render_tasks(frame, app, area, block),
+        Overlay::Models => render_models(frame, app, area, block),
+        Overlay::Settings => render_settings(frame, app, area, block),
+        Overlay::Plugin => {
+            let document = app.tui_document.as_ref();
+            let title = document
+                .map(|document| format!(" {} · Esc close ", document.title))
+                .unwrap_or_else(|| " PLUGIN PANEL ".to_string());
+            let body = document
+                .map(|document| document.body.as_str())
+                .unwrap_or("Plugin panel did not return content.");
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(block.title(title))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Document => {
+            let (title, body) = app
+                .document
+                .as_ref()
+                .map(|(title, body)| (format!(" {title} · Esc close "), body.as_str()))
+                .unwrap_or((" DOCUMENT ".to_string(), "Nothing to show."));
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(block.title(title))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Selector => render_selector(frame, app, area, block),
+        Overlay::Text => {
+            let Some(prompt) = app.text_prompt.as_ref() else {
+                return;
+            };
+            let value = if prompt.secret {
+                format!("{}█", "•".repeat(prompt.value.chars().count().min(48)))
+            } else {
+                format!("{}█", prompt.value)
+            };
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(prompt.message.clone(), Style::default().fg(MUTED)),
+                    Line::default(),
+                    Line::styled(value, Style::default().fg(TEXT)),
+                ])
+                .block(block.title(format!(" {} ", prompt.title))),
+                area,
+            );
+        }
+        Overlay::Terminal => render_pty(frame, app, area),
+        Overlay::Oauth => {
+            let Some(oauth) = app.oauth.as_ref() else {
+                return;
+            };
+            let display = oauth.login.display();
+            let mut lines = vec![
+                Line::styled(display.instructions, Style::default().fg(MUTED)),
+                Line::default(),
+            ];
+            let device = display.user_code.clone();
+            if let Some(code) = &device {
+                lines.push(Line::styled(
+                    format!("code  {code}"),
+                    Style::default().fg(WARM).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::default());
+            }
+            if !display.url.is_empty() {
+                lines.push(Line::styled(display.url, Style::default().fg(ACCENT)));
+                lines.push(Line::default());
+            }
+            if device.is_none() {
+                lines.push(Line::styled(
+                    format!("paste {}█", oauth.paste),
+                    Style::default().fg(TEXT),
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block.title(format!(" OAUTH · {} · Esc cancel ", oauth.provider)))
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
+    }
+}
+
+fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let resize_error = {
+        let Some(pty) = app.pty.as_mut() else {
+            return;
+        };
+        pty.area = area;
+        let inner = area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let resize_error = pty.terminal.resize(inner.height, inner.width).err();
+        let parser = pty.terminal.screen();
+        frame.render_widget(
+            PseudoTerminal::new(parser.screen()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .style(Style::default().bg(SURFACE))
+                    .title(" TERMINAL · double Esc close · Shift-drag select "),
+            ),
+            area,
+        );
+        resize_error
+    };
+    if let Some(error) = resize_error {
+        app.set_flash(format!("Embedded terminal resize failed: {error:#}"));
+    }
+}
+
+fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    frame.render_widget(
+        block.title(" COMMAND · Tab complete · Enter run · Esc close "),
+        area,
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(":{}█", app.command_line)).style(Style::default().fg(TEXT)),
+        sections[0],
+    );
+    let commands = app.filtered_commands();
+    let items = commands.iter().enumerate().map(|(index, item)| {
+        let selected = index == app.command_selected;
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(":{:<14}", item.id),
+                Style::default()
+                    .fg(if selected { ACCENT } else { TEXT })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(item.description.clone(), Style::default().fg(MUTED)),
+        ]))
+        .style(Style::default().bg(if selected { BG } else { SURFACE }))
+    });
+    let mut state = ListState::default().with_selected(Some(app.command_selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for index in state.offset()..commands.len() {
+        let y = sections[1]
+            .y
+            .saturating_add((index - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::Palette(index),
+        });
+    }
+}
+
+fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    let Some(selector) = app.selector.as_ref() else {
+        return;
+    };
+    frame.render_widget(
+        block.title(format!(
+            " {} · type to filter · Enter choose · Esc close ",
+            selector.title
+        )),
+        area,
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!("⌕ {}█", selector.query)).style(Style::default().fg(TEXT)),
+        sections[0],
+    );
+    let items = selector
+        .visible
         .iter()
         .enumerate()
-        .map(|(index, block)| {
-            format!(
-                "{index}\t{}\t{}",
-                block.title,
-                single_line_preview(&block.text, 180)
+        .filter_map(|(position, index)| {
+            let item = selector.items.get(*index)?;
+            let selected = position == selector.selected;
+            Some(
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(
+                        format!("{:<22}", item.title),
+                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    ),
+                    Span::styled(item.description.clone(), Style::default().fg(MUTED)),
+                ]))
+                .style(Style::default().bg(if selected { BG } else { SURFACE })),
             )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&input, lines).await?;
-    Ok((input, result))
-}
-
-fn picker_wrapper(command: &str, input: &Path, result: &Path) -> Result<Vec<String>> {
-    let mut picker = shell_words::split(command).context("cannot parse picker command")?;
-    if picker.is_empty() {
-        bail!("picker command is empty");
-    }
-    #[cfg(unix)]
-    {
-        let mut arguments = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "input=$1; output=$2; shift 2; exec \"$@\" < \"$input\" > \"$output\"".to_string(),
-            "uri-agent-picker".to_string(),
-            input.to_string_lossy().into_owned(),
-            result.to_string_lossy().into_owned(),
-        ];
-        arguments.append(&mut picker);
-        Ok(arguments)
-    }
-    #[cfg(windows)]
-    {
-        let mut arguments = vec![
-            "pwsh".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "$inputPath=$args[0]; $outputPath=$args[1]; $exe=$args[2]; $rest=$args[3..($args.Length-1)]; Get-Content -LiteralPath $inputPath | & $exe @rest | Set-Content -NoNewline -LiteralPath $outputPath".to_string(),
-            input.to_string_lossy().into_owned(),
-            result.to_string_lossy().into_owned(),
-        ];
-        arguments.append(&mut picker);
-        Ok(arguments)
-    }
-}
-
-fn builder_from_arguments(mut arguments: Vec<String>) -> Result<CommandBuilder> {
-    if arguments.is_empty() {
-        bail!("command is empty");
-    }
-    let executable = arguments.remove(0);
-    let mut builder = CommandBuilder::new(executable);
-    builder.args(arguments);
-    Ok(builder)
-}
-
-async fn open_embedded_picker(app: &mut App, terminal_area: Rect) -> Result<()> {
-    let picker = app
-        .info
-        .picker
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("configure Picker in Settings first"))?;
-    let (input, result) = picker_files(app).await?;
-    let arguments = picker_wrapper(picker, &input, &result)?;
-    let area = centered(terminal_area, 88, 76);
-    let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let terminal = match EmbeddedTerminal::start(
-        builder_from_arguments(arguments)?,
-        &app.info.cwd,
-        inner.height,
-        inner.width,
-    ) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let _ = fs::remove_file(&input).await;
-            let _ = fs::remove_file(&result).await;
-            return Err(error)
-                .context("cannot start picker; install fzf or change Picker in Settings");
+        });
+    let mut state = ListState::default().with_selected(Some(selector.selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for position in state.offset()..selector.visible.len() {
+        let y = sections[1]
+            .y
+            .saturating_add((position - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
         }
-    };
-    app.overlay = None;
-    app.selection = None;
-    app.external = Some(ExternalProcess {
-        terminal,
-        purpose: ExternalPurpose::Picker { input, result },
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::Selector(position),
+        });
+    }
+}
+
+fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    frame.render_widget(
+        block.title(" MODELS · type to search · Enter use · Ctrl+R refresh "),
         area,
-        title: " FIND EVENT · Enter choose · Esc cancel · Shift-drag select ",
-        last_escape: None,
-    });
-    Ok(())
-}
-
-async fn open_fullscreen_picker(
-    terminal: &mut DefaultTerminal,
-    app: &App,
-) -> Result<Option<usize>> {
-    let picker = app
-        .info
-        .picker
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("configure Picker in Settings first"))?;
-    let (input, result) = picker_files(app).await?;
-    let arguments = picker_wrapper(picker, &input, &result)?;
-    execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
-    ratatui::try_restore()?;
-    let command_result = Command::new(&arguments[0])
-        .args(&arguments[1..])
-        .current_dir(&app.info.cwd)
-        .status()
-        .await;
-    *terminal = ratatui::try_init()?;
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    clear_terminal_screen()?;
-
-    let selection = match command_result {
-        Ok(_) => read_picker_result(&result).await,
-        Err(error) => {
-            Err(error).context("cannot start picker; install fzf or change Picker in Settings")
-        }
-    };
-    let _ = fs::remove_file(input).await;
-    let _ = fs::remove_file(result).await;
-    selection
-}
-
-async fn read_picker_result(path: &Path) -> Result<Option<usize>> {
-    let result = match fs::read_to_string(path).await {
-        Ok(result) => result,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(index) = result.split('\t').next().filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        index.parse().context("picker returned an invalid event")?,
-    ))
-}
-
-fn apply_editor_result(app: &mut App, result: Result<Option<String>>) {
-    match result {
-        Ok(Some(content)) => {
-            app.input = TextArea::new(content.split('\n').map(str::to_owned).collect());
-            style_input(&mut app.input, app.busy);
-            app.mode = Mode::Insert;
-            app.set_flash("Draft updated from editor");
-        }
-        Ok(None) => app.set_flash("Editor closed"),
-        Err(error) => app.set_flash(format!("Editor failed: {error:#}")),
-    }
-}
-
-fn apply_picker_result(app: &mut App, result: Result<Option<usize>>) {
-    match result {
-        Ok(Some(index)) if index < app.blocks.len() => {
-            app.selected_block = index;
-            app.overlay_scroll = 0;
-            app.overlay = Some(Overlay::Detail);
-            app.set_flash(format!("Selected event {}", index + 1));
-        }
-        Ok(Some(_)) => app.set_flash("Picker selected an unknown event"),
-        Ok(None) => app.set_flash("Picker closed"),
-        Err(error) => app.set_flash(format!("Picker failed: {error:#}")),
-    }
-}
-
-fn external_finished(app: &mut App) -> Result<bool> {
-    app.external
-        .as_mut()
-        .map(|external| external.terminal.try_wait().map(|status| status.is_some()))
-        .transpose()
-        .map(Option::unwrap_or_default)
-}
-
-async fn finish_external(app: &mut App) {
-    let Some(external) = app.external.take() else {
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let Some(selector) = app.model_selector.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("Model catalog is not loaded.").style(Style::default().fg(MUTED)),
+            inner,
+        );
         return;
     };
-    let ExternalProcess {
-        terminal, purpose, ..
-    } = external;
-    drop(terminal);
-    app.selection = None;
-    match purpose {
-        ExternalPurpose::Editor { path, read_back } => {
-            let result = if read_back {
-                fs::read_to_string(&path)
-                    .await
-                    .map(Some)
-                    .map_err(Into::into)
+    let summary = if app.catalog_refreshing {
+        format!("{} refreshing pi.dev", animation::spinner(app.frame))
+    } else {
+        format!(
+            "{} matches · {} models · {} providers",
+            selector.visible_len(),
+            selector.model_count(),
+            selector.provider_count()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("⌕  ", Style::default().fg(ACCENT)),
+            Span::styled(selector.query(), Style::default().fg(TEXT)),
+            Span::styled("█", Style::default().fg(ACCENT)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED))
+                .title(format!(" SEARCH · {summary} ")),
+        ),
+        sections[0],
+    );
+    let name_width: usize = if sections[1].width < 60 { 18 } else { 30 };
+    let items = selector.visible().enumerate().map(|(position, model)| {
+        let selected = position == selector.selected_position();
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "{} {:<14}",
+                    if selector.is_current(model) {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    model.provider
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                format!(
+                    "{:<name_width$}",
+                    single_line_preview(model_label(model), name_width.saturating_sub(2))
+                ),
+                Style::default().fg(if selected { ACCENT } else { TEXT }),
+            ),
+            Span::styled(
+                format!(
+                    "{}{}",
+                    context_label(model.context_window()),
+                    if reasoning(model) { " · think" } else { "" }
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ]))
+        .style(Style::default().bg(if selected { BG } else { SURFACE }))
+    });
+    let mut state = ListState::default().with_selected(Some(selector.selected_position()));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for position in state.offset()..selector.visible_len() {
+        let y = sections[1]
+            .y
+            .saturating_add((position - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::Model(position),
+        });
+    }
+    let footer = if let Some(model) = selector.selected() {
+        format!("{}/{} · {}", model.provider, model.id, model.api)
+    } else {
+        "No models match this search".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+        sections[2],
+    );
+}
+
+fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    let Some(settings) = app.settings.as_ref() else {
+        frame.render_widget(Paragraph::new("Loading settings…").block(block), area);
+        return;
+    };
+    let model = settings
+        .model()
+        .map(|model| {
+            if model.name.is_empty() || model.name == model.id {
+                model.id.clone()
             } else {
-                Ok(None)
-            };
-            let _ = fs::remove_file(path).await;
-            apply_editor_result(app, result);
-        }
-        ExternalPurpose::Picker { input, result } => {
-            let selection = read_picker_result(&result).await;
-            let _ = fs::remove_file(input).await;
-            let _ = fs::remove_file(result).await;
-            apply_picker_result(app, selection);
-        }
+                format!("{}  ·  {}", model.name, model.id)
+            }
+        })
+        .unwrap_or_else(|| settings.active.model.clone());
+    let credential = match settings.active.auth_kind {
+        AuthKind::Oauth => format!("OAuth  ·  {}", settings.active.api_key_source.label()),
+        AuthKind::ApiKey => format!("API key  ·  {}", settings.active.api_key_source.label()),
+        AuthKind::None => "not configured  ·  :login".to_string(),
+    };
+    let output_limit = if settings.editing == Some(EditingSetting::OutputLimit) {
+        format!("{}█", settings.output_limit)
+    } else {
+        format!("{} bytes", settings.output_limit)
+    };
+    let rows = [
+        ("Model", format!("{} / {model}", settings.provider())),
+        ("Credential", credential),
+        ("Output limit", output_limit),
+    ];
+    let mut lines = vec![
+        Line::styled(
+            "Use :login / :logout for credentials. Enter edits the selected field.",
+            Style::default().fg(MUTED),
+        ),
+        Line::default(),
+    ];
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        let selected = settings.selected == index;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!("{label:<14}"),
+                Style::default().fg(if selected { ACCENT } else { MUTED }),
+            ),
+            Span::styled(value, Style::default().fg(TEXT)),
+        ]));
+        lines.push(Line::default());
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block.title(" SETTINGS · s save · Esc close "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    for index in 0..3 {
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(
+                inner.x,
+                inner.y.saturating_add(2 + index as u16 * 2),
+                inner.width,
+                1,
+            ),
+            target: AppHit::Setting(index),
+        });
     }
 }
 
-async fn cancel_external(app: &mut App) {
-    let Some(external) = app.external.take() else {
+fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    if app.task_records.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No managed tasks in this process.")
+                .block(block.title(" TASKS "))
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block.title(" TASKS · ↑/↓ select · x cancel "), area);
+    let items = app.task_records.iter().enumerate().map(|(index, task)| {
+        ListItem::new(format!(
+            "{} {:9} {}",
+            if index == app.selected_task {
+                "›"
+            } else {
+                " "
+            },
+            task.status.as_str(),
+            task.label
+        ))
+        .style(Style::default().fg(if index == app.selected_task {
+            ACCENT
+        } else {
+            TEXT
+        }))
+    });
+    let mut state = ListState::default().with_selected(Some(app.selected_task));
+    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    for index in state.offset()..app.task_records.len() {
+        let y = inner.y.saturating_add((index - state.offset()) as u16);
+        if y >= inner.bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(inner.x, y, inner.width, 1),
+            target: AppHit::Task(index),
+        });
+    }
+}
+
+fn style_input(input: &mut TextArea<'static>, busy: bool) {
+    input.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if busy { MUTED } else { ACCENT }))
+            .title(" COMPOSE · Enter send · Shift+Enter newline · Esc keep draft ")
+            .style(Style::default().bg(SURFACE)),
+    );
+    input.set_style(Style::default().fg(TEXT).bg(SURFACE));
+    input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
+    input.set_cursor_style(Style::default().fg(BG).bg(ACCENT));
+}
+
+fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let cells = (area.y..area.bottom())
+        .map(|row| {
+            (area.x..area.right())
+                .map(|column| {
+                    frame
+                        .buffer_mut()
+                        .cell((column, row))
+                        .map(|cell| cell.symbol().to_string())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    app.selectable = Some(SelectableSurface { area, cells });
+}
+
+fn render_selection(frame: &mut Frame<'_>, app: &App) {
+    let (Some(surface), Some(selection)) = (&app.selectable, app.selection) else {
         return;
     };
-    let ExternalProcess {
-        terminal, purpose, ..
-    } = external;
-    drop(terminal);
-    app.selection = None;
-    match purpose {
-        ExternalPurpose::Editor { path, .. } => {
-            let _ = fs::remove_file(path).await;
-        }
-        ExternalPurpose::Picker { input, result } => {
-            let _ = fs::remove_file(input).await;
-            let _ = fs::remove_file(result).await;
-        }
-    }
-    app.set_flash("Embedded terminal closed");
-}
-
-fn handle_external_key(app: &mut App, key: KeyEvent) -> Result<bool> {
-    if app.selection.is_some() {
-        match app.keymap.action("selection", &key_name(key)).as_deref() {
-            Some("copy") => copy_current_surface(app),
-            Some("close") => app.selection = None,
-            _ => {}
-        }
-        return Ok(false);
-    }
-    match app.keymap.action("terminal", &key_name(key)).as_deref() {
-        Some("copy") => {
-            copy_current_surface(app);
-            return Ok(false);
-        }
-        Some("close") => return Ok(true),
-        Some("escape") => {
-            let now = Instant::now();
-            let external = app.external.as_mut().expect("checked by caller");
-            if external
-                .last_escape
-                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(500))
-            {
-                return Ok(true);
+    let first = selection.start;
+    let second = selection.end;
+    let (start, end) = if (first.1, first.0) <= (second.1, second.0) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    for row in start.1..=end.1 {
+        let from = if row == start.1 {
+            start.0
+        } else {
+            surface.area.x
+        };
+        let to = if row == end.1 {
+            end.0
+        } else {
+            surface.area.right().saturating_sub(1)
+        };
+        for column in from..=to {
+            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
-            external.last_escape = Some(now);
-            external.terminal.send_key(key)?;
-            return Ok(false);
         }
-        _ => {}
     }
-    let external = app.external.as_mut().expect("checked by caller");
-    external.last_escape = None;
-    external.terminal.send_key(key)?;
-    Ok(false)
-}
-
-fn handle_external_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
-    if update_mouse_selection(app, mouse, true) {
-        return Ok(());
-    }
-    let external = app.external.as_mut().expect("checked by caller");
-    let inner = external.area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    if mouse.column >= inner.x
-        && mouse.column < inner.right()
-        && mouse.row >= inner.y
-        && mouse.row < inner.bottom()
-    {
-        external.terminal.send_mouse(
-            mouse,
-            mouse.column.saturating_sub(inner.x),
-            mouse.row.saturating_sub(inner.y),
-        )?;
-    }
-    Ok(())
 }
 
 fn update_mouse_selection(app: &mut App, mouse: MouseEvent, require_shift: bool) -> bool {
@@ -2181,344 +3929,94 @@ fn complete_surface_text(surface: &SelectableSurface) -> String {
         .to_string()
 }
 
-async fn open_editor(
-    terminal: &mut DefaultTerminal,
-    editor: Option<&str>,
-    content: &str,
-    read_back: bool,
-) -> Result<Option<String>> {
-    let editor = editor
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("configure Editor in Settings first"))?;
-    let mut arguments = shell_words::split(editor).context("cannot parse editor command")?;
-    if arguments.is_empty() {
-        bail!("editor command is empty");
+fn display_cwd(path: &Path) -> String {
+    let text = path.display().to_string();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return text;
+    };
+    rest.strip_prefix(r"UNC\")
+        .map(|unc| format!(r"\\{unc}"))
+        .unwrap_or_else(|| rest.to_string())
+}
+
+/// Pi's `formatCwdForFooter`: replace the home directory prefix with `~`.
+fn footer_cwd(path: &Path) -> String {
+    let text = display_cwd(path);
+    let Some(home) = dirs::home_dir() else {
+        return text;
+    };
+    let home_text = display_cwd(&home);
+    if text == home_text {
+        return "~".to_string();
     }
-    let executable = arguments.remove(0);
-    let path = temporary_document(content).await?;
-    arguments.push(path.to_string_lossy().into_owned());
+    let prefix = format!("{home_text}{}", std::path::MAIN_SEPARATOR);
+    text.strip_prefix(&prefix)
+        .map(|rest| format!("~{}{rest}", std::path::MAIN_SEPARATOR))
+        .unwrap_or(text)
+}
 
-    execute!(stdout(), DisableMouseCapture, DisableBracketedPaste)?;
-    ratatui::try_restore()?;
-    let editor_result = Command::new(&executable).args(arguments).status().await;
-    *terminal = ratatui::try_init()?;
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    clear_terminal_screen()?;
+/// Pi's `formatTokens`: compact 1000-based token counts.
+fn format_tokens(count: u64) -> String {
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 10_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else if count < 1_000_000 {
+        format!("{}k", count / 1_000)
+    } else if count < 10_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else {
+        format!("{}M", count / 1_000_000)
+    }
+}
 
-    let status = match editor_result {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = fs::remove_file(&path).await;
-            let context = if executable == "hx" {
-                "cannot start `hx`; install Helix or change Editor in Settings".to_string()
+const BRANCH_CACHE_TTL: Duration = Duration::from_secs(2);
+
+fn current_branch(app: &mut App) -> Option<String> {
+    let now = Instant::now();
+    if let Some((checked, value)) = &app.branch
+        && now.duration_since(*checked) < BRANCH_CACHE_TTL
+    {
+        return value.clone();
+    }
+    let value = git_branch(&app.info.cwd);
+    app.branch = Some((now, value.clone()));
+    value
+}
+
+/// Walk up from `cwd` to the nearest `.git`, supporting worktrees whose
+/// `.git` is a file pointing at the real gitdir. Mirrors pi's footer branch.
+fn git_branch(cwd: &Path) -> Option<String> {
+    let mut current = Some(cwd);
+    while let Some(directory) = current {
+        let marker = directory.join(".git");
+        if marker.is_dir() {
+            return head_branch(&marker);
+        }
+        if marker.is_file() {
+            let content = std::fs::read_to_string(&marker).ok()?;
+            let target = content.trim().strip_prefix("gitdir: ")?;
+            let target = Path::new(target);
+            let gitdir = if target.is_absolute() {
+                target.to_path_buf()
             } else {
-                format!("cannot start `{executable}`; change Editor in Settings")
+                directory.join(target)
             };
-            return Err(error).context(context);
+            return head_branch(&gitdir);
         }
-    };
-    if !status.success() {
-        let _ = fs::remove_file(&path).await;
-        bail!("editor exited with {status}");
+        current = directory.parent();
     }
-    let updated = if read_back {
-        Some(fs::read_to_string(&path).await?)
-    } else {
-        None
-    };
-    let _ = fs::remove_file(path).await;
-    Ok(updated)
+    None
 }
 
-fn clear_terminal_screen() -> Result<()> {
-    execute!(
-        stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        crossterm::cursor::MoveTo(0, 0)
-    )?;
-    Ok(())
-}
-
-fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
-    let uri = arguments.get("uri")?.as_str()?;
-    let separator = uri.find("://").or_else(|| uri.find(':'))?;
-    (separator > 0).then(|| uri[..separator].to_string())
-}
-
-fn render(frame: &mut Frame<'_>, app: &mut App) {
-    app.hit_regions.clear();
-    app.selectable = None;
-    let area = frame.area();
-    frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
-    let input_height = if app.mode == Mode::Insert {
-        (app.input.lines().len() as u16).clamp(1, 6) + 2
-    } else {
-        1
-    };
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    render_transcript(frame, app, areas[0]);
-    if app.mode == Mode::Insert {
-        frame.render_widget(&app.input, areas[1]);
-    } else {
-        let composer = if app.has_draft() {
-            let text = app.input.lines().join(" ");
-            Line::from(vec![
-                Span::styled(
-                    " DRAFT  ",
-                    Style::default().fg(WARM).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    single_line_preview(&text, areas[1].width.saturating_sub(10) as usize),
-                    Style::default().fg(TEXT),
-                ),
-            ])
-        } else {
-            Line::styled(" compose…", Style::default().fg(MUTED))
-        };
-        frame.render_widget(
-            Paragraph::new(composer).style(Style::default().bg(SURFACE)),
-            areas[1],
-        );
-        app.hit_regions.push(HitRegion {
-            area: areas[1],
-            target: AppHit::Composer,
-        });
-    }
-    render_statusline(frame, app, areas[2]);
-    let selectable_area = if app.external.is_some() {
-        app.hit_regions.clear();
-        render_external(frame, app)
-    } else if let Some(overlay) = app.overlay {
-        app.hit_regions.clear();
-        render_overlay(frame, app, overlay);
-        Some(overlay_area(frame.area(), overlay).inner(Margin {
-            horizontal: 2,
-            vertical: 2,
-        }))
-    } else {
-        Some(areas[0])
-    };
-    if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
-        capture_surface(frame, app, selectable_area);
-        render_selection(frame, app);
-    }
-}
-
-fn render_external(frame: &mut Frame<'_>, app: &mut App) -> Option<Rect> {
-    let (inner, resize_error) = {
-        let external = app.external.as_mut()?;
-        external.area = centered(frame.area(), 92, 88);
-        let inner = external.area.inner(Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let resize_error = external.terminal.resize(inner.height, inner.width).err();
-        frame.render_widget(Clear, external.area);
-        let parser = external.terminal.screen();
-        frame.render_widget(
-            PseudoTerminal::new(parser.screen()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT))
-                    .style(Style::default().bg(SURFACE))
-                    .title(external.title),
-            ),
-            external.area,
-        );
-        (inner, resize_error)
-    };
-    if let Some(error) = resize_error {
-        app.set_flash(format!("Embedded terminal resize failed: {error:#}"));
-    }
-    Some(inner)
-}
-
-fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let cells = (area.y..area.bottom())
-        .map(|row| {
-            (area.x..area.right())
-                .map(|column| {
-                    frame
-                        .buffer_mut()
-                        .cell((column, row))
-                        .map(|cell| cell.symbol().to_string())
-                        .unwrap_or_default()
-                })
-                .collect()
-        })
-        .collect();
-    app.selectable = Some(SelectableSurface { area, cells });
-}
-
-fn render_selection(frame: &mut Frame<'_>, app: &App) {
-    let (Some(surface), Some(selection)) = (&app.selectable, app.selection) else {
-        return;
-    };
-    let first = selection.start;
-    let second = selection.end;
-    let (start, end) = if (first.1, first.0) <= (second.1, second.0) {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    for row in start.1..=end.1 {
-        let from = if row == start.1 {
-            start.0
-        } else {
-            surface.area.x
-        };
-        let to = if row == end.1 {
-            end.0
-        } else {
-            surface.area.right().saturating_sub(1)
-        };
-        for column in from..=to {
-            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
-                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
-            }
-        }
-    }
-}
-
-fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    if app.blocks.is_empty() {
-        render_welcome(frame, app, area);
-        app.hit_regions.push(HitRegion {
-            area,
-            target: AppHit::Composer,
-        });
-        return;
-    }
-    let preview_width = area.width.saturating_sub(25) as usize;
-    let items = app.blocks.iter().enumerate().map(|(index, block)| {
-        let selected = index == app.selected_block;
-        let color = if block.failed {
-            ERROR
-        } else {
-            match block.kind {
-                BlockKind::User => ACCENT,
-                BlockKind::Assistant => TEXT,
-                BlockKind::Reasoning => MUTED,
-                BlockKind::Tool => WARM,
-                BlockKind::Compaction => ACCENT,
-                BlockKind::Notice => MUTED,
-                BlockKind::Error => ERROR,
-            }
-        };
-        let status = if index == app.blocks.len().saturating_sub(1)
-            && app.busy
-            && matches!(
-                block.kind,
-                BlockKind::Assistant | BlockKind::Reasoning | BlockKind::Tool
-            ) {
-            animation::spinner(app.frame).to_string()
-        } else if block.kind == BlockKind::Tool {
-            if block.failed {
-                "×".to_string()
-            } else if block.text.contains("\n\nRESULT\n") {
-                "✓".to_string()
-            } else {
-                "·".to_string()
-            }
-        } else {
-            " ".to_string()
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{status} {:<16}", block.title),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                single_line_preview(&block.text, preview_width),
-                Style::default().fg(if selected { TEXT } else { MUTED }),
-            ),
-        ]))
-        .style(Style::default().bg(if selected { SURFACE } else { BG }))
-    });
-    let mut state = ListState::default().with_selected(Some(app.selected_block));
-    frame.render_stateful_widget(
-        List::new(items).block(Block::new().padding(Padding::horizontal(1))),
-        area,
-        &mut state,
-    );
-    for index in state.offset()..app.blocks.len() {
-        let y = area.y.saturating_add((index - state.offset()) as u16);
-        if y >= area.y.saturating_add(area.height) {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(area.x, y, area.width, 1),
-            target: AppHit::Transcript(index),
-        });
-    }
-}
-
-fn render_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if area.width < 58 || area.height < 13 {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    "URI Agent · protocol-first coding",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    format!("{}/{}", app.info.provider, app.info.model),
-                    Style::default().fg(TEXT),
-                ),
-                Line::styled(
-                    "i compose · Space commands · F1 help",
-                    Style::default().fg(MUTED),
-                ),
-            ])
-            .alignment(Alignment::Center),
-            area,
-        );
-        return;
-    }
-    let width = area.width.min(76);
-    let height = area.height.min(15);
-    let welcome = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    let mut lines = animation::wordmark(app.frame)
-        .into_iter()
-        .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
-        .collect::<Vec<_>>();
-    lines.extend([
-        Line::default(),
-        Line::styled(
-            "PROTOCOL-FIRST CODING SURFACE",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            format!("{}/{}", app.info.provider, app.info.model),
-            Style::default().fg(MUTED),
-        ),
-        Line::styled(
-            single_line_preview(&app.info.cwd.display().to_string(), 68),
-            Style::default().fg(MUTED),
-        ),
-        Line::default(),
-        Line::styled(
-            "i compose   Space commands   F1 help",
-            Style::default().fg(WARM),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), welcome);
+fn head_branch(gitdir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(
+        head.strip_prefix("ref: refs/heads/")
+            .unwrap_or("detached")
+            .to_string(),
+    )
 }
 
 fn single_line_preview(text: &str, limit: usize) -> String {
@@ -2530,742 +4028,6 @@ fn single_line_preview(text: &str, limit: usize) -> String {
     } else {
         normalized.chars().take(limit - 1).collect::<String>() + "…"
     }
-}
-
-fn render_statusline(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    frame.render_widget(Block::new().style(Style::default().bg(SURFACE)), area);
-    let compact = area.width < 64;
-    let event_width = if app.blocks.is_empty() {
-        0
-    } else if compact {
-        8
-    } else {
-        14
-    };
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(if compact { 8 } else { 10 }),
-            Constraint::Percentage(if compact { 45 } else { 34 }),
-            Constraint::Min(0),
-            Constraint::Length(event_width),
-        ])
-        .split(area);
-    let (mode, mode_color) = if app.mode == Mode::Insert {
-        ("INSERT", WARM)
-    } else {
-        ("BROWSE", ACCENT)
-    };
-    frame.render_widget(
-        Paragraph::new(format!(" {mode} ")).style(
-            Style::default()
-                .fg(BG)
-                .bg(mode_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        columns[0],
-    );
-    let model = format!(" {}/{}", app.info.provider, app.info.model);
-    frame.render_widget(
-        Paragraph::new(single_line_preview(&model, columns[1].width as usize)).style(
-            Style::default()
-                .fg(if app.info.model_ready { TEXT } else { WARM })
-                .bg(SURFACE),
-        ),
-        columns[1],
-    );
-
-    let (message, message_style) = if app.busy {
-        let activity = app
-            .activity
-            .as_ref()
-            .map(Activity::label)
-            .unwrap_or_else(|| "working".to_string());
-        let elapsed = app
-            .busy_since
-            .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
-            .unwrap_or_default();
-        let wave = if columns[2].width > 30 {
-            format!("  {}", animation::activity(app.frame, 8))
-        } else {
-            String::new()
-        };
-        (
-            format!(
-                " {} {activity}{elapsed}{wave}",
-                animation::spinner(app.frame)
-            ),
-            Style::default().fg(ACCENT).bg(SURFACE),
-        )
-    } else if let Some(flash) = app.visible_flash() {
-        (
-            format!(" {flash}"),
-            Style::default()
-                .fg(if flash_is_error(flash) { ERROR } else { WARM })
-                .bg(SURFACE),
-        )
-    } else if app.mode == Mode::Browse && app.has_draft() {
-        let line_count = app.input.lines().len();
-        (
-            format!(
-                " draft · {line_count} line{}",
-                if line_count == 1 { "" } else { "s" }
-            ),
-            Style::default().fg(WARM).bg(SURFACE),
-        )
-    } else {
-        (String::new(), Style::default().bg(SURFACE))
-    };
-    frame.render_widget(Paragraph::new(message).style(message_style), columns[2]);
-
-    if !app.blocks.is_empty() {
-        let position = if compact {
-            format!(" {}/{}", app.selected_block + 1, app.blocks.len())
-        } else {
-            format!(" event {}/{} ", app.selected_block + 1, app.blocks.len())
-        };
-        frame.render_widget(
-            Paragraph::new(position)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(MUTED).bg(SURFACE)),
-            columns[3],
-        );
-    }
-}
-
-fn flash_is_error(flash: &str) -> bool {
-    let flash = flash.to_ascii_lowercase();
-    flash.contains("failed")
-        || flash.contains("error")
-        || flash.contains("invalid")
-        || flash.contains("could not")
-        || flash.contains("unknown")
-}
-
-fn keymap_help(keymap: &Keymap) -> String {
-    let mut output = String::new();
-    for (title, mode) in [
-        ("BROWSE", "browse"),
-        ("INSERT", "insert"),
-        ("DETAIL", "detail"),
-        ("LIST PANELS", "list"),
-        ("TASKS", "tasks"),
-        ("MODELS", "models"),
-        ("SETTINGS", "settings"),
-        ("COMMAND PANEL", "palette"),
-        ("COMMAND LINE", "command"),
-        ("TEXT FIELDS", "text"),
-        ("SELECTION", "selection"),
-        ("EMBEDDED TERMINAL", "terminal"),
-        ("GLOBAL", "global"),
-    ] {
-        output.push_str(title);
-        output.push('\n');
-        for (key, action) in keymap.bindings_for(mode) {
-            output.push_str(&format!("  {key:<14} {}\n", action.replace('_', " ")));
-        }
-        output.push('\n');
-    }
-    output
-}
-
-fn command_help(commands: &CommandRegistry) -> String {
-    commands
-        .list()
-        .into_iter()
-        .map(|command| {
-            let aliases = if command.aliases.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", command.aliases.join(", "))
-            };
-            format!("  :{:<14} {}{}\n", command.id, command.description, aliases)
-        })
-        .collect()
-}
-
-fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
-    if overlay == Overlay::Command {
-        Rect::new(
-            1,
-            frame.height.saturating_sub(6),
-            frame.width.saturating_sub(2),
-            5,
-        )
-    } else if overlay == Overlay::Models && frame.width < 110 {
-        centered(frame, 96, 96)
-    } else if matches!(overlay, Overlay::Settings | Overlay::Models) {
-        centered(frame, 82, 96)
-    } else {
-        centered(frame, 78, 82)
-    }
-}
-
-fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
-    let area = overlay_area(frame.area(), overlay);
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(SURFACE).fg(TEXT))
-        .padding(Padding::uniform(1));
-    match overlay {
-        Overlay::Detail => {
-            let (title, text) = app
-                .selected_block()
-                .map(|block| (format!(" {} ", block.title), block_document(block)))
-                .unwrap_or_else(|| (" DETAIL ".to_string(), "No event selected.".to_string()));
-            frame.render_widget(
-                Paragraph::new(text)
-                    .block(block.title(format!("{title}· ↑/↓ scroll · e editor · Esc close ")))
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.overlay_scroll, 0)),
-                area,
-            );
-        }
-        Overlay::Help => {
-            let text = format!(
-                "ACTIVE KEYMAP\n\n{}COMMANDS\n{}\nDrag to select read-only floats; Shift-drag selects interactive panels and embedded terminals. Press y or Ctrl+Shift+C to copy with OSC52.\n\nSlash commands remain available while composing.\n\nSESSION\n{}\n{}\n\nPROJECT\n{}",
-                keymap_help(&app.keymap),
-                command_help(&app.commands),
-                app.info.session_id,
-                app.info.model,
-                app.info.cwd.display()
-            );
-            frame.render_widget(
-                Paragraph::new(text)
-                    .block(block.title(" HELP "))
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.overlay_scroll, 0)),
-                area,
-            );
-        }
-        Overlay::Protocols => {
-            let mut lines = Vec::new();
-            for protocol in &app.protocols {
-                let modes = match (protocol.can_read, protocol.can_exec) {
-                    (true, true) => "read · exec",
-                    (true, false) => "read",
-                    (false, true) => "exec",
-                    (false, false) => "—",
-                };
-                lines.extend([
-                    Line::styled(
-                        format!("{}://   {modes}", protocol.name),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    Line::styled(protocol.description.clone(), Style::default().fg(TEXT)),
-                    Line::default(),
-                ]);
-            }
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .block(block.title(" PROTOCOLS · ↑/↓ scroll · read <name>://help "))
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.overlay_scroll, 0)),
-                area,
-            );
-        }
-        Overlay::Tasks => render_tasks(frame, app, area, block),
-        Overlay::Models => render_models(frame, app, area, block),
-        Overlay::Settings => render_settings(frame, app, area, block),
-        Overlay::Palette => render_palette(frame, app, area, block),
-        Overlay::Command => {
-            frame.render_widget(
-                Paragraph::new(format!(":{}█", app.command_line))
-                    .block(block.title(" COMMAND · Enter run · Esc cancel "))
-                    .style(Style::default().fg(TEXT)),
-                area,
-            );
-        }
-        Overlay::Plugin => {
-            let document = app.tui_document.as_ref();
-            let title = document
-                .map(|document| format!(" {} · ↑/↓ scroll · Esc close ", document.title))
-                .unwrap_or_else(|| " PLUGIN PANEL ".to_string());
-            let body = document
-                .map(|document| document.body.as_str())
-                .unwrap_or("Plugin panel did not return content.");
-            frame.render_widget(
-                Paragraph::new(body)
-                    .block(block.title(title))
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.overlay_scroll, 0)),
-                area,
-            );
-        }
-    }
-}
-
-fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
-    let inner = block.inner(area);
-    frame.render_widget(
-        block.title(" MODELS · type to search · ↑/↓ select · Enter use · Ctrl+R refresh "),
-        area,
-    );
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(4),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let Some(selector) = app.model_selector.as_ref() else {
-        frame.render_widget(
-            Paragraph::new("Model catalog is not loaded.").style(Style::default().fg(MUTED)),
-            inner,
-        );
-        return;
-    };
-    let summary = if app.catalog_refreshing {
-        format!("{} refreshing pi.dev", animation::spinner(app.frame))
-    } else {
-        format!(
-            "{} matches · {} models · {} providers",
-            selector.visible_len(),
-            selector.model_count(),
-            selector.provider_count()
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("⌕  ", Style::default().fg(ACCENT)),
-            Span::styled(selector.query(), Style::default().fg(TEXT)),
-            Span::styled("█", Style::default().fg(ACCENT)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MUTED))
-                .title(format!(" SEARCH · {summary} ")),
-        ),
-        sections[0],
-    );
-
-    let narrow = sections[1].width < 82;
-    let provider_width: usize = if sections[1].width < 60 { 10 } else { 15 };
-    let name_width: usize = if sections[1].width < 60 { 18 } else { 30 };
-    let mut previous_provider = "";
-    let items = selector.visible().enumerate().map(|(position, model)| {
-        let selected = position == selector.selected_position();
-        let provider = if model.provider == previous_provider {
-            "│".to_string()
-        } else {
-            previous_provider = &model.provider;
-            model.provider.clone()
-        };
-        let current = if selector.is_current(model) {
-            "●"
-        } else {
-            " "
-        };
-        let capabilities = if narrow {
-            context_label(model.context_window())
-        } else {
-            format!(
-                "{}{} · {}",
-                context_label(model.context_window()),
-                if reasoning(model) { " · think" } else { "" },
-                model.api
-            )
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{current} {provider:<provider_width$}"),
-                Style::default().fg(if current == "●" { ACCENT } else { MUTED }),
-            ),
-            Span::styled(
-                format!(
-                    "{:<name_width$}",
-                    single_line_preview(model_label(model), name_width.saturating_sub(2))
-                ),
-                Style::default()
-                    .fg(if selected { ACCENT } else { TEXT })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(capabilities, Style::default().fg(MUTED)),
-        ]))
-        .style(Style::default().bg(if selected { BG } else { SURFACE }))
-    });
-    let mut state = ListState::default().with_selected(Some(selector.selected_position()));
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    for position in state.offset()..selector.visible_len() {
-        let y = sections[1]
-            .y
-            .saturating_add((position - state.offset()) as u16);
-        if y >= sections[1].bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[1].x, y, sections[1].width, 1),
-            target: AppHit::Model(position),
-        });
-    }
-
-    if let Some(model) = selector.selected() {
-        let reasoning_label = if reasoning(model) {
-            "reasoning"
-        } else {
-            "standard"
-        };
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        model_label(model),
-                        Style::default().fg(WARM).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  {}/{}", model.provider, model.id),
-                        Style::default().fg(MUTED),
-                    ),
-                ]),
-                Line::styled(
-                    format!(
-                        "{} context · {reasoning_label} · {}",
-                        context_label(model.context_window()),
-                        model.api
-                    ),
-                    Style::default().fg(TEXT),
-                ),
-                Line::styled(
-                    if selector.is_current(model) {
-                        if app.info.model_ready {
-                            "● current provider credential is ready"
-                        } else {
-                            "○ current provider needs a credential · open Settings"
-                        }
-                    } else {
-                        "Provider credentials are checked when this model is selected"
-                    },
-                    Style::default().fg(if selector.is_current(model) && !app.info.model_ready {
-                        WARM
-                    } else {
-                        MUTED
-                    }),
-                ),
-            ])
-            .block(Block::default().borders(Borders::TOP).title(" SELECTED ")),
-            sections[2],
-        );
-    } else {
-        let empty = if selector.model_count() == 0 {
-            "No runnable models are cached. Press Ctrl+R to fetch pi.dev, or configure models.json."
-        } else {
-            "No models match this search. Backspace to broaden it."
-        };
-        frame.render_widget(
-            Paragraph::new(empty)
-                .style(Style::default().fg(WARM))
-                .block(Block::default().borders(Borders::TOP)),
-            sections[2],
-        );
-    }
-    let footer = if sections[3].width < 74 {
-        "● current  ·  double-click applies  ·  Esc closes"
-    } else {
-        "● current  ·  mouse click selects  ·  double-click applies  ·  Esc closes"
-    };
-    frame.render_widget(
-        Paragraph::new(footer)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(MUTED)),
-        sections[3],
-    );
-}
-
-fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
-    let inner = block.inner(area);
-    let Some(settings) = app.settings.as_ref() else {
-        frame.render_widget(Paragraph::new("Loading settings…").block(block), area);
-        return;
-    };
-    let provider = settings.provider();
-    let model = settings
-        .model()
-        .map(|model| {
-            if model.name.is_empty() || model.name == model.id {
-                model.id.clone()
-            } else {
-                format!("{}  ·  {}", model.name, model.id)
-            }
-        })
-        .unwrap_or_else(|| settings.active.model.clone());
-    let provider = format!("{provider}  ·  Enter to choose");
-    let model = format!("{model}  ·  Enter to choose");
-    let key = if settings.editing == Some(EditingSetting::ApiKey) {
-        format!("{}█", "•".repeat(settings.api_key.chars().count().min(36)))
-    } else if settings.api_key_changed {
-        format!(
-            "{}  staged",
-            "•".repeat(settings.api_key.chars().count().min(36))
-        )
-    } else if settings.active.api_key.is_some() {
-        format!("configured  ·  {}", settings.active.api_key_source.label())
-    } else {
-        "not configured".to_string()
-    };
-    let output_limit = if settings.editing == Some(EditingSetting::OutputLimit) {
-        format!("{}█", settings.output_limit)
-    } else {
-        format!("{} bytes", settings.output_limit)
-    };
-    let editor = if settings.editing == Some(EditingSetting::Editor) {
-        format!("{}█", settings.editor)
-    } else if settings.editor.is_empty() {
-        "not configured".to_string()
-    } else {
-        settings.editor.clone()
-    };
-    let picker = if settings.editing == Some(EditingSetting::Picker) {
-        format!("{}█", settings.picker)
-    } else if settings.picker.is_empty() {
-        "not configured".to_string()
-    } else {
-        settings.picker.clone()
-    };
-    let rows = [
-        ("Provider", provider),
-        ("Model", model),
-        ("API key", key),
-        ("Output limit", output_limit),
-        ("Editor", editor),
-        ("Editor mode", format!("‹  {}  ›", settings.editor_mode)),
-        ("Picker", picker),
-        ("Picker mode", format!("‹  {}  ›", settings.picker_mode)),
-    ];
-    let mut lines = vec![
-        Line::styled(
-            "Model catalog from pi.dev · supported API families only",
-            Style::default().fg(MUTED),
-        ),
-        Line::default(),
-    ];
-    for (index, (label, value)) in rows.into_iter().enumerate() {
-        let selected = settings.selected == index;
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{label:<14}"),
-                Style::default()
-                    .fg(if selected { ACCENT } else { MUTED })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(value, Style::default().fg(TEXT)),
-        ]));
-        lines.push(Line::default());
-    }
-    lines.extend([
-        Line::styled(
-            "EFFECTIVE SOURCES",
-            Style::default().fg(WARM).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            format!(
-                "provider {} · model {} · limit {} · editor {} / {} · picker {} / {}",
-                settings.active.provider_source.label(),
-                settings.active.model_source.label(),
-                settings.active.output_limit_source.label(),
-                settings.active.editor_source.label(),
-                settings.active.editor_mode_source.label(),
-                settings.active.picker_source.label(),
-                settings.active.picker_mode_source.label()
-            ),
-            Style::default().fg(MUTED),
-        ),
-        Line::styled(
-            "Environment variables and command-line values override saved text files.",
-            Style::default().fg(MUTED),
-        ),
-        Line::default(),
-        Line::styled(
-            "↑/↓ field  ·  Enter edit/choose  ·  x clear key  ·  s save  ·  r refresh",
-            Style::default().fg(ACCENT),
-        ),
-    ]);
-    if let Some(flash) = app.visible_flash() {
-        lines.extend([
-            Line::default(),
-            Line::styled(flash, Style::default().fg(WARM)),
-        ]);
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block.title(" SETTINGS · Esc close "))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-    for index in 0..8 {
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(
-                inner.x,
-                inner.y.saturating_add(2 + index as u16 * 2),
-                inner.width,
-                1,
-            ),
-            target: AppHit::Setting(index),
-        });
-    }
-}
-
-fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
-    if app.task_records.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No managed tasks in this process.")
-                .block(block.title(" TASKS "))
-                .style(Style::default().fg(MUTED)),
-            area,
-        );
-        return;
-    }
-    let inner = block.inner(area);
-    frame.render_widget(
-        block.title(" TASKS · ↑/↓ select · e editor · x cancel "),
-        area,
-    );
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(inner);
-    let items = app.task_records.iter().enumerate().map(|(index, task)| {
-        let marker = if index == app.selected_task {
-            "›"
-        } else {
-            " "
-        };
-        ListItem::new(format!(
-            "{marker} {:9} {}",
-            task.status.as_str(),
-            task.label
-        ))
-        .style(Style::default().fg(if index == app.selected_task {
-            ACCENT
-        } else {
-            TEXT
-        }))
-    });
-    let mut state = ListState::default().with_selected(Some(app.selected_task));
-    frame.render_stateful_widget(List::new(items), columns[0], &mut state);
-    for index in state.offset()..app.task_records.len() {
-        let y = columns[0].y.saturating_add((index - state.offset()) as u16);
-        if y >= columns[0].y.saturating_add(columns[0].height) {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(columns[0].x, y, columns[0].width, 1),
-            target: AppHit::Task(index),
-        });
-    }
-    if let Some(task) = app.task_records.get(app.selected_task) {
-        let content = format!(
-            "{}://tasks/{}\n\nStatus: {}\n\n{}",
-            task.protocol,
-            task.id,
-            task.status.as_str(),
-            String::from_utf8_lossy(&task.content)
-        );
-        frame.render_widget(
-            Paragraph::new(content)
-                .style(Style::default().fg(TEXT))
-                .wrap(Wrap { trim: false })
-                .scroll((app.overlay_scroll, 0)),
-            columns[1].inner(Margin {
-                horizontal: 2,
-                vertical: 0,
-            }),
-        );
-    }
-}
-
-fn render_palette(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
-    let inner = block.inner(area);
-    frame.render_widget(
-        block.title(" COMMANDS · ↑/↓ select · Enter or click run · Esc close "),
-        area,
-    );
-    let commands = app.commands.list();
-    let items = commands.iter().enumerate().map(|(index, item)| {
-        let selected = index == app.palette_selected;
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{:<24}", item.title),
-                Style::default()
-                    .fg(if selected { ACCENT } else { TEXT })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(item.description.clone(), Style::default().fg(MUTED)),
-        ]))
-        .style(Style::default().bg(if selected { BG } else { SURFACE }))
-    });
-    let mut state = ListState::default().with_selected(Some(app.palette_selected));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
-    for index in state.offset()..commands.len() {
-        let y = inner.y.saturating_add((index - state.offset()) as u16);
-        if y >= inner.y.saturating_add(inner.height) {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(inner.x, y, inner.width, 1),
-            target: AppHit::Palette(index),
-        });
-    }
-}
-
-fn style_input(input: &mut TextArea<'static>, busy: bool) {
-    input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if busy { MUTED } else { ACCENT }))
-            .title(" INSERT ")
-            .style(Style::default().bg(SURFACE)),
-    );
-    input.set_style(Style::default().fg(TEXT).bg(SURFACE));
-    input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
-    input.set_cursor_style(Style::default().fg(BG).bg(ACCENT));
-}
-
-fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_percent) / 2),
-            Constraint::Percentage(height_percent),
-            Constraint::Percentage((100 - height_percent) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_percent) / 2),
-            Constraint::Percentage(width_percent),
-            Constraint::Percentage((100 - width_percent) / 2),
-        ])
-        .split(vertical[1])[1]
 }
 
 struct RestoreTerminal;
@@ -3284,7 +4046,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     fn test_app() -> App {
         App::new(
@@ -3298,295 +4059,398 @@ mod tests {
                 session_id: "session".to_string(),
                 context_window: 128_000,
                 model_ready: true,
-                editor: None,
-                editor_mode: ExternalMode::Float,
-                picker: Some("fzf".to_string()),
-                picker_mode: ExternalMode::Float,
+                provider_count: 1,
+                context_tokens: 0,
+                terminal: None,
             },
             Keymap::with_defaults().unwrap(),
+            String::new(),
         )
     }
 
+    fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
+        app.skip_splash();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
-    fn settings_panel_renders_sources_and_never_renders_the_api_key() {
+    fn unconfigured_brand_asks_for_login_instead_of_a_default_model() {
+        let mut app = test_app();
+        app.info.provider.clear();
+        app.info.model.clear();
+        app.info.model_ready = false;
+        let rendered = render_to_string(&mut app, 100, 24);
+        let compact = rendered
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains("尚未配置，请运行:login"));
+        assert!(!rendered.contains("gpt-5.2"));
+        assert!(!rendered.contains("openai/"));
+    }
+
+    #[test]
+    fn conversation_chrome_has_no_vim_modes_or_status_bar() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            false,
+        );
+        let rendered = render_to_string(&mut app, 100, 24);
+        // Once records exist the header and its animation are gone; the
+        // pi-style footer owns the bottom two lines.
+        assert!(!rendered.contains("URI Agent"));
+        assert!(!rendered.contains("ready"));
+        assert!(rendered.contains("/workspace"));
+        assert!(rendered.contains("0.0%/128k (auto)"));
+        assert!(rendered.contains("model"));
+        assert!(rendered.contains(": command"));
+        assert!(rendered.contains("?"));
+        assert!(
+            app.hit_regions
+                .iter()
+                .any(|region| region.target == AppHit::Help)
+        );
+        assert!(!rendered.contains("r thinking"));
+        assert!(!rendered.contains("BROWSE"));
+        assert!(!rendered.contains("INSERT"));
+        assert!(!rendered.contains("event 1/1"));
+    }
+
+    #[test]
+    fn footer_accumulates_usage_events_and_right_aligns_the_model() {
+        let mut app = test_app();
+        app.info.provider_count = 2;
+        app.info.context_tokens = 12_800;
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "hello".to_string(),
+            None,
+            false,
+            false,
+        );
+        app.apply(SessionEvent {
+            sequence: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::Usage {
+                input: 1_500,
+                output: 600,
+                cache_read: 500,
+                cache_write: 0,
+                cost: 0.0123,
+            },
+        });
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("↑1.5k"));
+        assert!(rendered.contains("↓600"));
+        assert!(rendered.contains("R500"));
+        assert!(rendered.contains("CH25.0%"));
+        assert!(rendered.contains("$0.012"));
+        assert!(rendered.contains("10.0%/128k (auto)"));
+        assert!(rendered.contains("(test) model"));
+        // Usage events update the footer without adding transcript blocks.
+        assert_eq!(app.blocks.len(), 1);
+    }
+
+    #[test]
+    fn git_branch_reads_heads_and_worktree_pointers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let git = workspace.path().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(git_branch(workspace.path()).as_deref(), Some("main"));
+        std::fs::write(git.join("HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(git_branch(workspace.path()).as_deref(), Some("detached"));
+
+        let real = workspace.path().join("real-git");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        let worktree = workspace.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}", real.display())).unwrap();
+        assert_eq!(git_branch(&worktree).as_deref(), Some("topic"));
+        assert_eq!(git_branch(Path::new("/definitely/not/a/repo")), None);
+    }
+
+    #[test]
+    fn selected_model_is_hidden_until_credentials_are_ready() {
+        let mut app = test_app();
+        app.info.provider = "google".to_string();
+        app.info.model = "gemini-3.1-pro-preview".to_string();
+        app.info.model_ready = false;
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            false,
+        );
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("no-model"));
+        assert!(!rendered.contains("google"));
+        assert!(!rendered.contains("gemini-3.1-pro-preview"));
+    }
+
+    #[test]
+    fn splash_uses_the_wordmark_then_conversation_replaces_it() {
+        let mut app = test_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let splash = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(splash.contains("URI AGENT"));
+        app.skip_splash();
+        let rendered = render_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("i compose"));
+    }
+
+    #[test]
+    fn composer_enter_sends_shift_enter_breaks_and_esc_keeps_draft() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("first");
+        assert_eq!(
+            app.keymap.action("composer", "shift+enter").as_deref(),
+            Some("newline")
+        );
+        app.input.insert_newline();
+        app.input.insert_str("second");
+        app.overlay = None;
+        assert_eq!(app.draft_text(), "first\nsecond");
+        app.overlay = Some(Overlay::Composer);
+        let prompt = app.submit().unwrap();
+        assert_eq!(prompt, "first\nsecond");
+        assert!(!app.has_draft());
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn enter_toggles_a_folded_history_block() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "secret chain".to_string(),
+            None,
+            false,
+            false,
+        );
+        app.toggle_selected();
+        assert!(app.blocks[0].expanded);
+        app.toggle_selected();
+        assert!(!app.blocks[0].expanded);
+    }
+
+    #[test]
+    fn jump_keys_move_between_matching_blocks() {
+        let mut app = test_app();
+        app.push(BlockKind::User, "YOU", "one".into(), None, false, false);
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "a".into(),
+            None,
+            false,
+            false,
+        );
+        app.push(BlockKind::User, "YOU", "two".into(), None, false, false);
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "b".into(),
+            None,
+            false,
+            false,
+        );
+        app.jump_to(JumpKind::User);
+        assert_eq!(app.jump, JumpKind::User);
+        assert_eq!(app.selected_block, 2);
+        app.jump_to(JumpKind::User);
+        assert_eq!(app.selected_block, 0);
+        app.jump_to(JumpKind::Reasoning);
+        assert_eq!(app.jump, JumpKind::Reasoning);
+        assert_eq!(app.blocks[app.selected_block].kind, BlockKind::Reasoning);
+    }
+
+    #[test]
+    fn terminal_command_rejects_an_empty_command() {
+        assert!(terminal_command("").is_err());
+        assert!(terminal_command("   ").is_err());
+        assert!(terminal_command("pwsh -NoLogo").is_ok());
+    }
+
+    #[test]
+    fn command_panel_tab_completes_unique_and_cycles_ambiguous_prefixes() {
+        let mut app = test_app();
+        app.command_line = "te".to_string();
+        app.complete_command(false);
+        assert_eq!(app.command_line, "terminal");
+
+        app.command_line = "t".to_string();
+        app.complete_command(false);
+        assert_eq!(app.command_line, "tasks");
+        app.complete_command(false);
+        assert_eq!(app.command_line, "terminal");
+        app.complete_command(false);
+        assert_eq!(app.command_line, "tasks");
+        app.complete_command(true);
+        assert_eq!(app.command_line, "terminal");
+
+        app.command_line = "q".to_string();
+        app.complete_command(false);
+        assert_eq!(app.command_line, "quit");
+
+        app.command_line = "terminal bash".to_string();
+        app.complete_command(false);
+        assert_eq!(app.command_line, "terminal bash");
+    }
+
+    #[test]
+    fn command_panel_tab_expands_common_prefix_before_cycling() {
+        let mut app = test_app();
+        app.command_line = "se".to_string();
+        app.complete_command(false);
+        assert_eq!(app.command_line, "set");
+        app.complete_command(false);
+        assert_eq!(app.command_line, "set-terminal");
+        app.complete_command(false);
+        assert_eq!(app.command_line, "settings");
+        app.complete_command(true);
+        assert_eq!(app.command_line, "set-terminal");
+    }
+
+    #[test]
+    fn login_selector_types_letters_that_are_list_motion_aliases() {
+        let mut app = test_app();
+        app.selector = Some(SelectorState::new(
+            SelectorKind::LoginProvider,
+            "LOGIN",
+            vec![
+                SelectorItem {
+                    id: "anthropic".to_string(),
+                    title: "anthropic".to_string(),
+                    description: "Claude".to_string(),
+                },
+                SelectorItem {
+                    id: "kimi".to_string(),
+                    title: "kimi".to_string(),
+                    description: "Kimi Code".to_string(),
+                },
+            ],
+        ));
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty());
+        let name = key_name(key);
+        assert!(matches!(
+            apply_selector_key(&mut app, key, &name),
+            SelectorKey::Continue
+        ));
+        let selector = app.selector.as_ref().unwrap();
+        assert_eq!(selector.query, "k");
+        assert_eq!(
+            selector.selected_item().map(|item| item.id.as_str()),
+            Some("kimi")
+        );
+    }
+
+    #[test]
+    fn colon_commands_include_login_logout_and_resume() {
+        let commands = CommandRegistry::with_core_commands();
+        assert_eq!(
+            commands.resolve(":login").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Login)
+        );
+        assert_eq!(
+            commands.resolve("logout").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Logout)
+        );
+        assert_eq!(
+            commands.resolve("resume").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Resume)
+        );
+        assert_eq!(
+            commands.resolve("sessions").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Resume)
+        );
+        assert_eq!(
+            commands.resolve(":terminal").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Terminal)
+        );
+        assert_eq!(
+            commands.resolve("set-terminal pwsh").unwrap().arguments,
+            "pwsh"
+        );
+        assert!(commands.resolve("editor").is_none());
+        assert!(commands.resolve("find").is_none());
+    }
+
+    #[test]
+    fn command_panel_lists_colon_commands() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Command);
+        let rendered = render_to_string(&mut app, 100, 32);
+        assert!(rendered.contains(":login"));
+        assert!(rendered.contains(":resume"));
+        assert!(!rendered.contains("Open in editor"));
+    }
+
+    #[test]
+    fn settings_panel_never_renders_the_api_key() {
         let active = ActiveSettings {
             provider: "openai".to_string(),
             model: "gpt-5.2".to_string(),
             api_key: Some("super-secret-value".to_string()),
+            auth_kind: AuthKind::ApiKey,
             output_limit: 32 * 1024,
-            editor: Some("nvim -f".to_string()),
-            editor_mode: ExternalMode::Float,
-            picker: Some("fzf".to_string()),
-            picker_mode: ExternalMode::Float,
             provider_source: ValueSource::Global,
             model_source: ValueSource::Global,
             api_key_source: ValueSource::Global,
             output_limit_source: ValueSource::Global,
-            editor_source: ValueSource::Global,
-            editor_mode_source: ValueSource::Global,
-            picker_source: ValueSource::Global,
-            picker_mode_source: ValueSource::Global,
+            terminal: None,
+            terminal_source: ValueSource::Global,
             credential_environment: BTreeMap::new(),
         };
-        let model = CatalogModel {
-            id: "gpt-5.2".to_string(),
-            name: "GPT-5.2".to_string(),
-            api: "openai-responses".to_string(),
-            provider: "openai".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            headers: BTreeMap::new(),
-            metadata: BTreeMap::new(),
-        };
-        let mut app = App::new(
-            Vec::new(),
-            Arc::new(CommandRegistry::with_core_commands()),
-            Arc::new(TuiRegistry::default()),
-            TuiInfo {
-                cwd: PathBuf::from("/workspace"),
-                provider: active.provider.clone(),
-                model: active.model.clone(),
-                session_id: "session".to_string(),
-                context_window: 128_000,
-                model_ready: true,
-                editor: active.editor.clone(),
-                editor_mode: active.editor_mode,
-                picker: active.picker.clone(),
-                picker_mode: active.picker_mode,
-            },
-            Keymap::default(),
-        );
+        let mut app = test_app();
         app.overlay = Some(Overlay::Settings);
         app.settings = Some(SettingsState {
             active,
-            model: Some(model),
+            model: None,
             selected: 0,
             editing: None,
             api_key: String::new(),
             api_key_changed: false,
             output_limit: "32768".to_string(),
-            editor: "nvim -f".to_string(),
-            editor_mode: ExternalMode::Float,
-            picker: "fzf".to_string(),
-            picker_mode: ExternalMode::Float,
         });
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
+        let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("SETTINGS"));
-        assert!(rendered.contains("GPT-5.2"));
-        assert!(rendered.contains("configured  ·  settings.json"));
+        assert!(rendered.contains("API key"));
         assert!(!rendered.contains("super-secret-value"));
+        assert!(!rendered.contains("Editor"));
+        assert!(!rendered.contains("fzf"));
     }
 
     #[test]
-    fn model_panel_search_metadata_and_mouse_targets_render_together() {
-        let catalog_model = |provider: &str, id: &str, name: &str| CatalogModel {
-            id: id.to_string(),
-            name: name.to_string(),
-            api: "openai-responses".to_string(),
-            provider: provider.to_string(),
-            base_url: String::new(),
-            headers: BTreeMap::new(),
-            metadata: BTreeMap::from([
-                ("contextWindow".to_string(), serde_json::json!(128_000)),
-                ("reasoning".to_string(), serde_json::json!(true)),
-            ]),
-        };
-        let mut app = test_app();
-        app.info.provider = "openai".to_string();
-        app.info.model = "gpt-5".to_string();
-        app.model_selector = Some(ModelSelector::from_models(
-            vec![
-                catalog_model("anthropic", "claude", "Claude Sonnet"),
-                catalog_model("openai", "gpt-5", "GPT 5"),
-            ],
-            "openai",
-            "gpt-5",
-        ));
-        app.overlay = Some(Overlay::Models);
-        let backend = TestBackend::new(120, 36);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("MODELS"));
-        assert!(rendered.contains("GPT 5"));
-        assert!(rendered.contains("128k"));
-        assert!(rendered.contains("credential is ready"));
-        assert_eq!(
-            app.hit_regions
-                .iter()
-                .filter(|region| matches!(region.target, AppHit::Model(_)))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn welcome_and_model_panel_degrade_without_panicking_on_small_terminals() {
-        for (width, height) in [(48, 12), (80, 24), (140, 44)] {
-            let mut app = test_app();
-            let backend = TestBackend::new(width, height);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        }
-
-        let mut app = test_app();
-        app.model_selector = Some(ModelSelector::from_models(Vec::new(), "test", "model"));
-        app.overlay = Some(Overlay::Models);
-        let backend = TestBackend::new(48, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    }
-
-    #[test]
-    fn activity_status_follows_stream_events() {
-        let mut app = test_app();
-        let event = |sequence, kind| SessionEvent {
-            sequence,
-            at: chrono::Utc::now(),
-            kind,
-        };
-        app.apply(event(
-            1,
-            EventKind::User {
-                text: "inspect files".to_string(),
-            },
-        ));
-        assert!(app.busy);
-        assert!(matches!(&app.activity, Some(Activity::Thinking)));
-        app.apply(event(
-            2,
-            EventKind::ToolCall {
-                call_id: "call".to_string(),
-                name: "read".to_string(),
-                arguments: serde_json::json!({"uri": "file://src/main.rs"}),
-            },
-        ));
-        assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
-        app.apply(event(3, EventKind::TurnFinished));
-        assert!(!app.busy);
-        assert!(app.activity.is_none());
-    }
-
-    #[tokio::test]
-    async fn insert_enter_adds_a_line_then_escape_preserves_and_browse_enter_submits() {
-        let mut app = test_app();
-        let tasks = TaskManager::new();
-        app.mode = Mode::Insert;
-        app.input.insert_str("first");
-
-        let action = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tasks,
-        )
-        .await;
-        assert!(matches!(action, Action::Continue));
-        assert!(app.mode == Mode::Insert);
-        assert_eq!(app.input.lines(), ["first", ""]);
-
-        app.input.insert_str("second");
-        let action = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &tasks,
-        )
-        .await;
-        assert!(matches!(action, Action::Continue));
-        assert!(app.mode == Mode::Browse);
-        assert_eq!(app.input.lines(), ["first", "second"]);
-
-        let action = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tasks,
-        )
-        .await;
-        assert!(matches!(action, Action::Submit(prompt) if prompt == "first\nsecond"));
-        assert!(!app.has_draft());
-    }
-
-    #[tokio::test]
-    async fn browse_enter_without_a_draft_opens_the_selected_event() {
-        let mut app = test_app();
-        let tasks = TaskManager::new();
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            "answer".to_string(),
-            None,
-            false,
-        );
-
-        let action = handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tasks,
-        )
-        .await;
-
-        assert!(matches!(action, Action::Continue));
-        assert!(app.overlay == Some(Overlay::Detail));
-    }
-
-    #[test]
-    fn conversation_chrome_has_no_persistent_shortcut_or_estimate_noise() {
-        let mut app = test_app();
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            "answer".to_string(),
-            None,
-            false,
-        );
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("BROWSE"));
-        assert!(rendered.contains("test/model"));
-        assert!(rendered.contains("event 1/1"));
-        assert!(!rendered.contains("ctx"));
-        assert!(!rendered.contains("protocols"));
-        assert!(!rendered.contains("Space commands"));
-    }
-
-    #[test]
-    fn status_notices_expire_instead_of_becoming_permanent_chrome() {
-        let mut app = test_app();
-        app.set_flash("saved");
-        assert_eq!(app.visible_flash(), Some("saved"));
-
-        app.flash_at = Some(Instant::now() - FLASH_DURATION);
-        assert_eq!(app.visible_flash(), None);
-    }
-
-    #[test]
-    fn tool_call_and_result_share_one_preview_and_one_complete_detail() {
+    fn tool_call_and_result_share_one_block() {
         let mut app = test_app();
         app.apply(SessionEvent {
             sequence: 1,
@@ -3607,38 +4471,45 @@ mod tests {
                 failed: false,
             },
         });
-
         assert_eq!(app.blocks.len(), 1);
-        assert_eq!(app.blocks[0].title, "TOOL · read");
         assert!(app.blocks[0].text.contains("CALL"));
         assert!(app.blocks[0].text.contains("RESULT"));
-        let detail = block_document(&app.blocks[0]);
-        assert!(detail.contains("file://src/main.rs"));
-        assert!(detail.contains("complete tool output"));
-        assert!(!single_line_preview(&app.blocks[0].text, 18).contains('\n'));
+        assert!(block_document(&app.blocks[0]).contains("complete tool output"));
     }
 
     #[test]
-    fn automatic_compaction_keeps_the_turn_busy_but_manual_compaction_finishes() {
+    fn activity_status_follows_stream_events() {
         let mut app = test_app();
-        app.busy = true;
-        let compaction = |sequence, manual| SessionEvent {
-            sequence,
+        app.apply(SessionEvent {
+            sequence: 1,
             at: chrono::Utc::now(),
-            kind: EventKind::Compaction {
-                summary: "checkpoint".to_string(),
-                tokens_before: 100,
-                replacement_history: Vec::new(),
-                manual,
+            kind: EventKind::User {
+                text: "inspect files".to_string(),
             },
-        };
-
-        app.apply(compaction(1, false));
+        });
         assert!(app.busy);
-
-        app.apply(compaction(2, true));
+        app.apply(SessionEvent {
+            sequence: 2,
+            at: chrono::Utc::now(),
+            kind: EventKind::ToolCall {
+                call_id: "call".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"uri": "file://src/main.rs"}),
+            },
+        });
+        assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
+        app.apply(SessionEvent {
+            sequence: 3,
+            at: chrono::Utc::now(),
+            kind: EventKind::TurnFinished,
+        });
         assert!(!app.busy);
-        assert!(app.flash.as_deref().unwrap().contains("retained"));
+        assert!(
+            app.blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Tool)
+                .all(|block| !block.expanded)
+        );
     }
 
     #[test]
@@ -3648,105 +4519,41 @@ mod tests {
             "ctrl+e"
         );
         assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            "shift+enter"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT)),
+            ":"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            "?"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char('：'), KeyModifiers::empty())),
+            ":"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char('？'), KeyModifiers::SHIFT)),
+            "?"
+        );
+        assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             "shift+g"
         );
-        assert_eq!(
-            key_name(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
-            "space"
-        );
     }
 
     #[test]
-    fn colon_commands_share_the_palette_command_set() {
-        let commands = CommandRegistry::with_core_commands();
+    fn windows_verbatim_cwd_prefix_is_not_shown() {
         assert_eq!(
-            commands.resolve(":settings").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Settings)
+            display_cwd(Path::new(r"\\?\C:\Users\4fu\project")),
+            r"C:\Users\4fu\project"
         );
         assert_eq!(
-            commands.resolve("model").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Models)
+            display_cwd(Path::new(r"\\?\UNC\server\share")),
+            r"\\server\share"
         );
-        assert_eq!(
-            commands.resolve("compact").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Compact)
-        );
-        assert!(commands.resolve("sessions").is_none());
-        assert_eq!(
-            commands.resolve("q").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Quit)
-        );
-        assert!(commands.resolve("unknown").is_none());
-    }
-
-    #[test]
-    fn command_panel_renders_clickable_items() {
-        let mut app = test_app();
-        app.overlay = Some(Overlay::Palette);
-        app.palette_selected = 2;
-        let backend = TestBackend::new(100, 32);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("COMMANDS"));
-        assert!(rendered.contains("Open in editor"));
-        assert_eq!(
-            app.hit_regions
-                .iter()
-                .filter(|region| matches!(region.target, AppHit::Palette(_)))
-                .count(),
-            app.commands.list().len()
-        );
-    }
-
-    #[test]
-    fn command_line_renders_entered_text() {
-        let mut app = test_app();
-        app.overlay = Some(Overlay::Command);
-        app.command_line = "settings".to_string();
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains(":settings█"));
-    }
-
-    #[test]
-    fn mouse_hit_testing_uses_rendered_regions() {
-        let regions = [HitRegion {
-            area: Rect::new(10, 5, 20, 2),
-            target: AppHit::Transcript(4),
-        }];
-        let inside = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 12,
-            row: 6,
-            modifiers: KeyModifiers::NONE,
-        };
-        let outside = MouseEvent {
-            column: 30,
-            ..inside
-        };
-
-        assert_eq!(hit_target(&regions, inside), Some(AppHit::Transcript(4)));
-        assert_eq!(hit_target(&regions, outside), None);
     }
 
     #[test]

@@ -19,8 +19,6 @@ URI Agent 是一个终端 coding agent，以精简且稳定的模型接口为核
 - 受支持 Provider 的 API key；
 - 支持标准键盘输入的终端。鼠标支持可选。
 
-[Helix](https://helix-editor.com/) 和 [fzf](https://github.com/junegunn/fzf) 不是必需依赖。它们分别用于默认外部编辑器和会话内容查找器；即使未安装，URI Agent 仍可运行。
-
 ### 从源码安装
 
 ```bash
@@ -31,23 +29,21 @@ cargo install --path .
 
 ### 启动会话
 
-全新配置默认使用 OpenAI。设置 API key，并让 URI Agent 在目标项目中启动：
+URI Agent 不会预设默认模型。在目标项目中启动后，运行 `:login` 和 `:model`：
 
 ```bash
-export OPENAI_API_KEY="<your-api-key>"
 uri-agent --cwd /path/to/project
 ```
 
-也可以在没有 key 的情况下启动，按 `F2` 在 Settings 中配置 Provider、模型与凭据。按 `F3` 可搜索当前可运行的模型目录。
+尚未配置时，界面显示 `尚未配置，请运行 :login`。`:login` 用于保存 API key 或完成 Anthropic OAuth；`:model` 从可运行目录中选择模型。
 
 发送第一条请求：
 
-1. 按 `i` 进入 Insert 模式。
-2. 输入请求；`Enter` 用于换行。
-3. 按 `Esc` 保留草稿并返回 Browse 模式。
-4. 在 Browse 模式按 `Enter` 提交。
+1. 按 `i` 打开输入浮窗。
+2. 输入请求；`Shift+Enter` 换行。
+3. 按 `Enter` 发送。`Esc` 会把草稿保存在 SQLite 中。
 
-按 `Space` 打开命令面板，或按 `F1` 查看当前生效的快捷键与命令参考。
+按 `:` 打开命令面板，或按 `F1` 查看当前生效的快捷键与命令参考。
 
 ## 为什么使用协议
 
@@ -141,19 +137,19 @@ URI Agent 使用 [pi](https://github.com/badlogic/pi-mono) 模型目录，目前
 - `anthropic-messages`
 - `google-generative-ai`
 
-模型选择器只展示可运行的 API family。当前仅支持 API key 认证；需要 OAuth 或云环境凭据的 Provider 可能出现在目录中，但没有专用适配器就无法运行。
+模型选择器只展示可运行的 API family。`:login` 对齐 Pi Agent：API key，以及 Anthropic、OpenRouter、OpenAI Codex、GitHub Copilot、Kimi Code、xAI 和 Radius 的 OAuth。存储格式与 Pi 的 `auth.json` 相同（`type: "api_key"` 或 `type: "oauth"`）。
 
 目录缓存四小时。使用 `--offline`、`URI_AGENT_OFFLINE=1` 或 `PI_OFFLINE=1` 可禁用目录请求，只使用本地数据。在模型选择器或 Settings 中按 `Ctrl+R` 可刷新目录。
 
 ## 配置
 
-按 `F2` 可编辑当前 Provider、模型、凭据、输出上限、外部编辑器、会话内容查找器及二者的显示模式。更改会立即应用到当前会话。
+按 `:settings` 可查看当前 Provider、模型、凭据状态和输出上限。凭据用 `:login` / `:logout`，换模型用 `:model`。更改会立即应用到当前会话。
 
 Linux 默认配置目录为 `~/.config/uri-agent`；可通过 `URI_AGENT_CONFIG_DIR` 指定其他位置。
 
 | 文件 | 用途 |
 | --- | --- |
-| `settings.json` | 全局 Provider、模型、输出、编辑器和查找器设置 |
+| `settings.json` | 全局 Provider、模型、输出和终端设置 |
 | `auth.json` | 全局 Provider 凭据；Unix 上创建为 `0600` 权限 |
 | `models.json` | 用户定义的 Provider、模型、header 和模型覆盖 |
 | `models-store.json` | 程序生成的 pi 目录缓存 |
@@ -185,10 +181,6 @@ models.json apiKey
 --continue-session       恢复该项目最近的会话
 --session <ID|latest>    恢复指定会话
 --output-limit <BYTES>   设置内联输出大小（最小 1024）
---editor <COMMAND>       设置外部编辑器
---editor-mode <MODE>     使用 float 或 fullscreen
---picker <COMMAND>       设置会话内容查找器
---picker-mode <MODE>     使用 float 或 fullscreen
 --offline                禁用 pi 目录网络请求
 ```
 
@@ -232,24 +224,28 @@ models.json apiKey
 
 ## 终端界面
 
-| 上下文 | 常用默认按键 |
-| --- | --- |
-| Browse | `↑/↓` 选择，`Enter` 提交/打开，`i` 编辑，`o` 详情，`Space` 命令面板，`:` 命令行 |
-| Insert | `Enter` 换行，`Ctrl+E` 外部编辑器，`Esc` 保留草稿并返回 Browse |
-| Detail | `↑/↓` 和 `PageUp/PageDown` 滚动，`e` 外部编辑器，`Esc` 关闭 |
-| Global | `F1` 帮助，`F2` 设置，`F3` 模型，`Ctrl+P` 协议，`Ctrl+T` 任务，`Ctrl+C` 退出 |
+启动时先播放短动画，随后进入单一会话界面。空会话保留动画品牌页；一旦出现记录，界面变为默认折叠的历史，底部是 pi 风格的页脚：第一行 `cwd (分支)`，第二行是累计 token 用量、成本、上下文占用和当前模型，最后一行是提示。
 
-方向键和鼠标是一等操作，`j`、`k` 只是可选别名。只读面板支持鼠标选择与 OSC52 复制；交互式 PTY 使用 Shift 拖选，使普通点击仍能传给内嵌程序。
+| 界面 | 常用默认按键 |
+| --- | --- |
+| 会话 | `i` 输入，`:` 命令，`?` 帮助，`Enter` 展开/折叠，`r`/`t`/`h` 在思维链/工具/用户消息间跳转 |
+| 输入浮窗 | `Enter` 发送，`Shift+Enter` 换行，`Esc` 保留草稿 |
+| 命令面板 | 输入过滤，`Tab` 补全，`Enter` 执行，`Esc` 关闭 |
+| 全局 | `F1` 帮助，`F2` 设置，`F3` 模型，`Ctrl+C` 退出 |
+
+常用冒号命令：`:login`、`:logout`、`:model`、`:resume`、`:new`、`:set-terminal`、`:terminal`、`:compact`、`:help`、`:q`。
+
+`:set-terminal` 保存浮窗终端命令（如 `pwsh`、`bash`）。`:terminal` 以 PTY 浮窗打开；连按两次 `Esc` 关闭。Shift 拖选文字，普通点击仍交给终端程序。
+
+方向键和鼠标是一等操作，`j`、`k` 只是可选别名。只读视图支持鼠标选择与 OSC52 复制。
 
 快捷键按内置默认值、全局 `keymap.rhai`、项目 `keymap.rhai` 的顺序分层加载。每个文件都可以映射或移除 action：
 
 ```rhai
-map("browse", "x", "detail");
-unmap("browse", "e");
-map("insert", "ctrl+j", "newline");
+map("main", "x", "copy");
+unmap("main", "j");
+map("composer", "ctrl+j", "newline");
 ```
-
-Helix（`hx`）和 fzf 默认运行在内嵌 PTY 浮窗中。如果应用需要暂时接管终端，可在 Settings 中将其模式设为 `fullscreen`。GUI 编辑器应带有等待参数，例如 `code --wait`。
 
 ## 扩展 URI Agent
 

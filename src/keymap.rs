@@ -16,77 +16,64 @@ map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");
 map("global", "ctrl+shift+c", "copy");
 
-map("browse", "space", "palette");
-map("browse", ":", "command");
-map("browse", "/", "finder");
-map("browse", "i", "insert");
-map("browse", "j", "next");
-map("browse", "down", "next");
-map("browse", "k", "previous");
-map("browse", "up", "previous");
-map("browse", "ctrl+d", "page_down");
-map("browse", "pagedown", "page_down");
-map("browse", "ctrl+u", "page_up");
-map("browse", "pageup", "page_up");
-map("browse", "g", "first");
-map("browse", "home", "first");
-map("browse", "shift+g", "last");
-map("browse", "end", "last");
-map("browse", "enter", "submit");
-map("browse", "o", "detail");
-map("browse", "e", "editor");
-map("browse", "y", "copy");
-map("browse", "q", "quit");
+map("main", "i", "compose");
+map("main", ":", "command");
+map("main", "?", "help");
+map("main", "r", "jump_reasoning");
+map("main", "t", "jump_tools");
+map("main", "h", "jump_user");
+map("main", "down", "next");
+map("main", "up", "previous");
+map("main", "j", "next");
+map("main", "k", "previous");
+map("main", "pagedown", "page_down");
+map("main", "pageup", "page_up");
+map("main", "home", "first");
+map("main", "end", "last");
+map("main", "enter", "toggle");
+map("main", "esc", "clear");
+map("main", "y", "copy");
+map("main", "q", "quit");
 
-map("insert", "esc", "browse");
-map("insert", "enter", "newline");
-map("insert", "shift+enter", "newline");
-map("insert", "ctrl+e", "editor");
-map("insert", "ctrl+d", "quit_empty");
+map("composer", "enter", "submit");
+map("composer", "shift+enter", "newline");
+map("composer", "ctrl+enter", "newline");
+map("composer", "ctrl+j", "newline");
+map("composer", "esc", "close");
 
-map("detail", "j", "scroll_down");
-map("detail", "down", "scroll_down");
-map("detail", "k", "scroll_up");
-map("detail", "up", "scroll_up");
-map("detail", "pagedown", "page_down");
-map("detail", "pageup", "page_up");
-map("detail", "e", "editor");
-map("detail", "esc", "close");
-
-map("list", "j", "next");
 map("list", "down", "next");
-map("list", "k", "previous");
 map("list", "up", "previous");
+map("list", "j", "next");
+map("list", "k", "previous");
 map("list", "pagedown", "page_down");
 map("list", "pageup", "page_up");
+map("list", "enter", "confirm");
 map("list", "esc", "close");
 
-map("tasks", "e", "editor");
-map("tasks", "x", "cancel");
+map("selector", "down", "next");
+map("selector", "up", "previous");
+map("selector", "enter", "confirm");
+map("selector", "esc", "close");
+map("selector", "backspace", "backspace");
 
-map("palette", "j", "next");
-map("palette", "down", "next");
-map("palette", "k", "previous");
-map("palette", "up", "previous");
-map("palette", "enter", "confirm");
-map("palette", "esc", "close");
+map("tasks", "x", "cancel");
 
 map("command", "enter", "confirm");
 map("command", "esc", "cancel");
 map("command", "backspace", "backspace");
+map("command", "up", "previous");
+map("command", "down", "next");
+map("command", "tab", "complete");
+map("command", "backtab", "complete_previous");
+map("command", "shift+tab", "complete_previous");
 
-map("settings", "j", "next");
 map("settings", "down", "next");
-map("settings", "k", "previous");
 map("settings", "up", "previous");
-map("settings", "h", "left");
-map("settings", "left", "left");
-map("settings", "l", "right");
-map("settings", "right", "right");
+map("settings", "j", "next");
+map("settings", "k", "previous");
 map("settings", "enter", "edit");
 map("settings", "s", "save");
 map("settings", "r", "refresh");
-map("settings", "x", "clear");
 map("settings", "esc", "close");
 
 map("models", "up", "previous");
@@ -103,6 +90,16 @@ map("models", "ctrl+r", "refresh");
 map("text", "enter", "confirm");
 map("text", "esc", "cancel");
 map("text", "backspace", "backspace");
+
+map("oauth", "enter", "confirm");
+map("oauth", "esc", "cancel");
+map("oauth", "backspace", "backspace");
+
+map("document", "up", "scroll_up");
+map("document", "down", "scroll_down");
+map("document", "pageup", "page_up");
+map("document", "pagedown", "page_down");
+map("document", "esc", "close");
 
 map("selection", "y", "copy");
 map("selection", "ctrl+shift+c", "copy");
@@ -141,6 +138,7 @@ impl Keymap {
     }
 
     pub fn action_chain(&self, modes: &[&str], key: &str) -> Option<String> {
+        let key = canonical_key(key);
         let bindings = self.bindings.lock().unwrap();
         modes
             .iter()
@@ -203,10 +201,10 @@ impl Keymap {
         engine.register_fn(
             "map",
             move |mode: ImmutableString, key: ImmutableString, action: ImmutableString| {
-                mapped
-                    .lock()
-                    .unwrap()
-                    .insert((mode.to_string(), key.to_string()), action.to_string());
+                mapped.lock().unwrap().insert(
+                    (mode.to_string(), canonical_key(&key).to_string()),
+                    action.to_string(),
+                );
             },
         );
         let unmapped = self.bindings.clone();
@@ -216,12 +214,20 @@ impl Keymap {
                 unmapped
                     .lock()
                     .unwrap()
-                    .remove(&(mode.to_string(), key.to_string()));
+                    .remove(&(mode.to_string(), canonical_key(&key).to_string()));
             },
         );
         engine
             .eval::<()>(source)
             .with_context(|| format!("cannot evaluate {label}"))
+    }
+}
+
+pub(crate) fn canonical_key(key: &str) -> &str {
+    match key {
+        "：" => ":",
+        "？" => "?",
+        other => other,
     }
 }
 
@@ -263,15 +269,15 @@ mod tests {
         keymap
             .evaluate(
                 r#"
-                map("browse", "x", "finder");
-                unmap("browse", "j");
+                map("main", "x", "copy");
+                unmap("main", "j");
                 "#,
                 "test",
             )
             .unwrap();
-        assert_eq!(keymap.action("browse", "x").as_deref(), Some("finder"));
-        assert_eq!(keymap.action("browse", "j"), None);
-        assert_eq!(keymap.action("browse", "f1").as_deref(), Some("help"));
+        assert_eq!(keymap.action("main", "x").as_deref(), Some("copy"));
+        assert_eq!(keymap.action("main", "j"), None);
+        assert_eq!(keymap.action("main", "f1").as_deref(), Some("help"));
     }
 
     #[test]
@@ -279,20 +285,36 @@ mod tests {
         let keymap = Keymap::default();
         keymap.evaluate(DEFAULT_KEYMAP, "defaults").unwrap();
 
-        assert_eq!(keymap.action("browse", "down").as_deref(), Some("next"));
-        assert_eq!(keymap.action("browse", "up").as_deref(), Some("previous"));
-        assert_eq!(keymap.key_for("browse", "previous").as_deref(), Some("up"));
-        assert_eq!(keymap.action("browse", "space").as_deref(), Some("palette"));
-        assert_eq!(keymap.action("browse", ":").as_deref(), Some("command"));
-        assert_eq!(keymap.action("browse", "enter").as_deref(), Some("submit"));
-        assert_eq!(keymap.action("browse", "o").as_deref(), Some("detail"));
-        assert_eq!(keymap.action("insert", "enter").as_deref(), Some("newline"));
-        assert_eq!(keymap.action("insert", "esc").as_deref(), Some("browse"));
+        assert_eq!(keymap.action("main", "down").as_deref(), Some("next"));
+        assert_eq!(keymap.action("main", "up").as_deref(), Some("previous"));
+        assert_eq!(keymap.key_for("main", "previous").as_deref(), Some("up"));
+        assert_eq!(keymap.action("main", ":").as_deref(), Some("command"));
+        assert_eq!(keymap.action("main", "：").as_deref(), Some("command"));
+        assert_eq!(keymap.action("main", "?").as_deref(), Some("help"));
+        assert_eq!(keymap.action("main", "？").as_deref(), Some("help"));
+        assert_eq!(keymap.action("main", "i").as_deref(), Some("compose"));
         assert_eq!(
-            keymap.action("palette", "enter").as_deref(),
+            keymap.action("main", "r").as_deref(),
+            Some("jump_reasoning")
+        );
+        assert_eq!(
+            keymap.action("composer", "enter").as_deref(),
+            Some("submit")
+        );
+        assert_eq!(
+            keymap.action("composer", "shift+enter").as_deref(),
+            Some("newline")
+        );
+        assert_eq!(keymap.action("composer", "esc").as_deref(), Some("close"));
+        assert_eq!(
+            keymap.action("command", "enter").as_deref(),
             Some("confirm")
         );
+        assert_eq!(keymap.action("command", "tab").as_deref(), Some("complete"));
         assert_eq!(keymap.action("global", "f3").as_deref(), Some("model"));
         assert_eq!(keymap.action("models", "down").as_deref(), Some("next"));
+        assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
+        assert_eq!(keymap.action("selector", "k"), None);
+        assert_eq!(keymap.action("terminal", "esc").as_deref(), Some("escape"));
     }
 }

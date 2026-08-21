@@ -31,13 +31,17 @@ Capabilities are registered as protocols and document their operational contract
 - Session events are append-only. Compaction adds a SQLite checkpoint and changes model replay without deleting original events.
 - Compaction boundaries must be complete user turns; never separate a tool call from its result.
 - The canonical launch directory is the project boundary. Latest and explicit session resume must not cross it.
-- Browse, Insert, and Detail remain separate TUI contexts. Conversation rows are previews; complete messages, reasoning, and tool calls/results remain inspectable.
-- Insert edits a draft: `Enter` inserts a newline and `Esc` preserves the draft. Browse submits a non-empty draft with `Enter` and otherwise opens the selected event.
+- The TUI is a single conversation surface. There are no Browse/Insert/Detail modes and no persistent status bar.
+- Startup may show the splash animation, then replace it with the conversation view. An empty conversation keeps the animated brand view; once records exist there is no header, and the bottom shows a pi-style footer (`cwd (branch)`, usage/cost/context meter, model) with hints on the last line.
+- `i` opens a floating composer: `Enter` sends, `Shift+Enter` inserts a newline, and `Esc` keeps the draft in SQLite.
+- `:` opens the colon command panel anywhere except inside an open float. There are no slash commands.
+- Commands that need a choice or extra text open a floating selector or input. Do not add a second command syntax.
+- History rows stay folded until opened. Click or `Enter` expands a row, including reasoning. `r`, `t`, and `h` jump among reasoning, tool, and user rows.
 - Arrow keys and mouse input are first-class. `j`/`k` may be aliases, but defaults and help must not require Vim knowledge.
 - Route configurable keys through the layered Rhai keymap. Do not add modeless hard-coded shortcuts for configurable actions.
 - Route palette entries, colon commands, and key-bindable command IDs through `CommandRegistry`.
 - Keep plugin-specific behavior in registered protocols, commands, or panel providers. TUI panel rendering stays generic.
-- Preserve embedded PTY cleanup, terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
+- Preserve terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
 
 ## Repository map
 
@@ -57,7 +61,8 @@ Capabilities are registered as protocols and document their operational contract
 - `src/plugin.rs` — protocol, command, and generic TUI panel registration.
 - `src/keymap.rs` — default Rhai mappings and global/project overlays.
 - `src/terminal.rs` — embedded PTY lifecycle, emulation, resize, and input encoding.
-- `src/tui.rs` — Browse/Insert/Detail behavior, overlays, editor/finder integration, selection, and rendering.
+- `src/oauth.rs` — Anthropic OAuth login, callback server, and token refresh.
+- `src/tui.rs` — splash, conversation surface, composer/command floats, selectors, and rendering.
 
 Put behavior in the module that owns it. Before adding a wrapper, helper, or type, check whether changing the existing source of truth is clearer. Avoid one-use abstractions unless they enforce a named invariant.
 
@@ -83,10 +88,7 @@ Put behavior in the module that owns it. Before adding a wrapper, helper, or typ
 
 - Keep the interface keyboard-complete and preserve mouse hit regions for selectable lists and command panels.
 - Register extension commands and panels through `PluginHost`; do not add extension-specific branches to `src/tui.rs`.
-- External editor and finder commands must work as embedded PTY floats and configurable fullscreen handoffs.
-- Closing an embedded PTY must terminate its child and reader thread.
-- Before a fullscreen handoff, restore the terminal; after return, recreate the event stream and terminal modes.
-- Ordinary clicks must reach interactive programs. Use the existing Shift-selection behavior there and direct drag selection in read-only views.
+- Direct drag selection in read-only views; Shift-drag when a float needs to keep ordinary clicks.
 
 ### Scope and generated data
 
@@ -96,7 +98,7 @@ Put behavior in the module that owns it. Before adding a wrapper, helper, or typ
 
 ## Verification
 
-Use stable Rust. Add focused tests beside changed behavior. Shared protocol, task, session, compaction, or model-loop changes need both a normal-path test and the affected boundary-condition test. TUI changes should cover the affected mode and input path.
+Use stable Rust. Add focused tests beside changed behavior. Shared protocol, task, session, compaction, or model-loop changes need both a normal-path test and the affected boundary-condition test. TUI changes should cover the affected surface and input path.
 
 Before completing a code change, run:
 

@@ -8,17 +8,20 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreCommand {
     Compose,
-    Detail,
-    Editor,
-    Finder,
     Copy,
     Tasks,
     Protocols,
     Models,
     Settings,
+    Login,
+    Logout,
+    Resume,
+    NewSession,
     Compact,
     Help,
     Quit,
+    SetTerminal,
+    Terminal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,7 +109,7 @@ impl CommandRegistry {
     }
 
     pub fn resolve(&self, input: &str) -> Option<ResolvedCommand> {
-        let input = input.trim().trim_start_matches(':').trim_start();
+        let input = input.trim().trim_start_matches([':', '：']).trim_start();
         let split = input.find(char::is_whitespace).unwrap_or(input.len());
         let name = &input[..split];
         let id = self.names.get(name)?;
@@ -142,30 +145,9 @@ fn core_commands() -> Vec<CommandSpec> {
         CommandSpec::new(
             "compose",
             "Compose message",
-            "enter Insert mode",
+            "open the floating composer",
             ["insert"],
             CommandTarget::Core(Compose),
-        ),
-        CommandSpec::new(
-            "detail",
-            "Open event detail",
-            "inspect the selected event",
-            ["open"],
-            CommandTarget::Core(Detail),
-        ),
-        CommandSpec::new(
-            "editor",
-            "Open in editor",
-            "use the configured external editor",
-            ["edit"],
-            CommandTarget::Core(Editor),
-        ),
-        CommandSpec::new(
-            "find",
-            "Find conversation event",
-            "search previews with the configured picker",
-            ["search", "picker"],
-            CommandTarget::Core(Finder),
         ),
         CommandSpec::new(
             "copy",
@@ -198,9 +180,37 @@ fn core_commands() -> Vec<CommandSpec> {
         CommandSpec::new(
             "settings",
             "Settings",
-            "credentials, limits, editor, picker, and display modes",
-            ["login"],
+            "model, credential status, and output limit",
+            std::iter::empty::<&str>(),
             CommandTarget::Core(Settings),
+        ),
+        CommandSpec::new(
+            "login",
+            "Log in",
+            "save an API key or complete provider OAuth",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Login),
+        ),
+        CommandSpec::new(
+            "logout",
+            "Log out",
+            "remove a stored provider credential",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Logout),
+        ),
+        CommandSpec::new(
+            "resume",
+            "Resume session",
+            "switch to another session in this project",
+            ["sessions"],
+            CommandTarget::Core(Resume),
+        ),
+        CommandSpec::new(
+            "new",
+            "New session",
+            "start a new session in this project",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(NewSession),
         ),
         CommandSpec::new(
             "compact",
@@ -222,6 +232,20 @@ fn core_commands() -> Vec<CommandSpec> {
             "close URI Agent",
             ["q"],
             CommandTarget::Core(Quit),
+        ),
+        CommandSpec::new(
+            "set-terminal",
+            "Set default terminal",
+            "save the command used by :terminal",
+            ["terminal-set"],
+            CommandTarget::Core(SetTerminal),
+        ),
+        CommandSpec::new(
+            "terminal",
+            "Open terminal",
+            "open the default terminal in a float",
+            ["term"],
+            CommandTarget::Core(Terminal),
         ),
     ]
 }
@@ -316,6 +340,10 @@ mod tests {
         assert_eq!(
             registry.resolve(":model").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Models)
+        );
+        assert_eq!(
+            registry.resolve("：login").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Login)
         );
         assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
     }

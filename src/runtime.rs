@@ -1,9 +1,11 @@
+use crate::catalog::ModelLimits;
 use crate::compaction;
 use crate::model::{ModelBackend, ModelDelta, ModelRequest, ModelResponse};
 use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
 use crate::task::TaskManager;
 use anyhow::{Context, Result, anyhow, bail};
+use rig::completion::Usage;
 use rig::message::{AssistantContent, Message, Text, ToolCall, ToolResultContent, UserContent};
 use serde_json::Value;
 use std::sync::Arc;
@@ -17,7 +19,8 @@ pub struct AgentRuntime {
     protocols: Arc<ProtocolRegistry>,
     session: Session,
     system_prompt: String,
-    context_window: AtomicUsize,
+    limits: RwLock<ModelLimits>,
+    estimated_tokens: AtomicUsize,
     turn: Mutex<()>,
 }
 
@@ -27,14 +30,15 @@ impl AgentRuntime {
         protocols: Arc<ProtocolRegistry>,
         session: Session,
         system_prompt: String,
-        context_window: usize,
+        limits: ModelLimits,
     ) -> Self {
         Self {
             backend: RwLock::new(backend),
             protocols,
             session,
             system_prompt,
-            context_window: AtomicUsize::new(context_window),
+            limits: RwLock::new(limits),
+            estimated_tokens: AtomicUsize::new(0),
             turn: Mutex::new(()),
         }
     }
@@ -43,10 +47,29 @@ impl AgentRuntime {
         &self.session
     }
 
-    pub async fn set_backend(&self, backend: Option<Arc<dyn ModelBackend>>, context_window: usize) {
+    /// Estimated tokens the next model request would carry, used by the
+    /// footer's context meter the same way pi estimates its context usage.
+    pub fn estimated_context(&self) -> usize {
+        self.estimated_tokens.load(Ordering::Relaxed)
+    }
+
+    pub async fn refresh_context_estimate(&self) {
+        let history = self.session.model_history().await;
+        self.estimated_tokens.store(
+            compaction::estimate_tokens(&self.system_prompt, &history),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub async fn set_backend(
+        &self,
+        backend: Option<Arc<dyn ModelBackend>>,
+        limits: Option<ModelLimits>,
+    ) {
         *self.backend.write().await = backend;
-        self.context_window
-            .store(context_window.max(1), Ordering::Relaxed);
+        if let Some(limits) = limits {
+            *self.limits.write().await = limits;
+        }
     }
 
     pub async fn has_backend(&self) -> bool {
@@ -55,9 +78,12 @@ impl AgentRuntime {
 
     pub async fn compact(&self) -> Result<()> {
         let _turn = self.turn.lock().await;
-        let backend = self.backend.read().await.clone().ok_or_else(|| {
-            anyhow!("no API key configured; open Settings with F2 or enter /login")
-        })?;
+        let backend = self
+            .backend
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
         if !self.compact_with(backend.as_ref(), true).await? {
             bail!("not enough completed history to compact")
         }
@@ -73,7 +99,7 @@ impl AgentRuntime {
         let backend = match self.backend.read().await.clone() {
             Some(backend) => backend,
             None => {
-                let text = "no API key configured; open Settings with F2 or enter /login";
+                let text = "no credential configured; press :login";
                 self.session
                     .append(EventKind::Error {
                         text: text.to_string(),
@@ -109,6 +135,7 @@ impl AgentRuntime {
         for _ in 0..MAX_TOOL_ROUNDS {
             self.compact_with(backend.as_ref(), false).await?;
             let response = self.complete_once(backend.as_ref()).await?;
+            self.record_usage(response.usage).await?;
             let assistant_message = Message::Assistant {
                 id: None,
                 content: response.content.clone(),
@@ -135,7 +162,7 @@ impl AgentRuntime {
 
     async fn compact_with(&self, backend: &dyn ModelBackend, force: bool) -> Result<bool> {
         let history = self.session.model_history().await;
-        let context_window = self.context_window.load(Ordering::Relaxed).max(1);
+        let context_window = self.limits.read().await.context_window.max(1);
         if !force && !compaction::should_compact(&self.system_prompt, &history, context_window) {
             return Ok(false);
         }
@@ -157,6 +184,7 @@ impl AgentRuntime {
             .complete(request, deltas)
             .await
             .context("context compaction model request failed")?;
+        self.record_usage(response.usage).await?;
         let summary = response
             .content
             .iter()
@@ -173,13 +201,45 @@ impl AgentRuntime {
         self.session
             .append_compaction(summary, preparation.tokens_before, replacement, force)
             .await?;
+        self.refresh_context_estimate().await;
         Ok(true)
     }
 
+    /// Persist one response's token usage, priced with the active model's
+    /// catalog rates. A zero-valued report is the sentinel for missing
+    /// metrics and carries no information worth an event.
+    async fn record_usage(&self, usage: Option<Usage>) -> Result<()> {
+        let Some(usage) = usage else { return Ok(()) };
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            return Ok(());
+        }
+        let cost = self.limits.read().await.cost.total(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        self.session
+            .append(EventKind::Usage {
+                input: usage.input_tokens,
+                output: usage.output_tokens,
+                cache_read: usage.cached_input_tokens,
+                cache_write: usage.cache_creation_input_tokens,
+                cost,
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn complete_once(&self, backend: &dyn ModelBackend) -> Result<ModelResponse> {
+        let history = self.session.model_history().await;
+        self.estimated_tokens.store(
+            compaction::estimate_tokens(&self.system_prompt, &history),
+            Ordering::Relaxed,
+        );
         let request = ModelRequest {
             system: self.system_prompt.clone(),
-            history: self.session.model_history().await,
+            history,
             tools: true,
         };
         let (deltas, mut receiver) = mpsc::unbounded_channel();
@@ -305,7 +365,7 @@ mod tests {
     use std::collections::VecDeque;
 
     struct FakeBackend {
-        responses: Mutex<VecDeque<Vec<AssistantContent>>>,
+        responses: Mutex<VecDeque<(Vec<AssistantContent>, Option<Usage>)>>,
         requests: Mutex<Vec<ModelRequest>>,
     }
 
@@ -317,13 +377,23 @@ mod tests {
             deltas: mpsc::UnboundedSender<ModelDelta>,
         ) -> Result<ModelResponse> {
             self.requests.lock().await.push(request);
-            let content = self.responses.lock().await.pop_front().unwrap();
+            let (content, usage) = self.responses.lock().await.pop_front().unwrap();
             for part in &content {
                 if let AssistantContent::Text(text) = part {
                     let _ = deltas.send(ModelDelta::Text(text.text.clone()));
                 }
             }
-            Ok(ModelResponse { content })
+            Ok(ModelResponse { content, usage })
+        }
+    }
+
+    fn fake_usage() -> Usage {
+        Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cached_input_tokens: 100,
+            cache_creation_input_tokens: 50,
+            ..Usage::new()
         }
     }
 
@@ -374,7 +444,7 @@ mod tests {
             Arc::new(protocols),
             session.clone(),
             "system".to_string(),
-            128_000,
+            ModelLimits::default(),
         );
 
         assert!(runtime.run_turn("hello".to_string()).await.is_err());
@@ -386,7 +456,7 @@ mod tests {
                 .any(|event| matches!(event.kind, EventKind::User { .. }))
         );
         assert!(
-            matches!(events.last().map(|event| &event.kind), Some(EventKind::Error { text }) if text.contains("F2"))
+            matches!(events.last().map(|event| &event.kind), Some(EventKind::Error { text }) if text.contains(":login"))
         );
 
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
@@ -429,8 +499,8 @@ mod tests {
         );
         let backend = Arc::new(FakeBackend {
             responses: Mutex::new(VecDeque::from([
-                vec![AssistantContent::ToolCall(call)],
-                vec![AssistantContent::text("Done")],
+                (vec![AssistantContent::ToolCall(call)], None),
+                (vec![AssistantContent::text("Done")], Some(fake_usage())),
             ])),
             requests: Mutex::new(Vec::new()),
         });
@@ -439,7 +509,16 @@ mod tests {
             Arc::new(protocols),
             session.clone(),
             "test system prompt".to_string(),
-            128_000,
+            ModelLimits {
+                context_window: 128_000,
+                max_tokens: 8_192,
+                cost: crate::catalog::ModelCost {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_read: 0.3,
+                    cache_write: 3.75,
+                },
+            },
         );
 
         runtime.run_turn("Read the help".to_string()).await.unwrap();
@@ -455,6 +534,26 @@ mod tests {
             Some(EventKind::TurnFinished)
         ));
         assert_eq!(session.model_history().await.len(), 4);
+        let usage = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::Usage {
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                    cost,
+                } => Some((*input, *output, *cache_read, *cache_write, *cost)),
+                _ => None,
+            })
+            .expect("a reported usage becomes a session event");
+        assert_eq!(usage.0, 1_000);
+        assert_eq!(usage.1, 500);
+        assert_eq!(usage.2, 100);
+        assert_eq!(usage.3, 50);
+        let expected = (1_000.0 * 3.0 + 500.0 * 15.0 + 100.0 * 0.3 + 50.0 * 3.75) / 1_000_000.0;
+        assert!((usage.4 - expected).abs() < f64::EPSILON);
+        assert!(runtime.estimated_context() > 0);
 
         drop(runtime);
         drop(session);
@@ -496,9 +595,12 @@ mod tests {
         );
         let output_directory = output.directory().to_path_buf();
         let backend = Arc::new(FakeBackend {
-            responses: Mutex::new(VecDeque::from([vec![AssistantContent::text(
-                "The first task is complete; continue the current task.",
-            )]])),
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text(
+                    "The first task is complete; continue the current task.",
+                )],
+                None,
+            )])),
             requests: Mutex::new(Vec::new()),
         });
         let runtime = AgentRuntime::new(
@@ -506,7 +608,7 @@ mod tests {
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
             session.clone(),
             "frozen system".to_string(),
-            128_000,
+            ModelLimits::default(),
         );
 
         runtime.compact().await.unwrap();
@@ -567,8 +669,8 @@ mod tests {
         let output_directory = output.directory().to_path_buf();
         let backend = Arc::new(FakeBackend {
             responses: Mutex::new(VecDeque::from([
-                vec![AssistantContent::text("Old work is complete.")],
-                vec![AssistantContent::text("Current answer")],
+                (vec![AssistantContent::text("Old work is complete.")], None),
+                (vec![AssistantContent::text("Current answer")], None),
             ])),
             requests: Mutex::new(Vec::new()),
         });
@@ -577,7 +679,10 @@ mod tests {
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
             session.clone(),
             "frozen system".to_string(),
-            64,
+            ModelLimits {
+                context_window: 64,
+                ..ModelLimits::default()
+            },
         );
 
         runtime.run_turn("current task".to_string()).await.unwrap();
