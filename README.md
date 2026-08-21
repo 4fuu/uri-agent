@@ -234,7 +234,7 @@ As model replay approaches the selected model's context window, URI Agent create
 
 ## Terminal interface
 
-Startup shows a short splash, then a single conversation surface. An empty conversation keeps the animated mark without the product name and shows the project, branch, token usage, context pressure, active model, and plugin status directly beneath it. Once records appear, folded history keeps the highlighted one-line URI status bar; click it, press `F4`, or run `:status` to open the detailed project/session/usage view. The persistent shortcut hint row is omitted. Opening the composer pauses UI animation and places the terminal cursor at the text caret so IME candidate windows remain anchored correctly.
+Startup shows a short splash, then a single conversation surface. An empty conversation keeps the centered animated mark and shows only the working directory and active provider/model beneath it, followed by a locally centered compose/command/help key hint. Once records appear, folded history keeps the highlighted one-line URI status bar; click it, press `F4`, or run `:status` to open the detailed project/session/usage view. Opening the composer pauses UI animation and places the terminal cursor at the text caret so IME candidate windows remain anchored correctly.
 
 | Surface | Useful defaults |
 | --- | --- |

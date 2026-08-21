@@ -2986,13 +2986,7 @@ fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, splash: bool) 
         ]);
     } else {
         lines.push(Line::default());
-        lines.extend(brand_status_lines(app, brand_area.width as usize));
-        if !app.info.model_ready {
-            lines.extend([
-                Line::default(),
-                Line::styled("尚未配置，请运行 :login", Style::default().fg(WARM)),
-            ]);
-        }
+        lines.extend(welcome_lines(app, brand_area.width as usize));
     }
     frame.render_widget(
         Paragraph::new(lines).alignment(Alignment::Center),
@@ -3000,29 +2994,43 @@ fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, splash: bool) 
     );
 }
 
-fn brand_status_lines(app: &mut App, width: usize) -> Vec<Line<'static>> {
-    let mut project = footer_cwd(&app.info.cwd);
-    if let Some(branch) = current_branch(app) {
-        project = format!("{project} ({branch})");
-    }
-    let mut details = vec![
-        compact_usage(app),
-        format!("ctx {:.1}%", context_percent(app)),
-        compact_model(app),
-    ];
-    details.extend(
-        plugin_status_items(app, false)
-            .into_iter()
-            .map(|item| format!("{} {}", item.label, item.value)),
-    );
+fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let model = if app.info.model_ready {
+        Line::styled(
+            single_line_preview(
+                &format!("{} / {}", app.info.provider, app.info.model),
+                width.saturating_sub(1),
+            ),
+            Style::default().fg(TEXT),
+        )
+    } else {
+        Line::styled("尚未配置，请运行 :login", Style::default().fg(WARM))
+    };
+    let compose = app
+        .keymap
+        .key_for("main", "compose")
+        .unwrap_or_else(|| "i".to_string());
+    let command = app
+        .keymap
+        .key_for("main", "command")
+        .unwrap_or_else(|| ":".to_string());
+    let help = app
+        .keymap
+        .key_for("main", "help")
+        .unwrap_or_else(|| "?".to_string());
     vec![
         Line::styled(
-            single_line_preview(&project, width.saturating_sub(1)),
+            single_line_preview(&footer_cwd(&app.info.cwd), width.saturating_sub(1)),
             Style::default().fg(MUTED),
         ),
+        model,
+        Line::default(),
         Line::styled(
-            single_line_preview(&details.join(" │ "), width.saturating_sub(1)),
-            Style::default().fg(TEXT),
+            single_line_preview(
+                &format!("{compose} compose · {command} commands · {help} help"),
+                width.saturating_sub(1),
+            ),
+            Style::default().fg(MUTED),
         ),
     ]
 }
@@ -4533,6 +4541,30 @@ mod tests {
     }
 
     #[test]
+    fn welcome_keeps_its_layout_with_a_centered_local_key_hint() {
+        let mut app = test_app();
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("/workspace"));
+        assert!(rendered.contains("test / model"));
+        assert!(rendered.contains("i compose · : commands · ? help"));
+        assert!(!rendered.contains("tokens"));
+        assert!(!rendered.contains("ctx "));
+
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let project_row = lines
+            .iter()
+            .position(|line| line.contains("/workspace"))
+            .expect("welcome project row");
+        assert_eq!(project_row, 13);
+        assert_eq!(lines[project_row].find("/workspace"), Some(45));
+        assert_eq!(lines[project_row + 1].find("test / model"), Some(44));
+        let hint_row = project_row + 3;
+        assert!(lines[hint_row].contains("i compose · : commands · ? help"));
+        assert_eq!(lines[hint_row].find("i compose"), Some(35));
+        assert_eq!(lines.len() - hint_row - 1, 7);
+    }
+
+    #[test]
     fn conversation_footer_is_one_highlighted_project_status_line() {
         let mut app = test_app();
         app.push(
@@ -4737,10 +4769,10 @@ mod tests {
         app.skip_splash();
         let rendered = render_to_string(&mut app, 80, 24);
         assert!(rendered.contains("/workspace"));
-        assert!(rendered.contains("tokens 0"));
-        assert!(rendered.contains("ctx 0.0%"));
-        assert!(rendered.contains("model"));
-        assert!(!rendered.contains("i compose"));
+        assert!(rendered.contains("test / model"));
+        assert!(rendered.contains("i compose · : commands · ? help"));
+        assert!(!rendered.contains("tokens"));
+        assert!(!rendered.contains("ctx "));
     }
 
     #[test]
