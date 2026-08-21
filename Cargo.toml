@@ -1,0 +1,34 @@
+[package]
+name = "uri-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A protocol-oriented coding agent with a focused terminal interface"
+repository = "https://github.com/4fuu/uri-agent"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+dirs = "6"
+futures-util = "0.3"
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+rig = { package = "rig-core", git = "https://github.com/0xPlaygrounds/rig", rev = "abe338a" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+textwrap = "0.16"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tui-textarea = { package = "tui-textarea-2", version = "0.9" }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

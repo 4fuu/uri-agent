@@ -1,0 +1,4 @@
+/target/
+/.amp/
+/.uri-agent/
+*.log
