@@ -13,7 +13,7 @@ use crate::plugin::{
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
 use crate::session::{EventKind, SessionEvent};
-use crate::task::{TaskManager, TaskRecord, TaskStatus};
+use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -32,7 +32,6 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
-use std::collections::HashMap;
 use std::env;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
@@ -50,6 +49,7 @@ const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
 const WARM: Color = Color::Rgb(239, 173, 104);
 const ERROR: Color = Color::Rgb(239, 108, 120);
+const FLASH_DURATION: Duration = Duration::from_secs(5);
 
 pub struct TuiInfo {
     pub cwd: PathBuf,
@@ -57,7 +57,6 @@ pub struct TuiInfo {
     pub model: String,
     pub session_id: String,
     pub context_window: usize,
-    pub system_prompt_tokens: usize,
     pub model_ready: bool,
     pub editor: Option<String>,
     pub editor_mode: ExternalMode,
@@ -230,7 +229,6 @@ struct App {
     input: TextArea<'static>,
     blocks: Vec<DisplayBlock>,
     protocols: Vec<ProtocolDescriptor>,
-    tasks: HashMap<String, (String, TaskStatus)>,
     task_records: Vec<TaskRecord>,
     selected_task: usize,
     selected_block: usize,
@@ -241,10 +239,10 @@ struct App {
     activity: Option<Activity>,
     busy_since: Option<Instant>,
     frame: usize,
-    context_tokens: usize,
     last_sequence: Option<u64>,
     info: TuiInfo,
     flash: Option<String>,
+    flash_at: Option<Instant>,
     model_selector: Option<ModelSelector>,
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
@@ -275,7 +273,6 @@ impl App {
             input,
             blocks: Vec::new(),
             protocols,
-            tasks: HashMap::new(),
             task_records: Vec::new(),
             selected_task: 0,
             selected_block: 0,
@@ -286,10 +283,10 @@ impl App {
             activity: None,
             busy_since: None,
             frame: 0,
-            context_tokens: info.system_prompt_tokens,
             last_sequence: None,
             info,
             flash: None,
+            flash_at: None,
             model_selector: None,
             catalog_refreshing: false,
             settings: None,
@@ -318,12 +315,10 @@ impl App {
         let follow =
             self.blocks.is_empty() || self.selected_block == self.blocks.len().saturating_sub(1);
         match event.kind {
-            EventKind::SessionCreated { .. } | EventKind::SessionContext { .. } => {}
-            EventKind::ModelMessage { message } => {
-                self.context_tokens = self
-                    .context_tokens
-                    .saturating_add(estimated_message_tokens(&message));
-            }
+            EventKind::SessionCreated { .. }
+            | EventKind::SessionContext { .. }
+            | EventKind::ModelMessage { .. }
+            | EventKind::Task { .. } => {}
             EventKind::User { text } => {
                 self.busy = true;
                 self.busy_since.get_or_insert_with(Instant::now);
@@ -389,11 +384,6 @@ impl App {
                 }
                 self.activity = Some(Activity::Thinking);
             }
-            EventKind::Task {
-                id, label, status, ..
-            } => {
-                self.tasks.insert(id, (label, status));
-            }
             EventKind::Notice { text } => self.push(BlockKind::Notice, "SYSTEM", text, None, false),
             EventKind::Error { text } => {
                 self.busy = false;
@@ -404,20 +394,14 @@ impl App {
             EventKind::Compaction {
                 summary,
                 tokens_before,
-                replacement_history,
+                replacement_history: _,
                 manual,
             } => {
-                self.context_tokens = self.info.system_prompt_tokens.saturating_add(
-                    replacement_history
-                        .iter()
-                        .map(estimated_message_tokens)
-                        .sum::<usize>(),
-                );
                 if manual {
                     self.busy = false;
                     self.activity = None;
                     self.busy_since = None;
-                    self.flash = Some("Context compacted; original events retained".to_string());
+                    self.set_flash("Context compacted; original events retained");
                 } else {
                     self.activity = Some(Activity::Thinking);
                 }
@@ -477,7 +461,7 @@ impl App {
 
     fn submit(&mut self) -> Option<String> {
         if self.busy {
-            self.flash = Some("A turn is already running".to_string());
+            self.set_flash("A turn is already running");
             return None;
         }
         let text = self.input.lines().join("\n");
@@ -491,6 +475,30 @@ impl App {
         self.activity = Some(Activity::Thinking);
         self.mode = Mode::Browse;
         Some(text)
+    }
+
+    fn has_draft(&self) -> bool {
+        self.input
+            .lines()
+            .iter()
+            .any(|line| !line.trim().is_empty())
+    }
+
+    fn set_flash(&mut self, message: impl Into<String>) {
+        self.flash = Some(message.into());
+        self.flash_at = Some(Instant::now());
+    }
+
+    fn clear_flash(&mut self) {
+        self.flash = None;
+        self.flash_at = None;
+    }
+
+    fn visible_flash(&self) -> Option<&str> {
+        self.flash.as_deref().filter(|_| {
+            self.flash_at
+                .is_some_and(|created| created.elapsed() < FLASH_DURATION)
+        })
     }
 
     fn selected_block(&self) -> Option<&DisplayBlock> {
@@ -643,7 +651,7 @@ async fn run_loop(
                                     terminal_events = EventStream::new();
                                     apply_editor_result(app, result);
                                 } else if let Err(error) = open_embedded_editor(app, &content, replace_input, terminal.size()?.into()).await {
-                                    app.flash = Some(format!("Editor failed: {error:#}"));
+                                    app.set_flash(format!("Editor failed: {error:#}"));
                                 }
                             }
                             Action::OpenPicker => {
@@ -653,7 +661,7 @@ async fn run_loop(
                                     terminal_events = EventStream::new();
                                     apply_picker_result(app, result);
                                 } else if let Err(error) = open_embedded_picker(app, terminal.size()?.into()).await {
-                                    app.flash = Some(format!("Picker failed: {error:#}"));
+                                    app.set_flash(format!("Picker failed: {error:#}"));
                                 }
                             }
                         }
@@ -661,7 +669,7 @@ async fn run_loop(
                     Event::Paste(text) => {
                         if let Some(external) = app.external.as_mut() {
                             if let Err(error) = external.terminal.send_paste(&text) {
-                                app.flash = Some(format!("Terminal input failed: {error:#}"));
+                                app.set_flash(format!("Terminal input failed: {error:#}"));
                             }
                         } else if let Some(settings) = app.settings.as_mut()
                             && let Some(editing) = settings.editing
@@ -690,7 +698,7 @@ async fn run_loop(
                     Event::Mouse(mouse) => {
                         if app.external.is_some() {
                             if let Err(error) = handle_external_mouse(app, mouse) {
-                                app.flash = Some(format!("Terminal mouse input failed: {error:#}"));
+                                app.set_flash(format!("Terminal mouse input failed: {error:#}"));
                             }
                             continue;
                         }
@@ -730,7 +738,7 @@ async fn run_loop(
                                     terminal_events = EventStream::new();
                                     apply_editor_result(app, result);
                                 } else if let Err(error) = open_embedded_editor(app, &content, replace_input, terminal.size()?.into()).await {
-                                    app.flash = Some(format!("Editor failed: {error:#}"));
+                                    app.set_flash(format!("Editor failed: {error:#}"));
                                 }
                             }
                             Action::OpenPicker => {
@@ -740,7 +748,7 @@ async fn run_loop(
                                     terminal_events = EventStream::new();
                                     apply_picker_result(app, result);
                                 } else if let Err(error) = open_embedded_picker(app, terminal.size()?.into()).await {
-                                    app.flash = Some(format!("Picker failed: {error:#}"));
+                                    app.set_flash(format!("Picker failed: {error:#}"));
                                 }
                             }
                         }
@@ -811,7 +819,7 @@ async fn dispatch_ui_command(
                     app.overlay = Some(Overlay::Plugin);
                 }
                 Err(error) => {
-                    app.flash = Some(format!("Plugin panel failed: {error:#}"));
+                    app.set_flash(format!("Plugin panel failed: {error:#}"));
                 }
             }
             return Action::Continue;
@@ -820,7 +828,7 @@ async fn dispatch_ui_command(
     match command {
         CoreCommand::Compose => {
             app.mode = Mode::Insert;
-            app.flash = None;
+            app.clear_flash();
             Action::Continue
         }
         CoreCommand::Detail => {
@@ -828,7 +836,7 @@ async fn dispatch_ui_command(
                 app.overlay_scroll = 0;
                 app.overlay = Some(Overlay::Detail);
             } else {
-                app.flash = Some("No event is selected".to_string());
+                app.set_flash("No event is selected");
             }
             Action::Continue
         }
@@ -839,7 +847,7 @@ async fn dispatch_ui_command(
                     replace_input: false,
                 }
             } else {
-                app.flash = Some("No event is selected".to_string());
+                app.set_flash("No event is selected");
                 Action::Continue
             }
         }
@@ -880,7 +888,7 @@ fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
     app.busy = true;
     app.busy_since = Some(Instant::now());
     app.activity = Some(Activity::Compacting);
-    app.flash = Some("Compacting older model context…".to_string());
+    app.set_flash("Compacting older model context…");
     tokio::spawn(async move {
         if let Err(error) = runtime.compact().await {
             let _ = runtime
@@ -891,6 +899,30 @@ fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
                 .await;
         }
     });
+}
+
+fn submit_draft(app: &mut App) -> Action {
+    let Some(prompt) = app.submit() else {
+        return Action::Continue;
+    };
+    let command = prompt.split_whitespace().next();
+    if matches!(command, Some("/settings" | "/model" | "/login")) {
+        app.busy = false;
+        app.activity = None;
+        app.busy_since = None;
+        style_input(&mut app.input, false);
+        if command == Some("/model") {
+            let query = prompt
+                .trim_start()
+                .strip_prefix("/model")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            return Action::OpenModels(query);
+        }
+        return Action::OpenSettings;
+    }
+    Action::Submit(prompt)
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action {
@@ -958,7 +990,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action
                         )
                         .await;
                     }
-                    app.flash = Some(format!(
+                    app.set_flash(format!(
                         "Unknown command :{} · press Space for commands",
                         entered.trim()
                     ));
@@ -1194,7 +1226,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action
             return dispatch_core(app, CoreCommand::Tasks, tasks).await;
         }
         action if app.mode == Mode::Insert => match action {
-            Some("browse") => app.mode = Mode::Browse,
+            Some("browse") => {
+                app.mode = Mode::Browse;
+                if app.has_draft() {
+                    app.set_flash("Draft kept · Enter submits from Browse");
+                }
+            }
             Some("newline") => app.input.insert_newline(),
             Some("editor") => {
                 return Action::OpenEditor {
@@ -1205,32 +1242,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action
             Some("quit_empty") if app.input.lines().iter().all(|line| line.is_empty()) => {
                 return Action::Quit;
             }
-            Some("send") => {
-                if let Some(prompt) = app.submit() {
-                    if matches!(
-                        prompt.split_whitespace().next(),
-                        Some("/settings" | "/model" | "/login")
-                    ) {
-                        app.busy = false;
-                        app.activity = None;
-                        app.busy_since = None;
-                        style_input(&mut app.input, false);
-                        if prompt.split_whitespace().next() == Some("/model") {
-                            let query = prompt
-                                .trim_start()
-                                .strip_prefix("/model")
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string();
-                            return Action::OpenModels(query);
-                        }
-                        return Action::OpenSettings;
-                    }
-                    return Action::Submit(prompt);
-                }
-            }
+            Some("submit") => return submit_draft(app),
             _ => {
-                app.flash = None;
+                app.clear_flash();
                 app.input.input(key);
             }
         },
@@ -1249,6 +1263,8 @@ async fn handle_key(app: &mut App, key: KeyEvent, tasks: &TaskManager) -> Action
         Some("page_up") => app.move_selection(-10),
         Some("first") => app.selected_block = 0,
         Some("last") => app.selected_block = app.blocks.len().saturating_sub(1),
+        Some("submit") if app.has_draft() => return submit_draft(app),
+        Some("submit") => return dispatch_core(app, CoreCommand::Detail, tasks).await,
         Some("detail") => return dispatch_core(app, CoreCommand::Detail, tasks).await,
         Some("editor") => return dispatch_core(app, CoreCommand::Editor, tasks).await,
         Some("finder") => return dispatch_core(app, CoreCommand::Finder, tasks).await,
@@ -1379,7 +1395,7 @@ async fn open_models(
     let active = manager.current().await;
     let selector = ModelSelector::load(catalog, &active, query).await;
     if selector.model_count() == 0 {
-        app.flash = Some(
+        app.set_flash(
             "No runnable models cached · refresh the Pi catalog or add models.json".to_string(),
         );
     }
@@ -1400,7 +1416,7 @@ async fn select_model(
         .and_then(ModelSelector::selected)
         .cloned()
     else {
-        app.flash = Some("No model matches the current search".to_string());
+        app.set_flash("No model matches the current search");
         return;
     };
     let requested = format!("{}/{}", model.provider, model.id);
@@ -1416,7 +1432,7 @@ async fn select_model(
             app.overlay = None;
             app.model_selector = None;
             app.settings = None;
-            app.flash = Some(
+            app.set_flash(
                 if active.provider == model.provider && active.model == model.id {
                     format!("Model changed to {requested}")
                 } else {
@@ -1430,7 +1446,7 @@ async fn select_model(
             );
         }
         Err(error) => {
-            app.flash = Some(format!("Could not select {requested}: {error:#}"));
+            app.set_flash(format!("Could not select {requested}: {error:#}"));
         }
     }
 }
@@ -1505,11 +1521,11 @@ async fn save_settings(
     let output_limit = match settings.output_limit.parse::<usize>() {
         Ok(limit) if limit >= 1024 => limit,
         Ok(_) => {
-            app.flash = Some("Output limit must be at least 1024 bytes".to_string());
+            app.set_flash("Output limit must be at least 1024 bytes");
             return;
         }
         Err(error) => {
-            app.flash = Some(format!("Output limit is invalid: {error}"));
+            app.set_flash(format!("Output limit is invalid: {error}"));
             return;
         }
     };
@@ -1538,7 +1554,7 @@ async fn save_settings(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    app.flash = Some(match result {
+    app.set_flash(match result {
         Ok(()) => "Settings saved and applied".to_string(),
         Err(error) => format!("Settings were not fully applied: {error:#}"),
     });
@@ -1550,11 +1566,11 @@ fn start_catalog_refresh(
     sender: mpsc::UnboundedSender<BackgroundEvent>,
 ) {
     if app.catalog_refreshing {
-        app.flash = Some("The Pi model catalog is already refreshing".to_string());
+        app.set_flash("The Pi model catalog is already refreshing");
         return;
     }
     app.catalog_refreshing = true;
-    app.flash = Some("Refreshing the Pi model catalog in the background…".to_string());
+    app.set_flash("Refreshing the Pi model catalog in the background…");
     let catalog = services.catalog.clone();
     let manager = services.manager.clone();
     tokio::spawn(async move {
@@ -1596,7 +1612,7 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            app.flash = Some(match result {
+            app.set_flash(match result {
                 Ok(()) => "Pi model catalog refreshed".to_string(),
                 Err(error) => format!("Catalog refresh failed: {error:#}"),
             });
@@ -1625,7 +1641,7 @@ async fn clear_api_key(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    app.flash = Some(match result {
+    app.set_flash(match result {
         Ok(()) => format!("Stored credential for {provider} cleared"),
         Err(error) => format!("Could not clear credential: {error:#}"),
     });
@@ -1915,10 +1931,10 @@ fn apply_editor_result(app: &mut App, result: Result<Option<String>>) {
             app.input = TextArea::new(content.split('\n').map(str::to_owned).collect());
             style_input(&mut app.input, app.busy);
             app.mode = Mode::Insert;
-            app.flash = Some("Draft updated from editor".to_string());
+            app.set_flash("Draft updated from editor");
         }
-        Ok(None) => app.flash = Some("Editor closed".to_string()),
-        Err(error) => app.flash = Some(format!("Editor failed: {error:#}")),
+        Ok(None) => app.set_flash("Editor closed"),
+        Err(error) => app.set_flash(format!("Editor failed: {error:#}")),
     }
 }
 
@@ -1928,11 +1944,11 @@ fn apply_picker_result(app: &mut App, result: Result<Option<usize>>) {
             app.selected_block = index;
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Detail);
-            app.flash = Some(format!("Selected event {}", index + 1));
+            app.set_flash(format!("Selected event {}", index + 1));
         }
-        Ok(Some(_)) => app.flash = Some("Picker selected an unknown event".to_string()),
-        Ok(None) => app.flash = Some("Picker closed".to_string()),
-        Err(error) => app.flash = Some(format!("Picker failed: {error:#}")),
+        Ok(Some(_)) => app.set_flash("Picker selected an unknown event"),
+        Ok(None) => app.set_flash("Picker closed"),
+        Err(error) => app.set_flash(format!("Picker failed: {error:#}")),
     }
 }
 
@@ -1993,7 +2009,7 @@ async fn cancel_external(app: &mut App) {
             let _ = fs::remove_file(result).await;
         }
     }
-    app.flash = Some("Embedded terminal closed".to_string());
+    app.set_flash("Embedded terminal closed");
 }
 
 fn handle_external_key(app: &mut App, key: KeyEvent) -> Result<bool> {
@@ -2096,7 +2112,7 @@ fn update_mouse_selection(app: &mut App, mouse: MouseEvent, require_shift: bool)
 
 fn copy_current_surface(app: &mut App) {
     let Some(surface) = app.selectable.as_ref() else {
-        app.flash = Some("Nothing visible can be copied".to_string());
+        app.set_flash("Nothing visible can be copied");
         return;
     };
     let text = if let Some(selection) = app.selection {
@@ -2105,12 +2121,12 @@ fn copy_current_surface(app: &mut App) {
         complete_surface_text(surface)
     };
     if text.trim().is_empty() {
-        app.flash = Some("The selection is empty".to_string());
+        app.set_flash("The selection is empty");
         return;
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let result = write!(stdout(), "\x1b]52;c;{encoded}\x07").and_then(|()| stdout().flush());
-    app.flash = Some(if result.is_ok() {
+    app.set_flash(if result.is_ok() {
         format!("Copied {} characters with OSC52", text.chars().count())
     } else {
         "Could not write OSC52 clipboard data".to_string()
@@ -2223,12 +2239,6 @@ fn clear_terminal_screen() -> Result<()> {
     Ok(())
 }
 
-fn estimated_message_tokens(message: &rig::message::Message) -> usize {
-    serde_json::to_vec(message)
-        .map(|bytes| bytes.len().div_ceil(4))
-        .unwrap_or_default()
-}
-
 fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
     let uri = arguments.get("uri")?.as_str()?;
     let separator = uri.find("://").or_else(|| uri.find(':'))?;
@@ -2245,45 +2255,43 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         1
     };
-    let activity_height = u16::from(app.busy);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
             Constraint::Min(3),
-            Constraint::Length(activity_height),
             Constraint::Length(input_height),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
-    render_header(frame, app, areas[0]);
-    render_transcript(frame, app, areas[1]);
-    if app.busy {
-        render_activity(frame, app, areas[2]);
-    }
+    render_transcript(frame, app, areas[0]);
     if app.mode == Mode::Insert {
-        frame.render_widget(&app.input, areas[3]);
+        frame.render_widget(&app.input, areas[1]);
     } else {
-        let insert = key_hint(&app.keymap, "browse", "insert");
-        let detail = key_hint(&app.keymap, "browse", "detail");
-        let editor = key_hint(&app.keymap, "browse", "editor");
-        let hint = if areas[3].width > 92 {
-            format!(
-                " BROWSE  ·  {insert} compose  ·  {detail} detail  ·  {editor} editor  ·  Space commands  ·  : command"
-            )
+        let composer = if app.has_draft() {
+            let text = app.input.lines().join(" ");
+            Line::from(vec![
+                Span::styled(
+                    " DRAFT  ",
+                    Style::default().fg(WARM).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    single_line_preview(&text, areas[1].width.saturating_sub(10) as usize),
+                    Style::default().fg(TEXT),
+                ),
+            ])
         } else {
-            format!(" BROWSE  ·  {insert} compose  ·  {detail} detail  ·  Space commands")
+            Line::styled(" compose…", Style::default().fg(MUTED))
         };
         frame.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(MUTED).bg(SURFACE)),
-            areas[3],
+            Paragraph::new(composer).style(Style::default().bg(SURFACE)),
+            areas[1],
         );
         app.hit_regions.push(HitRegion {
-            area: areas[3],
+            area: areas[1],
             target: AppHit::Composer,
         });
     }
-    render_footer(frame, app, areas[4]);
+    render_statusline(frame, app, areas[2]);
     let selectable_area = if app.external.is_some() {
         app.hit_regions.clear();
         render_external(frame, app)
@@ -2295,7 +2303,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             vertical: 2,
         }))
     } else {
-        Some(areas[1])
+        Some(areas[0])
     };
     if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
         capture_surface(frame, app, selectable_area);
@@ -2304,27 +2312,31 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_external(frame: &mut Frame<'_>, app: &mut App) -> Option<Rect> {
-    let external = app.external.as_mut()?;
-    external.area = centered(frame.area(), 92, 88);
-    let inner = external.area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    if let Err(error) = external.terminal.resize(inner.height, inner.width) {
-        app.flash = Some(format!("Embedded terminal resize failed: {error:#}"));
+    let (inner, resize_error) = {
+        let external = app.external.as_mut()?;
+        external.area = centered(frame.area(), 92, 88);
+        let inner = external.area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let resize_error = external.terminal.resize(inner.height, inner.width).err();
+        frame.render_widget(Clear, external.area);
+        let parser = external.terminal.screen();
+        frame.render_widget(
+            PseudoTerminal::new(parser.screen()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .style(Style::default().bg(SURFACE))
+                    .title(external.title),
+            ),
+            external.area,
+        );
+        (inner, resize_error)
+    };
+    if let Some(error) = resize_error {
+        app.set_flash(format!("Embedded terminal resize failed: {error:#}"));
     }
-    frame.render_widget(Clear, external.area);
-    let parser = external.terminal.screen();
-    frame.render_widget(
-        PseudoTerminal::new(parser.screen()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
-                .style(Style::default().bg(SURFACE))
-                .title(external.title),
-        ),
-        external.area,
-    );
     Some(inner)
 }
 
@@ -2373,68 +2385,6 @@ fn render_selection(frame: &mut Frame<'_>, app: &App) {
             }
         }
     }
-}
-
-fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(12), Constraint::Length(20)])
-        .split(rows[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " URI/AGENT ",
-                Style::default()
-                    .fg(BG)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  v{}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(MUTED),
-            ),
-        ]))
-        .style(Style::default().bg(BG)),
-        columns[0],
-    );
-    let mode = if app.mode == Mode::Insert {
-        "INSERT"
-    } else {
-        "BROWSE"
-    };
-    let state = format!("{mode}  {}", if app.info.model_ready { "●" } else { "○" });
-    frame.render_widget(
-        Paragraph::new(state).alignment(Alignment::Right).style(
-            Style::default()
-                .fg(if app.busy { ACCENT } else { MUTED })
-                .bg(BG),
-        ),
-        columns[1],
-    );
-    let model = format!("{} / {}", app.info.provider, app.info.model);
-    let context = format!(
-        "≈{} / {} ctx",
-        context_label(app.context_tokens),
-        context_label(app.info.context_window)
-    );
-    let second = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(24)])
-        .split(rows[1]);
-    frame.render_widget(
-        Paragraph::new(format!(" {model}")).style(Style::default().fg(TEXT).bg(SURFACE)),
-        second[0],
-    );
-    frame.render_widget(
-        Paragraph::new(context)
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(MUTED).bg(SURFACE)),
-        second[1],
-    );
 }
 
 fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -2523,11 +2473,11 @@ fn render_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(
-                    format!("{} / {}", app.info.provider, app.info.model),
+                    format!("{}/{}", app.info.provider, app.info.model),
                     Style::default().fg(TEXT),
                 ),
                 Line::styled(
-                    "i compose · F3 models · Space commands · F1 help",
+                    "i compose · Space commands · F1 help",
                     Style::default().fg(MUTED),
                 ),
             ])
@@ -2555,13 +2505,7 @@ fn render_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Line::styled(
-            format!(
-                "{} protocols  ·  {} / {}  ·  {} context",
-                app.protocols.len(),
-                app.info.provider,
-                app.info.model,
-                context_label(app.info.context_window)
-            ),
+            format!("{}/{}", app.info.provider, app.info.model),
             Style::default().fg(MUTED),
         ),
         Line::styled(
@@ -2570,41 +2514,11 @@ fn render_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         Line::default(),
         Line::styled(
-            "i compose   F3 models   Space commands   F1 help",
+            "i compose   Space commands   F1 help",
             Style::default().fg(WARM),
         ),
     ]);
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), welcome);
-}
-
-fn render_activity(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let label = app
-        .activity
-        .as_ref()
-        .map(Activity::label)
-        .unwrap_or_else(|| "working".to_string());
-    let elapsed = app
-        .busy_since
-        .map(|since| format!("  {:.1}s", since.elapsed().as_secs_f32()))
-        .unwrap_or_default();
-    let wave_width = if area.width > 72 { 18 } else { 8 };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {} ", animation::spinner(app.frame)),
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(label, Style::default().fg(TEXT)),
-            Span::styled(elapsed, Style::default().fg(MUTED)),
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                animation::activity(app.frame, wave_width),
-                Style::default().fg(ACCENT),
-            ),
-        ]))
-        .style(Style::default().bg(SURFACE)),
-        area,
-    );
 }
 
 fn single_line_preview(text: &str, limit: usize) -> String {
@@ -2618,102 +2532,114 @@ fn single_line_preview(text: &str, limit: usize) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let fallback = if app.mode == Mode::Insert {
-        format!(
-            "INSERT  ·  {} send  ·  {} newline  ·  {} editor  ·  {} browse",
-            key_hint(&app.keymap, "insert", "send"),
-            key_hint(&app.keymap, "insert", "newline"),
-            key_hint(&app.keymap, "insert", "editor"),
-            key_hint(&app.keymap, "insert", "browse")
-        )
-    } else if area.width > 90 {
-        format!(
-            "BROWSE  ·  {}/{} select  ·  {} detail  ·  {} compose  ·  / find  ·  y copy  ·  Space commands",
-            key_hint(&app.keymap, "browse", "previous"),
-            key_hint(&app.keymap, "browse", "next"),
-            key_hint(&app.keymap, "browse", "detail"),
-            key_hint(&app.keymap, "browse", "insert")
-        )
-    } else {
-        format!(
-            "BROWSE  ·  {}/{} select  ·  {} detail  ·  {} compose",
-            key_hint(&app.keymap, "browse", "previous"),
-            key_hint(&app.keymap, "browse", "next"),
-            key_hint(&app.keymap, "browse", "detail"),
-            key_hint(&app.keymap, "browse", "insert")
-        )
-    };
-    let active_tasks = app
-        .tasks
-        .values()
-        .filter(|(_, status)| !status.terminal())
-        .count();
-    let percent = if app.info.context_window == 0 {
+fn render_statusline(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    frame.render_widget(Block::new().style(Style::default().bg(SURFACE)), area);
+    let compact = area.width < 64;
+    let event_width = if app.blocks.is_empty() {
         0
+    } else if compact {
+        8
     } else {
-        app.context_tokens
-            .saturating_mul(100)
-            .checked_div(app.info.context_window)
-            .unwrap_or_default()
-            .min(999)
+        14
     };
-    let project = app
-        .info
-        .cwd
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
-    let mut status = format!(
-        " {project}  ·  ctx {percent}%  ·  {} protocols",
-        app.protocols.len()
-    );
-    if active_tasks > 0 {
-        status.push_str(&format!("  ·  {active_tasks} tasks"));
-    }
-    if area.width > 86 {
-        status.push_str(&format!(
-            "  ·  session {}",
-            app.info.session_id.chars().take(12).collect::<String>()
-        ));
-    }
-    let message = app.flash.as_deref().unwrap_or(&fallback);
-    let message_style = if app.flash.as_ref().is_some_and(|flash| {
-        let flash = flash.to_ascii_lowercase();
-        flash.contains("failed")
-            || flash.contains("error")
-            || flash.contains("invalid")
-            || flash.contains("could not")
-            || flash.contains("unknown")
-    }) {
-        Style::default().fg(ERROR).bg(BG)
-    } else if app.flash.is_some() {
-        Style::default().fg(WARM).bg(BG)
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(if compact { 8 } else { 10 }),
+            Constraint::Percentage(if compact { 45 } else { 34 }),
+            Constraint::Min(0),
+            Constraint::Length(event_width),
+        ])
+        .split(area);
+    let (mode, mode_color) = if app.mode == Mode::Insert {
+        ("INSERT", WARM)
     } else {
-        Style::default().fg(MUTED).bg(BG)
+        ("BROWSE", ACCENT)
     };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(status, Style::default().fg(MUTED).bg(SURFACE)),
-            Line::styled(message, message_style).alignment(Alignment::Center),
-        ]),
-        area,
+        Paragraph::new(format!(" {mode} ")).style(
+            Style::default()
+                .fg(BG)
+                .bg(mode_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        columns[0],
     );
+    let model = format!(" {}/{}", app.info.provider, app.info.model);
+    frame.render_widget(
+        Paragraph::new(single_line_preview(&model, columns[1].width as usize)).style(
+            Style::default()
+                .fg(if app.info.model_ready { TEXT } else { WARM })
+                .bg(SURFACE),
+        ),
+        columns[1],
+    );
+
+    let (message, message_style) = if app.busy {
+        let activity = app
+            .activity
+            .as_ref()
+            .map(Activity::label)
+            .unwrap_or_else(|| "working".to_string());
+        let elapsed = app
+            .busy_since
+            .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
+            .unwrap_or_default();
+        let wave = if columns[2].width > 30 {
+            format!("  {}", animation::activity(app.frame, 8))
+        } else {
+            String::new()
+        };
+        (
+            format!(
+                " {} {activity}{elapsed}{wave}",
+                animation::spinner(app.frame)
+            ),
+            Style::default().fg(ACCENT).bg(SURFACE),
+        )
+    } else if let Some(flash) = app.visible_flash() {
+        (
+            format!(" {flash}"),
+            Style::default()
+                .fg(if flash_is_error(flash) { ERROR } else { WARM })
+                .bg(SURFACE),
+        )
+    } else if app.mode == Mode::Browse && app.has_draft() {
+        let line_count = app.input.lines().len();
+        (
+            format!(
+                " draft · {line_count} line{}",
+                if line_count == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(WARM).bg(SURFACE),
+        )
+    } else {
+        (String::new(), Style::default().bg(SURFACE))
+    };
+    frame.render_widget(Paragraph::new(message).style(message_style), columns[2]);
+
+    if !app.blocks.is_empty() {
+        let position = if compact {
+            format!(" {}/{}", app.selected_block + 1, app.blocks.len())
+        } else {
+            format!(" event {}/{} ", app.selected_block + 1, app.blocks.len())
+        };
+        frame.render_widget(
+            Paragraph::new(position)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(MUTED).bg(SURFACE)),
+            columns[3],
+        );
+    }
 }
 
-fn key_hint(keymap: &Keymap, mode: &str, action: &str) -> String {
-    keymap
-        .key_for(mode, action)
-        .map(|key| match key.as_str() {
-            "up" => "↑".to_string(),
-            "down" => "↓".to_string(),
-            "left" => "←".to_string(),
-            "right" => "→".to_string(),
-            "pageup" => "PgUp".to_string(),
-            "pagedown" => "PgDn".to_string(),
-            _ => key,
-        })
-        .unwrap_or_else(|| format!("[{action}]"))
+fn flash_is_error(flash: &str) -> bool {
+    let flash = flash.to_ascii_lowercase();
+    flash.contains("failed")
+        || flash.contains("error")
+        || flash.contains("invalid")
+        || flash.contains("could not")
+        || flash.contains("unknown")
 }
 
 fn keymap_help(keymap: &Keymap) -> String {
@@ -3174,10 +3100,10 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
             Style::default().fg(ACCENT),
         ),
     ]);
-    if let Some(flash) = &app.flash {
+    if let Some(flash) = app.visible_flash() {
         lines.extend([
             Line::default(),
-            Line::styled(flash.clone(), Style::default().fg(WARM)),
+            Line::styled(flash, Style::default().fg(WARM)),
         ]);
     }
     frame.render_widget(
@@ -3315,7 +3241,7 @@ fn style_input(input: &mut TextArea<'static>, busy: bool) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if busy { MUTED } else { ACCENT }))
-            .title(if busy { " working " } else { " message " })
+            .title(" INSERT ")
             .style(Style::default().bg(SURFACE)),
     );
     input.set_style(Style::default().fg(TEXT).bg(SURFACE));
@@ -3371,14 +3297,13 @@ mod tests {
                 model: "model".to_string(),
                 session_id: "session".to_string(),
                 context_window: 128_000,
-                system_prompt_tokens: 100,
                 model_ready: true,
                 editor: None,
                 editor_mode: ExternalMode::Float,
                 picker: Some("fzf".to_string()),
                 picker_mode: ExternalMode::Float,
             },
-            Keymap::default(),
+            Keymap::with_defaults().unwrap(),
         )
     }
 
@@ -3422,7 +3347,6 @@ mod tests {
                 model: active.model.clone(),
                 session_id: "session".to_string(),
                 context_window: 128_000,
-                system_prompt_tokens: 100,
                 model_ready: true,
                 editor: active.editor.clone(),
                 editor_mode: active.editor_mode,
@@ -3531,9 +3455,8 @@ mod tests {
     }
 
     #[test]
-    fn activity_and_context_status_follow_stream_events() {
+    fn activity_status_follows_stream_events() {
         let mut app = test_app();
-        let initial_tokens = app.context_tokens;
         let event = |sequence, kind| SessionEvent {
             sequence,
             at: chrono::Utc::now(),
@@ -3549,13 +3472,6 @@ mod tests {
         assert!(matches!(&app.activity, Some(Activity::Thinking)));
         app.apply(event(
             2,
-            EventKind::ModelMessage {
-                message: rig::message::Message::user("inspect files"),
-            },
-        ));
-        assert!(app.context_tokens > initial_tokens);
-        app.apply(event(
-            3,
             EventKind::ToolCall {
                 call_id: "call".to_string(),
                 name: "read".to_string(),
@@ -3563,9 +3479,110 @@ mod tests {
             },
         ));
         assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
-        app.apply(event(4, EventKind::TurnFinished));
+        app.apply(event(3, EventKind::TurnFinished));
         assert!(!app.busy);
         assert!(app.activity.is_none());
+    }
+
+    #[tokio::test]
+    async fn insert_enter_adds_a_line_then_escape_preserves_and_browse_enter_submits() {
+        let mut app = test_app();
+        let tasks = TaskManager::new();
+        app.mode = Mode::Insert;
+        app.input.insert_str("first");
+
+        let action = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tasks,
+        )
+        .await;
+        assert!(matches!(action, Action::Continue));
+        assert!(app.mode == Mode::Insert);
+        assert_eq!(app.input.lines(), ["first", ""]);
+
+        app.input.insert_str("second");
+        let action = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tasks,
+        )
+        .await;
+        assert!(matches!(action, Action::Continue));
+        assert!(app.mode == Mode::Browse);
+        assert_eq!(app.input.lines(), ["first", "second"]);
+
+        let action = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tasks,
+        )
+        .await;
+        assert!(matches!(action, Action::Submit(prompt) if prompt == "first\nsecond"));
+        assert!(!app.has_draft());
+    }
+
+    #[tokio::test]
+    async fn browse_enter_without_a_draft_opens_the_selected_event() {
+        let mut app = test_app();
+        let tasks = TaskManager::new();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+        );
+
+        let action = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tasks,
+        )
+        .await;
+
+        assert!(matches!(action, Action::Continue));
+        assert!(app.overlay == Some(Overlay::Detail));
+    }
+
+    #[test]
+    fn conversation_chrome_has_no_persistent_shortcut_or_estimate_noise() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+        );
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("BROWSE"));
+        assert!(rendered.contains("test/model"));
+        assert!(rendered.contains("event 1/1"));
+        assert!(!rendered.contains("ctx"));
+        assert!(!rendered.contains("protocols"));
+        assert!(!rendered.contains("Space commands"));
+    }
+
+    #[test]
+    fn status_notices_expire_instead_of_becoming_permanent_chrome() {
+        let mut app = test_app();
+        app.set_flash("saved");
+        assert_eq!(app.visible_flash(), Some("saved"));
+
+        app.flash_at = Some(Instant::now() - FLASH_DURATION);
+        assert_eq!(app.visible_flash(), None);
     }
 
     #[test]

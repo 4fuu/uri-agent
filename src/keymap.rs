@@ -32,14 +32,14 @@ map("browse", "g", "first");
 map("browse", "home", "first");
 map("browse", "shift+g", "last");
 map("browse", "end", "last");
-map("browse", "enter", "detail");
+map("browse", "enter", "submit");
 map("browse", "o", "detail");
 map("browse", "e", "editor");
 map("browse", "y", "copy");
 map("browse", "q", "quit");
 
 map("insert", "esc", "browse");
-map("insert", "enter", "send");
+map("insert", "enter", "newline");
 map("insert", "shift+enter", "newline");
 map("insert", "ctrl+e", "editor");
 map("insert", "ctrl+d", "quit_empty");
@@ -119,8 +119,7 @@ pub struct Keymap {
 
 impl Keymap {
     pub async fn load(project: Option<&Path>) -> Result<Self> {
-        let keymap = Self::default();
-        keymap.evaluate(DEFAULT_KEYMAP, "built-in keymap")?;
+        let keymap = Self::with_defaults()?;
         let global = config_directory()?.join("keymap.rhai");
         keymap.evaluate_file(&global).await?;
         if let Some(project) = project {
@@ -128,6 +127,12 @@ impl Keymap {
                 .evaluate_file(&project.join(".uri-agent/keymap.rhai"))
                 .await?;
         }
+        Ok(keymap)
+    }
+
+    pub(crate) fn with_defaults() -> Result<Self> {
+        let keymap = Self::default();
+        keymap.evaluate(DEFAULT_KEYMAP, "built-in keymap")?;
         Ok(keymap)
     }
 
@@ -279,6 +284,10 @@ mod tests {
         assert_eq!(keymap.key_for("browse", "previous").as_deref(), Some("up"));
         assert_eq!(keymap.action("browse", "space").as_deref(), Some("palette"));
         assert_eq!(keymap.action("browse", ":").as_deref(), Some("command"));
+        assert_eq!(keymap.action("browse", "enter").as_deref(), Some("submit"));
+        assert_eq!(keymap.action("browse", "o").as_deref(), Some("detail"));
+        assert_eq!(keymap.action("insert", "enter").as_deref(), Some("newline"));
+        assert_eq!(keymap.action("insert", "esc").as_deref(), Some("browse"));
         assert_eq!(
             keymap.action("palette", "enter").as_deref(),
             Some("confirm")

@@ -18,6 +18,7 @@ Keep these product invariants intact:
 - Register `bash` and `pwsh` only when an executable is present in the environment.
 - Treat the canonical launch directory as the project boundary. Session resume and explicit IDs must not cross that boundary; do not add a cross-project session or directory overview unless the product direction changes.
 - Keep Browse, Insert, and Detail as distinct TUI contexts. Conversation rows are previews; complete reasoning, tool calls/results, and messages remain individually inspectable.
+- Treat Insert as draft editing, not submission: `Enter` inserts a newline and `Esc` returns to Browse without losing the draft. In Browse, `Enter` submits a non-empty draft and otherwise opens the selected event.
 - Keep arrows and mouse as first-class navigation. `j/k` may remain aliases, but defaults and interface hints must not require Vim knowledge. Browse mode owns the discoverable Space command panel and `:` command line.
 - Keep external editor and finder commands available as embedded PTY floats and as configurable fullscreen handoffs. Mouse selection and OSC52 copy must remain available without stealing ordinary clicks from interactive programs.
 - Resolve keyboard behavior through the layered Rhai keymap. Do not reintroduce modeless hard-coded shortcuts for configurable actions.

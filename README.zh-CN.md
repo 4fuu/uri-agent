@@ -278,19 +278,19 @@ SQLite 是项目最初公开的持久化格式，因此不包含 JSONL 兼容层
 
 ## TUI
 
-Ratatui 界面将事件浏览、消息输入和详细查看分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。`Enter` 在可滚动浮窗中打开完整事件，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
+Ratatui 界面将事件浏览、草稿编辑和详细查看分开。对话区为每条用户消息、回复、reasoning 片段或工具调用保留一条可选择的预览；工具调用及结果合并在同一行，因此流式思考和大型工具输出不会把有效对话持续推出屏幕。Browse 中没有草稿时，`Enter` 打开完整事件；`o` 始终打开详情，`e` 使用配置的编辑器查看。相同列表支持滚轮和鼠标选择，双击事件即可查看详情。
 
-空会话会展示紧凑的 ordered-dither 像素标记、项目与模型信息，以及常用入口。模型工作时，固定高度的活动条会区分 reasoning、回复流式输出、工具执行和上下文压缩，并显示耗时。状态区持续展示模式、Provider/模型可用状态、估算上下文占用、运行任务数、协议数、项目、会话和临时通知，不会因流式内容扩张。抖动与活动波形是确定性、低噪声且不改变布局的动画；窄终端会退化为紧凑欢迎界面。
+空会话会展示紧凑的 ordered-dither 像素标记、项目与模型，以及少量初始入口。受 Helix 启发的单行状态栏只显示当前模式、模型、所选事件位置，以及当前确实需要关注的信息：已保留的草稿、临时通知，或正在进行的 reasoning、工具调用和压缩。快捷键说明和估算计数不会常驻。抖动与工作波形是确定性、低噪声且不改变布局的动画；窄终端会退化为紧凑欢迎界面。
 
 | 模式 | 默认按键 | 行为 |
 | --- | --- | --- |
-| Browse | `↑/↓`、`Enter`、`i`、`e`、`/`、`y`、`Space`、`:`、鼠标 | 选择预览、查看详情、输入、查找事件、复制或执行命令 |
-| Insert | `Enter`、`Shift+Enter`、`Ctrl+E`、`Esc` | 发送、换行、在外部编辑器编辑草稿或返回 Browse |
+| Browse | `↑/↓`、`Enter`、`o`、`i`、`e`、`/`、`y`、`Space`、`:`、鼠标 | 选择预览；`Enter` 有草稿时提交，否则打开详情 |
+| Insert | `Enter`、`Ctrl+E`、`Esc` | 换行、在外部编辑器编辑草稿，或保留草稿并返回 Browse |
 | Detail | `↑/↓`、`PageUp/PageDown`、`e`、`Esc`、拖选、滚轮 | 查看、选取、复制完整内容，或用编辑器打开 |
 | 内嵌终端 | 外部程序正常按键、双 `Esc`、Shift 拖选 | 操作编辑器/选取器、关闭 PTY 或选取终端文本 |
 | Global | `F1`、`F2`、`F3`、`Ctrl+P`、`Ctrl+T`、`Ctrl+Shift+C`、`Ctrl+C` | 帮助、Settings、模型选择、协议、任务、复制和退出 |
 
-Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行，`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compact`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`；插件注册的命令也会出现在同一个命令面板和帮助浮窗。帮助浮窗展示实际生效的 keymap，而不是固定按键表。
+Browse 模式只借鉴 Helix 交互中适合 Agent 的部分，而不要求用户掌握 Vim：方向键和鼠标是一等操作，`j/k` 保留为别名，`Space` 打开可点击命令面板，`:` 打开命令行。Insert 只负责编辑：`Enter` 插入换行，`Esc` 保留草稿并返回 Browse，随后在 Browse 按 `Enter` 才提交。`/` 打开全局会话内容选取器。命令包括 `:settings`、`:model`、`:login`、`:find`、`:copy`、`:tasks`、`:protocols`、`:compact`、`:compose`、`:detail`、`:editor`、`:help` 和 `:quit`；插件注册的命令也会出现在同一个命令面板和帮助浮窗。`F1` 按需展示实际生效的 keymap，不让快捷键提示常驻界面。
 
 只读浮窗可以直接用鼠标拖选。交互式面板和内嵌终端使用 Shift 拖选，使普通点击仍能交给程序处理。按 `y` 或 `Ctrl+Shift+C` 通过 OSC52 复制选区；没有选区时，同一操作会复制当前可见面板。
 
@@ -312,7 +312,7 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`models`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`detail`、`editor`、`palette`、`command`、`send`、`newline`、`model`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。注册命令的 ID 同时也是稳定的 action ID，因此可直接绑定 `map("browse", "c", "compact")` 或插件命令 ID。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
+可用模式包括 `global`、`browse`、`insert`、`detail`、`list`、`tasks`、`models`、`settings`、`palette`、`command`、`text`、`selection` 和 `terminal`。可用 action 会在 `F1` 帮助中显示，包括 `next`、`previous`、`finder`、`copy`、`insert`、`submit`、`detail`、`editor`、`palette`、`command`、`newline`、`model`、`settings`、`protocols`、`tasks`、`escape`、`close` 和 `quit`。注册命令的 ID 同时也是稳定的 action ID，因此可直接绑定 `map("browse", "c", "compact")` 或插件命令 ID。脚本最多执行 100,000 个 Rhai 操作，不会获得宿主文件系统或进程 API。
 
 ### 外部编辑器与选取器
 

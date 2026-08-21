@@ -278,19 +278,19 @@ The canonical launch directory is the project boundary. A normal launch creates 
 
 ## TUI
 
-The Ratatui interface separates event browsing, message input, and detailed inspection. The conversation surface shows one selectable preview per user message, response, reasoning segment, or tool call. A tool call and its result share one row, so streaming reasoning and large tool output never force the useful conversation off-screen. `Enter` opens the complete selected event in a scrollable panel; `e` opens it in the configured editor. The same lists support wheel scrolling and mouse selection; double-click an event to inspect it.
+The Ratatui interface separates event browsing, draft editing, and detailed inspection. The conversation surface shows one selectable preview per user message, response, reasoning segment, or tool call. A tool call and its result share one row, so streaming reasoning and large tool output never force the useful conversation off-screen. In Browse with no draft, `Enter` opens the complete selected event; `o` always opens it and `e` uses the configured editor. The same lists support wheel scrolling and mouse selection; double-click an event to inspect it.
 
-An empty session opens with a compact ordered-dither pixel mark, project and model facts, and the available entry points. During a turn, a fixed-height activity strip identifies reasoning, response streaming, tool execution, or compaction and shows elapsed time. The status area keeps the active mode, provider/model readiness, estimated context use, running task count, protocol count, project, session, and transient notices visible without expanding streamed content. The shimmer and activity waves are deterministic, low-noise animations that do not move the layout; narrow terminals fall back to a compact welcome.
+An empty session opens with a compact ordered-dither pixel mark, the project and model, and a few initial entry points. The Helix-inspired one-line status bar shows only the active mode, model, selected event position, and information that currently requires attention: a retained draft, temporary notice, or active reasoning/tool/compaction state. It does not keep shortcut instructions or estimated counters on screen. The dither shimmer and in-progress activity wave are deterministic, low-noise animations that never change the layout; narrow terminals fall back to a compact welcome.
 
 | Mode | Default keys | Action |
 | --- | --- | --- |
-| Browse | `↑/↓`, `Enter`, `i`, `e`, `/`, `y`, `Space`, `:`, mouse | Select previews, inspect details, compose, find an event, copy, or run a command |
-| Insert | `Enter`, `Shift+Enter`, `Ctrl+E`, `Esc` | Send, add a line, edit the draft externally, or return to Browse |
+| Browse | `↑/↓`, `Enter`, `o`, `i`, `e`, `/`, `y`, `Space`, `:`, mouse | Select previews; `Enter` submits a draft or opens detail when none exists |
+| Insert | `Enter`, `Ctrl+E`, `Esc` | Add a line, edit the draft externally, or preserve it and return to Browse |
 | Detail | `↑/↓`, `PageUp/PageDown`, `e`, `Esc`, drag, wheel | Inspect, select, copy, or externally view complete content |
 | Embedded terminal | normal program keys, double `Esc`, Shift-drag | Operate the editor/picker, close its PTY, or select terminal text |
 | Global | `F1`, `F2`, `F3`, `Ctrl+P`, `Ctrl+T`, `Ctrl+Shift+C`, `Ctrl+C` | Help, Settings, model picker, protocols, tasks, copy, and quit |
 
-Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compact`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. Registered plugin commands appear in the same palette and help panel. Help renders the active keymap rather than a fixed key table.
+Browse mode follows the small useful part of Helix's interaction model rather than requiring Vim knowledge: arrows and mouse are first-class, `j/k` remain aliases, `Space` opens a clickable command panel, and `:` opens a command line. Insert is exclusively for editing: `Enter` inserts a newline, while `Esc` preserves the draft and returns to Browse; `Enter` from Browse then submits it. `/` opens the global conversation finder. Commands include `:settings`, `:model`, `:login`, `:find`, `:copy`, `:tasks`, `:protocols`, `:compact`, `:compose`, `:detail`, `:editor`, `:help`, and `:quit`. Registered plugin commands appear in the same palette and help panel. `F1` renders the active keymap on demand rather than keeping shortcut hints on screen.
 
 Read-only floats support direct mouse drag selection. Use Shift-drag in interactive panels and embedded terminals so normal clicks still reach the application. Press `y` or `Ctrl+Shift+C` to copy the selection through OSC52; with no selection, the same action copies the visible panel.
 
@@ -312,7 +312,7 @@ unmap("browse", "e");
 map("insert", "ctrl+j", "newline");
 ```
 
-Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `models`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `detail`, `editor`, `palette`, `command`, `send`, `newline`, `model`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. A registered command ID is also a stable action ID, so `map("browse", "c", "compact")` or a plugin command ID can be bound directly. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
+Modes are `global`, `browse`, `insert`, `detail`, `list`, `tasks`, `models`, `settings`, `palette`, `command`, `text`, `selection`, and `terminal`. Available actions are the names shown by `F1`, including `next`, `previous`, `finder`, `copy`, `insert`, `submit`, `detail`, `editor`, `palette`, `command`, `newline`, `model`, `settings`, `protocols`, `tasks`, `escape`, `close`, and `quit`. A registered command ID is also a stable action ID, so `map("browse", "c", "compact")` or a plugin command ID can be bound directly. Scripts are limited to 100,000 Rhai operations and receive no host filesystem or process APIs.
 
 ### External editor and finder
 
