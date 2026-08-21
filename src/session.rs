@@ -120,6 +120,7 @@ pub struct Session {
     id: String,
     created: bool,
     project: String,
+    project_directory: PathBuf,
     directory: PathBuf,
     database_path: PathBuf,
     connection: Connection,
@@ -155,11 +156,8 @@ impl Session {
         context: SessionContext,
     ) -> Result<Self> {
         let (directory, connection) = open_database(database_path.clone()).await?;
-        let project = cwd
-            .canonicalize()
-            .unwrap_or_else(|_| cwd.to_path_buf())
-            .to_string_lossy()
-            .into_owned();
+        let project_directory = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let project = project_directory.to_string_lossy().into_owned();
 
         if let Some(id) = requested.filter(|id| *id != "latest") {
             validate_session_id(id)?;
@@ -284,6 +282,7 @@ impl Session {
             id,
             created: created_session,
             project,
+            project_directory,
             directory,
             database_path,
             connection,
@@ -303,6 +302,9 @@ impl Session {
     }
     pub fn is_new(&self) -> bool {
         self.created
+    }
+    pub fn project_directory(&self) -> &Path {
+        &self.project_directory
     }
     pub fn directory(&self) -> &Path {
         &self.directory

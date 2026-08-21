@@ -112,7 +112,7 @@ impl AgentRuntime {
                 return Err(anyhow!(text));
             }
         };
-        let images = match image_attachments(prompt, self.session.directory()).await {
+        let images = match image_attachments(prompt, self.session.project_directory()).await {
             Ok(images) => images,
             Err(error) => {
                 let text = format!("{error:#}");
@@ -543,17 +543,16 @@ mod tests {
     #[tokio::test]
     async fn text_only_backends_reject_images_before_recording_the_turn() {
         let workspace = tempfile::tempdir().unwrap();
-        tokio::fs::write(
-            workspace.path().join("screen.png"),
-            b"\x89PNG\r\n\x1a\nimage-data",
-        )
-        .await
-        .unwrap();
+        let project = workspace.path().join("project");
+        tokio::fs::create_dir(&project).await.unwrap();
+        tokio::fs::write(project.join("screen.png"), b"\x89PNG\r\n\x1a\nimage-data")
+            .await
+            .unwrap();
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let session = crate::session::Session::open_at(
-            workspace.path().join("sessions.db"),
+            workspace.path().join("session-data/sessions.db"),
             Some(&session_id),
-            workspace.path(),
+            &project,
             "fake",
             "text-only",
             SessionContext {
@@ -583,6 +582,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("does not accept image input"));
+        assert!(backend.requests.lock().await.is_empty());
+        assert!(session.model_history().await.is_empty());
+
+        drop(runtime);
+        drop(session);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn image_attachments_in_the_session_directory_are_outside_the_project_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = workspace.path().join("project");
+        tokio::fs::create_dir(&project).await.unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("session-data/sessions.db"),
+            Some(&session_id),
+            &project,
+            "fake",
+            "text-only",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let outside = session.directory().join("outside.png");
+        tokio::fs::write(&outside, b"\x89PNG\r\n\x1a\nimage-data")
+            .await
+            .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(session.id(), 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = AgentRuntime::new(
+            Some(backend.clone()),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        );
+
+        let error = runtime
+            .run_turn(format!("inspect @{}", outside.display()))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("outside the project boundary"));
         assert!(backend.requests.lock().await.is_empty());
         assert!(session.model_history().await.is_empty());
 
