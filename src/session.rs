@@ -110,12 +110,16 @@ pub enum EventKind {
 
 struct State {
     events: Vec<SessionEvent>,
+    persisted: bool,
+    provider: String,
+    model: String,
 }
 
 #[derive(Clone)]
 pub struct Session {
     id: String,
     created: bool,
+    project: String,
     directory: PathBuf,
     database_path: PathBuf,
     connection: Connection,
@@ -247,52 +251,12 @@ impl Session {
         let created_session = existing.is_empty();
         if created_session {
             let at = Utc::now();
-            let at_text = at.to_rfc3339();
             let created = EventKind::SessionCreated {
                 cwd: cwd.to_path_buf(),
                 provider: provider.to_string(),
                 model: model.to_string(),
             };
             let frozen = EventKind::SessionContext { context };
-            let created_payload =
-                serde_json::to_string(&created).context("cannot serialize session creation")?;
-            let context_payload =
-                serde_json::to_string(&frozen).context("cannot serialize session context")?;
-            let id_for_create = id.clone();
-            let project_for_create = project.clone();
-            let provider_for_create = provider.to_string();
-            let model_for_create = model.to_string();
-            let at_for_create = at_text.clone();
-            connection
-                .call(move |db| {
-                    let transaction = db.transaction()?;
-                    transaction.execute(
-                        "INSERT INTO sessions
-                         (id, created_at, updated_at, cwd, provider, model, head_sequence, draft)
-                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1, '')",
-                        params![
-                            id_for_create,
-                            at_for_create,
-                            project_for_create,
-                            provider_for_create,
-                            model_for_create
-                        ],
-                    )?;
-                    transaction.execute(
-                        "INSERT INTO events (session_id, sequence, at, kind, payload_json)
-                         VALUES (?1, 0, ?2, 'session_created', ?3)",
-                        params![id_for_create, at_for_create, created_payload],
-                    )?;
-                    transaction.execute(
-                        "INSERT INTO events (session_id, sequence, at, kind, payload_json)
-                         VALUES (?1, 1, ?2, 'session_context', ?3)",
-                        params![id_for_create, at_for_create, context_payload],
-                    )?;
-                    transaction.commit()?;
-                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-                })
-                .await
-                .context("cannot create session")?;
             existing.extend([
                 SessionEvent {
                     sequence: 0,
@@ -319,10 +283,16 @@ impl Session {
         let session = Self {
             id,
             created: created_session,
+            project,
             directory,
             database_path,
             connection,
-            state: Arc::new(Mutex::new(State { events: existing })),
+            state: Arc::new(Mutex::new(State {
+                events: existing,
+                persisted: !created_session,
+                provider: provider.to_string(),
+                model: model.to_string(),
+            })),
             events,
         };
         Ok(session)
@@ -341,26 +311,51 @@ impl Session {
         &self.database_path
     }
     pub async fn draft(&self) -> String {
-        let id = self.id.clone();
+        let persisted = self.state.lock().await.persisted;
+        let key = if persisted {
+            self.id.clone()
+        } else {
+            self.project.clone()
+        };
         self.connection
             .call(move |db| {
-                db.query_row("SELECT draft FROM sessions WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
+                let query = if persisted {
+                    "SELECT draft FROM sessions WHERE id = ?1"
+                } else {
+                    "SELECT draft FROM pending_drafts WHERE cwd = ?1"
+                };
+                db.query_row(query, [key], |row| row.get(0)).optional()
             })
             .await
+            .ok()
+            .flatten()
             .unwrap_or_default()
     }
 
     pub async fn save_draft(&self, text: &str) -> Result<()> {
-        let id = self.id.clone();
+        let persisted = self.state.lock().await.persisted;
+        let key = if persisted {
+            self.id.clone()
+        } else {
+            self.project.clone()
+        };
         let text = text.to_string();
         self.connection
             .call(move |db| {
-                db.execute(
-                    "UPDATE sessions SET draft = ?2 WHERE id = ?1",
-                    params![id, text],
-                )?;
+                if persisted {
+                    db.execute(
+                        "UPDATE sessions SET draft = ?2 WHERE id = ?1",
+                        params![key, text],
+                    )?;
+                } else if text.is_empty() {
+                    db.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [key])?;
+                } else {
+                    db.execute(
+                        "INSERT INTO pending_drafts (cwd, draft) VALUES (?1, ?2)
+                         ON CONFLICT(cwd) DO UPDATE SET draft = excluded.draft",
+                        params![key, text],
+                    )?;
+                }
                 Ok::<_, tokio_rusqlite::rusqlite::Error>(())
             })
             .await
@@ -368,23 +363,7 @@ impl Session {
     }
 
     pub async fn list_for_project(&self) -> Result<Vec<SessionSummary>> {
-        list_project_sessions(
-            self.database_path.clone(),
-            Path::new(&self.project_cwd().await),
-        )
-        .await
-    }
-
-    async fn project_cwd(&self) -> String {
-        let id = self.id.clone();
-        self.connection
-            .call(move |db| {
-                db.query_row("SELECT cwd FROM sessions WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
-            })
-            .await
-            .unwrap_or_default()
+        list_project_sessions(self.database_path.clone(), Path::new(&self.project)).await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
@@ -452,6 +431,14 @@ impl Session {
     }
 
     pub async fn update_model(&self, provider: &str, model: &str) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.provider = provider.to_string();
+        state.model = model.to_string();
+        if !state.persisted {
+            return Ok(());
+        }
+        drop(state);
+
         let id = self.id.clone();
         let provider = provider.to_string();
         let model = model.to_string();
@@ -470,9 +457,83 @@ impl Session {
 
     pub async fn append(&self, kind: EventKind) -> Result<SessionEvent> {
         let mut state = self.state.lock().await;
-        let id = self.id.clone();
         let at = Utc::now();
         let at_text = at.to_rfc3339();
+
+        if !state.persisted {
+            let sequence = state
+                .events
+                .last()
+                .map_or(0, |event| event.sequence.saturating_add(1));
+            let event = SessionEvent { sequence, at, kind };
+            if !matches!(&event.kind, EventKind::User { .. }) {
+                state.events.push(event.clone());
+                drop(state);
+                let _ = self.events.send(event.clone());
+                return Ok(event);
+            }
+
+            let mut stored_events = Vec::with_capacity(state.events.len() + 1);
+            for stored in state.events.iter().chain(std::iter::once(&event)) {
+                stored_events.push((
+                    stored.sequence as i64,
+                    stored.at.to_rfc3339(),
+                    payload_kind(&stored.kind).to_string(),
+                    serde_json::to_string(&stored.kind)
+                        .context("cannot serialize session event")?,
+                ));
+            }
+            let id = self.id.clone();
+            let project = self.project.clone();
+            let provider = state.provider.clone();
+            let model = state.model.clone();
+            self.connection
+                .call(move |db| {
+                    let transaction = db.transaction()?;
+                    let draft = transaction
+                        .query_row(
+                            "SELECT draft FROM pending_drafts WHERE cwd = ?1",
+                            [&project],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .unwrap_or_default();
+                    transaction.execute(
+                        "INSERT INTO sessions
+                         (id, created_at, updated_at, cwd, provider, model, head_sequence, draft)
+                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            id,
+                            at_text,
+                            project,
+                            provider,
+                            model,
+                            sequence as i64,
+                            draft
+                        ],
+                    )?;
+                    for (sequence, event_at, kind_name, payload) in stored_events {
+                        transaction.execute(
+                            "INSERT INTO events
+                             (session_id, sequence, at, kind, payload_json)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![id, sequence, event_at, kind_name, payload],
+                        )?;
+                    }
+                    transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
+                    transaction.commit()?;
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                })
+                .await
+                .context("cannot create session")?;
+            state.persisted = true;
+            state.events.push(event.clone());
+            drop(state);
+            let _ = self.events.send(event.clone());
+            return Ok(event);
+        }
+
+        let id = self.id.clone();
         let payload = serde_json::to_string(&kind).context("cannot serialize session event")?;
         let kind_name = payload_kind(&kind).to_string();
         let sequence = self
@@ -606,6 +667,9 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                    kind TEXT NOT NULL, payload_json TEXT NOT NULL,
                    PRIMARY KEY(session_id, sequence),
                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS pending_drafts (
+                   cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
                  );",
             )?;
             let has_draft = {
@@ -619,6 +683,40 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                     [],
                 )?;
             }
+
+            // TODO: Remove this compatibility cleanup after legacy empty sessions have aged out.
+            let transaction = db.transaction()?;
+            transaction.execute(
+                "INSERT INTO pending_drafts (cwd, draft)
+                 SELECT legacy.cwd, legacy.draft
+                 FROM sessions AS legacy
+                 WHERE legacy.draft <> ''
+                   AND NOT EXISTS (
+                     SELECT 1 FROM events
+                     WHERE events.session_id = legacy.id AND events.kind = 'user'
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM sessions AS newer
+                     WHERE newer.cwd = legacy.cwd
+                       AND NOT EXISTS (
+                         SELECT 1 FROM events
+                         WHERE events.session_id = newer.id AND events.kind = 'user'
+                       )
+                       AND (newer.updated_at > legacy.updated_at
+                            OR (newer.updated_at = legacy.updated_at AND newer.id > legacy.id))
+                   )
+                 ON CONFLICT(cwd) DO UPDATE SET draft = excluded.draft",
+                [],
+            )?;
+            transaction.execute(
+                "DELETE FROM sessions
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM events
+                   WHERE events.session_id = sessions.id AND events.kind = 'user'
+                 )",
+                [],
+            )?;
+            transaction.commit()?;
             Ok::<_, tokio_rusqlite::rusqlite::Error>(())
         })
         .await
@@ -719,6 +817,12 @@ mod tests {
         let path = temp.path().join("sessions.db");
         let first = session(&path, Some("history")).await;
         first
+            .append(EventKind::User {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        first
             .append(EventKind::ModelMessage {
                 message: Message::user("hello"),
             })
@@ -750,6 +854,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(original.context().await.system_prompt, "system original");
+        original
+            .append(EventKind::User {
+                text: "freeze this session".into(),
+            })
+            .await
+            .unwrap();
         drop(original);
 
         let resumed = Session::open_at(
@@ -776,6 +886,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
         let original = session(&path, Some("legacy")).await;
+        original
+            .append(EventKind::User {
+                text: "persist legacy session".into(),
+            })
+            .await
+            .unwrap();
         original
             .connection
             .call(|database| {
@@ -811,6 +927,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
         let compacted = session(&path, Some("compacted")).await;
+        compacted
+            .append(EventKind::User {
+                text: "start history".into(),
+            })
+            .await
+            .unwrap();
         compacted
             .append(EventKind::ModelMessage {
                 message: Message::user("old history"),
@@ -848,7 +970,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
         let older = session(&path, Some("older")).await;
+        older
+            .append(EventKind::User {
+                text: "older".into(),
+            })
+            .await
+            .unwrap();
         let newer = session(&path, Some("newer")).await;
+        newer
+            .append(EventKind::User {
+                text: "newer".into(),
+            })
+            .await
+            .unwrap();
         older
             .append(EventKind::Notice {
                 text: "updated last".into(),
@@ -874,10 +1008,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_session_is_not_persisted_until_the_first_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("deferred")).await;
+        opened
+            .append(EventKind::Notice {
+                text: "startup notice".into(),
+            })
+            .await
+            .unwrap();
+        opened.update_model("changed", "next-model").await.unwrap();
+        let before: i64 = opened
+            .connection
+            .call(|db| db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(before, 0);
+
+        opened
+            .append(EventKind::User {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        let persisted: (i64, i64, String, String) = opened
+            .connection
+            .call(|db| {
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                    db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?,
+                    db.query_row("SELECT count(*) FROM events", [], |row| row.get(0))?,
+                    db.query_row("SELECT provider FROM sessions", [], |row| row.get(0))?,
+                    db.query_row("SELECT model FROM sessions", [], |row| row.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(persisted, (1, 4, "changed".into(), "next-model".into()));
+    }
+
+    #[tokio::test]
     async fn an_explicit_session_cannot_cross_project_boundaries() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
-        Session::open_at(
+        let other = Session::open_at(
             path.clone(),
             Some("other-project"),
             Path::new("/projects/other"),
@@ -887,6 +1061,12 @@ mod tests {
         )
         .await
         .unwrap();
+        other
+            .append(EventKind::User {
+                text: "other project".into(),
+            })
+            .await
+            .unwrap();
 
         let error = match Session::open_at(
             path,
@@ -909,11 +1089,77 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
         let opened = session(&path, Some("drafty")).await;
+        opened
+            .append(EventKind::User {
+                text: "existing turn".into(),
+            })
+            .await
+            .unwrap();
         opened.save_draft("keep me").await.unwrap();
         drop(opened);
         let reopened = session(&path, Some("drafty")).await;
         assert_eq!(reopened.draft().await, "keep me");
-        assert_eq!(reopened.snapshot().await.len(), 2);
+        assert_eq!(reopened.snapshot().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn pending_draft_persists_without_creating_a_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("pending-draft")).await;
+        opened.save_draft("keep me").await.unwrap();
+        drop(opened);
+
+        let reopened = session(&path, Some("another-new-session")).await;
+        assert_eq!(reopened.draft().await, "keep me");
+        let count: i64 = reopened
+            .connection
+            .call(|db| db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_empty_sessions_are_removed_without_losing_their_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("setup")).await;
+        opened
+            .connection
+            .call(|db| {
+                db.execute(
+                    "INSERT INTO sessions
+                     (id, created_at, updated_at, cwd, provider, model, head_sequence, draft)
+                     VALUES ('legacy-empty', '2026-01-01T00:00:00Z',
+                             '2026-01-01T00:00:00Z', '/work', 'test', 'model', 1, 'legacy draft')",
+                    [],
+                )?;
+                db.execute(
+                    "INSERT INTO events (session_id, sequence, at, kind, payload_json)
+                     VALUES ('legacy-empty', 0, '2026-01-01T00:00:00Z', 'notice',
+                             '{\"kind\":\"notice\",\"text\":\"startup\"}')",
+                    [],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        drop(opened);
+
+        let reopened = session(&path, Some("fresh")).await;
+        assert_eq!(reopened.draft().await, "legacy draft");
+        let counts: (i64, i64) = reopened
+            .connection
+            .call(|db| {
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                    db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?,
+                    db.query_row("SELECT count(*) FROM events", [], |row| row.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
     }
 
     #[tokio::test]
@@ -928,7 +1174,7 @@ mod tests {
             .await
             .unwrap();
         session(&path, Some("beta")).await;
-        Session::open_at(
+        let other = Session::open_at(
             path.clone(),
             Some("other"),
             Path::new("/projects/other"),
@@ -938,13 +1184,19 @@ mod tests {
         )
         .await
         .unwrap();
+        other
+            .append(EventKind::User {
+                text: "other question".into(),
+            })
+            .await
+            .unwrap();
         let listed = first.list_for_project().await.unwrap();
         let ids = listed
             .iter()
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>();
         assert!(ids.contains(&"alpha"));
-        assert!(ids.contains(&"beta"));
+        assert!(!ids.contains(&"beta"));
         assert!(!ids.contains(&"other"));
         assert_eq!(
             listed

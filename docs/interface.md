@@ -117,15 +117,17 @@ Sessions are append-only and stored in SQLite:
 
 If a platform data directory cannot be determined, URI Agent falls back to `<project>/.uri-agent/sessions.db`.
 
+URI Agent keeps a new session in memory until its first user message is accepted, then writes the frozen context, queued startup events, and user message in one transaction. Opening and closing the application without sending a message does not create a session record.
+
 The canonical startup directory is the project boundary and is recorded with every session. Session selection cannot cross it:
 
-- a normal launch creates a new session;
+- a normal launch starts a new session;
 - `--continue-session` resumes the most recently updated session for this project;
 - `--session <id>` resumes that ID only if it belongs to this project;
 - `--session latest` selects the same project-scoped latest session;
 - `:resume` lists sessions for the current project.
 
-`Esc` keeps draft text in the composer. URI Agent writes the current draft to SQLite when the TUI exits or switches sessions, then restores it with that session.
+`Esc` keeps draft text in the composer. URI Agent writes the current draft to SQLite when the TUI exits or switches sessions. Before the first message, it stores the draft separately by project so preserving a draft does not create an empty session record.
 
 ### Frozen startup context
 
