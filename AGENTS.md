@@ -61,4 +61,4 @@ Add focused tests beside changed behavior. Shared protocol, task, session, or mo
 
 Write model-facing help as operational documentation: state the valid URI, accepted body shapes, async behavior, result address, limits, and one concrete example. Keep the initial system prompt short; detailed instructions belong behind `://help`.
 
-Update `README.md` when CLI flags, provider defaults, key bindings, scan locations, persistence paths, or public protocol behavior changes.
+Keep the English `README.md` and Chinese `README.zh-CN.md` equivalent. Update both when CLI flags, provider defaults, key bindings, scan locations, persistence paths, or public protocol behavior changes.
