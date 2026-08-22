@@ -4,7 +4,7 @@ use crate::task::TaskManager;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -47,8 +47,14 @@ pub trait Protocol: Send + Sync {
     }
 }
 
+pub trait DynamicProtocolSource: Send + Sync {
+    fn descriptors(&self) -> Vec<ProtocolDescriptor>;
+    fn protocol(&self, name: &str) -> Option<Arc<dyn Protocol>>;
+}
+
 pub struct ProtocolRegistry {
     protocols: BTreeMap<String, Arc<dyn Protocol>>,
+    dynamic: Option<Arc<dyn DynamicProtocolSource>>,
     output: Arc<OutputStore>,
     context: ProtocolContext,
 }
@@ -57,6 +63,7 @@ impl ProtocolRegistry {
     pub fn new(output: Arc<OutputStore>, tasks: TaskManager) -> Self {
         Self {
             protocols: BTreeMap::new(),
+            dynamic: None,
             output,
             context: ProtocolContext { tasks },
         }
@@ -80,11 +87,37 @@ impl ProtocolRegistry {
         Ok(())
     }
 
+    pub fn set_dynamic_source(&mut self, source: Arc<dyn DynamicProtocolSource>) -> Result<()> {
+        if self.dynamic.is_some() {
+            bail!("dynamic protocol source is already registered");
+        }
+        let mut names = HashSet::new();
+        for descriptor in source.descriptors() {
+            validate_descriptor(&descriptor)?;
+            if self.protocols.contains_key(&descriptor.name)
+                || !names.insert(descriptor.name.clone())
+            {
+                bail!(
+                    "dynamic protocol name is already registered: {}",
+                    descriptor.name
+                );
+            }
+        }
+        self.dynamic = Some(source);
+        Ok(())
+    }
+
     pub fn descriptors(&self) -> Vec<ProtocolDescriptor> {
-        self.protocols
+        let mut descriptors = self
+            .protocols
             .values()
             .map(|protocol| protocol.descriptor())
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(dynamic) = &self.dynamic {
+            descriptors.extend(dynamic.descriptors());
+        }
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors
     }
 
     pub fn prompt_protocols(&self) -> Vec<ProtocolPrompt> {
@@ -98,10 +131,30 @@ impl ProtocolRegistry {
     }
 
     pub async fn read(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+        self.dispatch_read(uri, body, true).await
+    }
+
+    pub async fn exec(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+        self.dispatch_exec(uri, body, true).await
+    }
+
+    pub(crate) async fn read_static(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+        self.dispatch_read(uri, body, false).await
+    }
+
+    pub(crate) async fn exec_static(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+        self.dispatch_exec(uri, body, false).await
+    }
+
+    async fn dispatch_read(
+        &self,
+        uri: &str,
+        body: Option<&Value>,
+        include_dynamic: bool,
+    ) -> Result<String> {
         let (name, target) = split_address(uri)?;
         let protocol = self
-            .protocols
-            .get(name)
+            .find_protocol(name, include_dynamic)
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
         let descriptor = protocol.descriptor();
         if !descriptor.can_read {
@@ -113,11 +166,15 @@ impl ProtocolRegistry {
         self.output.present(content, name).await
     }
 
-    pub async fn exec(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+    async fn dispatch_exec(
+        &self,
+        uri: &str,
+        body: Option<&Value>,
+        include_dynamic: bool,
+    ) -> Result<String> {
         let (name, target) = split_address(uri)?;
         let protocol = self
-            .protocols
-            .get(name)
+            .find_protocol(name, include_dynamic)
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
@@ -127,6 +184,14 @@ impl ProtocolRegistry {
             .exec(ProtocolRequest { uri, target, body }, self.context.clone())
             .await?;
         self.output.present(content, name).await
+    }
+
+    fn find_protocol(&self, name: &str, include_dynamic: bool) -> Option<Arc<dyn Protocol>> {
+        self.protocols.get(name).cloned().or_else(|| {
+            include_dynamic
+                .then(|| self.dynamic.as_ref()?.protocol(name))
+                .flatten()
+        })
     }
 }
 

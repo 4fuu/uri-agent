@@ -15,3 +15,4 @@ pub mod skill;
 pub mod task;
 pub mod terminal;
 pub mod tui;
+pub mod wasm_plugin;

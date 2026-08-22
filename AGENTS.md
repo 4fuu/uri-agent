@@ -36,6 +36,7 @@ Use [`docs/README.md`](docs/README.md) as the documentation index. Exact CLI beh
 - Keep file writes atomic, terminate shell child processes on cancellation, and preserve oversized output behind a readable `file://` address.
 - Enable only an available `bash` protocol on non-Windows platforms. On Windows, keep native-shell policy in the `pwsh` plugin: require PowerShell 7 or newer, warn and leave `pwsh` disabled when unavailable, and suppress `bash` when enabled.
 - Discover Skills once at startup, preserve first-wins protocol naming and containment, and freeze the generated prompt plus selected Skill metadata and canonical paths in every new session.
+- Load trusted WASM modules from top-level `.wasm` files in the persistent plugin directory. Keep `wasm_plugin` limited to `help` and atomic whole-set `reload`; keep guest SDK host calls out of dynamic WASM routing.
 - Resume only from frozen session context. Session events remain append-only; compaction adds checkpoints, keeps complete user turns, and never separates a tool call from its result.
 - Treat canonical `--cwd` as the project boundary for attachments and session resume.
 - Keep one keyboard-complete conversation surface. Route commands through `CommandRegistry`, configurable keys through the layered Rhai keymap, and extension UI through generic `PluginHost` registrations.

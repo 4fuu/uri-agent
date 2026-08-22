@@ -8,16 +8,17 @@ use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
 use uri_agent::plugin::{CommandRegistry, PluginHost, TuiRegistry};
 use uri_agent::prompts::ProtocolPrompt;
-use uri_agent::protocol::{ProtocolDescriptor, ProtocolRegistry};
+use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice, SessionContext};
 use uri_agent::skill::SkillProtocol;
 use uri_agent::task::TaskManager;
 use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
+use uri_agent::wasm_plugin::WasmPluginManager;
 
 struct SessionRuntime {
     runtime: Arc<AgentRuntime>,
-    protocols: Vec<ProtocolDescriptor>,
+    protocols: Arc<ProtocolRegistry>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
     tasks: TaskManager,
@@ -71,7 +72,9 @@ async fn run_session(
     terminal: &mut TuiTerminal,
 ) -> Result<(TuiOutcome, SessionRuntime)> {
     let initial = config.manager.current().await;
-    let plugins = uri_agent::builtins::plugins(&config.cwd);
+    let mut plugins = uri_agent::builtins::plugins(&config.cwd);
+    let wasm_plugins = WasmPluginManager::new(config.manager.directory(), &config.cwd).await?;
+    plugins.add(wasm_plugins.clone());
     let plugin_notices = plugins.startup_notices();
     let plugin_protocols = plugins.protocol_descriptors()?;
     let plugin_prompt_fragments = plugins.system_prompt_fragments()?;
@@ -143,6 +146,7 @@ async fn run_session(
     notices.extend(plugin_notices);
     let tasks = TaskManager::new();
     let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
+    wasm_plugins.bind_output(output.clone())?;
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
     let mut commands = CommandRegistry::with_core_commands();
     let mut tui = TuiRegistry::default();
@@ -169,9 +173,21 @@ async fn run_session(
             notices.push(format!("skipped {description}: {error}"));
         }
     }
+    wasm_plugins.set_reserved_protocols(
+        protocols
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name),
+    )?;
+    let wasm_report = wasm_plugins.reload().await?;
+    if !wasm_report.diagnostics.is_empty() {
+        notices.push(format!(
+            "skipped {} WASM plugin(s); read wasm_plugin://help for diagnostics",
+            wasm_report.diagnostics.len()
+        ));
+    }
     notices.extend(config.catalog.warnings().await);
 
-    let descriptors = protocols.descriptors();
     let configured = match configured_backend(&active, &config.catalog, Some(session.id())).await {
         Ok(configured) => configured,
         Err(error) => {
@@ -190,7 +206,9 @@ async fn run_session(
                 .map_or_else(ModelLimits::default, |model| model.limits()),
         ),
     };
+    protocols.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
     let protocols = Arc::new(protocols);
+    wasm_plugins.bind_host(Arc::downgrade(&protocols))?;
     for notice in notices {
         session.append(EventKind::Notice { text: notice }).await?;
     }
@@ -198,7 +216,7 @@ async fn run_session(
     let context_window = limits.context_window;
     let runtime = Arc::new(AgentRuntime::new(
         backend,
-        protocols,
+        protocols.clone(),
         session.clone(),
         frozen_context.system_prompt,
         limits,
@@ -208,7 +226,7 @@ async fn run_session(
     let tui = Arc::new(tui);
     let session_runtime = SessionRuntime {
         runtime: runtime.clone(),
-        protocols: descriptors,
+        protocols,
         commands,
         tui,
         tasks,

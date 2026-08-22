@@ -10,4 +10,5 @@ if [[ -f "$HOME/.cargo/env" ]]; then
   . "$HOME/.cargo/env"
 fi
 rustup component add rustfmt clippy
+rustup target add wasm32-wasip1
 cargo fetch --locked 2>/dev/null || cargo fetch

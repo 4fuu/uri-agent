@@ -16,6 +16,7 @@ URI Agent 是一个终端 coding agent，核心是固定且精简的模型接口
 - **稳定的工具面：**增加能力不会增加新的模型工具 schema。
 - **渐进式上下文：**只有模型读取协议或 Skill 帮助时，相应说明才进入上下文。
 - **可观察的执行过程：**异步工作的状态和最终输出都通过协议的读取路由提供。
+- **便携的可信扩展：**Extism WASM 模块可通过稳定的 Rust SDK 添加支持热重载的协议，并拥有与 URI Agent 相同的用户权限。
 - **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
 - **完整键盘操作的 TUI：**会话、输入、命令、模型选择、设置和终端集中在同一界面。
 
@@ -76,6 +77,15 @@ exec("pwsh://?wait=30", "cargo test")  # Windows
 非 Windows 平台只启用 Bash。在 Windows 上，PowerShell 7 或更高版本会启用 `pwsh` 并关闭 `bash`；如果 PowerShell 7 不可用，URI Agent 会显示警告，已安装的 Bash 仍会保持启用。
 
 URI Agent 只按第一个 `://` 分割地址；剩余 target 由选中的协议负责解释。注册表会原样传递可选 JSON `body`。完整设计和内置协议清单见英文文档 [Protocols, tasks, Skills, and extensions](docs/protocols.md)。
+
+可信 WASM 协议插件以 `.wasm` 文件的形式存放在 `<config>/wasm-plugins/`。模型可以读取 `wasm_plugin://help`，在临时目录 clone 并构建 Rust 插件，把产物原子放入这个持久目录，再调用 `wasm_plugin://reload`，无需重启进程。URI Agent 不要求 package manifest，也不内置 Git package manager：
+
+```text
+read("wasm_plugin://help")
+exec("wasm_plugin://reload")
+```
+
+这里的 WASM 是稳定的分发 ABI，不是安全边界。启用的插件拥有 WASI、HTTP、文件系统和内置协议访问能力，其用户权限与 URI Agent 相同。Rust SDK、reload 行为和可靠性限制见英文文档 [WASM plugins](docs/protocols.md#wasm-plugins)。
 
 ## 文档
 

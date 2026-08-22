@@ -95,6 +95,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 | `<config>/models.json` | Custom providers, models, headers, and model overrides |
 | `<config>/models-store.json` | Generated pi catalog cache |
 | `<config>/keymap.rhai` | Global keymap overrides |
+| `<config>/wasm-plugins/` | Trusted WASM modules loaded at startup and on reload |
 | `<project>/.uri-agent/settings.json` | Optional project settings |
 | `<project>/.uri-agent/keymap.rhai` | Optional project keymap overrides |
 
@@ -134,6 +135,19 @@ Relevant environment variables are:
 | `URI_AGENT_TERMINAL` | Embedded terminal command |
 
 When the project settings file already exists, changes made through model selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
+
+### Persistent WASM plugins
+
+URI Agent creates `<config>/wasm-plugins/` with the rest of its persistent
+configuration. Every non-hidden regular `.wasm` file directly inside that
+directory is enabled; nested files and temporary files are ignored. The
+directory follows `URI_AGENT_CONFIG_DIR` when that environment variable
+overrides the platform configuration directory.
+
+There is no settings field, CLI path flag, package manifest, or package command.
+The model-facing `wasm_plugin://help` route publishes the actual directory and
+the build/install workflow. `wasm_plugin://reload` rebuilds and atomically swaps
+the dynamic protocol set. See [WASM plugins](protocols.md#wasm-plugins).
 
 ## Thinking effort
 

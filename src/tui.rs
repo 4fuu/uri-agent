@@ -13,7 +13,7 @@ use crate::plugin::{
     CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext,
     TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
 };
-use crate::protocol::ProtocolDescriptor;
+use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::AgentRuntime;
 use crate::session::{EventKind, SessionEvent, SessionSummary, SessionUpdate};
 use crate::task::{TaskManager, TaskRecord};
@@ -402,6 +402,7 @@ struct App {
     input: TextArea<'static>,
     blocks: Vec<DisplayBlock>,
     protocols: Vec<ProtocolDescriptor>,
+    protocol_source: Option<Arc<ProtocolRegistry>>,
     task_records: Vec<TaskRecord>,
     selected_task: usize,
     selected_block: usize,
@@ -475,6 +476,7 @@ impl App {
             input,
             blocks: Vec::new(),
             protocols,
+            protocol_source: None,
             task_records: Vec::new(),
             selected_task: 0,
             selected_block: 0,
@@ -1374,7 +1376,7 @@ fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: 
 
 pub struct TuiServices {
     pub runtime: Arc<AgentRuntime>,
-    pub protocols: Vec<ProtocolDescriptor>,
+    pub protocols: Arc<ProtocolRegistry>,
     pub commands: Arc<CommandRegistry>,
     pub tui: Arc<TuiRegistry>,
     pub tasks: TaskManager,
@@ -1422,7 +1424,16 @@ impl TuiTerminal {
         let mut receiver = session.subscribe();
         let keymap = Keymap::load(Some(&info.cwd)).await?;
         let show_splash = std::mem::take(&mut self.first_session);
-        let mut app = App::new(protocols, commands, tui, info, keymap, draft, show_splash);
+        let mut app = App::new(
+            protocols.descriptors(),
+            commands,
+            tui,
+            info,
+            keymap,
+            draft,
+            show_splash,
+        );
+        app.protocol_source = Some(protocols);
         for event in session.snapshot().await {
             app.apply(event);
         }
@@ -4755,6 +4766,12 @@ fn bottom_float(frame: Rect, desired_height: u16) -> Rect {
     )
 }
 
+fn active_protocols(app: &App) -> Vec<ProtocolDescriptor> {
+    app.protocol_source
+        .as_ref()
+        .map_or_else(|| app.protocols.clone(), |source| source.descriptors())
+}
+
 fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
     let area = overlay_area(frame.area(), overlay);
     frame.render_widget(Clear, area);
@@ -4794,7 +4811,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         }
         Overlay::Protocols => {
             let mut lines = Vec::new();
-            for protocol in &app.protocols {
+            for protocol in active_protocols(app) {
                 let modes = match (protocol.can_read, protocol.can_exec) {
                     (true, true) => "read · exec",
                     (true, false) => "read",
@@ -4806,7 +4823,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
                         format!("{}://   {modes}", protocol.name),
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
-                    Line::styled(protocol.description.clone(), Style::default().fg(TEXT)),
+                    Line::styled(protocol.description, Style::default().fg(TEXT)),
                     Line::default(),
                 ]);
             }
@@ -5016,7 +5033,7 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<
         ),
         status_row(
             "PROTOCOLS",
-            format!("{} registered", app.protocols.len()),
+            format!("{} registered", active_protocols(app).len()),
             Style::default().fg(TEXT),
         ),
     ];
@@ -5954,9 +5971,32 @@ fn single_line_preview(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::ValueSource;
+    use crate::protocol::{Protocol, ProtocolContext, ProtocolRequest};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
+
+    struct LiveProtocol;
+
+    #[async_trait::async_trait]
+    impl Protocol for LiveProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "live".to_string(),
+                description: "Live protocol".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+
+        async fn read(
+            &self,
+            _request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+    }
 
     fn test_app_with_splash(show_splash: bool) -> App {
         App::new(
@@ -5996,6 +6036,26 @@ mod tests {
     fn edit_composer_with_default_keymap(app: &mut App, key: KeyEvent) {
         let action = app.keymap.action("composer", &key_name(key));
         app.edit_composer(key, action.as_deref());
+    }
+
+    #[tokio::test]
+    async fn protocol_surfaces_prefer_the_live_registry() {
+        let session_id = format!("tui-protocol-test-{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry.register(LiveProtocol).unwrap();
+        let mut app = test_app();
+        app.protocol_source = Some(Arc::new(registry));
+
+        assert_eq!(
+            active_protocols(&app)
+                .into_iter()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>(),
+            ["live"]
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {

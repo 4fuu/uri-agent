@@ -7,6 +7,10 @@ description = "A protocol-oriented coding agent with a focused terminal interfac
 repository = "https://github.com/4fuu/uri-agent"
 readme = "README.md"
 
+[workspace]
+members = ["examples/wasm-plugin", "sdk"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -16,6 +20,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6"
+extism = { version = "1.21", default-features = false, features = ["http", "register-filesystem", "register-http", "wasmtime-default-features"] }
 futures-util = "0.3"
 getrandom = "0.2"
 http = "1"
@@ -38,6 +43,7 @@ tui-term = "0.3"
 tui-textarea = { package = "tui-textarea-2", version = "0.9" }
 unicode-segmentation = "1"
 unicode-width = "0.2"
+uri-agent-plugin-sdk = { path = "sdk" }
 uuid = { version = "1", features = ["serde", "v7"] }
 vt100 = "0.16"
 
@@ -46,6 +52,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+wat = "1"
 
 [lints.rust]
 # aws-lc-sys (pulled in by reqwest's rustls feature) marks its jitterentropy

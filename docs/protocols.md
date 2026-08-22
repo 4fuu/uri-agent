@@ -218,7 +218,171 @@ When a session is created, URI Agent freezes:
 
 Resume reuses this snapshot instead of rediscovering current context. A same-named Skill elsewhere cannot replace the frozen one. Help and resources are still read from the frozen path, so removing that file produces an explicit error. A historical session without frozen context is invalid rather than being reinterpreted with current startup state.
 
-## Rust extensions
+## WASM plugins
+
+URI Agent loads trusted [Extism](https://extism.org/) modules from
+`<config>/wasm-plugins/`. The built-in `wasm_plugin` protocol exposes exactly two
+operations:
+
+```text
+read("wasm_plugin://help")
+exec("wasm_plugin://reload")
+```
+
+There are no install, update, remove, or list operations, no `--wasm-plugin`
+flag, no `wasmPlugins` setting, and no package manifest. `wasm_plugin://help`
+publishes the actual persistent directory and the current build/install
+contract. The agent owns repository discovery, source review, cloning, and
+building through the normal file and shell protocols. It builds in a temporary
+directory, writes a temporary file beside the destination, atomically renames
+that file to `<name>.wasm`, and then reloads.
+
+URI Agent scans only non-hidden regular `.wasm` files directly inside the
+persistent directory. Nested files and temporary suffixes such as `.wasm.tmp`
+are ignored. Removing a file disables it at the next reload; atomically
+replacing a file updates it.
+
+### Reload lifecycle
+
+Reload follows Pi's rebuild-then-replace resource lifecycle. URI Agent reads
+the complete directory in stable path order, constructs fresh Extism runtimes,
+validates their manifests and protocol names, and assembles a complete dynamic
+protocol set without mutating the active set. Invalid modules and modules that
+collide with built-ins, Skills, or an earlier module are skipped with
+diagnostics. Only after discovery finishes does URI Agent swap the complete set
+in one operation. A directory-level failure leaves the old set active. Calls
+that already captured an old protocol keep its old runtime until they finish;
+new calls see the replacement set.
+
+The model tool schemas do not change because every protocol remains behind
+`read` and `exec`. Reload reports the active protocol names and tells the model
+to read each new `<protocol>://help`. Diagnostic strings are stored as JSON in
+the session output directory rather than embedded in model-facing text;
+`wasm_plugin://help` reports their count and links the file as a `file://`
+address. The TUI protocol overlay reads the live registry, so it also reflects
+the replacement set. Frozen session prompts expose the stable `wasm_plugin`
+manager rather than embedding a mutable dynamic protocol list. Its help includes
+the current active names and last reload diagnostic file. New and resumed
+sessions load the current persistent plugin set; after any change, help and the
+reload result are the source of truth.
+
+### ABI version 1
+
+ABI version 1 lets a module contribute protocols. It does not contribute system
+prompt fragments, commands, panels, or status providers. A plugin export is an
+Extism bytes-in/bytes-out function and can be implemented with any compatible
+PDK.
+
+Every module exports `uri_agent_manifest`, which takes no input and returns this
+JSON shape:
+
+```json
+{
+  "abi_version": 1,
+  "protocols": [
+    {
+      "name": "example",
+      "description": "Read and execute example resources",
+      "can_read": true,
+      "can_exec": true
+    }
+  ]
+}
+```
+
+Protocol names must be unique within the module and must satisfy the normal
+registry rules. Descriptions must be nonempty. Every protocol must set
+`can_read` to `true` and implement `read("<protocol>://help")`; `can_exec` may be
+either `true` or `false`.
+
+A module that declares a protocol also exports `uri_agent_handle`. URI Agent
+calls it with JSON containing the selected protocol, operation, original URI,
+opaque target, and optional body:
+
+```json
+{
+  "protocol": "example",
+  "operation": "read",
+  "uri": "example://a://b?x=1",
+  "target": "a://b?x=1",
+  "body": {"key": "value"}
+}
+```
+
+`operation` is `read` or `exec`; `body` is `null` when the tool call omitted it.
+
+The handler's returned bytes become the protocol result. Returning an Extism
+error fails the tool call. A plugin remains instantiated until the next reload,
+so its in-memory state survives calls; calls into one module are serialized.
+Plugins must implement their own `<protocol>://help` response through the same
+handler and must describe every supported address and body shape there.
+
+WASM is a portable ABI, not a sandbox in this feature. Plugins must be treated
+as trusted code. They receive WASI, unrestricted outbound HTTP, and writable
+host filesystem access on Unix. The SDK's `read` and `exec` host calls route to
+URI Agent's static built-in protocols, including file and available shell
+protocols, with URI Agent's user permissions. Host calls reject dynamic WASM
+protocols and `wasm_plugin` itself to prevent recursive entry into a module
+runtime.
+
+Reliability limits still apply: each guest call has a 30-second wall-clock
+timeout, a 100-million fuel limit, a 16 MiB WebAssembly memory ceiling, and a
+1 MiB Extism variable store. Modules and responses are limited to 16 MiB;
+manifests are limited to 256 KiB and 64 protocols.
+
+### Rust guest example
+
+The workspace includes the guest crate
+[`uri-agent-plugin-sdk`](../sdk/) and a buildable
+[`examples/wasm-plugin`](../examples/wasm-plugin/) project. An external plugin
+can depend directly on the Git repository; it needs no package manifest:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+uri-agent-plugin-sdk = { git = "https://github.com/4fuu/uri-agent" }
+```
+
+```rust
+use uri_agent_plugin_sdk::{
+    HandlerRequest, HandlerResult, PluginManifest, ProtocolDescriptor,
+    define_plugin,
+};
+
+fn manifest() -> PluginManifest {
+    PluginManifest::new([ProtocolDescriptor::new(
+        "example",
+        "Read example://help before use",
+        true,
+        false,
+    )])
+}
+
+fn handle(request: HandlerRequest) -> HandlerResult {
+    match request.target.as_str() {
+        "help" => Ok(b"# example\n\nDescribe every supported address here.\n".to_vec()),
+        _ => Err(format!("unsupported address: {}", request.uri)),
+    }
+}
+
+define_plugin!(manifest(), handle);
+```
+
+The SDK generates `uri_agent_manifest` and `uri_agent_handle`, provides typed
+request and manifest values, and exposes built-in host calls as
+`uri_agent_plugin_sdk::read` and `uri_agent_plugin_sdk::exec`. Build with:
+
+```text
+rustup target add wasm32-wasip1
+cargo build --release --target wasm32-wasip1
+```
+
+The WASI target lets ordinary Rust filesystem APIs use the host paths granted
+by URI Agent.
+
+## Linked Rust extensions
 
 First-party capabilities use the same plugin path exposed to linked Rust extensions:
 
@@ -229,6 +393,6 @@ First-party capabilities use the same plugin path exposed to linked Rust extensi
 
 TUI extensions return generic documents and semantic status items. Status providers run while frames are drawn, so they must be fast and non-blocking. They receive `TuiStatusContext`, whose `expanded` flag allows concise footer content and richer content in the status panel.
 
-URI Agent does not currently load native dynamic libraries. Third-party Rust extensions must be linked during application assembly.
+URI Agent does not load native dynamic libraries. Third-party Rust extensions must be linked during application assembly; use the WASM ABI for runtime-loaded protocol plugins.
 
 Keep operational plugin behavior inside registered protocols, commands, or panel providers. Use prompt fragments only for startup context that must be available before a tool call. Generic rendering belongs in the TUI; extension-specific branches do not.

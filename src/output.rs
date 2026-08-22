@@ -40,18 +40,23 @@ impl OutputStore {
         self.limit.load(Ordering::Relaxed)
     }
 
+    pub(crate) async fn preserve(&self, content: &[u8], hint: &str) -> Result<PathBuf> {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let filename = format!("{:06}-{}.txt", sequence, sanitize(hint));
+        let path = self.directory.join(filename);
+        fs::write(&path, content)
+            .await
+            .with_context(|| format!("failed to preserve complete output: {}", path.display()))?;
+        Ok(path)
+    }
+
     pub async fn present(&self, content: Vec<u8>, hint: &str) -> Result<String> {
         let limit = self.limit();
         if content.len() <= limit {
             return Ok(String::from_utf8_lossy(&content).into_owned());
         }
 
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let filename = format!("{:06}-{}.txt", sequence, sanitize(hint));
-        let path = self.directory.join(filename);
-        fs::write(&path, &content)
-            .await
-            .with_context(|| format!("failed to preserve complete output: {}", path.display()))?;
+        let path = self.preserve(&content, hint).await?;
 
         let head = limit.saturating_mul(3) / 4;
         let tail = limit.saturating_sub(head);

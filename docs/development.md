@@ -46,6 +46,9 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
 | `src/builtins/` | Built-in project-instruction, binary-hint, file, exact replacement, Codex patch, Bash, and PowerShell plugins |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, and status registration |
+| `src/wasm_plugin.rs` | Persistent module discovery, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
+| `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
+| `examples/wasm-plugin/` | Buildable Rust guest plugin example |
 | `src/task.rs` | In-process task lifecycle, waiting, cancellation, records, and notices |
 | `src/output.rs` | Inline output limits, previews, and complete-output persistence |
 | `src/skill.rs` | Skill discovery, frontmatter, protocol naming, snapshots, and resource containment |
@@ -90,6 +93,11 @@ The detailed protocol behavior is in [Protocols, tasks, Skills, and extensions](
 - Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
 - Append plugin system prompt fragments after the generated protocol list, preserving plugin registration order.
 - Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
+- Load trusted WASM modules from non-hidden top-level `.wasm` files in the persistent plugin directory. There is no package manifest or package manager.
+- Build a complete validated dynamic WASM protocol set before swapping it into the registry. A directory-level reload failure keeps the old set; in-flight calls retain their captured old runtime.
+- Keep `wasm_plugin` limited to `read("wasm_plugin://help")` and `exec("wasm_plugin://reload")`, require every dynamic protocol to provide readable help, and keep its model-facing help synchronized with the SDK, actual directory, install workflow, permissions, limits, and reload behavior. Preserve raw reload diagnostics as output files instead of embedding them in model-facing text.
+- Route WASM guest host calls only to static protocols; never recursively route them into dynamic WASM protocols or `wasm_plugin` itself.
+- Treat WASM plugins as trusted code, not sandboxed code. Preserve their documented WASI, HTTP, filesystem, and built-in protocol access while retaining reliability limits.
 - Resume from the frozen snapshot. Never synthesize current prompt or Skill state for an old session, and never rebind a same-named Skill at another path.
 - A missing frozen Skill file fails explicitly. A resumed session without frozen context is invalid.
 - Session events are append-only. Compaction changes model replay by adding a checkpoint; it does not delete original events.

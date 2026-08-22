@@ -16,6 +16,7 @@ Protocols load their operational guidance on demand from `<protocol>://help`. Lo
 - **Stable tool surface:** adding a capability does not add another model-facing tool schema.
 - **Progressive context:** protocol and Skill instructions enter the context only when the model reads their help.
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
+- **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols through a stable Rust SDK and the same user authority as URI Agent.
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
 - **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface.
 
@@ -76,6 +77,23 @@ exec("pwsh://?wait=30", "cargo test")  # Windows
 Non-Windows platforms enable only Bash. On Windows, PowerShell 7 or newer enables `pwsh` and suppresses `bash`; if it is unavailable, URI Agent shows a warning and keeps Bash enabled when Bash is installed.
 
 URI Agent splits an address only at the first `://`; the selected protocol owns the remaining target. The registry passes the optional JSON `body` through unchanged. See [Protocols, tasks, Skills, and extensions](docs/protocols.md) for the complete design and built-in protocol inventory.
+
+Trusted WASM protocol plugins live as `.wasm` files in
+`<config>/wasm-plugins/`. The model can read `wasm_plugin://help`, clone and
+build a Rust plugin in a temporary directory, atomically place the result in
+that persistent directory, and call `wasm_plugin://reload` without restarting
+the process. URI Agent does not require a package manifest and does not own a
+Git package manager:
+
+```text
+read("wasm_plugin://help")
+exec("wasm_plugin://reload")
+```
+
+WASM is a stable distribution ABI here, not a security boundary. Enabled
+plugins receive WASI, HTTP, filesystem, and built-in protocol access with the
+same user authority as URI Agent. See [WASM plugins](docs/protocols.md#wasm-plugins)
+for the Rust SDK, reload behavior, and reliability limits.
 
 ## Documentation
 
