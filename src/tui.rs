@@ -250,6 +250,7 @@ struct SelectorItem {
     id: String,
     title: String,
     description: String,
+    search_text: Option<String>,
 }
 
 enum SelectorKind {
@@ -257,6 +258,7 @@ enum SelectorKind {
     LoginMethod { provider: String },
     Logout,
     Resume,
+    Search,
     Effort { provider: String, model: String },
 }
 
@@ -284,16 +286,32 @@ impl SelectorState {
     }
 
     fn rebuild(&mut self) {
-        let query = self.query.trim().to_ascii_lowercase();
+        let query = self.query.trim().to_lowercase();
+        if matches!(&self.kind, SelectorKind::Search) {
+            for item in &mut self.items {
+                item.description = search_line_preview(
+                    item.search_text.as_deref().unwrap_or_default(),
+                    &query,
+                    180,
+                );
+            }
+        }
         self.visible = self
             .items
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                query.is_empty()
-                    || item.title.to_ascii_lowercase().contains(&query)
-                    || item.description.to_ascii_lowercase().contains(&query)
-                    || item.id.to_ascii_lowercase().contains(&query)
+                if query.is_empty() {
+                    return true;
+                }
+                if let Some(search_text) = &item.search_text {
+                    item.title.to_lowercase().contains(&query)
+                        || search_text.to_lowercase().contains(&query)
+                } else {
+                    item.title.to_lowercase().contains(&query)
+                        || item.description.to_lowercase().contains(&query)
+                        || item.id.to_lowercase().contains(&query)
+                }
             })
             .map(|(index, _)| index)
             .collect();
@@ -308,6 +326,11 @@ impl SelectorState {
 
     fn move_selection(&mut self, distance: isize) {
         self.selected = wrapped_index(self.selected, distance, self.visible.len());
+    }
+
+    fn select_from_click(&mut self, position: usize, double_click: bool) -> bool {
+        self.selected = position;
+        double_click || matches!(&self.kind, SelectorKind::Search)
     }
 }
 
@@ -841,6 +864,20 @@ impl App {
         self.selected_block = indices[next];
         self.transcript_follow_tail = false;
         self.transcript_center_selected = true;
+    }
+
+    fn select_search_result(&mut self, index: usize) -> bool {
+        let Some(block) = self.blocks.get_mut(index) else {
+            return false;
+        };
+        if !matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
+            block.expanded = true;
+        }
+        self.jump = JumpKind::All;
+        self.selected_block = index;
+        self.transcript_follow_tail = false;
+        self.transcript_center_selected = true;
+        true
     }
 
     fn jump_to(&mut self, kind: JumpKind) {
@@ -1554,6 +1591,10 @@ async fn dispatch_ui_command(
         CoreCommand::Login => open_login(app, &services.catalog).await,
         CoreCommand::Logout => open_logout(app, &services.manager).await,
         CoreCommand::Resume => open_resume(app, services).await,
+        CoreCommand::Search => {
+            open_search(app);
+            Action::Continue
+        }
         CoreCommand::NewSession => Action::NewSession,
         CoreCommand::Compact => Action::Compact,
         CoreCommand::Help => {
@@ -2041,6 +2082,17 @@ async fn confirm_selector(app: &mut App, services: &LoopServices) -> Action {
         },
         SelectorKind::Logout => Action::Logout { provider: item.id },
         SelectorKind::Resume => Action::Resume(item.id),
+        SelectorKind::Search => {
+            let selected = item
+                .id
+                .parse::<usize>()
+                .ok()
+                .is_some_and(|index| app.select_search_result(index));
+            if !selected {
+                app.set_flash("Search result is no longer available");
+            }
+            Action::Continue
+        }
         SelectorKind::Effort { provider, model } => {
             let Ok(thinking) = item.id.parse::<ThinkingLevel>() else {
                 app.set_flash("The selected effort is invalid");
@@ -2314,10 +2366,11 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                     }
                 }
                 AppHit::Selector(index) => {
-                    if let Some(selector) = app.selector.as_mut() {
-                        selector.selected = index;
-                    }
-                    if activate {
+                    let confirm = app
+                        .selector
+                        .as_mut()
+                        .is_some_and(|selector| selector.select_from_click(index, activate));
+                    if confirm {
                         return confirm_selector(app, services).await;
                     }
                 }
@@ -2431,6 +2484,7 @@ fn login_provider_item(provider: &str, current: &str) -> SelectorItem {
         } else {
             description
         },
+        search_text: None,
     }
 }
 
@@ -2441,6 +2495,7 @@ fn open_login_method(app: &mut App, provider: String) -> Action {
             id: method.id.to_string(),
             title: method.label.to_string(),
             description: method.description.to_string(),
+            search_text: None,
         }));
     }
     let offers_key = OauthProvider::from_id(&provider)
@@ -2451,6 +2506,7 @@ fn open_login_method(app: &mut App, provider: String) -> Action {
             id: "api_key".to_string(),
             title: "API key".to_string(),
             description: format!("Paste an API key for {provider}"),
+            search_text: None,
         });
     }
     if items.len() == 1 && items[0].id == "api_key" {
@@ -2658,6 +2714,7 @@ async fn open_logout(app: &mut App, manager: &ConfigManager) -> Action {
             id: entry.provider.clone(),
             title: entry.provider,
             description: entry.kind,
+            search_text: None,
         })
         .collect::<Vec<_>>();
     if items.is_empty() {
@@ -2667,6 +2724,26 @@ async fn open_logout(app: &mut App, manager: &ConfigManager) -> Action {
     app.selector = Some(SelectorState::new(SelectorKind::Logout, "LOGOUT", items));
     app.overlay = Some(Overlay::Selector);
     Action::Continue
+}
+
+fn open_search(app: &mut App) {
+    if app.blocks.is_empty() {
+        app.set_flash("No conversation text to search");
+        return;
+    }
+    let items = app
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| SelectorItem {
+            id: index.to_string(),
+            title: block.title.clone(),
+            description: search_line_preview(&block.text, "", 180),
+            search_text: Some(block.text.clone()),
+        })
+        .collect();
+    app.selector = Some(SelectorState::new(SelectorKind::Search, "SEARCH", items));
+    app.overlay = Some(Overlay::Selector);
 }
 
 async fn open_resume(app: &mut App, services: &LoopServices) -> Action {
@@ -2708,6 +2785,7 @@ fn resume_item(current: &str, session: SessionSummary, thinking: ThinkingLevel) 
             thinking,
             single_line_preview(&session.preview, 48)
         ),
+        search_text: None,
     }
 }
 
@@ -2896,6 +2974,7 @@ fn effort_selector(active: &ActiveSettings, model: &CatalogModel) -> SelectorSta
             } else {
                 format!("available for {}/{}", model.provider, model.id)
             },
+            search_text: None,
         })
         .collect();
     let mut selector = SelectorState::new(
@@ -4532,10 +4611,15 @@ fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
     let Some(selector) = app.selector.as_ref() else {
         return;
     };
+    let instructions = if matches!(&selector.kind, SelectorKind::Search) {
+        "click or Enter jump"
+    } else {
+        "Enter choose"
+    };
     frame.render_widget(
         block.title(format!(
-            " {} · type to filter · Enter choose · Esc close ",
-            selector.title
+            " {} · type to filter · {instructions} · Esc close ",
+            selector.title,
         )),
         area,
     );
@@ -5148,6 +5232,18 @@ fn head_branch(gitdir: &Path) -> Option<String> {
             .unwrap_or("detached")
             .to_string(),
     )
+}
+
+fn search_line_preview(text: &str, query: &str, limit: usize) -> String {
+    let line = (!query.is_empty())
+        .then(|| {
+            text.lines()
+                .find(|line| line.to_lowercase().contains(query))
+        })
+        .flatten()
+        .or_else(|| text.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or_default();
+    single_line_preview(line, limit)
 }
 
 fn single_line_preview(text: &str, limit: usize) -> String {
@@ -6612,11 +6708,13 @@ mod tests {
 
         app.command_query = "se".to_string();
         apply_command_key(&mut app, tab, "tab");
-        assert_eq!(app.command_query, "set");
+        assert_eq!(app.command_query, "search");
         apply_command_key(&mut app, tab, "tab");
         assert_eq!(app.command_query, "set-terminal");
         apply_command_key(&mut app, tab, "tab");
         assert_eq!(app.command_query, "settings");
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "search");
 
         app.reset_command_search();
         app.command_query = "th".to_string();
@@ -6747,6 +6845,97 @@ mod tests {
     }
 
     #[test]
+    fn conversation_search_filters_full_block_text_and_jumps_to_the_result() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "earlier request".to_string(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            format!(
+                "first line\n{}\nNeedle in the later conversation text",
+                "padding ".repeat(40)
+            ),
+            None,
+            false,
+            false,
+        );
+
+        open_search(&mut app);
+        assert!(app.overlay == Some(Overlay::Selector));
+        assert!(matches!(
+            app.selector.as_ref().map(|selector| &selector.kind),
+            Some(SelectorKind::Search)
+        ));
+
+        handle_paste(&mut app, "needle".to_string());
+        let selector = app.selector.as_ref().unwrap();
+        assert_eq!(selector.visible.len(), 1);
+        assert_eq!(
+            selector.selected_item().map(|item| item.id.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            selector
+                .selected_item()
+                .map(|item| item.description.as_str()),
+            Some("Needle in the later conversation text")
+        );
+        let rendered = render_to_string(&mut app, 100, 32);
+        assert!(rendered.contains("SEARCH · type to filter · click or Enter jump · Esc close"));
+        assert!(rendered.contains("Needle in the later conversation text"));
+
+        assert!(app.selector.as_mut().unwrap().select_from_click(0, false));
+
+        app.selector = None;
+        app.overlay = None;
+        assert!(app.select_search_result(1));
+        assert_eq!(app.selected_block, 1);
+        assert!(app.blocks[1].expanded);
+        assert!(!app.transcript_follow_tail);
+        assert!(app.transcript_center_selected);
+    }
+
+    #[test]
+    fn conversation_search_requires_text_and_is_not_active_in_the_resume_selector() {
+        let mut app = test_app();
+        open_search(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.visible_flash(), Some("No conversation text to search"));
+
+        app.selector = Some(SelectorState::new(
+            SelectorKind::Resume,
+            "RESUME",
+            vec![SelectorItem {
+                id: "other-session".to_string(),
+                title: "other-session".to_string(),
+                description: "saved conversation".to_string(),
+                search_text: None,
+            }],
+        ));
+        app.overlay = Some(Overlay::Selector);
+        assert_eq!(app.keymap.action("main", ":").as_deref(), Some("command"));
+        let colon = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE);
+        assert!(matches!(
+            apply_selector_key(&mut app, colon, ":"),
+            SelectorKey::Continue
+        ));
+        assert!(app.overlay == Some(Overlay::Selector));
+        let selector = app.selector.as_ref().unwrap();
+        assert!(matches!(selector.kind, SelectorKind::Resume));
+        assert_eq!(selector.query, ":");
+        let selector = app.selector.as_mut().unwrap();
+        assert!(!selector.select_from_click(0, false));
+        assert!(selector.select_from_click(0, true));
+    }
+
+    #[test]
     fn login_selector_types_letters_that_are_list_motion_aliases() {
         let mut app = test_app();
         app.selector = Some(SelectorState::new(
@@ -6757,11 +6946,13 @@ mod tests {
                     id: "anthropic".to_string(),
                     title: "anthropic".to_string(),
                     description: "Claude".to_string(),
+                    search_text: None,
                 },
                 SelectorItem {
                     id: "kimi".to_string(),
                     title: "kimi".to_string(),
                     description: "Kimi Code".to_string(),
+                    search_text: None,
                 },
             ],
         ));
@@ -6785,7 +6976,7 @@ mod tests {
     }
 
     #[test]
-    fn colon_commands_include_login_logout_and_resume() {
+    fn colon_commands_include_login_logout_resume_and_search() {
         let commands = CommandRegistry::with_core_commands();
         assert_eq!(
             commands.resolve(":login").unwrap().spec.target,
@@ -6816,11 +7007,18 @@ mod tests {
             CommandTarget::Core(CoreCommand::Terminal)
         );
         assert_eq!(
+            commands.resolve(":search").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Search)
+        );
+        assert_eq!(
+            commands.resolve("find").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Search)
+        );
+        assert_eq!(
             commands.resolve("set-terminal pwsh").unwrap().arguments,
             "pwsh"
         );
         assert!(commands.resolve("editor").is_none());
-        assert!(commands.resolve("find").is_none());
     }
 
     #[test]
@@ -6830,6 +7028,7 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 32);
         assert!(rendered.contains(":login"));
         assert!(rendered.contains(":resume"));
+        assert!(rendered.contains(":search"));
         assert!(rendered.contains(":insert"));
         assert!(rendered.contains(":quit"));
         assert!(!rendered.contains(":compose"));

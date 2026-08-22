@@ -39,10 +39,13 @@ Core commands are registered through `CommandRegistry`:
 | `:settings` | Inspect and edit active settings |
 | `:login`, `:logout` | Manage provider credentials |
 | `:resume`, `:new` | Switch project sessions or create one |
+| `:search` or `:find` | Search text already shown in the current conversation and jump to a matching block |
 | `:compact` | Request a context checkpoint after usage exceeds 20% |
 | `:set-terminal`, `:terminal` | Configure and open the embedded terminal |
 | `:help` | Show the active commands and keymap |
 | `:quit` or `:q` | Exit URI Agent |
+
+Conversation search includes user, assistant, reasoning, tool, notice, compaction, and error text currently loaded in the transcript. Type to filter the results, use the arrow keys to choose one and press `Enter`, or click a result to return to that block. It is unavailable before the conversation has any text and while the `:resume` session selector is open.
 
 Extensions register commands through the same registry, so they appear in the panel, help, and key-bindable action set without TUI-specific routing.
 

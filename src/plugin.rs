@@ -18,6 +18,7 @@ pub enum CoreCommand {
     Login,
     Logout,
     Resume,
+    Search,
     NewSession,
     Compact,
     Help,
@@ -220,6 +221,13 @@ fn core_commands() -> Vec<CommandSpec> {
             "switch to another session in this project",
             ["sessions"],
             CommandTarget::Core(Resume),
+        ),
+        CommandSpec::new(
+            "search",
+            "Search conversation",
+            "find text already shown in this conversation",
+            ["find"],
+            CommandTarget::Core(Search),
         ),
         CommandSpec::new(
             "new",
@@ -582,6 +590,14 @@ mod tests {
         assert_eq!(
             registry.resolve(":sessions").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Resume)
+        );
+        assert_eq!(
+            registry.resolve(":search").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Search)
+        );
+        assert_eq!(
+            registry.resolve(":find").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Search)
         );
         assert_eq!(
             registry.resolve(":terminal-set").unwrap().spec.target,
