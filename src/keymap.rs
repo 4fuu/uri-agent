@@ -43,6 +43,22 @@ map("composer", "enter", "submit");
 map("composer", "shift+enter", "newline");
 map("composer", "ctrl+enter", "newline");
 map("composer", "ctrl+j", "newline");
+map("composer", "up", "cursor_up");
+map("composer", "shift+up", "cursor_up");
+map("composer", "down", "cursor_down");
+map("composer", "shift+down", "cursor_down");
+map("composer", "ctrl+home", "first");
+map("composer", "ctrl+shift+home", "first");
+map("composer", "ctrl+end", "last");
+map("composer", "ctrl+shift+end", "last");
+map("composer", "alt+left", "word_back");
+map("composer", "alt+shift+left", "word_back");
+map("composer", "alt+right", "word_forward");
+map("composer", "alt+shift+right", "word_forward");
+map("composer", "ctrl+backspace", "delete_word");
+map("composer", "ctrl+delete", "delete_next_word");
+map("composer", "ctrl+z", "undo");
+map("composer", "ctrl+shift+z", "redo");
 map("composer", "esc", "close");
 
 map("list", "down", "next");
@@ -333,6 +349,35 @@ mod tests {
         assert_eq!(
             keymap.action("composer", "shift+enter").as_deref(),
             Some("newline")
+        );
+        assert_eq!(
+            keymap.action("composer", "up").as_deref(),
+            Some("cursor_up")
+        );
+        assert_eq!(
+            keymap.action("composer", "down").as_deref(),
+            Some("cursor_down")
+        );
+        assert_eq!(
+            keymap.action("composer", "ctrl+home").as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            keymap.action("composer", "ctrl+end").as_deref(),
+            Some("last")
+        );
+        assert_eq!(
+            keymap.action("composer", "ctrl+backspace").as_deref(),
+            Some("delete_word")
+        );
+        assert_eq!(
+            keymap.action("composer", "ctrl+delete").as_deref(),
+            Some("delete_next_word")
+        );
+        assert_eq!(keymap.action("composer", "ctrl+z").as_deref(), Some("undo"));
+        assert_eq!(
+            keymap.action("composer", "ctrl+shift+z").as_deref(),
+            Some("redo")
         );
         assert_eq!(keymap.action("composer", "esc").as_deref(), Some("close"));
         assert_eq!(

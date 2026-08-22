@@ -21,6 +21,12 @@ Press `i` to open the rounded, bottom-anchored composer. An empty composer shows
 | `Enter` | Send the request |
 | `Shift+Enter` | Insert a newline |
 | `Ctrl+Enter` or `Ctrl+J` | Insert a newline |
+| `Up`/`Down` | Move between lines; at the first or last line, move to the start or end of the draft |
+| `Home`/`End`, `Ctrl+A`/`Ctrl+E` | Move to the start or end of the current line |
+| `Ctrl+Home`/`Ctrl+End` | Move to the start or end of the draft |
+| `Ctrl+Left`/`Ctrl+Right`, `Alt+Left`/`Alt+Right` | Move by word |
+| `Ctrl+Backspace`/`Ctrl+Delete` | Delete the previous or next word |
+| `Ctrl+Z`/`Ctrl+Shift+Z` | Undo or redo an edit |
 | `Esc` | Close the composer and preserve the draft |
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.

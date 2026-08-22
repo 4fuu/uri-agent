@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tui_term::widget::PseudoTerminal;
-use tui_textarea::{TextArea, WrapMode};
+use tui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const BG: Color = Color::Reset;
@@ -916,6 +916,55 @@ impl App {
 
     fn draft_text(&self) -> String {
         self.input.lines().join("\n")
+    }
+
+    fn edit_composer(&mut self, key: KeyEvent, action: Option<&str>) {
+        let movement = match action {
+            Some("cursor_up") => Some(if self.input.cursor().0 == 0 {
+                CursorMove::Head
+            } else {
+                CursorMove::Up
+            }),
+            Some("cursor_down") => Some(if self.input.cursor().0 + 1 == self.input.lines().len() {
+                CursorMove::End
+            } else {
+                CursorMove::Down
+            }),
+            Some("first") => Some(CursorMove::Jump(0, 0)),
+            Some("last") => Some(CursorMove::Jump(u16::MAX, u16::MAX)),
+            Some("word_back") => Some(CursorMove::WordBack),
+            Some("word_forward") => Some(CursorMove::WordForward),
+            Some("delete_word") => {
+                self.input.delete_word();
+                None
+            }
+            Some("delete_next_word") => {
+                self.input.delete_next_word();
+                None
+            }
+            Some("undo") => {
+                self.input.undo();
+                None
+            }
+            Some("redo") => {
+                self.input.redo();
+                None
+            }
+            _ => {
+                self.input.input(key);
+                None
+            }
+        };
+        if let Some(movement) = movement {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                if !self.input.is_selecting() {
+                    self.input.start_selection();
+                }
+            } else {
+                self.input.cancel_selection();
+            }
+            self.input.move_cursor(movement);
+        }
     }
 
     fn set_flash(&mut self, message: impl Into<String>) {
@@ -1943,8 +1992,8 @@ async fn handle_overlay_key(
                 Action::Continue
             }
             Some("quit") => Action::Quit,
-            _ => {
-                app.input.input(key);
+            action => {
+                app.edit_composer(key, action);
                 Action::Continue
             }
         },
@@ -5623,6 +5672,11 @@ mod tests {
         });
     }
 
+    fn edit_composer_with_default_keymap(app: &mut App, key: KeyEvent) {
+        let action = app.keymap.action("composer", &key_name(key));
+        app.edit_composer(key, action.as_deref());
+    }
+
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
         app.skip_splash();
         let backend = TestBackend::new(width, height);
@@ -6894,6 +6948,63 @@ mod tests {
         assert!(app.draft_text().is_empty());
         assert!(app.overlay.is_none());
         assert!(!app.animations_paused());
+    }
+
+    #[test]
+    fn composer_boundary_arrows_reach_the_start_and_end_of_the_draft() {
+        let mut app = test_app();
+        app.input.insert_str("first");
+        app.input.insert_newline();
+        app.input.insert_str("second");
+
+        app.input.move_cursor(CursorMove::Jump(0, 3));
+        edit_composer_with_default_keymap(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input.cursor(), (0, 0));
+
+        app.input.move_cursor(CursorMove::Jump(1, 2));
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(app.input.cursor(), (1, 6));
+    }
+
+    #[test]
+    fn composer_common_navigation_and_editing_shortcuts_work() {
+        let mut app = test_app();
+        app.input.insert_str("alpha beta");
+        app.input.insert_newline();
+        app.input.insert_str("omega");
+
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.input.cursor(), (0, 0));
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.input.cursor(), (1, 5));
+
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft_text(), "alpha beta\n");
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.draft_text(), "alpha beta\nomega");
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        );
+        assert_eq!(app.draft_text(), "alpha beta\n");
     }
 
     #[test]
