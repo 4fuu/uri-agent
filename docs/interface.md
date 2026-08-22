@@ -24,6 +24,7 @@ Press `i` to open the rounded, bottom-anchored composer. An empty composer shows
 | `Esc` | Close the composer and preserve the draft |
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
+Long logical lines soft-wrap at the visible composer edge; only the newline shortcuts above insert a newline into the submitted text.
 
 Press `:` from the conversation to open the command panel. Type to fuzzy-filter registered command names, aliases, and descriptions; use `Tab` or `Shift+Tab` to complete and cycle matching commands, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command; description matches keep the canonical name, and completing any match inserts its canonical command name. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
 

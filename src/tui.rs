@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tui_term::widget::PseudoTerminal;
-use tui_textarea::TextArea;
+use tui_textarea::{TextArea, WrapMode};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const BG: Color = Color::Reset;
@@ -394,7 +394,6 @@ struct App {
     activity: Option<Activity>,
     busy_since: Option<Instant>,
     frame: usize,
-    composer_scroll: (u16, u16),
     transcript_body_width: usize,
     transcript_offset: usize,
     transcript_rows: usize,
@@ -465,7 +464,6 @@ impl App {
             activity: None,
             busy_since: None,
             frame: 0,
-            composer_scroll: (0, 0),
             transcript_body_width: 72,
             transcript_offset: 0,
             transcript_rows: 0,
@@ -881,7 +879,6 @@ impl App {
             return None;
         }
         self.input = TextArea::default();
-        self.composer_scroll = (0, 0);
         style_input(&mut self.input, true);
         self.busy = true;
         self.busy_since = Some(Instant::now());
@@ -4557,9 +4554,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         Overlay::Composer => {
             style_input(&mut app.input, app.busy);
             frame.render_widget(&app.input, area);
-            if let Some(position) =
-                composer_cursor_position(&app.input, area, &mut app.composer_scroll)
-            {
+            if let Some(position) = composer_cursor_position(frame, &app.input, area) {
                 frame.set_cursor_position(position);
             }
         }
@@ -5220,54 +5215,32 @@ fn style_input(input: &mut TextArea<'static>, busy: bool) {
     input.set_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_style(Style::default().fg(SURFACE).bg(border));
+    input.set_wrap_mode(WrapMode::WordOrGlyph);
 }
 
 fn composer_cursor_position(
+    frame: &mut Frame<'_>,
     input: &TextArea<'_>,
     area: Rect,
-    scroll: &mut (u16, u16),
 ) -> Option<(u16, u16)> {
     let inner = input.block().map_or(area, |block| block.inner(area));
     if inner.is_empty() {
         return None;
     }
-    let (logical_row, col) = input.cursor();
-    let display_col = input
-        .lines()
-        .get(logical_row)
-        .map(|line| input_line_width(line, col, input.tab_length()))
-        .unwrap_or(0);
-    let row = u16::try_from(logical_row).unwrap_or(u16::MAX);
-    let top_row = scroll_to_cursor(scroll.0, row, inner.height);
-    let top_col = scroll_to_cursor(scroll.1, display_col, inner.width);
-    *scroll = (top_row, top_col);
-    Some((
-        inner.x.saturating_add(display_col.saturating_sub(top_col)),
-        inner.y.saturating_add(row.saturating_sub(top_row)),
-    ))
-}
 
-fn input_line_width(line: &str, chars: usize, tab_length: u8) -> u16 {
-    let mut width = 0usize;
-    for character in line.chars().take(chars) {
-        if character == '\t' && tab_length > 0 {
-            let tab_length = tab_length as usize;
-            width += tab_length - width % tab_length;
-        } else {
-            width += character.width().unwrap_or(0);
+    let cursor_style = input.cursor_style();
+    let foreground = cursor_style.fg?;
+    let background = cursor_style.bg?;
+    let buffer = frame.buffer_mut();
+    for y in inner.y..inner.bottom() {
+        for x in inner.x..inner.right() {
+            let cell = buffer.cell((x, y))?;
+            if cell.fg == foreground && cell.bg == background {
+                return Some((x, y));
+            }
         }
     }
-    u16::try_from(width).unwrap_or(u16::MAX)
-}
-
-fn scroll_to_cursor(previous: u16, cursor: u16, length: u16) -> u16 {
-    if cursor < previous {
-        cursor
-    } else if previous.saturating_add(length) <= cursor {
-        cursor.saturating_add(1).saturating_sub(length)
-    } else {
-        previous
-    }
+    None
 }
 
 fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -6943,16 +6916,29 @@ mod tests {
     }
 
     #[test]
-    fn composer_cursor_tracks_horizontal_scrolling() {
-        let mut input = TextArea::default();
-        style_input(&mut input, false);
-        input.insert_str("123456789");
-        let mut scroll = (0, 0);
+    fn composer_soft_wraps_long_input_and_tracks_the_visual_caret() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("x".repeat(75));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        terminal.backend_mut().assert_cursor_position((4, 18));
+        assert!(rendered[17].contains(&"x".repeat(74)));
         assert_eq!(
-            composer_cursor_position(&input, Rect::new(2, 12, 10, 10), &mut scroll),
-            Some((10, 13))
+            terminal.backend().buffer().cell((3, 18)).unwrap().symbol(),
+            "x"
         );
-        assert_eq!(scroll, (0, 2));
     }
 
     #[test]
