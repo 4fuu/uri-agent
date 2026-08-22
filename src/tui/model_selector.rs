@@ -1,3 +1,4 @@
+use super::wrapped_index;
 use crate::catalog::{CatalogModel, ModelCatalog};
 use crate::config::ActiveSettings;
 
@@ -79,16 +80,7 @@ impl ModelSelector {
     }
 
     pub(super) fn move_selection(&mut self, distance: isize) {
-        if self.visible.is_empty() {
-            self.selected = 0;
-        } else if distance < 0 {
-            self.selected = self.selected.saturating_sub(distance.unsigned_abs());
-        } else {
-            self.selected = self
-                .selected
-                .saturating_add(distance as usize)
-                .min(self.visible.len() - 1);
-        }
+        self.selected = wrapped_index(self.selected, distance, self.visible.len());
     }
 
     pub(super) fn first(&mut self) {
@@ -281,15 +273,15 @@ mod tests {
     }
 
     #[test]
-    fn moving_selection_is_clamped() {
+    fn moving_selection_wraps() {
         let mut selector = ModelSelector::from_models(
             vec![model("openai", "a", "A"), model("openai", "b", "B")],
             "openai",
             "a",
         );
-        selector.move_selection(20);
+        selector.move_selection(-1);
         assert_eq!(selector.selected_position(), 1);
-        selector.move_selection(-20);
+        selector.move_selection(1);
         assert_eq!(selector.selected_position(), 0);
     }
 

@@ -23,13 +23,13 @@ Press `i` to open the floating composer:
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 
-Press `:` from the conversation to open the command panel. Type to filter, use the arrow keys or mouse to choose a command, press `Enter` to run the selected command, and press `Esc` to close it. Search text only filters the list and is never parsed as command arguments. Commands that need a value open a selector or a separate input float; there is no secondary command syntax.
+Press `:` from the conversation to open the command panel. Type to filter registered command names and aliases, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
 
 Core commands are registered through `CommandRegistry`:
 
 | Command | Purpose |
 | --- | --- |
-| `:compose` | Open the composer |
+| `:insert` | Open the composer |
 | `:copy` | Copy the current selection or visible panel through OSC52 |
 | `:tasks` | Inspect and cancel managed protocol work |
 | `:protocols` | List registered read and exec routes |
@@ -53,9 +53,11 @@ Extensions register commands through the same registry, so they appear in the pa
 | Conversation | `Up`/`Down` select, `Enter` open/fold, `PageUp`/`PageDown` page, `Home`/`End` jump |
 | Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
 | Global | `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
-| Copy and exit | `Ctrl+Shift+C` copy, `Ctrl+C` quit |
+| Copy | `Ctrl+Shift+C` copy |
 
-Arrow keys and mouse input are first-class. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
+Arrow keys and mouse input are first-class. Selection wraps from the last item to the first and from the first item to the last in every selectable list. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
+
+URI Agent ignores `Ctrl+C` on its own surfaces. Exit through `:quit` or `:q` instead.
 
 `F1` and `:help` are more authoritative than this summary because they reflect loaded keymap overrides and registered extension commands.
 
@@ -85,7 +87,7 @@ Configurable actions must go through the keymap. New commands that should be ava
 
 `:set-terminal` stores the command used by `:terminal`, such as `bash` or `pwsh -NoLogo`. The `URI_AGENT_TERMINAL` environment variable can override the stored command for an invocation.
 
-`:terminal` opens that command in a PTY float rooted at the project directory. Terminal input, resize, mouse events, and process exit are handled by the embedded terminal layer. Press `Esc` twice within 500 milliseconds to close the float; a single `Esc` is sent to the running terminal program.
+`:terminal` opens that command in a PTY float rooted at the project directory. Terminal input, including `Ctrl+C`, is forwarded to the terminal program; resize, mouse events, and process exit are handled by the embedded terminal layer. Press `Esc` twice within 500 milliseconds to close the float; a single `Esc` is sent to the running terminal program.
 
 Ordinary clicks and drags are sent to the terminal application. Hold `Shift` while dragging to select rendered text. `Ctrl+Shift+C` copies the selection through OSC52.
 

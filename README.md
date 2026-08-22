@@ -58,7 +58,7 @@ URI Agent does not choose a default model. In the TUI:
 
 When setup is complete, the welcome view shows the selected provider, model, and thinking effort instead of the setup prompt; submitted requests and responses then appear in the conversation.
 
-`Shift+Enter` inserts a newline, `Esc` closes the composer while preserving its draft, `:` opens the searchable command panel, and `F1` shows the active keymap and command reference. Search text only filters commands; commands that need a value open a selector or a separate input float.
+`Shift+Enter` inserts a newline, `Esc` closes the composer while preserving its draft, `:` opens the searchable command panel, and `F1` shows the active keymap and command reference. Command aliases participate in search without cluttering the default list. Search text only filters commands; commands that need a value open a selector or a separate input float.
 
 ## How protocols look
 

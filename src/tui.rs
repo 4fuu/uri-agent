@@ -175,6 +175,12 @@ struct TextSelection {
     end: (u16, u16),
 }
 
+#[derive(Clone)]
+struct CommandMatch {
+    spec: CommandSpec,
+    name: String,
+}
+
 struct SettingsState {
     active: ActiveSettings,
     model: Option<CatalogModel>,
@@ -286,6 +292,10 @@ impl SelectorState {
         self.visible
             .get(self.selected)
             .and_then(|index| self.items.get(*index))
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        self.selected = wrapped_index(self.selected, distance, self.visible.len());
     }
 }
 
@@ -695,13 +705,7 @@ impl App {
             .iter()
             .position(|index| *index == self.selected_block)
             .unwrap_or(0);
-        let next = if distance < 0 {
-            current.saturating_sub(distance.unsigned_abs())
-        } else {
-            current
-                .saturating_add(distance as usize)
-                .min(indices.len() - 1)
-        };
+        let next = wrapped_index(current, distance, indices.len());
         self.selected_block = indices[next];
     }
 
@@ -753,19 +757,13 @@ impl App {
         self.command_selected = 0;
     }
 
-    fn filtered_commands(&self) -> Vec<CommandSpec> {
-        let query = self.command_query.trim().to_ascii_lowercase();
-        self.commands
-            .list()
-            .into_iter()
-            .filter(|command| {
-                query.is_empty()
-                    || command.id.contains(&query)
-                    || command.title.to_ascii_lowercase().contains(&query)
-                    || command.description.to_ascii_lowercase().contains(&query)
-                    || command.aliases.iter().any(|alias| alias.contains(&query))
-            })
-            .collect()
+    fn matching_commands(&self) -> Vec<CommandMatch> {
+        matching_commands(&self.commands, &self.command_query)
+    }
+
+    fn move_command_selection(&mut self, distance: isize) {
+        let count = self.matching_commands().len();
+        self.command_selected = wrapped_index(self.command_selected, distance, count);
     }
 
     fn close_floats(&mut self) {
@@ -794,6 +792,18 @@ fn hit_target<T: Copy>(regions: &[HitRegion<T>], mouse: MouseEvent) -> Option<T>
                 && mouse.row < region.area.y.saturating_add(region.area.height)
         })
         .map(|region| region.target)
+}
+
+fn wrapped_index(current: usize, distance: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let current = current % count;
+    if distance < 0 {
+        (current + count - distance.unsigned_abs() % count) % count
+    } else {
+        (current + distance as usize % count) % count
+    }
 }
 
 fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: T) -> bool {
@@ -885,6 +895,9 @@ async fn run_loop(
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        if app.pty.is_none() && is_ignored_tui_key(key) {
+                            continue;
+                        }
                         if app.showing_splash() {
                             app.skip_splash();
                         }
@@ -1391,14 +1404,11 @@ async fn handle_overlay_key(
                 Action::Continue
             }
             Some("previous") => {
-                app.selected_task = app.selected_task.saturating_sub(1);
+                app.selected_task = wrapped_index(app.selected_task, -1, app.task_records.len());
                 Action::Continue
             }
             Some("next") => {
-                app.selected_task = app
-                    .selected_task
-                    .saturating_add(1)
-                    .min(app.task_records.len().saturating_sub(1));
+                app.selected_task = wrapped_index(app.selected_task, 1, app.task_records.len());
                 Action::Continue
             }
             Some("cancel") => {
@@ -1532,10 +1542,11 @@ async fn handle_overlay_key(
 }
 
 async fn confirm_command(app: &mut App, services: &LoopServices) -> Action {
-    let commands = app.filtered_commands();
+    let command = app.matching_commands().get(app.command_selected).cloned();
     app.overlay = None;
-    if let Some(command) = commands.get(app.command_selected).cloned() {
-        return dispatch_ui_command(app, command.target, services).await;
+    app.reset_command_search();
+    if let Some(command) = command {
+        return dispatch_ui_command(app, command.spec.target, services).await;
     }
     Action::Continue
 }
@@ -1560,14 +1571,11 @@ fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) -> CommandKey
             CommandKey::Continue
         }
         Some("previous") => {
-            app.command_selected = app.command_selected.saturating_sub(1);
+            app.move_command_selection(-1);
             CommandKey::Continue
         }
         Some("next") => {
-            let count = app.filtered_commands().len();
-            if count > 0 {
-                app.command_selected = (app.command_selected + 1).min(count - 1);
-            }
+            app.move_command_selection(1);
             CommandKey::Continue
         }
         Some("confirm") => CommandKey::Confirm,
@@ -1617,14 +1625,11 @@ fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -> SelectorK
             SelectorKey::Continue
         }
         Some("previous") => {
-            selector.selected = selector.selected.saturating_sub(1);
+            selector.move_selection(-1);
             SelectorKey::Continue
         }
         Some("next") => {
-            selector.selected = selector
-                .selected
-                .saturating_add(1)
-                .min(selector.visible.len().saturating_sub(1));
+            selector.move_selection(1);
             SelectorKey::Continue
         }
         Some("confirm") => SelectorKey::Confirm,
@@ -1806,11 +1811,11 @@ fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
             Action::Continue
         }
         Some("previous") => {
-            settings.selected = settings.selected.saturating_sub(1);
+            settings.selected = wrapped_index(settings.selected, -1, 4);
             Action::Continue
         }
         Some("next") => {
-            settings.selected = (settings.selected + 1).min(3);
+            settings.selected = wrapped_index(settings.selected, 1, 4);
             Action::Continue
         }
         Some("edit") => match settings.selected {
@@ -1840,15 +1845,15 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
     match mouse.kind {
         MouseEventKind::ScrollUp => match app.overlay {
             Some(Overlay::Command) => {
-                app.command_selected = app.command_selected.saturating_sub(1);
+                app.move_command_selection(-1);
             }
             Some(Overlay::Selector) => {
                 if let Some(selector) = app.selector.as_mut() {
-                    selector.selected = selector.selected.saturating_sub(1);
+                    selector.move_selection(-1);
                 }
             }
             Some(Overlay::Tasks) => {
-                app.selected_task = app.selected_task.saturating_sub(1);
+                app.selected_task = wrapped_index(app.selected_task, -1, app.task_records.len());
             }
             Some(Overlay::Models) => {
                 if let Some(selector) = app.model_selector.as_mut() {
@@ -1857,7 +1862,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = settings.selected.saturating_sub(1);
+                    settings.selected = wrapped_index(settings.selected, -1, 4);
                 }
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
@@ -1866,24 +1871,15 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         },
         MouseEventKind::ScrollDown => match app.overlay {
             Some(Overlay::Command) => {
-                let count = app.filtered_commands().len();
-                if count > 0 {
-                    app.command_selected = (app.command_selected + 1).min(count - 1);
-                }
+                app.move_command_selection(1);
             }
             Some(Overlay::Selector) => {
                 if let Some(selector) = app.selector.as_mut() {
-                    selector.selected = selector
-                        .selected
-                        .saturating_add(1)
-                        .min(selector.visible.len().saturating_sub(1));
+                    selector.move_selection(1);
                 }
             }
             Some(Overlay::Tasks) => {
-                app.selected_task = app
-                    .selected_task
-                    .saturating_add(1)
-                    .min(app.task_records.len().saturating_sub(1));
+                app.selected_task = wrapped_index(app.selected_task, 1, app.task_records.len());
             }
             Some(Overlay::Models) => {
                 if let Some(selector) = app.model_selector.as_mut() {
@@ -1892,7 +1888,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = settings.selected.saturating_add(1).min(3);
+                    settings.selected = wrapped_index(settings.selected, 1, 4);
                 }
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
@@ -2511,6 +2507,10 @@ async fn effective_thinking(
         .model(provider, model)
         .await
         .map_or(configured, |model| clamp_thinking_level(&model, configured))
+}
+
+fn is_ignored_tui_key(key: KeyEvent) -> bool {
+    key_name(key) == "ctrl+c"
 }
 
 fn key_name(key: KeyEvent) -> String {
@@ -3233,15 +3233,53 @@ fn command_help(commands: &CommandRegistry) -> String {
     commands
         .list()
         .into_iter()
-        .map(|command| {
-            let aliases = if command.aliases.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", command.aliases.join(", "))
-            };
-            format!("  :{:<14} {}{}\n", command.id, command.description, aliases)
-        })
+        .map(|command| format!("  :{:<14} {}\n", command.id, command.description))
         .collect()
+}
+
+fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<CommandMatch> {
+    let query = query
+        .trim()
+        .trim_start_matches([':', '：'])
+        .to_ascii_lowercase();
+    if query.is_empty() {
+        return commands
+            .list()
+            .into_iter()
+            .map(|spec| CommandMatch {
+                name: spec.id.clone(),
+                spec,
+            })
+            .collect();
+    }
+
+    let mut matches = commands
+        .list()
+        .into_iter()
+        .filter_map(|spec| {
+            let (score, _, name) = std::iter::once(&spec.id)
+                .chain(spec.aliases.iter())
+                .enumerate()
+                .filter_map(|(index, name)| {
+                    command_name_score(name, &query).map(|score| (score, index, name.clone()))
+                })
+                .min_by_key(|(score, index, _)| (*score, *index))?;
+            Some((score, spec.id.clone(), CommandMatch { spec, name }))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    matches.into_iter().map(|(_, _, command)| command).collect()
+}
+
+fn command_name_score(name: &str, query: &str) -> Option<usize> {
+    let name = name.to_ascii_lowercase();
+    if name == query {
+        Some(0)
+    } else if name.starts_with(query) {
+        Some(1)
+    } else {
+        name.find(query).map(|position| position + 2)
+    }
 }
 
 fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
@@ -3589,7 +3627,7 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
         Paragraph::new(format!("⌕ {}█", app.command_query)).style(Style::default().fg(TEXT)),
         sections[0],
     );
-    let commands = app.filtered_commands();
+    let commands = app.matching_commands();
     let items = commands.iter().enumerate().map(|(index, item)| {
         let selected = index == app.command_selected;
         ListItem::new(Line::from(vec![
@@ -3598,7 +3636,7 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!(":{:<14}", item.id),
+                format!(":{:<14}", item.name),
                 Style::default()
                     .fg(if selected { ACCENT } else { TEXT })
                     .add_modifier(if selected {
@@ -3607,7 +3645,7 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
                         Modifier::empty()
                     }),
             ),
-            Span::styled(item.description.clone(), Style::default().fg(MUTED)),
+            Span::styled(item.spec.description.clone(), Style::default().fg(MUTED)),
         ]))
         .style(Style::default().bg(if selected { BG } else { SURFACE }))
     });
@@ -4587,6 +4625,22 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_is_ignored_without_hiding_the_copy_chord() {
+        let app = test_app();
+        assert!(is_ignored_tui_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_ignored_tui_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert_eq!(app.keymap.action("main", "ctrl+c"), None);
+        assert_eq!(app.keymap.action("composer", "ctrl+c"), None);
+        assert_eq!(app.keymap.action("command", "ctrl+c"), None);
+    }
+
+    #[test]
     fn composer_places_the_terminal_cursor_at_the_unicode_caret() {
         let mut app = test_app();
         app.skip_splash();
@@ -4662,6 +4716,23 @@ mod tests {
     }
 
     #[test]
+    fn list_selection_wraps_in_both_directions() {
+        assert_eq!(wrapped_index(0, -1, 3), 2);
+        assert_eq!(wrapped_index(2, 1, 3), 0);
+        assert_eq!(wrapped_index(2, 4, 3), 0);
+        assert_eq!(wrapped_index(8, 1, 0), 0);
+
+        let mut app = test_app();
+        app.push(BlockKind::User, "YOU", "one".into(), None, false, false);
+        app.push(BlockKind::User, "YOU", "two".into(), None, false, false);
+        app.selected_block = 0;
+        app.move_selection(-1);
+        assert_eq!(app.selected_block, 1);
+        app.move_selection(1);
+        assert_eq!(app.selected_block, 0);
+    }
+
+    #[test]
     fn terminal_command_rejects_an_empty_command() {
         assert!(terminal_command("").is_err());
         assert!(terminal_command("   ").is_err());
@@ -4684,9 +4755,9 @@ mod tests {
         handle_paste(&mut app, "ffort".to_string());
         assert_eq!(app.command_query, "effort");
         assert_eq!(app.command_selected, 0);
-        let commands = app.filtered_commands();
+        let commands = app.matching_commands();
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].id, "effort");
+        assert_eq!(commands[0].spec.id, "effort");
 
         assert!(matches!(
             apply_command_key(
@@ -4699,13 +4770,60 @@ mod tests {
         assert_eq!(app.command_query, "effor");
 
         app.command_query.push_str("t high");
-        assert!(app.filtered_commands().is_empty());
+        assert!(app.matching_commands().is_empty());
         app.command_query.truncate("effort".len());
         let rendered = render_to_string(&mut app, 100, 32);
         assert!(rendered.contains("COMMAND · type to filter · Enter run · Esc close"));
         assert!(rendered.contains("⌕ effort█"));
         assert!(rendered.contains(":effort"));
         assert!(!rendered.contains(":terminal"));
+        assert!(!rendered.contains("Tab complete"));
+    }
+
+    #[test]
+    fn command_panel_searches_aliases_and_wraps_selection() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Command);
+        assert!(
+            app.matching_commands()
+                .iter()
+                .all(|command| command.name == command.spec.id)
+        );
+
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+        let key_name = key_name(key);
+        assert!(matches!(
+            apply_command_key(&mut app, key, &key_name),
+            CommandKey::Continue
+        ));
+        let commands = app.matching_commands();
+        assert_eq!(app.command_query, "t");
+        assert_eq!(
+            commands
+                .iter()
+                .find(|command| command.spec.id == "effort")
+                .map(|command| command.name.as_str()),
+            Some("thinking")
+        );
+
+        app.command_selected = 0;
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert!(matches!(
+            apply_command_key(&mut app, up, "up"),
+            CommandKey::Continue
+        ));
+        assert_eq!(app.command_selected, commands.len() - 1);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(matches!(
+            apply_command_key(&mut app, down, "down"),
+            CommandKey::Continue
+        ));
+        assert_eq!(app.command_selected, 0);
+
+        let rendered = render_to_string(&mut app, 100, 32);
+        assert!(rendered.contains("COMMAND · type to filter · Enter run · Esc close"));
+        assert!(rendered.contains("⌕ t█"));
+        assert!(rendered.contains(":thinking"));
         assert!(!rendered.contains("Tab complete"));
     }
 
@@ -4802,12 +4920,17 @@ mod tests {
             apply_selector_key(&mut app, key, &name),
             SelectorKey::Continue
         ));
-        let selector = app.selector.as_ref().unwrap();
+        let selector = app.selector.as_mut().unwrap();
         assert_eq!(selector.query, "k");
         assert_eq!(
             selector.selected_item().map(|item| item.id.as_str()),
             Some("kimi")
         );
+        selector.selected = 0;
+        selector.move_selection(-1);
+        assert_eq!(selector.selected, selector.visible.len() - 1);
+        selector.move_selection(1);
+        assert_eq!(selector.selected, 0);
     }
 
     #[test]
@@ -4830,6 +4953,14 @@ mod tests {
             CommandTarget::Core(CoreCommand::Resume)
         );
         assert_eq!(
+            commands.resolve(":insert").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Compose)
+        );
+        assert_eq!(
+            commands.resolve(":compose").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Compose)
+        );
+        assert_eq!(
             commands.resolve(":terminal").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Terminal)
         );
@@ -4848,7 +4979,17 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 32);
         assert!(rendered.contains(":login"));
         assert!(rendered.contains(":resume"));
+        assert!(rendered.contains(":insert"));
+        assert!(rendered.contains(":quit"));
+        assert!(!rendered.contains(":compose"));
+        assert!(!rendered.contains(":thinking"));
+        assert!(!rendered.contains(":terminal-set"));
         assert!(!rendered.contains("Open in editor"));
+
+        app.command_selected = app.commands.list().len() - 1;
+        let rendered = render_to_string(&mut app, 100, 32);
+        assert!(rendered.contains(":terminal"));
+        assert!(!rendered.contains(":term "));
     }
 
     #[test]

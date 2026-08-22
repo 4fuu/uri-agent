@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use tokio::fs;
 
 const DEFAULT_KEYMAP: &str = r#"
-map("global", "ctrl+c", "quit");
 map("global", "f1", "help");
 map("global", "f2", "settings");
 map("global", "f3", "model");
@@ -34,7 +33,6 @@ map("main", "end", "last");
 map("main", "enter", "toggle");
 map("main", "esc", "clear");
 map("main", "y", "copy");
-map("main", "q", "quit");
 
 map("composer", "enter", "submit");
 map("composer", "shift+enter", "newline");
@@ -291,6 +289,9 @@ mod tests {
         assert_eq!(keymap.action("main", "?").as_deref(), Some("help"));
         assert_eq!(keymap.action("main", "？").as_deref(), Some("help"));
         assert_eq!(keymap.action("main", "i").as_deref(), Some("compose"));
+        assert_eq!(keymap.action("main", "q"), None);
+        assert_eq!(keymap.action("main", "ctrl+c"), None);
+        assert_eq!(keymap.action("composer", "ctrl+c"), None);
         assert_eq!(
             keymap.action("main", "r").as_deref(),
             Some("jump_reasoning")

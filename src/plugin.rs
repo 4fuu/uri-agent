@@ -145,10 +145,10 @@ fn core_commands() -> Vec<CommandSpec> {
     use CoreCommand::*;
     vec![
         CommandSpec::new(
-            "compose",
+            "insert",
             "Compose message",
             "open the floating composer",
-            ["insert"],
+            ["compose"],
             CommandTarget::Core(Compose),
         ),
         CommandSpec::new(
@@ -518,10 +518,46 @@ mod tests {
             registry.resolve(":status").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Status)
         );
+        assert_eq!(
+            registry.resolve(":quit").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Quit)
+        );
+        assert_eq!(
+            registry.resolve(":q").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Quit)
+        );
+        assert_eq!(
+            registry.resolve(":insert").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Compose)
+        );
+        assert_eq!(
+            registry.resolve(":compose").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Compose)
+        );
+        assert_eq!(
+            registry.resolve(":yank").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Copy)
+        );
+        assert_eq!(
+            registry.resolve(":models").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Models)
+        );
+        assert_eq!(
+            registry.resolve(":term").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Terminal)
+        );
         assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
         assert_eq!(
             registry.resolve(":thinking high").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Effort)
+        );
+        assert_eq!(
+            registry.resolve(":sessions").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::Resume)
+        );
+        assert_eq!(
+            registry.resolve(":terminal-set").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::SetTerminal)
         );
         assert_eq!(registry.resolve(":effort high").unwrap().arguments, "high");
     }
