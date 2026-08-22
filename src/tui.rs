@@ -2954,7 +2954,7 @@ async fn save_terminal(app: &mut App, services: &LoopServices, command: String) 
 fn open_pty(app: &mut App) {
     let command = app.info.terminal.clone().unwrap_or_default();
     if command.trim().is_empty() {
-        app.set_flash("尚未配置，请运行 :set-terminal");
+        app.set_flash("No terminal configured. Run :set-terminal");
         return;
     }
     app.close_floats();
@@ -3988,7 +3988,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Style::default().fg(TEXT),
         )
     } else {
-        Line::styled("尚未配置，请运行 :login", Style::default().fg(WARM))
+        Line::styled("No model configured. Run :login", Style::default().fg(WARM))
     };
     let compose = app
         .keymap
@@ -4126,7 +4126,7 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let lines = if unconfigured {
             vec![
                 Line::styled(
-                    "尚未配置，请运行 :login",
+                    "No model configured. Run :login",
                     Style::default().fg(WARM).add_modifier(Modifier::BOLD),
                 ),
                 Line::styled("i compose   : command   :model", Style::default().fg(MUTED)),
@@ -6478,7 +6478,7 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>();
-        assert!(compact.contains("尚未配置，请运行:login"));
+        assert!(compact.contains("Nomodelconfigured.Run:login"));
         assert!(!rendered.contains("gpt-5.2"));
         assert!(!rendered.contains("openai/"));
     }
