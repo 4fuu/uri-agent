@@ -35,6 +35,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
+use std::collections::HashSet;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,6 +84,7 @@ pub enum TuiOutcome {
 enum BlockKind {
     User,
     Assistant,
+    Process,
     Reasoning,
     Tool,
     Compaction,
@@ -99,13 +101,20 @@ struct DisplayBlock {
     expanded: bool,
     tool: Option<ToolDisplay>,
     transient: bool,
-    final_response: bool,
+    turn_result: bool,
+    parent_process: Option<u64>,
+    process: Option<ProcessDisplay>,
 }
 
 struct ToolDisplay {
     name: String,
     arguments: serde_json::Value,
     output: Option<String>,
+}
+
+struct ProcessDisplay {
+    id: u64,
+    steps: usize,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -397,6 +406,7 @@ struct App {
     last_sequence: Option<u64>,
     applying_transient: bool,
     reasoning_folded_during_stream: bool,
+    next_process_id: u64,
     info: TuiInfo,
     flash: Option<String>,
     flash_at: Option<Instant>,
@@ -467,6 +477,7 @@ impl App {
             last_sequence: None,
             applying_transient: false,
             reasoning_folded_during_stream: false,
+            next_process_id: 0,
             info,
             flash: None,
             flash_at: None,
@@ -697,28 +708,17 @@ impl App {
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
-                for block in &mut self.blocks {
-                    if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
-                        block.expanded = false;
-                    }
-                }
-                let turn_start = self
-                    .blocks
-                    .iter()
-                    .rposition(|block| block.kind == BlockKind::User)
-                    .map_or(0, |index| index + 1);
-                if let Some(block) = self.blocks[turn_start..]
-                    .iter_mut()
-                    .rev()
-                    .find(|block| block.kind == BlockKind::Assistant)
-                {
-                    block.expanded = true;
-                    block.final_response = true;
-                }
+                self.finish_current_turn();
             }
         }
         if select_tail {
-            self.selected_block = self.blocks.len().saturating_sub(1);
+            self.selected_block = self
+                .blocks
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, _)| self.block_visible(index).then_some(index))
+                .unwrap_or_default();
         }
         style_input(&mut self.input, self.busy);
     }
@@ -754,6 +754,74 @@ impl App {
         }
     }
 
+    fn finish_current_turn(&mut self) {
+        let turn_start = self
+            .blocks
+            .iter()
+            .rposition(|block| block.kind == BlockKind::User)
+            .map_or(0, |index| index + 1);
+        let result_index = self.blocks[turn_start..]
+            .iter()
+            .rposition(|block| matches!(block.kind, BlockKind::Assistant | BlockKind::Error))
+            .map(|index| turn_start + index);
+        let selected_was_in_turn = self.selected_block >= turn_start;
+        let selected_was_result = result_index == Some(self.selected_block);
+        let result = result_index.map(|index| {
+            let mut result = self.blocks.remove(index);
+            result.expanded = true;
+            result.turn_result = true;
+            result
+        });
+        let process_end = self.blocks.len();
+        if process_end == turn_start {
+            if let Some(result) = result {
+                self.blocks.push(result);
+            }
+            if selected_was_in_turn {
+                self.selected_block = turn_start;
+            }
+            return;
+        }
+
+        let process_id = self.next_process_id;
+        self.next_process_id += 1;
+        for block in &mut self.blocks[turn_start..process_end] {
+            block.parent_process = Some(process_id);
+            if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
+                block.expanded = false;
+            }
+        }
+        self.blocks.insert(
+            turn_start,
+            DisplayBlock {
+                kind: BlockKind::Process,
+                title: "PROCESS".to_string(),
+                text: String::new(),
+                call_id: None,
+                failed: false,
+                expanded: false,
+                tool: None,
+                transient: false,
+                turn_result: false,
+                parent_process: None,
+                process: Some(ProcessDisplay {
+                    id: process_id,
+                    steps: process_end - turn_start,
+                }),
+            },
+        );
+        if let Some(result) = result {
+            self.blocks.push(result);
+        }
+        if selected_was_in_turn {
+            self.selected_block = if selected_was_result {
+                self.blocks.len().saturating_sub(1)
+            } else {
+                turn_start
+            };
+        }
+    }
+
     fn finish_hydration(&mut self) {
         self.busy = false;
         self.activity = None;
@@ -785,7 +853,9 @@ impl App {
             expanded,
             tool: None,
             transient: self.applying_transient,
-            final_response: false,
+            turn_result: false,
+            parent_process: None,
+            process: None,
         });
     }
 
@@ -837,11 +907,14 @@ impl App {
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
+        let collapsed_processes = self.collapsed_processes();
         self.blocks
             .iter()
             .enumerate()
             .filter(|(_, block)| match self.jump {
-                JumpKind::All => true,
+                JumpKind::All => block
+                    .parent_process
+                    .is_none_or(|process| !collapsed_processes.contains(&process)),
                 JumpKind::Reasoning => block.kind == BlockKind::Reasoning,
                 JumpKind::Tool => block.kind == BlockKind::Tool,
                 JumpKind::User => block.kind == BlockKind::User,
@@ -861,6 +934,7 @@ impl App {
             .unwrap_or(0);
         let next = wrapped_index(current, distance, indices.len());
         self.selected_block = indices[next];
+        self.expand_parent_process(self.selected_block);
         self.transcript_follow_tail = false;
         self.transcript_center_selected = true;
     }
@@ -872,6 +946,7 @@ impl App {
         if !matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
             block.expanded = true;
         }
+        self.expand_parent_process(index);
         self.jump = JumpKind::All;
         self.selected_block = index;
         self.transcript_follow_tail = false;
@@ -903,8 +978,56 @@ impl App {
                 .unwrap_or(0),
         };
         self.selected_block = indices[next];
+        self.expand_parent_process(self.selected_block);
         self.transcript_follow_tail = false;
         self.transcript_center_selected = true;
+    }
+
+    fn block_visible(&self, index: usize) -> bool {
+        let Some(parent_id) = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.parent_process)
+        else {
+            return true;
+        };
+        self.blocks.iter().any(|block| {
+            block
+                .process
+                .as_ref()
+                .is_some_and(|process| process.id == parent_id && block.expanded)
+        })
+    }
+
+    fn collapsed_processes(&self) -> HashSet<u64> {
+        self.blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .process
+                    .as_ref()
+                    .filter(|_| !block.expanded)
+                    .map(|process| process.id)
+            })
+            .collect()
+    }
+
+    fn expand_parent_process(&mut self, index: usize) {
+        let Some(parent_id) = self
+            .blocks
+            .get(index)
+            .and_then(|block| block.parent_process)
+        else {
+            return;
+        };
+        if let Some(parent) = self.blocks.iter_mut().find(|block| {
+            block
+                .process
+                .as_ref()
+                .is_some_and(|process| process.id == parent_id)
+        }) {
+            parent.expanded = true;
+        }
     }
 
     fn toggle_selected(&mut self) {
@@ -925,7 +1048,22 @@ impl App {
         if matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
             return;
         }
-        self.document = Some((block.title.clone(), block_document(block)));
+        let title = block.title.clone();
+        let document = if let Some(process) = &block.process {
+            let mut document = format!("# {title}\n");
+            for child in self
+                .blocks
+                .iter()
+                .filter(|child| child.parent_process == Some(process.id))
+            {
+                document.push('\n');
+                document.push_str(&block_document_with_level(child, 2));
+            }
+            document
+        } else {
+            block_document(block)
+        };
+        self.document = Some((title, document));
         self.overlay_scroll = 0;
         self.overlay = Some(Overlay::Document);
     }
@@ -2730,21 +2868,22 @@ async fn open_logout(app: &mut App, manager: &ConfigManager) -> Action {
 }
 
 fn open_search(app: &mut App) {
-    if app.blocks.is_empty() {
-        app.set_flash("No conversation text to search");
-        return;
-    }
     let items = app
         .blocks
         .iter()
         .enumerate()
+        .filter(|(_, block)| block.kind != BlockKind::Process)
         .map(|(index, block)| SelectorItem {
             id: index.to_string(),
             title: block.title.clone(),
             description: search_line_preview(&block.text, "", 180),
             search_text: Some(block.text.clone()),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        app.set_flash("No conversation text to search");
+        return;
+    }
     app.selector = Some(SelectorState::new(SelectorKind::Search, "SEARCH", items));
     app.overlay = Some(Overlay::Selector);
 }
@@ -3309,7 +3448,11 @@ async fn active_for_runtime(
 }
 
 fn block_document(block: &DisplayBlock) -> String {
-    let mut document = format!("# {}\n", block.title);
+    block_document_with_level(block, 1)
+}
+
+fn block_document_with_level(block: &DisplayBlock, level: usize) -> String {
+    let mut document = format!("{} {}\n", "#".repeat(level), block.title);
     if let Some(call_id) = &block.call_id {
         document.push_str(&format!("\nCall ID: `{call_id}`\n"));
     }
@@ -3766,9 +3909,17 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut block_for_row = Vec::new();
     let mut block_rows = vec![None; app.blocks.len()];
     let active_block = app.active_transcript_block();
+    let collapsed_processes = app.collapsed_processes();
+    let mut previous_visible = None;
     for (index, block) in app.blocks.iter().enumerate() {
-        if index > 0
-            && transcript_needs_gap(app.blocks[index - 1].kind, block.kind, block.final_response)
+        if block
+            .parent_process
+            .is_some_and(|process| collapsed_processes.contains(&process))
+        {
+            continue;
+        }
+        if previous_visible
+            .is_some_and(|previous| transcript_needs_gap(previous, block.kind, block.turn_result))
         {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
             block_for_row.push(None);
@@ -3786,6 +3937,7 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             block_for_row.push(Some(index));
         }
         block_rows[index] = Some((first, items.len().saturating_sub(1)));
+        previous_visible = Some(block.kind);
     }
     app.transcript_rows = items.len();
     app.transcript_height = area.height as usize;
@@ -3828,22 +3980,26 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn transcript_needs_gap(previous: BlockKind, current: BlockKind, final_response: bool) -> bool {
+fn transcript_needs_gap(previous: BlockKind, current: BlockKind, turn_result: bool) -> bool {
     (current == BlockKind::User && previous != BlockKind::User)
         || (previous == BlockKind::User && current != BlockKind::User)
-        || (current == BlockKind::Assistant
-            && final_response
-            && matches!(previous, BlockKind::Reasoning | BlockKind::Tool))
+        || (turn_result
+            && matches!(current, BlockKind::Assistant | BlockKind::Error)
+            && previous != BlockKind::User)
 }
 
 fn transcript_block_items(
     block: &DisplayBlock,
     selected: bool,
     live: bool,
-    message_width: usize,
-    process_width: usize,
+    mut message_width: usize,
+    mut process_width: usize,
     app: &App,
 ) -> Vec<ListItem<'static>> {
+    if block.parent_process.is_some() {
+        message_width = message_width.saturating_sub(2).max(1);
+        process_width = process_width.saturating_sub(2).max(1);
+    }
     let background = match block.kind {
         BlockKind::User => USER_SURFACE,
         BlockKind::Assistant => BG,
@@ -3860,19 +4016,49 @@ fn transcript_block_items(
     match block.kind {
         BlockKind::User => {
             for line in wrapped_block_lines(&block.text, message_width) {
-                rows.push(transcript_item(
+                rows.push(transcript_block_item(
+                    block,
                     vec![Span::styled(line, Style::default().fg(TEXT))],
                     background,
                 ));
             }
         }
         BlockKind::Assistant => {
-            for line in markdown::render(&block.text, message_width) {
+            for mut line in markdown::render(&block.text, message_width) {
+                if block.parent_process.is_some() {
+                    line.spans.insert(0, Span::raw("  "));
+                }
                 rows.push(ListItem::new(line).style(Style::default().bg(background)));
             }
         }
+        BlockKind::Process => {
+            let steps = block.process.as_ref().map_or(0, |process| process.steps);
+            rows.push(transcript_block_item(
+                block,
+                vec![
+                    Span::styled("◇ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!(
+                            "Process · {steps} step{}",
+                            if steps == 1 { "" } else { "s" }
+                        ),
+                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if block.expanded {
+                            "  ▾"
+                        } else {
+                            "  ▸ Enter to expand"
+                        },
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+                background,
+            ));
+        }
         BlockKind::Reasoning => {
-            rows.push(transcript_item(
+            rows.push(transcript_block_item(
+                block,
                 vec![
                     Span::styled("◇ ", Style::default().fg(MUTED)),
                     Span::styled(
@@ -3897,11 +4083,17 @@ fn transcript_block_items(
                     visible_block_lines(&block.text, process_width, EXPANDED_PREVIEW_LINES, live);
                 if live && extra > 0 {
                     rows.push(transcript_hint(
-                        extra, "earlier", true, &open_key, background,
+                        extra,
+                        "earlier",
+                        true,
+                        &open_key,
+                        background,
+                        block.parent_process.is_some(),
                     ));
                 }
                 for line in lines {
-                    rows.push(transcript_item(
+                    rows.push(transcript_block_item(
+                        block,
                         vec![
                             Span::raw("  "),
                             Span::styled(
@@ -3913,7 +4105,14 @@ fn transcript_block_items(
                     ));
                 }
                 if !live && extra > 0 {
-                    rows.push(transcript_hint(extra, "more", true, &open_key, background));
+                    rows.push(transcript_hint(
+                        extra,
+                        "more",
+                        true,
+                        &open_key,
+                        background,
+                        block.parent_process.is_some(),
+                    ));
                 }
             }
         }
@@ -3933,7 +4132,8 @@ fn transcript_block_items(
             } else {
                 "·".to_string()
             };
-            rows.push(transcript_item(
+            rows.push(transcript_block_item(
+                block,
                 vec![
                     Span::styled(
                         format!("{status} "),
@@ -3955,7 +4155,8 @@ fn transcript_block_items(
             if block.expanded {
                 let (lines, extra) = tool_detail_lines(block, process_width, 8);
                 for (line, color) in lines {
-                    rows.push(transcript_item(
+                    rows.push(transcript_block_item(
+                        block,
                         vec![
                             Span::raw("  "),
                             Span::styled(line, Style::default().fg(color)),
@@ -3964,7 +4165,14 @@ fn transcript_block_items(
                     ));
                 }
                 if extra > 0 {
-                    rows.push(transcript_hint(extra, "more", true, &open_key, background));
+                    rows.push(transcript_hint(
+                        extra,
+                        "more",
+                        true,
+                        &open_key,
+                        background,
+                        block.parent_process.is_some(),
+                    ));
                 }
             }
         }
@@ -3988,7 +4196,8 @@ fn transcript_block_items(
             };
             let (lines, extra) = visible_block_lines(&block.text, process_width, limit, false);
             for (index, line) in lines.into_iter().enumerate() {
-                rows.push(transcript_item(
+                rows.push(transcript_block_item(
+                    block,
                     vec![
                         Span::styled(
                             if index == 0 {
@@ -4013,6 +4222,7 @@ fn transcript_block_items(
                     block.expanded,
                     &open_key,
                     background,
+                    block.parent_process.is_some(),
                 ));
             }
         }
@@ -4025,30 +4235,43 @@ fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'st
     ListItem::new(Line::from(spans)).style(Style::default().bg(background))
 }
 
+fn transcript_block_item(
+    block: &DisplayBlock,
+    mut spans: Vec<Span<'static>>,
+    background: Color,
+) -> ListItem<'static> {
+    if block.parent_process.is_some() {
+        spans.insert(0, Span::raw("  "));
+    }
+    transcript_item(spans, background)
+}
+
 fn transcript_hint(
     extra: usize,
     position: &str,
     expanded: bool,
     open_key: &str,
     background: Color,
+    nested: bool,
 ) -> ListItem<'static> {
-    transcript_item(
-        vec![
-            Span::raw("  "),
-            Span::styled(
-                format!(
-                    "… {extra} {position} lines · {}",
-                    if expanded {
-                        format!("{open_key} or right-click opens full")
-                    } else {
-                        "Enter expands".to_string()
-                    }
-                ),
-                Style::default().fg(MUTED),
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "… {extra} {position} lines · {}",
+                if expanded {
+                    format!("{open_key} or right-click opens full")
+                } else {
+                    "Enter expands".to_string()
+                }
             ),
-        ],
-        background,
-    )
+            Style::default().fg(MUTED),
+        ),
+    ];
+    if nested {
+        spans.insert(0, Span::raw("  "));
+    }
+    transcript_item(spans, background)
 }
 
 fn visible_block_lines(
@@ -5347,6 +5570,14 @@ mod tests {
         test_app_with_splash(true)
     }
 
+    fn apply_event(app: &mut App, sequence: u64, kind: EventKind) {
+        app.apply(SessionEvent {
+            sequence,
+            at: chrono::Utc::now(),
+            kind,
+        });
+    }
+
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
         app.skip_splash();
         let backend = TestBackend::new(width, height);
@@ -5469,6 +5700,259 @@ mod tests {
         });
         assert!(!tool_app.blocks[0].expanded);
         assert_eq!(tool_app.blocks[1].kind, BlockKind::Tool);
+    }
+
+    #[test]
+    fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
+        let mut app = test_app();
+        apply_event(
+            &mut app,
+            0,
+            EventKind::User {
+                text: "Inspect the renderer".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            1,
+            EventKind::AssistantReasoning {
+                text: "Find the transcript owner".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            2,
+            EventKind::ToolCall {
+                call_id: "call-1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"uri": "file://src/tui.rs"}),
+            },
+        );
+        apply_event(
+            &mut app,
+            3,
+            EventKind::ToolResult {
+                call_id: "call-1".into(),
+                name: "read".into(),
+                output: "source".into(),
+                failed: false,
+            },
+        );
+        apply_event(
+            &mut app,
+            4,
+            EventKind::AssistantText {
+                text: "The final response stays visible.".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            5,
+            EventKind::AssistantReasoning {
+                text: "Reasoning emitted after the response text".into(),
+            },
+        );
+        apply_event(&mut app, 6, EventKind::TurnFinished);
+
+        assert_eq!(
+            app.blocks
+                .iter()
+                .map(|block| block.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                BlockKind::User,
+                BlockKind::Process,
+                BlockKind::Reasoning,
+                BlockKind::Tool,
+                BlockKind::Reasoning,
+                BlockKind::Assistant,
+            ]
+        );
+        assert!(!app.blocks[1].expanded);
+        assert!(app.blocks[5].turn_result);
+        assert_eq!(app.filtered_indices(), vec![0, 1, 5]);
+
+        let collapsed = render_to_string(&mut app, 100, 24);
+        assert!(collapsed.contains("Process · 3 steps  ▸ Enter to expand"));
+        assert!(collapsed.contains("The final response stays visible."));
+        assert!(!collapsed.contains("Thought"));
+        assert!(!collapsed.contains("Read src/tui.rs"));
+
+        app.selected_block = 1;
+        app.toggle_selected();
+        let expanded = render_to_string(&mut app, 100, 24);
+        assert!(expanded.contains("Process · 3 steps  ▾"));
+        assert!(expanded.contains("◇ Thought  ▸ Enter to expand"));
+        assert!(expanded.contains("✓ Read src/tui.rs  ▸"));
+        assert!(expanded.contains("The final response stays visible."));
+
+        app.selected_block = 1;
+        app.toggle_selected();
+        app.jump_to(JumpKind::Tool);
+        assert!(app.blocks[1].expanded);
+        assert_eq!(app.selected_block, 3);
+    }
+
+    #[test]
+    fn completed_turns_have_independent_process_folds() {
+        let mut app = test_app();
+        for (sequence, kind) in [
+            (0, EventKind::User { text: "one".into() }),
+            (
+                1,
+                EventKind::AssistantReasoning {
+                    text: "first process".into(),
+                },
+            ),
+            (
+                2,
+                EventKind::AssistantText {
+                    text: "first result".into(),
+                },
+            ),
+            (3, EventKind::TurnFinished),
+        ] {
+            apply_event(&mut app, sequence, kind);
+        }
+        app.selected_block = 1;
+        app.toggle_selected();
+
+        for (sequence, kind) in [
+            (4, EventKind::User { text: "two".into() }),
+            (
+                5,
+                EventKind::AssistantReasoning {
+                    text: "second process".into(),
+                },
+            ),
+            (
+                6,
+                EventKind::AssistantText {
+                    text: "second result".into(),
+                },
+            ),
+            (7, EventKind::TurnFinished),
+        ] {
+            apply_event(&mut app, sequence, kind);
+        }
+
+        let folds = app
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::Process)
+            .map(|block| block.expanded)
+            .collect::<Vec<_>>();
+        assert_eq!(folds, vec![true, false]);
+
+        app.finish_hydration();
+        assert!(
+            app.blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Process)
+                .all(|block| !block.expanded)
+        );
+    }
+
+    #[test]
+    fn searching_hidden_process_content_expands_its_turn() {
+        let mut app = test_app();
+        for (sequence, kind) in [
+            (
+                0,
+                EventKind::User {
+                    text: "inspect".into(),
+                },
+            ),
+            (
+                1,
+                EventKind::AssistantReasoning {
+                    text: "unique hidden reasoning".into(),
+                },
+            ),
+            (
+                2,
+                EventKind::AssistantText {
+                    text: "done".into(),
+                },
+            ),
+            (3, EventKind::TurnFinished),
+        ] {
+            apply_event(&mut app, sequence, kind);
+        }
+
+        assert!(!app.blocks[1].expanded);
+        assert!(app.select_search_result(2));
+        assert!(app.blocks[1].expanded);
+        assert!(app.blocks[2].expanded);
+        assert_eq!(app.selected_block, 2);
+        assert!(render_to_string(&mut app, 80, 16).contains("unique hidden reasoning"));
+    }
+
+    #[test]
+    fn turn_without_intermediate_steps_has_no_empty_process() {
+        let mut app = test_app();
+        apply_event(
+            &mut app,
+            0,
+            EventKind::User {
+                text: "answer directly".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            1,
+            EventKind::AssistantText {
+                text: "direct answer".into(),
+            },
+        );
+        apply_event(&mut app, 2, EventKind::TurnFinished);
+
+        assert_eq!(app.blocks.len(), 2);
+        assert!(app.blocks[1].turn_result);
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| block.kind == BlockKind::Process)
+        );
+        let rendered = render_to_string(&mut app, 80, 12);
+        assert!(rendered.contains("direct answer"));
+        assert!(!rendered.contains("Process ·"));
+    }
+
+    #[test]
+    fn failed_turn_folds_its_process_and_keeps_the_error_visible() {
+        let mut app = test_app();
+        apply_event(
+            &mut app,
+            0,
+            EventKind::User {
+                text: "run the check".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            1,
+            EventKind::AssistantReasoning {
+                text: "inspect failure".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            2,
+            EventKind::Error {
+                text: "check failed".into(),
+            },
+        );
+        apply_event(&mut app, 3, EventKind::TurnFinished);
+
+        assert_eq!(app.blocks[1].kind, BlockKind::Process);
+        assert!(!app.blocks[1].expanded);
+        assert_eq!(app.blocks[3].kind, BlockKind::Error);
+        assert!(app.blocks[3].turn_result);
+        let rendered = render_to_string(&mut app, 80, 12);
+        assert!(rendered.contains("Process · 1 step"));
+        assert!(rendered.contains("check failed"));
+        assert!(!rendered.contains("inspect failure"));
     }
 
     #[test]
@@ -6067,25 +6551,26 @@ mod tests {
             kind: EventKind::TurnFinished,
         });
 
-        assert!(!app.blocks[0].final_response);
-        assert!(app.blocks[2].final_response);
+        assert_eq!(app.blocks[0].kind, BlockKind::Process);
+        assert!(!app.blocks[0].expanded);
+        assert!(app.blocks[3].turn_result);
         let rendered = render_to_string(&mut app, 80, 12);
-        let reasoning_row = app
+        let process_row = app
             .hit_regions
             .iter()
-            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
             .unwrap();
         let final_row = app
             .hit_regions
             .iter()
-            .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
+            .find_map(|region| (region.target == AppHit::Transcript(3)).then_some(region.area.y))
             .unwrap();
 
-        assert_eq!(final_row, reasoning_row + 2);
+        assert_eq!(final_row, process_row + 2);
         assert!(
             rendered
                 .lines()
-                .nth((reasoning_row + 1) as usize)
+                .nth((process_row + 1) as usize)
                 .unwrap()
                 .trim()
                 .is_empty()
