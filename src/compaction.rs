@@ -48,7 +48,26 @@ pub fn prepare(
     context_window: usize,
     force: bool,
 ) -> Option<CompactionPreparation> {
-    if history.len() < 3 {
+    prepare_with_options(system_prompt, history, context_window, force, true)
+}
+
+pub fn prepare_preserving_latest_turn(
+    system_prompt: &str,
+    history: &[Message],
+    context_window: usize,
+    force: bool,
+) -> Option<CompactionPreparation> {
+    prepare_with_options(system_prompt, history, context_window, force, false)
+}
+
+fn prepare_with_options(
+    system_prompt: &str,
+    history: &[Message],
+    context_window: usize,
+    force: bool,
+    split_oversized_turn: bool,
+) -> Option<CompactionPreparation> {
+    if history.len() < 2 {
         return None;
     }
     let keep_budget = KEEP_RECENT_TOKENS.min((context_window / 4).max(1));
@@ -57,15 +76,41 @@ pub fn prepare(
         .enumerate()
         .filter_map(|(index, message)| starts_user_turn(message).then_some(index))
         .collect::<Vec<_>>();
-    let mut start = *turn_starts.last()?;
+    let latest_turn = *turn_starts.last()?;
+    let mut start = latest_turn;
     let mut retained_tokens = estimate_tokens("", &history[start..]);
-    for candidate in turn_starts.iter().rev().skip(1).copied() {
-        let candidate_tokens = estimate_tokens("", &history[candidate..start]);
-        if retained_tokens.saturating_add(candidate_tokens) > keep_budget {
-            break;
+    if retained_tokens > keep_budget && split_oversized_turn {
+        // A single tool-heavy turn can exceed the entire retention budget.
+        // Like Pi, split it at a context-valid message boundary, never at a
+        // tool result (which must remain paired with the preceding call).
+        let valid = (latest_turn + 1..history.len())
+            .filter(|index| valid_cut_point(&history[*index]))
+            .collect::<Vec<_>>();
+        let mut suffix_tokens = 0usize;
+        for index in (latest_turn + 1..history.len()).rev() {
+            suffix_tokens = suffix_tokens
+                .saturating_add(estimate_tokens("", std::slice::from_ref(&history[index])));
+            if suffix_tokens >= keep_budget {
+                start = valid
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate >= index)
+                    .unwrap_or(latest_turn);
+                break;
+            }
         }
-        start = candidate;
-        retained_tokens += candidate_tokens;
+        if start == latest_turn {
+            start = valid.first().copied().unwrap_or(latest_turn);
+        }
+    } else {
+        for candidate in turn_starts.iter().rev().skip(1).copied() {
+            let candidate_tokens = estimate_tokens("", &history[candidate..start]);
+            if retained_tokens.saturating_add(candidate_tokens) > keep_budget {
+                break;
+            }
+            start = candidate;
+            retained_tokens += candidate_tokens;
+        }
     }
     if start == 0 && force {
         start = turn_starts
@@ -111,6 +156,16 @@ fn starts_user_turn(message: &Message) -> bool {
         Message::User { content }
             if content.iter().any(|item| matches!(item, UserContent::Text(_)))
     )
+}
+
+fn valid_cut_point(message: &Message) -> bool {
+    match message {
+        Message::Assistant { .. } => true,
+        Message::User { content } => content
+            .iter()
+            .any(|item| matches!(item, UserContent::Text(_))),
+        Message::System { .. } => false,
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +244,63 @@ mod tests {
 
         assert_eq!(prepared.summarizable, history[..4]);
         assert_eq!(prepared.retained, history[4..]);
+    }
+
+    #[test]
+    fn oversized_latest_turn_is_split_without_orphaning_a_tool_result() {
+        let first_call_id = ToolCallId::new("call-1").unwrap();
+        let second_call_id = ToolCallId::new("call-2").unwrap();
+        let call = |id: ToolCallId| Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall::new(
+                id,
+                ToolFunction::new("read".to_string(), serde_json::json!({"uri": "file://x"})),
+            ))],
+        };
+        let result = |id: ToolCallId| Message::User {
+            content: vec![UserContent::tool_result_for(
+                id,
+                None,
+                "read".to_string(),
+                vec![ToolResultContent::text("large result".repeat(20_000))],
+            )],
+        };
+        let history = vec![
+            Message::user("one very large turn"),
+            call(first_call_id.clone()),
+            result(first_call_id),
+            call(second_call_id.clone()),
+            result(second_call_id),
+            Message::assistant("done"),
+        ];
+
+        let prepared = prepare("system", &history, 32_000, false).unwrap();
+
+        assert!(!prepared.summarizable.is_empty());
+        assert!(matches!(
+            prepared.retained.first(),
+            Some(Message::Assistant { .. })
+        ));
+        assert!(!matches!(
+            prepared.retained.first(),
+            Some(Message::User { content })
+                if content.iter().any(|item| matches!(item, UserContent::ToolResult(_)))
+        ));
+    }
+
+    #[test]
+    fn preserving_preparation_keeps_an_oversized_latest_turn_whole() {
+        let history = vec![
+            Message::user("old task"),
+            Message::assistant("old answer"),
+            Message::user("current task"),
+            Message::assistant("large current answer".repeat(20_000)),
+        ];
+
+        let prepared = prepare_preserving_latest_turn("system", &history, 32_000, false).unwrap();
+
+        assert_eq!(prepared.summarizable, history[..2]);
+        assert_eq!(prepared.retained, history[2..]);
     }
 
     #[test]

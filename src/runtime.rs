@@ -14,9 +14,16 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::task::JoinHandle;
 
 const MAX_TOOL_ROUNDS: usize = 32;
+const TURN_INTERRUPTED: &str = "turn interrupted by shutdown";
+
+struct ActiveTurn {
+    cancel: watch::Sender<bool>,
+    handle: JoinHandle<()>,
+}
 
 pub struct AgentRuntime {
     backend: RwLock<Option<Arc<dyn ModelBackend>>>,
@@ -26,6 +33,7 @@ pub struct AgentRuntime {
     limits: RwLock<ModelLimits>,
     estimated_tokens: AtomicUsize,
     turn: Mutex<()>,
+    active_turn: Mutex<Option<ActiveTurn>>,
 }
 
 impl AgentRuntime {
@@ -44,6 +52,7 @@ impl AgentRuntime {
             limits: RwLock::new(limits),
             estimated_tokens: AtomicUsize::new(0),
             turn: Mutex::new(()),
+            active_turn: Mutex::new(None),
         }
     }
 
@@ -80,6 +89,14 @@ impl AgentRuntime {
         self.backend.read().await.is_some()
     }
 
+    pub async fn turn_running(&self) -> bool {
+        self.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| !turn.handle.is_finished())
+    }
+
     pub async fn compact(&self) -> Result<()> {
         let _turn = self.turn.lock().await;
         let history = self.session.model_history().await;
@@ -94,13 +111,56 @@ impl AgentRuntime {
             .await
             .clone()
             .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
-        if !self.compact_with(backend.as_ref(), true).await? {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        if !self
+            .compact_with(backend.as_ref(), true, true, &mut cancel)
+            .await?
+        {
             bail!("not enough completed history to compact")
         }
         Ok(())
     }
 
+    /// Start a detached turn owned by this runtime. The handle remains
+    /// available for orderly process shutdown instead of becoming fire-and-forget.
+    pub async fn start_turn(self: &Arc<Self>, prompt: String) -> Result<()> {
+        let mut active = self.active_turn.lock().await;
+        if let Some(previous) = active.take() {
+            if !previous.handle.is_finished() {
+                *active = Some(previous);
+                bail!("a turn is already running")
+            }
+            let _ = previous.handle.await;
+        }
+        let (cancel, receiver) = watch::channel(false);
+        let runtime = self.clone();
+        let handle = tokio::spawn(async move {
+            let _ = runtime.run_turn_with_cancel(prompt, receiver).await;
+        });
+        *active = Some(ActiveTurn { cancel, handle });
+        Ok(())
+    }
+
+    /// Cancel the active request/tool operation, then wait until the worker has
+    /// durably recorded its interrupted terminal boundary.
+    pub async fn shutdown(&self) {
+        let Some(active) = self.active_turn.lock().await.take() else {
+            return;
+        };
+        let _ = active.cancel.send(true);
+        let _ = active.handle.await;
+    }
+
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
+        let (_cancel_tx, cancel) = watch::channel(false);
+        self.run_turn_with_cancel(prompt, cancel).await
+    }
+
+    async fn run_turn_with_cancel(
+        &self,
+        prompt: String,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<()> {
         let _turn = self.turn.lock().await;
         let prompt = prompt.trim();
         if prompt.is_empty() {
@@ -135,16 +195,21 @@ impl AgentRuntime {
                 .await?;
             return Err(anyhow!(text));
         }
-        self.session
-            .append(EventKind::User {
-                text: prompt.to_string(),
-            })
-            .await?;
         let mut content = vec![UserContent::text(prompt)];
         content.extend(images);
-        self.append_model_message(Message::User { content }).await?;
+        self.session
+            .append_batch(vec![
+                EventKind::User {
+                    text: prompt.to_string(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::User { content },
+                },
+            ])
+            .await
+            .context("cannot persist user turn boundary")?;
 
-        let result = self.run_tool_loop(backend).await;
+        let result = self.run_tool_loop(backend, &mut cancel).await;
         match result {
             Ok(()) => {
                 self.session.append(EventKind::TurnFinished).await?;
@@ -153,23 +218,55 @@ impl AgentRuntime {
             Err(error) => {
                 let text = format!("{error:#}");
                 self.session
-                    .append(EventKind::Error { text: text.clone() })
+                    .append_batch(vec![
+                        EventKind::Error { text: text.clone() },
+                        EventKind::TurnFinished,
+                    ])
                     .await?;
                 Err(anyhow!(text))
             }
         }
     }
 
-    async fn run_tool_loop(&self, backend: Arc<dyn ModelBackend>) -> Result<()> {
+    async fn run_tool_loop(
+        &self,
+        backend: Arc<dyn ModelBackend>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut overflow_retried = false;
         for _ in 0..MAX_TOOL_ROUNDS {
-            self.compact_with(backend.as_ref(), false).await?;
-            let response = self.complete_once(backend.as_ref()).await?;
-            self.record_usage(response.usage).await?;
+            self.compact_with(backend.as_ref(), false, false, cancel)
+                .await?;
+            let response = loop {
+                match self.complete_once(backend.as_ref(), cancel).await {
+                    Ok(response) => break response,
+                    Err(error) if !overflow_retried && is_context_overflow(&error) => {
+                        overflow_retried = true;
+                        if !self
+                            .compact_with(backend.as_ref(), true, false, cancel)
+                            .await?
+                        {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             let assistant_message = Message::Assistant {
                 id: None,
                 content: response.content.clone(),
             };
-            self.append_model_message(assistant_message).await?;
+            let mut events = self.assistant_events(&response.content);
+            if let Some(usage) = self.usage_event(response.usage).await {
+                events.insert(0, usage);
+            }
+            events.push(EventKind::ModelMessage {
+                message: assistant_message,
+            });
+            self.session
+                .append_batch(events)
+                .await
+                .context("cannot persist assistant turn boundary")?;
 
             let tool_calls = response
                 .content
@@ -183,21 +280,35 @@ impl AgentRuntime {
                 return Ok(());
             }
             for call in tool_calls {
-                self.execute_tool(call).await?;
+                self.execute_tool(call, cancel).await?;
             }
         }
         bail!("model exceeded {MAX_TOOL_ROUNDS} consecutive tool rounds")
     }
 
-    async fn compact_with(&self, backend: &dyn ModelBackend, force: bool) -> Result<bool> {
+    async fn compact_with(
+        &self,
+        backend: &dyn ModelBackend,
+        force: bool,
+        manual: bool,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<bool> {
         let history = self.session.model_history().await;
         let context_window = self.limits.read().await.context_window.max(1);
         if !force && !compaction::should_compact(&self.system_prompt, &history, context_window) {
             return Ok(false);
         }
-        let Some(preparation) =
+        let preparation = if force && !manual {
             compaction::prepare(&self.system_prompt, &history, context_window, force)
-        else {
+        } else {
+            compaction::prepare_preserving_latest_turn(
+                &self.system_prompt,
+                &history,
+                context_window,
+                force,
+            )
+        };
+        let Some(preparation) = preparation else {
             return Ok(false);
         };
         let request = ModelRequest {
@@ -206,10 +317,17 @@ impl AgentRuntime {
             tools: false,
         };
         let (deltas, _receiver) = mpsc::unbounded_channel();
-        let response = backend
-            .complete(request, deltas)
-            .await
-            .context("context compaction model request failed")?;
+        let completion = backend.complete(request, deltas);
+        tokio::pin!(completion);
+        let response = tokio::select! {
+            response = &mut completion => response.context("context compaction model request failed")?,
+            changed = cancel.changed() => {
+                if changed.is_ok() && *cancel.borrow() {
+                    bail!(TURN_INTERRUPTED)
+                }
+                completion.await.context("context compaction model request failed")?
+            }
+        };
         self.record_usage(response.usage).await?;
         let summary = response
             .content
@@ -225,7 +343,7 @@ impl AgentRuntime {
         }
         let replacement = compaction::replacement_history(&summary, &preparation.retained);
         self.session
-            .append_compaction(summary, preparation.tokens_before, replacement, force)
+            .append_compaction(summary, preparation.tokens_before, replacement, manual)
             .await?;
         self.refresh_context_estimate().await;
         Ok(true)
@@ -235,9 +353,17 @@ impl AgentRuntime {
     /// catalog rates. A zero-valued report is the sentinel for missing
     /// metrics and carries no information worth an event.
     async fn record_usage(&self, usage: Option<Usage>) -> Result<()> {
-        let Some(usage) = usage else { return Ok(()) };
-        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        let Some(event) = self.usage_event(usage).await else {
             return Ok(());
+        };
+        self.session.append(event).await?;
+        Ok(())
+    }
+
+    async fn usage_event(&self, usage: Option<Usage>) -> Option<EventKind> {
+        let usage = usage?;
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            return None;
         }
         let cost = self.limits.read().await.cost.total(
             usage.input_tokens,
@@ -245,19 +371,20 @@ impl AgentRuntime {
             usage.cached_input_tokens,
             usage.cache_creation_input_tokens,
         );
-        self.session
-            .append(EventKind::Usage {
-                input: usage.input_tokens,
-                output: usage.output_tokens,
-                cache_read: usage.cached_input_tokens,
-                cache_write: usage.cache_creation_input_tokens,
-                cost,
-            })
-            .await?;
-        Ok(())
+        Some(EventKind::Usage {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cached_input_tokens,
+            cache_write: usage.cache_creation_input_tokens,
+            cost,
+        })
     }
 
-    async fn complete_once(&self, backend: &dyn ModelBackend) -> Result<ModelResponse> {
+    async fn complete_once(
+        &self,
+        backend: &dyn ModelBackend,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<ModelResponse> {
         let history = self.session.model_history().await;
         self.estimated_tokens.store(
             compaction::estimate_tokens(&self.system_prompt, &history),
@@ -275,63 +402,72 @@ impl AgentRuntime {
             tokio::select! {
                 response = &mut completion => {
                     while let Ok(delta) = receiver.try_recv() {
-                        self.append_delta(delta).await?;
+                        self.publish_delta(delta);
                     }
                     return response;
                 }
                 delta = receiver.recv() => {
                     if let Some(delta) = delta {
-                        self.append_delta(delta).await?;
+                        self.publish_delta(delta);
+                    }
+                }
+                changed = cancel.changed() => {
+                    if changed.is_ok() && *cancel.borrow() {
+                        bail!(TURN_INTERRUPTED)
                     }
                 }
             }
         }
     }
 
-    async fn append_delta(&self, delta: ModelDelta) -> Result<()> {
-        self.session
-            .append(match delta {
-                ModelDelta::Text(text) => EventKind::AssistantText { text },
-                ModelDelta::Reasoning(text) => EventKind::AssistantReasoning { text },
-            })
-            .await?;
-        Ok(())
+    fn publish_delta(&self, delta: ModelDelta) {
+        self.session.publish_transient(match delta {
+            ModelDelta::Text(text) => EventKind::AssistantText { text },
+            ModelDelta::Reasoning(text) => EventKind::AssistantReasoning { text },
+        });
     }
 
-    async fn execute_tool(&self, call: ToolCall) -> Result<()> {
+    async fn execute_tool(&self, call: ToolCall, cancel: &mut watch::Receiver<bool>) -> Result<()> {
         let name = call.function.name.clone();
         let call_id = call.id.to_string();
-        self.session
-            .append(EventKind::ToolCall {
-                call_id: call_id.clone(),
-                name: name.clone(),
-                arguments: call.function.arguments.clone(),
-            })
-            .await?;
-
-        let result = self.dispatch(&name, &call.function.arguments).await;
+        let dispatch = self.dispatch(&name, &call.function.arguments);
+        tokio::pin!(dispatch);
+        let result = tokio::select! {
+            result = &mut dispatch => result,
+            changed = cancel.changed() => {
+                if changed.is_ok() && *cancel.borrow() {
+                    bail!(TURN_INTERRUPTED)
+                }
+                dispatch.await
+            }
+        };
         let (output, failed) = match result {
             Ok(output) => (output, false),
             Err(error) => (format!("Error: {error:#}"), true),
         };
-        self.session
-            .append(EventKind::ToolResult {
-                call_id,
-                name: name.clone(),
-                output: output.clone(),
-                failed,
-            })
-            .await?;
         let result = UserContent::tool_result_for(
             call.id,
             call.provider,
-            name,
-            vec![ToolResultContent::Text(Text::new(output))],
+            name.clone(),
+            vec![ToolResultContent::Text(Text::new(output.clone()))],
         );
-        self.append_model_message(Message::User {
-            content: vec![result],
-        })
-        .await
+        self.session
+            .append_batch(vec![
+                EventKind::ToolResult {
+                    call_id,
+                    name: name.clone(),
+                    output,
+                    failed,
+                },
+                EventKind::ModelMessage {
+                    message: Message::User {
+                        content: vec![result],
+                    },
+                },
+            ])
+            .await
+            .context("cannot persist tool result boundary")?;
+        Ok(())
     }
 
     async fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
@@ -350,13 +486,69 @@ impl AgentRuntime {
         }
     }
 
-    async fn append_model_message(&self, message: Message) -> Result<()> {
-        self.session
-            .append(EventKind::ModelMessage { message })
-            .await
-            .context("cannot persist model history")?;
-        Ok(())
+    fn assistant_events(&self, content: &[AssistantContent]) -> Vec<EventKind> {
+        content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text(text) => Some(EventKind::AssistantText {
+                    text: text.text.clone(),
+                }),
+                AssistantContent::Reasoning(reasoning) => {
+                    let text = reasoning.display_text();
+                    (!text.is_empty()).then_some(EventKind::AssistantReasoning { text })
+                }
+                AssistantContent::ToolCall(call) => Some(EventKind::ToolCall {
+                    call_id: call.id.to_string(),
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                }),
+                AssistantContent::Image(_) => None,
+            })
+            .collect()
     }
+}
+
+fn is_context_overflow(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    if [
+        "rate limit",
+        "too many requests",
+        "throttling error",
+        "service unavailable",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        return false;
+    }
+    [
+        "prompt is too long",
+        "request_too_large",
+        "input is too long for requested model",
+        "exceeds the context window",
+        "maximum context length",
+        "input token count",
+        "maximum prompt length",
+        "reduce the length of the messages",
+        "maximum allowed input length",
+        "longer than the model's context length",
+        "exceeds the available context size",
+        "greater than the context length",
+        "context window exceeds limit",
+        "exceeded model token limit",
+        "model_context_window_exceeded",
+        "prompt too long",
+        "configured context size",
+        "range of input length should be",
+        "context_length_exceeded",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+        || text.starts_with("400 status code (no body)")
+        || text.starts_with("413 status code (no body)")
 }
 
 async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>> {
@@ -460,6 +652,16 @@ mod tests {
         requests: Mutex<Vec<ModelRequest>>,
     }
 
+    struct ScriptedBackend {
+        responses: Mutex<VecDeque<Result<ModelResponse>>>,
+        requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    struct BlockingBackend {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
     #[async_trait]
     impl ModelBackend for FakeBackend {
         async fn complete(
@@ -478,6 +680,34 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelBackend for ScriptedBackend {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _deltas: mpsc::UnboundedSender<ModelDelta>,
+        ) -> Result<ModelResponse> {
+            self.requests.lock().await.push(request);
+            self.responses.lock().await.pop_front().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelBackend for BlockingBackend {
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _deltas: mpsc::UnboundedSender<ModelDelta>,
+        ) -> Result<ModelResponse> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(ModelResponse {
+                content: vec![AssistantContent::text("released")],
+                usage: None,
+            })
+        }
+    }
+
     fn fake_usage() -> Usage {
         Usage {
             input_tokens: 1_000,
@@ -486,6 +716,41 @@ mod tests {
             cache_creation_input_tokens: 50,
             ..Usage::new()
         }
+    }
+
+    async fn test_runtime(
+        workspace: &Path,
+        backend: Arc<dyn ModelBackend>,
+        limits: ModelLimits,
+    ) -> (Arc<AgentRuntime>, Session, PathBuf) {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.join("sessions.db"),
+            Some(&session_id),
+            workspace,
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let runtime = Arc::new(AgentRuntime::new(
+            Some(backend),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            session.clone(),
+            "system".to_string(),
+            limits,
+        ));
+        (runtime, session, output_directory)
     }
 
     #[test]
@@ -1006,6 +1271,211 @@ mod tests {
                 .any(|event| matches!(event.kind, EventKind::Compaction { .. }))
         );
 
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[test]
+    fn context_overflow_classifier_excludes_rate_limits() {
+        assert!(is_context_overflow(&anyhow!(
+            "Your input exceeds the context window of this model"
+        )));
+        assert!(is_context_overflow(&anyhow!(
+            "prompt has 200,000 tokens, but the configured context size is 128,000 tokens"
+        )));
+        assert!(!is_context_overflow(&anyhow!(
+            "Throttling error: too many tokens; rate limit exceeded"
+        )));
+    }
+
+    #[tokio::test]
+    async fn first_context_overflow_compacts_and_retries_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                Err(anyhow!(
+                    "Your input exceeds the context window of this model"
+                )),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("summary of old work")],
+                    usage: None,
+                }),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("answer after retry")],
+                    usage: None,
+                }),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend.clone(),
+            ModelLimits {
+                context_window: 128_000,
+                ..ModelLimits::default()
+            },
+        )
+        .await;
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: "old task".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("old task"),
+                },
+                EventKind::AssistantText {
+                    text: "old answer".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("old answer"),
+                },
+            ])
+            .await
+            .unwrap();
+
+        runtime.run_turn("current task".into()).await.unwrap();
+
+        let requests = backend.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].tools);
+        assert_eq!(requests[1].system, compaction::SUMMARY_SYSTEM_PROMPT);
+        assert!(requests[2].tools);
+        drop(requests);
+        assert_eq!(
+            session
+                .snapshot()
+                .await
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::Compaction { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            session.snapshot().await.last().map(|event| &event.kind),
+            Some(EventKind::TurnFinished)
+        ));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn second_context_overflow_settles_without_an_infinite_retry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                Err(anyhow!("prompt is too long")),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("summary")],
+                    usage: None,
+                }),
+                Err(anyhow!("prompt is too long")),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend.clone(),
+            ModelLimits {
+                context_window: 128_000,
+                ..ModelLimits::default()
+            },
+        )
+        .await;
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: "old task".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("old task"),
+                },
+                EventKind::AssistantText {
+                    text: "old answer".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("old answer"),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let error = runtime.run_turn("current task".into()).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("prompt is too long"));
+        assert_eq!(backend.requests.lock().await.len(), 3);
+        let events = session.snapshot().await;
+        assert!(matches!(
+            events.last().map(|event| &event.kind),
+            Some(EventKind::TurnFinished)
+        ));
+        assert!(matches!(
+            events.get(events.len() - 2).map(|event| &event.kind),
+            Some(EventKind::Error { text }) if text.contains("prompt is too long")
+        ));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_durably_settles_a_running_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime.start_turn("long request".into()).await.unwrap();
+        backend.started.notified().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), runtime.shutdown())
+            .await
+            .expect("shutdown should cancel the model request promptly");
+
+        let events = session.snapshot().await;
+        assert!(matches!(
+            events.last().map(|event| &event.kind),
+            Some(EventKind::TurnFinished)
+        ));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Error { text } if text == TURN_INTERRUPTED
+        )));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn detached_turn_survives_its_conversation_surface_switching_away() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime
+            .start_turn("background request".into())
+            .await
+            .unwrap();
+        backend.started.notified().await;
+        drop(runtime);
+        backend.release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    session.snapshot().await.last().map(|event| &event.kind),
+                    Some(EventKind::TurnFinished)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached turn should finish after the old surface is gone");
+        assert!(session.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::AssistantText { text } if text == "released"
+        )));
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 }

@@ -1,3 +1,4 @@
+use crate::catalog::ThinkingLevel;
 use crate::skill::SkillSnapshot;
 use crate::task::TaskStatus;
 use anyhow::{Context, Result, anyhow};
@@ -28,7 +29,15 @@ pub struct SessionSummary {
     pub updated_at: DateTime<Utc>,
     pub provider: String,
     pub model: String,
+    pub thinking: ThinkingLevel,
     pub preview: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionModelSettings {
+    pub provider: String,
+    pub model: String,
+    pub thinking: ThinkingLevel,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -45,6 +54,12 @@ pub struct SessionContext {
     pub skills: Vec<SkillSnapshot>,
 }
 
+#[derive(Clone, Debug)]
+pub enum SessionUpdate {
+    Persisted(SessionEvent),
+    Transient(EventKind),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -52,6 +67,8 @@ pub enum EventKind {
         cwd: PathBuf,
         provider: String,
         model: String,
+        #[serde(default)]
+        thinking: ThinkingLevel,
     },
     SessionContext {
         context: SessionContext,
@@ -78,6 +95,11 @@ pub enum EventKind {
     },
     ModelMessage {
         message: Message,
+    },
+    ModelSettingsChanged {
+        provider: String,
+        model: String,
+        thinking: ThinkingLevel,
     },
     Task {
         id: String,
@@ -111,8 +133,7 @@ pub enum EventKind {
 struct State {
     events: Vec<SessionEvent>,
     persisted: bool,
-    provider: String,
-    model: String,
+    model_settings: SessionModelSettings,
 }
 
 #[derive(Clone)]
@@ -125,7 +146,7 @@ pub struct Session {
     database_path: PathBuf,
     connection: Connection,
     state: Arc<Mutex<State>>,
-    events: broadcast::Sender<SessionEvent>,
+    events: broadcast::Sender<SessionUpdate>,
 }
 
 impl Session {
@@ -134,25 +155,49 @@ impl Session {
         cwd: &Path,
         provider: &str,
         model: &str,
+        thinking: ThinkingLevel,
         context: SessionContext,
     ) -> Result<Self> {
-        Self::open_at(
+        Self::open_at_with_thinking(
             session_database_path(cwd),
             requested,
             cwd,
             provider,
             model,
+            thinking,
             context,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn open_at(
         database_path: PathBuf,
         requested: Option<&str>,
         cwd: &Path,
         provider: &str,
         model: &str,
+        context: SessionContext,
+    ) -> Result<Self> {
+        Self::open_at_with_thinking(
+            database_path,
+            requested,
+            cwd,
+            provider,
+            model,
+            ThinkingLevel::default(),
+            context,
+        )
+        .await
+    }
+
+    async fn open_at_with_thinking(
+        database_path: PathBuf,
+        requested: Option<&str>,
+        cwd: &Path,
+        provider: &str,
+        model: &str,
+        thinking: ThinkingLevel,
         context: SessionContext,
     ) -> Result<Self> {
         let (directory, connection) = open_database(database_path.clone()).await?;
@@ -253,6 +298,7 @@ impl Session {
                 cwd: cwd.to_path_buf(),
                 provider: provider.to_string(),
                 model: model.to_string(),
+                thinking,
             };
             let frozen = EventKind::SessionContext { context };
             existing.extend([
@@ -277,6 +323,39 @@ impl Session {
             ));
         }
 
+        let stored_settings = if created_session {
+            None
+        } else {
+            let settings_id = id.clone();
+            connection
+                .call(move |db| {
+                    db.query_row(
+                        "SELECT provider, model, thinking FROM sessions WHERE id = ?1",
+                        [settings_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                })
+                .await
+                .context("cannot restore session model settings")?
+                .map(|(provider, model, thinking)| SessionModelSettings {
+                    provider,
+                    model,
+                    thinking: thinking.parse().unwrap_or_default(),
+                })
+        };
+        let fallback_settings = stored_settings.unwrap_or_else(|| SessionModelSettings {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            thinking,
+        });
+        let model_settings = model_settings_from_events(&existing, fallback_settings);
         let (events, _) = broadcast::channel(512);
         let session = Self {
             id,
@@ -289,8 +368,7 @@ impl Session {
             state: Arc::new(Mutex::new(State {
                 events: existing,
                 persisted: !created_session,
-                provider: provider.to_string(),
-                model: model.to_string(),
+                model_settings,
             })),
             events,
         };
@@ -368,11 +446,22 @@ impl Session {
         list_project_sessions(self.database_path.clone(), Path::new(&self.project)).await
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionUpdate> {
         self.events.subscribe()
     }
+
+    /// Publish provisional UI state without adding it to durable replay. The
+    /// completed response boundary later replaces these deltas in the transcript.
+    pub fn publish_transient(&self, kind: EventKind) {
+        let _ = self.events.send(SessionUpdate::Transient(kind));
+    }
+
     pub async fn snapshot(&self) -> Vec<SessionEvent> {
         self.state.lock().await.events.clone()
+    }
+
+    pub async fn model_settings(&self) -> SessionModelSettings {
+        self.state.lock().await.model_settings.clone()
     }
 
     pub async fn context(&self) -> SessionContext {
@@ -432,51 +521,81 @@ impl Session {
         .await
     }
 
-    pub async fn update_model(&self, provider: &str, model: &str) -> Result<()> {
-        let mut state = self.state.lock().await;
-        state.provider = provider.to_string();
-        state.model = model.to_string();
-        if !state.persisted {
+    pub async fn update_model_settings(
+        &self,
+        provider: &str,
+        model: &str,
+        thinking: ThinkingLevel,
+    ) -> Result<()> {
+        let requested = SessionModelSettings {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            thinking,
+        };
+        if self.state.lock().await.model_settings == requested {
             return Ok(());
         }
-        drop(state);
+        self.append(EventKind::ModelSettingsChanged {
+            provider: requested.provider,
+            model: requested.model,
+            thinking: requested.thinking,
+        })
+        .await
+        .context("cannot update session model settings")?;
+        Ok(())
+    }
 
-        let id = self.id.clone();
-        let provider = provider.to_string();
-        let model = model.to_string();
-        let updated_at = Utc::now().to_rfc3339();
-        self.connection
-            .call(move |db| {
-                db.execute(
-                    "UPDATE sessions SET provider = ?2, model = ?3, updated_at = ?4 WHERE id = ?1",
-                    params![id, provider, model, updated_at],
-                )?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-            })
-            .await
-            .context("cannot update session model")
+    #[cfg(test)]
+    async fn update_model(&self, provider: &str, model: &str) -> Result<()> {
+        let thinking = self.model_settings().await.thinking;
+        self.update_model_settings(provider, model, thinking).await
     }
 
     pub async fn append(&self, kind: EventKind) -> Result<SessionEvent> {
+        self.append_batch(vec![kind])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("session append produced no event"))
+    }
+
+    /// Append a related event boundary in one SQLite transaction and publish
+    /// it only after commit. This keeps transcript, replay, usage, and terminal
+    /// state from observing partially persisted boundaries after a crash.
+    pub async fn append_batch(&self, kinds: Vec<EventKind>) -> Result<Vec<SessionEvent>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut state = self.state.lock().await;
         let at = Utc::now();
         let at_text = at.to_rfc3339();
+        let first_sequence = state
+            .events
+            .last()
+            .map_or(0, |event| event.sequence.saturating_add(1));
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(offset, kind)| SessionEvent {
+                sequence: first_sequence.saturating_add(offset as u64),
+                at,
+                kind,
+            })
+            .collect::<Vec<_>>();
+        let mut next_settings = state.model_settings.clone();
+        apply_model_settings(&mut next_settings, events.iter().map(|event| &event.kind));
 
         if !state.persisted {
-            let sequence = state
-                .events
-                .last()
-                .map_or(0, |event| event.sequence.saturating_add(1));
-            let event = SessionEvent { sequence, at, kind };
-            if !matches!(&event.kind, EventKind::User { .. }) {
-                state.events.push(event.clone());
+            if !events.iter().any(|event| starts_session(&event.kind)) {
+                state.events.extend(events.iter().cloned());
+                state.model_settings = next_settings;
                 drop(state);
-                let _ = self.events.send(event.clone());
-                return Ok(event);
+                self.publish_persisted(&events);
+                return Ok(events);
             }
 
-            let mut stored_events = Vec::with_capacity(state.events.len() + 1);
-            for stored in state.events.iter().chain(std::iter::once(&event)) {
+            let mut stored_events = Vec::with_capacity(state.events.len() + events.len());
+            for stored in state.events.iter().chain(events.iter()) {
                 stored_events.push((
                     stored.sequence as i64,
                     stored.at.to_rfc3339(),
@@ -487,8 +606,13 @@ impl Session {
             }
             let id = self.id.clone();
             let project = self.project.clone();
-            let provider = state.provider.clone();
-            let model = state.model.clone();
+            let provider = next_settings.provider.clone();
+            let model = next_settings.model.clone();
+            let thinking = next_settings.thinking.to_string();
+            let head_sequence = events
+                .last()
+                .expect("nonempty batch has a final event")
+                .sequence;
             self.connection
                 .call(move |db| {
                     let transaction = db.transaction()?;
@@ -502,15 +626,16 @@ impl Session {
                         .unwrap_or_default();
                     transaction.execute(
                         "INSERT INTO sessions
-                         (id, created_at, updated_at, cwd, provider, model, head_sequence, draft)
-                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         (id, created_at, updated_at, cwd, provider, model, thinking, head_sequence, draft)
+                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
                             id,
                             at_text,
                             project,
                             provider,
                             model,
-                            sequence as i64,
+                            thinking,
+                            head_sequence as i64,
                             draft
                         ],
                     )?;
@@ -529,17 +654,36 @@ impl Session {
                 .await
                 .context("cannot create session")?;
             state.persisted = true;
-            state.events.push(event.clone());
+            state.events.extend(events.iter().cloned());
+            state.model_settings = next_settings;
             drop(state);
-            let _ = self.events.send(event.clone());
-            return Ok(event);
+            self.publish_persisted(&events);
+            return Ok(events);
         }
 
         let id = self.id.clone();
-        let payload = serde_json::to_string(&kind).context("cannot serialize session event")?;
-        let kind_name = payload_kind(&kind).to_string();
-        let sequence = self
-            .connection
+        let stored_events = events
+            .iter()
+            .map(|event| {
+                Ok::<_, anyhow::Error>((
+                    event.sequence as i64,
+                    payload_kind(&event.kind).to_string(),
+                    serde_json::to_string(&event.kind).context("cannot serialize session event")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let provider = next_settings.provider.clone();
+        let model = next_settings.model.clone();
+        let thinking = next_settings.thinking.to_string();
+        let expected_head = state
+            .events
+            .last()
+            .map_or(-1, |event| event.sequence as i64);
+        let head_sequence = events
+            .last()
+            .expect("nonempty batch has a final event")
+            .sequence as i64;
+        self.connection
             .call(move |db| {
                 let transaction = db.transaction()?;
                 let head: i64 = transaction.query_row(
@@ -547,26 +691,39 @@ impl Session {
                     [&id],
                     |row| row.get(0),
                 )?;
-                let sequence = head + 1;
+                if head != expected_head {
+                    return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+                }
+                for (sequence, kind_name, payload) in stored_events {
+                    transaction.execute(
+                        "INSERT INTO events (session_id, sequence, at, kind, payload_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![id, sequence, at_text, kind_name, payload],
+                    )?;
+                }
                 transaction.execute(
-                    "INSERT INTO events (session_id, sequence, at, kind, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![id, sequence, at_text, kind_name, payload],
-                )?;
-                transaction.execute(
-                    "UPDATE sessions SET updated_at = ?2, head_sequence = ?3 WHERE id = ?1",
-                    params![id, at_text, sequence],
+                    "UPDATE sessions
+                     SET updated_at = ?2, head_sequence = ?3,
+                         provider = ?4, model = ?5, thinking = ?6
+                     WHERE id = ?1",
+                    params![id, at_text, head_sequence, provider, model, thinking],
                 )?;
                 transaction.commit()?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(sequence as u64)
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
             })
             .await
-            .context("cannot append session event")?;
-        let event = SessionEvent { sequence, at, kind };
-        state.events.push(event.clone());
+            .context("cannot append session event batch")?;
+        state.events.extend(events.iter().cloned());
+        state.model_settings = next_settings;
         drop(state);
-        let _ = self.events.send(event.clone());
-        Ok(event)
+        self.publish_persisted(&events);
+        Ok(events)
+    }
+
+    fn publish_persisted(&self, events: &[SessionEvent]) {
+        for event in events {
+            let _ = self.events.send(SessionUpdate::Persisted(event.clone()));
+        }
     }
 }
 
@@ -580,7 +737,7 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
     connection
         .call(move |db| {
             let mut statement = db.prepare(
-                "SELECT id, updated_at, provider, model,
+                "SELECT id, updated_at, provider, model, thinking,
                     (SELECT payload_json FROM events
                      WHERE events.session_id = sessions.id AND kind = 'user'
                      ORDER BY sequence DESC LIMIT 1)
@@ -593,12 +750,13 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?;
             let mut sessions = Vec::new();
             for row in rows {
-                let (id, updated_at, provider, model, payload) = row?;
+                let (id, updated_at, provider, model, thinking, payload) = row?;
                 let preview = payload
                     .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
                     .and_then(|kind| match kind {
@@ -614,6 +772,7 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
                     updated_at,
                     provider,
                     model,
+                    thinking: thinking.parse().unwrap_or_default(),
                     preview,
                 });
             }
@@ -661,6 +820,7 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                  CREATE TABLE IF NOT EXISTS sessions (
                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                    cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                   thinking TEXT NOT NULL DEFAULT 'off',
                    head_sequence INTEGER NOT NULL,
                    draft TEXT NOT NULL DEFAULT ''
                  );
@@ -682,6 +842,17 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
             if !has_draft {
                 db.execute(
                     "ALTER TABLE sessions ADD COLUMN draft TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            let has_thinking = {
+                let mut statement = db.prepare("PRAGMA table_info(sessions)")?;
+                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+                names.filter_map(Result::ok).any(|name| name == "thinking")
+            };
+            if !has_thinking {
+                db.execute(
+                    "ALTER TABLE sessions ADD COLUMN thinking TEXT NOT NULL DEFAULT 'off'",
                     [],
                 )?;
             }
@@ -730,6 +901,7 @@ fn payload_kind(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::SessionCreated { .. } => "session_created",
         EventKind::SessionContext { .. } => "session_context",
+        EventKind::ModelSettingsChanged { .. } => "model_settings_changed",
         EventKind::User { .. } => "user",
         EventKind::AssistantText { .. } => "assistant_text",
         EventKind::AssistantReasoning { .. } => "assistant_reasoning",
@@ -743,6 +915,53 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::Compaction { .. } => "compaction",
         EventKind::TurnFinished => "turn_finished",
     }
+}
+
+fn starts_session(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::User { .. })
+}
+
+fn apply_model_settings<'a>(
+    settings: &mut SessionModelSettings,
+    kinds: impl IntoIterator<Item = &'a EventKind>,
+) {
+    for kind in kinds {
+        match kind {
+            EventKind::SessionCreated {
+                provider,
+                model,
+                thinking,
+                ..
+            }
+            | EventKind::ModelSettingsChanged {
+                provider,
+                model,
+                thinking,
+            } => {
+                settings.provider.clone_from(provider);
+                settings.model.clone_from(model);
+                settings.thinking = *thinking;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn model_settings_from_events(
+    events: &[SessionEvent],
+    mut fallback: SessionModelSettings,
+) -> SessionModelSettings {
+    // Older URI Agent versions updated only the materialized session row. If
+    // no append-only change exists, that row remains the compatibility truth
+    // rather than the original values in SessionCreated.
+    if !events
+        .iter()
+        .any(|event| matches!(&event.kind, EventKind::ModelSettingsChanged { .. }))
+    {
+        return fallback;
+    }
+    apply_model_settings(&mut fallback, events.iter().map(|event| &event.kind));
+    fallback
 }
 
 fn validate_session_id(id: &str) -> Result<()> {
@@ -1046,7 +1265,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(persisted, (1, 4, "changed".into(), "next-model".into()));
+        assert_eq!(persisted, (1, 5, "changed".into(), "next-model".into()));
     }
 
     #[tokio::test]
@@ -1208,5 +1427,161 @@ mod tests {
                 .preview,
             "first question"
         );
+    }
+
+    #[tokio::test]
+    async fn model_settings_are_event_sourced_and_restored_on_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let original = Session::open_at_with_thinking(
+            path.clone(),
+            Some("settings"),
+            Path::new("/work"),
+            "openai",
+            "gpt-old",
+            ThinkingLevel::High,
+            context("settings"),
+        )
+        .await
+        .unwrap();
+        original
+            .append(EventKind::User {
+                text: "remember the model".into(),
+            })
+            .await
+            .unwrap();
+        original
+            .update_model_settings("anthropic", "claude-new", ThinkingLevel::Medium)
+            .await
+            .unwrap();
+        assert!(original.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ModelSettingsChanged { provider, model, thinking }
+                if provider == "anthropic"
+                    && model == "claude-new"
+                    && *thinking == ThinkingLevel::Medium
+        )));
+        drop(original);
+
+        let resumed = Session::open_at_with_thinking(
+            path,
+            Some("settings"),
+            Path::new("/work"),
+            "different-default",
+            "different-model",
+            ThinkingLevel::Off,
+            context("ignored"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resumed.model_settings().await,
+            SessionModelSettings {
+                provider: "anthropic".into(),
+                model: "claude-new".into(),
+                thinking: ThinkingLevel::Medium,
+            }
+        );
+        let summary = resumed.list_for_project().await.unwrap().remove(0);
+        assert_eq!(summary.provider, "anthropic");
+        assert_eq!(summary.model, "claude-new");
+        assert_eq!(summary.thinking, ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn legacy_session_created_event_defaults_thinking_to_off() {
+        let kind: EventKind = serde_json::from_value(serde_json::json!({
+            "kind": "session_created",
+            "cwd": "/work",
+            "provider": "openai",
+            "model": "gpt-old"
+        }))
+        .unwrap();
+        assert!(matches!(
+            kind,
+            EventKind::SessionCreated {
+                thinking: ThinkingLevel::Off,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_row_only_model_change_remains_resumable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let original = session(&path, Some("legacy-model")).await;
+        original
+            .append(EventKind::User {
+                text: "persist".into(),
+            })
+            .await
+            .unwrap();
+        original
+            .connection
+            .call(|db| {
+                db.execute(
+                    "UPDATE sessions SET provider = 'legacy-provider', model = 'legacy-current'
+                     WHERE id = 'legacy-model'",
+                    [],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        drop(original);
+
+        let resumed = session(&path, Some("legacy-model")).await;
+        assert_eq!(resumed.model_settings().await.provider, "legacy-provider");
+        assert_eq!(resumed.model_settings().await.model, "legacy-current");
+    }
+
+    #[tokio::test]
+    async fn related_transcript_and_replay_events_rollback_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("atomic")).await;
+        opened
+            .connection
+            .call(|db| {
+                db.execute_batch(
+                    "CREATE TRIGGER reject_model_message
+                     BEFORE INSERT ON events
+                     WHEN NEW.kind = 'model_message'
+                     BEGIN
+                       SELECT RAISE(ABORT, 'simulated crash boundary');
+                     END;",
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let result = opened
+            .append_batch(vec![
+                EventKind::User {
+                    text: "must be atomic".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("must be atomic"),
+                },
+            ])
+            .await;
+        assert!(result.is_err());
+        assert!(!opened.snapshot().await.iter().any(|event| matches!(
+            event.kind,
+            EventKind::User { .. } | EventKind::ModelMessage { .. }
+        )));
+        let counts: (i64, i64) = opened
+            .connection
+            .call(|db| {
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                    db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?,
+                    db.query_row("SELECT count(*) FROM events", [], |row| row.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
     }
 }

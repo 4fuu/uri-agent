@@ -93,8 +93,12 @@ The detailed protocol behavior is in [Protocols, tasks, Skills, and extensions](
 - Resume from the frozen snapshot. Never synthesize current prompt or Skill state for an old session, and never rebind a same-named Skill at another path.
 - A missing frozen Skill file fails explicitly. A resumed session without frozen context is invalid.
 - Session events are append-only. Compaction changes model replay by adding a checkpoint; it does not delete original events.
-- Compaction boundaries are complete user turns and never separate a tool call from its result.
+- Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
+- Record provider, model, and thinking changes as events and restore their folded state on resume.
+- Compaction normally keeps complete recent turns. It may split an oversized turn only at a valid message boundary that does not orphan a tool result.
+- Retry a detected provider context overflow after compaction at most once per user turn.
 - Preserve provider tool-call identity during replay.
+- Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
 - The canonical launch directory is the project boundary. Latest and explicit session resume cannot cross it.
 
 The user-visible lifecycle is in [Sessions and context](interface.md#sessions-and-context).

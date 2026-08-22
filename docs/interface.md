@@ -129,7 +129,11 @@ The canonical startup directory is the project boundary and is recorded with eve
 - `--session latest` selects the same project-scoped latest session;
 - `:resume` lists sessions for the current project, including each session's model and configured effort.
 
+Each session records its provider, model, and thinking effort. Model or effort changes append a settings event, and resume restores the latest session settings instead of applying the defaults for a new session.
+
 `Esc` keeps draft text in the composer. URI Agent writes the current draft to SQLite when the TUI exits or switches sessions. Before the first message, it stores the draft separately by project so preserving a draft does not create an empty session record.
+
+Switching sessions leaves an active turn running against its original session. Exiting URI Agent cancels each active turn's in-flight wait and joins it after its interruption error and turn boundary are durable; the user does not need to wait for the model to finish naturally.
 
 ### Frozen startup context
 
@@ -139,7 +143,9 @@ This makes model replay stable across application restarts and configuration cha
 
 ### Append-only events
 
-User messages, model messages, tool calls and results, usage, notices, errors, task notices, turn boundaries, and compaction checkpoints are appended as events. Existing events are not rewritten or deleted during normal operation or context compaction.
+User messages, model messages, model settings, tool calls and results, usage, notices, errors, task notices, turn boundaries, and compaction checkpoints are appended as events. Existing events are not rewritten or deleted during normal operation or context compaction.
+
+The transcript event and model-replay event for one message commit in the same SQLite transaction. Streaming text and reasoning deltas are provisional TUI updates; the completed response replaces them after its durable boundary commits.
 
 Provider tool-call identity is preserved in model history so resumed tool conversations remain valid for the selected backend.
 
@@ -150,7 +156,7 @@ URI Agent estimates replay size against the selected model's context window. Bef
 ```text
 frozen system prompt
 + checkpoint summary of older history
-+ complete recent user turns
++ recent history retained at a valid message boundary
 + events after the checkpoint
 ```
 
@@ -158,7 +164,9 @@ Summary generation uses a dedicated compaction system prompt and does not
 expose registered tools. Normal execution resumes with the session's frozen
 system prompt unchanged.
 
-Compaction boundaries are complete user turns. A tool call is never separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
+Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the retention budget, URI Agent may summarize its older prefix and retain its recent suffix. A retained suffix never starts with a tool result, so a tool call is not separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
+
+If a provider still reports context overflow, URI Agent makes one forced compaction-and-retry attempt for that user turn. A second overflow settles as an error instead of retrying indefinitely.
 
 Run `:compact` to request an earlier checkpoint once estimated context usage is
 strictly above 20%. The command also fails clearly when there is not enough

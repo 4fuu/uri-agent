@@ -15,7 +15,7 @@ use crate::plugin::{
 };
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
-use crate::session::{EventKind, SessionEvent, SessionSummary};
+use crate::session::{EventKind, SessionEvent, SessionSummary, SessionUpdate};
 use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -98,6 +98,7 @@ struct DisplayBlock {
     failed: bool,
     expanded: bool,
     tool: Option<ToolDisplay>,
+    transient: bool,
 }
 
 struct ToolDisplay {
@@ -204,8 +205,7 @@ struct SettingsState {
 }
 
 impl SettingsState {
-    async fn load(manager: &ConfigManager, catalog: &ModelCatalog) -> Self {
-        let active = manager.current().await;
+    async fn load(active: ActiveSettings, catalog: &ModelCatalog) -> Self {
         let model = active.catalog_model(catalog).await;
         Self {
             output_limit: active.output_limit.to_string(),
@@ -371,6 +371,7 @@ struct App {
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
+    applying_transient: bool,
     info: TuiInfo,
     flash: Option<String>,
     flash_at: Option<Instant>,
@@ -436,6 +437,7 @@ impl App {
             started: Instant::now(),
             splash_skipped: false,
             last_sequence: None,
+            applying_transient: false,
             info,
             flash: None,
             flash_at: None,
@@ -477,6 +479,18 @@ impl App {
     }
 
     fn apply(&mut self, event: SessionEvent) {
+        if !self.applying_transient
+            && matches!(
+                &event.kind,
+                EventKind::AssistantText { .. }
+                    | EventKind::AssistantReasoning { .. }
+                    | EventKind::ModelMessage { .. }
+                    | EventKind::Error { .. }
+                    | EventKind::TurnFinished
+            )
+        {
+            self.clear_transient_blocks();
+        }
         if self
             .last_sequence
             .is_some_and(|sequence| event.sequence <= sequence)
@@ -489,6 +503,7 @@ impl App {
         match event.kind {
             EventKind::SessionCreated { .. }
             | EventKind::SessionContext { .. }
+            | EventKind::ModelSettingsChanged { .. }
             | EventKind::ModelMessage { .. }
             | EventKind::Task { .. } => {}
             EventKind::User { text } => {
@@ -648,6 +663,23 @@ impl App {
         style_input(&mut self.input, self.busy);
     }
 
+    fn apply_transient(&mut self, kind: EventKind) {
+        let last_sequence = self.last_sequence;
+        self.applying_transient = true;
+        self.apply(SessionEvent {
+            sequence: last_sequence.map_or(0, |sequence| sequence.saturating_add(1)),
+            at: chrono::Utc::now(),
+            kind,
+        });
+        self.applying_transient = false;
+        self.last_sequence = last_sequence;
+    }
+
+    fn clear_transient_blocks(&mut self) {
+        self.blocks.retain(|block| !block.transient);
+        self.selected_block = self.selected_block.min(self.blocks.len().saturating_sub(1));
+    }
+
     fn finish_hydration(&mut self) {
         self.busy = false;
         self.activity = None;
@@ -678,11 +710,16 @@ impl App {
             failed,
             expanded,
             tool: None,
+            transient: self.applying_transient,
         });
     }
 
     fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String, expanded: bool) {
-        if let Some(block) = self.blocks.last_mut().filter(|block| block.kind == kind) {
+        if let Some(block) = self
+            .blocks
+            .last_mut()
+            .filter(|block| block.kind == kind && block.transient == self.applying_transient)
+        {
             block.text.push_str(&text);
             block.expanded = expanded;
         } else {
@@ -1000,9 +1037,7 @@ pub async fn run(services: TuiServices) -> Result<TuiOutcome> {
         mut info,
         draft,
     } = services;
-    let active = manager.current().await;
-    info.thinking =
-        effective_thinking(&catalog, &active.provider, &active.model, active.thinking).await;
+    info.thinking = effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
     let session = runtime.session().clone();
     let mut receiver = session.subscribe();
     let keymap = Keymap::load(Some(&info.cwd)).await?;
@@ -1011,6 +1046,12 @@ pub async fn run(services: TuiServices) -> Result<TuiOutcome> {
         app.apply(event);
     }
     app.finish_hydration();
+    if runtime.turn_running().await {
+        app.busy = true;
+        app.busy_since = Some(Instant::now());
+        app.activity = Some(Activity::Thinking);
+        style_input(&mut app.input, true);
+    }
 
     let mut terminal = ratatui::try_init()?;
     let _restore = RestoreTerminal;
@@ -1037,7 +1078,7 @@ async fn run_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     services: LoopServices,
-    receiver: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    receiver: &mut tokio::sync::broadcast::Receiver<SessionUpdate>,
 ) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
@@ -1107,7 +1148,8 @@ async fn run_loop(
                 }
             }
             event = receiver.recv() => match event {
-                Ok(event) => app.apply(event),
+                Ok(SessionUpdate::Persisted(event)) => app.apply(event),
+                Ok(SessionUpdate::Transient(kind)) => app.apply_transient(kind),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for event in services.runtime.session().snapshot().await {
                         app.apply(event);
@@ -1137,6 +1179,9 @@ async fn persist_and_exit(
         .session()
         .save_draft(&app.draft_text())
         .await;
+    if matches!(&outcome, TuiOutcome::Quit) {
+        services.runtime.shutdown().await;
+    }
     app.close_floats();
     Ok(outcome)
 }
@@ -1194,10 +1239,12 @@ async fn apply_action(
         }
         Action::Submit(prompt) => {
             let _ = services.runtime.session().save_draft("").await;
-            let runtime = services.runtime.clone();
-            tokio::spawn(async move {
-                let _ = runtime.run_turn(prompt).await;
-            });
+            if let Err(error) = services.runtime.start_turn(prompt).await {
+                app.busy = false;
+                app.busy_since = None;
+                app.activity = None;
+                app.set_flash(format!("Cannot start turn: {error:#}"));
+            }
             Ok(None)
         }
         Action::Compact => {
@@ -1205,7 +1252,14 @@ async fn apply_action(
             Ok(None)
         }
         Action::OpenModels(query) => {
-            open_models(app, &services.manager, &services.catalog, query).await;
+            open_models(
+                app,
+                &services.runtime,
+                &services.manager,
+                &services.catalog,
+                query,
+            )
+            .await;
             Ok(None)
         }
         Action::SelectModel => {
@@ -1220,7 +1274,8 @@ async fn apply_action(
             Ok(None)
         }
         Action::OpenSettings => {
-            app.settings = Some(SettingsState::load(&services.manager, &services.catalog).await);
+            let active = active_for_runtime(&services.manager, &services.runtime).await?;
+            app.settings = Some(SettingsState::load(active, &services.catalog).await);
             app.overlay = Some(Overlay::Settings);
             Ok(None)
         }
@@ -2410,15 +2465,11 @@ async fn open_resume(app: &mut App, services: &LoopServices) -> Action {
             let current = app.info.session_id.clone();
             let mut items = Vec::with_capacity(sessions.len());
             for session in sessions {
-                let configured = services
-                    .manager
-                    .thinking_for_model(&session.provider, &session.model)
-                    .await;
                 let thinking = effective_thinking(
                     &services.catalog,
                     &session.provider,
                     &session.model,
-                    configured,
+                    session.thinking,
                 )
                 .await;
                 items.push(resume_item(&current, session, thinking));
@@ -2480,7 +2531,8 @@ async fn store_api_key(app: &mut App, services: &LoopServices, provider: &str, k
         return;
     }
     let result = async {
-        let active = services.manager.set_api_key(provider, key).await?;
+        services.manager.set_api_key(provider, key).await?;
+        let active = active_for_runtime(&services.manager, &services.runtime).await?;
         apply_active(
             app,
             &services.runtime,
@@ -2500,7 +2552,8 @@ async fn store_api_key(app: &mut App, services: &LoopServices, provider: &str, k
 
 async fn logout_provider(app: &mut App, services: &LoopServices, provider: &str) {
     let result = async {
-        let active = services.manager.clear_api_key(provider).await?;
+        services.manager.clear_api_key(provider).await?;
+        let active = active_for_runtime(&services.manager, &services.runtime).await?;
         apply_active(
             app,
             &services.runtime,
@@ -2520,11 +2573,18 @@ async fn logout_provider(app: &mut App, services: &LoopServices, provider: &str)
 
 async fn open_models(
     app: &mut App,
+    runtime: &AgentRuntime,
     manager: &ConfigManager,
     catalog: &ModelCatalog,
     query: String,
 ) {
-    let active = manager.current().await;
+    let active = match active_for_runtime(manager, runtime).await {
+        Ok(active) => active,
+        Err(error) => {
+            app.set_flash(format!("Could not resolve session model: {error:#}"));
+            return;
+        }
+    };
     let selector = ModelSelector::load(catalog, &active, query).await;
     if selector.model_count() == 0 {
         app.set_flash("No runnable models cached · :settings then refresh, or add models.json");
@@ -2580,7 +2640,13 @@ async fn select_model(
 }
 
 async fn open_effort(app: &mut App, services: &LoopServices) {
-    let active = services.manager.current().await;
+    let active = match active_for_runtime(&services.manager, &services.runtime).await {
+        Ok(active) => active,
+        Err(error) => {
+            app.set_flash(format!("Could not resolve session model: {error:#}"));
+            return;
+        }
+    };
     if !active.model_configured() {
         app.set_flash("No active model; choose one with :model");
         return;
@@ -2639,30 +2705,38 @@ async fn set_effort(
 ) {
     let key = format!("{provider}/{model}");
     let result = async {
-        let active = services
+        services
             .manager
             .set_model_thinking(provider, model, requested)
             .await?;
-        apply_active(
-            app,
-            &services.runtime,
-            &services.catalog,
-            &services.output,
-            &active,
-        )
-        .await?;
-        Ok::<_, anyhow::Error>(active)
+        let current = services.runtime.session().model_settings().await;
+        let applies_to_session = current.provider == provider && current.model == model;
+        if applies_to_session {
+            let active = services
+                .manager
+                .for_session(provider, model, requested)
+                .await?;
+            apply_active(
+                app,
+                &services.runtime,
+                &services.catalog,
+                &services.output,
+                &active,
+            )
+            .await?;
+        }
+        Ok::<_, anyhow::Error>(applies_to_session)
     }
     .await;
     app.set_flash(match result {
-        Ok(_) if app.info.thinking == requested => {
+        Ok(true) if app.info.thinking == requested => {
             format!("Effort for {key} set to {requested}")
         }
-        Ok(active) => format!(
-            "Saved {requested} for {key}, but {} keeps {} active",
-            active.thinking_source.label(),
-            active.thinking
+        Ok(true) => format!(
+            "Saved {requested} for {key}; active effort is {}",
+            app.info.thinking
         ),
+        Ok(false) => format!("Effort for {key} saved"),
         Err(error) => format!("Could not set effort for {key}: {error:#}"),
     });
 }
@@ -2775,15 +2849,17 @@ async fn save_settings(
             }
         }
         manager.set_output_limit(output_limit).await?;
-        if let Some((provider, model)) = selection {
+        let active = if let Some((provider, model)) = selection {
             manager
                 .set_model_thinking(&provider, &model, thinking)
                 .await?;
             manager.set_model(&provider, &model).await?;
-        }
-        let active = manager.current().await;
+            manager.for_session(&provider, &model, thinking).await?
+        } else {
+            active_for_runtime(manager, runtime).await?
+        };
         apply_active(app, runtime, catalog, output, &active).await?;
-        app.settings = Some(SettingsState::load(manager, catalog).await);
+        app.settings = Some(SettingsState::load(active, catalog).await);
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -2821,7 +2897,8 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
         BackgroundEvent::CatalogRefreshed(result) => {
             app.catalog_refreshing = false;
             let result = async {
-                let active = result?;
+                result?;
+                let active = active_for_runtime(&services.manager, &services.runtime).await?;
                 apply_active(
                     app,
                     &services.runtime,
@@ -2832,7 +2909,7 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
                 .await?;
                 if app.settings.is_some() {
                     app.settings =
-                        Some(SettingsState::load(&services.manager, &services.catalog).await);
+                        Some(SettingsState::load(active.clone(), &services.catalog).await);
                 }
                 if let Some(query) = app
                     .model_selector
@@ -2861,7 +2938,9 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
             match result {
                 Ok(token) => {
                     let applied = async {
-                        let active = services.manager.set_oauth(&provider, token).await?;
+                        services.manager.set_oauth(&provider, token).await?;
+                        let active =
+                            active_for_runtime(&services.manager, &services.runtime).await?;
                         apply_active(
                             app,
                             &services.runtime,
@@ -2906,11 +2985,11 @@ async fn apply_active(
     let context_window = limits
         .as_ref()
         .map_or(128_000, |limits| limits.context_window);
-    runtime.set_backend(backend, limits).await;
     runtime
         .session()
-        .update_model(&active.provider, &active.model)
+        .update_model_settings(&active.provider, &active.model, active.thinking)
         .await?;
+    runtime.set_backend(backend, limits).await;
     output.set_limit(active.output_limit);
     app.info.provider.clone_from(&active.provider);
     app.info.model.clone_from(&active.model);
@@ -2921,6 +3000,16 @@ async fn apply_active(
     app.info.provider_count = catalog.providers().await.len();
     app.info.terminal.clone_from(&active.terminal);
     Ok(())
+}
+
+async fn active_for_runtime(
+    manager: &ConfigManager,
+    runtime: &AgentRuntime,
+) -> Result<ActiveSettings> {
+    let settings = runtime.session().model_settings().await;
+    manager
+        .for_session(&settings.provider, &settings.model, settings.thinking)
+        .await
 }
 
 fn block_document(block: &DisplayBlock) -> String {
@@ -4951,6 +5040,73 @@ mod tests {
     }
 
     #[test]
+    fn durable_assistant_text_replaces_streaming_deltas() {
+        let mut app = test_app();
+        app.apply_transient(EventKind::AssistantText {
+            text: "streamed ".into(),
+        });
+        app.apply_transient(EventKind::AssistantText {
+            text: "draft".into(),
+        });
+        assert_eq!(app.blocks.len(), 1);
+        assert_eq!(app.blocks[0].text, "streamed draft");
+
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::Compaction {
+                summary: "overflow checkpoint".into(),
+                tokens_before: 100,
+                replacement_history: Vec::new(),
+                manual: false,
+            },
+        });
+        app.apply(SessionEvent {
+            sequence: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::AssistantText {
+                text: "settled response".into(),
+            },
+        });
+
+        assert_eq!(app.blocks.len(), 2);
+        assert_eq!(app.blocks[0].kind, BlockKind::Compaction);
+        assert_eq!(app.blocks[1].text, "settled response");
+        assert!(!app.blocks[1].transient);
+    }
+
+    #[test]
+    fn duplicate_settled_boundary_clears_a_stale_hydration_delta() {
+        let mut app = test_app();
+        let boundary = SessionEvent {
+            sequence: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::ModelMessage {
+                message: rig::message::Message::assistant("settled response"),
+            },
+        };
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::AssistantText {
+                text: "settled response".into(),
+            },
+        });
+        app.apply(boundary.clone());
+
+        // A subscriber can receive a queued delta that predates the snapshot
+        // used to hydrate the transcript, followed by this duplicate boundary.
+        app.apply_transient(EventKind::AssistantText {
+            text: "stale streamed text".into(),
+        });
+        app.apply(boundary);
+
+        assert_eq!(app.blocks.len(), 1);
+        assert_eq!(app.blocks[0].text, "settled response");
+        assert!(!app.blocks[0].transient);
+    }
+
+    #[test]
     fn unconfigured_brand_asks_for_login_instead_of_a_default_model() {
         let mut app = test_app();
         app.info.provider.clear();
@@ -5902,6 +6058,7 @@ mod tests {
                 updated_at: chrono::Utc::now(),
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
+                thinking: ThinkingLevel::Medium,
                 preview: "continue the work".to_string(),
             },
             ThinkingLevel::Medium,

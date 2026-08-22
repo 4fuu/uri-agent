@@ -130,6 +130,7 @@ pub fn display_path(path: &Path) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueSource {
     Default,
+    Session,
     Global,
     Project,
     Environment(String),
@@ -141,6 +142,7 @@ impl ValueSource {
     pub fn label(&self) -> String {
         match self {
             Self::Default => "default".to_string(),
+            Self::Session => "session".to_string(),
             Self::Global => "settings.json".to_string(),
             Self::Project => ".uri-agent/settings.json".to_string(),
             Self::Environment(name) => name.clone(),
@@ -299,6 +301,26 @@ impl ConfigManager {
 
     pub async fn current(&self) -> ActiveSettings {
         self.active.read().await.clone()
+    }
+
+    /// Resolve credentials and model metadata for settings frozen in a
+    /// session, without changing the defaults used by new sessions.
+    pub async fn for_session(
+        &self,
+        provider: &str,
+        model: &str,
+        thinking: ThinkingLevel,
+    ) -> Result<ActiveSettings> {
+        let files = self.files.lock().await;
+        let mut invocation = self.invocation.clone();
+        invocation.provider = Some(provider.to_string());
+        invocation.model = Some(model.to_string());
+        invocation.thinking = Some(thinking);
+        let mut active = calculate_active(&files, &self.catalog, &invocation).await?;
+        active.provider_source = ValueSource::Session;
+        active.model_source = ValueSource::Session;
+        active.thinking_source = ValueSource::Session;
+        Ok(active)
     }
 
     pub async fn thinking_for_model(&self, provider: &str, model: &str) -> ThinkingLevel {
@@ -990,6 +1012,21 @@ mod tests {
         .unwrap();
         assert_eq!(openai.thinking, ThinkingLevel::High);
         assert_eq!(anthropic.thinking, ThinkingLevel::Medium);
+        drop(files);
+
+        let defaults = manager.current().await;
+        let resumed = manager
+            .for_session("anthropic", "claude-opus-4-6", ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(resumed.provider, "anthropic");
+        assert_eq!(resumed.model, "claude-opus-4-6");
+        assert_eq!(resumed.thinking, ThinkingLevel::Low);
+        assert_eq!(resumed.provider_source, ValueSource::Session);
+        assert_eq!(resumed.model_source, ValueSource::Session);
+        assert_eq!(resumed.thinking_source, ValueSource::Session);
+        assert_eq!(manager.current().await.provider, defaults.provider);
+        assert_eq!(manager.current().await.model, defaults.model);
     }
 
     #[test]
