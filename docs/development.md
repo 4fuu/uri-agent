@@ -62,72 +62,59 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 
 Put behavior in the module that owns the corresponding state and contract. Before adding a wrapper, helper, or type, check whether changing the existing source of truth is clearer. A one-use abstraction is justified only when it enforces a named invariant or removes real complexity.
 
-## Non-negotiable product contracts
+## Linked Rust extensions
+
+First-party capabilities use the plugin path exposed to linked Rust extensions:
+
+1. A [`Plugin`](../src/plugin.rs) may declare protocol descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen.
+2. `PluginRegistry` validates descriptor names, rejects duplicates, collects notices, and preserves registration order for prompt fragments.
+3. Plugins install protocols, commands, panel providers, and status providers through `PluginHost`; prompt-only plugins need no runtime registration.
+4. Protocols remain behind `read` and `exec`, while commands join the searchable panel and key-bindable command registry.
+
+TUI extensions return generic documents and semantic status items. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, or panel providers; reserve prompt fragments for context required before the first tool call.
+
+URI Agent does not load native dynamic libraries. Third-party runtime protocols use the trusted [WASM plugin](plugins.md) path instead.
+
+## Architectural contracts
 
 ### Model-facing interface and protocols
 
 - The model sees exactly two tool definitions: `read` and `exec`.
-- Split protocol addresses only at the first `://`. The registry treats the remainder as opaque and does not perform RFC URL parsing, decoding, normalization, or generic option handling.
-- Accept any JSON value as `body` and pass it to the selected protocol unchanged.
+- Split protocol addresses only at the first `://`; pass the opaque remainder and optional JSON body to the selected protocol unchanged.
 - Protocol names are unique. A protocol may implement `read`, `exec`, or both.
-- Each protocol documents its operational contract at `<protocol>://help`. Keep [built-in help](../src/prompts.rs) synchronized with behavior, including valid addresses, body shapes, asynchronous behavior, result routes, limits, and an example.
+- Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
 - Prefer extending `Protocol` over adding another model-facing concept or embedding every capability in the initial prompt.
 - Reserve plugin system prompt fragments for context the model must receive before its first tool call. Prompt-only plugins do not need to register a protocol.
 
-The detailed protocol behavior is in [Protocols, tasks, Skills, and extensions](protocols.md).
+The shared routing and execution lifecycle is in [Protocols, tasks, output, and Skills](protocols.md).
 
-### Tasks, writes, and output
+### Execution and persistence
 
 - Asynchronous task acceptance is not completion. Status and final content remain available through the owning protocol's read route.
-- URI options belong to their protocol. `bash` and `pwsh` own `?wait=N`; the registry must not interpret it.
-- A wait timeout leaves the task running.
+- URI syntax belongs to its protocol; the registry must not interpret protocol-specific options.
 - Shell cancellation terminates child processes, not only the parent future.
 - File writes remain atomic. Exact replacement rejects missing and ambiguous matches.
 - Preserve oversized output in the session output directory and return a readable `file://` address.
-- Enable only an available `bash` protocol on non-Windows platforms. On Windows, keep native-shell policy in the `pwsh` plugin: require PowerShell 7 or newer, warn and leave `pwsh` disabled when unavailable, and suppress `bash` when enabled.
-
-### Skills and sessions
-
-- Discover Skills once at startup from the documented project and user roots. Never compile or copy a machine-specific discovered Skill list into the product.
-- Normalize each accepted Skill to `<name>-skill`, keep first-wins precedence, and skip protocol collisions with a clear notice.
 - Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
-- Append plugin system prompt fragments after the generated protocol list, preserving plugin registration order.
 - Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
-- Load trusted WASM modules from non-hidden top-level `.wasm` files in the persistent plugin directory. There is no package manifest or package manager.
-- Build a complete validated dynamic WASM protocol set before swapping it into the registry. A directory-level reload failure keeps the old set; in-flight calls retain their captured old runtime.
-- Keep `wasm_plugin` limited to `read("wasm_plugin://help")` and `exec("wasm_plugin://reload")`, require every dynamic protocol to provide readable help, and keep its model-facing help synchronized with the SDK, actual directory, install workflow, permissions, limits, and reload behavior. Preserve raw reload diagnostics as output files instead of embedding them in model-facing text.
-- Route WASM guest host calls only to static protocols; never recursively route them into dynamic WASM protocols or `wasm_plugin` itself.
-- Treat WASM plugins as trusted code, not sandboxed code. Preserve their documented WASI, HTTP, filesystem, and built-in protocol access while retaining reliability limits.
-- Resume from the frozen snapshot. Never synthesize current prompt or Skill state for an old session, and never rebind a same-named Skill at another path.
-- A missing frozen Skill file fails explicitly. A resumed session without frozen context is invalid.
+- Resume from the frozen snapshot rather than regenerating current prompt or Skill state.
 - Session events are append-only. Compaction changes model replay by adding a checkpoint; it does not delete original events.
 - Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
-- Record provider, model, and thinking changes as events and restore their folded state on resume.
-- Compaction normally keeps complete recent turns. It may split an oversized turn only at a valid message boundary that does not orphan a tool result.
-- Retry a detected provider context overflow after compaction at most once per user turn.
 - Preserve provider tool-call identity during replay.
 - Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
-- The canonical launch directory is the project boundary. Latest and explicit session resume cannot cross it.
+- Treat the canonical launch directory as the project boundary for attachments and session selection.
 
-The user-visible lifecycle is in [Sessions and context](interface.md#sessions-and-context).
+The exact Skill rules are in [Skills](protocols.md#skills); the user-visible persistence and compaction lifecycle is in [Sessions and context](interface.md#sessions-and-context).
 
 ### TUI and extensions
 
 - The TUI is one conversation surface. Do not introduce Browse, Insert, or Detail modes, a slash-command syntax, or a second command path.
-- Startup may show the splash, then the conversation. Empty history keeps the centered animated brand, working directory, provider/model/effort or login prompt, and a local compose/command/help hint; nonempty history uses role-specific transcript blocks and one highlighted footer with expanded status available through `F4` or `:status`.
-- `i` opens the composer; `Enter` sends, `Shift+Enter` inserts a newline, and `Esc` preserves the draft.
-- Two `Esc` presses within 500 milliseconds interrupt a running turn through runtime cancellation while the first press preserves its surface-specific behavior. The embedded terminal retains its separate double-`Esc` close gesture.
-- `:` opens a searchable command panel from the conversation. Its input only filters the list; commands needing a choice or text open a selector or input float instead of parsing search text.
-- Final assistant responses remain readable in the transcript, while each completed turn's intermediate timeline folds into one process row. Expanding it reveals independently foldable reasoning and tool summaries. Click or `Enter` toggles a block, right-click opens its full document even during streaming, and `r`, `t`, and `h` filter or jump among reasoning, tool, and user blocks.
-- Arrow keys and mouse input are first-class. `j` and `k` may remain aliases, but defaults and help must not require Vim knowledge.
-- Route configurable keys through the layered Rhai keymap.
-- Route command panel entries and key-bindable command IDs through `CommandRegistry`.
-- Register extension protocols, commands, panels, and status through `PluginHost`. Keep panel rendering generic and plugin-specific behavior out of `src/tui.rs`.
-- Keep the interface keyboard-complete and preserve mouse hit regions for selectable lists and command panels.
-- Use direct drag selection in read-only views and Shift-drag where a float must keep ordinary clicks.
+- Keep the interface keyboard-complete, with arrow keys and mouse input as first-class paths.
+- Route configurable keys through the layered Rhai keymap, commands through `CommandRegistry`, and extension UI through generic `PluginHost` registrations.
+- Preserve mouse hit regions for selectable lists and command panels.
 - Preserve terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
 
-The active user behavior and defaults are in [Terminal interface and sessions](interface.md).
+The active keys, interactions, and visible behavior are owned by [Terminal interface and sessions](interface.md), with `F1` and `:help` as the runtime reference.
 
 ### Models and configuration
 
@@ -157,6 +144,10 @@ When adding or changing a protocol:
 5. update [protocol documentation](protocols.md) when public cross-cutting behavior changes.
 
 Do not add generic registry behavior for syntax that belongs to one protocol.
+
+### WASM plugin and SDK changes
+
+Keep `wasm_plugin://help`, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. Test both a valid module and the affected reload, collision, permission, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing.
 
 ### Model, Skill, session, and runtime changes
 
@@ -191,10 +182,12 @@ For documentation-only changes, the full Rust suite is unnecessary unless code o
 ## Documentation ownership
 
 - Root READMEs own project fit, critical warnings, the shortest successful setup, and navigation.
-- [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, output, Skill, and extension detail.
-- [`docs/configuration.md`](configuration.md) owns models, authentication, files, precedence, CLI options, and custom providers.
+- [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, output, and Skill detail.
+- [`docs/plugins.md`](plugins.md) owns WASM installation, reload, ABI, trust boundaries, and runtime limits; [`sdk/README.md`](../sdk/README.md) owns Rust guest SDK usage.
+- [`docs/configuration.md`](configuration.md) owns models, authentication, files, precedence, CLI override semantics, and custom providers.
 - [`docs/interface.md`](interface.md) owns TUI behavior, commands, keymaps, terminal interaction, attachments, sessions, and compaction.
 - This document owns architecture, module boundaries, engineering invariants, change rules, and verification.
+- `uri-agent --help` owns the exact CLI contract.
 - `<protocol>://help` owns the exact model-facing contract for one protocol.
 - [`AGENTS.md`](../AGENTS.md) remains a concise agent entry point and links here instead of duplicating the complete manual.
 

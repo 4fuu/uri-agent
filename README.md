@@ -11,12 +11,14 @@ Protocols load their operational guidance on demand from `<protocol>://help`. Lo
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 
+URI Agent is currently a pre-1.0 project installed from source. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
+
 ## Why URI Agent
 
 - **Stable tool surface:** adding a capability does not add another model-facing tool schema.
 - **Progressive context:** protocol and Skill instructions enter the context only when the model reads their help.
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
-- **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols through a stable Rust SDK and the same user authority as URI Agent.
+- **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
 - **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface.
 
@@ -45,25 +47,23 @@ cargo install --path .
 
 ### Start your first session
 
-Launch URI Agent with the project directory it may access:
+Launch URI Agent with the project directory it should use:
 
 ```bash
 uri-agent --cwd /path/to/project
 ```
 
-If the project root contains `AGENTS.md`, URI Agent includes its instructions in the system prompt for each new session. Resumed sessions keep the copy frozen when they were created.
-
-New sessions also scan `PATH` once and tell the model which supported modern command-line tools are available. Resumed sessions keep the original hint.
+`--cwd` sets the project and default working directory; it is not a filesystem access boundary. If the project contains `AGENTS.md`, review it before launch: new sessions include those instructions and freeze their startup context.
 
 URI Agent does not choose a default model. In the TUI:
 
 1. Run `:login` to save an API key or complete a supported OAuth flow.
 2. Run `:model` and select a runnable model.
-3. Press `i`, enter a request, and press `Enter` to send it.
+3. Press `i`, enter a small read-only request such as `Read the top-level files and explain what this project does. Do not modify files.`, and press `Enter`.
 
-When setup is complete, the welcome view shows the selected provider, model, and thinking effort instead of the setup prompt; submitted requests and responses then appear in the conversation.
+The first session is working when protocol activity appears and the assistant returns an answer based on the project. Press `F1` or run `:help` for the active commands and key bindings.
 
-`Shift+Enter` inserts a newline, `Esc` closes the composer while preserving its draft, and pressing `Esc` twice within 500 milliseconds interrupts a running model turn. `:` opens the command panel, `Tab` completes matching commands, and `F1` shows the active keymap and command reference. The panel fuzzy-searches command names, aliases, and descriptions without cluttering the default list. Search text only filters commands; commands that need a value open a selector or a separate input float. `:new` switches directly to a fresh welcome view without restarting the terminal interface.
+See [Models and configuration](docs/configuration.md) for supported API families, authentication, offline mode, and custom endpoints.
 
 ## How protocols look
 
@@ -74,32 +74,18 @@ exec("bash://?wait=30", "cargo test")  # Unix-like systems
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-Non-Windows platforms enable only Bash. On Windows, PowerShell 7 or newer enables `pwsh` and suppresses `bash`; if it is unavailable, URI Agent shows a warning and keeps Bash enabled when Bash is installed.
+URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
 
-URI Agent splits an address only at the first `://`; the selected protocol owns the remaining target. The registry passes the optional JSON `body` through unchanged. See [Protocols, tasks, Skills, and extensions](docs/protocols.md) for the complete design and built-in protocol inventory.
+## Extensions
 
-Trusted WASM protocol plugins live as `.wasm` files in
-`<config>/wasm-plugins/`. The model can read `wasm_plugin://help`, clone and
-build a Rust plugin in a temporary directory, atomically place the result in
-that persistent directory, and call `wasm_plugin://reload` without restarting
-the process. URI Agent does not require a package manifest and does not own a
-Git package manager:
-
-```text
-read("wasm_plugin://help")
-exec("wasm_plugin://reload")
-```
-
-WASM is a stable distribution ABI here, not a security boundary. Enabled
-plugins receive WASI, HTTP, filesystem, and built-in protocol access with the
-same user authority as URI Agent. See [WASM plugins](docs/protocols.md#wasm-plugins)
-for the Rust SDK, reload behavior, and reliability limits.
+Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI here, not a security boundary: enabled plugins receive filesystem, HTTP, WASI, and built-in protocol access with the same user authority as URI Agent. See [WASM plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage, and reliability limits.
 
 ## Documentation
 
 The [`docs/` index](docs/README.md) organizes detailed documentation by task:
 
-- [Protocols, tasks, Skills, and extensions](docs/protocols.md) — model-facing contracts, built-ins, asynchronous execution, output preservation, Skill discovery, and plugin registration.
+- [Protocols, tasks, output, and Skills](docs/protocols.md) — model-facing routing, built-ins, asynchronous execution, output preservation, and Skill discovery.
+- [WASM plugins](docs/plugins.md) — installation, reload, trust boundaries, ABI, SDK, and runtime limits.
 - [Models and configuration](docs/configuration.md) — catalog behavior, authentication, settings precedence, CLI flags, thinking levels, and custom providers.
 - [Terminal interface and sessions](docs/interface.md) — composer and commands, keymaps, embedded terminal, image attachments, persistence, resume, and compaction.
 - [Architecture and development](docs/development.md) — module ownership, non-negotiable invariants, change rules, and verification.
@@ -108,16 +94,7 @@ At runtime, `<protocol>://help` is the authoritative reference for a protocol's 
 
 ## Development
 
-The project currently builds on stable Rust. Before submitting a code change, run:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo check
-```
-
-Read [`AGENTS.md`](AGENTS.md) before changing the repository and use the [development guide](docs/development.md) for detailed ownership and testing rules.
+The project builds on stable Rust. Read [`AGENTS.md`](AGENTS.md) before changing the repository; the [development guide](docs/development.md) defines module ownership, change rules, and required verification.
 
 ## License
 

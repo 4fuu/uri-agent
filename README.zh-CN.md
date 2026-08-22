@@ -11,12 +11,14 @@ URI Agent 是一个终端 coding agent，核心是固定且精简的模型接口
 > [!WARNING]
 > URI Agent 不提供沙箱。文件与 Shell 协议使用 `uri-agent` 进程本身的权限运行。请只使用可信的项目和配置。
 
+URI Agent 目前是从源码安装的 pre-1.0 项目。模型请求及其所需上下文会发送给你选择的 Provider；除非启用离线模式，URI Agent 还会从 pi.dev 获取模型目录元数据。
+
 ## 为什么使用 URI Agent
 
 - **稳定的工具面：**增加能力不会增加新的模型工具 schema。
 - **渐进式上下文：**只有模型读取协议或 Skill 帮助时，相应说明才进入上下文。
 - **可观察的执行过程：**异步工作的状态和最终输出都通过协议的读取路由提供。
-- **便携的可信扩展：**Extism WASM 模块可通过稳定的 Rust SDK 添加支持热重载的协议，并拥有与 URI Agent 相同的用户权限。
+- **便携的可信扩展：**Extism WASM 模块可以添加支持热重载的协议，而不改变模型工具面。
 - **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
 - **完整键盘操作的 TUI：**会话、输入、命令、模型选择、设置和终端集中在同一界面。
 
@@ -45,25 +47,23 @@ cargo install --path .
 
 ### 启动第一个会话
 
-启动 URI Agent，并指定允许它访问的项目目录：
+启动 URI Agent，并指定它应使用的项目目录：
 
 ```bash
 uri-agent --cwd /path/to/project
 ```
 
-如果项目根目录存在 `AGENTS.md`，URI Agent 会在每个新会话的系统提示词中包含其指令。恢复已有会话时，仍使用该会话创建时固化的副本。
-
-新会话还会扫描一次 `PATH`，并告知模型当前有哪些受支持的现代命令行工具。恢复已有会话时，仍使用最初固化的提示。
+`--cwd` 设置项目和默认工作目录，不是文件系统访问边界。如果项目包含 `AGENTS.md`，请在启动前检查它；新会话会包含其中的指令，并固化启动上下文。
 
 URI Agent 不会自动选择默认模型。在 TUI 中：
 
 1. 运行 `:login` 保存 API key 或完成受支持的 OAuth 登录。
 2. 运行 `:model` 并选择一个可运行模型。
-3. 按 `i`，输入请求，再按 `Enter` 发送。
+3. 按 `i`，输入一个小型只读请求，例如 `读取顶层文件并说明这个项目的用途，不要修改文件。`，再按 `Enter` 发送。
 
-配置完成后，欢迎界面会显示选中的 Provider、模型和思考强度，不再显示配置提示；随后提交的请求与响应会出现在会话中。
+当界面出现协议活动，并且 assistant 根据项目内容返回答案时，第一个会话就已正常工作。按 `F1` 或运行 `:help` 可查看当前生效的命令和快捷键。
 
-`Shift+Enter` 插入换行，`Esc` 关闭输入浮窗并保留草稿；在 500 毫秒内连续按两次 `Esc` 可中断正在运行的模型回合。`:` 打开命令面板，`Tab` 补全匹配的命令，`F1` 显示当前生效的快捷键与命令参考。面板会对命令名、别名和描述进行模糊搜索，同时保持默认列表简洁。搜索内容只用于筛选命令；需要设置值的命令会打开选择面板或独立输入浮窗。`:new` 会直接切换到新的欢迎界面，不会重启终端界面。
+受支持的 API 系列、认证、离线模式和自定义端点见英文文档 [Models and configuration](docs/configuration.md)。
 
 ## 协议示例
 
@@ -74,24 +74,18 @@ exec("bash://?wait=30", "cargo test")  # Unix-like 系统
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-非 Windows 平台只启用 Bash。在 Windows 上，PowerShell 7 或更高版本会启用 `pwsh` 并关闭 `bash`；如果 PowerShell 7 不可用，URI Agent 会显示警告，已安装的 Bash 仍会保持启用。
+URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
 
-URI Agent 只按第一个 `://` 分割地址；剩余 target 由选中的协议负责解释。注册表会原样传递可选 JSON `body`。完整设计和内置协议清单见英文文档 [Protocols, tasks, Skills, and extensions](docs/protocols.md)。
+## 扩展
 
-可信 WASM 协议插件以 `.wasm` 文件的形式存放在 `<config>/wasm-plugins/`。模型可以读取 `wasm_plugin://help`，在临时目录 clone 并构建 Rust 插件，把产物原子放入这个持久目录，再调用 `wasm_plugin://reload`，无需重启进程。URI Agent 不要求 package manifest，也不内置 Git package manager：
-
-```text
-read("wasm_plugin://help")
-exec("wasm_plugin://reload")
-```
-
-这里的 WASM 是稳定的分发 ABI，不是安全边界。启用的插件拥有 WASI、HTTP、文件系统和内置协议访问能力，其用户权限与 URI Agent 相同。Rust SDK、reload 行为和可靠性限制见英文文档 [WASM plugins](docs/protocols.md#wasm-plugins)。
+可信 WASM 模块可以添加运行时加载的协议。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
 
 ## 文档
 
 [`docs/` 索引](docs/README.md)按任务组织详细的英文文档：
 
-- [Protocols, tasks, Skills, and extensions](docs/protocols.md) — 模型接口约束、内置协议、异步执行、完整输出保留、Skill 发现与插件注册。
+- [Protocols, tasks, output, and Skills](docs/protocols.md) — 模型路由、内置协议、异步执行、完整输出保留与 Skill 发现。
+- [WASM plugins](docs/plugins.md) — 安装、reload、信任边界、ABI、SDK 与运行限制。
 - [Models and configuration](docs/configuration.md) — 模型目录、认证、配置优先级、CLI 参数、thinking 等级与自定义 Provider。
 - [Terminal interface and sessions](docs/interface.md) — 输入与命令、快捷键、内嵌终端、图片附件、持久化、会话恢复与上下文压缩。
 - [Architecture and development](docs/development.md) — 模块职责、不可变约束、修改规则与验证要求。
@@ -100,16 +94,7 @@ exec("wasm_plugin://reload")
 
 ## 开发
 
-项目使用 stable Rust。提交代码修改前运行：
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo check
-```
-
-修改仓库前请阅读 [`AGENTS.md`](AGENTS.md)；详细的模块职责和测试规则见[开发文档](docs/development.md)。
+项目使用 stable Rust。修改仓库前请阅读 [`AGENTS.md`](AGENTS.md)；模块职责、修改规则和必需的验证见[开发文档](docs/development.md)。
 
 ## 许可证
 

@@ -101,6 +101,8 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 
 Sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Terminal interface and sessions](interface.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
 
+The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings field. See [WASM plugins](plugins.md) for loading, installation, and reload behavior.
+
 ## Settings fields and precedence
 
 `settings.json` and project settings use camel-case JSON fields:
@@ -136,19 +138,6 @@ Relevant environment variables are:
 
 When the project settings file already exists, changes made through model selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
 
-### Persistent WASM plugins
-
-URI Agent creates `<config>/wasm-plugins/` with the rest of its persistent
-configuration. Every non-hidden regular `.wasm` file directly inside that
-directory is enabled; nested files and temporary files are ignored. The
-directory follows `URI_AGENT_CONFIG_DIR` when that environment variable
-overrides the platform configuration directory.
-
-There is no settings field, CLI path flag, package manifest, or package command.
-The model-facing `wasm_plugin://help` route publishes the actual directory and
-the build/install workflow. `wasm_plugin://reload` rebuilds and atomically swaps
-the dynamic protocol set. See [WASM plugins](protocols.md#wasm-plugins).
-
 ## Thinking effort
 
 Thinking defaults to `off`. Supported values are:
@@ -163,17 +152,7 @@ The active model determines which levels are available. Run `:effort` to open a 
 
 ## Command-line options
 
-```text
---provider <ID>          Select a provider
---model <ID>             Select one of that provider's models
---api-key <KEY>          Set a credential for this process only
---cwd <PATH>             Set the project and protocol working directory
---continue-session       Resume this project's latest session
---session <ID>           Resume a session ID; "latest" is also accepted
---thinking <LEVEL>       Set model reasoning effort
---output-limit <BYTES>   Set inline output size; minimum 1024
---offline                Disable pi.dev catalog requests
-```
+Command-line flags can override the provider, model, process-only API key, project working directory, thinking effort, inline output limit, and offline catalog behavior. They can also resume the latest project session or a project-scoped session ID. Run `uri-agent --help` for the exact names, accepted values, and current syntax.
 
 `--continue-session` and `--session` conflict. Session selection remains scoped to the canonical `--cwd`; see [Sessions and context](interface.md#sessions-and-context).
 

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for coding agents working anywhere in this repository.
+Guidance for coding agents working anywhere in this repository. This file is the entry point; detailed contracts belong to the linked documents.
 
 ## Project contract
 
@@ -11,65 +11,40 @@ read(uri, body?)
 exec(uri, body?)
 ```
 
-Capabilities are registered as protocols and publish their operational instructions at `<protocol>://help`. Preserve this design instead of adding model-facing tools or placing every capability in the initial system prompt.
+Capabilities are registered as protocols and publish their operational instructions at `<protocol>://help`. Preserve this design: do not add another model-facing tool or place every capability in the initial system prompt.
 
-## Read the relevant design first
+## Read before changing
 
-The detailed engineering reference is [`docs/development.md`](docs/development.md). Read the focused document before changing its area:
+Before changing code, read the applicable repository map, change rules, and verification guidance in [`docs/development.md`](docs/development.md). Then read every focused document that owns the affected behavior:
 
 | Area | Authoritative detail |
 | --- | --- |
-| Protocol routing, built-ins, tasks, output, Skills, plugins | [`docs/protocols.md`](docs/protocols.md) |
-| Models, authentication, configuration, CLI, custom providers | [`docs/configuration.md`](docs/configuration.md) |
+| Protocol routing, built-ins, tasks, output, Skills | [`docs/protocols.md`](docs/protocols.md) |
+| WASM installation, reload, ABI, permissions, SDK | [`docs/plugins.md`](docs/plugins.md) |
+| Models, authentication, configuration, CLI overrides, custom providers | [`docs/configuration.md`](docs/configuration.md) |
 | TUI, commands, keymaps, terminal, attachments, sessions, compaction | [`docs/interface.md`](docs/interface.md) |
-| Module ownership, invariants, change rules, verification | [`docs/development.md`](docs/development.md) |
+| Module ownership, linked Rust extensions, invariants, change rules, verification | [`docs/development.md`](docs/development.md) |
+| Documentation ownership or an unclear destination | [`docs/README.md`](docs/README.md) |
 
-Use [`docs/README.md`](docs/README.md) as the documentation index. Exact CLI behavior remains authoritative in `uri-agent --help`; exact protocol behavior remains authoritative in `<protocol>://help` and its implementation.
-
-## Non-negotiable invariants
-
-- The model sees exactly two tools: `read` and `exec`.
-- Split a protocol address only at the first `://`. Pass the opaque remainder and any JSON `body` to the selected protocol unchanged.
-- Protocol names are unique. A protocol may implement `read`, `exec`, or both.
-- Keep each built-in protocol's help in `src/prompts.rs` synchronized with its addresses, body shape, asynchronous behavior, result routes, limits, and examples.
-- Task acceptance is not completion. Results remain observable through the owning protocol's read route. Protocol-specific options stay protocol-specific; `?wait=N` belongs only to `bash` and `pwsh`, and timeout leaves the task running.
-- Keep file writes atomic, terminate shell child processes on cancellation, and preserve oversized output behind a readable `file://` address.
-- Enable only an available `bash` protocol on non-Windows platforms. On Windows, keep native-shell policy in the `pwsh` plugin: require PowerShell 7 or newer, warn and leave `pwsh` disabled when unavailable, and suppress `bash` when enabled.
-- Discover Skills once at startup, preserve first-wins protocol naming and containment, and freeze the generated prompt plus selected Skill metadata and canonical paths in every new session.
-- Load trusted WASM modules from top-level `.wasm` files in the persistent plugin directory. Keep `wasm_plugin` limited to `help` and atomic whole-set `reload`; keep guest SDK host calls out of dynamic WASM routing.
-- Resume only from frozen session context. Session events remain append-only; compaction adds checkpoints, keeps complete user turns, and never separates a tool call from its result.
-- Treat canonical `--cwd` as the project boundary for attachments and session resume.
-- Keep one keyboard-complete conversation surface. Route commands through `CommandRegistry`, configurable keys through the layered Rhai keymap, and extension UI through generic `PluginHost` registrations.
-- Preserve terminal restoration, mouse selection, and OSC52 copy on normal and error exits.
+Read all applicable documents for a cross-domain change; unrelated documents are not required. `uri-agent --help` defines the exact CLI contract, while `<protocol>://help` defines a protocol's exact model-facing contract. If implementation, tests, help, or documentation disagree, make them consistent.
 
 ## Working rules
 
-- Put behavior in the module that owns its state and contract; the repository map is in [`docs/development.md`](docs/development.md#repository-map).
-- Prefer changing the source of truth over adding wrappers, adapters, one-use helpers, or duplicated types.
+- Preserve the project contract and the architectural contracts in the applicable focused document.
+- Put behavior in the module that owns its state and contract; prefer changing the source of truth over adding a wrapper or duplicated type.
 - Make the smallest complete change. Leave unrelated refactors, formatting, and speculative configurability alone.
 - Follow references when removing behavior and remove code that exists only for that behavior.
-- Keep provider adapters thin and fake-backend tests independent of live keys or network access.
 - Do not commit credentials, generated sessions, complete-output files, `.uri-agent/`, `.amp/`, or `target/` artifacts.
 
-## Tests and verification
+## Verification
 
-Use stable Rust and add focused tests beside changed behavior. Shared protocol, task, session, compaction, or runtime changes need a normal-path test and the affected boundary-condition test. TUI changes must cover the affected surface and input path.
+Use stable Rust. Add focused tests beside changed behavior, then run the checks required by [`docs/development.md#verification`](docs/development.md#verification). Tests must not require live credentials or network access.
 
-Before completing a code change, run:
+For documentation-only changes, use the documentation verification path in that section; the full Rust suite is unnecessary unless code or documentation generation changed.
 
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo check
-```
-
-For documentation-only changes, verify links, examples, current names, defaults, precedence, and English/Chinese README parity. The full Rust suite is unnecessary unless code or documentation generation changed.
-
-## Documentation rules
+## Documentation changes
 
 - Keep `README.md` and `README.zh-CN.md` equivalent and focused on adoption, first success, critical warnings, and navigation.
-- Maintain detailed documents under `docs/` in English only. Follow the ownership map in [`docs/development.md`](docs/development.md#documentation-ownership) instead of duplicating mutable detail.
-- Update both root READMEs when public setup or top-level behavior changes. Update the owning detailed document for protocol, configuration, interface, session, or developer behavior.
-- Keep model-facing protocol operations in `<protocol>://help` rather than expanding the initial prompt or README.
-- Use `URI Agent` in prose and `uri-agent` for the binary, crate, commands, and filesystem names.
+- Update both root READMEs when public setup or top-level behavior changes.
+- Update the owning detailed document when domain behavior changes; do not copy mutable detail into other layers.
+- Update `<protocol>://help` whenever a protocol's model-facing operations change.
