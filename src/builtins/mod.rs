@@ -1,3 +1,4 @@
+mod agents;
 mod apply_patch;
 mod file;
 mod replace;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 
 pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
+    plugins.add(agents::AgentsPlugin::new(cwd));
     plugins.add(file::FileProtocol::new(cwd));
     plugins.add(replace::ReplaceProtocol::new(cwd));
     plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
@@ -106,7 +108,8 @@ mod tests {
     #[test]
     fn built_in_distribution_declares_file_replace_and_apply_patch_plugins() {
         let directory = tempfile::tempdir().unwrap();
-        let names = plugins(directory.path())
+        let plugins = plugins(directory.path());
+        let names = plugins
             .protocol_descriptors()
             .unwrap()
             .into_iter()
@@ -117,5 +120,6 @@ mod tests {
         assert!(names.iter().any(|name| name == "replace"));
         assert!(names.iter().any(|name| name == "apply_patch"));
         assert!(!names.iter().any(|name| name == "edit"));
+        assert!(plugins.system_prompt_fragments().unwrap().is_empty());
     }
 }

@@ -15,11 +15,14 @@ CLI + files + environment
           v
 built-in plugins + discovered Skills
           |
-          +----> protocol descriptors ----> generated system prompt
-          |                                      |
-          |                                      v
-          |                              frozen SessionContext
-          v                                      |
+          +----> protocol descriptors + prompt fragments
+          |                         |
+          |                         v
+          |                generated system prompt
+          |                         |
+          |                         v
+          |                 frozen SessionContext
+          v                         |
 protocol / command / TUI registries <------------+
           |
           v
@@ -41,8 +44,8 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/model.rs` | Rig provider adapters, model request compatibility, multimodal support, and the two tool schemas |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and built-in protocol help |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in file, exact replacement, Codex patch, Bash, and PowerShell plugins |
-| `src/plugin.rs` | Plugin declarations plus protocol, command, generic panel, and status registration |
+| `src/builtins/` | Built-in project-instruction, file, exact replacement, Codex patch, Bash, and PowerShell plugins |
+| `src/plugin.rs` | Plugin declarations, system prompt fragments, and protocol, command, generic panel, and status registration |
 | `src/task.rs` | In-process task lifecycle, waiting, cancellation, records, and notices |
 | `src/output.rs` | Inline output limits, previews, and complete-output persistence |
 | `src/skill.rs` | Skill discovery, frontmatter, protocol naming, snapshots, and resource containment |
@@ -66,6 +69,7 @@ Put behavior in the module that owns the corresponding state and contract. Befor
 - Protocol names are unique. A protocol may implement `read`, `exec`, or both.
 - Each protocol documents its operational contract at `<protocol>://help`. Keep [built-in help](../src/prompts.rs) synchronized with behavior, including valid addresses, body shapes, asynchronous behavior, result routes, limits, and an example.
 - Prefer extending `Protocol` over adding another model-facing concept or embedding every capability in the initial prompt.
+- Reserve plugin system prompt fragments for context the model must receive before its first tool call. Prompt-only plugins do not need to register a protocol.
 
 The detailed protocol behavior is in [Protocols, tasks, Skills, and extensions](protocols.md).
 
@@ -84,6 +88,7 @@ The detailed protocol behavior is in [Protocols, tasks, Skills, and extensions](
 - Discover Skills once at startup from the documented project and user roots. Never compile or copy a machine-specific discovered Skill list into the product.
 - Normalize each accepted Skill to `<name>-skill`, keep first-wins precedence, and skip protocol collisions with a clear notice.
 - Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
+- Append plugin system prompt fragments after the generated protocol list, preserving plugin registration order.
 - Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
 - Resume from the frozen snapshot. Never synthesize current prompt or Skill state for an old session, and never rebind a same-named Skill at another path.
 - A missing frozen Skill file fails explicitly. A resumed session without frozen context is invalid.

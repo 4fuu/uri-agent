@@ -50,6 +50,8 @@ Launch URI Agent with the project directory it may access:
 uri-agent --cwd /path/to/project
 ```
 
+If the project root contains `AGENTS.md`, URI Agent includes its instructions in the system prompt for each new session. Resumed sessions keep the copy frozen when they were created.
+
 URI Agent does not choose a default model. In the TUI:
 
 1. Run `:login` to save an API key or complete a supported OAuth flow.

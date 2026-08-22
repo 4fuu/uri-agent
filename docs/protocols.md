@@ -103,6 +103,20 @@ Commands run from the startup working directory. Bash starts without profile or 
 
 PowerShell source and plain-text output use UTF-8. Its task status follows the final PowerShell or native command, including the native command's exact exit code.
 
+## Built-in project instructions
+
+A prompt-only built-in plugin reads `AGENTS.md` from the canonical project directory when the file exists. It appends the file's content to the bottom of a new session's system prompt in this form:
+
+```text
+<project_rule_md>
+The following content is from the project's AGENTS.md. Follow these instructions.
+
+<AGENTS.md content>
+</project_rule_md>
+```
+
+This plugin does not register a protocol, command, panel, or status provider. A missing `AGENTS.md` contributes no prompt content; other read failures stop session startup with an error. Because the complete prompt is frozen, later changes to `AGENTS.md` apply only to new sessions.
+
 ## Managed tasks
 
 Execution is asynchronous by default. An accepted request normally returns before the operation is complete:
@@ -184,13 +198,13 @@ Resume reuses this snapshot instead of rediscovering current context. A same-nam
 
 First-party capabilities use the same plugin path exposed to linked Rust extensions:
 
-1. A [`Plugin`](../src/plugin.rs) declares protocol descriptors before a new session's prompt is frozen.
-2. `PluginRegistry` validates descriptor names and rejects duplicates.
-3. The plugin installs protocols, commands, panel providers, or status providers through `PluginHost`.
+1. A [`Plugin`](../src/plugin.rs) may declare protocol descriptors and contribute an optional system prompt fragment before a new session's prompt is frozen.
+2. `PluginRegistry` validates descriptor names, rejects duplicates, and appends prompt fragments in plugin registration order after the protocol list.
+3. The plugin installs protocols, commands, panel providers, or status providers through `PluginHost`; a prompt-only plugin may perform no runtime registration.
 4. Registered protocols remain behind `read` and `exec`; registered commands join the searchable command panel and key-bindable command registry.
 
 TUI extensions return generic documents and semantic status items. Status providers run while frames are drawn, so they must be fast and non-blocking. They receive `TuiStatusContext`, whose `expanded` flag allows concise footer content and richer content in the status panel.
 
 URI Agent does not currently load native dynamic libraries. Third-party Rust extensions must be linked during application assembly.
 
-Keep plugin-specific behavior inside registered protocols, commands, or panel providers. Generic rendering belongs in the TUI; extension-specific branches do not.
+Keep operational plugin behavior inside registered protocols, commands, or panel providers. Use prompt fragments only for startup context that must be available before a tool call. Generic rendering belongs in the TUI; extension-specific branches do not.

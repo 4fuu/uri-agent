@@ -414,6 +414,12 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Optional content appended to a new session's system prompt before it is
+    /// frozen. A plugin may contribute prompt content without adding a protocol.
+    fn system_prompt_fragment(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
 }
 
@@ -448,6 +454,16 @@ impl PluginRegistry {
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(descriptors)
+    }
+
+    pub fn system_prompt_fragments(&self) -> Result<Vec<String>> {
+        let mut fragments = Vec::new();
+        for plugin in &self.plugins {
+            if let Some(fragment) = plugin.system_prompt_fragment()? {
+                fragments.push(fragment);
+            }
+        }
+        Ok(fragments)
     }
 
     pub fn install(&self, host: &mut PluginHost<'_>) -> Result<()> {
@@ -646,6 +662,18 @@ mod tests {
         declares_protocol: bool,
     }
 
+    struct PromptOnlyPlugin;
+
+    impl Plugin for PromptOnlyPlugin {
+        fn system_prompt_fragment(&self) -> Result<Option<String>> {
+            Ok(Some("<prompt-only>content</prompt-only>".to_string()))
+        }
+
+        fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl Protocol for DeclaredProtocolPlugin {
         fn descriptor(&self) -> ProtocolDescriptor {
@@ -681,6 +709,18 @@ mod tests {
             TuiRegistry::default(),
             directory,
         )
+    }
+
+    #[test]
+    fn plugins_can_contribute_system_prompt_content_without_protocols() {
+        let mut plugins = PluginRegistry::new();
+        plugins.add(PromptOnlyPlugin);
+
+        assert!(plugins.protocol_descriptors().unwrap().is_empty());
+        assert_eq!(
+            plugins.system_prompt_fragments().unwrap(),
+            vec!["<prompt-only>content</prompt-only>".to_string()]
+        );
     }
 
     #[tokio::test]

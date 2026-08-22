@@ -31,6 +31,7 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
     let initial = config.manager.current().await;
     let plugins = uri_agent::builtins::plugins(&config.cwd);
     let plugin_protocols = plugins.protocol_descriptors()?;
+    let plugin_prompt_fragments = plugins.system_prompt_fragments()?;
     let mut protocol_names = plugin_protocols
         .iter()
         .map(|descriptor| descriptor.name.clone())
@@ -63,7 +64,10 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
     }
     prompt_protocols.sort_by(|left, right| left.name.cmp(&right.name));
     let candidate_context = SessionContext {
-        system_prompt: uri_agent::prompts::system_prompt(&prompt_protocols),
+        system_prompt: uri_agent::prompts::system_prompt(
+            &prompt_protocols,
+            &plugin_prompt_fragments,
+        ),
         skills: skill_snapshots,
     };
     let requested = match &config.session {

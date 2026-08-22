@@ -12,7 +12,7 @@ pub struct ProtocolPrompt {
     pub description: String,
 }
 
-pub fn system_prompt(protocols: &[ProtocolPrompt]) -> String {
+pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> String {
     let mut prompt = String::from(
         "You are a general-purpose agent.\n\
          You have exactly two tools: read and exec.\n\
@@ -26,6 +26,14 @@ pub fn system_prompt(protocols: &[ProtocolPrompt]) -> String {
 
     for protocol in protocols {
         let _ = writeln!(prompt, "- {}: {}", protocol.name, protocol.description);
+    }
+
+    for fragment in fragments {
+        prompt.push('\n');
+        prompt.push_str(fragment);
+        if !fragment.ends_with('\n') {
+            prompt.push('\n');
+        }
     }
 
     prompt
@@ -189,13 +197,32 @@ mod tests {
 
     #[test]
     fn system_prompt_has_no_working_directory_or_repeated_help_addresses() {
-        let prompt = system_prompt(&[ProtocolPrompt {
-            name: "file".to_string(),
-            description: "Read files.".to_string(),
-        }]);
+        let prompt = system_prompt(
+            &[ProtocolPrompt {
+                name: "file".to_string(),
+                description: "Read files.".to_string(),
+            }],
+            &[],
+        );
         assert!(prompt.starts_with("You are a general-purpose agent."));
         assert!(prompt.contains("Before using a protocol for the first time"));
         assert!(prompt.contains("- file: Read files."));
         assert!(!prompt.contains("file://help"));
+    }
+
+    #[test]
+    fn system_prompt_appends_plugin_fragments_after_protocols() {
+        let prompt = system_prompt(
+            &[ProtocolPrompt {
+                name: "file".to_string(),
+                description: "Read files.".to_string(),
+            }],
+            &["<project_rule_md>rules</project_rule_md>".to_string()],
+        );
+
+        assert!(prompt.ends_with("\n<project_rule_md>rules</project_rule_md>\n"));
+        assert!(
+            prompt.find("- file: Read files.").unwrap() < prompt.find("<project_rule_md>").unwrap()
+        );
     }
 }
