@@ -16,6 +16,7 @@ map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");
 map("global", "ctrl+shift+c", "copy");
 map("global", "super+c", "copy");
+map("global", "esc", "interrupt_on_double_press");
 
 map("main", "i", "compose");
 map("main", ":", "command");
@@ -353,6 +354,10 @@ mod tests {
         );
         assert_eq!(keymap.action("global", "f3").as_deref(), Some("model"));
         assert_eq!(keymap.action("global", "f4").as_deref(), Some("status"));
+        assert_eq!(
+            keymap.action("global", "esc").as_deref(),
+            Some("interrupt_on_double_press")
+        );
         assert_eq!(keymap.action("models", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("selector", "k"), None);

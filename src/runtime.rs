@@ -18,10 +18,26 @@ use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
 const MAX_TOOL_ROUNDS: usize = 32;
-const TURN_INTERRUPTED: &str = "turn interrupted by shutdown";
+const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
+const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
+
+#[derive(Clone, Copy)]
+enum TurnCancellation {
+    User,
+    Shutdown,
+}
+
+impl TurnCancellation {
+    fn message(self) -> &'static str {
+        match self {
+            Self::User => TURN_INTERRUPTED_BY_USER,
+            Self::Shutdown => TURN_INTERRUPTED_BY_SHUTDOWN,
+        }
+    }
+}
 
 struct ActiveTurn {
-    cancel: watch::Sender<bool>,
+    cancel: watch::Sender<Option<TurnCancellation>>,
     handle: JoinHandle<()>,
 }
 
@@ -111,7 +127,7 @@ impl AgentRuntime {
             .await
             .clone()
             .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
-        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let (_cancel_tx, mut cancel) = watch::channel(None);
         if !self
             .compact_with(backend.as_ref(), true, true, &mut cancel)
             .await?
@@ -132,7 +148,7 @@ impl AgentRuntime {
             }
             let _ = previous.handle.await;
         }
-        let (cancel, receiver) = watch::channel(false);
+        let (cancel, receiver) = watch::channel(None);
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             let _ = runtime.run_turn_with_cancel(prompt, receiver).await;
@@ -141,25 +157,38 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Request cancellation of the active turn without blocking the caller
+    /// while its interrupted terminal boundary is persisted.
+    pub async fn interrupt_turn(&self) -> bool {
+        let active = self.active_turn.lock().await;
+        let Some(active) = active
+            .as_ref()
+            .filter(|active| !active.handle.is_finished())
+        else {
+            return false;
+        };
+        active.cancel.send(Some(TurnCancellation::User)).is_ok()
+    }
+
     /// Cancel the active request/tool operation, then wait until the worker has
     /// durably recorded its interrupted terminal boundary.
     pub async fn shutdown(&self) {
         let Some(active) = self.active_turn.lock().await.take() else {
             return;
         };
-        let _ = active.cancel.send(true);
+        let _ = active.cancel.send(Some(TurnCancellation::Shutdown));
         let _ = active.handle.await;
     }
 
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
-        let (_cancel_tx, cancel) = watch::channel(false);
+        let (_cancel_tx, cancel) = watch::channel(None);
         self.run_turn_with_cancel(prompt, cancel).await
     }
 
     async fn run_turn_with_cancel(
         &self,
         prompt: String,
-        mut cancel: watch::Receiver<bool>,
+        mut cancel: watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<()> {
         let _turn = self.turn.lock().await;
         let prompt = prompt.trim();
@@ -231,7 +260,7 @@ impl AgentRuntime {
     async fn run_tool_loop(
         &self,
         backend: Arc<dyn ModelBackend>,
-        cancel: &mut watch::Receiver<bool>,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<()> {
         let mut overflow_retried = false;
         for _ in 0..MAX_TOOL_ROUNDS {
@@ -291,7 +320,7 @@ impl AgentRuntime {
         backend: &dyn ModelBackend,
         force: bool,
         manual: bool,
-        cancel: &mut watch::Receiver<bool>,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<bool> {
         let history = self.session.model_history().await;
         let context_window = self.limits.read().await.context_window.max(1);
@@ -322,8 +351,10 @@ impl AgentRuntime {
         let response = tokio::select! {
             response = &mut completion => response.context("context compaction model request failed")?,
             changed = cancel.changed() => {
-                if changed.is_ok() && *cancel.borrow() {
-                    bail!(TURN_INTERRUPTED)
+                if changed.is_ok()
+                    && let Some(cancellation) = *cancel.borrow()
+                {
+                    bail!(cancellation.message())
                 }
                 completion.await.context("context compaction model request failed")?
             }
@@ -383,7 +414,7 @@ impl AgentRuntime {
     async fn complete_once(
         &self,
         backend: &dyn ModelBackend,
-        cancel: &mut watch::Receiver<bool>,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<ModelResponse> {
         let history = self.session.model_history().await;
         self.estimated_tokens.store(
@@ -412,8 +443,10 @@ impl AgentRuntime {
                     }
                 }
                 changed = cancel.changed() => {
-                    if changed.is_ok() && *cancel.borrow() {
-                        bail!(TURN_INTERRUPTED)
+                    if changed.is_ok()
+                        && let Some(cancellation) = *cancel.borrow()
+                    {
+                        bail!(cancellation.message())
                     }
                 }
             }
@@ -427,7 +460,11 @@ impl AgentRuntime {
         });
     }
 
-    async fn execute_tool(&self, call: ToolCall, cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    async fn execute_tool(
+        &self,
+        call: ToolCall,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
+    ) -> Result<()> {
         let name = call.function.name.clone();
         let call_id = call.id.to_string();
         let dispatch = self.dispatch(&name, &call.function.arguments);
@@ -435,8 +472,10 @@ impl AgentRuntime {
         let result = tokio::select! {
             result = &mut dispatch => result,
             changed = cancel.changed() => {
-                if changed.is_ok() && *cancel.borrow() {
-                    bail!(TURN_INTERRUPTED)
+                if changed.is_ok()
+                    && let Some(cancellation) = *cancel.borrow()
+                {
+                    bail!(cancellation.message())
                 }
                 dispatch.await
             }
@@ -1415,6 +1454,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_interrupt_cancels_and_durably_settles_a_running_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime.start_turn("long request".into()).await.unwrap();
+        backend.started.notified().await;
+
+        assert!(runtime.interrupt_turn().await);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while runtime.turn_running().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user interruption should cancel the model request promptly");
+        assert!(!runtime.interrupt_turn().await);
+
+        let events = session.snapshot().await;
+        assert!(matches!(
+            events.last().map(|event| &event.kind),
+            Some(EventKind::TurnFinished)
+        ));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Error { text } if text == TURN_INTERRUPTED_BY_USER
+        )));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
     async fn shutdown_cancels_and_durably_settles_a_running_turn() {
         let workspace = tempfile::tempdir().unwrap();
         let backend = Arc::new(BlockingBackend {
@@ -1437,7 +1511,7 @@ mod tests {
         ));
         assert!(events.iter().any(|event| matches!(
             &event.kind,
-            EventKind::Error { text } if text == TURN_INTERRUPTED
+            EventKind::Error { text } if text == TURN_INTERRUPTED_BY_SHUTDOWN
         )));
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

@@ -166,6 +166,7 @@ enum Activity {
     Writing,
     Tool(String),
     Compacting,
+    Interrupting,
 }
 
 impl Activity {
@@ -176,6 +177,7 @@ impl Activity {
             Self::Writing => "writing".to_string(),
             Self::Tool(protocol) => format!("running {protocol}"),
             Self::Compacting => "compacting".to_string(),
+            Self::Interrupting => "interrupting".to_string(),
         }
     }
 }
@@ -430,6 +432,7 @@ struct App {
     usage: UsageTotals,
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
+    last_interrupt_press: Option<(String, Instant)>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
     tui_document: Option<TuiDocument>,
@@ -500,6 +503,7 @@ impl App {
             usage: UsageTotals::default(),
             last_cache_hit: None,
             branch: None,
+            last_interrupt_press: None,
             commands,
             tui,
             tui_document: None,
@@ -516,6 +520,29 @@ impl App {
 
     fn animations_paused(&self) -> bool {
         self.overlay == Some(Overlay::Composer)
+    }
+
+    fn interrupt_on_double_press(&mut self, key: KeyEvent, key_name: &str) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if !self.busy
+            || matches!(self.activity, Some(Activity::Compacting))
+            || self.keymap.action("global", key_name).as_deref()
+                != Some("interrupt_on_double_press")
+        {
+            self.last_interrupt_press = None;
+            return false;
+        }
+        let now = Instant::now();
+        let repeated = self
+            .last_interrupt_press
+            .as_ref()
+            .is_some_and(|(previous, at)| {
+                previous == key_name && now.duration_since(*at) < DOUBLE_CLICK_INTERVAL
+            });
+        self.last_interrupt_press = (!repeated).then_some((key_name.to_string(), now));
+        repeated
     }
 
     fn apply(&mut self, event: SessionEvent) {
@@ -1113,7 +1140,7 @@ impl App {
                             .is_some_and(|tool| tool.output.is_none()))
                     .then_some(index)
                 }),
-            Some(Activity::Compacting) | None => None,
+            Some(Activity::Compacting | Activity::Interrupting) | None => None,
         }
     }
 
@@ -1486,6 +1513,7 @@ enum Action {
     Continue,
     Quit,
     Submit(String),
+    InterruptTurn,
     Compact,
     OpenModels(String),
     SelectModel,
@@ -1535,6 +1563,12 @@ async fn apply_action(
                 app.busy_since = None;
                 app.activity = None;
                 app.set_flash(format!("Cannot start turn: {error:#}"));
+            }
+            Ok(None)
+        }
+        Action::InterruptTurn => {
+            if services.runtime.interrupt_turn().await {
+                app.activity = Some(Activity::Interrupting);
             }
             Ok(None)
         }
@@ -1758,6 +1792,9 @@ fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
 
 async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Action {
     let key_name = key_name(key);
+    if app.interrupt_on_double_press(key, &key_name) {
+        return Action::InterruptTurn;
+    }
     if app.selection.is_some() {
         match app.keymap.action("selection", &key_name).as_deref() {
             Some("copy") => copy_current_surface(app),
@@ -8103,6 +8140,29 @@ mod tests {
             key_name(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER)),
             "super+c"
         );
+    }
+
+    #[test]
+    fn double_escape_gesture_requires_two_press_events_during_a_running_turn() {
+        let mut app = test_app();
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        assert!(keymap_help(&app.keymap).contains("interrupt on double press"));
+        assert!(!app.interrupt_on_double_press(escape, "esc"));
+        app.busy = true;
+        assert!(!app.interrupt_on_double_press(escape, "esc"));
+        assert!(!app.interrupt_on_double_press(repeat, "esc"));
+        assert!(app.interrupt_on_double_press(escape, "esc"));
+        assert!(!app.interrupt_on_double_press(escape, "esc"));
+
+        let unrelated = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!app.interrupt_on_double_press(unrelated, "x"));
+        assert!(!app.interrupt_on_double_press(escape, "esc"));
+        app.last_interrupt_press =
+            Some(("esc".to_string(), Instant::now() - DOUBLE_CLICK_INTERVAL));
+        assert!(!app.interrupt_on_double_press(escape, "esc"));
     }
 
     #[test]
