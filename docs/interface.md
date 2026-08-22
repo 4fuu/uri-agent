@@ -39,7 +39,7 @@ Core commands are registered through `CommandRegistry`:
 | `:settings` | Inspect and edit active settings |
 | `:login`, `:logout` | Manage provider credentials |
 | `:resume`, `:new` | Switch project sessions or create one |
-| `:compact` | Request a context checkpoint |
+| `:compact` | Request a context checkpoint after usage exceeds 20% |
 | `:set-terminal`, `:terminal` | Configure and open the embedded terminal |
 | `:help` | Show the active commands and keymap |
 | `:quit` or `:q` | Exit URI Agent |
@@ -154,6 +154,12 @@ frozen system prompt
 + events after the checkpoint
 ```
 
+Summary generation uses a dedicated compaction system prompt and does not
+expose registered tools. Normal execution resumes with the session's frozen
+system prompt unchanged.
+
 Compaction boundaries are complete user turns. A tool call is never separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
 
-Run `:compact` to request an earlier checkpoint. The command fails clearly when there is not enough completed history to summarize.
+Run `:compact` to request an earlier checkpoint once estimated context usage is
+strictly above 20%. The command also fails clearly when there is not enough
+completed history to summarize.

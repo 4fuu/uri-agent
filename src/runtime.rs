@@ -82,6 +82,12 @@ impl AgentRuntime {
 
     pub async fn compact(&self) -> Result<()> {
         let _turn = self.turn.lock().await;
+        let history = self.session.model_history().await;
+        let context_window = self.limits.read().await.context_window.max(1);
+        let context_tokens = compaction::estimate_tokens(&self.system_prompt, &history);
+        if !compaction::manual_compaction_allowed(context_tokens, context_window) {
+            bail!("manual compaction requires context usage above 20%")
+        }
         let backend = self
             .backend
             .read()
@@ -195,10 +201,7 @@ impl AgentRuntime {
             return Ok(false);
         };
         let request = ModelRequest {
-            system: format!(
-                "{}\n\nYou are producing a context checkpoint. Follow the final checkpoint request and return only its summary.",
-                self.system_prompt
-            ),
+            system: compaction::SUMMARY_SYSTEM_PROMPT.to_string(),
             history: compaction::summary_history(&preparation),
             tools: false,
         };
@@ -840,7 +843,10 @@ mod tests {
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
             session.clone(),
             "frozen system".to_string(),
-            ModelLimits::default(),
+            ModelLimits {
+                context_window: 64,
+                ..ModelLimits::default()
+            },
         );
 
         runtime.compact().await.unwrap();
@@ -865,7 +871,74 @@ mod tests {
                 .unwrap()
                 .contains("first task")
         );
-        assert!(!backend.requests.lock().await[0].tools);
+        let requests = backend.requests.lock().await;
+        assert_eq!(requests[0].system, compaction::SUMMARY_SYSTEM_PROMPT);
+        assert!(!requests[0].system.contains("frozen system"));
+        assert!(!requests[0].tools);
+
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_rejects_context_at_or_below_twenty_percent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        for message in [
+            Message::user("first task"),
+            Message::assistant("first answer"),
+            Message::user("current task"),
+            Message::assistant("current answer"),
+        ] {
+            session
+                .append(EventKind::ModelMessage { message })
+                .await
+                .unwrap();
+        }
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = AgentRuntime::new(
+            Some(backend.clone()),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits {
+                context_window: 128_000,
+                ..ModelLimits::default()
+            },
+        );
+
+        let error = runtime.compact().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "manual compaction requires context usage above 20%"
+        );
+        assert!(backend.requests.lock().await.is_empty());
+        assert!(
+            !session
+                .snapshot()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::Compaction { .. }))
+        );
 
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
@@ -921,7 +994,9 @@ mod tests {
 
         let requests = backend.requests.lock().await;
         assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system, compaction::SUMMARY_SYSTEM_PROMPT);
         assert!(!requests[0].tools);
+        assert_eq!(requests[1].system, "frozen system");
         assert!(requests[1].tools);
         assert!(
             session
