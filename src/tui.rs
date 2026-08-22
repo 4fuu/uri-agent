@@ -4245,13 +4245,6 @@ fn context_color(percent: f64) -> Color {
     }
 }
 
-fn status_key(app: &App) -> String {
-    app.keymap
-        .key_for("global", "status")
-        .unwrap_or_else(|| ":status".to_string())
-        .to_ascii_uppercase()
-}
-
 fn plugin_status_items(app: &App, expanded: bool) -> Vec<TuiStatusItem> {
     app.tui.status_items(&TuiStatusContext {
         cwd: app.info.cwd.clone(),
@@ -4964,7 +4957,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
             );
             frame.render_widget(
                 Paragraph::new(text)
-                    .block(block.title(" HELP · Esc close "))
+                    .block(block.title(" HELP "))
                     .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,
@@ -5002,7 +4995,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         Overlay::Plugin => {
             let document = app.tui_document.as_ref();
             let title = document
-                .map(|document| format!(" {} · Esc close ", document.title))
+                .map(|document| format!(" {} ", document.title))
                 .unwrap_or_else(|| " PLUGIN PANEL ".to_string());
             let body = document
                 .map(|document| document.body.as_str())
@@ -5019,7 +5012,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
             let (title, body) = app
                 .document
                 .as_ref()
-                .map(|(title, body)| (format!(" {title} · Esc close "), body.as_str()))
+                .map(|(title, body)| (format!(" {title} "), body.as_str()))
                 .unwrap_or((" DOCUMENT ".to_string(), "Nothing to show."));
             frame.render_widget(
                 Paragraph::new(body)
@@ -5079,7 +5072,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
             }
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(format!(" OAUTH · {} · Esc cancel ", oauth.provider)))
+                    .block(block.title(format!(" OAUTH · {} ", oauth.provider)))
                     .wrap(Wrap { trim: false }),
                 area,
             );
@@ -5215,7 +5208,7 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block.title(format!(" STATUS · {} toggle · Esc close ", status_key(app))))
+            .block(block.title(" STATUS "))
             .wrap(Wrap { trim: false })
             .scroll((app.overlay_scroll, 0)),
         area,
@@ -5238,10 +5231,7 @@ fn status_row(
 
 fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    frame.render_widget(
-        block.title(" COMMAND · type to filter · Tab complete · Enter run · Esc close "),
-        area,
-    );
+    frame.render_widget(block.title(" COMMAND · Tab complete "), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
@@ -5293,18 +5283,7 @@ fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
     let Some(selector) = app.selector.as_ref() else {
         return;
     };
-    let instructions = if matches!(&selector.kind, SelectorKind::Search) {
-        "click or Enter jump"
-    } else {
-        "Enter choose"
-    };
-    frame.render_widget(
-        block.title(format!(
-            " {} · type to filter · {instructions} · Esc close ",
-            selector.title,
-        )),
-        area,
-    );
+    frame.render_widget(block.title(format!(" {} ", selector.title)), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
@@ -5357,10 +5336,7 @@ fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
 
 fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    frame.render_widget(
-        block.title(" MODELS · type to search · Enter use · Ctrl+R refresh "),
-        area,
-    );
+    frame.render_widget(block.title(" MODELS · Ctrl+R refresh "), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -5519,7 +5495,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block.title(" SETTINGS · s save · Esc close "))
+            .block(block.title(" SETTINGS · s save "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -5547,7 +5523,7 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
         return;
     }
     let inner = block.inner(area);
-    frame.render_widget(block.title(" TASKS · ↑/↓ select · x cancel "), area);
+    frame.render_widget(block.title(" TASKS · x cancel "), area);
     let items = app.task_records.iter().enumerate().map(|(index, task)| {
         ListItem::new(format!(
             "{} {:9} {}",
@@ -5594,9 +5570,9 @@ fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, im
         ),
     };
     let footer = if image_count == 0 {
-        " Enter send · Shift+Enter newline · Esc keep draft "
+        " Enter send · Shift+Enter newline "
     } else {
-        " Enter send · Alt+Backspace remove latest image · Esc keep draft "
+        " Enter send · Alt+Backspace remove latest image "
     };
     input.set_block(
         Block::default()
@@ -6858,7 +6834,9 @@ mod tests {
 
         app.overlay = Some(Overlay::Status);
         let rendered = render_to_string(&mut app, 100, 24);
-        assert!(rendered.contains("STATUS · F4 toggle"));
+        assert!(rendered.contains("STATUS"));
+        assert!(!rendered.contains("toggle"));
+        assert!(!rendered.contains("Esc close"));
         assert!(rendered.contains("test / model · effort off"));
         assert!(rendered.contains("26k / 262k · 10.0%"));
         assert!(rendered.contains("read 500 · write 0 · last hit 25.0%"));
@@ -7718,7 +7696,8 @@ mod tests {
         assert!(rows[16].contains("MESSAGE"));
         assert!(rows[17].contains("Ask URI Agent to build, explain, or fix…"));
         assert!(rows[23].starts_with("  ╰"));
-        assert!(rows[23].contains("Enter send · Shift+Enter newline · Esc keep draft"));
+        assert!(rows[23].contains("Enter send · Shift+Enter newline"));
+        assert!(!rows[23].contains("Esc keep draft"));
         assert!(rows[23].ends_with("╯  "));
     }
 
@@ -8366,9 +8345,10 @@ mod tests {
         assert!(app.matching_commands().is_empty());
         app.command_query.truncate("effort".len());
         let rendered = render_to_string(&mut app, 100, 32);
-        assert!(
-            rendered.contains("COMMAND · type to filter · Tab complete · Enter run · Esc close")
-        );
+        assert!(rendered.contains("COMMAND · Tab complete"));
+        assert!(!rendered.contains("type to filter"));
+        assert!(!rendered.contains("Enter run"));
+        assert!(!rendered.contains("Esc close"));
         assert!(rendered.contains("⌕ effort█"));
         assert!(rendered.contains(":effort"));
         assert!(!rendered.contains(":terminal"));
@@ -8470,9 +8450,7 @@ mod tests {
         assert_eq!(app.command_selected, 0);
 
         let rendered = render_to_string(&mut app, 100, 32);
-        assert!(
-            rendered.contains("COMMAND · type to filter · Tab complete · Enter run · Esc close")
-        );
+        assert!(rendered.contains("COMMAND · Tab complete"));
         assert!(rendered.contains("⌕ t█"));
         assert!(rendered.contains(":thinking"));
     }
@@ -8605,7 +8583,10 @@ mod tests {
             Some("Needle in the later conversation text")
         );
         let rendered = render_to_string(&mut app, 100, 32);
-        assert!(rendered.contains("SEARCH · type to filter · click or Enter jump · Esc close"));
+        assert!(rendered.contains("SEARCH"));
+        assert!(!rendered.contains("type to filter"));
+        assert!(!rendered.contains("Enter jump"));
+        assert!(!rendered.contains("Esc close"));
         assert!(rendered.contains("Needle in the later conversation text"));
 
         assert!(app.selector.as_mut().unwrap().select_from_click(0, false));
