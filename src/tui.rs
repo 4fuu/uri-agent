@@ -46,7 +46,7 @@ use tui_term::widget::PseudoTerminal;
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const BG: Color = Color::Rgb(13, 15, 18);
+const BG: Color = Color::Reset;
 const SURFACE: Color = Color::Rgb(21, 24, 28);
 const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
 const USER_SURFACE: Color = Color::Rgb(17, 25, 24);
@@ -4851,7 +4851,7 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
             ),
             Span::styled(item.spec.description.clone(), Style::default().fg(MUTED)),
         ]))
-        .style(Style::default().bg(if selected { BG } else { SURFACE }))
+        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
     });
     let mut state = ListState::default().with_selected(Some(app.command_selected));
     frame.render_stateful_widget(List::new(items), sections[1], &mut state);
@@ -4913,7 +4913,11 @@ fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
                     ),
                     Span::styled(item.description.clone(), Style::default().fg(MUTED)),
                 ]))
-                .style(Style::default().bg(if selected { BG } else { SURFACE })),
+                .style(Style::default().bg(if selected {
+                    ROW_ACTIVE
+                } else {
+                    SURFACE
+                })),
             )
         });
     let mut state = ListState::default().with_selected(Some(selector.selected));
@@ -5013,7 +5017,7 @@ fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<
                 Style::default().fg(MUTED),
             ),
         ]))
-        .style(Style::default().bg(if selected { BG } else { SURFACE }))
+        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
     });
     let mut state = ListState::default().with_selected(Some(selector.selected_position()));
     frame.render_stateful_widget(List::new(items), sections[1], &mut state);
@@ -5184,7 +5188,7 @@ fn style_input(input: &mut TextArea<'static>, busy: bool) {
     input.set_placeholder_style(Style::default().fg(MUTED).bg(SURFACE));
     input.set_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
-    input.set_cursor_style(Style::default().fg(BG).bg(border));
+    input.set_cursor_style(Style::default().fg(SURFACE).bg(border));
 }
 
 fn composer_cursor_position(
@@ -6239,7 +6243,10 @@ mod tests {
             .iter()
             .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
             .unwrap();
-        assert_eq!(terminal.backend().buffer()[(10, assistant_row)].bg, BG);
+        assert_eq!(
+            terminal.backend().buffer()[(10, assistant_row)].bg,
+            Color::Reset
+        );
         let reasoning_row = app
             .hit_regions
             .iter()
@@ -6254,7 +6261,10 @@ mod tests {
 
         app.selected_block = 1;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(10, assistant_row)].bg, BG);
+        assert_eq!(
+            terminal.backend().buffer()[(10, assistant_row)].bg,
+            Color::Reset
+        );
         app.selected_block = 2;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(
@@ -6293,7 +6303,11 @@ mod tests {
         for (row, symbol) in [(user_row, "U"), (assistant_row, "A")] {
             assert_eq!(terminal.backend().buffer()[(1, row)].symbol(), symbol);
             assert_eq!(terminal.backend().buffer()[(38, row)].symbol(), symbol);
-            let background = if symbol == "U" { USER_SURFACE } else { BG };
+            let background = if symbol == "U" {
+                USER_SURFACE
+            } else {
+                Color::Reset
+            };
             assert_eq!(terminal.backend().buffer()[(1, row)].bg, background);
             assert_eq!(terminal.backend().buffer()[(38, row)].bg, background);
         }
