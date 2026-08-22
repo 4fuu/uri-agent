@@ -39,6 +39,9 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["serde", "v7"] }
 vt100 = "0.16"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

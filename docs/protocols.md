@@ -101,6 +101,8 @@ exec("pwsh://run", "cargo test")
 
 Commands run from the startup working directory. Bash starts without profile or rc files; PowerShell starts without a profile and reads the script from standard input.
 
+PowerShell source and plain-text output use UTF-8. Its task status follows the final PowerShell or native command, including the native command's exact exit code.
+
 ## Managed tasks
 
 Execution is asynchronous by default. An accepted request normally returns before the operation is complete:

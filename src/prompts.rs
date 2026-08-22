@@ -131,6 +131,9 @@ Add `?wait=N` to wait up to N seconds (maximum 300), for example
 `pwsh://?wait=30`. If the wait window expires, the command keeps running and
 the result contains its task URI.
 
+PowerShell source and plain-text output use UTF-8. Task success follows the
+final PowerShell or native command, and native exit codes are preserved.
+
 Read `pwsh://tasks/<id>` for status and bounded output. If that output exceeds
 the system limit, the result includes a `file://` address containing the full
 output.
