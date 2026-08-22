@@ -49,7 +49,6 @@ const BG: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(21, 24, 28);
 const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
 const USER_SURFACE: Color = Color::Rgb(29, 34, 40);
-const USER_ACTIVE: Color = Color::Rgb(35, 42, 49);
 const TEXT: Color = Color::Rgb(218, 223, 229);
 const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
@@ -57,6 +56,7 @@ const WARM: Color = Color::Rgb(239, 173, 104);
 const ERROR: Color = Color::Rgb(239, 108, 120);
 const FLASH_DURATION: Duration = Duration::from_secs(5);
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const EXPANDED_PREVIEW_LINES: usize = 24;
 
 pub struct TuiInfo {
@@ -99,6 +99,7 @@ struct DisplayBlock {
     expanded: bool,
     tool: Option<ToolDisplay>,
     transient: bool,
+    final_response: bool,
 }
 
 struct ToolDisplay {
@@ -390,11 +391,13 @@ struct App {
     document: Option<(String, String)>,
     hit_regions: Vec<HitRegion<AppHit>>,
     last_click: Option<(AppHit, Instant)>,
+    overlay_bounds: Option<Rect>,
     selectable: Option<SelectableSurface>,
     selection: Option<TextSelection>,
     usage: UsageTotals,
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
+    pending_transcript_click: Option<(usize, Instant)>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
     tui_document: Option<TuiDocument>,
@@ -457,11 +460,13 @@ impl App {
             document: None,
             hit_regions: Vec::new(),
             last_click: None,
+            overlay_bounds: None,
             selectable: None,
             selection: None,
             usage: UsageTotals::default(),
             last_cache_hit: None,
             branch: None,
+            pending_transcript_click: None,
             commands,
             tui,
             tui_document: None,
@@ -673,13 +678,18 @@ impl App {
                         block.expanded = false;
                     }
                 }
-                if let Some(block) = self
+                let turn_start = self
                     .blocks
+                    .iter()
+                    .rposition(|block| block.kind == BlockKind::User)
+                    .map_or(0, |index| index + 1);
+                if let Some(block) = self.blocks[turn_start..]
                     .iter_mut()
                     .rev()
                     .find(|block| block.kind == BlockKind::Assistant)
                 {
                     block.expanded = true;
+                    block.final_response = true;
                 }
             }
         }
@@ -751,6 +761,7 @@ impl App {
             expanded,
             tool: None,
             transient: self.applying_transient,
+            final_response: false,
         });
     }
 
@@ -881,7 +892,7 @@ impl App {
         self.overlay = Some(Overlay::Document);
     }
 
-    fn click_transcript_block(&mut self, index: usize, double_click: bool) {
+    fn click_transcript_block(&mut self, index: usize, open_document: bool) {
         self.selected_block = index;
         self.transcript_follow_tail = false;
         if !self
@@ -891,12 +902,82 @@ impl App {
         {
             return;
         }
-        if double_click {
-            // Restore the state changed by the first click, then open without folding.
-            self.toggle_selected();
+        if open_document {
             self.open_selected_document();
         } else {
             self.toggle_selected();
+        }
+    }
+
+    fn queue_transcript_click(&mut self, index: usize) {
+        let now = Instant::now();
+        if let Some((pending, at)) = self.pending_transcript_click.take() {
+            if pending == index && now.duration_since(at) < DOUBLE_CLICK_INTERVAL {
+                self.last_click = None;
+                self.click_transcript_block(index, true);
+                return;
+            }
+            self.click_transcript_block(pending, false);
+        }
+        self.selected_block = index;
+        self.transcript_follow_tail = false;
+        self.last_click = None;
+        if self
+            .blocks
+            .get(index)
+            .is_some_and(|block| !matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+        {
+            self.pending_transcript_click = Some((index, now));
+        }
+    }
+
+    fn confirm_pending_transcript_click(&mut self) {
+        if let Some((index, _)) = self.pending_transcript_click.take() {
+            self.click_transcript_block(index, false);
+        }
+    }
+
+    fn confirm_pending_transcript_click_if_elapsed(&mut self) {
+        if self
+            .pending_transcript_click
+            .is_some_and(|(_, at)| at.elapsed() >= DOUBLE_CLICK_INTERVAL)
+        {
+            self.confirm_pending_transcript_click();
+        }
+    }
+
+    fn active_transcript_block(&self) -> Option<usize> {
+        if !self.busy {
+            return None;
+        }
+        let current_turn_start = self
+            .blocks
+            .iter()
+            .rposition(|block| block.kind == BlockKind::User)
+            .map_or(0, |index| index + 1);
+        match &self.activity {
+            Some(Activity::Reasoning) => self
+                .blocks
+                .iter()
+                .rposition(|block| block.kind == BlockKind::Reasoning),
+            Some(Activity::Writing) => self
+                .blocks
+                .iter()
+                .rposition(|block| block.kind == BlockKind::Assistant),
+            Some(Activity::Thinking | Activity::Tool(_)) => self
+                .blocks
+                .iter()
+                .enumerate()
+                .skip(current_turn_start)
+                .find_map(|(index, block)| {
+                    (block.kind == BlockKind::Tool
+                        && block
+                            .tool
+                            .as_ref()
+                            .is_some_and(|tool| tool.output.is_none()))
+                    .then_some(index)
+                }),
+            Some(Activity::Compacting) | None => None,
         }
     }
 
@@ -1044,9 +1125,9 @@ fn wrapped_index(current: usize, distance: isize, count: usize) -> usize {
 fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: T) -> bool {
     let now = Instant::now();
     let repeated = last_click.as_ref().is_some_and(|(previous, at)| {
-        *previous == target && now.duration_since(*at) < Duration::from_millis(500)
+        *previous == target && now.duration_since(*at) < DOUBLE_CLICK_INTERVAL
     });
-    *last_click = Some((target, now));
+    *last_click = (!repeated).then_some((target, now));
     repeated
 }
 
@@ -1128,12 +1209,14 @@ async fn run_loop(
         terminal.draw(|frame| render(frame, app))?;
         tokio::select! {
             _ = animation.tick(), if !app.animations_paused() => {
+                app.confirm_pending_transcript_click_if_elapsed();
                 app.frame = app.frame.wrapping_add(1);
             },
             event = terminal_events.next() => {
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        app.confirm_pending_transcript_click();
                         if app.pty.is_none() && is_ignored_tui_key(key) {
                             continue;
                         }
@@ -2111,6 +2194,15 @@ fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
 }
 
 async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices) -> Action {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.confirm_pending_transcript_click();
+    }
+    if close_document_on_outside_click(app, mouse) {
+        return Action::Continue;
+    }
+    if begin_direct_transcript_selection(app, mouse) {
+        return Action::Continue;
+    }
     if update_mouse_selection(app, mouse, app.overlay.is_none()) {
         return Action::Continue;
     }
@@ -2169,11 +2261,17 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         },
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = hit_target(&app.hit_regions, mouse) else {
+                app.confirm_pending_transcript_click();
                 return Action::Continue;
             };
+            if let AppHit::Transcript(index) = target {
+                app.queue_transcript_click(index);
+                return Action::Continue;
+            }
+            app.confirm_pending_transcript_click();
             let activate = is_double_click(&mut app.last_click, target);
             match target {
-                AppHit::Transcript(index) => app.click_transcript_block(index, activate),
+                AppHit::Transcript(_) => unreachable!(),
                 AppHit::Palette(index) => {
                     app.command_selected = index;
                     return confirm_command(app, services).await;
@@ -2217,6 +2315,41 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         _ => {}
     }
     Action::Continue
+}
+
+fn close_document_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
+    if app.overlay != Some(Overlay::Document)
+        || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        || !app
+            .overlay_bounds
+            .is_some_and(|area| !area.contains((mouse.column, mouse.row).into()))
+    {
+        return false;
+    }
+    app.overlay = None;
+    app.overlay_scroll = 0;
+    app.selection = None;
+    true
+}
+
+fn begin_direct_transcript_selection(app: &mut App, mouse: MouseEvent) -> bool {
+    if app.overlay.is_some() || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Some(AppHit::Transcript(index)) = hit_target(&app.hit_regions, mouse) else {
+        return false;
+    };
+    if !app
+        .blocks
+        .get(index)
+        .is_some_and(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+    {
+        return false;
+    }
+    app.confirm_pending_transcript_click();
+    app.selected_block = index;
+    app.transcript_follow_tail = false;
+    update_mouse_selection(app, mouse, false)
 }
 
 fn open_status(app: &mut App) {
@@ -3241,6 +3374,7 @@ fn json_value_summary(value: &serde_json::Value) -> String {
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_regions.clear();
+    app.overlay_bounds = None;
     app.selectable = None;
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
@@ -3280,8 +3414,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     let selectable_area = if let Some(overlay) = app.overlay {
         app.hit_regions.clear();
+        let area = overlay_area(frame.area(), overlay);
+        app.overlay_bounds = Some(area);
         render_overlay(frame, app, overlay);
-        Some(overlay_area(frame.area(), overlay).inner(Margin {
+        Some(area.inner(Margin {
             horizontal: 2,
             vertical: 2,
         }))
@@ -3501,13 +3637,22 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut items = Vec::new();
     let mut block_for_row = Vec::new();
     let mut block_rows = vec![None; app.blocks.len()];
+    let active_block = app.active_transcript_block();
     for (index, block) in app.blocks.iter().enumerate() {
-        if index > 0 && transcript_needs_gap(app.blocks[index - 1].kind, block.kind) {
+        if index > 0
+            && transcript_needs_gap(app.blocks[index - 1].kind, block.kind, block.final_response)
+        {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
             block_for_row.push(None);
         }
         let first = items.len();
-        for item in transcript_block_items(block, index == app.selected_block, body_width, app) {
+        for item in transcript_block_items(
+            block,
+            index == app.selected_block,
+            Some(index) == active_block,
+            body_width,
+            app,
+        ) {
             items.push(item);
             block_for_row.push(Some(index));
         }
@@ -3554,31 +3699,27 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn transcript_needs_gap(previous: BlockKind, current: BlockKind) -> bool {
-    (matches!(current, BlockKind::User | BlockKind::Assistant) && previous != current)
-        || (previous == BlockKind::User
-            && matches!(current, BlockKind::Reasoning | BlockKind::Tool))
+fn transcript_needs_gap(previous: BlockKind, current: BlockKind, final_response: bool) -> bool {
+    (current == BlockKind::User && previous != BlockKind::User)
+        || (previous == BlockKind::User && current != BlockKind::User)
+        || (current == BlockKind::Assistant
+            && final_response
+            && matches!(previous, BlockKind::Reasoning | BlockKind::Tool))
 }
 
 fn transcript_block_items(
     block: &DisplayBlock,
     selected: bool,
+    live: bool,
     body_width: usize,
     app: &App,
 ) -> Vec<ListItem<'static>> {
-    let background = if block.kind == BlockKind::User {
-        if selected { USER_ACTIVE } else { USER_SURFACE }
-    } else if selected {
-        ROW_ACTIVE
-    } else {
-        BG
+    let background = match block.kind {
+        BlockKind::User => USER_SURFACE,
+        BlockKind::Assistant => BG,
+        _ if selected => ROW_ACTIVE,
+        _ => BG,
     };
-    let live = selected
-        && app.busy
-        && matches!(
-            block.kind,
-            BlockKind::Assistant | BlockKind::Reasoning | BlockKind::Tool
-        );
     let selection = if selected { "▌ " } else { "  " };
     let open_key = app
         .keymap
@@ -4840,8 +4981,14 @@ fn update_mouse_selection(app: &mut App, mouse: MouseEvent, require_shift: bool)
             true
         }
         MouseEventKind::Up(MouseButton::Left) if app.selection.is_some() => {
-            if let Some(selection) = app.selection.as_mut() {
+            let empty = if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
+                selection.start == selection.end
+            } else {
+                false
+            };
+            if empty {
+                app.selection = None;
             }
             true
         }
@@ -5458,11 +5605,11 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(
             terminal.backend().buffer()[(10, user_rows[0])].bg,
-            USER_ACTIVE
+            USER_SURFACE
         );
         assert_eq!(
             terminal.backend().buffer()[(98, user_rows[0])].bg,
-            USER_ACTIVE
+            USER_SURFACE
         );
         let assistant_row = app
             .hit_regions
@@ -5481,6 +5628,71 @@ mod tests {
             .find_map(|region| (region.target == AppHit::Transcript(3)).then_some(region.area.y))
             .unwrap();
         assert_eq!(tool_row, reasoning_row + 1);
+
+        app.selected_block = 1;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(10, assistant_row)].bg, BG);
+        app.selected_block = 2;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(10, reasoning_row)].bg,
+            ROW_ACTIVE
+        );
+    }
+
+    #[test]
+    fn assistant_reply_supports_direct_mouse_drag_selection() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "Select this response with the mouse.".into(),
+            None,
+            false,
+            true,
+        );
+        render_to_string(&mut app, 80, 12);
+        let row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .unwrap();
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 20,
+            ..down
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..drag
+        };
+
+        assert!(begin_direct_transcript_selection(&mut app, down));
+        assert!(update_mouse_selection(&mut app, drag, true));
+        assert!(update_mouse_selection(&mut app, up, true));
+        assert!(
+            app.selection
+                .is_some_and(|selection| selection.start != selection.end)
+        );
+        assert_eq!(app.selected_block, 0);
+
+        app.selection = None;
+        assert!(begin_direct_transcript_selection(&mut app, down));
+        assert!(update_mouse_selection(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..down
+            },
+            true
+        ));
+        assert!(app.selection.is_none());
     }
 
     #[test]
@@ -5502,6 +5714,14 @@ mod tests {
             false,
             false,
         );
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "I will inspect the history.".into(),
+            None,
+            false,
+            true,
+        );
 
         let rendered = render_to_string(&mut app, 80, 12);
         let user_row = app
@@ -5514,8 +5734,14 @@ mod tests {
             .iter()
             .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
             .unwrap();
+        let assistant_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
+            .unwrap();
 
         assert_eq!(reasoning_row, user_row + 2);
+        assert_eq!(assistant_row, reasoning_row + 1);
         assert!(
             rendered
                 .lines()
@@ -5524,8 +5750,84 @@ mod tests {
                 .trim()
                 .is_empty()
         );
-        assert!(transcript_needs_gap(BlockKind::User, BlockKind::Tool));
-        assert!(!transcript_needs_gap(BlockKind::Reasoning, BlockKind::Tool));
+        assert!(transcript_needs_gap(
+            BlockKind::User,
+            BlockKind::Tool,
+            false
+        ));
+        assert!(!transcript_needs_gap(
+            BlockKind::Reasoning,
+            BlockKind::Assistant,
+            false
+        ));
+        assert!(!transcript_needs_gap(
+            BlockKind::Reasoning,
+            BlockKind::Tool,
+            false
+        ));
+    }
+
+    #[test]
+    fn final_assistant_response_has_one_blank_row_after_the_process() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "I will inspect the history.".into(),
+            None,
+            false,
+            true,
+        );
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "Summarize the result.".into(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "Here is the final answer.".into(),
+            None,
+            false,
+            true,
+        );
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::TurnFinished,
+        });
+
+        assert!(!app.blocks[0].final_response);
+        assert!(app.blocks[2].final_response);
+        let rendered = render_to_string(&mut app, 80, 12);
+        let reasoning_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+        let final_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
+            .unwrap();
+
+        assert_eq!(final_row, reasoning_row + 2);
+        assert!(
+            rendered
+                .lines()
+                .nth((reasoning_row + 1) as usize)
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        assert!(transcript_needs_gap(
+            BlockKind::Reasoning,
+            BlockKind::Assistant,
+            true
+        ));
     }
 
     #[test]
@@ -5810,6 +6112,47 @@ mod tests {
     }
 
     #[test]
+    fn clicking_outside_closes_only_the_full_document_float() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Document);
+        app.overlay_scroll = 6;
+        app.selection = Some(TextSelection {
+            start: (20, 8),
+            end: (24, 8),
+        });
+        render_to_string(&mut app, 100, 24);
+        let bounds = app.overlay_bounds.expect("rendered document bounds");
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(!close_document_on_outside_click(
+            &mut app,
+            click(bounds.x, bounds.y)
+        ));
+        assert!(app.overlay == Some(Overlay::Document));
+
+        assert!(close_document_on_outside_click(
+            &mut app,
+            click(bounds.x.saturating_sub(1), bounds.y)
+        ));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.overlay_scroll, 0);
+        assert!(app.selection.is_none());
+
+        app.overlay = Some(Overlay::Help);
+        app.overlay_bounds = Some(bounds);
+        assert!(!close_document_on_outside_click(
+            &mut app,
+            click(bounds.x.saturating_sub(1), bounds.y)
+        ));
+        assert!(app.overlay == Some(Overlay::Help));
+    }
+
+    #[test]
     fn transcript_double_click_opens_without_changing_the_folded_state() {
         let mut app = test_app();
         app.push(
@@ -5821,15 +6164,44 @@ mod tests {
             false,
         );
 
-        app.click_transcript_block(0, false);
-        assert!(app.blocks[0].expanded);
-        app.click_transcript_block(0, true);
+        app.queue_transcript_click(0);
+        assert!(!app.blocks[0].expanded);
+        assert!(app.pending_transcript_click.is_some());
+        app.queue_transcript_click(0);
 
         assert!(!app.blocks[0].expanded);
         assert!(app.overlay == Some(Overlay::Document));
         assert!(app.document.is_some());
+        assert!(app.pending_transcript_click.is_none());
         assert_eq!(app.selected_block, 0);
         assert!(!app.transcript_follow_tail);
+    }
+
+    #[test]
+    fn transcript_single_click_waits_before_toggling_each_time() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "full thought".to_string(),
+            None,
+            false,
+            false,
+        );
+
+        app.queue_transcript_click(0);
+        assert!(!app.blocks[0].expanded);
+        app.pending_transcript_click.as_mut().unwrap().1 = Instant::now() - DOUBLE_CLICK_INTERVAL;
+        app.confirm_pending_transcript_click_if_elapsed();
+        assert!(app.blocks[0].expanded);
+        assert!(app.pending_transcript_click.is_none());
+
+        app.queue_transcript_click(0);
+        assert!(app.blocks[0].expanded);
+        app.pending_transcript_click.as_mut().unwrap().1 = Instant::now() - DOUBLE_CLICK_INTERVAL;
+        app.confirm_pending_transcript_click_if_elapsed();
+        assert!(!app.blocks[0].expanded);
+        assert!(app.overlay.is_none());
     }
 
     #[test]
@@ -5851,7 +6223,7 @@ mod tests {
         assert!(app.overlay.is_none());
         assert!(app.document.is_none());
         assert!(app.blocks[0].expanded);
-        let rows = transcript_block_items(&app.blocks[0], true, 8, &app);
+        let rows = transcript_block_items(&app.blocks[0], true, false, 8, &app);
         assert!(rows.len() > EXPANDED_PREVIEW_LINES);
 
         app.blocks.clear();
@@ -5868,7 +6240,7 @@ mod tests {
         assert!(!app.blocks[0].expanded);
         assert!(app.overlay.is_none());
         assert!(app.document.is_none());
-        assert!(transcript_block_items(&app.blocks[0], true, 8, &app).len() > 24);
+        assert!(transcript_block_items(&app.blocks[0], true, false, 8, &app).len() > 24);
     }
 
     #[test]
@@ -6500,6 +6872,54 @@ mod tests {
                 .filter(|block| block.kind == BlockKind::Tool)
                 .all(|block| !block.expanded)
         );
+    }
+
+    #[test]
+    fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
+        let mut app = test_app();
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::User {
+                text: "inspect files".into(),
+            },
+        });
+        app.apply(SessionEvent {
+            sequence: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::ToolCall {
+                call_id: "old".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"uri": "file://old.rs"}),
+            },
+        });
+        app.apply(SessionEvent {
+            sequence: 2,
+            at: chrono::Utc::now(),
+            kind: EventKind::ToolResult {
+                call_id: "old".into(),
+                name: "read".into(),
+                output: "done".into(),
+                failed: false,
+            },
+        });
+        app.apply(SessionEvent {
+            sequence: 3,
+            at: chrono::Utc::now(),
+            kind: EventKind::ToolCall {
+                call_id: "current".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"uri": "file://current.rs"}),
+            },
+        });
+        app.selected_block = 1;
+
+        assert_eq!(app.active_transcript_block(), Some(2));
+        let spinner = animation::spinner(app.frame);
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("✓ Read old.rs"));
+        assert!(rendered.contains(&format!("{spinner} Read current.rs")));
+        assert!(!rendered.contains(&format!("{spinner} Read old.rs")));
     }
 
     #[test]
