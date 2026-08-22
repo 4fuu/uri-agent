@@ -4228,9 +4228,10 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn transcript_needs_gap(previous: BlockKind, current: BlockKind, turn_result: bool) -> bool {
-    turn_result
-        && matches!(current, BlockKind::Assistant | BlockKind::Error)
-        && previous != BlockKind::User
+    matches!((previous, current), (BlockKind::User, BlockKind::Process))
+        || (turn_result
+            && matches!(current, BlockKind::Assistant | BlockKind::Error)
+            && previous != BlockKind::User)
 }
 
 fn transcript_live_tail(rows: usize, height: usize) -> usize {
@@ -6759,7 +6760,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_successive_turn_marks_the_user_prompt_with_a_padded_band() {
+    fn completed_turn_separates_folded_process_from_padded_user_prompt() {
         let mut app = test_app();
         app.push(
             BlockKind::Assistant,
@@ -6824,17 +6825,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(user_row, previous_row + 2);
-        assert_eq!(process_row, user_row + 2);
+        assert_eq!(process_row, user_row + 3);
         assert_eq!(result_row, process_row + 2);
         for row in [user_row - 1, user_row, user_row + 1] {
             assert_eq!(terminal.backend().buffer()[(1, row)].bg, USER_SURFACE);
             assert_eq!(terminal.backend().buffer()[(78, row)].bg, USER_SURFACE);
         }
-        for row in [user_row - 1, user_row + 1] {
+        assert_eq!(
+            terminal.backend().buffer()[(1, user_row + 2)].bg,
+            Color::Reset
+        );
+        for row in [user_row - 1, user_row + 1, user_row + 2] {
             assert!(!app.hit_regions.iter().any(|region| {
                 region.area.y == row && matches!(region.target, AppHit::Transcript(_))
             }));
         }
+        assert!(transcript_needs_gap(
+            BlockKind::User,
+            BlockKind::Process,
+            false
+        ));
     }
 
     #[test]
