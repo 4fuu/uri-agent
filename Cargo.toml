@@ -46,6 +46,12 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.rust]
+# aws-lc-sys (pulled in by reqwest's rustls feature) marks its jitterentropy
+# symbols dllexport on Windows, so MSVC link.exe prints a localized
+# "Creating library" notice when linking the binary. The output is benign.
+linker_messages = "allow"
+
 [profile.release]
 lto = "thin"
 strip = true
