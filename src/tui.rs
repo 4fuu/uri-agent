@@ -49,7 +49,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const BG: Color = Color::Reset;
 const SURFACE: Color = Color::Rgb(21, 24, 28);
 const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
-const USER_SURFACE: Color = Color::Rgb(17, 25, 24);
+const USER_SURFACE: Color = Color::Rgb(23, 48, 45);
 const TEXT: Color = Color::Rgb(218, 223, 229);
 const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
@@ -1121,16 +1121,24 @@ impl App {
     }
 
     fn scroll_transcript(&mut self, distance: isize) {
-        let max_offset = self.transcript_rows.saturating_sub(self.transcript_height);
-        self.transcript_offset = if distance < 0 {
+        let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
+        let reading_end = transcript_reading_end(self.transcript_rows, self.transcript_height);
+        let offset = if distance < 0 {
             self.transcript_offset
                 .saturating_sub(distance.unsigned_abs())
         } else {
             self.transcript_offset
                 .saturating_add(distance as usize)
-                .min(max_offset)
+                .min(reading_end)
         };
-        self.transcript_follow_tail = self.transcript_offset >= max_offset;
+        self.transcript_offset = if (self.transcript_offset < live_tail && offset > live_tail)
+            || (self.transcript_offset > live_tail && offset < live_tail)
+        {
+            live_tail
+        } else {
+            offset
+        };
+        self.transcript_follow_tail = self.transcript_offset == live_tail;
         self.transcript_center_selected = false;
     }
 
@@ -1829,6 +1837,14 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
         }
         Some("page_up") => {
             app.move_selection(-8);
+            Action::Continue
+        }
+        Some("scroll_down") => {
+            app.scroll_transcript(3);
+            Action::Continue
+        }
+        Some("scroll_up") => {
+            app.scroll_transcript(-3);
             Action::Continue
         }
         Some("first") => {
@@ -3924,6 +3940,10 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
             block_for_row.push(None);
         }
+        if block.kind == BlockKind::User {
+            items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
+            block_for_row.push(None);
+        }
         let first = items.len();
         for item in transcript_block_items(
             block,
@@ -3937,13 +3957,18 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             block_for_row.push(Some(index));
         }
         block_rows[index] = Some((first, items.len().saturating_sub(1)));
+        if block.kind == BlockKind::User {
+            items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
+            block_for_row.push(None);
+        }
         previous_visible = Some(block.kind);
     }
     app.transcript_rows = items.len();
     app.transcript_height = area.height as usize;
-    let max_offset = app.transcript_rows.saturating_sub(app.transcript_height);
+    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
+    let reading_end = transcript_reading_end(app.transcript_rows, app.transcript_height);
     if app.transcript_follow_tail {
-        app.transcript_offset = max_offset;
+        app.transcript_offset = live_tail;
     } else if app.transcript_center_selected
         && let Some((first, _)) = block_rows.get(app.selected_block).copied().flatten()
         && (first < app.transcript_offset
@@ -3951,9 +3976,9 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     {
         app.transcript_offset = first
             .saturating_sub(app.transcript_height / 2)
-            .min(max_offset);
+            .min(reading_end);
     } else {
-        app.transcript_offset = app.transcript_offset.min(max_offset);
+        app.transcript_offset = app.transcript_offset.min(reading_end);
     }
     app.transcript_center_selected = false;
     let offset = app.transcript_offset;
@@ -3981,11 +4006,17 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn transcript_needs_gap(previous: BlockKind, current: BlockKind, turn_result: bool) -> bool {
-    (current == BlockKind::User && previous != BlockKind::User)
-        || (previous == BlockKind::User && current != BlockKind::User)
-        || (turn_result
-            && matches!(current, BlockKind::Assistant | BlockKind::Error)
-            && previous != BlockKind::User)
+    turn_result
+        && matches!(current, BlockKind::Assistant | BlockKind::Error)
+        && previous != BlockKind::User
+}
+
+fn transcript_live_tail(rows: usize, height: usize) -> usize {
+    rows.saturating_sub(height)
+}
+
+fn transcript_reading_end(rows: usize, height: usize) -> usize {
+    rows.saturating_add(height / 2).saturating_sub(height)
 }
 
 fn transcript_block_items(
@@ -6238,6 +6269,15 @@ mod tests {
             terminal.backend().buffer()[(98, user_rows[0])].bg,
             USER_SURFACE
         );
+        for padding_row in [user_rows[0] - 1, user_rows[1] + 1] {
+            assert_eq!(
+                terminal.backend().buffer()[(10, padding_row)].bg,
+                USER_SURFACE
+            );
+            assert!(!app.hit_regions.iter().any(|region| {
+                region.area.y == padding_row && matches!(region.target, AppHit::Transcript(_))
+            }));
+        }
         let assistant_row = app
             .hit_regions
             .iter()
@@ -6271,6 +6311,85 @@ mod tests {
             terminal.backend().buffer()[(10, reasoning_row)].bg,
             ROW_ACTIVE
         );
+    }
+
+    #[test]
+    fn completed_successive_turn_marks_the_user_prompt_with_a_padded_band() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "Previous answer.".into(),
+            None,
+            false,
+            true,
+        );
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "Follow-up question.".into(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "Check the new turn.".into(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "Next answer.".into(),
+            None,
+            false,
+            true,
+        );
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::TurnFinished,
+        });
+        app.skip_splash();
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let previous_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .unwrap();
+        let user_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+        let process_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
+            .unwrap();
+        let result_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(4)).then_some(region.area.y))
+            .unwrap();
+
+        assert_eq!(user_row, previous_row + 2);
+        assert_eq!(process_row, user_row + 2);
+        assert_eq!(result_row, process_row + 2);
+        for row in [user_row - 1, user_row, user_row + 1] {
+            assert_eq!(terminal.backend().buffer()[(1, row)].bg, USER_SURFACE);
+            assert_eq!(terminal.backend().buffer()[(78, row)].bg, USER_SURFACE);
+        }
+        for row in [user_row - 1, user_row + 1] {
+            assert!(!app.hit_regions.iter().any(|region| {
+                region.area.y == row && matches!(region.target, AppHit::Transcript(_))
+            }));
+        }
     }
 
     #[test]
@@ -6515,7 +6634,7 @@ mod tests {
                 .trim()
                 .is_empty()
         );
-        assert!(transcript_needs_gap(
+        assert!(!transcript_needs_gap(
             BlockKind::User,
             BlockKind::Tool,
             false
@@ -7161,12 +7280,12 @@ mod tests {
         let mut app = test_app();
         for index in 0..30 {
             app.push(
-                BlockKind::User,
-                "YOU",
+                BlockKind::Assistant,
+                "AGENT",
                 format!("message {index}"),
                 None,
                 false,
-                false,
+                true,
             );
         }
         app.selected_block = 29;
@@ -7182,12 +7301,12 @@ mod tests {
         assert!(!app.transcript_follow_tail);
 
         app.push(
-            BlockKind::User,
-            "YOU",
+            BlockKind::Assistant,
+            "AGENT",
             "message 30".to_string(),
             None,
             false,
-            false,
+            true,
         );
         render_to_string(&mut app, 80, 12);
         assert_eq!(app.transcript_offset, tail_offset - 3);
@@ -7199,12 +7318,12 @@ mod tests {
         assert!(app.transcript_follow_tail);
 
         app.push(
-            BlockKind::User,
-            "YOU",
+            BlockKind::Assistant,
+            "AGENT",
             "message 31".to_string(),
             None,
             false,
-            false,
+            true,
         );
         render_to_string(&mut app, 80, 12);
         assert_eq!(app.transcript_offset, tail_offset + 2);
@@ -7214,16 +7333,75 @@ mod tests {
     }
 
     #[test]
+    fn manual_scroll_can_lift_the_final_row_to_the_viewport_middle() {
+        let mut app = test_app();
+        for index in 0..30 {
+            app.push(
+                BlockKind::Assistant,
+                "AGENT",
+                format!("message {index}"),
+                None,
+                false,
+                true,
+            );
+        }
+        app.selected_block = 29;
+        render_to_string(&mut app, 80, 12);
+        let live_tail = app.transcript_offset;
+        assert_eq!(
+            live_tail,
+            transcript_live_tail(app.transcript_rows, app.transcript_height)
+        );
+
+        app.scroll_transcript(3);
+        assert_eq!(app.transcript_offset, live_tail + 3);
+        assert!(!app.transcript_follow_tail);
+        app.scroll_transcript(isize::MAX);
+        render_to_string(&mut app, 80, 12);
+        assert_eq!(
+            app.transcript_offset,
+            transcript_reading_end(app.transcript_rows, app.transcript_height)
+        );
+        let final_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(29)).then_some(region.area.y))
+            .unwrap();
+        assert_eq!(final_row, app.transcript_height as u16 / 2);
+
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "message 30".into(),
+            None,
+            false,
+            true,
+        );
+        render_to_string(&mut app, 80, 12);
+        assert!(!app.transcript_follow_tail);
+        assert_eq!(app.transcript_offset, live_tail + app.transcript_height / 2);
+
+        app.transcript_follow_tail = true;
+        render_to_string(&mut app, 80, 12);
+        let final_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(30)).then_some(region.area.y))
+            .unwrap();
+        assert_eq!(final_row, app.transcript_height as u16 - 1);
+    }
+
+    #[test]
     fn keyboard_navigation_centers_an_offscreen_transcript_block() {
         let mut app = test_app();
         for index in 0..30 {
             app.push(
-                BlockKind::User,
-                "YOU",
+                BlockKind::Assistant,
+                "AGENT",
                 format!("message {index}"),
                 None,
                 false,
-                false,
+                true,
             );
         }
         app.selected_block = 29;

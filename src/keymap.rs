@@ -29,6 +29,8 @@ map("main", "j", "next");
 map("main", "k", "previous");
 map("main", "pagedown", "page_down");
 map("main", "pageup", "page_up");
+map("main", "ctrl+down", "scroll_down");
+map("main", "ctrl+up", "scroll_up");
 map("main", "home", "first");
 map("main", "end", "last");
 map("main", "enter", "toggle");
@@ -293,6 +295,14 @@ mod tests {
         assert_eq!(keymap.action("main", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("main", "up").as_deref(), Some("previous"));
         assert_eq!(keymap.key_for("main", "previous").as_deref(), Some("up"));
+        assert_eq!(
+            keymap.action("main", "ctrl+down").as_deref(),
+            Some("scroll_down")
+        );
+        assert_eq!(
+            keymap.action("main", "ctrl+up").as_deref(),
+            Some("scroll_up")
+        );
         assert_eq!(keymap.action("main", ":").as_deref(), Some("command"));
         assert_eq!(keymap.action("main", "：").as_deref(), Some("command"));
         assert_eq!(keymap.action("main", "?").as_deref(), Some("help"));
