@@ -4,9 +4,9 @@ URI Agent presents one conversation surface with floating controls for compositi
 
 ## Startup and conversation surface
 
-Startup may show a short animated splash before the conversation. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
+Startup may show a short animated splash before the conversation. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model with its thinking effort below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
 
-After the first record appears, the transcript uses the available content area and a minimal footer stays on the bottom row. It shows the active model first, followed by an animated context meter and `percentage/context-window-size`, for example `model  ▓······· 10.0%/262k`. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel.
+After the first record appears, the transcript uses the available content area and a minimal footer stays on the bottom row. It shows the active model and effort first, followed by an animated context meter and `percentage/context-window-size`, for example `model · effort high  ▓······· 10.0%/262k`. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
 
 Conversation rows stay folded until opened. Select a row with the arrow keys or mouse and press `Enter` to expand or fold it. Reasoning rows are included instead of being placed in a separate mode.
 
@@ -23,7 +23,7 @@ Press `i` to open the floating composer:
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 
-Press `:` from the conversation to open the command panel. Type to filter, use `Tab` or `Shift+Tab` to complete, press `Enter` to run, and press `Esc` to close it. Commands that need a choice or more text open a selector or input float. There are no slash commands or secondary command syntax.
+Press `:` from the conversation to open the command panel. It is selection-only: use the arrow keys or mouse to choose a command, press `Enter` to run it, and press `Esc` to close it. Commands that need a value open a selector or a separate input float. The command panel does not accept text, and there is no secondary command syntax.
 
 Core commands are registered through `CommandRegistry`:
 
@@ -35,7 +35,7 @@ Core commands are registered through `CommandRegistry`:
 | `:protocols` | List registered read and exec routes |
 | `:status` | Show project, model, usage, and extension status |
 | `:model` | Search runnable models |
-| `:effort` | Show or set thinking effort |
+| `:effort` | Select thinking effort supported by the active model |
 | `:settings` | Inspect and edit active settings |
 | `:login`, `:logout` | Manage provider credentials |
 | `:resume`, `:new` | Switch project sessions or create one |
@@ -44,7 +44,7 @@ Core commands are registered through `CommandRegistry`:
 | `:help` | Show the active commands and keymap |
 | `:quit` or `:q` | Exit URI Agent |
 
-Extensions register commands through the same registry, so they appear in the panel, colon command line, help, and key-bindable action set without TUI-specific routing.
+Extensions register commands through the same registry, so they appear in the panel, help, and key-bindable action set without TUI-specific routing.
 
 ## Default navigation
 
@@ -79,7 +79,7 @@ map("composer", "ctrl+j", "newline");
 
 Bindings belong to surfaces such as `global`, `main`, `composer`, `command`, `list`, `selector`, `settings`, `models`, `document`, `selection`, and `terminal`. A surface binding is checked before a global binding.
 
-Configurable actions must go through the keymap. New commands that should be available from the command panel, colon line, or key bindings must go through `CommandRegistry`; do not add a modeless hard-coded shortcut as a separate path.
+Configurable actions must go through the keymap. New commands that should be available from the command panel or key bindings must go through `CommandRegistry`; do not add a modeless hard-coded shortcut as a separate path.
 
 ## Embedded terminal
 
@@ -125,7 +125,7 @@ The canonical startup directory is the project boundary and is recorded with eve
 - `--continue-session` resumes the most recently updated session for this project;
 - `--session <id>` resumes that ID only if it belongs to this project;
 - `--session latest` selects the same project-scoped latest session;
-- `:resume` lists sessions for the current project.
+- `:resume` lists sessions for the current project, including each session's model and configured effort.
 
 `Esc` keeps draft text in the composer. URI Agent writes the current draft to SQLite when the TUI exits or switches sessions. Before the first message, it stores the draft separately by project so preserving a draft does not create an empty session record.
 

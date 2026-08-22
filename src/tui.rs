@@ -9,8 +9,8 @@ use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
-    CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext,
-    TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
+    CommandRegistry, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext, TuiRegistry,
+    TuiStatusContext, TuiStatusItem, TuiStatusTone,
 };
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
@@ -59,6 +59,7 @@ pub struct TuiInfo {
     pub cwd: PathBuf,
     pub provider: String,
     pub model: String,
+    pub thinking: ThinkingLevel,
     pub session_id: String,
     pub context_window: usize,
     pub model_ready: bool,
@@ -238,6 +239,7 @@ enum SelectorKind {
     LoginMethod { provider: String },
     Logout,
     Resume,
+    Effort { provider: String, model: String },
 }
 
 struct SelectorState {
@@ -349,9 +351,7 @@ struct App {
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
     keymap: Keymap,
-    command_line: String,
     command_selected: usize,
-    command_stem: Option<String>,
     selector: Option<SelectorState>,
     text_prompt: Option<TextPrompt>,
     oauth: Option<OauthState>,
@@ -408,9 +408,7 @@ impl App {
             catalog_refreshing: false,
             settings: None,
             keymap,
-            command_line: String::new(),
             command_selected: 0,
-            command_stem: None,
             selector: None,
             text_prompt: None,
             oauth: None,
@@ -748,133 +746,8 @@ impl App {
         }
     }
 
-    fn reset_command_input(&mut self) {
-        self.command_line.clear();
+    fn reset_command_selection(&mut self) {
         self.command_selected = 0;
-        self.command_stem = None;
-    }
-
-    fn command_matches(&self, prefix: &str) -> Vec<CommandSpec> {
-        let prefix = prefix.to_ascii_lowercase();
-        self.commands
-            .list()
-            .into_iter()
-            .filter(|command| {
-                prefix.is_empty()
-                    || command.id.starts_with(&prefix)
-                    || command
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.starts_with(&prefix))
-            })
-            .collect()
-    }
-
-    fn completion_candidates(&self, prefix: &str) -> Vec<CommandSpec> {
-        let prefix = prefix.to_ascii_lowercase();
-        let matches = self.command_matches(&prefix);
-        if prefix.is_empty() {
-            return matches;
-        }
-        let id_matches = matches
-            .iter()
-            .filter(|command| command.id.starts_with(&prefix))
-            .cloned()
-            .collect::<Vec<_>>();
-        if id_matches.is_empty() {
-            matches
-        } else {
-            id_matches
-        }
-    }
-
-    fn command_stem_applies(&self, typed: &str) -> bool {
-        let Some(stem) = self.command_stem.as_deref() else {
-            return false;
-        };
-        typed.starts_with(stem)
-            || self
-                .completion_candidates(stem)
-                .iter()
-                .any(|command| command.id.eq_ignore_ascii_case(typed))
-    }
-
-    fn sync_command_selection(&mut self) {
-        let name = self
-            .command_line
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let filtered = self.filtered_commands();
-        self.command_selected = filtered
-            .iter()
-            .position(|command| command.id == name)
-            .or_else(|| {
-                filtered
-                    .iter()
-                    .position(|command| command.aliases.iter().any(|alias| alias == &name))
-            })
-            .unwrap_or(0);
-    }
-
-    fn complete_command(&mut self, reverse: bool) {
-        if self.command_line.chars().any(char::is_whitespace) {
-            return;
-        }
-        let typed = self.command_line.to_ascii_lowercase();
-        if !self.command_stem_applies(&typed) {
-            self.command_stem = Some(typed.clone());
-        }
-        let prefix = self.command_stem.clone().unwrap_or_else(|| typed.clone());
-        let matches = self.completion_candidates(&prefix);
-        if matches.is_empty() {
-            return;
-        }
-        if matches.len() == 1 {
-            self.command_line.clone_from(&matches[0].id);
-            self.sync_command_selection();
-            return;
-        }
-        let ids = matches
-            .iter()
-            .map(|command| command.id.clone())
-            .collect::<Vec<_>>();
-        let common = common_command_prefix(&ids);
-        if common.len() > typed.len() {
-            self.command_line = common;
-            self.sync_command_selection();
-            return;
-        }
-        let current = ids.iter().position(|id| id.eq_ignore_ascii_case(&typed));
-        let next = match current {
-            Some(index) if reverse => (index + ids.len() - 1) % ids.len(),
-            Some(index) => (index + 1) % ids.len(),
-            None if reverse => ids.len() - 1,
-            None => 0,
-        };
-        self.command_line.clone_from(&ids[next]);
-        self.sync_command_selection();
-    }
-
-    fn filtered_commands(&self) -> Vec<CommandSpec> {
-        let query = self.command_line.trim().to_ascii_lowercase();
-        let name = query
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        self.commands
-            .list()
-            .into_iter()
-            .filter(|command| {
-                name.is_empty()
-                    || command.id.contains(&name)
-                    || command.title.to_ascii_lowercase().contains(&name)
-                    || command.description.to_ascii_lowercase().contains(&name)
-                    || command.aliases.iter().any(|alias| alias.contains(&name))
-            })
-            .collect()
     }
 
     fn close_floats(&mut self) {
@@ -891,23 +764,6 @@ impl App {
         self.overlay = None;
         self.overlay_scroll = 0;
     }
-}
-
-fn common_command_prefix(names: &[String]) -> String {
-    let Some(first) = names.first() else {
-        return String::new();
-    };
-    let mut end = first.len();
-    for name in &names[1..] {
-        end = first
-            .as_bytes()
-            .iter()
-            .take(end)
-            .zip(name.as_bytes())
-            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
-            .count();
-    }
-    first[..end].to_string()
 }
 
 fn hit_target<T: Copy>(regions: &[HitRegion<T>], mouse: MouseEvent) -> Option<T> {
@@ -954,9 +810,12 @@ pub async fn run(services: TuiServices) -> Result<TuiOutcome> {
         manager,
         catalog,
         output,
-        info,
+        mut info,
         draft,
     } = services;
+    let active = manager.current().await;
+    info.thinking =
+        effective_thinking(&catalog, &active.provider, &active.model, active.thinking).await;
     let session = runtime.session().clone();
     let mut receiver = session.subscribe();
     let keymap = Keymap::load(Some(&info.cwd)).await?;
@@ -1122,9 +981,7 @@ enum Action {
         provider: String,
     },
     SaveTerminal(String),
-    OpenTerminal {
-        command: Option<String>,
-    },
+    OpenTerminal,
 }
 
 async fn apply_action(
@@ -1212,8 +1069,8 @@ async fn apply_action(
             save_terminal(app, services, command).await;
             Ok(None)
         }
-        Action::OpenTerminal { command } => {
-            open_pty(app, command);
+        Action::OpenTerminal => {
+            open_pty(app);
             Ok(None)
         }
     }
@@ -1236,11 +1093,7 @@ fn handle_paste(app: &mut App, text: String) {
                 selector.paste(text.trim());
             }
         }
-        Some(Overlay::Command) => {
-            app.command_line.push_str(text.trim());
-            app.command_selected = 0;
-            app.command_stem = None;
-        }
+        Some(Overlay::Command) => {}
         Some(Overlay::Selector) => {
             if let Some(selector) = app.selector.as_mut() {
                 selector.query.push_str(text.trim());
@@ -1266,7 +1119,6 @@ fn handle_paste(app: &mut App, text: String) {
 async fn dispatch_ui_command(
     app: &mut App,
     target: CommandTarget,
-    arguments: String,
     services: &LoopServices,
 ) -> Action {
     let previous_overlay = app.overlay;
@@ -1277,7 +1129,7 @@ async fn dispatch_ui_command(
             let context = TuiPanelContext {
                 cwd: app.info.cwd.clone(),
                 session_id: app.info.session_id.clone(),
-                arguments,
+                arguments: String::new(),
             };
             match app.tui.open_panel(&panel, context).await {
                 Ok(document) => {
@@ -1318,15 +1170,15 @@ async fn dispatch_ui_command(
             }
             Action::Continue
         }
-        CoreCommand::Models => Action::OpenModels(arguments),
+        CoreCommand::Models => Action::OpenModels(String::new()),
         CoreCommand::Effort => {
-            handle_effort(app, services, &arguments).await;
+            open_effort(app, services).await;
             Action::Continue
         }
         CoreCommand::Settings => Action::OpenSettings,
-        CoreCommand::Login => open_login(app, &services.catalog, arguments).await,
-        CoreCommand::Logout => open_logout(app, &services.manager, arguments).await,
-        CoreCommand::Resume => open_resume(app, &services.runtime, arguments).await,
+        CoreCommand::Login => open_login(app, &services.catalog).await,
+        CoreCommand::Logout => open_logout(app, &services.manager).await,
+        CoreCommand::Resume => open_resume(app, services).await,
         CoreCommand::NewSession => Action::NewSession,
         CoreCommand::Compact => Action::Compact,
         CoreCommand::Help => {
@@ -1336,19 +1188,10 @@ async fn dispatch_ui_command(
         }
         CoreCommand::Quit => Action::Quit,
         CoreCommand::SetTerminal => {
-            if arguments.trim().is_empty() {
-                open_set_terminal_prompt(app);
-                Action::Continue
-            } else {
-                Action::SaveTerminal(arguments)
-            }
+            open_set_terminal_prompt(app);
+            Action::Continue
         }
-        CoreCommand::Terminal => Action::OpenTerminal {
-            command: {
-                let command = arguments.trim();
-                (!command.is_empty()).then(|| command.to_string())
-            },
-        },
+        CoreCommand::Terminal => Action::OpenTerminal,
     }
 }
 
@@ -1394,22 +1237,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             return Action::Continue;
         }
         Some("tasks") => {
-            return dispatch_ui_command(
-                app,
-                CommandTarget::Core(CoreCommand::Tasks),
-                String::new(),
-                services,
-            )
-            .await;
+            return dispatch_ui_command(app, CommandTarget::Core(CoreCommand::Tasks), services)
+                .await;
         }
         Some("status") => {
-            return dispatch_ui_command(
-                app,
-                CommandTarget::Core(CoreCommand::Status),
-                String::new(),
-                services,
-            )
-            .await;
+            return dispatch_ui_command(app, CommandTarget::Core(CoreCommand::Status), services)
+                .await;
         }
         Some("copy") => {
             copy_current_surface(app);
@@ -1427,7 +1260,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             Action::Continue
         }
         Some("command") => {
-            app.reset_command_input();
+            app.reset_command_selection();
             app.overlay = Some(Overlay::Command);
             Action::Continue
         }
@@ -1485,7 +1318,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
         }
         Some(action) => {
             if let Some(target) = app.commands.target_for_action(action) {
-                dispatch_ui_command(app, target, String::new(), services).await
+                dispatch_ui_command(app, target, services).await
             } else {
                 Action::Continue
             }
@@ -1518,51 +1351,10 @@ async fn handle_overlay_key(
                 Action::Continue
             }
         },
-        Overlay::Command => match app.keymap.action("command", key_name).as_deref() {
-            Some("quit") => Action::Quit,
-            Some("cancel") => {
-                app.reset_command_input();
-                app.overlay = None;
-                Action::Continue
-            }
-            Some("backspace") => {
-                app.command_line.pop();
-                app.command_selected = 0;
-                app.command_stem = None;
-                Action::Continue
-            }
-            Some("previous") => {
-                app.command_selected = app.command_selected.saturating_sub(1);
-                Action::Continue
-            }
-            Some("next") => {
-                let count = app.filtered_commands().len();
-                if count > 0 {
-                    app.command_selected = (app.command_selected + 1).min(count - 1);
-                }
-                Action::Continue
-            }
-            Some("confirm") => confirm_command(app, services).await,
-            Some("complete") => {
-                app.complete_command(false);
-                Action::Continue
-            }
-            Some("complete_previous") => {
-                app.complete_command(true);
-                Action::Continue
-            }
-            _ => {
-                if let KeyCode::Char(character) = key.code
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                {
-                    app.command_line.push(character);
-                    app.command_selected = 0;
-                    app.command_stem = None;
-                }
-                Action::Continue
-            }
+        Overlay::Command => match apply_command_key(app, key_name) {
+            CommandKey::Quit => Action::Quit,
+            CommandKey::Confirm => confirm_command(app, services).await,
+            CommandKey::Continue => Action::Continue,
         },
         Overlay::Selector => handle_selector_key(app, key, key_name, services).await,
         Overlay::Text => handle_text_key(app, key, key_name),
@@ -1719,25 +1511,42 @@ async fn handle_overlay_key(
 }
 
 async fn confirm_command(app: &mut App, services: &LoopServices) -> Action {
-    let filtered = app.filtered_commands();
-    let entered = std::mem::take(&mut app.command_line);
-    app.command_stem = None;
+    let commands = app.commands.list();
     app.overlay = None;
-    if let Some(command) = filtered.get(app.command_selected).cloned() {
-        let arguments = entered
-            .trim()
-            .split_once(char::is_whitespace)
-            .map(|(_, rest)| rest.trim().to_string())
-            .unwrap_or_default();
-        return dispatch_ui_command(app, command.target, arguments, services).await;
-    }
-    if let Some(command) = app.commands.resolve(&entered) {
-        return dispatch_ui_command(app, command.spec.target, command.arguments, services).await;
-    }
-    if !entered.trim().is_empty() {
-        app.set_flash(format!("Unknown command :{}", entered.trim()));
+    if let Some(command) = commands.get(app.command_selected).cloned() {
+        return dispatch_ui_command(app, command.target, services).await;
     }
     Action::Continue
+}
+
+enum CommandKey {
+    Continue,
+    Confirm,
+    Quit,
+}
+
+fn apply_command_key(app: &mut App, key_name: &str) -> CommandKey {
+    match app.keymap.action("command", key_name).as_deref() {
+        Some("quit") => CommandKey::Quit,
+        Some("cancel") => {
+            app.reset_command_selection();
+            app.overlay = None;
+            CommandKey::Continue
+        }
+        Some("previous") => {
+            app.command_selected = app.command_selected.saturating_sub(1);
+            CommandKey::Continue
+        }
+        Some("next") => {
+            let count = app.commands.list().len();
+            if count > 0 {
+                app.command_selected = (app.command_selected + 1).min(count - 1);
+            }
+            CommandKey::Continue
+        }
+        Some("confirm") => CommandKey::Confirm,
+        _ => CommandKey::Continue,
+    }
 }
 
 enum SelectorKey {
@@ -1802,7 +1611,7 @@ fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -> SelectorK
     }
 }
 
-async fn confirm_selector(app: &mut App, _services: &LoopServices) -> Action {
+async fn confirm_selector(app: &mut App, services: &LoopServices) -> Action {
     let Some(selector) = app.selector.take() else {
         app.overlay = None;
         return Action::Continue;
@@ -1832,6 +1641,14 @@ async fn confirm_selector(app: &mut App, _services: &LoopServices) -> Action {
         },
         SelectorKind::Logout => Action::Logout { provider: item.id },
         SelectorKind::Resume => Action::Resume(item.id),
+        SelectorKind::Effort { provider, model } => {
+            let Ok(thinking) = item.id.parse::<ThinkingLevel>() else {
+                app.set_flash("The selected effort is invalid");
+                return Action::Continue;
+            };
+            set_effort(app, services, &provider, &model, thinking).await;
+            Action::Continue
+        }
     }
 }
 
@@ -2013,7 +1830,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         },
         MouseEventKind::ScrollDown => match app.overlay {
             Some(Overlay::Command) => {
-                let count = app.filtered_commands().len();
+                let count = app.commands.list().len();
                 if count > 0 {
                     app.command_selected = (app.command_selected + 1).min(count - 1);
                 }
@@ -2111,11 +1928,7 @@ fn open_status(app: &mut App) {
     app.overlay = Some(Overlay::Status);
 }
 
-async fn open_login(app: &mut App, catalog: &ModelCatalog, arguments: String) -> Action {
-    let provider = arguments.trim().to_string();
-    if !provider.is_empty() {
-        return open_login_method(app, provider);
-    }
+async fn open_login(app: &mut App, catalog: &ModelCatalog) -> Action {
     let current = app.info.provider.clone();
     let mut seen = std::collections::BTreeSet::new();
     let mut items = Vec::new();
@@ -2244,10 +2057,8 @@ async fn save_terminal(app: &mut App, services: &LoopServices, command: String) 
     }
 }
 
-fn open_pty(app: &mut App, command: Option<String>) {
-    let command = command
-        .or_else(|| app.info.terminal.clone())
-        .unwrap_or_default();
+fn open_pty(app: &mut App) {
+    let command = app.info.terminal.clone().unwrap_or_default();
     if command.trim().is_empty() {
         app.set_flash("尚未配置，请运行 :set-terminal");
         return;
@@ -2367,11 +2178,7 @@ fn close_pty(app: &mut App, message: &str) {
     app.set_flash(message);
 }
 
-async fn open_logout(app: &mut App, manager: &ConfigManager, arguments: String) -> Action {
-    let provider = arguments.trim().to_string();
-    if !provider.is_empty() {
-        return Action::Logout { provider };
-    }
+async fn open_logout(app: &mut App, manager: &ConfigManager) -> Action {
     let items = manager
         .stored_credentials()
         .await
@@ -2391,21 +2198,29 @@ async fn open_logout(app: &mut App, manager: &ConfigManager, arguments: String) 
     Action::Continue
 }
 
-async fn open_resume(app: &mut App, runtime: &AgentRuntime, arguments: String) -> Action {
-    let id = arguments.trim().to_string();
-    if !id.is_empty() {
-        return Action::Resume(id);
-    }
-    match runtime.session().list_for_project().await {
+async fn open_resume(app: &mut App, services: &LoopServices) -> Action {
+    match services.runtime.session().list_for_project().await {
         Ok(sessions) => {
             if sessions.is_empty() {
                 app.set_flash("No sessions in this project");
                 return Action::Continue;
             }
-            let items = sessions
-                .into_iter()
-                .map(|session| resume_item(&app.info.session_id, session))
-                .collect();
+            let current = app.info.session_id.clone();
+            let mut items = Vec::with_capacity(sessions.len());
+            for session in sessions {
+                let configured = services
+                    .manager
+                    .thinking_for_model(&session.provider, &session.model)
+                    .await;
+                let thinking = effective_thinking(
+                    &services.catalog,
+                    &session.provider,
+                    &session.model,
+                    configured,
+                )
+                .await;
+                items.push(resume_item(&current, session, thinking));
+            }
             app.selector = Some(SelectorState::new(SelectorKind::Resume, "RESUME", items));
             app.overlay = Some(Overlay::Selector);
         }
@@ -2414,15 +2229,16 @@ async fn open_resume(app: &mut App, runtime: &AgentRuntime, arguments: String) -
     Action::Continue
 }
 
-fn resume_item(current: &str, session: SessionSummary) -> SelectorItem {
+fn resume_item(current: &str, session: SessionSummary, thinking: ThinkingLevel) -> SelectorItem {
     let marker = if session.id == current { "● " } else { "" };
     SelectorItem {
         id: session.id.clone(),
         title: format!("{marker}{}", session.id),
         description: format!(
-            "{}/{} · {}",
+            "{}/{} · effort {} · {}",
             session.provider,
             session.model,
+            thinking,
             single_line_preview(&session.preview, 48)
         ),
     }
@@ -2561,7 +2377,7 @@ async fn select_model(
     }
 }
 
-async fn handle_effort(app: &mut App, services: &LoopServices, arguments: &str) {
+async fn open_effort(app: &mut App, services: &LoopServices) {
     let active = services.manager.current().await;
     if !active.model_configured() {
         app.set_flash("No active model; choose one with :model");
@@ -2574,49 +2390,56 @@ async fn handle_effort(app: &mut App, services: &LoopServices, arguments: &str) 
         ));
         return;
     };
+    app.selector = Some(effort_selector(&active, &model));
+    app.overlay = Some(Overlay::Selector);
+}
+
+fn effort_selector(active: &ActiveSettings, model: &CatalogModel) -> SelectorState {
     let available = ThinkingLevel::ALL
         .into_iter()
         .filter(|level| model.supports_thinking_level(*level))
         .collect::<Vec<_>>();
-    let available_label = available
+    let effective = clamp_thinking_level(model, active.thinking);
+    let selected = available
         .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let key = format!("{}/{}", active.provider, active.model);
-    let requested = arguments.trim();
-    if requested.is_empty() {
-        let effective = clamp_thinking_level(&model, active.thinking);
-        app.set_flash(if effective == active.thinking {
-            format!("Effort for {key}: {effective} · available: {available_label}")
-        } else {
-            format!(
-                "Effort for {key}: {effective} ({} requested by {}) · available: {available_label}",
-                active.thinking,
-                active.thinking_source.label()
-            )
-        });
-        return;
-    }
-    let requested = match requested.parse::<ThinkingLevel>() {
-        Ok(level) => level,
-        Err(_) => {
-            app.set_flash(format!(
-                "Unknown effort {requested:?} · available for {key}: {available_label}"
-            ));
-            return;
-        }
-    };
-    if !available.contains(&requested) {
-        app.set_flash(format!(
-            "Effort {requested} is not supported by {key} · available: {available_label}"
-        ));
-        return;
-    }
+        .position(|level| *level == effective)
+        .unwrap_or_default();
+    let items = available
+        .into_iter()
+        .map(|level| SelectorItem {
+            id: level.to_string(),
+            title: level.to_string(),
+            description: if level == effective {
+                "current".to_string()
+            } else {
+                format!("available for {}/{}", model.provider, model.id)
+            },
+        })
+        .collect();
+    let mut selector = SelectorState::new(
+        SelectorKind::Effort {
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+        },
+        format!("EFFORT · {}/{}", model.provider, model.id),
+        items,
+    );
+    selector.selected = selected;
+    selector
+}
+
+async fn set_effort(
+    app: &mut App,
+    services: &LoopServices,
+    provider: &str,
+    model: &str,
+    requested: ThinkingLevel,
+) {
+    let key = format!("{provider}/{model}");
     let result = async {
         let active = services
             .manager
-            .set_model_thinking(&model.provider, &model.id, requested)
+            .set_model_thinking(provider, model, requested)
             .await?;
         apply_active(
             app,
@@ -2630,7 +2453,7 @@ async fn handle_effort(app: &mut App, services: &LoopServices, arguments: &str) 
     }
     .await;
     app.set_flash(match result {
-        Ok(active) if active.thinking == requested => {
+        Ok(_) if app.info.thinking == requested => {
             format!("Effort for {key} set to {requested}")
         }
         Ok(active) => format!(
@@ -2640,6 +2463,18 @@ async fn handle_effort(app: &mut App, services: &LoopServices, arguments: &str) 
         ),
         Err(error) => format!("Could not set effort for {key}: {error:#}"),
     });
+}
+
+async fn effective_thinking(
+    catalog: &ModelCatalog,
+    provider: &str,
+    model: &str,
+    configured: ThinkingLevel,
+) -> ThinkingLevel {
+    catalog
+        .model(provider, model)
+        .await
+        .map_or(configured, |model| clamp_thinking_level(&model, configured))
 }
 
 fn key_name(key: KeyEvent) -> String {
@@ -2873,6 +2708,8 @@ async fn apply_active(
     output.set_limit(active.output_limit);
     app.info.provider.clone_from(&active.provider);
     app.info.model.clone_from(&active.model);
+    app.info.thinking =
+        effective_thinking(catalog, &active.provider, &active.model, active.thinking).await;
     app.info.context_window = context_window;
     app.info.model_ready = model_ready;
     app.info.provider_count = catalog.providers().await.len();
@@ -2998,7 +2835,10 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let model = if app.info.model_ready {
         Line::styled(
             single_line_preview(
-                &format!("{} / {}", app.info.provider, app.info.model),
+                &format!(
+                    "{} / {} · effort {}",
+                    app.info.provider, app.info.model, app.info.thinking
+                ),
                 width.saturating_sub(1),
             ),
             Style::default().fg(TEXT),
@@ -3074,11 +2914,12 @@ fn compact_model(app: &App) -> String {
     if !app.info.model_ready || app.info.model.is_empty() {
         return "no-model".to_string();
     }
-    if app.info.provider_count > 1 {
+    let model = if app.info.provider_count > 1 {
         format!("{}/{}", app.info.provider, app.info.model)
     } else {
         app.info.model.clone()
-    }
+    };
+    format!("{model} · effort {}", app.info.thinking)
 }
 
 fn context_percent(app: &App) -> f64 {
@@ -3605,7 +3446,10 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<
         status_row(
             "MODEL",
             if app.info.model_ready {
-                format!("{} / {}", app.info.provider, app.info.model)
+                format!(
+                    "{} / {} · effort {}",
+                    app.info.provider, app.info.model, app.info.thinking
+                )
             } else {
                 "not configured · :login".to_string()
             },
@@ -3697,19 +3541,8 @@ fn status_row(
 
 fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    frame.render_widget(
-        block.title(" COMMAND · Tab complete · Enter run · Esc close "),
-        area,
-    );
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(format!(":{}█", app.command_line)).style(Style::default().fg(TEXT)),
-        sections[0],
-    );
-    let commands = app.filtered_commands();
+    frame.render_widget(block.title(" COMMAND · Enter run · Esc close "), area);
+    let commands = app.commands.list();
     let items = commands.iter().enumerate().map(|(index, item)| {
         let selected = index == app.command_selected;
         ListItem::new(Line::from(vec![
@@ -3732,16 +3565,14 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
         .style(Style::default().bg(if selected { BG } else { SURFACE }))
     });
     let mut state = ListState::default().with_selected(Some(app.command_selected));
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    frame.render_stateful_widget(List::new(items), inner, &mut state);
     for index in state.offset()..commands.len() {
-        let y = sections[1]
-            .y
-            .saturating_add((index - state.offset()) as u16);
-        if y >= sections[1].bottom() {
+        let y = inner.y.saturating_add((index - state.offset()) as u16);
+        if y >= inner.bottom() {
             break;
         }
         app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            area: Rect::new(inner.x, y, inner.width, 1),
             target: AppHit::Palette(index),
         });
     }
@@ -4393,6 +4224,7 @@ mod tests {
                 cwd: PathBuf::from("/workspace"),
                 provider: "test".to_string(),
                 model: "model".to_string(),
+                thinking: ThinkingLevel::Off,
                 session_id: "session".to_string(),
                 context_window: 128_000,
                 model_ready: true,
@@ -4441,7 +4273,7 @@ mod tests {
         let mut app = test_app();
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("/workspace"));
-        assert!(rendered.contains("test / model"));
+        assert!(rendered.contains("test / model · effort off"));
         assert!(rendered.contains("i compose · : commands · ? help"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("ctx "));
@@ -4453,7 +4285,10 @@ mod tests {
             .expect("welcome project row");
         assert_eq!(project_row, 13);
         assert_eq!(lines[project_row].find("/workspace"), Some(45));
-        assert_eq!(lines[project_row + 1].find("test / model"), Some(44));
+        assert_eq!(
+            lines[project_row + 1].find("test / model · effort off"),
+            Some(38)
+        );
         let hint_row = project_row + 3;
         assert!(lines[hint_row].contains("i compose · : commands · ? help"));
         assert_eq!(lines[hint_row].find("i compose"), Some(35));
@@ -4461,7 +4296,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_footer_only_shows_context_and_model() {
+    fn conversation_footer_only_shows_context_model_and_effort() {
         let mut app = test_app();
         app.push(
             BlockKind::Assistant,
@@ -4480,7 +4315,11 @@ mod tests {
         // leaves richer project and usage details to the expanded status panel.
         assert!(!rendered.contains("URI Agent"));
         assert!(!rendered.contains("ready"));
-        assert!(footer.trim_start().starts_with("model  ········ 0.0%/128k"));
+        assert!(
+            footer
+                .trim_start()
+                .starts_with("model · effort off  ········ 0.0%/128k")
+        );
         assert!(!footer.contains("ctx"));
         assert!(footer.contains("model"));
         assert!(!footer.contains("URI"));
@@ -4499,7 +4338,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let model = &terminal.backend().buffer()[(0, 23)];
-        let context = &terminal.backend().buffer()[(7, 23)];
+        let context = &terminal.backend().buffer()[(20, 23)];
         assert_eq!((context.fg, context.bg), (ACCENT, BG));
         assert!(context.modifier.contains(Modifier::BOLD));
         assert_eq!((model.fg, model.bg), (TEXT, BG));
@@ -4553,12 +4392,13 @@ mod tests {
         assert!(!rendered.contains("↑1.5k"));
         assert!(!rendered.contains("↓600"));
         assert!(!rendered.contains("$0.012"));
-        assert!(rendered.contains("test/model  ▓······· 10.0%/262k"));
+        assert!(rendered.contains("test/model · effort off  ▓······· 10.0%/262k"));
         assert!(!rendered.contains("last hit 25.0%"));
 
         app.overlay = Some(Overlay::Status);
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("STATUS · F4 toggle"));
+        assert!(rendered.contains("test / model · effort off"));
         assert!(rendered.contains("26k / 262k · 10.0%"));
         assert!(rendered.contains("read 500 · write 0 · last hit 25.0%"));
         assert!(rendered.contains("$0.0123"));
@@ -4669,7 +4509,7 @@ mod tests {
         app.skip_splash();
         let rendered = render_to_string(&mut app, 80, 24);
         assert!(rendered.contains("/workspace"));
-        assert!(rendered.contains("test / model"));
+        assert!(rendered.contains("test / model · effort off"));
         assert!(rendered.contains("i compose · : commands · ? help"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("ctx "));
@@ -4780,43 +4620,90 @@ mod tests {
     }
 
     #[test]
-    fn command_panel_tab_completes_unique_and_cycles_ambiguous_prefixes() {
+    fn command_panel_is_selection_only() {
         let mut app = test_app();
-        app.command_line = "te".to_string();
-        app.complete_command(false);
-        assert_eq!(app.command_line, "terminal");
-
-        app.command_line = "t".to_string();
-        app.complete_command(false);
-        assert_eq!(app.command_line, "tasks");
-        app.complete_command(false);
-        assert_eq!(app.command_line, "terminal");
-        app.complete_command(false);
-        assert_eq!(app.command_line, "tasks");
-        app.complete_command(true);
-        assert_eq!(app.command_line, "terminal");
-
-        app.command_line = "q".to_string();
-        app.complete_command(false);
-        assert_eq!(app.command_line, "quit");
-
-        app.command_line = "terminal bash".to_string();
-        app.complete_command(false);
-        assert_eq!(app.command_line, "terminal bash");
+        app.overlay = Some(Overlay::Command);
+        app.command_selected = 2;
+        handle_paste(&mut app, "effort high".to_string());
+        assert_eq!(app.command_selected, 2);
+        assert!(matches!(
+            apply_command_key(&mut app, "e"),
+            CommandKey::Continue
+        ));
+        assert_eq!(app.command_selected, 2);
+        let rendered = render_to_string(&mut app, 100, 32);
+        assert!(rendered.contains("COMMAND · Enter run · Esc close"));
+        assert!(!rendered.contains("Tab complete"));
+        assert!(!rendered.contains("effort high"));
+        assert!(!rendered.contains('█'));
     }
 
     #[test]
-    fn command_panel_tab_expands_common_prefix_before_cycling() {
-        let mut app = test_app();
-        app.command_line = "se".to_string();
-        app.complete_command(false);
-        assert_eq!(app.command_line, "set");
-        app.complete_command(false);
-        assert_eq!(app.command_line, "set-terminal");
-        app.complete_command(false);
-        assert_eq!(app.command_line, "settings");
-        app.complete_command(true);
-        assert_eq!(app.command_line, "set-terminal");
+    fn effort_command_uses_a_selector_with_the_current_level_selected() {
+        let active = ActiveSettings {
+            provider: "openai".to_string(),
+            model: "reasoning-model".to_string(),
+            api_key: None,
+            auth_kind: AuthKind::None,
+            output_limit: 32 * 1024,
+            thinking: ThinkingLevel::High,
+            provider_source: ValueSource::Global,
+            model_source: ValueSource::Global,
+            api_key_source: ValueSource::Default,
+            output_limit_source: ValueSource::Global,
+            thinking_source: ValueSource::Global,
+            terminal: None,
+            terminal_source: ValueSource::Default,
+            credential_environment: BTreeMap::new(),
+        };
+        let model = serde_json::from_value(serde_json::json!({
+            "id": "reasoning-model",
+            "name": "Reasoning model",
+            "api": "openai-responses",
+            "provider": "openai",
+            "baseUrl": "https://example.test/v1",
+            "reasoning": true
+        }))
+        .unwrap();
+        let selector = effort_selector(&active, &model);
+        assert!(matches!(selector.kind, SelectorKind::Effort { .. }));
+        assert_eq!(
+            selector.selected_item().map(|item| item.id.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            selector
+                .selected_item()
+                .map(|item| item.description.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            selector
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["off", "minimal", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn resume_model_description_includes_effort() {
+        let item = resume_item(
+            "session",
+            SessionSummary {
+                id: "session".to_string(),
+                updated_at: chrono::Utc::now(),
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                preview: "continue the work".to_string(),
+            },
+            ThinkingLevel::Medium,
+        );
+        assert_eq!(
+            item.description,
+            "openai/gpt-5 · effort medium · continue the work"
+        );
     }
 
     #[test]
@@ -4998,7 +4885,7 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 24);
         let rows = rendered.lines().collect::<Vec<_>>();
         assert!(rows[22].contains("thinking"));
-        assert!(rows[23].contains("model  ········ 0.0%/128k"));
+        assert!(rows[23].contains("model · effort off  ········ 0.0%/128k"));
         app.apply(SessionEvent {
             sequence: 2,
             at: chrono::Utc::now(),

@@ -164,6 +164,7 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
             cwd: config.cwd.clone(),
             provider: initial.provider,
             model: initial.model,
+            thinking: initial.thinking,
             session_id: session.id().to_string(),
             context_window,
             model_ready,

@@ -189,7 +189,7 @@ fn core_commands() -> Vec<CommandSpec> {
         CommandSpec::new(
             "effort",
             "Thinking effort",
-            "show or set thinking effort for the active model",
+            "select thinking effort for the active model",
             ["thinking"],
             CommandTarget::Core(Effort),
         ),

@@ -56,9 +56,9 @@ URI Agent does not choose a default model. In the TUI:
 2. Run `:model` and select a runnable model.
 3. Press `i`, enter a request, and press `Enter` to send it.
 
-When setup is complete, the welcome view shows the selected provider and model instead of the setup prompt; submitted requests and responses then appear in the conversation.
+When setup is complete, the welcome view shows the selected provider, model, and thinking effort instead of the setup prompt; submitted requests and responses then appear in the conversation.
 
-`Shift+Enter` inserts a newline, `Esc` closes the composer while preserving its draft, `:` opens the command panel, and `F1` shows the active keymap and command reference.
+`Shift+Enter` inserts a newline, `Esc` closes the composer while preserving its draft, `:` opens the selection-only command panel, and `F1` shows the active keymap and command reference. Commands that need a value open a selector or a separate input float.
 
 ## How protocols look
 

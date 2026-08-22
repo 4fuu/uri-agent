@@ -291,6 +291,18 @@ impl ConfigManager {
         self.active.read().await.clone()
     }
 
+    pub async fn thinking_for_model(&self, provider: &str, model: &str) -> ThinkingLevel {
+        let files = self.files.lock().await;
+        let (configured, _) = configured_thinking(&files, provider, model);
+        drop(files);
+        let active = self.active.read().await;
+        if active.thinking_source.externally_overridden() {
+            active.thinking
+        } else {
+            configured
+        }
+    }
+
     pub async fn reload(&self) -> Result<ActiveSettings> {
         self.catalog.reload_user_overrides().await?;
         let mut files = self.files.lock().await;
@@ -520,20 +532,7 @@ async fn calculate_active(
         bail!("output limit must be at least 1024 bytes");
     }
 
-    let (mut thinking, mut thinking_source) = setting(
-        ThinkingLevel::Off,
-        files.global.default_thinking_level,
-        files.project.default_thinking_level,
-    );
-    let thinking_key = model_setting_key(&provider, &model);
-    if let Some(value) = files.global.model_thinking_levels.get(&thinking_key) {
-        thinking = *value;
-        thinking_source = ValueSource::Global;
-    }
-    if let Some(value) = files.project.model_thinking_levels.get(&thinking_key) {
-        thinking = *value;
-        thinking_source = ValueSource::Project;
-    }
+    let (mut thinking, mut thinking_source) = configured_thinking(files, &provider, &model);
     if let Ok(value) = env::var("URI_AGENT_THINKING")
         && !value.trim().is_empty()
     {
@@ -626,6 +625,28 @@ async fn calculate_active(
         terminal_source,
         credential_environment,
     })
+}
+
+fn configured_thinking(
+    files: &ConfigFiles,
+    provider: &str,
+    model: &str,
+) -> (ThinkingLevel, ValueSource) {
+    let (mut thinking, mut source) = setting(
+        ThinkingLevel::Off,
+        files.global.default_thinking_level,
+        files.project.default_thinking_level,
+    );
+    let key = model_setting_key(provider, model);
+    if let Some(value) = files.global.model_thinking_levels.get(&key) {
+        thinking = *value;
+        source = ValueSource::Global;
+    }
+    if let Some(value) = files.project.model_thinking_levels.get(&key) {
+        thinking = *value;
+        source = ValueSource::Project;
+    }
+    (thinking, source)
 }
 
 async fn refresh_stored_oauth(files: &mut ConfigFiles, auth_path: &Path) -> Result<()> {
@@ -910,6 +931,16 @@ mod tests {
         assert_eq!(
             saved["modelThinkingLevels"]["anthropic/claude-opus-4-6"],
             "medium"
+        );
+        assert_eq!(
+            manager.thinking_for_model("openai", "gpt-5.2").await,
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            manager
+                .thinking_for_model("anthropic", "claude-opus-4-6")
+                .await,
+            ThinkingLevel::Medium
         );
 
         let files = manager.files.lock().await;

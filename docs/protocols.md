@@ -173,7 +173,7 @@ First-party capabilities use the same plugin path exposed to linked Rust extensi
 1. A [`Plugin`](../src/plugin.rs) declares protocol descriptors before a new session's prompt is frozen.
 2. `PluginRegistry` validates descriptor names and rejects duplicates.
 3. The plugin installs protocols, commands, panel providers, or status providers through `PluginHost`.
-4. Registered protocols remain behind `read` and `exec`; registered commands join the command panel, colon command line, and key-bindable command registry.
+4. Registered protocols remain behind `read` and `exec`; registered commands join the selection-only command panel and key-bindable command registry.
 
 TUI extensions return generic documents and semantic status items. Status providers run while frames are drawn, so they must be fast and non-blocking. They receive `TuiStatusContext`, whose `expanded` flag allows concise footer content and richer content in the status panel.
 

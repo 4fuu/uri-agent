@@ -143,11 +143,7 @@ Thinking defaults to `off`. Supported values are:
 off, minimal, low, medium, high, xhigh, max
 ```
 
-The active model determines which levels are available. Run `:effort` to inspect the current value and supported levels, or set one directly:
-
-```text
-:effort high
-```
+The active model determines which levels are available. Run `:effort` to open a selector containing only supported levels; the current effective level is selected when the panel opens.
 
 `:effort` and the Thinking row in Settings persist the selection in `modelThinkingLevels` under `provider/model`. Switching models restores that model's saved value. `defaultThinkingLevel` is the file-level fallback; `URI_AGENT_THINKING` and `--thinking` override it for the current invocation.
 
