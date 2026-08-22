@@ -20,6 +20,7 @@ futures-util = "0.3"
 getrandom = "0.2"
 http = "1"
 portable-pty = "0.9"
+pulldown-cmark = { version = "0.10", default-features = false }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rig = { package = "rig-core", git = "https://github.com/0xPlaygrounds/rig", rev = "abe338a" }

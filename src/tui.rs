@@ -1,4 +1,5 @@
 mod animation;
+mod markdown;
 mod model_selector;
 
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
@@ -96,6 +97,13 @@ struct DisplayBlock {
     call_id: Option<String>,
     failed: bool,
     expanded: bool,
+    tool: Option<ToolDisplay>,
+}
+
+struct ToolDisplay {
+    name: String,
+    arguments: serde_json::Value,
+    output: Option<String>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -355,6 +363,11 @@ struct App {
     frame: usize,
     composer_scroll: (u16, u16),
     transcript_body_width: usize,
+    transcript_offset: usize,
+    transcript_rows: usize,
+    transcript_height: usize,
+    transcript_follow_tail: bool,
+    transcript_center_selected: bool,
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
@@ -415,6 +428,11 @@ impl App {
             frame: 0,
             composer_scroll: (0, 0),
             transcript_body_width: 72,
+            transcript_offset: 0,
+            transcript_rows: 0,
+            transcript_height: 0,
+            transcript_follow_tail: true,
+            transcript_center_selected: false,
             started: Instant::now(),
             splash_skipped: false,
             last_sequence: None,
@@ -466,7 +484,7 @@ impl App {
             return;
         }
         self.last_sequence = Some(event.sequence);
-        let follow =
+        let select_tail =
             self.blocks.is_empty() || self.selected_block == self.blocks.len().saturating_sub(1);
         match event.kind {
             EventKind::SessionCreated { .. }
@@ -503,8 +521,13 @@ impl App {
                     format!("CALL\n{text}"),
                     Some(call_id),
                     false,
-                    true,
+                    false,
                 );
+                self.blocks.last_mut().unwrap().tool = Some(ToolDisplay {
+                    name,
+                    arguments,
+                    output: None,
+                });
             }
             EventKind::ToolResult {
                 call_id,
@@ -519,14 +542,17 @@ impl App {
                     .find(|block| block.call_id.as_deref() == Some(&call_id))
                 {
                     block.failed = failed;
+                    if let Some(tool) = block.tool.as_mut() {
+                        tool.output = Some(output.clone());
+                    }
                     block.text.push_str(if failed {
                         "\n\nERROR\n"
                     } else {
                         "\n\nRESULT\n"
                     });
                     block.text.push_str(&output);
-                    block.expanded = true;
                 } else {
+                    let tool_output = output.clone();
                     self.push(
                         if failed {
                             BlockKind::Error
@@ -539,6 +565,11 @@ impl App {
                         failed,
                         true,
                     );
+                    self.blocks.last_mut().unwrap().tool = Some(ToolDisplay {
+                        name,
+                        arguments: serde_json::Value::Null,
+                        output: Some(tool_output),
+                    });
                 }
                 self.activity = Some(Activity::Thinking);
             }
@@ -611,7 +642,7 @@ impl App {
                 }
             }
         }
-        if follow {
+        if select_tail {
             self.selected_block = self.blocks.len().saturating_sub(1);
         }
         style_input(&mut self.input, self.busy);
@@ -646,6 +677,7 @@ impl App {
             call_id,
             failed,
             expanded,
+            tool: None,
         });
     }
 
@@ -718,6 +750,8 @@ impl App {
             .unwrap_or(0);
         let next = wrapped_index(current, distance, indices.len());
         self.selected_block = indices[next];
+        self.transcript_follow_tail = false;
+        self.transcript_center_selected = true;
     }
 
     fn jump_to(&mut self, kind: JumpKind) {
@@ -744,6 +778,8 @@ impl App {
                 .unwrap_or(0),
         };
         self.selected_block = indices[next];
+        self.transcript_follow_tail = false;
+        self.transcript_center_selected = true;
     }
 
     fn toggle_selected(&mut self) {
@@ -751,8 +787,12 @@ impl App {
         let Some(block) = self.blocks.get_mut(self.selected_block) else {
             return;
         };
+        if matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
+            return;
+        }
         if !block.expanded {
             block.expanded = true;
+            self.transcript_center_selected = true;
             return;
         }
         let preview_limit = if block.kind == BlockKind::Tool {
@@ -767,6 +807,21 @@ impl App {
         } else {
             block.expanded = false;
         }
+        self.transcript_center_selected = true;
+    }
+
+    fn scroll_transcript(&mut self, distance: isize) {
+        let max_offset = self.transcript_rows.saturating_sub(self.transcript_height);
+        self.transcript_offset = if distance < 0 {
+            self.transcript_offset
+                .saturating_sub(distance.unsigned_abs())
+        } else {
+            self.transcript_offset
+                .saturating_add(distance as usize)
+                .min(max_offset)
+        };
+        self.transcript_follow_tail = self.transcript_offset >= max_offset;
+        self.transcript_center_selected = false;
     }
 
     fn reset_command_search(&mut self) {
@@ -1420,12 +1475,16 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
         Some("first") => {
             if let Some(index) = app.filtered_indices().first().copied() {
                 app.selected_block = index;
+                app.transcript_follow_tail = false;
+                app.transcript_center_selected = true;
             }
             Action::Continue
         }
         Some("last") => {
             if let Some(index) = app.filtered_indices().last().copied() {
                 app.selected_block = index;
+                app.transcript_follow_tail = true;
+                app.transcript_center_selected = true;
             }
             Action::Continue
         }
@@ -1968,7 +2027,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
             Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_sub(3),
-            None => app.move_selection(-3),
+            None => app.scroll_transcript(-3),
         },
         MouseEventKind::ScrollDown => match app.overlay {
             Some(Overlay::Command) => {
@@ -1994,7 +2053,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
             Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_add(3),
-            None => app.move_selection(3),
+            None => app.scroll_transcript(3),
         },
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = hit_target(&app.hit_regions, mouse) else {
@@ -2004,10 +2063,10 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             match target {
                 AppHit::Transcript(index) => {
                     app.selected_block = index;
-                    if let Some(block) = app.blocks.get_mut(index) {
-                        block.expanded = !block.expanded;
-                    }
-                    if activate {
+                    app.transcript_follow_tail = false;
+                    if app.blocks.get(index).is_some_and(|block| {
+                        !matches!(block.kind, BlockKind::User | BlockKind::Assistant)
+                    }) {
                         app.toggle_selected();
                     }
                 }
@@ -2874,11 +2933,172 @@ fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
 }
 
 fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
-    let name = name.to_ascii_uppercase();
-    let Some(uri) = arguments.get("uri").and_then(serde_json::Value::as_str) else {
-        return name;
+    let action = match name {
+        "read" => "Read",
+        "exec" => "Ran",
+        _ => return name.to_string(),
     };
-    format!("{name} · {}", single_line_preview(uri, 72))
+    let Some(uri) = arguments.get("uri").and_then(serde_json::Value::as_str) else {
+        return action.to_string();
+    };
+    let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
+    if name == "exec"
+        && matches!(protocol, "bash" | "pwsh")
+        && let Some(command) = arguments.get("body").and_then(serde_json::Value::as_str)
+    {
+        return format!(
+            "$ {}",
+            single_line_preview(command.lines().next().unwrap_or_default(), 76)
+        );
+    }
+    if name == "exec" && protocol == "apply_patch" {
+        let files = arguments
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .map(patch_targets)
+            .unwrap_or_default();
+        if let Some(first) = files.first() {
+            let more = files.len().saturating_sub(1);
+            return format!(
+                "Patched {}{}",
+                single_line_preview(first, 64),
+                if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        return "Applied patch".to_string();
+    }
+    if name == "exec" && protocol == "replace" {
+        return format!("Edited {}", single_line_preview(target, 72));
+    }
+    if name == "read" && protocol == "file" {
+        return format!("Read {}", single_line_preview(target, 76));
+    }
+    if target == "help" {
+        return format!("Read {protocol} help");
+    }
+    format!("{action} {}", single_line_preview(uri, 76))
+}
+
+fn patch_targets(patch: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in patch.lines() {
+        let path = ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix));
+        if let Some(path) = path
+            && !targets.iter().any(|target| target == path)
+        {
+            targets.push(path.to_string());
+        }
+    }
+    targets
+}
+
+fn tool_detail_lines(
+    block: &DisplayBlock,
+    width: usize,
+    limit: usize,
+) -> (Vec<(String, Color)>, usize) {
+    let mut logical = Vec::new();
+    if let Some(tool) = &block.tool {
+        if let Some(uri) = tool
+            .arguments
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+        {
+            logical.push((format!("↳ {uri}"), MUTED));
+        } else {
+            logical.push((format!("↳ {}", tool.name), MUTED));
+        }
+        tool_argument_details(&tool.arguments, &mut logical);
+        if let Some(output) = &tool.output {
+            for (index, line) in output.lines().enumerate() {
+                logical.push((
+                    format!("{} {line}", if index == 0 { "└" } else { " " }),
+                    if block.failed { ERROR } else { MUTED },
+                ));
+            }
+        }
+    } else if let Some((_, result)) = block
+        .text
+        .split_once("\n\nRESULT\n")
+        .or_else(|| block.text.split_once("\n\nERROR\n"))
+    {
+        for (index, line) in result.lines().enumerate() {
+            logical.push((
+                format!("{} {line}", if index == 0 { "└" } else { " " }),
+                if block.failed { ERROR } else { MUTED },
+            ));
+        }
+    }
+    if logical.is_empty() {
+        logical.push(("Waiting for result…".to_string(), MUTED));
+    }
+
+    let mut wrapped = Vec::new();
+    for (line, color) in logical {
+        let lines = wrapped_block_lines(&line, width.max(1));
+        wrapped.extend(lines.into_iter().map(|line| (line, color)));
+    }
+    let extra = wrapped.len().saturating_sub(limit);
+    wrapped.truncate(limit);
+    (wrapped, extra)
+}
+
+fn tool_argument_details(arguments: &serde_json::Value, lines: &mut Vec<(String, Color)>) {
+    if let Some(fields) = arguments.as_object() {
+        for (key, value) in fields {
+            if matches!(key.as_str(), "uri" | "body") {
+                continue;
+            }
+            lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
+        }
+    }
+    let Some(body) = arguments.get("body") else {
+        return;
+    };
+    match body {
+        serde_json::Value::String(value) => {
+            let files = patch_targets(value);
+            if !files.is_empty() {
+                lines.extend(files.into_iter().map(|file| (format!("  {file}"), MUTED)));
+            } else if value.lines().count() > 1 {
+                lines.extend(
+                    value
+                        .lines()
+                        .skip(1)
+                        .take(3)
+                        .map(|line| (format!("  {line}"), MUTED)),
+                );
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            lines.push((format!("  body: {} items", values.len()), MUTED));
+        }
+        serde_json::Value::Number(value) => lines.push((format!("  body: {value}"), MUTED)),
+        serde_json::Value::Bool(value) => lines.push((format!("  body: {value}"), MUTED)),
+        serde_json::Value::Null => {}
+    }
+}
+
+fn json_value_summary(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => single_line_preview(value, 72),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(values) => format!("{} items", values.len()),
+        serde_json::Value::Object(values) => format!("{} fields", values.len()),
+    }
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -3142,28 +3362,46 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.transcript_body_width = body_width;
     let mut items = Vec::new();
     let mut block_for_row = Vec::new();
+    let mut block_rows = vec![None; app.blocks.len()];
     for (index, block) in app.blocks.iter().enumerate() {
-        if index > 0 {
+        if index > 0 && transcript_needs_gap(app.blocks[index - 1].kind, block.kind) {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
             block_for_row.push(None);
         }
+        let first = items.len();
         for item in transcript_block_items(block, index == app.selected_block, body_width, app) {
             items.push(item);
             block_for_row.push(Some(index));
         }
+        block_rows[index] = Some((first, items.len().saturating_sub(1)));
     }
-    let mut state = ListState::default().with_selected(Some(
-        block_for_row
-            .iter()
-            .position(|index| *index == Some(app.selected_block))
-            .unwrap_or(0),
-    ));
-    frame.render_stateful_widget(
-        List::new(items).block(Block::new().padding(Padding::horizontal(1))),
+    app.transcript_rows = items.len();
+    app.transcript_height = area.height as usize;
+    let max_offset = app.transcript_rows.saturating_sub(app.transcript_height);
+    if app.transcript_follow_tail {
+        app.transcript_offset = max_offset;
+    } else if app.transcript_center_selected
+        && let Some((first, _)) = block_rows.get(app.selected_block).copied().flatten()
+        && (first < app.transcript_offset
+            || first >= app.transcript_offset.saturating_add(app.transcript_height))
+    {
+        app.transcript_offset = first
+            .saturating_sub(app.transcript_height / 2)
+            .min(max_offset);
+    } else {
+        app.transcript_offset = app.transcript_offset.min(max_offset);
+    }
+    app.transcript_center_selected = false;
+    let offset = app.transcript_offset;
+    let visible = items
+        .into_iter()
+        .skip(offset)
+        .take(app.transcript_height)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(visible).block(Block::new().padding(Padding::horizontal(1))),
         area,
-        &mut state,
     );
-    let offset = state.offset();
     for (row, index) in block_for_row.into_iter().enumerate().skip(offset) {
         let y = area.y.saturating_add((row - offset) as u16);
         if y >= area.bottom() {
@@ -3176,6 +3414,10 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             });
         }
     }
+}
+
+fn transcript_needs_gap(previous: BlockKind, current: BlockKind) -> bool {
+    matches!(current, BlockKind::User | BlockKind::Assistant) && previous != current
 }
 
 fn transcript_block_items(
@@ -3202,13 +3444,10 @@ fn transcript_block_items(
 
     match block.kind {
         BlockKind::User => {
-            let limit = if block.expanded {
-                EXPANDED_PREVIEW_LINES
-            } else {
-                3
-            };
-            let (lines, extra) = visible_block_lines(&block.text, body_width, limit);
-            for (index, line) in lines.into_iter().enumerate() {
+            for (index, line) in wrapped_block_lines(&block.text, body_width)
+                .into_iter()
+                .enumerate()
+            {
                 rows.push(transcript_item(
                     vec![
                         Span::styled(selection, Style::default().fg(ACCENT)),
@@ -3221,45 +3460,21 @@ fn transcript_block_items(
                     background,
                 ));
             }
-            if extra > 0 {
-                rows.push(transcript_hint(
-                    selection,
-                    extra,
-                    block.expanded,
-                    background,
-                ));
-            }
         }
         BlockKind::Assistant => {
-            let limit = if block.expanded {
-                EXPANDED_PREVIEW_LINES
-            } else {
-                1
-            };
-            let (lines, extra) = visible_block_lines(&block.text, body_width, limit);
-            for (index, line) in lines.into_iter().enumerate() {
-                let prefix = if index == 0 {
-                    if block.expanded { "• " } else { "▸ " }
-                } else {
-                    "  "
-                };
-                rows.push(transcript_item(
+            for (index, line) in markdown::render(&block.text, body_width)
+                .into_iter()
+                .enumerate()
+            {
+                rows.push(transcript_styled_item(
                     vec![
                         Span::styled(selection, Style::default().fg(ACCENT)),
                         Span::styled(
-                            prefix,
+                            if index == 0 { "• " } else { "  " },
                             Style::default().fg(if live { ACCENT } else { MUTED }),
                         ),
-                        Span::styled(line, Style::default().fg(TEXT)),
                     ],
-                    background,
-                ));
-            }
-            if extra > 0 {
-                rows.push(transcript_hint(
-                    selection,
-                    extra,
-                    block.expanded,
+                    line,
                     background,
                 ));
             }
@@ -3312,7 +3527,13 @@ fn transcript_block_items(
                 animation::spinner(app.frame).to_string()
             } else if block.failed {
                 "×".to_string()
-            } else if block.text.contains("\n\nRESULT\n") {
+            } else if block
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.output.as_ref())
+                .is_some()
+                || block.text.contains("\n\nRESULT\n")
+            {
                 "✓".to_string()
             } else {
                 "·".to_string()
@@ -3338,23 +3559,13 @@ fn transcript_block_items(
                 background,
             ));
             if block.expanded {
-                let (lines, extra) = visible_block_lines(&block.text, body_width, 10);
-                for line in lines {
-                    let label = matches!(line.as_str(), "CALL" | "RESULT" | "ERROR");
+                let (lines, extra) = tool_detail_lines(block, body_width, 8);
+                for (line, color) in lines {
                     rows.push(transcript_item(
                         vec![
                             Span::styled(selection, Style::default().fg(ACCENT)),
                             Span::raw("  "),
-                            Span::styled(
-                                line,
-                                Style::default()
-                                    .fg(if label { WARM } else { MUTED })
-                                    .add_modifier(if label {
-                                        Modifier::BOLD
-                                    } else {
-                                        Modifier::empty()
-                                    }),
-                            ),
+                            Span::styled(line, Style::default().fg(color)),
                         ],
                         background,
                     ));
@@ -3421,6 +3632,15 @@ fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'st
     ListItem::new(Line::from(spans)).style(Style::default().bg(background))
 }
 
+fn transcript_styled_item(
+    mut prefix: Vec<Span<'static>>,
+    line: Line<'static>,
+    background: Color,
+) -> ListItem<'static> {
+    prefix.extend(line.spans);
+    ListItem::new(Line::from(prefix).style(line.style)).style(Style::default().bg(background))
+}
+
 fn transcript_hint(
     selection: &str,
     extra: usize,
@@ -3444,6 +3664,13 @@ fn transcript_hint(
 }
 
 fn visible_block_lines(text: &str, width: usize, limit: usize) -> (Vec<String>, usize) {
+    let mut wrapped = wrapped_block_lines(text, width);
+    let extra = wrapped.len().saturating_sub(limit);
+    wrapped.truncate(limit);
+    (wrapped, extra)
+}
+
+fn wrapped_block_lines(text: &str, width: usize) -> Vec<String> {
     let mut wrapped = Vec::new();
     for logical in text.lines() {
         if logical.is_empty() {
@@ -3459,9 +3686,7 @@ fn visible_block_lines(text: &str, width: usize, limit: usize) -> (Vec<String>, 
     if wrapped.is_empty() {
         wrapped.push(String::new());
     }
-    let extra = wrapped.len().saturating_sub(limit);
-    wrapped.truncate(limit);
-    (wrapped, extra)
+    wrapped
 }
 
 fn status_notice(app: &App) -> Option<(String, Color)> {
@@ -4950,6 +5175,37 @@ mod tests {
             .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
             .unwrap();
         assert_eq!(terminal.backend().buffer()[(10, assistant_row)].bg, BG);
+        let reasoning_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
+            .unwrap();
+        let tool_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(3)).then_some(region.area.y))
+            .unwrap();
+        assert_eq!(tool_row, reasoning_row + 1);
+    }
+
+    #[test]
+    fn assistant_transcript_renders_markdown_instead_of_source_markers() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "# Result\n\n- **done** with `cargo test`\n\n[Details](https://example.com)"
+                .to_string(),
+            None,
+            false,
+            true,
+        );
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("# Result"));
+        assert!(rendered.contains("• done with cargo test"));
+        assert!(rendered.contains("Details (https://example.com)"));
+        assert!(!rendered.contains("**done**"));
+        assert!(!rendered.contains("`cargo test`"));
     }
 
     #[test]
@@ -5159,7 +5415,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_full_document_when_wrapping_exceeds_the_preview() {
+    fn user_and_assistant_messages_never_fold_or_open_a_document() {
         let mut app = test_app();
         app.transcript_body_width = 8;
         app.push(
@@ -5173,9 +5429,24 @@ mod tests {
 
         app.toggle_selected();
 
-        assert!(app.overlay == Some(Overlay::Document));
-        assert!(app.document.is_some());
+        assert!(app.overlay.is_none());
+        assert!(app.document.is_none());
         assert!(app.blocks[0].expanded);
+        let rows = transcript_block_items(&app.blocks[0], true, 8, &app);
+        assert!(rows.len() > EXPANDED_PREVIEW_LINES);
+
+        app.blocks.clear();
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "prompt ".repeat(60),
+            None,
+            false,
+            false,
+        );
+        app.toggle_selected();
+        assert!(!app.blocks[0].expanded);
+        assert!(transcript_block_items(&app.blocks[0], true, 8, &app).len() > 24);
     }
 
     #[test]
@@ -5224,6 +5495,96 @@ mod tests {
         assert_eq!(app.selected_block, 1);
         app.move_selection(1);
         assert_eq!(app.selected_block, 0);
+    }
+
+    #[test]
+    fn transcript_scroll_is_independent_from_selection_and_follows_the_tail_again() {
+        let mut app = test_app();
+        for index in 0..30 {
+            app.push(
+                BlockKind::User,
+                "YOU",
+                format!("message {index}"),
+                None,
+                false,
+                false,
+            );
+        }
+        app.selected_block = 29;
+        render_to_string(&mut app, 80, 12);
+        let tail_offset = app.transcript_offset;
+        let selected = app.selected_block;
+        assert!(tail_offset > 0);
+
+        app.scroll_transcript(-3);
+        render_to_string(&mut app, 80, 12);
+        assert_eq!(app.selected_block, selected);
+        assert_eq!(app.transcript_offset, tail_offset - 3);
+        assert!(!app.transcript_follow_tail);
+
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "message 30".to_string(),
+            None,
+            false,
+            false,
+        );
+        render_to_string(&mut app, 80, 12);
+        assert_eq!(app.transcript_offset, tail_offset - 3);
+        assert_eq!(app.selected_block, selected);
+
+        app.scroll_transcript(4);
+        render_to_string(&mut app, 80, 12);
+        assert_eq!(app.transcript_offset, tail_offset + 1);
+        assert!(app.transcript_follow_tail);
+
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "message 31".to_string(),
+            None,
+            false,
+            false,
+        );
+        render_to_string(&mut app, 80, 12);
+        assert_eq!(app.transcript_offset, tail_offset + 2);
+
+        render_to_string(&mut app, 80, 40);
+        assert_eq!(app.transcript_offset, 0);
+    }
+
+    #[test]
+    fn keyboard_navigation_centers_an_offscreen_transcript_block() {
+        let mut app = test_app();
+        for index in 0..30 {
+            app.push(
+                BlockKind::User,
+                "YOU",
+                format!("message {index}"),
+                None,
+                false,
+                false,
+            );
+        }
+        app.selected_block = 29;
+        render_to_string(&mut app, 80, 12);
+        let tail_offset = app.transcript_offset;
+        app.move_selection(-1);
+        render_to_string(&mut app, 80, 12);
+        assert_eq!(app.transcript_offset, tail_offset);
+
+        app.selected_block = 29;
+        app.move_selection(-11);
+        render_to_string(&mut app, 80, 12);
+
+        assert_eq!(app.selected_block, 18);
+        assert_eq!(app.transcript_height, 11);
+        assert_eq!(app.transcript_offset, 13);
+        assert!(app.hit_regions.iter().any(|region| {
+            region.target == AppHit::Transcript(18)
+                && region.area.y == app.transcript_height as u16 / 2
+        }));
     }
 
     #[test]
@@ -5627,10 +5988,55 @@ mod tests {
             },
         });
         assert_eq!(app.blocks.len(), 1);
-        assert_eq!(app.blocks[0].title, "READ · file://src/main.rs");
+        assert_eq!(app.blocks[0].title, "Read src/main.rs");
         assert!(app.blocks[0].text.contains("CALL"));
         assert!(app.blocks[0].text.contains("RESULT"));
         assert!(block_document(&app.blocks[0]).contains("complete tool output"));
+
+        let collapsed = render_to_string(&mut app, 100, 24);
+        assert!(collapsed.contains("✓ Read src/main.rs"));
+        assert!(!collapsed.contains("{\"uri\""));
+        assert!(!collapsed.contains("CALL"));
+        app.blocks[0].expanded = true;
+        let expanded = render_to_string(&mut app, 100, 24);
+        assert!(expanded.contains("↳ file://src/main.rs"));
+        assert!(expanded.contains("└ complete tool output"));
+        assert!(!expanded.contains("{\"uri\""));
+    }
+
+    #[test]
+    fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
+        assert_eq!(
+            tool_title(
+                "exec",
+                &serde_json::json!({"uri": "bash://run", "body": "cargo test\necho done"})
+            ),
+            "$ cargo test"
+        );
+        assert_eq!(
+            tool_title(
+                "exec",
+                &serde_json::json!({
+                    "uri": "apply_patch://run",
+                    "body": "*** Begin Patch\n*** Update File: src/tui.rs\n*** Update File: Cargo.toml\n*** End Patch"
+                })
+            ),
+            "Patched src/tui.rs +1"
+        );
+
+        let mut lines = Vec::new();
+        tool_argument_details(
+            &serde_json::json!({"body": {"path": "src/main.rs", "limit": 20}}),
+            &mut lines,
+        );
+        let text = lines
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("path: src/main.rs"));
+        assert!(text.contains("limit: 20"));
+        assert!(!text.contains(['{', '}', '"']));
     }
 
     #[test]

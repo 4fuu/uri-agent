@@ -8,7 +8,7 @@ Startup may show a short animated splash before the conversation. An empty conve
 
 After the first record appears, the transcript uses the available content area and a minimal footer stays on the bottom row. It keeps the active model and effort at the left edge and the animated context meter plus `percentage/context-window-size` at the right edge. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
 
-User prompts use a low-contrast full-width band, while assistant responses remain unboxed and read like a document. Completed reasoning and tool calls collapse to compact semantic summaries; assistant responses remain expanded up to the transcript preview limit. Select a block with the arrow keys or mouse and press `Enter` to expand, fold, or open its full document. Reasoning remains in the conversation instead of moving to a separate mode.
+User prompts use a low-contrast full-width band, while assistant responses remain unboxed and render as Markdown documents, including headings, emphasis, links, lists, quotes, code blocks, and responsive tables. User prompts and assistant responses never fold. Completed reasoning and tool calls collapse to compact semantic summaries; tool rows describe the routed URI, command, patch targets, and result instead of exposing raw argument JSON. Select a reasoning or tool block with the arrow keys or mouse and press `Enter` to expand, fold, or open its full document. Reasoning remains in the conversation instead of moving to a separate mode.
 
 ## Composer and commands
 
@@ -55,7 +55,7 @@ Extensions register commands through the same registry, so they appear in the pa
 | Global | `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
 | Copy | `Ctrl+Shift+C` copy |
 
-Arrow keys and mouse input are first-class. Selection wraps from the last item to the first and from the first item to the last in every selectable list. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
+Arrow keys and mouse input are first-class. The mouse wheel scrolls the conversation viewport without changing the selected block. Keyboard navigation keeps an off-screen destination visible and centers it when the transcript has enough room; new output follows the bottom until the user scrolls away. Selection wraps from the last item to the first and from the first item to the last in every selectable list. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
 
 URI Agent ignores `Ctrl+C` on its own surfaces. Exit through `:quit` or `:q` instead.
 
