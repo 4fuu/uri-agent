@@ -28,7 +28,9 @@ For example, the target received by `capture` here is exactly `a://b?not=a url`:
 read("capture://a://b?not=a url")
 ```
 
-Protocols own their target syntax. `file` interprets `?offset` and `?limit`; `bash` and `pwsh` interpret `?wait`; the registry treats all of those characters as opaque.
+Protocols own their target syntax. `file` interprets `?offset`, `?limit`, and
+`?line_numbers`; `bash` and `pwsh` interpret `?wait`; the registry treats all
+of those characters as opaque.
 
 Protocol names must be unique. Registration fails rather than silently replacing an existing protocol.
 
@@ -53,7 +55,17 @@ Relative paths resolve from the canonical startup working directory; absolute pa
 read("file://src/main.rs?offset=1&limit=200")
 ```
 
-The default limit is 200 lines and the protocol clamps requested limits to 2,000 lines. Read `file://help` for the current contract.
+File content is returned without line numbers by default. Add
+`line_numbers=true` when one-based line prefixes are useful:
+
+```text
+read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
+```
+
+The default limit is 200 lines and the protocol clamps requested limits to
+2,000 lines. `file://help` also reports the current working directory, using a
+normal display path rather than a Windows verbatim-path prefix. Read
+`file://help` for the current contract.
 
 ### `replace`
 
@@ -80,11 +92,11 @@ It supports adding, deleting, updating, and moving files. Writes are atomic per 
 
 ### `bash` and `pwsh`
 
-Shell bodies may be a command string or an object containing a `command` string:
+Shell bodies must be command strings:
 
 ```text
 exec("bash://run", "cargo test")
-exec("pwsh://run", {"command":"cargo test"})
+exec("pwsh://run", "cargo test")
 ```
 
 Commands run from the startup working directory. Bash starts without profile or rc files; PowerShell starts without a profile and reads the script from standard input.

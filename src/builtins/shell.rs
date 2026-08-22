@@ -105,20 +105,19 @@ impl Protocol for ShellProtocol {
                 self.name
             );
         }
-        let body = request.body.cloned();
+        let command = command_from_body(request.body)?.to_string();
         let executable = self.executable.clone();
         let cwd = self.cwd.clone();
         let protocol = self.name.to_string();
         let record = context
             .tasks
-            .allocate(self.name, command_label(body.as_ref()))
+            .allocate(self.name, command_label(&command))
             .await;
         let id = record.id.clone();
         let tasks = context.tasks.clone();
         tasks
             .spawn(record, async move {
-                let command = command_from_body(body.as_ref())?;
-                execute(&protocol, &executable, &cwd, command).await
+                execute(&protocol, &executable, &cwd, &command).await
             })
             .await;
         let Some(wait) = wait else {
@@ -158,16 +157,11 @@ fn parse_target(target: &str) -> Result<(&str, Option<Duration>)> {
 fn command_from_body(body: Option<&Value>) -> Result<&str> {
     match body {
         Some(Value::String(command)) => Ok(command),
-        Some(Value::Object(object)) => object
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("shell body object requires a command string")),
-        _ => bail!("shell body must be a command string or an object with command"),
+        _ => bail!("shell body must be a command string"),
     }
 }
 
-fn command_label(body: Option<&Value>) -> String {
-    let command = command_from_body(body).unwrap_or("invalid command");
+fn command_label(command: &str) -> String {
     let mut label = command
         .lines()
         .next()
@@ -271,6 +265,15 @@ mod tests {
         assert!(parse_target("run?wait=not-a-number").is_err());
         assert!(parse_target("run?wait=301").is_err());
         assert!(parse_target("run?other=30").is_err());
+    }
+
+    #[test]
+    fn shell_body_only_accepts_a_command_string() {
+        let string = Value::String("cargo test".to_string());
+        let object = serde_json::json!({"command": "cargo test"});
+        assert_eq!(command_from_body(Some(&string)).unwrap(), "cargo test");
+        assert!(command_from_body(Some(&object)).is_err());
+        assert!(command_from_body(None).is_err());
     }
 
     #[tokio::test]

@@ -114,7 +114,7 @@ mod tests {
         let rendered = store.present(vec![b'x'; 100], "test").await.unwrap();
         assert!(rendered.contains("[output truncated]"));
         let path = store.directory.join("000000-test.txt");
-        assert!(rendered.contains(&format!("file://{}", path.display())));
+        assert!(rendered.contains(&format!("file://{}", crate::config::display_path(&path))));
         assert_eq!(fs::read(path).await.unwrap(), vec![b'x'; 100]);
     }
 

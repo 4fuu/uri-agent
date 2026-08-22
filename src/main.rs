@@ -63,7 +63,7 @@ async fn run_session(config: &Config) -> Result<TuiOutcome> {
     }
     prompt_protocols.sort_by(|left, right| left.name.cmp(&right.name));
     let candidate_context = SessionContext {
-        system_prompt: uri_agent::prompts::system_prompt(&config.cwd, &prompt_protocols),
+        system_prompt: uri_agent::prompts::system_prompt(&prompt_protocols),
         skills: skill_snapshots,
     };
     let requested = match &config.session {

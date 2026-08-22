@@ -1,3 +1,4 @@
+use crate::config::display_path;
 use crate::plugin::{Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
@@ -50,21 +51,21 @@ impl Protocol for FileProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
-            return Ok(prompts::FILE_HELP.as_bytes().to_vec());
+            return Ok(prompts::file_help(&self.cwd).into_bytes());
         }
 
         let (target, query) = split_query(request.target);
         let path = resolve_path(&self.cwd, target);
         let metadata = fs::metadata(&path)
             .await
-            .with_context(|| format!("cannot read {}", path.display()))?;
+            .with_context(|| format!("cannot read {}", display_path(&path)))?;
         let range = Range::parse(query)?;
         if metadata.is_dir() {
             read_directory(&path, range).await
         } else if metadata.is_file() {
             read_file(&path, request.uri, range).await
         } else {
-            bail!("not a regular file or directory: {}", path.display())
+            bail!("not a regular file or directory: {}", display_path(&path))
         }
     }
 }
@@ -91,12 +92,14 @@ fn split_query(target: &str) -> (&str, Option<&str>) {
 struct Range {
     offset: usize,
     limit: usize,
+    line_numbers: bool,
 }
 
 impl Range {
     fn parse(query: Option<&str>) -> Result<Self> {
         let mut offset = 1_usize;
         let mut limit = DEFAULT_LIMIT;
+        let mut line_numbers = false;
         for pair in query
             .unwrap_or_default()
             .split('&')
@@ -118,37 +121,58 @@ impl Range {
                         .with_context(|| format!("invalid limit: {value}"))?
                         .clamp(1, MAX_LIMIT)
                 }
+                "line_numbers" => {
+                    line_numbers = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => bail!("invalid line_numbers: {value}; expected true or false"),
+                    }
+                }
                 _ => bail!("unknown file query parameter: {key}"),
             }
         }
-        Ok(Self { offset, limit })
+        Ok(Self {
+            offset,
+            limit,
+            line_numbers,
+        })
     }
 }
 
 async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
     let content = fs::read(path)
         .await
-        .with_context(|| format!("cannot read {}", path.display()))?;
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
     let content = String::from_utf8_lossy(&content);
     let lines = content.lines().collect::<Vec<_>>();
     let start = range.offset.saturating_sub(1).min(lines.len());
     let end = start.saturating_add(range.limit).min(lines.len());
-    let width = end.max(1).to_string().len();
     let mut output = String::new();
     for (index, line) in lines[start..end].iter().enumerate() {
-        let line_number = start + index + 1;
-        let _ = writeln!(output, "{line_number:>width$} │ {line}");
+        if range.line_numbers {
+            let line_number = start + index + 1;
+            let width = end.max(1).to_string().len();
+            let _ = writeln!(output, "{line_number:>width$} │ {line}");
+        } else {
+            let _ = writeln!(output, "{line}");
+        }
     }
 
     if end < lines.len() {
         let base = uri.split_once('?').map_or(uri, |(base, _)| base);
+        let line_numbers = if range.line_numbers {
+            "&line_numbers=true"
+        } else {
+            ""
+        };
         let _ = writeln!(
             output,
-            "\n[{} more lines]\nNext: {}?offset={}&limit={}",
+            "\n[{} more lines]\nNext: {}?offset={}&limit={}{}",
             lines.len() - end,
             base,
             end + 1,
-            range.limit
+            range.limit,
+            line_numbers
         );
     }
     Ok(output.into_bytes())
@@ -157,7 +181,7 @@ async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
 async fn read_directory(path: &Path, range: Range) -> Result<Vec<u8>> {
     let mut directory = fs::read_dir(path)
         .await
-        .with_context(|| format!("cannot list {}", path.display()))?;
+        .with_context(|| format!("cannot list {}", display_path(path)))?;
     let mut entries = Vec::new();
     while let Some(entry) = directory.next_entry().await? {
         let file_type = entry.file_type().await?;
@@ -198,5 +222,62 @@ mod tests {
         let range = Range::parse(Some("offset=0&limit=99999")).unwrap();
         assert_eq!(range.offset, 1);
         assert_eq!(range.limit, MAX_LIMIT);
+        assert!(!range.line_numbers);
+    }
+
+    #[test]
+    fn line_numbers_are_opt_in() {
+        assert!(
+            Range::parse(Some("line_numbers=true"))
+                .unwrap()
+                .line_numbers
+        );
+        assert!(
+            !Range::parse(Some("line_numbers=false"))
+                .unwrap()
+                .line_numbers
+        );
+        assert!(Range::parse(Some("line_numbers=1")).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_output_only_includes_line_numbers_when_requested() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "alpha\nbeta\n").await.unwrap();
+
+        let plain = read_file(&path, "file://file.txt", Range::parse(None).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(plain).unwrap(), "alpha\nbeta\n");
+
+        let numbered = read_file(
+            &path,
+            "file://file.txt?line_numbers=true",
+            Range::parse(Some("line_numbers=true")).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(numbered).unwrap(),
+            "1 │ alpha\n2 │ beta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_the_line_number_option() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "alpha\nbeta\n").await.unwrap();
+
+        let output = read_file(
+            &path,
+            "file://file.txt?offset=1&limit=1&line_numbers=true",
+            Range::parse(Some("offset=1&limit=1&line_numbers=true")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Next: file://file.txt?offset=2&limit=1&line_numbers=true"));
     }
 }

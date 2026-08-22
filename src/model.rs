@@ -1270,10 +1270,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         "properties": {
             "uri": {
                 "type": "string",
-                "description": "Custom protocol address in the form <protocol>://<opaque-target>."
+                "description": "Protocol address in the custom form <protocol>://<opaque-target>. It is not an RFC URL and is passed to the selected protocol unchanged."
             },
             "body": {
-                "description": "Optional protocol-specific payload. Any JSON value is accepted."
+                "description": "Optional protocol-specific payload. It may be any JSON value and is passed to the selected protocol unchanged."
             }
         },
         "required": ["uri"],

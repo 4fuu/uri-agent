@@ -117,6 +117,16 @@ impl Config {
     }
 }
 
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return text;
+    };
+    rest.strip_prefix(r"UNC\")
+        .map(|unc| format!(r"\\{unc}"))
+        .unwrap_or_else(|| rest.to_string())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueSource {
     Default,
@@ -880,6 +890,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_verbatim_path_prefix_is_not_displayed() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\4fu\project")),
+            r"C:\Users\4fu\project"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share")),
+            r"\\server\share"
+        );
+    }
 
     #[test]
     fn settings_file_uses_pi_thinking_fields_and_migrates_the_legacy_name() {

@@ -1,9 +1,10 @@
+use crate::config::display_path;
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub const READ_TOOL_DESCRIPTION: &str = "Read a resource from a registered protocol. The uri and optional body are passed to the protocol unchanged.";
+pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol. Use this for protocol help, resources, task status, and completed results.";
 
-pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Work is asynchronous by default; protocols may expose an explicit bounded wait option. The uri and optional body are passed to the protocol unchanged. Use read with a returned task URI to inspect later progress or results.";
+pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Use this to start protocol operations. Execution may finish immediately or continue asynchronously. If the returned content includes a task URI, use read on that URI to inspect status and final output; task acceptance alone is not completion.";
 
 #[derive(Clone, Debug)]
 pub struct ProtocolPrompt {
@@ -11,46 +12,45 @@ pub struct ProtocolPrompt {
     pub description: String,
 }
 
-pub fn system_prompt(cwd: &Path, protocols: &[ProtocolPrompt]) -> String {
-    let mut prompt = format!(
-        "You are a coding agent working in {}.\n\
+pub fn system_prompt(protocols: &[ProtocolPrompt]) -> String {
+    let mut prompt = String::from(
+        "You are a general-purpose agent.\n\
          You have exactly two tools: read and exec.\n\
-         Protocol addresses use the custom form <protocol>://<opaque-target>; \
-         they are not RFC URLs. The protocol receives the URI and body unchanged.\n\
-         Use read for resources, help, task snapshots, and completed output.\n\
-         Exec work is asynchronous by default. An accepted result does not mean \
-         the work finished; inspect the returned URI with read. Some protocols \
-         document a bounded wait option for work whose immediate result is useful.\n\
-         Before using an unfamiliar protocol, read <protocol>://help.\n\
-         When output is truncated, read the supplied file:// address for the complete content.\n\
+         Use read to retrieve information through registered protocols.\n\
+         Use exec to perform actions through registered protocols.\n\
+         Before using a protocol for the first time, you must call read on \
+         <protocol>://help to learn its contract.\n\
          Verify relevant results before claiming work is complete.\n\n\
          Available protocols:\n",
-        cwd.display()
     );
 
     for protocol in protocols {
-        let _ = writeln!(
-            prompt,
-            "- {}: {} Help: {}://help",
-            protocol.name, protocol.description, protocol.name
-        );
+        let _ = writeln!(prompt, "- {}: {}", protocol.name, protocol.description);
     }
 
     prompt
 }
 
-pub const FILE_HELP: &str = r#"# file
+pub fn file_help(cwd: &Path) -> String {
+    format!(
+        r#"# file
 
 Read files and directories.
 
-- `file://relative/path` resolves from the startup working directory.
+Current working directory: `file://{}`
+
+- `file://relative/path` resolves from the current working directory.
 - `file:///absolute/path` reads an absolute path.
 - Add `?offset=N&limit=N` to read a bounded range of text lines.
+- Add `?line_numbers=true` to prefix file content with one-based line numbers. Line numbers are disabled by default.
 - Reading a directory returns a bounded directory listing.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
 The body is passed through but is not required by this built-in protocol.
-"#;
+"#,
+        display_path(cwd)
+    )
+}
 
 pub const REPLACE_HELP: &str = r#"# replace
 
@@ -102,10 +102,15 @@ pub const BASH_HELP: &str = r#"# bash
 
 Run Bash commands as managed asynchronous tasks.
 
-Call `exec` with `bash://run`. The body may be a command string or an object
-containing a `command` string. Add `?wait=N` to wait up to N seconds (maximum
-300), for example `bash://?wait=30`. If the wait window expires, the command
-keeps running and the result contains its task URI.
+Call `exec` with `bash://run` and pass the command string directly as the body:
+
+```text
+exec("bash://run", "cargo test")
+```
+
+Add `?wait=N` to wait up to N seconds (maximum 300), for example
+`bash://?wait=30`. If the wait window expires, the command keeps running and
+the result contains its task URI.
 
 Read `bash://tasks/<id>` for status and bounded output. If that output exceeds
 the system limit, the result includes a `file://` address containing the full
@@ -116,10 +121,15 @@ pub const PWSH_HELP: &str = r#"# pwsh
 
 Run PowerShell 7 commands as managed asynchronous tasks.
 
-Call `exec` with `pwsh://run`. The body may be a command string or an object
-containing a `command` string. Add `?wait=N` to wait up to N seconds (maximum
-300), for example `pwsh://?wait=30`. If the wait window expires, the command
-keeps running and the result contains its task URI.
+Call `exec` with `pwsh://run` and pass the command string directly as the body:
+
+```text
+exec("pwsh://run", "cargo test")
+```
+
+Add `?wait=N` to wait up to N seconds (maximum 300), for example
+`pwsh://?wait=30`. If the wait window expires, the command keeps running and
+the result contains its task URI.
 
 Read `pwsh://tasks/<id>` for status and bounded output. If that output exceeds
 the system limit, the result includes a `file://` address containing the full
@@ -151,13 +161,38 @@ pub fn task_snapshot(
 pub fn skill_help(skill_md: &str, skill_directory: &Path) -> String {
     format!(
         "{skill_md}\n\nSkill files: file://{}/\n",
-        skill_directory.display()
+        display_path(skill_directory)
     )
 }
 
 pub fn truncated_output(preview: &str, complete_file: &Path) -> String {
     format!(
         "{preview}\n\n[output truncated]\nFull output: file://{}",
-        complete_file.display()
+        display_path(complete_file)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_help_reports_display_path_and_opt_in_line_numbers() {
+        let help = file_help(Path::new(r"\\?\C:\Users\4fu\project"));
+        assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
+        assert!(help.contains("`?line_numbers=true`"));
+        assert!(help.contains("Line numbers are disabled by default."));
+    }
+
+    #[test]
+    fn system_prompt_has_no_working_directory_or_repeated_help_addresses() {
+        let prompt = system_prompt(&[ProtocolPrompt {
+            name: "file".to_string(),
+            description: "Read files.".to_string(),
+        }]);
+        assert!(prompt.starts_with("You are a general-purpose agent."));
+        assert!(prompt.contains("Before using a protocol for the first time"));
+        assert!(prompt.contains("- file: Read files."));
+        assert!(!prompt.contains("file://help"));
+    }
 }

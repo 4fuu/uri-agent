@@ -3,7 +3,7 @@ mod model_selector;
 
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
 use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
-use crate::config::{ActiveSettings, AuthKind, ConfigManager};
+use crate::config::{ActiveSettings, AuthKind, ConfigManager, display_path};
 use crate::keymap::{Keymap, canonical_key};
 use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
@@ -3337,7 +3337,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
                 command_help(&app.commands),
                 app.info.session_id,
                 app.info.model,
-                app.info.cwd.display()
+                display_path(&app.info.cwd)
             );
             frame.render_widget(
                 Paragraph::new(text)
@@ -3497,8 +3497,8 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<
     let branch = current_branch(app);
     let percent = context_percent(app);
     let project = branch.map_or_else(
-        || display_cwd(&app.info.cwd),
-        |branch| format!("{} · git:{branch}", display_cwd(&app.info.cwd)),
+        || display_path(&app.info.cwd),
+        |branch| format!("{} · git:{branch}", display_path(&app.info.cwd)),
     );
     let state = app
         .activity
@@ -4184,23 +4184,13 @@ fn complete_surface_text(surface: &SelectableSurface) -> String {
         .to_string()
 }
 
-fn display_cwd(path: &Path) -> String {
-    let text = path.display().to_string();
-    let Some(rest) = text.strip_prefix(r"\\?\") else {
-        return text;
-    };
-    rest.strip_prefix(r"UNC\")
-        .map(|unc| format!(r"\\{unc}"))
-        .unwrap_or_else(|| rest.to_string())
-}
-
 /// Pi's `formatCwdForFooter`: replace the home directory prefix with `~`.
 fn footer_cwd(path: &Path) -> String {
-    let text = display_cwd(path);
+    let text = display_path(path);
     let Some(home) = dirs::home_dir() else {
         return text;
     };
-    let home_text = display_cwd(&home);
+    let home_text = display_path(&home);
     if text == home_text {
         return "~".to_string();
     }
@@ -5151,18 +5141,6 @@ mod tests {
         assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             "shift+g"
-        );
-    }
-
-    #[test]
-    fn windows_verbatim_cwd_prefix_is_not_shown() {
-        assert_eq!(
-            display_cwd(Path::new(r"\\?\C:\Users\4fu\project")),
-            r"C:\Users\4fu\project"
-        );
-        assert_eq!(
-            display_cwd(Path::new(r"\\?\UNC\server\share")),
-            r"\\server\share"
         );
     }
 
