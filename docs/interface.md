@@ -66,7 +66,7 @@ Extensions register commands through the same registry, so they appear in the pa
 
 | Surface | Useful defaults |
 | --- | --- |
-| Conversation | `@` attach a clipboard image, `Up`/`Down` select, `Ctrl+Up`/`Ctrl+Down` scroll, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
+| Conversation | `@` attach a clipboard image, `Alt+Backspace` remove the latest pending image, `Up`/`Down` select, `Ctrl+Up`/`Ctrl+Down` scroll, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
 | Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
 | Global | Double `Esc` interrupts a running turn; `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
 | Copy | `Ctrl+C` or right-click copies an active selection; without a selection, right-click opens a reasoning or tool block's full document; `Ctrl+Shift+C` copies the selection or visible surface; `Cmd+C` is accepted when the terminal forwards it |
@@ -111,9 +111,9 @@ User prompts, assistant responses, and read-only floats support direct drag sele
 
 ## Image attachments
 
-From the conversation surface, press `@` to read the current system clipboard image into an in-memory attachment list. This does not open the composer: press `i` separately when ready to write the message. The read runs in the background, and URI Agent reports whether the image was attached. Submitting is disabled until an in-progress clipboard read finishes, so the image cannot arrive after its intended message has already been sent.
+From the conversation surface, press `@` to read the current system clipboard image into an in-memory attachment list. This does not open the composer: press `Space` separately when ready to write the message. The read runs in the background, and URI Agent reports whether the image was attached. While images are pending or a clipboard read is in progress, a status line above the footer (or at the bottom of the welcome view) keeps the count visible after the flash expires. Submitting is disabled until an in-progress clipboard read finishes, so the image cannot arrive after its intended message has already been sent.
 
-The composer title shows the number of pending images. `Alt+Backspace` removes the most recently attached image, while `Esc` preserves both the text draft and pending images. The next non-empty message includes all pending clipboard images and clears them once the runtime accepts the turn. Unsent clipboard images are process-local: they are not written to SQLite and are discarded when the process exits or the user switches sessions. Pressing `@` inside the composer continues to insert ordinary text for `@path` attachments.
+The composer title also shows the number of pending images. `Alt+Backspace` removes the most recently attached image from the conversation or the composer, while `Esc` preserves both the text draft and pending images. The next non-empty message includes all pending clipboard images and clears them once the runtime accepts the turn. The user prompt then shows a muted image count for clipboard and path attachments; copied user text stays the original prompt. Unsent clipboard images are process-local: they are not written to SQLite and are discarded when the process exits or the user switches sessions. Pressing `@` inside the composer continues to insert ordinary text for `@path` attachments.
 
 For a model whose catalog `input` includes `image`, add a standalone `@path` argument to the composer text:
 

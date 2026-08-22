@@ -20,6 +20,7 @@ map("global", "esc", "interrupt_on_double_press");
 
 map("main", "space", "compose");
 map("main", "@", "paste_image");
+map("main", "alt+backspace", "remove_last_image");
 map("main", ":", "command");
 map("main", "?", "help");
 map("main", "r", "jump_reasoning");
@@ -330,6 +331,10 @@ mod tests {
         assert_eq!(keymap.action("main", "space").as_deref(), Some("compose"));
         assert_eq!(keymap.action("main", "i"), None);
         assert_eq!(keymap.action("main", "@").as_deref(), Some("paste_image"));
+        assert_eq!(
+            keymap.action("main", "alt+backspace").as_deref(),
+            Some("remove_last_image")
+        );
         assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);

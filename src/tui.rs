@@ -37,6 +37,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
+use rig::message::{Message, UserContent};
 use std::collections::HashSet;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
@@ -107,6 +108,7 @@ struct DisplayBlock {
     turn_result: bool,
     parent_process: Option<u64>,
     process: Option<ProcessDisplay>,
+    images: usize,
 }
 
 struct ToolDisplay {
@@ -645,8 +647,19 @@ impl App {
             EventKind::SessionCreated { .. }
             | EventKind::SessionContext { .. }
             | EventKind::ModelSettingsChanged { .. }
-            | EventKind::ModelMessage { .. }
             | EventKind::Task { .. } => {}
+            EventKind::ModelMessage { message } => {
+                let count = user_message_image_count(&message);
+                if count > 0
+                    && let Some(block) = self
+                        .blocks
+                        .iter_mut()
+                        .rev()
+                        .find(|block| block.kind == BlockKind::User)
+                {
+                    block.images = count;
+                }
+            }
             EventKind::User { text } => {
                 self.reasoning_folded_during_stream = false;
                 self.busy = true;
@@ -917,6 +930,7 @@ impl App {
                     id: process_id,
                     steps: process_end - turn_start,
                 }),
+                images: 0,
             },
         );
         if let Some(result) = result {
@@ -970,6 +984,7 @@ impl App {
             turn_result: false,
             parent_process: None,
             process: None,
+            images: 0,
         });
     }
 
@@ -1018,6 +1033,7 @@ impl App {
         } else {
             self.set_flash("No image attachment to remove");
         }
+        self.sync_composer_chrome();
     }
 
     fn finish_clipboard_image_read(&mut self, result: Result<Vec<u8>>) {
@@ -1032,6 +1048,16 @@ impl App {
             }
             Err(error) => self.set_flash(format!("Clipboard image failed: {error:#}")),
         }
+        self.sync_composer_chrome();
+    }
+
+    fn sync_composer_chrome(&mut self) {
+        style_input(
+            &mut self.input,
+            self.busy,
+            self.pending_images.len(),
+            self.clipboard_image_loading,
+        );
     }
 
     fn draft_text(&self) -> String {
@@ -1755,11 +1781,15 @@ async fn apply_action(
                 .start_turn_with_images(prompt, images)
                 .await
             {
-                Ok(()) => app.pending_images.clear(),
+                Ok(()) => {
+                    app.pending_images.clear();
+                    app.sync_composer_chrome();
+                }
                 Err(error) => {
                     app.busy = false;
                     app.busy_since = None;
                     app.activity = None;
+                    app.sync_composer_chrome();
                     app.set_flash(format!("Cannot start turn: {error:#}"));
                 }
             }
@@ -2048,6 +2078,10 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             Action::Continue
         }
         Some("paste_image") => Action::ReadClipboardImage,
+        Some("remove_last_image") => {
+            app.remove_last_image();
+            Action::Continue
+        }
         Some("command") => {
             app.reset_command_search();
             app.overlay = Some(Overlay::Command);
@@ -3674,6 +3708,7 @@ fn start_clipboard_image_read(app: &mut App, sender: mpsc::UnboundedSender<Backg
         return;
     }
     app.clipboard_image_loading = true;
+    app.sync_composer_chrome();
     app.set_flash("Reading an image from the clipboard…");
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(clipboard::read_image_png)
@@ -4424,6 +4459,16 @@ fn transcript_block_items(
                     background,
                 ));
             }
+            if block.images > 0 {
+                rows.push(transcript_block_item(
+                    block,
+                    vec![Span::styled(
+                        image_count_label(block.images),
+                        Style::default().fg(MUTED),
+                    )],
+                    background,
+                ));
+            }
         }
         BlockKind::Assistant => {
             for mut line in markdown::render(&block.text, message_width) {
@@ -4755,10 +4800,43 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
             ),
             WARM,
         )
+    } else if app.clipboard_image_loading || !app.pending_images.is_empty() {
+        (
+            pending_image_notice(app.pending_images.len(), app.clipboard_image_loading),
+            WARM,
+        )
     } else {
         return None;
     };
     Some((message, color))
+}
+
+fn pending_image_notice(count: usize, loading: bool) -> String {
+    match (count, loading) {
+        (0, true) => " reading clipboard image…".to_string(),
+        (count, false) => format!(
+            " {count} image{} ready · alt+backspace remove",
+            if count == 1 { "" } else { "s" }
+        ),
+        (count, true) => format!(
+            " {count} image{} ready · reading another…",
+            if count == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+fn image_count_label(count: usize) -> String {
+    format!("{count} image{}", if count == 1 { "" } else { "s" })
+}
+
+fn user_message_image_count(message: &Message) -> usize {
+    match message {
+        Message::User { content } => content
+            .iter()
+            .filter(|part| matches!(part, UserContent::Image(_)))
+            .count(),
+        _ => 0,
+    }
 }
 
 fn flash_is_error(flash: &str) -> bool {
@@ -7582,6 +7660,68 @@ mod tests {
         assert!(!app.clipboard_image_loading);
         assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
         assert!(app.visible_flash().unwrap().contains("failed"));
+    }
+
+    #[test]
+    fn pending_clipboard_images_keep_a_status_notice() {
+        let mut app = test_app();
+        app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
+        let welcome = render_to_string(&mut app, 100, 24);
+        assert!(welcome.contains("1 image ready"));
+        assert!(welcome.contains("alt+backspace remove"));
+
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            true,
+        );
+        let conversation = render_to_string(&mut app, 100, 24);
+        assert!(conversation.contains("1 image ready"));
+        let footer = conversation
+            .lines()
+            .find(|line| line.contains("········"))
+            .expect("conversation footer");
+        assert!(footer.contains("model"));
+        assert!(!footer.contains("image"));
+    }
+
+    #[test]
+    fn sent_user_messages_show_an_image_count_without_changing_copied_text() {
+        let mut app = test_app();
+        apply_event(
+            &mut app,
+            0,
+            EventKind::User {
+                text: "look at this".into(),
+            },
+        );
+        apply_event(
+            &mut app,
+            1,
+            EventKind::ModelMessage {
+                message: Message::User {
+                    content: vec![
+                        UserContent::text("look at this"),
+                        UserContent::image_base64(
+                            "abc",
+                            Some(rig::message::ImageMediaType::PNG),
+                            None,
+                        ),
+                    ],
+                },
+            },
+        );
+
+        assert_eq!(app.blocks[0].text, "look at this");
+        assert_eq!(app.blocks[0].images, 1);
+        app.busy = false;
+        app.activity = None;
+        let rendered = render_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("look at this"));
+        assert!(rendered.contains("1 image"));
     }
 
     #[test]

@@ -25,7 +25,7 @@ extism = { version = "1.21", default-features = false, features = ["http", "regi
 futures-util = "0.3"
 getrandom = "0.2"
 http = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
 portable-pty = "0.9"
 pulldown-cmark = { version = "0.10", default-features = false }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
@@ -51,6 +51,9 @@ vt100 = "0.16"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = { version = "5.4", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
