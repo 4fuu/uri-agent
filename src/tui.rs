@@ -31,7 +31,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use std::io::{Write, stdout};
@@ -42,10 +42,13 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tui_term::widget::PseudoTerminal;
 use tui_textarea::TextArea;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const BG: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(21, 24, 28);
+const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
+const USER_SURFACE: Color = Color::Rgb(29, 34, 40);
+const USER_ACTIVE: Color = Color::Rgb(35, 42, 49);
 const TEXT: Color = Color::Rgb(218, 223, 229);
 const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
@@ -351,6 +354,7 @@ struct App {
     busy_since: Option<Instant>,
     frame: usize,
     composer_scroll: (u16, u16),
+    transcript_body_width: usize,
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
@@ -410,6 +414,7 @@ impl App {
             busy_since: None,
             frame: 0,
             composer_scroll: (0, 0),
+            transcript_body_width: 72,
             started: Instant::now(),
             splash_skipped: false,
             last_sequence: None,
@@ -491,9 +496,10 @@ impl App {
                 self.activity = Some(Activity::Tool(protocol));
                 let text = serde_json::to_string_pretty(&arguments)
                     .unwrap_or_else(|_| arguments.to_string());
+                let title = tool_title(&name, &arguments);
                 self.push(
                     BlockKind::Tool,
-                    &format!("TOOL · {name}"),
+                    &title,
                     format!("CALL\n{text}"),
                     Some(call_id),
                     false,
@@ -527,7 +533,7 @@ impl App {
                         } else {
                             BlockKind::Tool
                         },
-                        &format!("TOOL · {name}"),
+                        &name.to_ascii_uppercase(),
                         output,
                         Some(call_id),
                         failed,
@@ -616,7 +622,10 @@ impl App {
         self.activity = None;
         self.busy_since = None;
         for block in &mut self.blocks {
-            block.expanded = false;
+            block.expanded = matches!(
+                block.kind,
+                BlockKind::Assistant | BlockKind::Notice | BlockKind::Error
+            );
         }
         style_input(&mut self.input, false);
     }
@@ -738,6 +747,7 @@ impl App {
     }
 
     fn toggle_selected(&mut self) {
+        let body_width = self.transcript_body_width;
         let Some(block) = self.blocks.get_mut(self.selected_block) else {
             return;
         };
@@ -745,7 +755,12 @@ impl App {
             block.expanded = true;
             return;
         }
-        if block.text.lines().count() > EXPANDED_PREVIEW_LINES {
+        let preview_limit = if block.kind == BlockKind::Tool {
+            10
+        } else {
+            EXPANDED_PREVIEW_LINES
+        };
+        if visible_block_lines(&block.text, body_width, preview_limit).1 > 0 {
             self.document = Some((block.title.clone(), block_document(block)));
             self.overlay_scroll = 0;
             self.overlay = Some(Overlay::Document);
@@ -2858,6 +2873,14 @@ fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
     (separator > 0).then(|| uri[..separator].to_string())
 }
 
+fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
+    let name = name.to_ascii_uppercase();
+    let Some(uri) = arguments.get("uri").and_then(serde_json::Value::as_str) else {
+        return name;
+    };
+    format!("{name} · {}", single_line_preview(uri, 72))
+}
+
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_regions.clear();
     app.selectable = None;
@@ -3004,20 +3027,29 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
     let percent = context_percent(app);
-    let context = format!(
-        "{} {percent:.1}%/{}",
-        animation::progress(app.frame, 8, percent / 100.0),
-        format_tokens(app.info.context_window as u64),
+    let available = area.width as usize;
+    let context = single_line_preview(
+        &format!(
+            "{} {percent:.1}%/{}",
+            animation::progress(app.frame, 8, percent / 100.0),
+            format_tokens(app.info.context_window as u64),
+        ),
+        available,
     );
-    let context_width = context.chars().count();
-    let model_width = (area.width as usize).saturating_sub(context_width + 2);
+    let context_width = context.width();
+    let model_limit = available.saturating_sub(context_width + 2);
+    let model = single_line_preview(&compact_model(app), model_limit);
+    let model_width = model.width();
+    let gap = available.saturating_sub(model_width + context_width);
     let mut spans = Vec::new();
-    if model_width > 0 {
+    if !model.is_empty() {
         spans.push(Span::styled(
-            single_line_preview(&compact_model(app), model_width),
+            model,
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw("  "));
+    }
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
     }
     spans.push(Span::styled(
         context,
@@ -3106,28 +3138,24 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
         return;
     }
-    let width = area.width.saturating_sub(6) as usize;
+    let body_width = (area.width.saturating_sub(8) as usize).max(8);
+    app.transcript_body_width = body_width;
     let mut items = Vec::new();
-    let mut index_for_row = Vec::new();
+    let mut block_for_row = Vec::new();
     for (index, block) in app.blocks.iter().enumerate() {
-        items.push(block_preview_item(
-            block,
-            index == app.selected_block,
-            width,
-            app,
-        ));
-        index_for_row.push(index);
-        if block.expanded {
-            for line in expanded_lines(block, width) {
-                items.push(line);
-                index_for_row.push(index);
-            }
+        if index > 0 {
+            items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
+            block_for_row.push(None);
+        }
+        for item in transcript_block_items(block, index == app.selected_block, body_width, app) {
+            items.push(item);
+            block_for_row.push(Some(index));
         }
     }
     let mut state = ListState::default().with_selected(Some(
-        index_for_row
+        block_for_row
             .iter()
-            .position(|index| *index == app.selected_block)
+            .position(|index| *index == Some(app.selected_block))
             .unwrap_or(0),
     ));
     frame.render_stateful_widget(
@@ -3136,36 +3164,32 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         &mut state,
     );
     let offset = state.offset();
-    for (row, index) in index_for_row.into_iter().enumerate().skip(offset) {
+    for (row, index) in block_for_row.into_iter().enumerate().skip(offset) {
         let y = area.y.saturating_add((row - offset) as u16);
         if y >= area.bottom() {
             break;
         }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(area.x, y, area.width, 1),
-            target: AppHit::Transcript(index),
-        });
+        if let Some(index) = index {
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(area.x, y, area.width, 1),
+                target: AppHit::Transcript(index),
+            });
+        }
     }
 }
 
-fn block_preview_item(
+fn transcript_block_items(
     block: &DisplayBlock,
     selected: bool,
-    width: usize,
+    body_width: usize,
     app: &App,
-) -> ListItem<'static> {
-    let color = if block.failed {
-        ERROR
+) -> Vec<ListItem<'static>> {
+    let background = if block.kind == BlockKind::User {
+        if selected { USER_ACTIVE } else { USER_SURFACE }
+    } else if selected {
+        ROW_ACTIVE
     } else {
-        match block.kind {
-            BlockKind::User => ACCENT,
-            BlockKind::Assistant => TEXT,
-            BlockKind::Reasoning => MUTED,
-            BlockKind::Tool => WARM,
-            BlockKind::Compaction => ACCENT,
-            BlockKind::Notice => MUTED,
-            BlockKind::Error => ERROR,
-        }
+        BG
     };
     let live = selected
         && app.busy
@@ -3173,62 +3197,271 @@ fn block_preview_item(
             block.kind,
             BlockKind::Assistant | BlockKind::Reasoning | BlockKind::Tool
         );
-    let marker = if block.expanded { "▾" } else { "▸" };
-    let status = if live {
-        animation::spinner(app.frame).to_string()
-    } else if block.kind == BlockKind::Tool {
-        if block.failed {
-            "×".to_string()
-        } else if block.text.contains("\n\nRESULT\n") {
-            "✓".to_string()
-        } else {
-            "·".to_string()
+    let selection = if selected { "▌ " } else { "  " };
+    let mut rows = Vec::new();
+
+    match block.kind {
+        BlockKind::User => {
+            let limit = if block.expanded {
+                EXPANDED_PREVIEW_LINES
+            } else {
+                3
+            };
+            let (lines, extra) = visible_block_lines(&block.text, body_width, limit);
+            for (index, line) in lines.into_iter().enumerate() {
+                rows.push(transcript_item(
+                    vec![
+                        Span::styled(selection, Style::default().fg(ACCENT)),
+                        Span::styled(
+                            if index == 0 { "› " } else { "  " },
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(line, Style::default().fg(TEXT)),
+                    ],
+                    background,
+                ));
+            }
+            if extra > 0 {
+                rows.push(transcript_hint(
+                    selection,
+                    extra,
+                    block.expanded,
+                    background,
+                ));
+            }
         }
-    } else {
-        " ".to_string()
-    };
-    ListItem::new(Line::from(vec![
-        Span::styled(
-            if selected { "› " } else { "  " },
-            Style::default().fg(ACCENT),
-        ),
-        Span::styled(
-            format!("{marker} {status} {:<12}", block.title),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            single_line_preview(&block.text, width.saturating_sub(18)),
-            Style::default().fg(if selected { TEXT } else { MUTED }),
-        ),
-    ]))
-    .style(Style::default().bg(if selected { SURFACE } else { BG }))
+        BlockKind::Assistant => {
+            let limit = if block.expanded {
+                EXPANDED_PREVIEW_LINES
+            } else {
+                1
+            };
+            let (lines, extra) = visible_block_lines(&block.text, body_width, limit);
+            for (index, line) in lines.into_iter().enumerate() {
+                let prefix = if index == 0 {
+                    if block.expanded { "• " } else { "▸ " }
+                } else {
+                    "  "
+                };
+                rows.push(transcript_item(
+                    vec![
+                        Span::styled(selection, Style::default().fg(ACCENT)),
+                        Span::styled(
+                            prefix,
+                            Style::default().fg(if live { ACCENT } else { MUTED }),
+                        ),
+                        Span::styled(line, Style::default().fg(TEXT)),
+                    ],
+                    background,
+                ));
+            }
+            if extra > 0 {
+                rows.push(transcript_hint(
+                    selection,
+                    extra,
+                    block.expanded,
+                    background,
+                ));
+            }
+        }
+        BlockKind::Reasoning => {
+            rows.push(transcript_item(
+                vec![
+                    Span::styled(selection, Style::default().fg(ACCENT)),
+                    Span::styled("◇ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        if live { "Thinking…" } else { "Thought" },
+                        Style::default()
+                            .fg(if live { ACCENT } else { MUTED })
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled(
+                        if block.expanded {
+                            "  ▾"
+                        } else {
+                            "  ▸ Enter to expand"
+                        },
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+                background,
+            ));
+            if block.expanded {
+                let (lines, extra) =
+                    visible_block_lines(&block.text, body_width, EXPANDED_PREVIEW_LINES);
+                for line in lines {
+                    rows.push(transcript_item(
+                        vec![
+                            Span::styled(selection, Style::default().fg(ACCENT)),
+                            Span::raw("  "),
+                            Span::styled(
+                                line,
+                                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                            ),
+                        ],
+                        background,
+                    ));
+                }
+                if extra > 0 {
+                    rows.push(transcript_hint(selection, extra, true, background));
+                }
+            }
+        }
+        BlockKind::Tool => {
+            let status = if live {
+                animation::spinner(app.frame).to_string()
+            } else if block.failed {
+                "×".to_string()
+            } else if block.text.contains("\n\nRESULT\n") {
+                "✓".to_string()
+            } else {
+                "·".to_string()
+            };
+            rows.push(transcript_item(
+                vec![
+                    Span::styled(selection, Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("{status} "),
+                        Style::default().fg(if block.failed { ERROR } else { WARM }),
+                    ),
+                    Span::styled(
+                        block.title.clone(),
+                        Style::default()
+                            .fg(if block.failed { ERROR } else { WARM })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if block.expanded { "  ▾" } else { "  ▸" },
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+                background,
+            ));
+            if block.expanded {
+                let (lines, extra) = visible_block_lines(&block.text, body_width, 10);
+                for line in lines {
+                    let label = matches!(line.as_str(), "CALL" | "RESULT" | "ERROR");
+                    rows.push(transcript_item(
+                        vec![
+                            Span::styled(selection, Style::default().fg(ACCENT)),
+                            Span::raw("  "),
+                            Span::styled(
+                                line,
+                                Style::default()
+                                    .fg(if label { WARM } else { MUTED })
+                                    .add_modifier(if label {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                        ],
+                        background,
+                    ));
+                }
+                if extra > 0 {
+                    rows.push(transcript_hint(selection, extra, true, background));
+                }
+            }
+        }
+        BlockKind::Compaction | BlockKind::Notice | BlockKind::Error => {
+            let color = match block.kind {
+                BlockKind::Compaction => ACCENT,
+                BlockKind::Notice => MUTED,
+                BlockKind::Error => ERROR,
+                _ => unreachable!(),
+            };
+            let symbol = match block.kind {
+                BlockKind::Compaction => "◇",
+                BlockKind::Notice => "·",
+                BlockKind::Error => "×",
+                _ => unreachable!(),
+            };
+            let limit = if block.expanded {
+                EXPANDED_PREVIEW_LINES
+            } else {
+                1
+            };
+            let (lines, extra) = visible_block_lines(&block.text, body_width, limit);
+            for (index, line) in lines.into_iter().enumerate() {
+                rows.push(transcript_item(
+                    vec![
+                        Span::styled(selection, Style::default().fg(ACCENT)),
+                        Span::styled(
+                            if index == 0 {
+                                format!("{symbol} {}  ", block.title)
+                            } else {
+                                "  ".to_string()
+                            },
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            line,
+                            Style::default().fg(if selected { TEXT } else { MUTED }),
+                        ),
+                    ],
+                    background,
+                ));
+            }
+            if extra > 0 {
+                rows.push(transcript_hint(
+                    selection,
+                    extra,
+                    block.expanded,
+                    background,
+                ));
+            }
+        }
+    }
+
+    rows
 }
 
-fn expanded_lines(block: &DisplayBlock, width: usize) -> Vec<ListItem<'static>> {
-    let wrapped = textwrap::wrap(&block.text, width.max(8));
-    let extra = wrapped.len().saturating_sub(EXPANDED_PREVIEW_LINES);
-    wrapped
-        .into_iter()
-        .take(EXPANDED_PREVIEW_LINES)
-        .map(|line| {
-            ListItem::new(Line::styled(
-                format!("     {line}"),
-                Style::default().fg(TEXT),
-            ))
-            .style(Style::default().bg(BG))
-        })
-        .chain(if extra > 0 {
-            Some(
-                ListItem::new(Line::styled(
-                    format!("     … {extra} more lines · Enter opens"),
-                    Style::default().fg(MUTED),
-                ))
-                .style(Style::default().bg(BG)),
-            )
+fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'static> {
+    ListItem::new(Line::from(spans)).style(Style::default().bg(background))
+}
+
+fn transcript_hint(
+    selection: &str,
+    extra: usize,
+    expanded: bool,
+    background: Color,
+) -> ListItem<'static> {
+    transcript_item(
+        vec![
+            Span::styled(selection.to_string(), Style::default().fg(ACCENT)),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "… {extra} more lines · Enter {}",
+                    if expanded { "opens" } else { "expands" }
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ],
+        background,
+    )
+}
+
+fn visible_block_lines(text: &str, width: usize, limit: usize) -> (Vec<String>, usize) {
+    let mut wrapped = Vec::new();
+    for logical in text.lines() {
+        if logical.is_empty() {
+            wrapped.push(String::new());
         } else {
-            None
-        })
-        .collect()
+            wrapped.extend(
+                textwrap::wrap(logical, width.max(1))
+                    .into_iter()
+                    .map(|line| line.into_owned()),
+            );
+        }
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    let extra = wrapped.len().saturating_sub(limit);
+    wrapped.truncate(limit);
+    (wrapped, extra)
 }
 
 fn status_notice(app: &App) -> Option<(String, Color)> {
@@ -3389,7 +3622,8 @@ fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
         Overlay::Status => bottom_float(frame, 14),
-        Overlay::Composer | Overlay::Text | Overlay::Oauth => Rect::new(
+        Overlay::Composer => bottom_float(frame, 8),
+        Overlay::Text | Overlay::Oauth => Rect::new(
             2,
             frame.height.saturating_sub(12).max(2),
             frame.width.saturating_sub(4),
@@ -3418,6 +3652,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(SURFACE).fg(TEXT))
         .padding(Padding::uniform(1));
@@ -4051,16 +4286,34 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
 }
 
 fn style_input(input: &mut TextArea<'static>, busy: bool) {
+    let border = if busy { MUTED } else { ACCENT };
     input.set_block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if busy { MUTED } else { ACCENT }))
-            .title(" COMPOSE · Enter send · Shift+Enter newline · Esc keep draft ")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .title(Line::styled(
+                " MESSAGE ",
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(
+                Line::styled(
+                    " Enter send · Shift+Enter newline · Esc keep draft ",
+                    Style::default().fg(MUTED),
+                )
+                .right_aligned(),
+            )
             .style(Style::default().bg(SURFACE)),
     );
+    input.set_placeholder_text(if busy {
+        "A turn is already running"
+    } else {
+        "Ask URI Agent to build, explain, or fix…"
+    });
+    input.set_placeholder_style(Style::default().fg(MUTED).bg(SURFACE));
     input.set_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
-    input.set_cursor_style(Style::default().fg(BG).bg(ACCENT));
+    input.set_cursor_style(Style::default().fg(BG).bg(border));
 }
 
 fn composer_cursor_position(
@@ -4369,12 +4622,27 @@ fn head_branch(gitdir: &Path) -> Option<String> {
 
 fn single_line_preview(text: &str, limit: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= limit {
+    if normalized.width() <= limit {
         normalized
-    } else if limit <= 1 {
+    } else if limit == 0 {
+        String::new()
+    } else if limit == 1 {
         "…".to_string()
     } else {
-        normalized.chars().take(limit - 1).collect::<String>() + "…"
+        let mut width = 0;
+        let preview = normalized
+            .chars()
+            .take_while(|character| {
+                let character_width = character.width().unwrap_or(0);
+                if width + character_width > limit - 1 {
+                    false
+                } else {
+                    width += character_width;
+                    true
+                }
+            })
+            .collect::<String>();
+        preview + "…"
     }
 }
 
@@ -4495,11 +4763,8 @@ mod tests {
         // leaves richer project and usage details to the expanded status panel.
         assert!(!rendered.contains("URI Agent"));
         assert!(!rendered.contains("ready"));
-        assert!(
-            footer
-                .trim_start()
-                .starts_with("model · effort off  ········ 0.0%/128k")
-        );
+        assert!(footer.starts_with("model · effort off"));
+        assert!(footer.trim_end().ends_with("········ 0.0%/128k"));
         assert!(!footer.contains("ctx"));
         assert!(footer.contains("model"));
         assert!(!footer.contains("URI"));
@@ -4518,7 +4783,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let model = &terminal.backend().buffer()[(0, 23)];
-        let context = &terminal.backend().buffer()[(20, 23)];
+        let context = &terminal.backend().buffer()[(82, 23)];
         assert_eq!((context.fg, context.bg), (ACCENT, BG));
         assert!(context.modifier.contains(Modifier::BOLD));
         assert_eq!((model.fg, model.bg), (TEXT, BG));
@@ -4541,6 +4806,30 @@ mod tests {
         assert_eq!(hit_target(&app.hit_regions, click), Some(AppHit::Status));
         open_status(&mut app);
         assert!(app.overlay == Some(Overlay::Status));
+    }
+
+    #[test]
+    fn compact_footer_right_aligns_context_and_handles_narrow_widths() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            true,
+        );
+        let backend = TestBackend::new(12, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let footer = &terminal.backend().buffer().content()[7 * 12..8 * 12];
+        assert_eq!(footer.last().unwrap().symbol(), "…");
+        assert_eq!(footer.last().unwrap().fg, ACCENT);
+        assert!(footer.iter().all(|cell| cell.fg != TEXT));
+        assert_eq!(single_line_preview("模型 名称", 5), "模型…");
+        assert_eq!(single_line_preview("model", 0), "");
     }
 
     #[test]
@@ -4572,7 +4861,9 @@ mod tests {
         assert!(!rendered.contains("↑1.5k"));
         assert!(!rendered.contains("↓600"));
         assert!(!rendered.contains("$0.012"));
-        assert!(rendered.contains("test/model · effort off  ▓······· 10.0%/262k"));
+        let footer = rendered.lines().last().unwrap();
+        assert!(footer.starts_with("test/model · effort off"));
+        assert!(footer.trim_end().ends_with("▓······· 10.0%/262k"));
         assert!(!rendered.contains("last hit 25.0%"));
 
         app.overlay = Some(Overlay::Status);
@@ -4584,6 +4875,81 @@ mod tests {
         assert!(rendered.contains("$0.0123"));
         // Usage events remain available in status without adding transcript blocks.
         assert_eq!(app.blocks.len(), 1);
+    }
+
+    #[test]
+    fn transcript_uses_role_specific_blocks_and_mouse_regions() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "Inspect the renderer\nand keep navigation intact.".to_string(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "I updated the conversation hierarchy.".to_string(),
+            None,
+            false,
+            true,
+        );
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "Compare the reference implementations.".to_string(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Tool,
+            "READ · file://src/tui.rs",
+            "CALL\n{}\n\nRESULT\nsource".to_string(),
+            Some("call-1".to_string()),
+            false,
+            false,
+        );
+        app.selected_block = 0;
+
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("▌ › Inspect the renderer"));
+        assert!(rendered.contains("• I updated the conversation hierarchy."));
+        assert!(rendered.contains("◇ Thought  ▸ Enter to expand"));
+        assert!(rendered.contains("✓ READ · file://src/tui.rs  ▸"));
+        assert!(!rendered.contains("YOU"));
+        assert!(!rendered.contains("AGENT"));
+        assert!(!rendered.contains("THINKING"));
+
+        let user_rows = app
+            .hit_regions
+            .iter()
+            .filter_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .collect::<Vec<_>>();
+        assert_eq!(user_rows.len(), 2);
+        assert!(!app.hit_regions.iter().any(|region| {
+            region.area.y == user_rows[1] + 1 && matches!(region.target, AppHit::Transcript(_))
+        }));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(10, user_rows[0])].bg,
+            USER_ACTIVE
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(98, user_rows[0])].bg,
+            USER_ACTIVE
+        );
+        let assistant_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(10, assistant_row)].bg, BG);
     }
 
     #[test]
@@ -4744,7 +5110,22 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        terminal.backend_mut().assert_cursor_position((5, 14));
+        terminal.backend_mut().assert_cursor_position((5, 18));
+    }
+
+    #[test]
+    fn composer_is_bottom_anchored_with_a_rounded_frame_and_placeholder() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        let rendered = render_to_string(&mut app, 80, 24);
+        let rows = rendered.lines().collect::<Vec<_>>();
+
+        assert!(rows[16].starts_with("  ╭"));
+        assert!(rows[16].contains("MESSAGE"));
+        assert!(rows[17].contains("Ask URI Agent to build, explain, or fix…"));
+        assert!(rows[23].starts_with("  ╰"));
+        assert!(rows[23].contains("Enter send · Shift+Enter newline · Esc keep draft"));
+        assert!(rows[23].ends_with("╯  "));
     }
 
     #[test]
@@ -4775,6 +5156,26 @@ mod tests {
         assert!(app.blocks[0].expanded);
         app.toggle_selected();
         assert!(!app.blocks[0].expanded);
+    }
+
+    #[test]
+    fn enter_opens_full_document_when_wrapping_exceeds_the_preview() {
+        let mut app = test_app();
+        app.transcript_body_width = 8;
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "word ".repeat(60),
+            None,
+            false,
+            true,
+        );
+
+        app.toggle_selected();
+
+        assert!(app.overlay == Some(Overlay::Document));
+        assert!(app.document.is_some());
+        assert!(app.blocks[0].expanded);
     }
 
     #[test]
@@ -5226,6 +5627,7 @@ mod tests {
             },
         });
         assert_eq!(app.blocks.len(), 1);
+        assert_eq!(app.blocks[0].title, "READ · file://src/main.rs");
         assert!(app.blocks[0].text.contains("CALL"));
         assert!(app.blocks[0].text.contains("RESULT"));
         assert!(block_document(&app.blocks[0]).contains("complete tool output"));
@@ -5245,7 +5647,8 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 24);
         let rows = rendered.lines().collect::<Vec<_>>();
         assert!(rows[22].contains("thinking"));
-        assert!(rows[23].contains("model · effort off  ········ 0.0%/128k"));
+        assert!(rows[23].starts_with("model · effort off"));
+        assert!(rows[23].trim_end().ends_with("········ 0.0%/128k"));
         app.apply(SessionEvent {
             sequence: 2,
             at: chrono::Utc::now(),

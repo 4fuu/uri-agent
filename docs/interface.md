@@ -6,13 +6,13 @@ URI Agent presents one conversation surface with floating controls for compositi
 
 Startup may show a short animated splash before the conversation. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model with its thinking effort below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
 
-After the first record appears, the transcript uses the available content area and a minimal footer stays on the bottom row. It shows the active model and effort first, followed by an animated context meter and `percentage/context-window-size`, for example `model · effort high  ▓······· 10.0%/262k`. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
+After the first record appears, the transcript uses the available content area and a minimal footer stays on the bottom row. It keeps the active model and effort at the left edge and the animated context meter plus `percentage/context-window-size` at the right edge. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
 
-Conversation rows stay folded until opened. Select a row with the arrow keys or mouse and press `Enter` to expand or fold it. Reasoning rows are included instead of being placed in a separate mode.
+User prompts use a low-contrast full-width band, while assistant responses remain unboxed and read like a document. Completed reasoning and tool calls collapse to compact semantic summaries; assistant responses remain expanded up to the transcript preview limit. Select a block with the arrow keys or mouse and press `Enter` to expand, fold, or open its full document. Reasoning remains in the conversation instead of moving to a separate mode.
 
 ## Composer and commands
 
-Press `i` to open the floating composer:
+Press `i` to open the rounded, bottom-anchored composer. An empty composer shows a placeholder; while a turn is running, its muted state explains that another turn cannot be submitted:
 
 | Key | Action |
 | --- | --- |
