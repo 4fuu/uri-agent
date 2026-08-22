@@ -28,6 +28,17 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
 const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImageAttachment {
+    bytes: Vec<u8>,
+}
+
+impl ImageAttachment {
+    pub(crate) fn png(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ModelRetryPolicy {
     max_retries: usize,
@@ -155,6 +166,14 @@ impl AgentRuntime {
     /// Start a detached turn owned by this runtime. The handle remains
     /// available for orderly process shutdown instead of becoming fire-and-forget.
     pub async fn start_turn(self: &Arc<Self>, prompt: String) -> Result<()> {
+        self.start_turn_with_images(prompt, Vec::new()).await
+    }
+
+    pub(crate) async fn start_turn_with_images(
+        self: &Arc<Self>,
+        prompt: String,
+        images: Vec<ImageAttachment>,
+    ) -> Result<()> {
         let mut active = self.active_turn.lock().await;
         if let Some(previous) = active.take() {
             if !previous.handle.is_finished() {
@@ -166,7 +185,7 @@ impl AgentRuntime {
         let (cancel, receiver) = watch::channel(None);
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
-            let _ = runtime.run_turn_with_cancel(prompt, receiver).await;
+            let _ = runtime.run_turn_with_cancel(prompt, images, receiver).await;
         });
         *active = Some(ActiveTurn { cancel, handle });
         Ok(())
@@ -196,13 +215,22 @@ impl AgentRuntime {
     }
 
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
+        self.run_turn_with_images(prompt, Vec::new()).await
+    }
+
+    pub(crate) async fn run_turn_with_images(
+        &self,
+        prompt: String,
+        images: Vec<ImageAttachment>,
+    ) -> Result<()> {
         let (_cancel_tx, cancel) = watch::channel(None);
-        self.run_turn_with_cancel(prompt, cancel).await
+        self.run_turn_with_cancel(prompt, images, cancel).await
     }
 
     async fn run_turn_with_cancel(
         &self,
         prompt: String,
+        clipboard_images: Vec<ImageAttachment>,
         mut cancel: watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<()> {
         let _turn = self.turn.lock().await;
@@ -222,7 +250,8 @@ impl AgentRuntime {
                 return Err(anyhow!(text));
             }
         };
-        let images = match image_attachments(prompt, self.session.project_directory()).await {
+        let mut images = memory_image_attachments(clipboard_images);
+        let path_images = match image_attachments(prompt, self.session.project_directory()).await {
             Ok(images) => images,
             Err(error) => {
                 let text = format!("{error:#}");
@@ -232,6 +261,7 @@ impl AgentRuntime {
                 return Err(anyhow!(text));
             }
         };
+        images.extend(path_images);
         if !images.is_empty() && !backend.accepts_image_input() {
             let text = "the active model does not accept image input".to_string();
             self.session
@@ -741,6 +771,19 @@ fn model_retry_reason(failure: &ModelFailure, policy: ModelRetryPolicy) -> Strin
     reason
 }
 
+fn memory_image_attachments(images: Vec<ImageAttachment>) -> Vec<UserContent> {
+    images
+        .into_iter()
+        .map(|image| {
+            UserContent::image_base64(
+                base64::engine::general_purpose::STANDARD.encode(image.bytes),
+                Some(ImageMediaType::PNG),
+                None,
+            )
+        })
+        .collect()
+}
+
 async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>> {
     let arguments = prompt_arguments(prompt);
     let root = tokio::fs::canonicalize(cwd)
@@ -882,6 +925,7 @@ mod tests {
     struct FakeBackend {
         responses: Mutex<VecDeque<(Vec<AssistantContent>, Option<Usage>)>>,
         requests: Mutex<Vec<ModelRequest>>,
+        accepts_images: bool,
     }
 
     struct ScriptedBackend {
@@ -904,6 +948,10 @@ mod tests {
 
     #[async_trait]
     impl ModelBackend for FakeBackend {
+        fn accepts_image_input(&self) -> bool {
+            self.accepts_images
+        }
+
         async fn complete(
             &self,
             request: ModelRequest,
@@ -1051,6 +1099,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(absolute.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clipboard_and_path_images_share_the_user_message() {
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            workspace.path().join("screen.png"),
+            b"\x89PNG\r\n\x1a\npath-image",
+        )
+        .await
+        .unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("Done")],
+                None,
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: true,
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime
+            .run_turn_with_images(
+                "inspect @screen.png".to_string(),
+                vec![ImageAttachment::png(
+                    b"\x89PNG\r\n\x1a\nclipboard-image".to_vec(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let requests = backend.requests.lock().await;
+        let images = requests[0]
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(
+                    content
+                        .iter()
+                        .filter_map(|content| match content {
+                            UserContent::Image(image) => Some(image),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(images.len(), 2);
+        assert!(
+            images
+                .iter()
+                .all(|image| image.media_type == Some(ImageMediaType::PNG))
+        );
+        assert!(matches!(
+            &images[0].data,
+            rig::message::DocumentSourceKind::Base64(data)
+                if base64::engine::general_purpose::STANDARD.decode(data).unwrap()
+                    == b"\x89PNG\r\n\x1a\nclipboard-image"
+        ));
+
+        drop(requests);
+        drop(runtime);
+        drop(session);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn text_only_backends_reject_clipboard_images_before_recording_the_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        let error = runtime
+            .run_turn_with_images(
+                "inspect this".to_string(),
+                vec![ImageAttachment::png(
+                    b"\x89PNG\r\n\x1a\nclipboard-image".to_vec(),
+                )],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("does not accept image input"));
+        assert!(backend.requests.lock().await.is_empty());
+        assert!(session.model_history().await.is_empty());
+
+        drop(runtime);
+        drop(session);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[tokio::test]
@@ -1263,6 +1403,7 @@ mod tests {
                 (vec![AssistantContent::text("Done")], Some(fake_usage())),
             ])),
             requests: Mutex::new(Vec::new()),
+            accepts_images: false,
         });
         let runtime = AgentRuntime::new(
             Some(backend),
@@ -1363,6 +1504,7 @@ mod tests {
                 None,
             )])),
             requests: Mutex::new(Vec::new()),
+            accepts_images: false,
         });
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
@@ -1504,6 +1646,7 @@ mod tests {
                 (vec![AssistantContent::text("Current answer")], None),
             ])),
             requests: Mutex::new(Vec::new()),
+            accepts_images: false,
         });
         let runtime = AgentRuntime::new(
             Some(backend.clone()),

@@ -1,5 +1,6 @@
 pub mod builtins;
 pub mod catalog;
+pub mod clipboard;
 pub mod compaction;
 pub mod config;
 pub mod keymap;

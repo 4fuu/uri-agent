@@ -4,6 +4,7 @@ mod model_selector;
 
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
 use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
+use crate::clipboard;
 use crate::config::{ActiveSettings, AuthKind, ConfigManager, display_path};
 use crate::keymap::{Keymap, canonical_key};
 use crate::model::{clamp_thinking_level, configured_backend};
@@ -14,7 +15,7 @@ use crate::plugin::{
     TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
-use crate::runtime::AgentRuntime;
+use crate::runtime::{AgentRuntime, ImageAttachment};
 use crate::session::{EventKind, SessionEvent, SessionSummary, SessionUpdate};
 use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
@@ -471,6 +472,8 @@ struct App {
     selection: Option<TextSelection>,
     composer_view: Option<ComposerView>,
     composer_mouse_selecting: bool,
+    pending_images: Vec<ImageAttachment>,
+    clipboard_image_loading: bool,
     usage: UsageTotals,
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
@@ -494,7 +497,7 @@ impl App {
         if !draft.is_empty() {
             input.insert_str(&draft);
         }
-        style_input(&mut input, false);
+        style_input(&mut input, false, 0, false);
         Self {
             input,
             blocks: Vec::new(),
@@ -545,6 +548,8 @@ impl App {
             selection: None,
             composer_view: None,
             composer_mouse_selecting: false,
+            pending_images: Vec::new(),
+            clipboard_image_loading: false,
             usage: UsageTotals::default(),
             last_cache_hit: None,
             branch: None,
@@ -819,7 +824,12 @@ impl App {
                 .find_map(|(index, _)| self.block_visible(index).then_some(index))
                 .unwrap_or_default();
         }
-        style_input(&mut self.input, self.busy);
+        style_input(
+            &mut self.input,
+            self.busy,
+            self.pending_images.len(),
+            self.clipboard_image_loading,
+        );
     }
 
     fn apply_transient(&mut self, kind: EventKind) {
@@ -931,7 +941,12 @@ impl App {
                 BlockKind::Assistant | BlockKind::Notice | BlockKind::Error
             );
         }
-        style_input(&mut self.input, false);
+        style_input(
+            &mut self.input,
+            false,
+            self.pending_images.len(),
+            self.clipboard_image_loading,
+        );
     }
 
     fn push(
@@ -970,23 +985,53 @@ impl App {
         }
     }
 
-    fn submit(&mut self) -> Option<String> {
+    fn submit(&mut self) -> Option<(String, Vec<ImageAttachment>)> {
         if self.busy {
             self.set_flash("A turn is already running");
+            return None;
+        }
+        if self.clipboard_image_loading {
+            self.set_flash("Still reading the clipboard image");
             return None;
         }
         let text = self.input.lines().join("\n");
         if text.trim().is_empty() {
             return None;
         }
+        let images = self.pending_images.clone();
         self.input = TextArea::default();
-        style_input(&mut self.input, true);
+        style_input(&mut self.input, true, images.len(), false);
         self.composer_mouse_selecting = false;
         self.busy = true;
         self.busy_since = Some(Instant::now());
         self.activity = Some(Activity::Thinking);
         self.overlay = None;
-        Some(text)
+        Some((text, images))
+    }
+
+    fn remove_last_image(&mut self) {
+        if self.pending_images.pop().is_some() {
+            let remaining = self.pending_images.len();
+            self.set_flash(format!(
+                "Removed the latest image attachment · {remaining} remaining"
+            ));
+        } else {
+            self.set_flash("No image attachment to remove");
+        }
+    }
+
+    fn finish_clipboard_image_read(&mut self, result: Result<Vec<u8>>) {
+        self.clipboard_image_loading = false;
+        match result {
+            Ok(bytes) => {
+                self.pending_images.push(ImageAttachment::png(bytes));
+                self.set_flash(format!(
+                    "Image attached for the next message · {} total",
+                    self.pending_images.len()
+                ));
+            }
+            Err(error) => self.set_flash(format!("Clipboard image failed: {error:#}")),
+        }
     }
 
     fn draft_text(&self) -> String {
@@ -1495,7 +1540,12 @@ impl TuiTerminal {
             app.busy = true;
             app.busy_since = Some(Instant::now());
             app.activity = Some(Activity::Thinking);
-            style_input(&mut app.input, true);
+            style_input(
+                &mut app.input,
+                true,
+                app.pending_images.len(),
+                app.clipboard_image_loading,
+            );
         }
 
         let services = LoopServices {
@@ -1644,12 +1694,17 @@ async fn persist_and_exit(
 enum BackgroundEvent {
     CatalogRefreshed(Result<ActiveSettings>),
     OauthFinished(Result<OauthToken>),
+    ClipboardImageRead(Result<Vec<u8>>),
 }
 
 enum Action {
     Continue,
     Quit,
-    Submit(String),
+    Submit {
+        prompt: String,
+        images: Vec<ImageAttachment>,
+    },
+    ReadClipboardImage,
     InterruptTurn,
     Compact,
     OpenModels(String),
@@ -1693,14 +1748,25 @@ async fn apply_action(
                 Ok(Some(TuiOutcome::Resume(id)))
             }
         }
-        Action::Submit(prompt) => {
+        Action::Submit { prompt, images } => {
             let _ = services.runtime.session().save_draft("").await;
-            if let Err(error) = services.runtime.start_turn(prompt).await {
-                app.busy = false;
-                app.busy_since = None;
-                app.activity = None;
-                app.set_flash(format!("Cannot start turn: {error:#}"));
+            match services
+                .runtime
+                .start_turn_with_images(prompt, images)
+                .await
+            {
+                Ok(()) => app.pending_images.clear(),
+                Err(error) => {
+                    app.busy = false;
+                    app.busy_since = None;
+                    app.activity = None;
+                    app.set_flash(format!("Cannot start turn: {error:#}"));
+                }
             }
+            Ok(None)
+        }
+        Action::ReadClipboardImage => {
+            start_clipboard_image_read(app, background_tx);
             Ok(None)
         }
         Action::InterruptTurn => {
@@ -1981,6 +2047,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             app.overlay = Some(Overlay::Composer);
             Action::Continue
         }
+        Some("paste_image") => Action::ReadClipboardImage,
         Some("command") => {
             app.reset_command_search();
             app.overlay = Some(Overlay::Command);
@@ -2074,9 +2141,19 @@ async fn handle_overlay_key(
 ) -> Action {
     match overlay {
         Overlay::Composer => match app.keymap.action("composer", key_name).as_deref() {
-            Some("submit") => app.submit().map_or(Action::Continue, Action::Submit),
+            Some("submit") => {
+                app.submit()
+                    .map_or(Action::Continue, |(prompt, images)| Action::Submit {
+                        prompt,
+                        images,
+                    })
+            }
             Some("newline") => {
                 app.input.insert_newline();
+                Action::Continue
+            }
+            Some("remove_last_image") => {
+                app.remove_last_image();
                 Action::Continue
             }
             Some("copy") => {
@@ -3591,6 +3668,22 @@ async fn save_settings(
     });
 }
 
+fn start_clipboard_image_read(app: &mut App, sender: mpsc::UnboundedSender<BackgroundEvent>) {
+    if app.clipboard_image_loading {
+        app.set_flash("A clipboard image is already being read");
+        return;
+    }
+    app.clipboard_image_loading = true;
+    app.set_flash("Reading an image from the clipboard…");
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(clipboard::read_image_png)
+            .await
+            .context("clipboard image reader stopped unexpectedly")
+            .and_then(|result| result);
+        let _ = sender.send(BackgroundEvent::ClipboardImageRead(result));
+    });
+}
+
 fn start_catalog_refresh(
     app: &mut App,
     services: &LoopServices,
@@ -3681,6 +3774,9 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
                 }
                 Err(error) => app.set_flash(format!("OAuth failed: {error:#}")),
             }
+        }
+        BackgroundEvent::ClipboardImageRead(result) => {
+            app.finish_clipboard_image_read(result);
         }
     }
 }
@@ -4837,7 +4933,12 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         .padding(Padding::uniform(1));
     match overlay {
         Overlay::Composer => {
-            style_input(&mut app.input, app.busy);
+            style_input(
+                &mut app.input,
+                app.busy,
+                app.pending_images.len(),
+                app.clipboard_image_loading,
+            );
             frame.render_widget(&app.input, area);
             if let Some(position) = composer_cursor_position(frame, &app.input, area) {
                 frame.set_cursor_position(position);
@@ -5472,24 +5573,35 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
     }
 }
 
-fn style_input(input: &mut TextArea<'static>, busy: bool) {
+fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, image_loading: bool) {
     let border = if busy { MUTED } else { ACCENT };
+    let title = match (image_count, image_loading) {
+        (0, false) => " MESSAGE ".to_string(),
+        (0, true) => " MESSAGE · reading clipboard image… ".to_string(),
+        (count, false) => format!(
+            " MESSAGE · {count} image{} ",
+            if count == 1 { "" } else { "s" }
+        ),
+        (count, true) => format!(
+            " MESSAGE · {count} image{} · reading another… ",
+            if count == 1 { "" } else { "s" }
+        ),
+    };
+    let footer = if image_count == 0 {
+        " Enter send · Shift+Enter newline · Esc keep draft "
+    } else {
+        " Enter send · Alt+Backspace remove latest image · Esc keep draft "
+    };
     input.set_block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border))
             .title(Line::styled(
-                " MESSAGE ",
+                title,
                 Style::default().fg(border).add_modifier(Modifier::BOLD),
             ))
-            .title_bottom(
-                Line::styled(
-                    " Enter send · Shift+Enter newline · Esc keep draft ",
-                    Style::default().fg(MUTED),
-                )
-                .right_aligned(),
-            )
+            .title_bottom(Line::styled(footer, Style::default().fg(MUTED)).right_aligned())
             .style(Style::default().bg(SURFACE)),
     );
     input.set_placeholder_text(if busy {
@@ -7438,11 +7550,54 @@ mod tests {
         app.overlay = None;
         assert_eq!(app.draft_text(), "first\nsecond");
         app.overlay = Some(Overlay::Composer);
-        let prompt = app.submit().unwrap();
+        let (prompt, images) = app.submit().unwrap();
         assert_eq!(prompt, "first\nsecond");
+        assert!(images.is_empty());
         assert!(app.draft_text().is_empty());
         assert!(app.overlay.is_none());
         assert!(!app.animations_paused());
+    }
+
+    #[test]
+    fn clipboard_images_wait_for_the_next_submit_and_are_removed_latest_first() {
+        let mut app = test_app();
+        let first = ImageAttachment::png(vec![1]);
+        let second = ImageAttachment::png(vec![2]);
+        app.pending_images.extend([first.clone(), second]);
+
+        app.remove_last_image();
+        assert_eq!(app.pending_images.as_slice(), std::slice::from_ref(&first));
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("inspect this");
+        app.clipboard_image_loading = true;
+        assert!(app.submit().is_none());
+        assert_eq!(app.draft_text(), "inspect this");
+        assert_eq!(app.pending_images.as_slice(), std::slice::from_ref(&first));
+
+        app.clipboard_image_loading = false;
+        let (prompt, images) = app.submit().unwrap();
+        assert_eq!(prompt, "inspect this");
+        assert_eq!(images.as_slice(), std::slice::from_ref(&first));
+        assert_eq!(app.pending_images, [first]);
+    }
+
+    #[test]
+    fn clipboard_read_completion_updates_pending_state_without_opening_composer() {
+        let mut app = test_app();
+        app.clipboard_image_loading = true;
+
+        app.finish_clipboard_image_read(Ok(vec![1, 2, 3]));
+
+        assert!(!app.clipboard_image_loading);
+        assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
+        assert!(app.overlay.is_none());
+        assert!(app.visible_flash().unwrap().contains("next message"));
+
+        app.clipboard_image_loading = true;
+        app.finish_clipboard_image_read(Err(anyhow!("clipboard unavailable")));
+        assert!(!app.clipboard_image_loading);
+        assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
+        assert!(app.visible_flash().unwrap().contains("failed"));
     }
 
     #[test]
@@ -7559,6 +7714,18 @@ mod tests {
         assert!(rows[23].starts_with("  ╰"));
         assert!(rows[23].contains("Enter send · Shift+Enter newline · Esc keep draft"));
         assert!(rows[23].ends_with("╯  "));
+    }
+
+    #[test]
+    fn composer_shows_pending_image_count_and_removal_shortcut() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
+
+        let rendered = render_to_string(&mut app, 80, 24);
+
+        assert!(rendered.contains("MESSAGE · 1 image"));
+        assert!(rendered.contains("Alt+Backspace remove latest image"));
     }
 
     #[test]
@@ -8828,6 +8995,14 @@ mod tests {
         assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             "?"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT)),
+            "@"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+            "alt+backspace"
         );
         assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('：'), KeyModifiers::empty())),

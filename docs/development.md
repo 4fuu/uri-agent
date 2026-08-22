@@ -42,6 +42,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
 | `src/model.rs` | Rig provider adapters, model request compatibility, multimodal support, and the two tool schemas |
+| `src/clipboard.rs` | Cross-platform clipboard image reads and PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and built-in protocol help |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
 | `src/builtins/` | Built-in project-instruction, binary-hint, file, exact replacement, Codex patch, Bash, and PowerShell plugins |
