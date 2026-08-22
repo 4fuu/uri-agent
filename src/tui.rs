@@ -28,6 +28,7 @@ use crossterm::event::{
 use crossterm::execute;
 use futures_util::StreamExt;
 use portable_pty::CommandBuilder;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -5351,13 +5352,18 @@ fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let cells = (area.y..area.bottom())
         .map(|row| {
+            let mut hidden_cells = 0;
             (area.x..area.right())
                 .map(|column| {
-                    frame
-                        .buffer_mut()
-                        .cell((column, row))
-                        .map(|cell| cell.symbol().to_string())
-                        .unwrap_or_default()
+                    let Some(cell) = frame.buffer_mut().cell((column, row)) else {
+                        return String::new();
+                    };
+                    if hidden_cells > 0 {
+                        hidden_cells -= 1;
+                        return String::new();
+                    }
+                    hidden_cells = cell.cell_width().saturating_sub(1);
+                    cell.symbol().to_string()
                 })
                 .collect()
         })
@@ -8297,5 +8303,32 @@ mod tests {
         };
         assert_eq!(selected_surface_text(&surface, selection), "bc\ndef");
         assert_eq!(complete_surface_text(&surface), "abc\ndef");
+    }
+
+    #[test]
+    fn captured_wide_characters_do_not_include_their_hidden_cells() {
+        let mut app = test_app();
+        let area = Rect::new(0, 0, 12, 1);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("复制内容"), area);
+                capture_surface(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let surface = app.selectable.as_ref().unwrap();
+        assert_eq!(
+            selected_surface_text(
+                surface,
+                TextSelection {
+                    start: (0, 0),
+                    end: (7, 0),
+                },
+            ),
+            "复制内容"
+        );
+        assert_eq!(complete_surface_text(surface), "复制内容");
     }
 }
