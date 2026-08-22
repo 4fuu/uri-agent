@@ -48,7 +48,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const BG: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(21, 24, 28);
 const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
-const USER_SURFACE: Color = Color::Rgb(29, 34, 40);
 const TEXT: Color = Color::Rgb(218, 223, 229);
 const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
@@ -3632,8 +3631,9 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
         return;
     }
-    let body_width = (area.width.saturating_sub(8) as usize).max(8);
-    app.transcript_body_width = body_width;
+    let message_width = area.width.saturating_sub(2).max(1) as usize;
+    let process_width = (area.width.saturating_sub(8) as usize).max(8);
+    app.transcript_body_width = process_width;
     let mut items = Vec::new();
     let mut block_for_row = Vec::new();
     let mut block_rows = vec![None; app.blocks.len()];
@@ -3650,7 +3650,8 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             block,
             index == app.selected_block,
             Some(index) == active_block,
-            body_width,
+            message_width,
+            process_width,
             app,
         ) {
             items.push(item);
@@ -3711,14 +3712,14 @@ fn transcript_block_items(
     block: &DisplayBlock,
     selected: bool,
     live: bool,
-    body_width: usize,
+    message_width: usize,
+    process_width: usize,
     app: &App,
 ) -> Vec<ListItem<'static>> {
-    let background = match block.kind {
-        BlockKind::User => USER_SURFACE,
-        BlockKind::Assistant => BG,
-        _ if selected => ROW_ACTIVE,
-        _ => BG,
+    let background = if selected && !matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
+        ROW_ACTIVE
+    } else {
+        BG
     };
     let selection = if selected { "▌ " } else { "  " };
     let open_key = app
@@ -3730,39 +3731,16 @@ fn transcript_block_items(
 
     match block.kind {
         BlockKind::User => {
-            for (index, line) in wrapped_block_lines(&block.text, body_width)
-                .into_iter()
-                .enumerate()
-            {
+            for line in wrapped_block_lines(&block.text, message_width) {
                 rows.push(transcript_item(
-                    vec![
-                        Span::styled(selection, Style::default().fg(ACCENT)),
-                        Span::styled(
-                            if index == 0 { "› " } else { "  " },
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(line, Style::default().fg(TEXT)),
-                    ],
+                    vec![Span::styled(line, Style::default().fg(TEXT))],
                     background,
                 ));
             }
         }
         BlockKind::Assistant => {
-            for (index, line) in markdown::render(&block.text, body_width)
-                .into_iter()
-                .enumerate()
-            {
-                rows.push(transcript_styled_item(
-                    vec![
-                        Span::styled(selection, Style::default().fg(ACCENT)),
-                        Span::styled(
-                            if index == 0 { "• " } else { "  " },
-                            Style::default().fg(if live { ACCENT } else { MUTED }),
-                        ),
-                    ],
-                    line,
-                    background,
-                ));
+            for line in markdown::render(&block.text, message_width) {
+                rows.push(ListItem::new(line).style(Style::default().bg(background)));
             }
         }
         BlockKind::Reasoning => {
@@ -3789,7 +3767,7 @@ fn transcript_block_items(
             ));
             if block.expanded {
                 let (lines, extra) =
-                    visible_block_lines(&block.text, body_width, EXPANDED_PREVIEW_LINES);
+                    visible_block_lines(&block.text, process_width, EXPANDED_PREVIEW_LINES);
                 for line in lines {
                     rows.push(transcript_item(
                         vec![
@@ -3847,7 +3825,7 @@ fn transcript_block_items(
                 background,
             ));
             if block.expanded {
-                let (lines, extra) = tool_detail_lines(block, body_width, 8);
+                let (lines, extra) = tool_detail_lines(block, process_width, 8);
                 for (line, color) in lines {
                     rows.push(transcript_item(
                         vec![
@@ -3883,7 +3861,7 @@ fn transcript_block_items(
             } else {
                 1
             };
-            let (lines, extra) = visible_block_lines(&block.text, body_width, limit);
+            let (lines, extra) = visible_block_lines(&block.text, process_width, limit);
             for (index, line) in lines.into_iter().enumerate() {
                 rows.push(transcript_item(
                     vec![
@@ -3921,15 +3899,6 @@ fn transcript_block_items(
 
 fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'static> {
     ListItem::new(Line::from(spans)).style(Style::default().bg(background))
-}
-
-fn transcript_styled_item(
-    mut prefix: Vec<Span<'static>>,
-    line: Line<'static>,
-    background: Color,
-) -> ListItem<'static> {
-    prefix.extend(line.spans);
-    ListItem::new(Line::from(prefix).style(line.style)).style(Style::default().bg(background))
 }
 
 fn transcript_hint(
@@ -5582,10 +5551,13 @@ mod tests {
         app.selected_block = 0;
 
         let rendered = render_to_string(&mut app, 100, 24);
-        assert!(rendered.contains("▌ › Inspect the renderer"));
-        assert!(rendered.contains("• I updated the conversation hierarchy."));
+        assert!(rendered.contains("Inspect the renderer"));
+        assert!(rendered.contains("I updated the conversation hierarchy."));
         assert!(rendered.contains("◇ Thought  ▸ Enter to expand"));
         assert!(rendered.contains("✓ READ · file://src/tui.rs  ▸"));
+        assert!(!rendered.contains('▌'));
+        assert!(!rendered.contains("› "));
+        assert!(!rendered.contains("• "));
         assert!(!rendered.contains("YOU"));
         assert!(!rendered.contains("AGENT"));
         assert!(!rendered.contains("THINKING"));
@@ -5603,14 +5575,8 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert_eq!(
-            terminal.backend().buffer()[(10, user_rows[0])].bg,
-            USER_SURFACE
-        );
-        assert_eq!(
-            terminal.backend().buffer()[(98, user_rows[0])].bg,
-            USER_SURFACE
-        );
+        assert_eq!(terminal.backend().buffer()[(10, user_rows[0])].bg, BG);
+        assert_eq!(terminal.backend().buffer()[(98, user_rows[0])].bg, BG);
         let assistant_row = app
             .hit_regions
             .iter()
@@ -5638,6 +5604,41 @@ mod tests {
             terminal.backend().buffer()[(10, reasoning_row)].bg,
             ROW_ACTIVE
         );
+    }
+
+    #[test]
+    fn user_and_assistant_content_aligns_to_both_transcript_edges() {
+        let mut app = test_app();
+        app.push(BlockKind::User, "YOU", "U".repeat(38), None, false, false);
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "A".repeat(38),
+            None,
+            false,
+            true,
+        );
+        app.skip_splash();
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let user_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .unwrap();
+        let assistant_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+
+        for (row, symbol) in [(user_row, "U"), (assistant_row, "A")] {
+            assert_eq!(terminal.backend().buffer()[(1, row)].symbol(), symbol);
+            assert_eq!(terminal.backend().buffer()[(38, row)].symbol(), symbol);
+            assert_eq!(terminal.backend().buffer()[(1, row)].bg, BG);
+            assert_eq!(terminal.backend().buffer()[(38, row)].bg, BG);
+        }
     }
 
     #[test]
@@ -6223,7 +6224,7 @@ mod tests {
         assert!(app.overlay.is_none());
         assert!(app.document.is_none());
         assert!(app.blocks[0].expanded);
-        let rows = transcript_block_items(&app.blocks[0], true, false, 8, &app);
+        let rows = transcript_block_items(&app.blocks[0], true, false, 8, 8, &app);
         assert!(rows.len() > EXPANDED_PREVIEW_LINES);
 
         app.blocks.clear();
@@ -6240,7 +6241,7 @@ mod tests {
         assert!(!app.blocks[0].expanded);
         assert!(app.overlay.is_none());
         assert!(app.document.is_none());
-        assert!(transcript_block_items(&app.blocks[0], true, false, 8, &app).len() > 24);
+        assert!(transcript_block_items(&app.blocks[0], true, false, 8, 8, &app).len() > 24);
     }
 
     #[test]
