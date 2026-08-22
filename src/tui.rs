@@ -372,6 +372,7 @@ struct App {
     splash_skipped: bool,
     last_sequence: Option<u64>,
     applying_transient: bool,
+    reasoning_folded_during_stream: bool,
     info: TuiInfo,
     flash: Option<String>,
     flash_at: Option<Instant>,
@@ -438,6 +439,7 @@ impl App {
             splash_skipped: false,
             last_sequence: None,
             applying_transient: false,
+            reasoning_folded_during_stream: false,
             info,
             flash: None,
             flash_at: None,
@@ -479,17 +481,25 @@ impl App {
     }
 
     fn apply(&mut self, event: SessionEvent) {
+        let settles_model_response = matches!(
+            &event.kind,
+            EventKind::ModelMessage { .. } | EventKind::Error { .. } | EventKind::TurnFinished
+        );
         if !self.applying_transient
             && matches!(
                 &event.kind,
                 EventKind::AssistantText { .. }
                     | EventKind::AssistantReasoning { .. }
+                    | EventKind::ToolCall { .. }
                     | EventKind::ModelMessage { .. }
                     | EventKind::Error { .. }
                     | EventKind::TurnFinished
             )
         {
             self.clear_transient_blocks();
+        }
+        if settles_model_response {
+            self.reasoning_folded_during_stream = false;
         }
         if self
             .last_sequence
@@ -498,6 +508,16 @@ impl App {
             return;
         }
         self.last_sequence = Some(event.sequence);
+        if matches!(
+            &event.kind,
+            EventKind::AssistantText { .. }
+                | EventKind::ToolCall { .. }
+                | EventKind::ModelMessage { .. }
+                | EventKind::Error { .. }
+                | EventKind::TurnFinished
+        ) {
+            self.fold_trailing_reasoning();
+        }
         let select_tail =
             self.blocks.is_empty() || self.selected_block == self.blocks.len().saturating_sub(1);
         match event.kind {
@@ -507,6 +527,7 @@ impl App {
             | EventKind::ModelMessage { .. }
             | EventKind::Task { .. } => {}
             EventKind::User { text } => {
+                self.reasoning_folded_during_stream = false;
                 self.busy = true;
                 self.busy_since.get_or_insert_with(Instant::now);
                 self.activity = Some(Activity::Thinking);
@@ -518,7 +539,12 @@ impl App {
             }
             EventKind::AssistantReasoning { text } => {
                 self.activity = Some(Activity::Reasoning);
-                self.append_or_push(BlockKind::Reasoning, "THINKING", text, true);
+                self.append_or_push(
+                    BlockKind::Reasoning,
+                    "THINKING",
+                    text,
+                    !self.reasoning_folded_during_stream,
+                );
             }
             EventKind::ToolCall {
                 call_id,
@@ -676,8 +702,22 @@ impl App {
     }
 
     fn clear_transient_blocks(&mut self) {
+        self.reasoning_folded_during_stream |= self
+            .blocks
+            .iter()
+            .any(|block| block.transient && block.kind == BlockKind::Reasoning && !block.expanded);
         self.blocks.retain(|block| !block.transient);
         self.selected_block = self.selected_block.min(self.blocks.len().saturating_sub(1));
+    }
+
+    fn fold_trailing_reasoning(&mut self) {
+        if let Some(block) = self
+            .blocks
+            .last_mut()
+            .filter(|block| block.kind == BlockKind::Reasoning)
+        {
+            block.expanded = false;
+        }
     }
 
     fn finish_hydration(&mut self) {
@@ -721,7 +761,6 @@ impl App {
             .filter(|block| block.kind == kind && block.transient == self.applying_transient)
         {
             block.text.push_str(&text);
-            block.expanded = expanded;
         } else {
             self.push(kind, title, text, None, false, expanded);
         }
@@ -3516,7 +3555,9 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn transcript_needs_gap(previous: BlockKind, current: BlockKind) -> bool {
-    matches!(current, BlockKind::User | BlockKind::Assistant) && previous != current
+    (matches!(current, BlockKind::User | BlockKind::Assistant) && previous != current)
+        || (previous == BlockKind::User
+            && matches!(current, BlockKind::Reasoning | BlockKind::Tool))
 }
 
 fn transcript_block_items(
@@ -5076,6 +5117,79 @@ mod tests {
     }
 
     #[test]
+    fn streaming_reasoning_keeps_the_users_fold_through_settlement() {
+        let mut app = test_app();
+        app.apply_transient(EventKind::AssistantReasoning {
+            text: "first ".into(),
+        });
+        assert!(app.blocks[0].expanded);
+
+        app.toggle_selected();
+        app.apply_transient(EventKind::AssistantReasoning {
+            text: "second".into(),
+        });
+        assert!(!app.blocks[0].expanded);
+        assert_eq!(app.blocks[0].text, "first second");
+
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::AssistantReasoning {
+                text: "first second".into(),
+            },
+        });
+        assert_eq!(app.blocks.len(), 1);
+        assert!(!app.blocks[0].transient);
+        assert!(!app.blocks[0].expanded);
+
+        app.apply(SessionEvent {
+            sequence: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::ModelMessage {
+                message: rig::message::Message::assistant("settled"),
+            },
+        });
+        app.apply_transient(EventKind::AssistantReasoning {
+            text: "next round".into(),
+        });
+        assert!(app.blocks.last().unwrap().expanded);
+    }
+
+    #[test]
+    fn reasoning_folds_when_streaming_advances_to_text_or_a_tool() {
+        let mut text_app = test_app();
+        text_app.apply_transient(EventKind::AssistantReasoning {
+            text: "thinking".into(),
+        });
+        assert!(text_app.blocks[0].expanded);
+        text_app.apply_transient(EventKind::AssistantText {
+            text: "answer".into(),
+        });
+        assert!(!text_app.blocks[0].expanded);
+
+        let mut tool_app = test_app();
+        tool_app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::AssistantReasoning {
+                text: "inspect".into(),
+            },
+        });
+        assert!(tool_app.blocks[0].expanded);
+        tool_app.apply(SessionEvent {
+            sequence: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::ToolCall {
+                call_id: "call".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"uri": "file://src/tui.rs"}),
+            },
+        });
+        assert!(!tool_app.blocks[0].expanded);
+        assert_eq!(tool_app.blocks[1].kind, BlockKind::Tool);
+    }
+
+    #[test]
     fn duplicate_settled_boundary_clears_a_stale_hydration_delta() {
         let mut app = test_app();
         let boundary = SessionEvent {
@@ -5367,6 +5481,51 @@ mod tests {
             .find_map(|region| (region.target == AppHit::Transcript(3)).then_some(region.area.y))
             .unwrap();
         assert_eq!(tool_row, reasoning_row + 1);
+    }
+
+    #[test]
+    fn first_process_block_has_one_blank_row_after_the_user_message() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::User,
+            "YOU",
+            "Inspect the renderer.".into(),
+            None,
+            false,
+            false,
+        );
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "Compare the references.".into(),
+            None,
+            false,
+            false,
+        );
+
+        let rendered = render_to_string(&mut app, 80, 12);
+        let user_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .unwrap();
+        let reasoning_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+
+        assert_eq!(reasoning_row, user_row + 2);
+        assert!(
+            rendered
+                .lines()
+                .nth((user_row + 1) as usize)
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        assert!(transcript_needs_gap(BlockKind::User, BlockKind::Tool));
+        assert!(!transcript_needs_gap(BlockKind::Reasoning, BlockKind::Tool));
     }
 
     #[test]
