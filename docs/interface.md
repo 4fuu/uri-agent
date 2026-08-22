@@ -23,7 +23,7 @@ Press `i` to open the floating composer:
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 
-Press `:` from the conversation to open the command panel. Type to filter registered command names and aliases, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
+Press `:` from the conversation to open the command panel. Type to filter registered command names and aliases, use `Tab` or `Shift+Tab` to complete and cycle matching commands, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command; completing an alias inserts its canonical command name. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
 
 Core commands are registered through `CommandRegistry`:
 

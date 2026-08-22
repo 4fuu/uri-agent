@@ -363,6 +363,7 @@ struct App {
     keymap: Keymap,
     command_query: String,
     command_selected: usize,
+    command_stem: Option<String>,
     selector: Option<SelectorState>,
     text_prompt: Option<TextPrompt>,
     oauth: Option<OauthState>,
@@ -421,6 +422,7 @@ impl App {
             keymap,
             command_query: String::new(),
             command_selected: 0,
+            command_stem: None,
             selector: None,
             text_prompt: None,
             oauth: None,
@@ -755,10 +757,83 @@ impl App {
     fn reset_command_search(&mut self) {
         self.command_query.clear();
         self.command_selected = 0;
+        self.command_stem = None;
     }
 
     fn matching_commands(&self) -> Vec<CommandMatch> {
         matching_commands(&self.commands, &self.command_query)
+    }
+
+    fn command_completion_candidates(&self, query: &str) -> Vec<CommandSpec> {
+        let matches = matching_commands(&self.commands, query);
+        let canonical = matches
+            .iter()
+            .filter(|command| command.spec.id.to_ascii_lowercase().starts_with(query))
+            .map(|command| command.spec.clone())
+            .collect::<Vec<_>>();
+        if !canonical.is_empty() {
+            return canonical;
+        }
+        let aliases = matches
+            .iter()
+            .filter(|command| command.name.to_ascii_lowercase().starts_with(query))
+            .map(|command| command.spec.clone())
+            .collect::<Vec<_>>();
+        if !aliases.is_empty() {
+            return aliases;
+        }
+        matches.into_iter().map(|command| command.spec).collect()
+    }
+
+    fn complete_command(&mut self, reverse: bool) {
+        if self.command_query.chars().any(char::is_whitespace) {
+            return;
+        }
+        let typed = self
+            .command_query
+            .trim_start_matches([':', '：'])
+            .to_ascii_lowercase();
+        let stem_applies = self.command_stem.as_ref().is_some_and(|stem| {
+            typed.starts_with(stem)
+                || self
+                    .command_completion_candidates(stem)
+                    .iter()
+                    .any(|command| command.id.eq_ignore_ascii_case(&typed))
+        });
+        if !stem_applies {
+            self.command_stem = Some(typed.clone());
+        }
+        let stem = self.command_stem.as_deref().unwrap_or(&typed);
+        let candidates = self.command_completion_candidates(stem);
+        if candidates.is_empty() {
+            return;
+        }
+        if candidates.len() == 1 {
+            self.command_query.clone_from(&candidates[0].id);
+            self.command_selected = 0;
+            return;
+        }
+        let names = candidates
+            .iter()
+            .map(|command| command.id.clone())
+            .collect::<Vec<_>>();
+        let common = common_command_prefix(&names);
+        if common.len() > typed.len() {
+            self.command_query = common;
+            self.command_selected = 0;
+            return;
+        }
+        let current = names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(&typed));
+        let next = match current {
+            Some(index) if reverse => (index + names.len() - 1) % names.len(),
+            Some(index) => (index + 1) % names.len(),
+            None if reverse => names.len() - 1,
+            None => 0,
+        };
+        self.command_query.clone_from(&names[next]);
+        self.command_selected = 0;
     }
 
     fn move_command_selection(&mut self, distance: isize) {
@@ -1127,6 +1202,7 @@ fn handle_paste(app: &mut App, text: String) {
         Some(Overlay::Command) => {
             app.command_query.push_str(text.trim());
             app.command_selected = 0;
+            app.command_stem = None;
         }
         Some(Overlay::Selector) => {
             if let Some(selector) = app.selector.as_mut() {
@@ -1568,6 +1644,7 @@ fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) -> CommandKey
         Some("backspace") => {
             app.command_query.pop();
             app.command_selected = 0;
+            app.command_stem = None;
             CommandKey::Continue
         }
         Some("previous") => {
@@ -1579,6 +1656,14 @@ fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) -> CommandKey
             CommandKey::Continue
         }
         Some("confirm") => CommandKey::Confirm,
+        Some("complete") => {
+            app.complete_command(false);
+            CommandKey::Continue
+        }
+        Some("complete_previous") => {
+            app.complete_command(true);
+            CommandKey::Continue
+        }
         _ => {
             if let KeyCode::Char(character) = key.code
                 && !key
@@ -1587,6 +1672,7 @@ fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) -> CommandKey
             {
                 app.command_query.push(character);
                 app.command_selected = 0;
+                app.command_stem = None;
             }
             CommandKey::Continue
         }
@@ -3237,6 +3323,23 @@ fn command_help(commands: &CommandRegistry) -> String {
         .collect()
 }
 
+fn common_command_prefix(names: &[String]) -> String {
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for name in &names[1..] {
+        end = first
+            .as_bytes()
+            .iter()
+            .take(end)
+            .zip(name.as_bytes())
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+    }
+    first[..end].to_string()
+}
+
 fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<CommandMatch> {
     let query = query
         .trim()
@@ -3616,7 +3719,7 @@ fn status_row(
 fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
     frame.render_widget(
-        block.title(" COMMAND · type to filter · Enter run · Esc close "),
+        block.title(" COMMAND · type to filter · Tab complete · Enter run · Esc close "),
         area,
     );
     let sections = Layout::default()
@@ -4763,11 +4866,65 @@ mod tests {
         assert!(app.matching_commands().is_empty());
         app.command_query.truncate("effort".len());
         let rendered = render_to_string(&mut app, 100, 32);
-        assert!(rendered.contains("COMMAND · type to filter · Enter run · Esc close"));
+        assert!(
+            rendered.contains("COMMAND · type to filter · Tab complete · Enter run · Esc close")
+        );
         assert!(rendered.contains("⌕ effort█"));
         assert!(rendered.contains(":effort"));
         assert!(!rendered.contains(":terminal"));
-        assert!(!rendered.contains("Tab complete"));
+    }
+
+    #[test]
+    fn command_panel_tab_completes_and_cycles_matches() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Command);
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        app.command_query = "te".to_string();
+        assert!(matches!(
+            apply_command_key(&mut app, tab, "tab"),
+            CommandKey::Continue
+        ));
+        assert_eq!(app.command_query, "terminal");
+
+        app.reset_command_search();
+        app.command_query = "t".to_string();
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "tasks");
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "terminal");
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "tasks");
+        apply_command_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            "backtab",
+        );
+        assert_eq!(app.command_query, "terminal");
+    }
+
+    #[test]
+    fn command_panel_completion_handles_common_prefixes_aliases_and_search_matches() {
+        let mut app = test_app();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        app.command_query = "se".to_string();
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "set");
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "set-terminal");
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "settings");
+
+        app.reset_command_search();
+        app.command_query = "th".to_string();
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "effort");
+
+        app.reset_command_search();
+        app.command_query = "erm".to_string();
+        apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "set-terminal");
     }
 
     #[test]
@@ -4811,10 +4968,11 @@ mod tests {
         assert_eq!(app.command_selected, 0);
 
         let rendered = render_to_string(&mut app, 100, 32);
-        assert!(rendered.contains("COMMAND · type to filter · Enter run · Esc close"));
+        assert!(
+            rendered.contains("COMMAND · type to filter · Tab complete · Enter run · Esc close")
+        );
         assert!(rendered.contains("⌕ t█"));
         assert!(rendered.contains(":thinking"));
-        assert!(!rendered.contains("Tab complete"));
     }
 
     #[test]
