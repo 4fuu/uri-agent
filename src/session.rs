@@ -110,6 +110,12 @@ pub enum EventKind {
     Notice {
         text: String,
     },
+    ModelRetry {
+        attempt: usize,
+        max_retries: usize,
+        delay_ms: u64,
+        reason: String,
+    },
     /// Token usage and USD cost reported by one model response.
     Usage {
         input: u64,
@@ -910,6 +916,7 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::ModelMessage { .. } => "model_message",
         EventKind::Task { .. } => "task",
         EventKind::Notice { .. } => "notice",
+        EventKind::ModelRetry { .. } => "model_retry",
         EventKind::Usage { .. } => "usage",
         EventKind::Error { .. } => "error",
         EventKind::Compaction { .. } => "compaction",

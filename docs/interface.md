@@ -164,6 +164,23 @@ The transcript event and model-replay event for one message commit in the same S
 
 Provider tool-call identity is preserved in model history so resumed tool conversations remain valid for the selected backend.
 
+### Model request retries
+
+URI Agent retries transient failures for both normal model calls and context-summary calls. Each failure class has its own counter within one logical model call, so changing failure type does not consume another type's budget. A successful response or new model round resets all counters. The limits below count additional retries after the initial attempt:
+
+| Failure | Retries | Fallback backoff before jitter |
+| --- | ---: | --- |
+| Rate limit (`429`) | 6 | 1s exponential, capped at 30s |
+| Network or stream transport failure | 5 | 500ms exponential, capped at 8s |
+| Server failure (`5xx`) | 5 | 1s exponential, capped at 15s |
+| Timeout or `408` | 4 | 1s exponential, capped at 10s |
+| Request conflict (`409`) | 4 | 500ms exponential, capped at 8s |
+| Empty completed response | 4 | 1s exponential, capped at 8s |
+
+Fallback delays include up to 25% jitter. When a retryable response supplies `Retry-After` or `retry-after-ms`, that delay takes precedence and is capped at 60 seconds. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
+
+Each retry is recorded as a visible session event containing its reason, delay, and retry count. Provisional text and reasoning from the failed stream are cleared before the next attempt and never enter model replay. Double `Esc` interrupts either an active request or its retry delay.
+
 ### Context compaction
 
 URI Agent estimates replay size against the selected model's context window. Before an overflowing request, it may ask the model for a durable summary of older history and append a compaction checkpoint. Replay then uses:
@@ -181,7 +198,7 @@ system prompt unchanged.
 
 Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the retention budget, URI Agent may summarize its older prefix and retain its recent suffix. A retained suffix never starts with a tool result, so a tool call is not separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
 
-If a provider still reports context overflow, URI Agent makes one forced compaction-and-retry attempt for that user turn. A second overflow settles as an error instead of retrying indefinitely.
+If a provider still reports context overflow, URI Agent makes one forced compaction-and-retry attempt for that user turn. This recovery has its own budget: it neither consumes nor resets transient-failure counters. A second overflow settles as an error instead of retrying indefinitely.
 
 Run `:compact` to request an earlier checkpoint once estimated context usage is
 strictly above 20%. The command also fails clearly when there is not enough

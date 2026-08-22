@@ -167,6 +167,11 @@ enum Activity {
     Reasoning,
     Writing,
     Tool(String),
+    Retrying {
+        attempt: usize,
+        max_retries: usize,
+        delay_ms: u64,
+    },
     Compacting,
     Interrupting,
 }
@@ -178,9 +183,27 @@ impl Activity {
             Self::Reasoning => "reasoning".to_string(),
             Self::Writing => "writing".to_string(),
             Self::Tool(protocol) => format!("running {protocol}"),
+            Self::Retrying {
+                attempt,
+                max_retries,
+                delay_ms,
+            } => format!(
+                "retrying {attempt}/{max_retries} in {}",
+                retry_delay_label(*delay_ms)
+            ),
             Self::Compacting => "compacting".to_string(),
             Self::Interrupting => "interrupting".to_string(),
         }
+    }
+}
+
+fn retry_delay_label(delay_ms: u64) -> String {
+    if delay_ms < 1_000 {
+        format!("{delay_ms}ms")
+    } else if delay_ms.is_multiple_of(1_000) {
+        format!("{}s", delay_ms / 1_000)
+    } else {
+        format!("{:.1}s", delay_ms as f64 / 1_000.0)
     }
 }
 
@@ -570,7 +593,10 @@ impl App {
     fn apply(&mut self, event: SessionEvent) {
         let settles_model_response = matches!(
             &event.kind,
-            EventKind::ModelMessage { .. } | EventKind::Error { .. } | EventKind::TurnFinished
+            EventKind::ModelMessage { .. }
+                | EventKind::ModelRetry { .. }
+                | EventKind::Error { .. }
+                | EventKind::TurnFinished
         );
         if !self.applying_transient
             && matches!(
@@ -579,6 +605,8 @@ impl App {
                     | EventKind::AssistantReasoning { .. }
                     | EventKind::ToolCall { .. }
                     | EventKind::ModelMessage { .. }
+                    | EventKind::ModelRetry { .. }
+                    | EventKind::Compaction { .. }
                     | EventKind::Error { .. }
                     | EventKind::TurnFinished
             )
@@ -600,6 +628,7 @@ impl App {
             EventKind::AssistantText { .. }
                 | EventKind::ToolCall { .. }
                 | EventKind::ModelMessage { .. }
+                | EventKind::ModelRetry { .. }
                 | EventKind::Error { .. }
                 | EventKind::TurnFinished
         ) {
@@ -703,6 +732,29 @@ impl App {
             }
             EventKind::Notice { text } => {
                 self.push(BlockKind::Notice, "SYSTEM", text, None, false, false);
+            }
+            EventKind::ModelRetry {
+                attempt,
+                max_retries,
+                delay_ms,
+                reason,
+            } => {
+                self.activity = Some(Activity::Retrying {
+                    attempt,
+                    max_retries,
+                    delay_ms,
+                });
+                self.push(
+                    BlockKind::Notice,
+                    "MODEL RETRY",
+                    format!(
+                        "{reason}; retry {attempt}/{max_retries} in {}",
+                        retry_delay_label(delay_ms)
+                    ),
+                    None,
+                    false,
+                    false,
+                );
             }
             EventKind::Usage {
                 input,
@@ -1212,7 +1264,8 @@ impl App {
                             .is_some_and(|tool| tool.output.is_none()))
                     .then_some(index)
                 }),
-            Some(Activity::Compacting | Activity::Interrupting) | None => None,
+            Some(Activity::Retrying { .. } | Activity::Compacting | Activity::Interrupting)
+            | None => None,
         }
     }
 
@@ -6096,6 +6149,12 @@ mod tests {
                 manual: false,
             },
         });
+        assert_eq!(app.blocks.len(), 1);
+        assert_eq!(app.blocks[0].kind, BlockKind::Compaction);
+        app.apply_transient(EventKind::AssistantText {
+            text: "replacement draft".into(),
+        });
+        assert_eq!(app.blocks[1].text, "replacement draft");
         app.apply(SessionEvent {
             sequence: 1,
             at: chrono::Utc::now(),
@@ -6107,6 +6166,51 @@ mod tests {
         assert_eq!(app.blocks.len(), 2);
         assert_eq!(app.blocks[0].kind, BlockKind::Compaction);
         assert_eq!(app.blocks[1].text, "settled response");
+        assert!(!app.blocks[1].transient);
+    }
+
+    #[test]
+    fn model_retry_clears_failed_stream_and_shows_the_retry_state() {
+        let mut app = test_app();
+        app.apply_transient(EventKind::AssistantText {
+            text: "partial failed answer".into(),
+        });
+
+        apply_event(
+            &mut app,
+            0,
+            EventKind::ModelRetry {
+                attempt: 2,
+                max_retries: 5,
+                delay_ms: 2_500,
+                reason: "network error during stream".into(),
+            },
+        );
+
+        assert_eq!(app.blocks.len(), 1);
+        assert_eq!(app.blocks[0].kind, BlockKind::Notice);
+        assert_eq!(
+            app.blocks[0].text,
+            "network error during stream; retry 2/5 in 2.5s"
+        );
+        assert_eq!(
+            app.activity.as_ref().unwrap().label(),
+            "retrying 2/5 in 2.5s"
+        );
+
+        app.apply_transient(EventKind::AssistantText {
+            text: "new attempt".into(),
+        });
+        apply_event(
+            &mut app,
+            1,
+            EventKind::AssistantText {
+                text: "recovered answer".into(),
+            },
+        );
+        assert_eq!(app.blocks.len(), 2);
+        assert_eq!(app.blocks[0].kind, BlockKind::Notice);
+        assert_eq!(app.blocks[1].text, "recovered answer");
         assert!(!app.blocks[1].transient);
     }
 

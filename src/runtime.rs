@@ -1,7 +1,10 @@
 use crate::catalog::ModelLimits;
 use crate::compaction;
 use crate::config::{display_path, path_is_within};
-use crate::model::{ModelBackend, ModelDelta, ModelRequest, ModelResponse};
+use crate::model::{
+    ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelFailurePhase, ModelRequest,
+    ModelResponse, looks_like_context_overflow,
+};
 use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
 use crate::task::TaskManager;
@@ -12,15 +15,26 @@ use rig::message::{
     AssistantContent, ImageMediaType, Message, Text, ToolCall, ToolResultContent, UserContent,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
 const MAX_TOOL_ROUNDS: usize = 32;
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
 const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
+
+#[derive(Clone, Copy)]
+struct ModelRetryPolicy {
+    max_retries: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+    reason: &'static str,
+}
 
 #[derive(Clone, Copy)]
 enum TurnCancellation {
@@ -267,6 +281,7 @@ impl AgentRuntime {
         for _ in 0..MAX_TOOL_ROUNDS {
             self.compact_with(backend.as_ref(), false, false, cancel)
                 .await?;
+            let mut model_retries = HashMap::new();
             let response = loop {
                 match self.complete_once(backend.as_ref(), cancel).await {
                     Ok(response) => break response,
@@ -279,7 +294,15 @@ impl AgentRuntime {
                             return Err(error);
                         }
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if self
+                            .retry_model_failure(&error, &mut model_retries, cancel)
+                            .await?
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
                 }
             };
             let assistant_message = Message::Assistant {
@@ -346,33 +369,57 @@ impl AgentRuntime {
             history: compaction::summary_history(&preparation),
             tools: false,
         };
-        let (deltas, _receiver) = mpsc::unbounded_channel();
-        let completion = backend.complete(request, deltas);
-        tokio::pin!(completion);
-        let response = tokio::select! {
-            response = &mut completion => response.context("context compaction model request failed")?,
-            changed = cancel.changed() => {
-                if changed.is_ok()
-                    && let Some(cancellation) = *cancel.borrow()
-                {
-                    bail!(cancellation.message())
+        let mut model_retries = HashMap::new();
+        let (response, summary) = loop {
+            let (deltas, _receiver) = mpsc::unbounded_channel();
+            let completion = backend.complete(request.clone(), deltas);
+            tokio::pin!(completion);
+            let result = tokio::select! {
+                response = &mut completion => response,
+                changed = cancel.changed() => {
+                    if changed.is_ok()
+                        && let Some(cancellation) = *cancel.borrow()
+                    {
+                        bail!(cancellation.message())
+                    }
+                    completion.await
                 }
-                completion.await.context("context compaction model request failed")?
+            };
+            match result {
+                Ok(response) => {
+                    let summary = response
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            AssistantContent::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !summary.trim().is_empty() {
+                        break (response, summary);
+                    }
+                    let error = anyhow::Error::new(ModelFailure::empty_response());
+                    if self
+                        .retry_model_failure(&error, &mut model_retries, cancel)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(error).context("context compaction model request failed");
+                }
+                Err(error) => {
+                    if self
+                        .retry_model_failure(&error, &mut model_retries, cancel)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(error).context("context compaction model request failed");
+                }
             }
         };
         self.record_usage(response.usage).await?;
-        let summary = response
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                AssistantContent::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if summary.trim().is_empty() {
-            bail!("context compaction returned no summary text");
-        }
         let replacement = compaction::replacement_history(&summary, &preparation.retained);
         self.session
             .append_compaction(summary, preparation.tokens_before, replacement, manual)
@@ -452,6 +499,51 @@ impl AgentRuntime {
                 }
             }
         }
+    }
+
+    async fn retry_model_failure(
+        &self,
+        error: &anyhow::Error,
+        retries: &mut HashMap<ModelFailureKind, usize>,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
+    ) -> Result<bool> {
+        let Some(failure) = error.downcast_ref::<ModelFailure>() else {
+            return Ok(false);
+        };
+        let Some(policy) = model_retry_policy(failure.kind()) else {
+            return Ok(false);
+        };
+        let attempt = {
+            let retries = retries.entry(failure.kind()).or_default();
+            if *retries >= policy.max_retries {
+                return Ok(false);
+            }
+            *retries += 1;
+            *retries
+        };
+        let delay = model_retry_delay(failure, policy, attempt);
+        self.session
+            .append(EventKind::ModelRetry {
+                attempt,
+                max_retries: policy.max_retries,
+                delay_ms: delay.as_millis().try_into().unwrap_or(u64::MAX),
+                reason: model_retry_reason(failure, policy),
+            })
+            .await?;
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        tokio::select! {
+            () = &mut sleep => {}
+            changed = cancel.changed() => {
+                if changed.is_ok()
+                    && let Some(cancellation) = *cancel.borrow()
+                {
+                    bail!(cancellation.message())
+                }
+                sleep.await;
+            }
+        }
+        Ok(true)
     }
 
     fn publish_delta(&self, delta: ModelDelta) {
@@ -549,46 +641,104 @@ impl AgentRuntime {
 }
 
 fn is_context_overflow(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_ascii_lowercase();
-    if [
-        "rate limit",
-        "too many requests",
-        "throttling error",
-        "service unavailable",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern))
-    {
-        return false;
+    if let Some(failure) = error.downcast_ref::<ModelFailure>() {
+        return failure.kind() == ModelFailureKind::ContextOverflow;
     }
-    [
-        "prompt is too long",
-        "request_too_large",
-        "input is too long for requested model",
-        "exceeds the context window",
-        "maximum context length",
-        "input token count",
-        "maximum prompt length",
-        "reduce the length of the messages",
-        "maximum allowed input length",
-        "longer than the model's context length",
-        "exceeds the available context size",
-        "greater than the context length",
-        "context window exceeds limit",
-        "exceeded model token limit",
-        "model_context_window_exceeded",
-        "prompt too long",
-        "configured context size",
-        "range of input length should be",
-        "context_length_exceeded",
-        "context length exceeded",
-        "too many tokens",
-        "token limit exceeded",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern))
-        || text.starts_with("400 status code (no body)")
-        || text.starts_with("413 status code (no body)")
+    looks_like_context_overflow(&format!("{error:#}"))
+}
+
+fn model_retry_policy(kind: ModelFailureKind) -> Option<ModelRetryPolicy> {
+    match kind {
+        ModelFailureKind::RateLimit => Some(ModelRetryPolicy {
+            max_retries: 6,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+            reason: "rate limit",
+        }),
+        ModelFailureKind::Network => Some(ModelRetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(8),
+            reason: "network error",
+        }),
+        ModelFailureKind::Server => Some(ModelRetryPolicy {
+            max_retries: 5,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(15),
+            reason: "server error",
+        }),
+        ModelFailureKind::Timeout => Some(ModelRetryPolicy {
+            max_retries: 4,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            reason: "timeout",
+        }),
+        ModelFailureKind::Conflict => Some(ModelRetryPolicy {
+            max_retries: 4,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(8),
+            reason: "request conflict",
+        }),
+        ModelFailureKind::EmptyResponse => Some(ModelRetryPolicy {
+            max_retries: 4,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(8),
+            reason: "empty response",
+        }),
+        ModelFailureKind::ContextOverflow
+        | ModelFailureKind::Authentication
+        | ModelFailureKind::Quota
+        | ModelFailureKind::Client
+        | ModelFailureKind::Other => None,
+    }
+}
+
+fn model_retry_delay(failure: &ModelFailure, policy: ModelRetryPolicy, retry: usize) -> Duration {
+    if let Some(requested) = failure.retry_after() {
+        return requested.min(MAX_RETRY_AFTER);
+    }
+    let multiplier = 1_u32 << retry.saturating_sub(1).min(31);
+    let backoff = policy
+        .base_delay
+        .saturating_mul(multiplier)
+        .min(policy.max_delay);
+    let jitter_limit_ms = (backoff / 4).as_millis();
+    let jitter_ms = if jitter_limit_ms == 0 {
+        0
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            % (jitter_limit_ms + 1)
+    };
+    backoff
+        .saturating_add(Duration::from_millis(
+            jitter_ms.try_into().unwrap_or(u64::MAX),
+        ))
+        .min(policy.max_delay)
+}
+
+fn model_retry_reason(failure: &ModelFailure, policy: ModelRetryPolicy) -> String {
+    let phase = match failure.phase() {
+        ModelFailurePhase::Request => "request",
+        ModelFailurePhase::Stream => "stream",
+        ModelFailurePhase::Response => "response",
+    };
+    let mut reason = failure.status().map_or_else(
+        || format!("{} during {phase}", policy.reason),
+        |status| {
+            format!(
+                "{} during {phase} (HTTP {})",
+                policy.reason,
+                status.as_u16()
+            )
+        },
+    );
+    if let Some(request_id) = failure.provider_request_id() {
+        reason.push_str(&format!("; request id {request_id}"));
+    }
+    reason
 }
 
 async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>> {
@@ -742,6 +892,14 @@ mod tests {
     struct BlockingBackend {
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
+    }
+
+    fn scripted_failure(
+        kind: ModelFailureKind,
+        retry_after: Option<Duration>,
+        message: &str,
+    ) -> Result<ModelResponse> {
+        Err(ModelFailure::for_test(kind, retry_after, message).into())
     }
 
     #[async_trait]
@@ -1377,6 +1535,131 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
+    #[tokio::test]
+    async fn automatic_compaction_retries_a_transient_summary_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                scripted_failure(
+                    ModelFailureKind::Server,
+                    Some(Duration::ZERO),
+                    "service unavailable",
+                ),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("summary")],
+                    usage: None,
+                }),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("answer")],
+                    usage: None,
+                }),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend.clone(),
+            ModelLimits {
+                context_window: 64,
+                ..ModelLimits::default()
+            },
+        )
+        .await;
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: "old task".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("old task"),
+                },
+                EventKind::AssistantText {
+                    text: "old answer".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("old answer"),
+                },
+            ])
+            .await
+            .unwrap();
+
+        runtime.run_turn("current task".into()).await.unwrap();
+
+        let requests = backend.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[0].tools);
+        assert!(!requests[1].tools);
+        assert!(requests[2].tools);
+        drop(requests);
+        assert!(session.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ModelRetry { attempt: 1, max_retries: 5, reason, .. }
+                if reason.contains("server error")
+        )));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_retries_a_blank_summary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("  \n")],
+                    usage: None,
+                }),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("summary")],
+                    usage: None,
+                }),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("answer")],
+                    usage: None,
+                }),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend.clone(),
+            ModelLimits {
+                context_window: 64,
+                ..ModelLimits::default()
+            },
+        )
+        .await;
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: "old task".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("old task"),
+                },
+                EventKind::AssistantText {
+                    text: "old answer".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("old answer"),
+                },
+            ])
+            .await
+            .unwrap();
+
+        runtime.run_turn("current task".into()).await.unwrap();
+
+        assert_eq!(backend.requests.lock().await.len(), 3);
+        assert!(session.snapshot().await.iter().any(|event| matches!(
+            event.kind,
+            EventKind::ModelRetry {
+                attempt: 1,
+                max_retries: 4,
+                ..
+            }
+        )));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
     #[test]
     fn context_overflow_classifier_excludes_rate_limits() {
         assert!(is_context_overflow(&anyhow!(
@@ -1388,6 +1671,247 @@ mod tests {
         assert!(!is_context_overflow(&anyhow!(
             "Throttling error: too many tokens; rate limit exceeded"
         )));
+    }
+
+    #[test]
+    fn retry_budgets_are_distinct_and_permanent_errors_are_not_retried() {
+        for (kind, expected) in [
+            (ModelFailureKind::RateLimit, 6),
+            (ModelFailureKind::Network, 5),
+            (ModelFailureKind::Server, 5),
+            (ModelFailureKind::Timeout, 4),
+            (ModelFailureKind::Conflict, 4),
+            (ModelFailureKind::EmptyResponse, 4),
+        ] {
+            assert_eq!(model_retry_policy(kind).unwrap().max_retries, expected);
+        }
+        for kind in [
+            ModelFailureKind::ContextOverflow,
+            ModelFailureKind::Authentication,
+            ModelFailureKind::Quota,
+            ModelFailureKind::Client,
+            ModelFailureKind::Other,
+        ] {
+            assert!(model_retry_policy(kind).is_none());
+        }
+    }
+
+    #[test]
+    fn retry_after_is_honored_with_a_sixty_second_cap() {
+        let policy = model_retry_policy(ModelFailureKind::RateLimit).unwrap();
+        let short = ModelFailure::for_test(
+            ModelFailureKind::RateLimit,
+            Some(Duration::from_secs(12)),
+            "rate limited",
+        );
+        let long = ModelFailure::for_test(
+            ModelFailureKind::RateLimit,
+            Some(Duration::from_secs(120)),
+            "rate limited",
+        );
+        assert_eq!(
+            model_retry_delay(&short, policy, 1),
+            Duration::from_secs(12)
+        );
+        assert_eq!(model_retry_delay(&long, policy, 1), MAX_RETRY_AFTER);
+    }
+
+    #[tokio::test]
+    async fn network_failure_can_use_its_full_retry_budget_and_then_succeed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut responses = VecDeque::new();
+        for _ in 0..5 {
+            responses.push_back(scripted_failure(
+                ModelFailureKind::Network,
+                Some(Duration::ZERO),
+                "connection reset",
+            ));
+        }
+        responses.push_back(Ok(ModelResponse {
+            content: vec![AssistantContent::text("recovered")],
+            usage: None,
+        }));
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.run_turn("retry this".into()).await.unwrap();
+
+        assert_eq!(backend.requests.lock().await.len(), 6);
+        let retries = session
+            .snapshot()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ModelRetry {
+                    attempt,
+                    max_retries,
+                    ..
+                } => Some((attempt, max_retries)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retries, [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_failure_stops_after_its_smaller_retry_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let responses = (0..5)
+            .map(|_| {
+                scripted_failure(
+                    ModelFailureKind::Timeout,
+                    Some(Duration::ZERO),
+                    "request timed out",
+                )
+            })
+            .collect();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        let error = runtime.run_turn("retry this".into()).await.unwrap_err();
+
+        assert!(error.to_string().contains("request timed out"));
+        assert_eq!(backend.requests.lock().await.len(), 5);
+        assert_eq!(
+            session
+                .snapshot()
+                .await
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::ModelRetry { .. }))
+                .count(),
+            4
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn changing_failure_kind_uses_each_types_own_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut responses = VecDeque::new();
+        for _ in 0..5 {
+            responses.push_back(scripted_failure(
+                ModelFailureKind::Network,
+                Some(Duration::ZERO),
+                "connection reset",
+            ));
+        }
+        responses.push_back(scripted_failure(
+            ModelFailureKind::RateLimit,
+            Some(Duration::ZERO),
+            "rate limited",
+        ));
+        responses.push_back(Ok(ModelResponse {
+            content: vec![AssistantContent::text("recovered")],
+            usage: None,
+        }));
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.run_turn("retry this".into()).await.unwrap();
+
+        assert_eq!(backend.requests.lock().await.len(), 7);
+        let retries = session
+            .snapshot()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ModelRetry {
+                    attempt,
+                    max_retries,
+                    ..
+                } => Some((attempt, max_retries)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retries, [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5), (1, 6)]);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_is_not_retried() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([scripted_failure(
+                ModelFailureKind::Authentication,
+                Some(Duration::ZERO),
+                "invalid credential",
+            )])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.run_turn("do not retry".into()).await.unwrap_err();
+
+        assert_eq!(backend.requests.lock().await.len(), 1);
+        assert!(
+            !session
+                .snapshot()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ModelRetry { .. }))
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn user_interrupt_cancels_retry_backoff() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([scripted_failure(
+                ModelFailureKind::RateLimit,
+                Some(Duration::from_secs(60)),
+                "rate limited",
+            )])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend, ModelLimits::default()).await;
+        runtime.start_turn("wait then retry".into()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if session
+                    .snapshot()
+                    .await
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::ModelRetry { .. }))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry boundary should be recorded before backoff");
+
+        assert!(runtime.interrupt_turn().await);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.turn_running().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user interruption should cancel retry backoff promptly");
+
+        assert!(session.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Error { text } if text == TURN_INTERRUPTED_BY_USER
+        )));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[tokio::test]

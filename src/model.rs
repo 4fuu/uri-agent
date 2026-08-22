@@ -4,18 +4,21 @@ use crate::config::{ActiveSettings, AuthKind, resolve_config_value};
 use crate::prompts;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rig::client::CompletionClient;
-use rig::completion::{CompletionModel as RigCompletionModel, ToolDefinition};
+use rig::completion::{CompletionError, CompletionModel as RigCompletionModel, ToolDefinition};
 use rig::http_client::HttpClientExt;
 use rig::message::{AssistantContent, Message};
 use rig::providers::{anthropic, gemini, openai};
 use rig::streaming::StreamedAssistantContent;
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -34,6 +37,349 @@ pub struct ModelRequest {
 pub struct ModelResponse {
     pub content: Vec<AssistantContent>,
     pub usage: Option<rig::completion::Usage>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ModelFailureKind {
+    ContextOverflow,
+    RateLimit,
+    Timeout,
+    Network,
+    Server,
+    Conflict,
+    EmptyResponse,
+    Authentication,
+    Quota,
+    Client,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ModelFailurePhase {
+    Request,
+    Stream,
+    Response,
+}
+
+#[derive(Debug)]
+pub(crate) struct ModelFailure {
+    kind: ModelFailureKind,
+    phase: ModelFailurePhase,
+    status: Option<http::StatusCode>,
+    retry_after: Option<Duration>,
+    provider_request_id: Option<String>,
+    message: String,
+}
+
+impl ModelFailure {
+    fn from_completion_error(error: CompletionError, phase: ModelFailurePhase) -> Self {
+        let status = error.provider_response_status();
+        let headers = error.provider_response_headers();
+        let retry_after = parse_retry_after(headers);
+        let provider_request_id = error
+            .provider_request_id()
+            .map(str::to_string)
+            .or_else(|| request_id_from_headers(headers));
+        let message = error.to_string();
+        let diagnostic = error.provider_response_body().unwrap_or(&message);
+        let kind = classify_model_failure(&error, status, diagnostic);
+        Self {
+            kind,
+            phase,
+            status,
+            retry_after,
+            provider_request_id,
+            message,
+        }
+    }
+
+    pub(crate) fn empty_response() -> Self {
+        Self {
+            kind: ModelFailureKind::EmptyResponse,
+            phase: ModelFailurePhase::Response,
+            status: None,
+            retry_after: None,
+            provider_request_id: None,
+            message: "model returned no assistant content".to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        kind: ModelFailureKind,
+        retry_after: Option<Duration>,
+        message: &str,
+    ) -> Self {
+        Self {
+            kind,
+            phase: ModelFailurePhase::Request,
+            status: None,
+            retry_after,
+            provider_request_id: None,
+            message: message.to_string(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> ModelFailureKind {
+        self.kind
+    }
+
+    pub(crate) fn phase(&self) -> ModelFailurePhase {
+        self.phase
+    }
+
+    pub(crate) fn status(&self) -> Option<http::StatusCode> {
+        self.status
+    }
+
+    pub(crate) fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    pub(crate) fn provider_request_id(&self) -> Option<&str> {
+        self.provider_request_id.as_deref()
+    }
+}
+
+impl fmt::Display for ModelFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let phase = match self.phase {
+            ModelFailurePhase::Request => "request",
+            ModelFailurePhase::Stream => "stream",
+            ModelFailurePhase::Response => "response",
+        };
+        write!(formatter, "model {phase} failed: {}", self.message)?;
+        if let Some(request_id) = self
+            .provider_request_id
+            .as_deref()
+            .filter(|request_id| !self.message.contains(request_id))
+        {
+            write!(formatter, " (request id: {request_id})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ModelFailure {}
+
+fn classify_model_failure(
+    error: &CompletionError,
+    status: Option<http::StatusCode>,
+    diagnostic: &str,
+) -> ModelFailureKind {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    if contains_any(
+        &diagnostic,
+        &[
+            "insufficient_quota",
+            "quota exceeded",
+            "usage limit reached",
+            "monthly usage limit",
+            "available balance",
+            "out of budget",
+            "billing",
+        ],
+    ) {
+        return ModelFailureKind::Quota;
+    }
+    if status.is_none_or(|status| status.is_success()) {
+        if contains_any(
+            &diagnostic,
+            &[
+                "rate_limit_error",
+                "rate_limit_exceeded",
+                "too_many_requests",
+                "resource_exhausted",
+                "rate limit",
+                "too many requests",
+            ],
+        ) {
+            return ModelFailureKind::RateLimit;
+        }
+        if contains_any(
+            &diagnostic,
+            &[
+                "overloaded_error",
+                "server_error",
+                "internal_server_error",
+                "service_unavailable",
+                "api_error",
+                "service unavailable",
+                "temporarily unavailable",
+                "server is overloaded",
+            ],
+        ) {
+            return ModelFailureKind::Server;
+        }
+    }
+    match status {
+        Some(http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN) => {
+            ModelFailureKind::Authentication
+        }
+        Some(http::StatusCode::REQUEST_TIMEOUT) => ModelFailureKind::Timeout,
+        Some(http::StatusCode::CONFLICT) => ModelFailureKind::Conflict,
+        Some(http::StatusCode::TOO_MANY_REQUESTS) => ModelFailureKind::RateLimit,
+        Some(http::StatusCode::PAYLOAD_TOO_LARGE) => ModelFailureKind::ContextOverflow,
+        Some(status) if status.is_server_error() => ModelFailureKind::Server,
+        Some(status) if status.is_client_error() => {
+            if looks_like_context_overflow(&diagnostic) {
+                ModelFailureKind::ContextOverflow
+            } else {
+                ModelFailureKind::Client
+            }
+        }
+        _ if looks_like_context_overflow(&diagnostic) => ModelFailureKind::ContextOverflow,
+        _ if looks_like_timeout(&diagnostic) => ModelFailureKind::Timeout,
+        _ if looks_like_network_failure(&diagnostic) => ModelFailureKind::Network,
+        _ => match error {
+            CompletionError::HttpError(rig::http_client::Error::Instance(_))
+            | CompletionError::HttpError(rig::http_client::Error::StreamEnded) => {
+                ModelFailureKind::Network
+            }
+            _ => ModelFailureKind::Other,
+        },
+    }
+}
+
+pub(crate) fn looks_like_context_overflow(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if contains_any(
+        &message,
+        &[
+            "rate limit",
+            "too many requests",
+            "throttling error",
+            "service unavailable",
+        ],
+    ) {
+        return false;
+    }
+    contains_any(
+        &message,
+        &[
+            "prompt is too long",
+            "request_too_large",
+            "input is too long for requested model",
+            "exceeds the context window",
+            "maximum context length",
+            "input token count",
+            "maximum prompt length",
+            "reduce the length of the messages",
+            "maximum allowed input length",
+            "longer than the model's context length",
+            "exceeds the available context size",
+            "greater than the context length",
+            "context window exceeds limit",
+            "exceeded model token limit",
+            "model_context_window_exceeded",
+            "prompt too long",
+            "configured context size",
+            "range of input length should be",
+            "context_length_exceeded",
+            "context length exceeded",
+            "too many tokens",
+            "token limit exceeded",
+        ],
+    ) || message.starts_with("400 status code (no body)")
+        || message.starts_with("413 status code (no body)")
+}
+
+fn looks_like_timeout(message: &str) -> bool {
+    contains_any(
+        message,
+        &[
+            "timed out",
+            "timeout",
+            "deadline exceeded",
+            "operation timed out",
+        ],
+    )
+}
+
+fn looks_like_network_failure(message: &str) -> bool {
+    contains_any(
+        message,
+        &[
+            "connection lost",
+            "connection reset",
+            "connection refused",
+            "connection closed",
+            "socket hang up",
+            "broken pipe",
+            "network error",
+            "network connection",
+            "error sending request",
+            "error decoding response body",
+            "unexpected eof",
+            "premature end",
+            "stream ended",
+            "incomplete message",
+            "dns error",
+            "failed to lookup address",
+            "enotfound",
+            "eai_again",
+        ],
+    )
+}
+
+fn contains_any(message: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| message.contains(pattern))
+}
+
+fn request_id_from_headers(headers: Option<&HeaderMap>) -> Option<String> {
+    let headers = headers?;
+    ["x-request-id", "request-id", "x-goog-request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name)?.to_str().ok())
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_retry_after(headers: Option<&HeaderMap>) -> Option<Duration> {
+    parse_retry_after_at(headers, Utc::now())
+}
+
+fn parse_retry_after_at(headers: Option<&HeaderMap>, now: DateTime<Utc>) -> Option<Duration> {
+    let headers = headers?;
+    if let Some(milliseconds) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_nonnegative_number)
+    {
+        return Duration::try_from_secs_f64(milliseconds / 1_000.0).ok();
+    }
+    let value = headers
+        .get(http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Some(seconds) = parse_nonnegative_number(value) {
+        return Duration::try_from_secs_f64(seconds).ok();
+    }
+    let requested = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(
+        requested
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default(),
+    )
+}
+
+fn parse_nonnegative_number(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn has_usable_assistant_content(content: &[AssistantContent]) -> bool {
+    content.iter().any(|content| match content {
+        AssistantContent::Text(text) => !text.text.trim().is_empty(),
+        AssistantContent::ToolCall(_) => true,
+        AssistantContent::Reasoning(_) | AssistantContent::Image(_) => false,
+    })
 }
 
 /// Mirrors pi's `clampMaxTokensToContext`: the catalog's `maxTokens` capped by
@@ -1229,10 +1575,15 @@ where
     if request.tools {
         completion = completion.tools(tool_definitions());
     }
-    let mut stream = completion.stream().await.context("model request failed")?;
+    let mut stream = completion
+        .stream()
+        .await
+        .map_err(|error| ModelFailure::from_completion_error(error, ModelFailurePhase::Request))?;
     let mut reasoning_deltas = HashSet::new();
     while let Some(event) = stream.next().await {
-        match event.context("model stream failed")? {
+        match event.map_err(|error| {
+            ModelFailure::from_completion_error(error, ModelFailurePhase::Stream)
+        })? {
             StreamedAssistantContent::Text(text) => {
                 let _ = deltas.send(ModelDelta::Text(text.text));
             }
@@ -1255,8 +1606,8 @@ where
             | StreamedAssistantContent::Unknown(_) => {}
         }
     }
-    if stream.choice.is_empty() {
-        bail!("model returned no assistant content");
+    if !has_usable_assistant_content(&stream.choice) {
+        return Err(ModelFailure::empty_response().into());
     }
     Ok(ModelResponse {
         content: stream.choice.clone(),
@@ -1377,6 +1728,102 @@ mod tests {
         normalize_usage_for_api("anthropic-messages", &mut anthropic);
         assert_eq!(anthropic.input_tokens, 600);
         assert_eq!(anthropic.output_tokens, 200);
+    }
+
+    #[test]
+    fn provider_failure_keeps_status_retry_after_and_request_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        headers.insert("x-request-id", HeaderValue::from_static("request-123"));
+        let error = CompletionError::from_http_response_with_request_id(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"rate limited"}"#,
+            Some("request-123".to_string()),
+        )
+        .with_response_headers(Some(Box::new(headers)));
+
+        let failure = ModelFailure::from_completion_error(error, ModelFailurePhase::Request);
+
+        assert_eq!(failure.kind(), ModelFailureKind::RateLimit);
+        assert_eq!(failure.status(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(failure.retry_after(), Some(Duration::from_millis(1_500)));
+        assert_eq!(failure.provider_request_id(), Some("request-123"));
+    }
+
+    #[test]
+    fn quota_and_stream_transport_errors_are_classified_separately() {
+        let quota = CompletionError::from_http_response(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+        );
+        assert_eq!(
+            ModelFailure::from_completion_error(quota, ModelFailurePhase::Request).kind(),
+            ModelFailureKind::Quota
+        );
+
+        let disconnected = CompletionError::ProviderError(
+            "Network connection lost before the terminal event".to_string(),
+        );
+        let failure = ModelFailure::from_completion_error(disconnected, ModelFailurePhase::Stream);
+        assert_eq!(failure.kind(), ModelFailureKind::Network);
+        assert_eq!(failure.phase(), ModelFailurePhase::Stream);
+    }
+
+    #[test]
+    fn statusless_provider_envelopes_keep_transient_error_types() {
+        for (body, expected) in [
+            (
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                ModelFailureKind::Server,
+            ),
+            (
+                r#"{"type":"error","error":{"code":"server_error","message":"response failed"}}"#,
+                ModelFailureKind::Server,
+            ),
+            (
+                r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+                ModelFailureKind::RateLimit,
+            ),
+        ] {
+            let failure = ModelFailure::from_completion_error(
+                CompletionError::from_provider_body(body),
+                ModelFailurePhase::Stream,
+            );
+            assert_eq!(failure.kind(), expected, "body: {body}");
+        }
+    }
+
+    #[test]
+    fn whitespace_and_reasoning_without_an_answer_are_empty_responses() {
+        assert!(!has_usable_assistant_content(&[
+            AssistantContent::text(" \n"),
+            AssistantContent::reasoning("unfinished thought"),
+        ]));
+        assert!(has_usable_assistant_content(&[AssistantContent::text(
+            "answer"
+        ),]));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:28:00 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("2.5"));
+        assert_eq!(
+            parse_retry_after_at(Some(&headers), now),
+            Some(Duration::from_millis(2_500))
+        );
+
+        headers.insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:30 GMT"),
+        );
+        assert_eq!(
+            parse_retry_after_at(Some(&headers), now),
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[test]
