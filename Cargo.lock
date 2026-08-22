@@ -3561,6 +3561,7 @@ dependencies = [
  "tokio-util",
  "tui-term",
  "tui-textarea-2",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
  "vt100",

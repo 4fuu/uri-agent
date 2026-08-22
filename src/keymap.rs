@@ -59,6 +59,7 @@ map("composer", "ctrl+backspace", "delete_word");
 map("composer", "ctrl+delete", "delete_next_word");
 map("composer", "ctrl+z", "undo");
 map("composer", "ctrl+shift+z", "redo");
+map("composer", "ctrl+c", "copy");
 map("composer", "esc", "close");
 
 map("list", "down", "next");
@@ -328,7 +329,7 @@ mod tests {
         assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);
-        assert_eq!(keymap.action("composer", "ctrl+c"), None);
+        assert_eq!(keymap.action("composer", "ctrl+c").as_deref(), Some("copy"));
         assert_eq!(
             keymap.action("selection", "ctrl+c").as_deref(),
             Some("copy")

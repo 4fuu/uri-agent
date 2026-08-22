@@ -45,6 +45,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tui_term::widget::PseudoTerminal;
 use tui_textarea::{CursorMove, TextArea, WrapMode};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const BG: Color = Color::Reset;
@@ -198,6 +199,20 @@ struct SelectableSurface {
 struct TextSelection {
     start: (u16, u16),
     end: (u16, u16),
+}
+
+#[derive(Clone)]
+struct ComposerView {
+    inner: Rect,
+    top: usize,
+    rows: Vec<ComposerVisualRow>,
+}
+
+#[derive(Clone, Copy)]
+struct ComposerVisualRow {
+    logical_row: usize,
+    start_col: usize,
+    end_col: usize,
 }
 
 #[derive(Clone)]
@@ -430,6 +445,8 @@ struct App {
     copy_click_release_pending: bool,
     selectable: Option<SelectableSurface>,
     selection: Option<TextSelection>,
+    composer_view: Option<ComposerView>,
+    composer_mouse_selecting: bool,
     usage: UsageTotals,
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
@@ -501,6 +518,8 @@ impl App {
             copy_click_release_pending: false,
             selectable: None,
             selection: None,
+            composer_view: None,
+            composer_mouse_selecting: false,
             usage: UsageTotals::default(),
             last_cache_hit: None,
             branch: None,
@@ -908,6 +927,7 @@ impl App {
         }
         self.input = TextArea::default();
         style_input(&mut self.input, true);
+        self.composer_mouse_selecting = false;
         self.busy = true;
         self.busy_since = Some(Instant::now());
         self.activity = Some(Activity::Thinking);
@@ -1461,8 +1481,11 @@ async fn run_loop(
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        let selection_active = app.selection.is_some()
+                            || (app.overlay == Some(Overlay::Composer)
+                                && composer_has_selection(&app.input));
                         if app.pty.is_none()
-                            && is_ignored_tui_key(key, app.selection.is_some())
+                            && is_ignored_tui_key(key, selection_active)
                         {
                             continue;
                         }
@@ -1876,7 +1899,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
                 .await;
         }
         Some("copy") => {
-            copy_current_surface(app);
+            if app.overlay == Some(Overlay::Composer) && composer_has_selection(&app.input) {
+                copy_composer_selection(app);
+            } else {
+                copy_current_surface(app);
+            }
             return Action::Continue;
         }
         _ => {}
@@ -1988,7 +2015,12 @@ async fn handle_overlay_key(
                 app.input.insert_newline();
                 Action::Continue
             }
+            Some("copy") => {
+                copy_composer_selection(app);
+                Action::Continue
+            }
             Some("close") => {
+                app.composer_mouse_selecting = false;
                 app.overlay = None;
                 Action::Continue
             }
@@ -2476,6 +2508,9 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
     if consume_copy_click_release(app, mouse) {
         return Action::Continue;
     }
+    if handle_composer_mouse(app, mouse) {
+        return Action::Continue;
+    }
     if is_selection_copy_click(app, mouse) {
         copy_current_surface(app);
         app.copy_click_release_pending = true;
@@ -2601,6 +2636,94 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         _ => {}
     }
     Action::Continue
+}
+
+fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if app.overlay != Some(Overlay::Composer) {
+        return false;
+    }
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+        && composer_has_selection(&app.input)
+    {
+        copy_composer_selection(app);
+        app.copy_click_release_pending = true;
+        return true;
+    }
+
+    let Some(view) = app.composer_view.as_ref() else {
+        return false;
+    };
+    let starting = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    let continuing = app.composer_mouse_selecting
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        );
+    if (!starting && !continuing)
+        || (starting && !view.inner.contains((mouse.column, mouse.row).into()))
+    {
+        return false;
+    }
+
+    let cursor = composer_cursor_at(view, &app.input, mouse.column, mouse.row);
+    if starting {
+        app.input.cancel_selection();
+        app.input
+            .move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
+        app.input.start_selection();
+        app.composer_mouse_selecting = true;
+    } else {
+        app.input
+            .move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            if app
+                .input
+                .selection_range()
+                .is_some_and(|(start, end)| start == end)
+            {
+                app.input.cancel_selection();
+            }
+            app.composer_mouse_selecting = false;
+        }
+    }
+    true
+}
+
+fn composer_cursor_at(
+    view: &ComposerView,
+    input: &TextArea<'_>,
+    column: u16,
+    row: u16,
+) -> (usize, usize) {
+    let visual_row = view.top
+        + row
+            .clamp(view.inner.y, view.inner.bottom().saturating_sub(1))
+            .saturating_sub(view.inner.y) as usize;
+    let wrapped = view.rows[visual_row.min(view.rows.len().saturating_sub(1))];
+    let target = column
+        .clamp(view.inner.x, view.inner.right().saturating_sub(1))
+        .saturating_sub(view.inner.x) as usize;
+    let line = &input.lines()[wrapped.logical_row];
+    let mut width = 0usize;
+    let mut best = (wrapped.start_col, target);
+    for (offset, character) in line
+        .chars()
+        .skip(wrapped.start_col)
+        .take(wrapped.end_col.saturating_sub(wrapped.start_col))
+        .enumerate()
+    {
+        let distance = target.abs_diff(width);
+        if distance <= best.1 {
+            best = (wrapped.start_col + offset, distance);
+        }
+        width = display_width_to(character, width, input.tab_length());
+    }
+    let distance = target.abs_diff(width);
+    if distance <= best.1 {
+        (wrapped.logical_row, wrapped.end_col)
+    } else {
+        (wrapped.logical_row, best.0)
+    }
 }
 
 fn activate_transcript_mouse(app: &mut App, mouse: MouseEvent) -> bool {
@@ -3743,6 +3866,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_regions.clear();
     app.overlay_bounds = None;
     app.selectable = None;
+    app.composer_view = None;
+    if app.overlay != Some(Overlay::Composer) {
+        app.composer_mouse_selecting = false;
+    }
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
     if app.showing_splash() {
@@ -4643,6 +4770,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
             frame.render_widget(&app.input, area);
             if let Some(position) = composer_cursor_position(frame, &app.input, area) {
                 frame.set_cursor_position(position);
+                app.composer_view = composer_view(&app.input, area, position);
             }
         }
         Overlay::Command => render_command(frame, app, area, block),
@@ -5302,7 +5430,150 @@ fn style_input(input: &mut TextArea<'static>, busy: bool) {
     input.set_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_style(Style::default().fg(SURFACE).bg(border));
+    input.set_selection_style(Style::default().fg(TEXT).bg(ACCENT));
     input.set_wrap_mode(WrapMode::WordOrGlyph);
+}
+
+fn composer_view(
+    input: &TextArea<'_>,
+    area: Rect,
+    cursor_position: (u16, u16),
+) -> Option<ComposerView> {
+    let inner = input.block().map_or(area, |block| block.inner(area));
+    if inner.is_empty() {
+        return None;
+    }
+    let rows = composer_visual_rows(input.lines(), inner.width as usize, input.tab_length());
+    let cursor = input.cursor();
+    let cursor_visual_row = rows.iter().enumerate().find_map(|(index, wrapped)| {
+        if wrapped.logical_row != cursor.0 {
+            return None;
+        }
+        let last_in_line = rows
+            .get(index + 1)
+            .is_none_or(|next| next.logical_row != wrapped.logical_row);
+        ((wrapped.start_col <= cursor.1)
+            && (cursor.1 < wrapped.end_col || (last_in_line && cursor.1 == wrapped.end_col)))
+            .then_some(index)
+    })?;
+    let cursor_screen_row = cursor_position.1.saturating_sub(inner.y) as usize;
+    Some(ComposerView {
+        inner,
+        top: cursor_visual_row.saturating_sub(cursor_screen_row),
+        rows,
+    })
+}
+
+fn composer_visual_rows(lines: &[String], width: usize, tab_length: u8) -> Vec<ComposerVisualRow> {
+    let mut rows = Vec::new();
+    for (logical_row, line) in lines.iter().enumerate() {
+        let mut start_col = 0usize;
+        for (start_byte, end_byte) in composer_line_ranges(line, width.max(1), tab_length) {
+            let end_col = start_col + line[start_byte..end_byte].chars().count();
+            rows.push(ComposerVisualRow {
+                logical_row,
+                start_col,
+                end_col,
+            });
+            start_col = end_col;
+        }
+    }
+    rows
+}
+
+fn composer_line_ranges(line: &str, width: usize, tab_length: u8) -> Vec<(usize, usize)> {
+    let chunks = UnicodeSegmentation::split_word_bound_indices(line)
+        .map(|(start, text)| (start, start + text.len()))
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    let mut start = chunks[0].0;
+    let mut end = start;
+    let mut line_width = 0usize;
+    while index < chunks.len() {
+        let chunk = chunks[index];
+        if end == start {
+            start = chunk.0;
+        }
+        let next_width = display_width_str(&line[chunk.0..chunk.1], line_width, tab_length);
+        if next_width <= width {
+            end = chunk.1;
+            line_width = next_width;
+            index += 1;
+        } else if end > start {
+            ranges.push((start, end));
+            start = end;
+            line_width = 0;
+        } else {
+            split_composer_graphemes(line, chunk.0, chunk.1, width, tab_length, &mut ranges);
+            index += 1;
+            start = chunk.1;
+            end = chunk.1;
+            line_width = 0;
+        }
+    }
+    if end > start {
+        ranges.push((start, end));
+    }
+    ranges
+}
+
+fn split_composer_graphemes(
+    line: &str,
+    start: usize,
+    end: usize,
+    width: usize,
+    tab_length: u8,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let mut segment_start = start;
+    while segment_start < end {
+        let mut segment_end = segment_start;
+        let mut segment_width = 0usize;
+        for (offset, grapheme) in
+            UnicodeSegmentation::grapheme_indices(&line[segment_start..end], true)
+        {
+            let grapheme_start = segment_start + offset;
+            let grapheme_end = grapheme_start + grapheme.len();
+            let next_width = display_width_str(grapheme, segment_width, tab_length);
+            if segment_end != segment_start && next_width > width {
+                break;
+            }
+            segment_end = grapheme_end;
+            segment_width = next_width;
+            if segment_width > width {
+                break;
+            }
+        }
+        if segment_end == segment_start {
+            segment_end = line[segment_start..end]
+                .chars()
+                .next()
+                .map_or(end, |character| segment_start + character.len_utf8());
+        }
+        ranges.push((segment_start, segment_end));
+        segment_start = segment_end;
+    }
+}
+
+fn display_width_str(text: &str, mut width: usize, tab_length: u8) -> usize {
+    for character in text.chars() {
+        width = display_width_to(character, width, tab_length);
+    }
+    width
+}
+
+fn display_width_to(character: char, width: usize, tab_length: u8) -> usize {
+    if character == '\t' && tab_length > 0 {
+        let tab_length = tab_length as usize;
+        width + tab_length - width % tab_length
+    } else {
+        width + character.width().unwrap_or(0)
+    }
 }
 
 fn composer_cursor_position(
@@ -5460,6 +5731,51 @@ fn copy_current_surface(app: &mut App) {
         app.set_flash("The selection is empty");
         return;
     }
+    copy_text_with_osc52(app, &text);
+    app.selection = None;
+}
+
+fn copy_composer_selection(app: &mut App) {
+    let Some(text) = composer_selected_text(&app.input) else {
+        return;
+    };
+    copy_text_with_osc52(app, &text);
+}
+
+fn composer_has_selection(input: &TextArea<'_>) -> bool {
+    input
+        .selection_range()
+        .is_some_and(|(start, end)| start != end)
+}
+
+fn composer_selected_text(input: &TextArea<'_>) -> Option<String> {
+    let (start, end) = input.selection_range()?;
+    if start == end {
+        return None;
+    }
+    if start.0 == end.0 {
+        return Some(
+            input.lines()[start.0]
+                .chars()
+                .skip(start.1)
+                .take(end.1.saturating_sub(start.1))
+                .collect(),
+        );
+    }
+    let mut selected = input.lines()[start.0]
+        .chars()
+        .skip(start.1)
+        .collect::<String>();
+    for line in &input.lines()[start.0 + 1..end.0] {
+        selected.push('\n');
+        selected.push_str(line);
+    }
+    selected.push('\n');
+    selected.extend(input.lines()[end.0].chars().take(end.1));
+    Some(selected)
+}
+
+fn copy_text_with_osc52(app: &mut App, text: &str) {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let result = write!(stdout(), "\x1b]52;c;{encoded}\x07").and_then(|()| stdout().flush());
     app.set_flash(if result.is_ok() {
@@ -5467,7 +5783,6 @@ fn copy_current_surface(app: &mut App) {
     } else {
         "Could not write OSC52 clipboard data".to_string()
     });
-    app.selection = None;
 }
 
 fn selected_surface_text(surface: &SelectableSurface, selection: TextSelection) -> String {
@@ -7032,7 +7347,10 @@ mod tests {
             false
         ));
         assert_eq!(app.keymap.action("main", "ctrl+c"), None);
-        assert_eq!(app.keymap.action("composer", "ctrl+c"), None);
+        assert_eq!(
+            app.keymap.action("composer", "ctrl+c").as_deref(),
+            Some("copy")
+        );
         assert_eq!(app.keymap.action("command", "ctrl+c"), None);
         assert_eq!(
             app.keymap.action("selection", "ctrl+c").as_deref(),
@@ -7092,6 +7410,102 @@ mod tests {
         assert_eq!(
             terminal.backend().buffer().cell((3, 18)).unwrap().symbol(),
             "x"
+        );
+    }
+
+    #[test]
+    fn composer_mouse_click_moves_the_caret_and_drag_selects_editable_text() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("alpha beta");
+        render_to_string(&mut app, 80, 24);
+        let inner = app.composer_view.as_ref().unwrap().inner;
+        let event = |kind, column| MouseEvent {
+            kind,
+            column: inner.x + column,
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), 6)
+        ));
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Up(MouseButton::Left), 6)
+        ));
+        assert_eq!(app.input.cursor(), (0, 6));
+        assert!(!app.input.is_selecting());
+
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), 0)
+        ));
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Drag(MouseButton::Left), 5)
+        ));
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Up(MouseButton::Left), 5)
+        ));
+        assert_eq!(composer_selected_text(&app.input).as_deref(), Some("alpha"));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((inner.x + 5, inner.y));
+        assert_eq!(terminal.backend().buffer()[(inner.x, inner.y)].bg, ACCENT);
+
+        edit_composer_with_default_keymap(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.draft_text(), "X beta");
+    }
+
+    #[test]
+    fn composer_mouse_selection_follows_soft_wrapped_text() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("x".repeat(75));
+        render_to_string(&mut app, 80, 24);
+        let inner = app.composer_view.as_ref().unwrap().inner;
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column: inner.x + column,
+            row: inner.y + row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Down(MouseButton::Left), 0, 0)
+        ));
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Drag(MouseButton::Left), 1, 1)
+        ));
+        assert!(handle_composer_mouse(
+            &mut app,
+            event(MouseEventKind::Up(MouseButton::Left), 1, 1)
+        ));
+        assert_eq!(composer_selected_text(&app.input), Some("x".repeat(75)));
+    }
+
+    #[test]
+    fn composer_selection_extracts_multiline_unicode_text() {
+        let mut input = TextArea::from(["你好吗", "second", "终"]);
+        input.move_cursor(CursorMove::Jump(0, 1));
+        input.start_selection();
+        input.move_cursor(CursorMove::Jump(2, 1));
+
+        assert_eq!(
+            composer_selected_text(&input).as_deref(),
+            Some("好吗\nsecond\n终")
         );
     }
 

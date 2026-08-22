@@ -29,6 +29,7 @@ Press `i` to open the rounded, bottom-anchored composer. An empty composer shows
 | `Ctrl+Z`/`Ctrl+Shift+Z` | Undo or redo an edit |
 | `Esc` | Close the composer and preserve the draft |
 
+Click to place the caret, or drag across the draft to select editable text. `Ctrl+C`, `Ctrl+Shift+C`, `Cmd+C`, or right-click copies the selected draft through OSC52.
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 Long logical lines soft-wrap at the visible composer edge; only the newline shortcuts above insert a newline into the submitted text.
 
