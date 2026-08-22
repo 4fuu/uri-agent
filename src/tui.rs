@@ -4142,7 +4142,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let compose = app
         .keymap
         .key_for("main", "compose")
-        .unwrap_or_else(|| "i".to_string());
+        .unwrap_or_else(|| "space".to_string());
     let command = app
         .keymap
         .key_for("main", "command")
@@ -4278,12 +4278,18 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     "No model configured. Run :login",
                     Style::default().fg(WARM).add_modifier(Modifier::BOLD),
                 ),
-                Line::styled("i compose   : command   :model", Style::default().fg(MUTED)),
+                Line::styled(
+                    "space compose   : command   :model",
+                    Style::default().fg(MUTED),
+                ),
             ]
         } else {
             vec![
                 Line::styled("No messages yet", Style::default().fg(MUTED)),
-                Line::styled("i compose   : command   :login", Style::default().fg(WARM)),
+                Line::styled(
+                    "space compose   : command   :login",
+                    Style::default().fg(WARM),
+                ),
             ]
         };
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
@@ -6705,7 +6711,7 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("/workspace"));
         assert!(rendered.contains("test / model · effort off"));
-        assert!(rendered.contains("i compose · : commands · ? help"));
+        assert!(rendered.contains("space compose · : commands · ? help"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("ctx "));
 
@@ -6721,8 +6727,8 @@ mod tests {
             Some(38)
         );
         let hint_row = project_row + 3;
-        assert!(lines[hint_row].contains("i compose · : commands · ? help"));
-        assert_eq!(lines[hint_row].find("i compose"), Some(35));
+        assert!(lines[hint_row].contains("space compose · : commands · ? help"));
+        assert_eq!(lines[hint_row].find("space compose"), Some(33));
         assert_eq!(lines.len() - hint_row - 1, 7);
     }
 
@@ -6755,7 +6761,7 @@ mod tests {
         assert!(!footer.contains("tokens"));
         assert!(!footer.contains("F4"));
         assert!(!footer.contains('│'));
-        assert!(!rendered.contains("i compose"));
+        assert!(!rendered.contains("space compose"));
         assert!(!rendered.contains(": command"));
         assert!(!rendered.contains("r thinking"));
         assert!(!rendered.contains("BROWSE"));
@@ -7510,7 +7516,7 @@ mod tests {
         let rendered = render_to_string(&mut app, 80, 24);
         assert!(rendered.contains("/workspace"));
         assert!(rendered.contains("test / model · effort off"));
-        assert!(rendered.contains("i compose · : commands · ? help"));
+        assert!(rendered.contains("space compose · : commands · ? help"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("ctx "));
     }
@@ -8980,6 +8986,10 @@ mod tests {
 
     #[test]
     fn key_events_have_stable_rhai_names() {
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            "space"
+        );
         assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
             "ctrl+e"

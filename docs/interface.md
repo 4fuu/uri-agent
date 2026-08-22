@@ -14,7 +14,7 @@ Select a process row with the arrow keys or mouse and press `Enter` to reveal or
 
 ## Composer and commands
 
-Press `i` to open the rounded, bottom-anchored composer. An empty composer shows a placeholder; while a turn is running, its muted state explains that another turn cannot be submitted:
+Press `Space` to open the rounded, bottom-anchored composer. An empty composer shows a placeholder; while a turn is running, its muted state explains that another turn cannot be submitted:
 
 | Key | Action |
 | --- | --- |

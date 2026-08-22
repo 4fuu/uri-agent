@@ -59,7 +59,7 @@ URI Agent does not choose a default model. In the TUI:
 
 1. Run `:login` to save an API key or complete a supported OAuth flow.
 2. Run `:model` and select a runnable model.
-3. Press `i`, enter a small read-only request such as `Read the top-level files and explain what this project does. Do not modify files.`, and press `Enter`.
+3. Press `Space`, enter a small read-only request such as `Read the top-level files and explain what this project does. Do not modify files.`, and press `Enter`.
 
 The first session is working when protocol activity appears and the assistant returns an answer based on the project. Press `F1` or run `:help` for the active commands and key bindings.
 

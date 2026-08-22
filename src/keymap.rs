@@ -18,7 +18,7 @@ map("global", "ctrl+shift+c", "copy");
 map("global", "super+c", "copy");
 map("global", "esc", "interrupt_on_double_press");
 
-map("main", "i", "compose");
+map("main", "space", "compose");
 map("main", "@", "paste_image");
 map("main", ":", "command");
 map("main", "?", "help");
@@ -327,7 +327,8 @@ mod tests {
         assert_eq!(keymap.action("main", "：").as_deref(), Some("command"));
         assert_eq!(keymap.action("main", "?").as_deref(), Some("help"));
         assert_eq!(keymap.action("main", "？").as_deref(), Some("help"));
-        assert_eq!(keymap.action("main", "i").as_deref(), Some("compose"));
+        assert_eq!(keymap.action("main", "space").as_deref(), Some("compose"));
+        assert_eq!(keymap.action("main", "i"), None);
         assert_eq!(keymap.action("main", "@").as_deref(), Some("paste_image"));
         assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
         assert_eq!(keymap.action("main", "q"), None);
