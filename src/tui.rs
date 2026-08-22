@@ -421,7 +421,6 @@ struct App {
     usage: UsageTotals,
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
-    pending_transcript_click: Option<(usize, Instant)>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
     tui_document: Option<TuiDocument>,
@@ -492,7 +491,6 @@ impl App {
             usage: UsageTotals::default(),
             last_cache_hit: None,
             branch: None,
-            pending_transcript_click: None,
             commands,
             tui,
             tui_document: None,
@@ -949,43 +947,6 @@ impl App {
         }
     }
 
-    fn queue_transcript_click(&mut self, index: usize) {
-        let now = Instant::now();
-        if let Some((pending, at)) = self.pending_transcript_click.take() {
-            if pending == index && now.duration_since(at) < DOUBLE_CLICK_INTERVAL {
-                self.last_click = None;
-                self.click_transcript_block(index, true);
-                return;
-            }
-            self.click_transcript_block(pending, false);
-        }
-        self.selected_block = index;
-        self.transcript_follow_tail = false;
-        self.last_click = None;
-        if self
-            .blocks
-            .get(index)
-            .is_some_and(|block| !matches!(block.kind, BlockKind::User | BlockKind::Assistant))
-        {
-            self.pending_transcript_click = Some((index, now));
-        }
-    }
-
-    fn confirm_pending_transcript_click(&mut self) {
-        if let Some((index, _)) = self.pending_transcript_click.take() {
-            self.click_transcript_block(index, false);
-        }
-    }
-
-    fn confirm_pending_transcript_click_if_elapsed(&mut self) {
-        if self
-            .pending_transcript_click
-            .is_some_and(|(_, at)| at.elapsed() >= DOUBLE_CLICK_INTERVAL)
-        {
-            self.confirm_pending_transcript_click();
-        }
-    }
-
     fn active_transcript_block(&self) -> Option<usize> {
         if !self.busy {
             return None;
@@ -1274,14 +1235,12 @@ async fn run_loop(
         terminal.draw(|frame| render(frame, app))?;
         tokio::select! {
             _ = animation.tick(), if !app.animations_paused() => {
-                app.confirm_pending_transcript_click_if_elapsed();
                 app.frame = app.frame.wrapping_add(1);
             },
             event = terminal_events.next() => {
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        app.confirm_pending_transcript_click();
                         if app.pty.is_none()
                             && is_ignored_tui_key(key, app.selection.is_some())
                         {
@@ -2276,9 +2235,6 @@ fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
 }
 
 async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices) -> Action {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        app.confirm_pending_transcript_click();
-    }
     if consume_copy_click_release(app, mouse) {
         return Action::Continue;
     }
@@ -2294,6 +2250,9 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         return Action::Continue;
     }
     if update_mouse_selection(app, mouse, app.overlay.is_none()) {
+        return Action::Continue;
+    }
+    if activate_transcript_mouse(app, mouse) {
         return Action::Continue;
     }
     match mouse.kind {
@@ -2351,14 +2310,12 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         },
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = hit_target(&app.hit_regions, mouse) else {
-                app.confirm_pending_transcript_click();
                 return Action::Continue;
             };
             if let AppHit::Transcript(index) = target {
-                app.queue_transcript_click(index);
+                app.click_transcript_block(index, false);
                 return Action::Continue;
             }
-            app.confirm_pending_transcript_click();
             let activate = is_double_click(&mut app.last_click, target);
             match target {
                 AppHit::Transcript(_) => unreachable!(),
@@ -2406,6 +2363,27 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         _ => {}
     }
     Action::Continue
+}
+
+fn activate_transcript_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    let open_document = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => false,
+        MouseEventKind::Down(MouseButton::Right) => true,
+        _ => return false,
+    };
+    let Some(AppHit::Transcript(index)) = hit_target(&app.hit_regions, mouse) else {
+        return false;
+    };
+    if !app
+        .blocks
+        .get(index)
+        .is_some_and(|block| !matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+    {
+        return false;
+    }
+    app.last_click = None;
+    app.click_transcript_block(index, open_document);
+    true
 }
 
 fn is_selection_copy_click(app: &App, mouse: MouseEvent) -> bool {
@@ -2459,7 +2437,6 @@ fn begin_direct_transcript_selection(app: &mut App, mouse: MouseEvent) -> bool {
     {
         return false;
     }
-    app.confirm_pending_transcript_click();
     app.selected_block = index;
     app.transcript_follow_tail = false;
     update_mouse_selection(app, mouse, false)
@@ -4055,7 +4032,7 @@ fn transcript_hint(
                 format!(
                     "… {extra} more lines · {}",
                     if expanded {
-                        format!("{open_key} or double-click opens full")
+                        format!("{open_key} or right-click opens full")
                     } else {
                         "Enter expands".to_string()
                     }
@@ -6379,7 +6356,7 @@ mod tests {
             assert!(app.blocks[0].expanded);
             if kind == BlockKind::Reasoning {
                 let rendered = render_to_string(&mut app, 100, 60);
-                assert!(rendered.contains("O or double-click opens full"));
+                assert!(rendered.contains("O or right-click opens full"));
                 assert!(!rendered.contains("Enter opens"));
             }
             app.toggle_selected();
@@ -6458,7 +6435,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_double_click_opens_without_changing_the_folded_state() {
+    fn transcript_right_click_opens_during_streaming_without_changing_folded_state() {
         let mut app = test_app();
         app.push(
             BlockKind::Reasoning,
@@ -6468,22 +6445,41 @@ mod tests {
             false,
             false,
         );
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::User {
+                text: "keep working".into(),
+            },
+        });
+        app.apply_transient(EventKind::AssistantText {
+            text: "streaming now".into(),
+        });
+        assert!(app.busy);
+        render_to_string(&mut app, 100, 24);
+        let area = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area))
+            .expect("history block mouse region");
+        let right_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
 
-        app.queue_transcript_click(0);
-        assert!(!app.blocks[0].expanded);
-        assert!(app.pending_transcript_click.is_some());
-        app.queue_transcript_click(0);
+        assert!(activate_transcript_mouse(&mut app, right_click));
 
         assert!(!app.blocks[0].expanded);
         assert!(app.overlay == Some(Overlay::Document));
         assert!(app.document.is_some());
-        assert!(app.pending_transcript_click.is_none());
         assert_eq!(app.selected_block, 0);
         assert!(!app.transcript_follow_tail);
     }
 
     #[test]
-    fn transcript_single_click_waits_before_toggling_each_time() {
+    fn transcript_single_click_toggles_immediately_each_time() {
         let mut app = test_app();
         app.push(
             BlockKind::Reasoning,
@@ -6493,18 +6489,23 @@ mod tests {
             false,
             false,
         );
+        render_to_string(&mut app, 100, 24);
+        let area = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area))
+            .expect("history block mouse region");
+        let left_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
 
-        app.queue_transcript_click(0);
-        assert!(!app.blocks[0].expanded);
-        app.pending_transcript_click.as_mut().unwrap().1 = Instant::now() - DOUBLE_CLICK_INTERVAL;
-        app.confirm_pending_transcript_click_if_elapsed();
+        assert!(activate_transcript_mouse(&mut app, left_click));
         assert!(app.blocks[0].expanded);
-        assert!(app.pending_transcript_click.is_none());
 
-        app.queue_transcript_click(0);
-        assert!(app.blocks[0].expanded);
-        app.pending_transcript_click.as_mut().unwrap().1 = Instant::now() - DOUBLE_CLICK_INTERVAL;
-        app.confirm_pending_transcript_click_if_elapsed();
+        assert!(activate_transcript_mouse(&mut app, left_click));
         assert!(!app.blocks[0].expanded);
         assert!(app.overlay.is_none());
     }
