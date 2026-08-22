@@ -783,31 +783,45 @@ impl App {
     }
 
     fn toggle_selected(&mut self) {
-        let body_width = self.transcript_body_width;
         let Some(block) = self.blocks.get_mut(self.selected_block) else {
             return;
         };
         if matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
             return;
         }
-        if !block.expanded {
-            block.expanded = true;
-            self.transcript_center_selected = true;
+        block.expanded = !block.expanded;
+        self.transcript_center_selected = true;
+    }
+
+    fn open_selected_document(&mut self) {
+        let Some(block) = self.blocks.get(self.selected_block) else {
+            return;
+        };
+        if matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
             return;
         }
-        let preview_limit = if block.kind == BlockKind::Tool {
-            10
-        } else {
-            EXPANDED_PREVIEW_LINES
-        };
-        if visible_block_lines(&block.text, body_width, preview_limit).1 > 0 {
-            self.document = Some((block.title.clone(), block_document(block)));
-            self.overlay_scroll = 0;
-            self.overlay = Some(Overlay::Document);
-        } else {
-            block.expanded = false;
+        self.document = Some((block.title.clone(), block_document(block)));
+        self.overlay_scroll = 0;
+        self.overlay = Some(Overlay::Document);
+    }
+
+    fn click_transcript_block(&mut self, index: usize, double_click: bool) {
+        self.selected_block = index;
+        self.transcript_follow_tail = false;
+        if !self
+            .blocks
+            .get(index)
+            .is_some_and(|block| !matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+        {
+            return;
         }
-        self.transcript_center_selected = true;
+        if double_click {
+            // Restore the state changed by the first click, then open without folding.
+            self.toggle_selected();
+            self.open_selected_document();
+        } else {
+            self.toggle_selected();
+        }
     }
 
     fn scroll_transcript(&mut self, distance: isize) {
@@ -1492,6 +1506,10 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             app.toggle_selected();
             Action::Continue
         }
+        Some("open") => {
+            app.open_selected_document();
+            Action::Continue
+        }
         Some("clear") => {
             app.jump = JumpKind::All;
             Action::Continue
@@ -2061,15 +2079,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             };
             let activate = is_double_click(&mut app.last_click, target);
             match target {
-                AppHit::Transcript(index) => {
-                    app.selected_block = index;
-                    app.transcript_follow_tail = false;
-                    if app.blocks.get(index).is_some_and(|block| {
-                        !matches!(block.kind, BlockKind::User | BlockKind::Assistant)
-                    }) {
-                        app.toggle_selected();
-                    }
-                }
+                AppHit::Transcript(index) => app.click_transcript_block(index, activate),
                 AppHit::Palette(index) => {
                     app.command_selected = index;
                     return confirm_command(app, services).await;
@@ -3440,6 +3450,11 @@ fn transcript_block_items(
             BlockKind::Assistant | BlockKind::Reasoning | BlockKind::Tool
         );
     let selection = if selected { "▌ " } else { "  " };
+    let open_key = app
+        .keymap
+        .key_for("main", "open")
+        .unwrap_or_else(|| "o".to_string())
+        .to_ascii_uppercase();
     let mut rows = Vec::new();
 
     match block.kind {
@@ -3518,7 +3533,9 @@ fn transcript_block_items(
                     ));
                 }
                 if extra > 0 {
-                    rows.push(transcript_hint(selection, extra, true, background));
+                    rows.push(transcript_hint(
+                        selection, extra, true, &open_key, background,
+                    ));
                 }
             }
         }
@@ -3571,7 +3588,9 @@ fn transcript_block_items(
                     ));
                 }
                 if extra > 0 {
-                    rows.push(transcript_hint(selection, extra, true, background));
+                    rows.push(transcript_hint(
+                        selection, extra, true, &open_key, background,
+                    ));
                 }
             }
         }
@@ -3619,6 +3638,7 @@ fn transcript_block_items(
                     selection,
                     extra,
                     block.expanded,
+                    &open_key,
                     background,
                 ));
             }
@@ -3645,6 +3665,7 @@ fn transcript_hint(
     selection: &str,
     extra: usize,
     expanded: bool,
+    open_key: &str,
     background: Color,
 ) -> ListItem<'static> {
     transcript_item(
@@ -3653,8 +3674,12 @@ fn transcript_hint(
             Span::raw("  "),
             Span::styled(
                 format!(
-                    "… {extra} more lines · Enter {}",
-                    if expanded { "opens" } else { "expands" }
+                    "… {extra} more lines · {}",
+                    if expanded {
+                        format!("{open_key} or double-click opens full")
+                    } else {
+                        "Enter expands".to_string()
+                    }
                 ),
                 Style::default().fg(MUTED),
             ),
@@ -5415,6 +5440,84 @@ mod tests {
     }
 
     #[test]
+    fn long_history_blocks_fold_instead_of_opening_a_document() {
+        for kind in [BlockKind::Reasoning, BlockKind::Tool] {
+            let mut app = test_app();
+            app.transcript_body_width = 8;
+            app.push(
+                kind,
+                "DETAIL",
+                "long content ".repeat(240),
+                None,
+                false,
+                false,
+            );
+
+            app.toggle_selected();
+            assert!(app.blocks[0].expanded);
+            if kind == BlockKind::Reasoning {
+                let rendered = render_to_string(&mut app, 100, 60);
+                assert!(rendered.contains("O or double-click opens full"));
+                assert!(!rendered.contains("Enter opens"));
+            }
+            app.toggle_selected();
+
+            assert!(!app.blocks[0].expanded);
+            assert!(app.overlay.is_none());
+            assert!(app.document.is_none());
+            assert!(app.transcript_center_selected);
+        }
+    }
+
+    #[test]
+    fn opening_a_full_document_does_not_change_the_folded_state() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "full thought".to_string(),
+            None,
+            false,
+            false,
+        );
+
+        app.open_selected_document();
+
+        assert!(!app.blocks[0].expanded);
+        assert!(app.overlay == Some(Overlay::Document));
+        assert_eq!(
+            app.document.as_ref(),
+            Some(&(
+                "THINKING".to_string(),
+                "# THINKING\n\nfull thought\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn transcript_double_click_opens_without_changing_the_folded_state() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "full thought".to_string(),
+            None,
+            false,
+            false,
+        );
+
+        app.click_transcript_block(0, false);
+        assert!(app.blocks[0].expanded);
+        app.click_transcript_block(0, true);
+
+        assert!(!app.blocks[0].expanded);
+        assert!(app.overlay == Some(Overlay::Document));
+        assert!(app.document.is_some());
+        assert_eq!(app.selected_block, 0);
+        assert!(!app.transcript_follow_tail);
+    }
+
+    #[test]
     fn user_and_assistant_messages_never_fold_or_open_a_document() {
         let mut app = test_app();
         app.transcript_body_width = 8;
@@ -5428,6 +5531,7 @@ mod tests {
         );
 
         app.toggle_selected();
+        app.open_selected_document();
 
         assert!(app.overlay.is_none());
         assert!(app.document.is_none());
@@ -5445,7 +5549,10 @@ mod tests {
             false,
         );
         app.toggle_selected();
+        app.open_selected_document();
         assert!(!app.blocks[0].expanded);
+        assert!(app.overlay.is_none());
+        assert!(app.document.is_none());
         assert!(transcript_block_items(&app.blocks[0], true, 8, &app).len() > 24);
     }
 

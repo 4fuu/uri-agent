@@ -8,7 +8,7 @@ Startup may show a short animated splash before the conversation. An empty conve
 
 After the first record appears, the transcript uses the available content area and a minimal footer stays on the bottom row. It keeps the active model and effort at the left edge and the animated context meter plus `percentage/context-window-size` at the right edge. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
 
-User prompts use a low-contrast full-width band, while assistant responses remain unboxed and render as Markdown documents, including headings, emphasis, links, lists, quotes, code blocks, and responsive tables. User prompts and assistant responses never fold. Completed reasoning and tool calls collapse to compact semantic summaries; tool rows describe the routed URI, command, patch targets, and result instead of exposing raw argument JSON. Select a reasoning or tool block with the arrow keys or mouse and press `Enter` to expand, fold, or open its full document. Reasoning remains in the conversation instead of moving to a separate mode.
+User prompts use a low-contrast full-width band, while assistant responses remain unboxed and render as Markdown documents, including headings, emphasis, links, lists, quotes, code blocks, and responsive tables. User prompts and assistant responses never fold. Completed reasoning and tool calls collapse to compact semantic summaries; tool rows describe the routed URI, command, patch targets, and result instead of exposing raw argument JSON. Select a reasoning or tool block with the arrow keys or mouse and press `Enter` or single-click to expand or fold it. Press `o` or double-click to open its full document. Reasoning remains in the conversation instead of moving to a separate mode.
 
 ## Composer and commands
 
@@ -50,7 +50,7 @@ Extensions register commands through the same registry, so they appear in the pa
 
 | Surface | Useful defaults |
 | --- | --- |
-| Conversation | `Up`/`Down` select, `Enter` open/fold, `PageUp`/`PageDown` page, `Home`/`End` jump |
+| Conversation | `Up`/`Down` select, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
 | Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
 | Global | `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
 | Copy | `Ctrl+Shift+C` copy |

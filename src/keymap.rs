@@ -31,6 +31,7 @@ map("main", "pageup", "page_up");
 map("main", "home", "first");
 map("main", "end", "last");
 map("main", "enter", "toggle");
+map("main", "o", "open");
 map("main", "esc", "clear");
 map("main", "y", "copy");
 
@@ -293,6 +294,7 @@ mod tests {
         assert_eq!(keymap.action("main", "?").as_deref(), Some("help"));
         assert_eq!(keymap.action("main", "？").as_deref(), Some("help"));
         assert_eq!(keymap.action("main", "i").as_deref(), Some("compose"));
+        assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);
         assert_eq!(keymap.action("composer", "ctrl+c"), None);
