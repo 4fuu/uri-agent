@@ -1,5 +1,6 @@
 mod agents;
 mod apply_patch;
+mod bin_hints;
 mod file;
 mod replace;
 mod shell;
@@ -15,6 +16,7 @@ use uuid::Uuid;
 pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
     plugins.add(agents::AgentsPlugin::new(cwd));
+    plugins.add(bin_hints::BinHintsPlugin);
     plugins.add(file::FileProtocol::new(cwd));
     plugins.add(replace::ReplaceProtocol::new(cwd));
     plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
@@ -118,6 +120,5 @@ mod tests {
         assert!(names.iter().any(|name| name == "replace"));
         assert!(names.iter().any(|name| name == "apply_patch"));
         assert!(!names.iter().any(|name| name == "edit"));
-        assert!(plugins.system_prompt_fragments().unwrap().is_empty());
     }
 }

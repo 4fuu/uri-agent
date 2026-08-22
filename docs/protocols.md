@@ -121,6 +121,26 @@ The following content is from the project's AGENTS.md. Follow these instructions
 
 This plugin does not register a protocol, command, panel, or status provider. A missing `AGENTS.md` contributes no prompt content; other read failures stop session startup with an error. Because the complete prompt is frozen, later changes to `AGENTS.md` apply only to new sessions.
 
+## Built-in binary hints
+
+A second prompt-only built-in plugin scans `PATH` once while constructing a new session's frozen system prompt. It detects these names in fixed display order:
+
+```text
+rg, fd, fdfind, sd, bat, batcat, eza, exa, lsd, delta,
+jq, yq, fzf, xh, hyperfine, dust, duf, procs, btm, zoxide,
+doggo, gping, hexyl, choose, sad, ast-grep, broot, tokei, watchexec, glow
+```
+
+When at least one is available, the plugin contributes this exact prompt fragment, with the detected names joined by ` / `:
+
+```text
+These faster cross-platform tools are available: `rg` / `fd` / `bat`. Prefer them over their classical Unix equivalents.
+```
+
+Matching is case-insensitive and output follows the fixed list rather than `PATH` order. Duplicate names are removed, while aliases such as `fd` and `fdfind` remain separate when both exist. Missing and unreadable directories are ignored. On Unix, a match must resolve to a regular file with at least one execute bit; on Windows, its final extension must appear in `PATHEXT`, whose default is `.COM;.EXE;.BAT;.CMD` when unset.
+
+No match contributes no prompt content. The plugin never invokes a detected program and registers no protocol, command, panel, status provider, key binding, or configuration. Changes to installed binaries or `PATH` take effect only in a new session; resumed sessions reuse their frozen prompt.
+
 ## Managed tasks
 
 Execution is asynchronous by default. An accepted request normally returns before the operation is complete:

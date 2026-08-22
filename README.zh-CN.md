@@ -52,6 +52,8 @@ uri-agent --cwd /path/to/project
 
 如果项目根目录存在 `AGENTS.md`，URI Agent 会在每个新会话的系统提示词中包含其指令。恢复已有会话时，仍使用该会话创建时固化的副本。
 
+新会话还会扫描一次 `PATH`，并告知模型当前有哪些受支持的现代命令行工具。恢复已有会话时，仍使用最初固化的提示。
+
 URI Agent 不会自动选择默认模型。在 TUI 中：
 
 1. 运行 `:login` 保存 API key 或完成受支持的 OAuth 登录。
