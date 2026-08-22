@@ -1,4 +1,4 @@
-use super::wrapped_index;
+use super::{fuzzy_score, wrapped_index};
 use crate::catalog::{CatalogModel, ModelCatalog};
 use crate::config::ActiveSettings;
 
@@ -197,30 +197,6 @@ pub(super) fn reasoning(model: &CatalogModel) -> bool {
         .get("reasoning")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
-}
-
-fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    if haystack == query {
-        return Some(0);
-    }
-    if haystack.starts_with(query) {
-        return Some(1);
-    }
-    if let Some(position) = haystack.find(query) {
-        return Some(position + 2);
-    }
-    let mut cursor = 0;
-    let mut score = 100;
-    for needle in query.chars() {
-        let suffix = haystack.get(cursor..)?;
-        let position = suffix.find(needle)?;
-        score += position;
-        cursor += position + needle.len_utf8();
-    }
-    Some(score)
 }
 
 #[cfg(test)]

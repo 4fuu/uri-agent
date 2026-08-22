@@ -4,7 +4,7 @@ URI Agent presents one conversation surface with floating controls for compositi
 
 ## Startup and conversation surface
 
-Startup may show a short animated splash before the conversation. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model with its thinking effort below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
+Startup may show a short animated splash before the first conversation. Session switches keep the terminal interface active; `:new` opens a fresh welcome view directly instead of replaying the splash. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model with its thinking effort below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
 
 After the first record appears, the transcript uses the available content area and a minimal, low-contrast footer stays on the bottom row. It keeps the active model and effort at the left edge and the animated context meter plus `percentage/context-window-size` at the right edge. Activity such as thinking or tool execution appears immediately above the footer. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
 
@@ -23,7 +23,7 @@ Press `i` to open the rounded, bottom-anchored composer. An empty composer shows
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 
-Press `:` from the conversation to open the command panel. Type to filter registered command names and aliases, use `Tab` or `Shift+Tab` to complete and cycle matching commands, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command; completing an alias inserts its canonical command name. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
+Press `:` from the conversation to open the command panel. Type to fuzzy-filter registered command names, aliases, and descriptions; use `Tab` or `Shift+Tab` to complete and cycle matching commands, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command; description matches keep the canonical name, and completing any match inserts its canonical command name. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
 
 Core commands are registered through `CommandRegistry`:
 

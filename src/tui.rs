@@ -435,6 +435,7 @@ impl App {
         info: TuiInfo,
         keymap: Keymap,
         draft: String,
+        show_splash: bool,
     ) -> Self {
         let mut input = TextArea::default();
         if !draft.is_empty() {
@@ -463,7 +464,7 @@ impl App {
             transcript_follow_tail: true,
             transcript_center_selected: false,
             started: Instant::now(),
-            splash_skipped: false,
+            splash_skipped: !show_splash,
             last_sequence: None,
             applying_transient: false,
             reasoning_folded_during_stream: false,
@@ -1183,46 +1184,71 @@ pub struct TuiServices {
     pub draft: String,
 }
 
-pub async fn run(services: TuiServices) -> Result<TuiOutcome> {
-    let TuiServices {
-        runtime,
-        protocols,
-        commands,
-        tui,
-        tasks,
-        manager,
-        catalog,
-        output,
-        mut info,
-        draft,
-    } = services;
-    info.thinking = effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
-    let session = runtime.session().clone();
-    let mut receiver = session.subscribe();
-    let keymap = Keymap::load(Some(&info.cwd)).await?;
-    let mut app = App::new(protocols, commands, tui, info, keymap, draft);
-    for event in session.snapshot().await {
-        app.apply(event);
-    }
-    app.finish_hydration();
-    if runtime.turn_running().await {
-        app.busy = true;
-        app.busy_since = Some(Instant::now());
-        app.activity = Some(Activity::Thinking);
-        style_input(&mut app.input, true);
+pub struct TuiTerminal {
+    terminal: DefaultTerminal,
+    first_session: bool,
+}
+
+impl TuiTerminal {
+    pub fn new() -> Result<Self> {
+        let terminal = ratatui::try_init()?;
+        if let Err(error) = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste) {
+            ratatui::restore();
+            return Err(error.into());
+        }
+        Ok(Self {
+            terminal,
+            first_session: true,
+        })
     }
 
-    let mut terminal = ratatui::try_init()?;
-    let _restore = RestoreTerminal;
-    execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    let services = LoopServices {
-        runtime,
-        tasks,
-        manager,
-        catalog,
-        output,
-    };
-    run_loop(&mut terminal, &mut app, services, &mut receiver).await
+    pub async fn run(&mut self, services: TuiServices) -> Result<TuiOutcome> {
+        let TuiServices {
+            runtime,
+            protocols,
+            commands,
+            tui,
+            tasks,
+            manager,
+            catalog,
+            output,
+            mut info,
+            draft,
+        } = services;
+        info.thinking =
+            effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
+        let session = runtime.session().clone();
+        let mut receiver = session.subscribe();
+        let keymap = Keymap::load(Some(&info.cwd)).await?;
+        let show_splash = std::mem::take(&mut self.first_session);
+        let mut app = App::new(protocols, commands, tui, info, keymap, draft, show_splash);
+        for event in session.snapshot().await {
+            app.apply(event);
+        }
+        app.finish_hydration();
+        if runtime.turn_running().await {
+            app.busy = true;
+            app.busy_since = Some(Instant::now());
+            app.activity = Some(Activity::Thinking);
+            style_input(&mut app.input, true);
+        }
+
+        let services = LoopServices {
+            runtime,
+            tasks,
+            manager,
+            catalog,
+            output,
+        };
+        run_loop(&mut self.terminal, &mut app, services, &mut receiver).await
+    }
+}
+
+impl Drop for TuiTerminal {
+    fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+        ratatui::restore();
+    }
 }
 
 struct LoopServices {
@@ -4177,10 +4203,7 @@ fn common_command_prefix(names: &[String]) -> String {
 }
 
 fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<CommandMatch> {
-    let query = query
-        .trim()
-        .trim_start_matches([':', '：'])
-        .to_ascii_lowercase();
+    let query = query.trim().trim_start_matches([':', '：']).to_lowercase();
     if query.is_empty() {
         return commands
             .list()
@@ -4196,28 +4219,52 @@ fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<CommandMatc
         .list()
         .into_iter()
         .filter_map(|spec| {
-            let (score, _, name) = std::iter::once(&spec.id)
+            let name_match = std::iter::once(&spec.id)
                 .chain(spec.aliases.iter())
                 .enumerate()
                 .filter_map(|(index, name)| {
-                    command_name_score(name, &query).map(|score| (score, index, name.clone()))
+                    fuzzy_score(&name.to_lowercase(), &query)
+                        .map(|score| (score, 0, index, name.clone()))
                 })
-                .min_by_key(|(score, index, _)| (*score, *index))?;
-            Some((score, spec.id.clone(), CommandMatch { spec, name }))
+                .min_by_key(|(score, source, index, _)| (*score, *source, *index));
+            let description_match = fuzzy_score(&spec.description.to_lowercase(), &query)
+                .map(|score| (score, 1, usize::MAX, spec.id.clone()));
+            let (score, source, _, name) = name_match
+                .into_iter()
+                .chain(description_match)
+                .min_by_key(|(score, source, index, _)| (*score, *source, *index))?;
+            Some((score, source, spec.id.clone(), CommandMatch { spec, name }))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    matches.into_iter().map(|(_, _, command)| command).collect()
+    matches.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    matches
+        .into_iter()
+        .map(|(_, _, _, command)| command)
+        .collect()
 }
 
-fn command_name_score(name: &str, query: &str) -> Option<usize> {
-    let name = name.to_ascii_lowercase();
-    if name == query {
+fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
+    if query.is_empty() || haystack == query {
         Some(0)
-    } else if name.starts_with(query) {
+    } else if haystack.starts_with(query) {
         Some(1)
+    } else if let Some(position) = haystack.find(query) {
+        Some(position + 2)
     } else {
-        name.find(query).map(|position| position + 2)
+        let mut cursor = 0;
+        let mut score = 100;
+        for needle in query.chars() {
+            let suffix = haystack.get(cursor..)?;
+            let position = suffix.find(needle)?;
+            score += position;
+            cursor += position + needle.len_utf8();
+        }
+        Some(score)
     }
 }
 
@@ -5272,15 +5319,6 @@ fn single_line_preview(text: &str, limit: usize) -> String {
     }
 }
 
-struct RestoreTerminal;
-
-impl Drop for RestoreTerminal {
-    fn drop(&mut self) {
-        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
-        ratatui::restore();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5289,7 +5327,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
 
-    fn test_app() -> App {
+    fn test_app_with_splash(show_splash: bool) -> App {
         App::new(
             Vec::new(),
             Arc::new(CommandRegistry::with_core_commands()),
@@ -5308,7 +5346,12 @@ mod tests {
             },
             Keymap::with_defaults().unwrap(),
             String::new(),
+            show_splash,
         )
+    }
+
+    fn test_app() -> App {
+        test_app_with_splash(true)
     }
 
     fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
@@ -6191,6 +6234,26 @@ mod tests {
     }
 
     #[test]
+    fn switched_session_opens_the_welcome_view_without_another_splash() {
+        let mut app = test_app_with_splash(false);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("/workspace"));
+        assert!(rendered.contains("test / model · effort off"));
+        assert!(!rendered.contains("press any key"));
+    }
+
+    #[test]
     fn composer_enter_sends_shift_enter_breaks_and_esc_keeps_draft() {
         let mut app = test_app();
         app.overlay = Some(Overlay::Composer);
@@ -6773,6 +6836,21 @@ mod tests {
         );
         assert!(rendered.contains("⌕ t█"));
         assert!(rendered.contains(":thinking"));
+    }
+
+    #[test]
+    fn command_panel_searches_descriptions_and_fuzzy_command_names() {
+        let commands = CommandRegistry::with_core_commands();
+
+        let description_matches = matching_commands(&commands, "asynchronous protocol");
+        assert_eq!(description_matches[0].spec.id, "tasks");
+        assert_eq!(description_matches[0].name, "tasks");
+
+        let fuzzy_description_matches = matching_commands(&commands, "asynprot");
+        assert_eq!(fuzzy_description_matches[0].spec.id, "tasks");
+
+        let fuzzy_matches = matching_commands(&commands, "sttus");
+        assert_eq!(fuzzy_matches[0].spec.id, "status");
     }
 
     #[test]

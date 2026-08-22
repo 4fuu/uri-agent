@@ -13,7 +13,7 @@ use uri_agent::runtime::{AgentRuntime, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice, SessionContext};
 use uri_agent::skill::SkillProtocol;
 use uri_agent::task::TaskManager;
-use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices};
+use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
 
 struct SessionRuntime {
     runtime: Arc<AgentRuntime>,
@@ -27,6 +27,7 @@ struct SessionRuntime {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut config = Config::load(Cli::parse()).await?;
+    let mut terminal = TuiTerminal::new()?;
     let mut detached_runtimes: Vec<SessionRuntime> = Vec::new();
     loop {
         let retained = match &config.session {
@@ -37,8 +38,8 @@ async fn main() -> Result<()> {
             SessionChoice::New | SessionChoice::Latest => None,
         };
         let result = match retained {
-            Some(session) => run_retained_session(&config, session).await,
-            None => run_session(&config).await,
+            Some(session) => run_retained_session(&config, session, &mut terminal).await,
+            None => run_session(&config, &mut terminal).await,
         };
         let (outcome, session_runtime) = match result {
             Ok(result) => result,
@@ -65,7 +66,10 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_session(config: &Config) -> Result<(TuiOutcome, SessionRuntime)> {
+async fn run_session(
+    config: &Config,
+    terminal: &mut TuiTerminal,
+) -> Result<(TuiOutcome, SessionRuntime)> {
     let initial = config.manager.current().await;
     let plugins = uri_agent::builtins::plugins(&config.cwd);
     let plugin_notices = plugins.startup_notices();
@@ -210,15 +214,24 @@ async fn run_session(config: &Config) -> Result<(TuiOutcome, SessionRuntime)> {
         tasks,
         output,
     };
-    show_session(config, session_runtime, active, context_window, model_ready).await
+    show_session(
+        config,
+        session_runtime,
+        active,
+        context_window,
+        model_ready,
+        terminal,
+    )
+    .await
 }
 
 async fn run_retained_session(
     config: &Config,
     session_runtime: SessionRuntime,
+    terminal: &mut TuiTerminal,
 ) -> Result<(TuiOutcome, SessionRuntime)> {
     let runtime = session_runtime.runtime.clone();
-    let result = run_retained_session_inner(config, session_runtime).await;
+    let result = run_retained_session_inner(config, session_runtime, terminal).await;
     if result.is_err() {
         runtime.shutdown().await;
     }
@@ -228,6 +241,7 @@ async fn run_retained_session(
 async fn run_retained_session_inner(
     config: &Config,
     session_runtime: SessionRuntime,
+    terminal: &mut TuiTerminal,
 ) -> Result<(TuiOutcome, SessionRuntime)> {
     let runtime = session_runtime.runtime.clone();
     let session = runtime.session();
@@ -261,7 +275,15 @@ async fn run_retained_session_inner(
     let context_window = limits.context_window;
     runtime.set_backend(backend, Some(limits)).await;
     session_runtime.output.set_limit(active.output_limit);
-    show_session(config, session_runtime, active, context_window, model_ready).await
+    show_session(
+        config,
+        session_runtime,
+        active,
+        context_window,
+        model_ready,
+        terminal,
+    )
+    .await
 }
 
 async fn show_session(
@@ -270,34 +292,36 @@ async fn show_session(
     active: uri_agent::config::ActiveSettings,
     context_window: usize,
     model_ready: bool,
+    terminal: &mut TuiTerminal,
 ) -> Result<(TuiOutcome, SessionRuntime)> {
     let runtime = session_runtime.runtime.clone();
     let draft = runtime.session().draft().await;
     let provider_count = config.catalog.providers().await.len();
-    let outcome = uri_agent::tui::run(TuiServices {
-        runtime: runtime.clone(),
-        protocols: session_runtime.protocols.clone(),
-        commands: session_runtime.commands.clone(),
-        tui: session_runtime.tui.clone(),
-        tasks: session_runtime.tasks.clone(),
-        manager: config.manager.clone(),
-        catalog: config.catalog.clone(),
-        output: session_runtime.output.clone(),
-        info: TuiInfo {
-            cwd: config.cwd.clone(),
-            provider: active.provider,
-            model: active.model,
-            thinking: active.thinking,
-            session_id: runtime.session().id().to_string(),
-            context_window,
-            model_ready,
-            provider_count,
-            context_tokens: runtime.estimated_context(),
-            terminal: active.terminal,
-        },
-        draft,
-    })
-    .await;
+    let outcome = terminal
+        .run(TuiServices {
+            runtime: runtime.clone(),
+            protocols: session_runtime.protocols.clone(),
+            commands: session_runtime.commands.clone(),
+            tui: session_runtime.tui.clone(),
+            tasks: session_runtime.tasks.clone(),
+            manager: config.manager.clone(),
+            catalog: config.catalog.clone(),
+            output: session_runtime.output.clone(),
+            info: TuiInfo {
+                cwd: config.cwd.clone(),
+                provider: active.provider,
+                model: active.model,
+                thinking: active.thinking,
+                session_id: runtime.session().id().to_string(),
+                context_window,
+                model_ready,
+                provider_count,
+                context_tokens: runtime.estimated_context(),
+                terminal: active.terminal,
+            },
+            draft,
+        })
+        .await;
     match outcome {
         Ok(outcome) => Ok((outcome, session_runtime)),
         Err(error) => {
