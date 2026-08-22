@@ -61,6 +61,7 @@ map("tasks", "x", "cancel");
 
 map("command", "enter", "confirm");
 map("command", "esc", "cancel");
+map("command", "backspace", "backspace");
 map("command", "up", "previous");
 map("command", "down", "next");
 
@@ -306,6 +307,10 @@ mod tests {
         assert_eq!(
             keymap.action("command", "enter").as_deref(),
             Some("confirm")
+        );
+        assert_eq!(
+            keymap.action("command", "backspace").as_deref(),
+            Some("backspace")
         );
         assert_eq!(keymap.action("command", "tab"), None);
         assert_eq!(keymap.action("global", "f3").as_deref(), Some("model"));

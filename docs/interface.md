@@ -23,7 +23,7 @@ Press `i` to open the floating composer:
 
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 
-Press `:` from the conversation to open the command panel. It is selection-only: use the arrow keys or mouse to choose a command, press `Enter` to run it, and press `Esc` to close it. Commands that need a value open a selector or a separate input float. The command panel does not accept text, and there is no secondary command syntax.
+Press `:` from the conversation to open the command panel. Type to filter, use the arrow keys or mouse to choose a command, press `Enter` to run the selected command, and press `Esc` to close it. Search text only filters the list and is never parsed as command arguments. Commands that need a value open a selector or a separate input float; there is no secondary command syntax.
 
 Core commands are registered through `CommandRegistry`:
 

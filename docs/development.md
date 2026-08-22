@@ -99,7 +99,7 @@ The user-visible lifecycle is in [Sessions and context](interface.md#sessions-an
 - The TUI is one conversation surface. Do not introduce Browse, Insert, or Detail modes, a slash-command syntax, or a second command path.
 - Startup may show the splash, then the conversation. Empty history keeps the centered animated brand, working directory, provider/model/effort or login prompt, and a local compose/command/help hint; nonempty history uses folded rows and one highlighted footer with expanded status available through `F4` or `:status`.
 - `i` opens the composer; `Enter` sends, `Shift+Enter` inserts a newline, and `Esc` preserves the draft.
-- `:` opens a selection-only command panel from the conversation. Commands needing a choice or text open a selector or input float.
+- `:` opens a searchable command panel from the conversation. Its input only filters the list; commands needing a choice or text open a selector or input float instead of parsing search text.
 - History rows stay folded until opened. Click or `Enter` toggles a row, and `r`, `t`, and `h` filter or jump among reasoning, tool, and user rows.
 - Arrow keys and mouse input are first-class. `j` and `k` may remain aliases, but defaults and help must not require Vim knowledge.
 - Route configurable keys through the layered Rhai keymap.

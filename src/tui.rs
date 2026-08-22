@@ -9,8 +9,8 @@ use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
-    CommandRegistry, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext, TuiRegistry,
-    TuiStatusContext, TuiStatusItem, TuiStatusTone,
+    CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext,
+    TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
 };
 use crate::protocol::ProtocolDescriptor;
 use crate::runtime::AgentRuntime;
@@ -351,6 +351,7 @@ struct App {
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
     keymap: Keymap,
+    command_query: String,
     command_selected: usize,
     selector: Option<SelectorState>,
     text_prompt: Option<TextPrompt>,
@@ -408,6 +409,7 @@ impl App {
             catalog_refreshing: false,
             settings: None,
             keymap,
+            command_query: String::new(),
             command_selected: 0,
             selector: None,
             text_prompt: None,
@@ -746,8 +748,24 @@ impl App {
         }
     }
 
-    fn reset_command_selection(&mut self) {
+    fn reset_command_search(&mut self) {
+        self.command_query.clear();
         self.command_selected = 0;
+    }
+
+    fn filtered_commands(&self) -> Vec<CommandSpec> {
+        let query = self.command_query.trim().to_ascii_lowercase();
+        self.commands
+            .list()
+            .into_iter()
+            .filter(|command| {
+                query.is_empty()
+                    || command.id.contains(&query)
+                    || command.title.to_ascii_lowercase().contains(&query)
+                    || command.description.to_ascii_lowercase().contains(&query)
+                    || command.aliases.iter().any(|alias| alias.contains(&query))
+            })
+            .collect()
     }
 
     fn close_floats(&mut self) {
@@ -1093,7 +1111,10 @@ fn handle_paste(app: &mut App, text: String) {
                 selector.paste(text.trim());
             }
         }
-        Some(Overlay::Command) => {}
+        Some(Overlay::Command) => {
+            app.command_query.push_str(text.trim());
+            app.command_selected = 0;
+        }
         Some(Overlay::Selector) => {
             if let Some(selector) = app.selector.as_mut() {
                 selector.query.push_str(text.trim());
@@ -1260,7 +1281,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
             Action::Continue
         }
         Some("command") => {
-            app.reset_command_selection();
+            app.reset_command_search();
             app.overlay = Some(Overlay::Command);
             Action::Continue
         }
@@ -1351,7 +1372,7 @@ async fn handle_overlay_key(
                 Action::Continue
             }
         },
-        Overlay::Command => match apply_command_key(app, key_name) {
+        Overlay::Command => match apply_command_key(app, key, key_name) {
             CommandKey::Quit => Action::Quit,
             CommandKey::Confirm => confirm_command(app, services).await,
             CommandKey::Continue => Action::Continue,
@@ -1511,7 +1532,7 @@ async fn handle_overlay_key(
 }
 
 async fn confirm_command(app: &mut App, services: &LoopServices) -> Action {
-    let commands = app.commands.list();
+    let commands = app.filtered_commands();
     app.overlay = None;
     if let Some(command) = commands.get(app.command_selected).cloned() {
         return dispatch_ui_command(app, command.target, services).await;
@@ -1525,12 +1546,17 @@ enum CommandKey {
     Quit,
 }
 
-fn apply_command_key(app: &mut App, key_name: &str) -> CommandKey {
+fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) -> CommandKey {
     match app.keymap.action("command", key_name).as_deref() {
         Some("quit") => CommandKey::Quit,
         Some("cancel") => {
-            app.reset_command_selection();
+            app.reset_command_search();
             app.overlay = None;
+            CommandKey::Continue
+        }
+        Some("backspace") => {
+            app.command_query.pop();
+            app.command_selected = 0;
             CommandKey::Continue
         }
         Some("previous") => {
@@ -1538,14 +1564,24 @@ fn apply_command_key(app: &mut App, key_name: &str) -> CommandKey {
             CommandKey::Continue
         }
         Some("next") => {
-            let count = app.commands.list().len();
+            let count = app.filtered_commands().len();
             if count > 0 {
                 app.command_selected = (app.command_selected + 1).min(count - 1);
             }
             CommandKey::Continue
         }
         Some("confirm") => CommandKey::Confirm,
-        _ => CommandKey::Continue,
+        _ => {
+            if let KeyCode::Char(character) = key.code
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            {
+                app.command_query.push(character);
+                app.command_selected = 0;
+            }
+            CommandKey::Continue
+        }
     }
 }
 
@@ -1830,7 +1866,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         },
         MouseEventKind::ScrollDown => match app.overlay {
             Some(Overlay::Command) => {
-                let count = app.commands.list().len();
+                let count = app.filtered_commands().len();
                 if count > 0 {
                     app.command_selected = (app.command_selected + 1).min(count - 1);
                 }
@@ -3541,8 +3577,19 @@ fn status_row(
 
 fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    frame.render_widget(block.title(" COMMAND · Enter run · Esc close "), area);
-    let commands = app.commands.list();
+    frame.render_widget(
+        block.title(" COMMAND · type to filter · Enter run · Esc close "),
+        area,
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!("⌕ {}█", app.command_query)).style(Style::default().fg(TEXT)),
+        sections[0],
+    );
+    let commands = app.filtered_commands();
     let items = commands.iter().enumerate().map(|(index, item)| {
         let selected = index == app.command_selected;
         ListItem::new(Line::from(vec![
@@ -3565,14 +3612,16 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
         .style(Style::default().bg(if selected { BG } else { SURFACE }))
     });
     let mut state = ListState::default().with_selected(Some(app.command_selected));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
     for index in state.offset()..commands.len() {
-        let y = inner.y.saturating_add((index - state.offset()) as u16);
-        if y >= inner.bottom() {
+        let y = sections[1]
+            .y
+            .saturating_add((index - state.offset()) as u16);
+        if y >= sections[1].bottom() {
             break;
         }
         app.hit_regions.push(HitRegion {
-            area: Rect::new(inner.x, y, inner.width, 1),
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
             target: AppHit::Palette(index),
         });
     }
@@ -4620,22 +4669,44 @@ mod tests {
     }
 
     #[test]
-    fn command_panel_is_selection_only() {
+    fn command_panel_input_filters_the_selection() {
         let mut app = test_app();
         app.overlay = Some(Overlay::Command);
         app.command_selected = 2;
-        handle_paste(&mut app, "effort high".to_string());
-        assert_eq!(app.command_selected, 2);
         assert!(matches!(
-            apply_command_key(&mut app, "e"),
+            apply_command_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                "e"
+            ),
             CommandKey::Continue
         ));
-        assert_eq!(app.command_selected, 2);
+        handle_paste(&mut app, "ffort".to_string());
+        assert_eq!(app.command_query, "effort");
+        assert_eq!(app.command_selected, 0);
+        let commands = app.filtered_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "effort");
+
+        assert!(matches!(
+            apply_command_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                "backspace"
+            ),
+            CommandKey::Continue
+        ));
+        assert_eq!(app.command_query, "effor");
+
+        app.command_query.push_str("t high");
+        assert!(app.filtered_commands().is_empty());
+        app.command_query.truncate("effort".len());
         let rendered = render_to_string(&mut app, 100, 32);
-        assert!(rendered.contains("COMMAND · Enter run · Esc close"));
+        assert!(rendered.contains("COMMAND · type to filter · Enter run · Esc close"));
+        assert!(rendered.contains("⌕ effort█"));
+        assert!(rendered.contains(":effort"));
+        assert!(!rendered.contains(":terminal"));
         assert!(!rendered.contains("Tab complete"));
-        assert!(!rendered.contains("effort high"));
-        assert!(!rendered.contains('█'));
     }
 
     #[test]
