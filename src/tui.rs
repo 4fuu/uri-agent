@@ -3894,7 +3894,12 @@ fn transcript_block_items(
             ));
             if block.expanded {
                 let (lines, extra) =
-                    visible_block_lines(&block.text, process_width, EXPANDED_PREVIEW_LINES);
+                    visible_block_lines(&block.text, process_width, EXPANDED_PREVIEW_LINES, live);
+                if live && extra > 0 {
+                    rows.push(transcript_hint(
+                        extra, "earlier", true, &open_key, background,
+                    ));
+                }
                 for line in lines {
                     rows.push(transcript_item(
                         vec![
@@ -3907,8 +3912,8 @@ fn transcript_block_items(
                         background,
                     ));
                 }
-                if extra > 0 {
-                    rows.push(transcript_hint(extra, true, &open_key, background));
+                if !live && extra > 0 {
+                    rows.push(transcript_hint(extra, "more", true, &open_key, background));
                 }
             }
         }
@@ -3959,7 +3964,7 @@ fn transcript_block_items(
                     ));
                 }
                 if extra > 0 {
-                    rows.push(transcript_hint(extra, true, &open_key, background));
+                    rows.push(transcript_hint(extra, "more", true, &open_key, background));
                 }
             }
         }
@@ -3981,7 +3986,7 @@ fn transcript_block_items(
             } else {
                 1
             };
-            let (lines, extra) = visible_block_lines(&block.text, process_width, limit);
+            let (lines, extra) = visible_block_lines(&block.text, process_width, limit, false);
             for (index, line) in lines.into_iter().enumerate() {
                 rows.push(transcript_item(
                     vec![
@@ -4004,6 +4009,7 @@ fn transcript_block_items(
             if extra > 0 {
                 rows.push(transcript_hint(
                     extra,
+                    "more",
                     block.expanded,
                     &open_key,
                     background,
@@ -4021,6 +4027,7 @@ fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'st
 
 fn transcript_hint(
     extra: usize,
+    position: &str,
     expanded: bool,
     open_key: &str,
     background: Color,
@@ -4030,7 +4037,7 @@ fn transcript_hint(
             Span::raw("  "),
             Span::styled(
                 format!(
-                    "… {extra} more lines · {}",
+                    "… {extra} {position} lines · {}",
                     if expanded {
                         format!("{open_key} or right-click opens full")
                     } else {
@@ -4044,10 +4051,19 @@ fn transcript_hint(
     )
 }
 
-fn visible_block_lines(text: &str, width: usize, limit: usize) -> (Vec<String>, usize) {
+fn visible_block_lines(
+    text: &str,
+    width: usize,
+    limit: usize,
+    from_tail: bool,
+) -> (Vec<String>, usize) {
     let mut wrapped = wrapped_block_lines(text, width);
     let extra = wrapped.len().saturating_sub(limit);
-    wrapped.truncate(limit);
+    if from_tail {
+        wrapped = wrapped.split_off(extra);
+    } else {
+        wrapped.truncate(limit);
+    }
     (wrapped, extra)
 }
 
@@ -6319,6 +6335,50 @@ mod tests {
             Some((10, 13))
         );
         assert_eq!(scroll, (0, 2));
+    }
+
+    #[test]
+    fn live_reasoning_preview_follows_its_tail() {
+        let mut app = test_app();
+        app.apply(SessionEvent {
+            sequence: 0,
+            at: chrono::Utc::now(),
+            kind: EventKind::User {
+                text: "question".into(),
+            },
+        });
+        let reasoning = (0..30)
+            .map(|index| format!("thought-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.apply_transient(EventKind::AssistantReasoning { text: reasoning });
+
+        let rendered = render_to_string(&mut app, 100, 40);
+        assert!(rendered.contains("Thinking…"));
+        assert!(rendered.contains("… 6 earlier lines"));
+        assert!(!rendered.contains("thought-05"));
+        assert!(rendered.contains("thought-06"));
+        assert!(rendered.contains("thought-29"));
+
+        app.apply_transient(EventKind::AssistantReasoning {
+            text: "\nthought-30".into(),
+        });
+        let rendered = render_to_string(&mut app, 100, 40);
+        assert!(rendered.contains("… 7 earlier lines"));
+        assert!(!rendered.contains("thought-06"));
+        assert!(rendered.contains("thought-07"));
+        assert!(rendered.contains("thought-30"));
+
+        app.apply_transient(EventKind::AssistantText {
+            text: "answer".into(),
+        });
+        app.selected_block = 1;
+        app.toggle_selected();
+        let rendered = render_to_string(&mut app, 100, 40);
+        assert!(rendered.contains("Thought"));
+        assert!(rendered.contains("thought-00"));
+        assert!(rendered.contains("… 7 more lines"));
+        assert!(!rendered.contains("thought-30"));
     }
 
     #[test]
