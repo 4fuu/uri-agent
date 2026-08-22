@@ -208,6 +208,10 @@ impl WasmPluginManager {
     }
 
     pub async fn reload(&self) -> Result<ReloadReport> {
+        self.reload_from(&self.directory).await
+    }
+
+    async fn reload_from(&self, directory: &Path) -> Result<ReloadReport> {
         let _guard = self.reload_lock.lock().await;
         let reserved = self
             .reserved_protocols
@@ -215,7 +219,7 @@ impl WasmPluginManager {
             .map_err(|_| anyhow!("WASM plugin reserved protocol lock is poisoned"))?
             .clone();
         let (next, report) = load_plugin_set(
-            &self.directory,
+            directory,
             &self.working_directory,
             &reserved,
             self.bridge.clone(),
@@ -553,8 +557,8 @@ fn build_runtime(
     #[cfg(not(unix))]
     {
         manifest = manifest
-            .with_allowed_path(working_directory.display().to_string(), "/workspace")
-            .with_allowed_path(plugin_directory.display().to_string(), "/plugins");
+            .with_allowed_path(display_path(working_directory), "/workspace")
+            .with_allowed_path(display_path(plugin_directory), "/plugins");
     }
     #[cfg(unix)]
     let _ = (working_directory, plugin_directory);
@@ -645,6 +649,8 @@ async fn set_private_permissions(directory: &Path) -> Result<()> {
             .await
             .with_context(|| format!("cannot secure {}", directory.display()))?;
     }
+    #[cfg(not(unix))]
+    let _ = directory;
     Ok(())
 }
 
@@ -956,11 +962,13 @@ mod tests {
         .await
         .unwrap();
         manager.reload().await.unwrap();
-        tokio::fs::remove_dir_all(manager.directory())
-            .await
-            .unwrap();
+        let missing = manager
+            .directory()
+            .parent()
+            .expect("plugin directory has a parent")
+            .join("missing-wasm-plugins");
 
-        assert!(manager.reload().await.is_err());
+        assert!(manager.reload_from(&missing).await.is_err());
         assert!(registry.read("stable://value", None).await.is_ok());
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }

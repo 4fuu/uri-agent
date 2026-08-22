@@ -1,10 +1,16 @@
 //! Rust guest types and host calls for URI Agent WebAssembly protocol plugins.
+//!
+//! ABI types and constants are available on every target so the host can share
+//! the wire format. Extism guest exports and host-call wrappers compile only
+//! for WebAssembly guests.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(target_family = "wasm")]
 #[doc(hidden)]
 pub use extism_pdk;
+#[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
 pub const ABI_VERSION: u32 = 1;
@@ -77,12 +83,14 @@ pub struct HandlerRequest {
 /// Result returned by a plugin request handler.
 pub type HandlerResult = Result<Vec<u8>, String>;
 
+#[cfg(target_family = "wasm")]
 #[derive(Serialize)]
 struct HostRequest<'a> {
     uri: &'a str,
     body: Option<&'a Value>,
 }
 
+#[cfg(target_family = "wasm")]
 mod host {
     use extism_pdk::*;
 
@@ -94,15 +102,18 @@ mod host {
 }
 
 /// Read through one of URI Agent's built-in protocols.
+#[cfg(target_family = "wasm")]
 pub fn read(uri: &str, body: Option<&Value>) -> Result<String, Error> {
     call_host(uri, body, host::uri_agent_read)
 }
 
 /// Execute through one of URI Agent's built-in protocols.
+#[cfg(target_family = "wasm")]
 pub fn exec(uri: &str, body: Option<&Value>) -> Result<String, Error> {
     call_host(uri, body, host::uri_agent_exec)
 }
 
+#[cfg(target_family = "wasm")]
 fn call_host(
     uri: &str,
     body: Option<&Value>,
@@ -113,21 +124,34 @@ fn call_host(
 }
 
 /// Export the URI Agent plugin ABI for a manifest expression and request handler.
+///
+/// Guest exports require a WebAssembly target. Native checks keep the manifest
+/// and handler referenced so workspace clippy can type-check plugin crates.
 #[macro_export]
 macro_rules! define_plugin {
     ($manifest:expr, $handler:path) => {
+        #[cfg(target_family = "wasm")]
         use $crate::extism_pdk;
 
+        #[cfg(target_family = "wasm")]
         #[$crate::plugin_fn]
         pub fn uri_agent_manifest() -> $crate::FnResult<$crate::Json<$crate::PluginManifest>> {
             Ok($crate::Json($manifest))
         }
 
+        #[cfg(target_family = "wasm")]
         #[$crate::plugin_fn]
         pub fn uri_agent_handle(
             request: $crate::Json<$crate::HandlerRequest>,
         ) -> $crate::FnResult<Vec<u8>> {
             Ok($handler(request.0).map_err($crate::Error::msg)?)
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        #[allow(dead_code)]
+        fn _uri_agent_define_plugin_native_ref() {
+            let _: $crate::PluginManifest = $manifest;
+            let _: fn($crate::HandlerRequest) -> $crate::HandlerResult = $handler;
         }
     };
 }

@@ -1,5 +1,6 @@
 use crate::catalog::ModelLimits;
 use crate::compaction;
+use crate::config::{display_path, path_is_within};
 use crate::model::{ModelBackend, ModelDelta, ModelRequest, ModelResponse};
 use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
@@ -591,12 +592,10 @@ fn is_context_overflow(error: &anyhow::Error) -> bool {
 }
 
 async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>> {
-    let arguments = shell_words::split(prompt).unwrap_or_else(|_| {
-        prompt
-            .split_whitespace()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    });
+    let arguments = prompt_arguments(prompt);
+    let root = tokio::fs::canonicalize(cwd)
+        .await
+        .with_context(|| format!("cannot resolve project directory {}", display_path(cwd)))?;
     let mut images = Vec::new();
     for argument in arguments {
         let Some(path) = argument.strip_prefix('@').filter(|path| !path.is_empty()) else {
@@ -606,7 +605,7 @@ async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>>
         let path = if path.is_absolute() {
             path
         } else {
-            cwd.join(path)
+            root.join(path)
         };
         let extension = path
             .extension()
@@ -618,18 +617,21 @@ async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>>
         }
         let canonical = tokio::fs::canonicalize(&path)
             .await
-            .with_context(|| format!("cannot attach image {}", path.display()))?;
-        if !canonical.starts_with(cwd) {
+            .with_context(|| format!("cannot attach image {}", display_path(&path)))?;
+        if !path_is_within(&canonical, &root) {
             bail!(
                 "image attachment is outside the project boundary: {}",
-                canonical.display()
+                display_path(&canonical)
             );
         }
         let bytes = tokio::fs::read(&canonical)
             .await
-            .with_context(|| format!("cannot read image {}", canonical.display()))?;
+            .with_context(|| format!("cannot read image {}", display_path(&canonical)))?;
         let media_type = detect_image_type(&bytes).with_context(|| {
-            format!("unsupported or invalid image file: {}", canonical.display())
+            format!(
+                "unsupported or invalid image file: {}",
+                display_path(&canonical)
+            )
         })?;
         images.push(UserContent::image_base64(
             base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -638,6 +640,47 @@ async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>>
         ));
     }
     Ok(images)
+}
+
+fn prompt_arguments(prompt: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut chars = prompt.chars().peekable();
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        arguments.push(take_prompt_argument(&mut chars));
+    }
+    arguments
+}
+
+fn take_prompt_argument(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) -> String {
+    let mut argument = String::new();
+    if chars.peek() == Some(&'@') {
+        argument.push('@');
+        chars.next();
+    }
+    if let Some(&quote) = chars.peek().filter(|ch| **ch == '"' || **ch == '\'') {
+        chars.next();
+        for ch in chars.by_ref() {
+            if ch == quote {
+                break;
+            }
+            argument.push(ch);
+        }
+        return argument;
+    }
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            break;
+        }
+        argument.push(ch);
+        chars.next();
+    }
+    argument
 }
 
 fn detect_image_type(bytes: &[u8]) -> Option<ImageMediaType> {
@@ -811,6 +854,22 @@ mod tests {
         assert_eq!(call.id.as_str(), "call-1");
     }
 
+    #[test]
+    fn prompt_arguments_keep_windows_paths_and_quoted_names() {
+        assert_eq!(
+            prompt_arguments(r"inspect @C:\Users\4fu\screen.png"),
+            ["inspect", r"@C:\Users\4fu\screen.png"]
+        );
+        assert_eq!(
+            prompt_arguments(r#"inspect @"my shot.png""#),
+            ["inspect", "@my shot.png"]
+        );
+        assert_eq!(
+            prompt_arguments(r#"inspect "@my shot.png""#),
+            ["inspect", "@my shot.png"]
+        );
+    }
+
     #[tokio::test]
     async fn at_image_paths_become_binary_model_attachments() {
         let workspace = tempfile::tempdir().unwrap();
@@ -829,6 +888,11 @@ mod tests {
                     && matches!(&image.data, rig::message::DocumentSourceKind::Base64(data)
                         if base64::engine::general_purpose::STANDARD.decode(data).unwrap().starts_with(b"\x89PNG"))
         ));
+
+        let absolute = image_attachments(&format!("inspect @{}", path.display()), workspace.path())
+            .await
+            .unwrap();
+        assert_eq!(absolute.len(), 1);
     }
 
     #[tokio::test]

@@ -127,6 +127,14 @@ pub fn display_path(path: &Path) -> String {
         .unwrap_or_else(|| rest.to_string())
 }
 
+/// Compare containment after stripping Windows verbatim prefixes.
+///
+/// `canonicalize` on Windows yields `\\?\C:\...` while callers often still
+/// hold `C:\...`. Component `starts_with` rejects that pair without this step.
+pub fn path_is_within(path: &Path, root: &Path) -> bool {
+    Path::new(&display_path(path)).starts_with(Path::new(&display_path(root)))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueSource {
     Default,
@@ -923,6 +931,27 @@ mod tests {
             display_path(Path::new(r"\\?\UNC\server\share")),
             r"\\server\share"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_paths_compare_inside_their_root() {
+        assert!(path_is_within(
+            Path::new(r"\\?\C:\Users\4fu\project\screen.png"),
+            Path::new(r"C:\Users\4fu\project"),
+        ));
+        assert!(path_is_within(
+            Path::new(r"C:\Users\4fu\project\screen.png"),
+            Path::new(r"\\?\C:\Users\4fu\project"),
+        ));
+        assert!(!path_is_within(
+            Path::new(r"\\?\C:\Users\4fu\other\screen.png"),
+            Path::new(r"C:\Users\4fu\project"),
+        ));
+        assert!(!path_is_within(
+            Path::new(r"\\?\C:\Users\4fu\project-extra\screen.png"),
+            Path::new(r"C:\Users\4fu\project"),
+        ));
     }
 
     #[test]

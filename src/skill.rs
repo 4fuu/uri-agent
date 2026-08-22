@@ -1,3 +1,4 @@
+use crate::config::path_is_within;
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
@@ -116,7 +117,7 @@ impl Protocol for SkillProtocol {
                 root.join(relative).display()
             )
         })?;
-        if !candidate.starts_with(root) {
+        if !path_is_within(&candidate, root) {
             bail!("skill resource escapes its skill directory");
         }
         let metadata = fs::metadata(&candidate)?;
