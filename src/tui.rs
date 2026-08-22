@@ -48,6 +48,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const BG: Color = Color::Rgb(13, 15, 18);
 const SURFACE: Color = Color::Rgb(21, 24, 28);
 const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
+const USER_SURFACE: Color = Color::Rgb(17, 25, 24);
 const TEXT: Color = Color::Rgb(218, 223, 229);
 const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
@@ -391,6 +392,7 @@ struct App {
     hit_regions: Vec<HitRegion<AppHit>>,
     last_click: Option<(AppHit, Instant)>,
     overlay_bounds: Option<Rect>,
+    copy_click_release_pending: bool,
     selectable: Option<SelectableSurface>,
     selection: Option<TextSelection>,
     usage: UsageTotals,
@@ -460,6 +462,7 @@ impl App {
             hit_regions: Vec::new(),
             last_click: None,
             overlay_bounds: None,
+            copy_click_release_pending: false,
             selectable: None,
             selection: None,
             usage: UsageTotals::default(),
@@ -1216,7 +1219,9 @@ async fn run_loop(
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         app.confirm_pending_transcript_click();
-                        if app.pty.is_none() && is_ignored_tui_key(key) {
+                        if app.pty.is_none()
+                            && is_ignored_tui_key(key, app.selection.is_some())
+                        {
                             continue;
                         }
                         if app.showing_splash() {
@@ -2196,6 +2201,14 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         app.confirm_pending_transcript_click();
     }
+    if consume_copy_click_release(app, mouse) {
+        return Action::Continue;
+    }
+    if is_selection_copy_click(app, mouse) {
+        copy_current_surface(app);
+        app.copy_click_release_pending = true;
+        return Action::Continue;
+    }
     if close_document_on_outside_click(app, mouse) {
         return Action::Continue;
     }
@@ -2314,6 +2327,28 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         _ => {}
     }
     Action::Continue
+}
+
+fn is_selection_copy_click(app: &App, mouse: MouseEvent) -> bool {
+    app.selection.is_some() && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+}
+
+fn consume_copy_click_release(app: &mut App, mouse: MouseEvent) -> bool {
+    if !app.copy_click_release_pending {
+        return false;
+    }
+    match mouse.kind {
+        MouseEventKind::Up(_) => {
+            app.copy_click_release_pending = false;
+            true
+        }
+        MouseEventKind::Drag(_) => true,
+        MouseEventKind::Down(_) => {
+            app.copy_click_release_pending = false;
+            false
+        }
+        _ => false,
+    }
 }
 
 fn close_document_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
@@ -2568,6 +2603,14 @@ fn handle_terminal_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 }
 
 fn handle_terminal_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    if consume_copy_click_release(app, mouse) {
+        return Ok(());
+    }
+    if is_selection_copy_click(app, mouse) {
+        copy_current_surface(app);
+        app.copy_click_release_pending = true;
+        return Ok(());
+    }
     if update_mouse_selection(app, mouse, true) {
         return Ok(());
     }
@@ -2924,8 +2967,8 @@ async fn effective_thinking(
         .map_or(configured, |model| clamp_thinking_level(&model, configured))
 }
 
-fn is_ignored_tui_key(key: KeyEvent) -> bool {
-    key_name(key) == "ctrl+c"
+fn is_ignored_tui_key(key: KeyEvent, selection_active: bool) -> bool {
+    key_name(key) == "ctrl+c" && !selection_active
 }
 
 fn key_name(key: KeyEvent) -> String {
@@ -3550,7 +3593,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .fg(context_color(percent))
             .add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
+        area,
+    );
     app.hit_regions.push(HitRegion {
         area,
         target: AppHit::Status,
@@ -3632,7 +3678,7 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
     let message_width = area.width.saturating_sub(2).max(1) as usize;
-    let process_width = (area.width.saturating_sub(8) as usize).max(8);
+    let process_width = message_width.saturating_sub(2).max(1);
     app.transcript_body_width = process_width;
     let mut items = Vec::new();
     let mut block_for_row = Vec::new();
@@ -3716,12 +3762,12 @@ fn transcript_block_items(
     process_width: usize,
     app: &App,
 ) -> Vec<ListItem<'static>> {
-    let background = if selected && !matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
-        ROW_ACTIVE
-    } else {
-        BG
+    let background = match block.kind {
+        BlockKind::User => USER_SURFACE,
+        BlockKind::Assistant => BG,
+        _ if selected => ROW_ACTIVE,
+        _ => BG,
     };
-    let selection = if selected { "▌ " } else { "  " };
     let open_key = app
         .keymap
         .key_for("main", "open")
@@ -3746,7 +3792,6 @@ fn transcript_block_items(
         BlockKind::Reasoning => {
             rows.push(transcript_item(
                 vec![
-                    Span::styled(selection, Style::default().fg(ACCENT)),
                     Span::styled("◇ ", Style::default().fg(MUTED)),
                     Span::styled(
                         if live { "Thinking…" } else { "Thought" },
@@ -3771,7 +3816,6 @@ fn transcript_block_items(
                 for line in lines {
                     rows.push(transcript_item(
                         vec![
-                            Span::styled(selection, Style::default().fg(ACCENT)),
                             Span::raw("  "),
                             Span::styled(
                                 line,
@@ -3782,9 +3826,7 @@ fn transcript_block_items(
                     ));
                 }
                 if extra > 0 {
-                    rows.push(transcript_hint(
-                        selection, extra, true, &open_key, background,
-                    ));
+                    rows.push(transcript_hint(extra, true, &open_key, background));
                 }
             }
         }
@@ -3806,7 +3848,6 @@ fn transcript_block_items(
             };
             rows.push(transcript_item(
                 vec![
-                    Span::styled(selection, Style::default().fg(ACCENT)),
                     Span::styled(
                         format!("{status} "),
                         Style::default().fg(if block.failed { ERROR } else { WARM }),
@@ -3829,7 +3870,6 @@ fn transcript_block_items(
                 for (line, color) in lines {
                     rows.push(transcript_item(
                         vec![
-                            Span::styled(selection, Style::default().fg(ACCENT)),
                             Span::raw("  "),
                             Span::styled(line, Style::default().fg(color)),
                         ],
@@ -3837,9 +3877,7 @@ fn transcript_block_items(
                     ));
                 }
                 if extra > 0 {
-                    rows.push(transcript_hint(
-                        selection, extra, true, &open_key, background,
-                    ));
+                    rows.push(transcript_hint(extra, true, &open_key, background));
                 }
             }
         }
@@ -3865,7 +3903,6 @@ fn transcript_block_items(
             for (index, line) in lines.into_iter().enumerate() {
                 rows.push(transcript_item(
                     vec![
-                        Span::styled(selection, Style::default().fg(ACCENT)),
                         Span::styled(
                             if index == 0 {
                                 format!("{symbol} {}  ", block.title)
@@ -3884,7 +3921,6 @@ fn transcript_block_items(
             }
             if extra > 0 {
                 rows.push(transcript_hint(
-                    selection,
                     extra,
                     block.expanded,
                     &open_key,
@@ -3902,7 +3938,6 @@ fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'st
 }
 
 fn transcript_hint(
-    selection: &str,
     extra: usize,
     expanded: bool,
     open_key: &str,
@@ -3910,7 +3945,6 @@ fn transcript_hint(
 ) -> ListItem<'static> {
     transcript_item(
         vec![
-            Span::styled(selection.to_string(), Style::default().fg(ACCENT)),
             Span::raw("  "),
             Span::styled(
                 format!(
@@ -5420,11 +5454,11 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let model = &terminal.backend().buffer()[(0, 23)];
         let context = &terminal.backend().buffer()[(82, 23)];
-        assert_eq!((context.fg, context.bg), (ACCENT, BG));
+        assert_eq!((context.fg, context.bg), (ACCENT, SURFACE));
         assert!(context.modifier.contains(Modifier::BOLD));
-        assert_eq!((model.fg, model.bg), (TEXT, BG));
+        assert_eq!((model.fg, model.bg), (TEXT, SURFACE));
         assert!(model.modifier.contains(Modifier::BOLD));
-        assert_eq!(terminal.backend().buffer()[(99, 23)].bg, BG);
+        assert_eq!(terminal.backend().buffer()[(99, 23)].bg, SURFACE);
 
         let status_region = app
             .hit_regions
@@ -5463,6 +5497,7 @@ mod tests {
         let footer = &terminal.backend().buffer().content()[7 * 12..8 * 12];
         assert_eq!(footer.last().unwrap().symbol(), "…");
         assert_eq!(footer.last().unwrap().fg, ACCENT);
+        assert!(footer.iter().all(|cell| cell.bg == SURFACE));
         assert!(footer.iter().all(|cell| cell.fg != TEXT));
         assert_eq!(single_line_preview("模型 名称", 5), "模型…");
         assert_eq!(single_line_preview("model", 0), "");
@@ -5575,8 +5610,14 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(10, user_rows[0])].bg, BG);
-        assert_eq!(terminal.backend().buffer()[(98, user_rows[0])].bg, BG);
+        assert_eq!(
+            terminal.backend().buffer()[(10, user_rows[0])].bg,
+            USER_SURFACE
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(98, user_rows[0])].bg,
+            USER_SURFACE
+        );
         let assistant_row = app
             .hit_regions
             .iter()
@@ -5636,9 +5677,78 @@ mod tests {
         for (row, symbol) in [(user_row, "U"), (assistant_row, "A")] {
             assert_eq!(terminal.backend().buffer()[(1, row)].symbol(), symbol);
             assert_eq!(terminal.backend().buffer()[(38, row)].symbol(), symbol);
-            assert_eq!(terminal.backend().buffer()[(1, row)].bg, BG);
-            assert_eq!(terminal.backend().buffer()[(38, row)].bg, BG);
+            let background = if symbol == "U" { USER_SURFACE } else { BG };
+            assert_eq!(terminal.backend().buffer()[(1, row)].bg, background);
+            assert_eq!(terminal.backend().buffer()[(38, row)].bg, background);
         }
+    }
+
+    #[test]
+    fn reasoning_and_tool_content_aligns_to_both_transcript_edges() {
+        let mut app = test_app();
+        app.push(
+            BlockKind::Reasoning,
+            "THINKING",
+            "R".repeat(36),
+            None,
+            false,
+            true,
+        );
+        app.push(
+            BlockKind::Tool,
+            &"T".repeat(36),
+            "CALL\n{}\n\nRESULT\nsource".into(),
+            None,
+            false,
+            false,
+        );
+        app.selected_block = 0;
+        app.skip_splash();
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let reasoning_rows = app
+            .hit_regions
+            .iter()
+            .filter_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .collect::<Vec<_>>();
+        let tool_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer()[(1, reasoning_rows[0])].symbol(),
+            "◇"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(2, reasoning_rows[1])].symbol(),
+            " "
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(3, reasoning_rows[1])].symbol(),
+            "R"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(38, reasoning_rows[1])].symbol(),
+            "R"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(1, reasoning_rows[1])].bg,
+            ROW_ACTIVE
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(38, reasoning_rows[1])].bg,
+            ROW_ACTIVE
+        );
+        assert_eq!(terminal.backend().buffer()[(1, tool_row)].symbol(), "✓");
+        assert_eq!(terminal.backend().buffer()[(38, tool_row)].symbol(), "T");
+
+        app.selected_block = 1;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, tool_row)].bg, ROW_ACTIVE);
+        assert_eq!(terminal.backend().buffer()[(38, tool_row)].bg, ROW_ACTIVE);
     }
 
     #[test]
@@ -5682,8 +5792,32 @@ mod tests {
                 .is_some_and(|selection| selection.start != selection.end)
         );
         assert_eq!(app.selected_block, 0);
+        assert!(is_selection_copy_click(
+            &app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                ..up
+            }
+        ));
+        assert!(!is_selection_copy_click(
+            &app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                ..up
+            }
+        ));
+        app.copy_click_release_pending = true;
+        assert!(consume_copy_click_release(&mut app, up));
+        assert!(!app.copy_click_release_pending);
 
         app.selection = None;
+        assert!(!is_selection_copy_click(
+            &app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                ..up
+            }
+        ));
         assert!(begin_direct_transcript_selection(&mut app, down));
         assert!(update_mouse_selection(
             &mut app,
@@ -5983,19 +6117,30 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_is_ignored_without_hiding_the_copy_chord() {
+    fn ctrl_c_copies_a_selection_and_is_otherwise_ignored() {
         let app = test_app();
-        assert!(is_ignored_tui_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
-        assert!(!is_ignored_tui_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        )));
+        assert!(is_ignored_tui_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false
+        ));
+        assert!(!is_ignored_tui_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            true
+        ));
+        assert!(!is_ignored_tui_key(
+            KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            false
+        ));
         assert_eq!(app.keymap.action("main", "ctrl+c"), None);
         assert_eq!(app.keymap.action("composer", "ctrl+c"), None);
         assert_eq!(app.keymap.action("command", "ctrl+c"), None);
+        assert_eq!(
+            app.keymap.action("selection", "ctrl+c").as_deref(),
+            Some("copy")
+        );
     }
 
     #[test]
@@ -6952,6 +7097,10 @@ mod tests {
         assert_eq!(
             key_name(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             "shift+g"
+        );
+        assert_eq!(
+            key_name(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            "super+c"
         );
     }
 

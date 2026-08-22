@@ -15,6 +15,7 @@ map("global", "ctrl+,", "settings");
 map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");
 map("global", "ctrl+shift+c", "copy");
+map("global", "super+c", "copy");
 
 map("main", "i", "compose");
 map("main", ":", "command");
@@ -103,11 +104,14 @@ map("document", "pagedown", "page_down");
 map("document", "esc", "close");
 
 map("selection", "y", "copy");
+map("selection", "ctrl+c", "copy");
 map("selection", "ctrl+shift+c", "copy");
+map("selection", "super+c", "copy");
 map("selection", "esc", "close");
 
 map("terminal", "esc", "escape");
 map("terminal", "ctrl+shift+c", "copy");
+map("terminal", "super+c", "copy");
 "#;
 
 #[derive(Clone, Default)]
@@ -299,6 +303,15 @@ mod tests {
         assert_eq!(keymap.action("main", "ctrl+c"), None);
         assert_eq!(keymap.action("composer", "ctrl+c"), None);
         assert_eq!(
+            keymap.action("selection", "ctrl+c").as_deref(),
+            Some("copy")
+        );
+        assert_eq!(
+            keymap.action("selection", "super+c").as_deref(),
+            Some("copy")
+        );
+        assert_eq!(keymap.action("main", "super+c").as_deref(), Some("copy"));
+        assert_eq!(
             keymap.action("main", "r").as_deref(),
             Some("jump_reasoning")
         );
@@ -334,5 +347,9 @@ mod tests {
         assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("selector", "k"), None);
         assert_eq!(keymap.action("terminal", "esc").as_deref(), Some("escape"));
+        assert_eq!(
+            keymap.action("terminal", "super+c").as_deref(),
+            Some("copy")
+        );
     }
 }

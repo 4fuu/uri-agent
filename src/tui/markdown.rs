@@ -1,5 +1,5 @@
 use super::{ACCENT, MUTED, SURFACE, TEXT};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -133,7 +133,7 @@ impl Writer {
             Tag::Paragraph => self.start_block(),
             Tag::Heading { level, .. } => {
                 self.start_block();
-                let style = heading_style(level);
+                let style = heading_style();
                 self.push_style(style);
                 self.text(&format!("{} ", "#".repeat(level as usize)), style);
             }
@@ -558,13 +558,8 @@ impl Writer {
     }
 }
 
-fn heading_style(level: HeadingLevel) -> Style {
-    let color = if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-        ACCENT
-    } else {
-        TEXT
-    };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+fn heading_style() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 #[cfg(test)]
@@ -591,6 +586,22 @@ mod tests {
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
             span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
+    }
+
+    #[test]
+    fn highlights_every_heading_level() {
+        let lines = render(
+            "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six",
+            40,
+        );
+
+        for heading in ["One", "Two", "Three", "Four", "Five", "Six"] {
+            let line = lines
+                .iter()
+                .find(|line| line.to_string().contains(heading))
+                .unwrap();
+            assert!(line.spans.iter().all(|span| span.style.fg == Some(ACCENT)));
+        }
     }
 
     #[test]
