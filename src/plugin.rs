@@ -414,6 +414,11 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Notices contributed by this plugin for the current application startup.
+    fn startup_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Optional content appended to a new session's system prompt before it is
     /// frozen. A plugin may contribute prompt content without adding a protocol.
     fn system_prompt_fragment(&self) -> Result<Option<String>> {
@@ -454,6 +459,13 @@ impl PluginRegistry {
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(descriptors)
+    }
+
+    pub fn startup_notices(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .flat_map(|plugin| plugin.startup_notices())
+            .collect()
     }
 
     pub fn system_prompt_fragments(&self) -> Result<Vec<String>> {
@@ -665,6 +677,10 @@ mod tests {
     struct PromptOnlyPlugin;
 
     impl Plugin for PromptOnlyPlugin {
+        fn startup_notices(&self) -> Vec<String> {
+            vec!["plugin startup notice".to_string()]
+        }
+
         fn system_prompt_fragment(&self) -> Result<Option<String>> {
             Ok(Some("<prompt-only>content</prompt-only>".to_string()))
         }
@@ -712,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn plugins_can_contribute_system_prompt_content_without_protocols() {
+    fn plugins_can_contribute_startup_notices_and_prompt_content_without_protocols() {
         let mut plugins = PluginRegistry::new();
         plugins.add(PromptOnlyPlugin);
 
@@ -720,6 +736,10 @@ mod tests {
         assert_eq!(
             plugins.system_prompt_fragments().unwrap(),
             vec!["<prompt-only>content</prompt-only>".to_string()]
+        );
+        assert_eq!(
+            plugins.startup_notices(),
+            vec!["plugin startup notice".to_string()]
         );
     }
 

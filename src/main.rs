@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
 async fn run_session(config: &Config) -> Result<(TuiOutcome, SessionRuntime)> {
     let initial = config.manager.current().await;
     let plugins = uri_agent::builtins::plugins(&config.cwd);
+    let plugin_notices = plugins.startup_notices();
     let plugin_protocols = plugins.protocol_descriptors()?;
     let plugin_prompt_fragments = plugins.system_prompt_fragments()?;
     let mut protocol_names = plugin_protocols
@@ -135,6 +136,7 @@ async fn run_session(config: &Config) -> Result<(TuiOutcome, SessionRuntime)> {
     if !session.is_new() {
         notices.clear();
     }
+    notices.extend(plugin_notices);
     let tasks = TaskManager::new();
     let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());

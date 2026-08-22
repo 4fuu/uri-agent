@@ -18,9 +18,7 @@ pub fn plugins(cwd: &Path) -> PluginRegistry {
     plugins.add(file::FileProtocol::new(cwd));
     plugins.add(replace::ReplaceProtocol::new(cwd));
     plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
-    for shell in shell::discover_shells(cwd) {
-        plugins.add(shell);
-    }
+    shell::add_plugins(&mut plugins, cwd);
     plugins
 }
 

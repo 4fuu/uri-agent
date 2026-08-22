@@ -67,8 +67,11 @@ When setup is complete, the welcome view shows the selected provider, model, and
 ```text
 read("file://src/main.rs?offset=1&limit=200")
 read("code-review-skill://help")
-exec("bash://?wait=30", "cargo test")
+exec("bash://?wait=30", "cargo test")  # Unix-like systems
+exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
+
+Non-Windows platforms enable only Bash. On Windows, PowerShell 7 or newer enables `pwsh` and suppresses `bash`; if it is unavailable, URI Agent shows a warning and keeps Bash enabled when Bash is installed.
 
 URI Agent splits an address only at the first `://`; the selected protocol owns the remaining target. The registry passes the optional JSON `body` through unchanged. See [Protocols, tasks, Skills, and extensions](docs/protocols.md) for the complete design and built-in protocol inventory.
 

@@ -41,11 +41,15 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | `file` | `read` | Read files and bounded directory listings |
 | `replace` | `read`, `exec` | Atomically replace one exact text match |
 | `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
-| `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash exists |
-| `pwsh` | `read`, `exec` | Run PowerShell 7 commands as managed tasks when `pwsh` exists |
+| `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash is enabled |
+| `pwsh` | `read`, `exec` | Run PowerShell 7 commands as managed tasks when `pwsh` is enabled |
 | `<name>-skill` | `read` | Load one discovered Skill and its bundled files |
 
-`bash` and `pwsh` are detected at startup and registered only when the corresponding executable is available.
+Shell plugins detect their own executables at startup. On Windows, the `pwsh`
+plugin also verifies that PowerShell 7 or newer can start. A valid `pwsh`
+plugin suppresses `bash`; otherwise `pwsh` remains disabled, a startup warning
+is shown, and `bash` remains available when installed. On non-Windows
+platforms, only the `bash` plugin is considered; `pwsh` is not started.
 
 ### `file`
 
@@ -198,8 +202,8 @@ Resume reuses this snapshot instead of rediscovering current context. A same-nam
 
 First-party capabilities use the same plugin path exposed to linked Rust extensions:
 
-1. A [`Plugin`](../src/plugin.rs) may declare protocol descriptors and contribute an optional system prompt fragment before a new session's prompt is frozen.
-2. `PluginRegistry` validates descriptor names, rejects duplicates, and appends prompt fragments in plugin registration order after the protocol list.
+1. A [`Plugin`](../src/plugin.rs) may declare protocol descriptors, contribute startup notices, and contribute an optional system prompt fragment before a new session's prompt is frozen.
+2. `PluginRegistry` validates descriptor names, rejects duplicates, collects startup notices, and appends prompt fragments in plugin registration order after the protocol list.
 3. The plugin installs protocols, commands, panel providers, or status providers through `PluginHost`; a prompt-only plugin may perform no runtime registration.
 4. Registered protocols remain behind `read` and `exec`; registered commands join the searchable command panel and key-bindable command registry.
 

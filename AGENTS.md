@@ -34,7 +34,7 @@ Use [`docs/README.md`](docs/README.md) as the documentation index. Exact CLI beh
 - Keep each built-in protocol's help in `src/prompts.rs` synchronized with its addresses, body shape, asynchronous behavior, result routes, limits, and examples.
 - Task acceptance is not completion. Results remain observable through the owning protocol's read route. Protocol-specific options stay protocol-specific; `?wait=N` belongs only to `bash` and `pwsh`, and timeout leaves the task running.
 - Keep file writes atomic, terminate shell child processes on cancellation, and preserve oversized output behind a readable `file://` address.
-- Register `bash` and `pwsh` only when their executables exist.
+- Enable only an available `bash` protocol on non-Windows platforms. On Windows, keep native-shell policy in the `pwsh` plugin: require PowerShell 7 or newer, warn and leave `pwsh` disabled when unavailable, and suppress `bash` when enabled.
 - Discover Skills once at startup, preserve first-wins protocol naming and containment, and freeze the generated prompt plus selected Skill metadata and canonical paths in every new session.
 - Resume only from frozen session context. Session events remain append-only; compaction adds checkpoints, keeps complete user turns, and never separates a tool call from its result.
 - Treat canonical `--cwd` as the project boundary for attachments and session resume.

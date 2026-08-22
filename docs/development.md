@@ -45,7 +45,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and built-in protocol help |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
 | `src/builtins/` | Built-in project-instruction, file, exact replacement, Codex patch, Bash, and PowerShell plugins |
-| `src/plugin.rs` | Plugin declarations, system prompt fragments, and protocol, command, generic panel, and status registration |
+| `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, and status registration |
 | `src/task.rs` | In-process task lifecycle, waiting, cancellation, records, and notices |
 | `src/output.rs` | Inline output limits, previews, and complete-output persistence |
 | `src/skill.rs` | Skill discovery, frontmatter, protocol naming, snapshots, and resource containment |
@@ -81,7 +81,7 @@ The detailed protocol behavior is in [Protocols, tasks, Skills, and extensions](
 - Shell cancellation terminates child processes, not only the parent future.
 - File writes remain atomic. Exact replacement rejects missing and ambiguous matches.
 - Preserve oversized output in the session output directory and return a readable `file://` address.
-- Register `bash` and `pwsh` only when the executable exists.
+- Enable only an available `bash` protocol on non-Windows platforms. On Windows, keep native-shell policy in the `pwsh` plugin: require PowerShell 7 or newer, warn and leave `pwsh` disabled when unavailable, and suppress `bash` when enabled.
 
 ### Skills and sessions
 

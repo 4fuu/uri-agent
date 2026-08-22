@@ -129,11 +129,24 @@ pub const PWSH_HELP: &str = r#"# pwsh
 
 Run PowerShell 7 commands as managed asynchronous tasks.
 
+Write PowerShell 7 syntax rather than Unix shell syntax. Use multiline commands
+with normal indentation when they improve readability; do not collapse them
+into one line. Single quotes are literal, double quotes expand variables, and
+the backtick is the escape character. Set environment variables with
+`$env:NAME = 'value'` and quote paths containing spaces.
+
+Prefer modern cross-platform tools such as `rg` and `fd` when available.
+PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
+depth, and output tightly.
+
 Call `exec` with `pwsh://run` and pass the command string directly as the body:
 
 ```text
-exec("pwsh://run", "cargo test")
+exec("pwsh://run", "Get-ChildItem -Path . -Force")
 ```
+
+Commands already run as managed tasks. Do not create another background layer
+inside the command. Use the returned task URI to inspect the task later.
 
 Add `?wait=N` to wait up to N seconds (maximum 300), for example
 `pwsh://?wait=30`. If the wait window expires, the command keeps running and
@@ -193,6 +206,15 @@ mod tests {
         assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
+    }
+
+    #[test]
+    fn pwsh_help_uses_powershell_syntax_and_bounds_shell_work() {
+        assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
+        assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
+        assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
+        assert!(PWSH_HELP.contains("Do not create another background layer"));
+        assert!(PWSH_HELP.contains("`pwsh://?wait=30`"));
     }
 
     #[test]

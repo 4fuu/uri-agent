@@ -67,8 +67,11 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 ```text
 read("file://src/main.rs?offset=1&limit=200")
 read("code-review-skill://help")
-exec("bash://?wait=30", "cargo test")
+exec("bash://?wait=30", "cargo test")  # Unix-like 系统
+exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
+
+非 Windows 平台只启用 Bash。在 Windows 上，PowerShell 7 或更高版本会启用 `pwsh` 并关闭 `bash`；如果 PowerShell 7 不可用，URI Agent 会显示警告，已安装的 Bash 仍会保持启用。
 
 URI Agent 只按第一个 `://` 分割地址；剩余 target 由选中的协议负责解释。注册表会原样传递可选 JSON `body`。完整设计和内置协议清单见英文文档 [Protocols, tasks, Skills, and extensions](docs/protocols.md)。
 

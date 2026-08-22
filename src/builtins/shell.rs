@@ -1,5 +1,5 @@
 use super::{render_record, render_task, render_task_list};
-use crate::plugin::{Plugin, PluginHost};
+use crate::plugin::{Plugin, PluginHost, PluginRegistry};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Result, anyhow, bail};
@@ -16,6 +16,8 @@ use tokio::time::{self, Instant};
 const PWSH_SOURCE_BOOTSTRAP: &str = "$__uri_agent_source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($__uri_agent_source))";
 const PWSH_UTF8_PREFIX: &str = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ";
 const PWSH_EXIT_EPILOGUE: &str = "\n; $__uri_agent_ok = $?; $__uri_agent_native = $global:LASTEXITCODE; if ($__uri_agent_ok) { $global:__uri_agent_exit_code = 0 } elseif ($null -ne $__uri_agent_native -and $__uri_agent_native -ne 0) { $global:__uri_agent_exit_code = $__uri_agent_native } else { $global:__uri_agent_exit_code = 1 }";
+const PWSH_WINDOWS_WARNING: &str =
+    "PowerShell 7 or newer was not found on Windows; pwsh:// is disabled.";
 const EXIT_OUTPUT_IDLE_GRACE: Duration = Duration::from_millis(100);
 
 struct ProcessTreeGuard {
@@ -58,15 +60,77 @@ impl ShellProtocol {
     }
 }
 
-pub(super) fn discover_shells(cwd: &Path) -> Vec<ShellProtocol> {
-    let mut shells = Vec::new();
-    if let Some(executable) = find_executable("bash") {
-        shells.push(ShellProtocol::new("bash", executable, cwd));
+#[derive(Clone)]
+struct PwshPlugin {
+    protocol: Option<ShellProtocol>,
+    suppresses_bash: bool,
+    warning: Option<String>,
+}
+
+impl PwshPlugin {
+    fn detect(
+        cwd: &Path,
+        windows: bool,
+        find: &mut impl FnMut(&str) -> Option<PathBuf>,
+        supports_pwsh_7: impl FnOnce(&Path) -> bool,
+    ) -> Option<Self> {
+        if !windows {
+            return None;
+        }
+        let protocol = find("pwsh").and_then(|executable| {
+            supports_pwsh_7(&executable).then(|| ShellProtocol::new("pwsh", executable, cwd))
+        });
+        Some(Self {
+            suppresses_bash: protocol.is_some(),
+            warning: protocol.is_none().then(|| PWSH_WINDOWS_WARNING.to_string()),
+            protocol,
+        })
     }
-    if let Some(executable) = find_executable("pwsh") {
-        shells.push(ShellProtocol::new("pwsh", executable, cwd));
+}
+
+impl Plugin for PwshPlugin {
+    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
+        self.protocol.iter().map(Protocol::descriptor).collect()
     }
-    shells
+
+    fn startup_notices(&self) -> Vec<String> {
+        self.warning.iter().cloned().collect()
+    }
+
+    fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+        if let Some(protocol) = &self.protocol {
+            host.protocols.register(protocol.clone())?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn add_plugins(plugins: &mut PluginRegistry, cwd: &Path) {
+    add_plugins_with(
+        plugins,
+        cwd,
+        cfg!(windows),
+        find_executable,
+        supports_pwsh_7,
+    );
+}
+
+fn add_plugins_with(
+    plugins: &mut PluginRegistry,
+    cwd: &Path,
+    windows: bool,
+    mut find: impl FnMut(&str) -> Option<PathBuf>,
+    supports_pwsh_7: impl FnOnce(&Path) -> bool,
+) {
+    let pwsh = PwshPlugin::detect(cwd, windows, &mut find, supports_pwsh_7);
+    if !pwsh.as_ref().is_some_and(|plugin| plugin.suppresses_bash)
+        && let Some(executable) = find("bash")
+    {
+        plugins.add(ShellProtocol::new("bash", executable, cwd));
+    }
+    if let Some(pwsh) = pwsh {
+        plugins.add(pwsh);
+    }
 }
 
 impl Plugin for ShellProtocol {
@@ -397,6 +461,22 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+fn supports_pwsh_7(executable: &Path) -> bool {
+    std::process::Command::new(executable)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "if ($PSVersionTable.PSVersion.Major -ge 7) { exit 0 } else { exit 1 }",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +514,93 @@ mod tests {
         assert!(decoded.contains("$__uri_agent_native = $global:LASTEXITCODE"));
         assert!(decoded.contains("} | Out-Default\nexit $global:__uri_agent_exit_code"));
         assert!(PWSH_SOURCE_BOOTSTRAP.is_ascii());
+    }
+
+    #[test]
+    fn valid_windows_pwsh_suppresses_bash() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plugins = PluginRegistry::new();
+        add_plugins_with(
+            &mut plugins,
+            directory.path(),
+            true,
+            |name| Some(PathBuf::from(format!("C:\\shells\\{name}.exe"))),
+            |_| true,
+        );
+        let names = plugins
+            .protocol_descriptors()
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["pwsh"]);
+        assert!(plugins.startup_notices().is_empty());
+        assert!(plugins.system_prompt_fragments().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_windows_pwsh_warns_and_leaves_bash_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plugins = PluginRegistry::new();
+        add_plugins_with(
+            &mut plugins,
+            directory.path(),
+            true,
+            |name| Some(PathBuf::from(name)),
+            |_| false,
+        );
+        let names = plugins
+            .protocol_descriptors()
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["bash"]);
+        assert_eq!(plugins.startup_notices(), vec![PWSH_WINDOWS_WARNING]);
+    }
+
+    #[test]
+    fn missing_windows_pwsh_warns_without_checking_a_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plugins = PluginRegistry::new();
+        add_plugins_with(
+            &mut plugins,
+            directory.path(),
+            true,
+            |name| (name == "bash").then(|| PathBuf::from(name)),
+            |_| panic!("a missing pwsh executable has no version to check"),
+        );
+
+        assert_eq!(plugins.startup_notices(), vec![PWSH_WINDOWS_WARNING]);
+        assert_eq!(plugins.protocol_descriptors().unwrap()[0].name, "bash");
+    }
+
+    #[test]
+    fn non_windows_only_adds_bash_without_checking_pwsh() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plugins = PluginRegistry::new();
+        add_plugins_with(
+            &mut plugins,
+            directory.path(),
+            false,
+            |name| {
+                assert_eq!(name, "bash");
+                Some(PathBuf::from(name))
+            },
+            |_| panic!("non-Windows discovery does not require a PowerShell version check"),
+        );
+        let names = plugins
+            .protocol_descriptors()
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["bash"]);
+        assert!(plugins.startup_notices().is_empty());
+        assert!(plugins.system_prompt_fragments().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -475,12 +642,10 @@ mod tests {
     #[tokio::test]
     async fn shell_is_async_by_default_and_can_opt_into_a_bounded_wait() {
         let directory = tempfile::tempdir().unwrap();
-        let Some(shell) = discover_shells(directory.path())
-            .into_iter()
-            .find(|shell| shell.name == "bash")
-        else {
+        let Some(executable) = find_executable("bash") else {
             return;
         };
+        let shell = ShellProtocol::new("bash", executable, directory.path());
         let context = ProtocolContext {
             tasks: crate::task::TaskManager::new(),
         };
