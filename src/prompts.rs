@@ -15,6 +15,7 @@ pub struct ProtocolPrompt {
 pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> String {
     let mut prompt = String::from(
         "You are a general-purpose agent.\n\
+         You are running in URI Agent.\n\
          You have exactly two tools: read and exec.\n\
          Use read to retrieve information through registered protocols.\n\
          Use exec to perform actions through registered protocols.\n\
@@ -81,7 +82,11 @@ mod tests {
             }],
             &[],
         );
-        assert!(prompt.starts_with("You are a general-purpose agent."));
+        assert!(prompt.starts_with(
+            "You are a general-purpose agent.\n\
+             You are running in URI Agent.\n\
+             You have exactly two tools: read and exec."
+        ));
         assert!(prompt.contains("Before using a protocol for the first time"));
         assert!(prompt.contains("- file: Read files."));
         assert!(!prompt.contains("file://help"));

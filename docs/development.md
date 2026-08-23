@@ -45,7 +45,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/clipboard.rs` | Cross-platform clipboard image reads and PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, binary-hint, file, exact replacement, Codex patch, Bash, and PowerShell plugins, including their protocol help |
+| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, exact replacement, Codex patch, Bash, and PowerShell plugins, including their protocol help |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, and status registration |
 | `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |

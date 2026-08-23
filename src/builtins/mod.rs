@@ -4,6 +4,7 @@ mod bin_hints;
 mod file;
 mod replace;
 mod shell;
+mod uri_agent_docs;
 
 use crate::plugin::PluginRegistry;
 use crate::task::{TaskManager, TaskRecord};
@@ -17,6 +18,7 @@ pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
     plugins.add(agents::AgentsPlugin::new(cwd));
     plugins.add(bin_hints::BinHintsPlugin);
+    plugins.add(uri_agent_docs::UriAgentDocsProtocol);
     plugins.add(file::FileProtocol::new(cwd));
     plugins.add(replace::ReplaceProtocol::new(cwd));
     plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
@@ -106,7 +108,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_distribution_declares_file_replace_and_apply_patch_plugins() {
+    fn built_in_distribution_declares_document_file_and_edit_plugins() {
         let directory = tempfile::tempdir().unwrap();
         let plugins = plugins(directory.path());
         let names = plugins
@@ -116,6 +118,7 @@ mod tests {
             .map(|descriptor| descriptor.name)
             .collect::<Vec<_>>();
 
+        assert!(names.iter().any(|name| name == "uri-agent-docs"));
         assert!(names.iter().any(|name| name == "file"));
         assert!(names.iter().any(|name| name == "replace"));
         assert!(names.iter().any(|name| name == "apply_patch"));

@@ -73,12 +73,13 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 
 ```text
 read("file://src/main.rs?offset=1&limit=200")
+read("uri-agent-docs://README.md")
 read("code-review-skill://help")
 exec("bash://?wait=30", "cargo test")  # Unix-like 系统
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
+URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
 
 ## 扩展
 

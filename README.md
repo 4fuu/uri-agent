@@ -73,12 +73,13 @@ See [Models and configuration](docs/configuration.md) for supported API families
 
 ```text
 read("file://src/main.rs?offset=1&limit=200")
+read("uri-agent-docs://README.md")
 read("code-review-skill://help")
 exec("bash://?wait=30", "cargo test")  # Unix-like systems
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
+URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
 
 ## Extensions
 

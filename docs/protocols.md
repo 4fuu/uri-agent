@@ -38,6 +38,7 @@ Protocol names must be unique. Registration fails rather than silently replacing
 
 | Protocol | Operations | Responsibility |
 | --- | --- | --- |
+| `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
 | `file` | `read` | Read files and bounded directory listings |
 | `replace` | `read`, `exec` | Atomically replace one exact text match |
 | `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
@@ -50,6 +51,21 @@ plugin also verifies that PowerShell 7 or newer can start. A valid `pwsh`
 plugin suppresses `bash`; otherwise `pwsh` remains disabled, a startup warning
 is shown, and `bash` remains available when installed. On non-Windows
 platforms, only the `bash` plugin is considered; `pwsh` is not started.
+
+### `uri-agent-docs`
+
+The Markdown files under `docs/` are embedded in the binary at build time, so
+they remain readable from any startup working directory and match the running
+URI Agent version. Start with the embedded documentation index:
+
+```text
+read("uri-agent-docs://README.md")
+```
+
+Other targets are the exact, case-sensitive filenames linked by that index,
+such as `uri-agent-docs://protocols.md`. Read `uri-agent-docs://help` for the
+complete filename list. Paths, query parameters, and execution are not
+supported.
 
 ### `file`
 
