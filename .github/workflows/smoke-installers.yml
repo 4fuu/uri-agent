@@ -1,0 +1,70 @@
+name: Installer smoke tests
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Released URI Agent version
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released URI Agent version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            installer: linux
+          - runner: macos-26
+            installer: homebrew
+          - runner: windows-2025
+            installer: scoop
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out released metadata
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+      - name: Test Linux installer
+        if: matrix.installer == 'linux'
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          URI_AGENT_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh "$VERSION"
+          "$RUNNER_TEMP/bin/uri-agent" --version | grep -F "uri-agent $VERSION"
+      - name: Test Homebrew formula
+        if: matrix.installer == 'homebrew'
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          brew tap 4fuu/uri-agent "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          brew install 4fuu/uri-agent/uri-agent
+          uri-agent --version | grep -F "uri-agent $VERSION"
+      - name: Test Scoop manifest payload
+        if: matrix.installer == 'scoop'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $manifest = Get-Content bucket/uri-agent.json | ConvertFrom-Json
+          if ($manifest.version -ne $env:VERSION) { throw "Unexpected manifest version" }
+          $archive = Join-Path $env:RUNNER_TEMP "uri-agent.zip"
+          Invoke-WebRequest $manifest.architecture.'64bit'.url -OutFile $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($hash -ne $manifest.architecture.'64bit'.hash) { throw "Checksum mismatch" }
+          $destination = Join-Path $env:RUNNER_TEMP "uri-agent"
+          Expand-Archive $archive $destination
+          $output = & "$destination/uri-agent.exe" --version
+          if ($output -ne "uri-agent $env:VERSION") { throw "Unexpected version: $output" }
