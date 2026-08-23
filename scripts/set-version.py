@@ -26,13 +26,13 @@ def validate_version(version: str) -> None:
         raise SystemExit("month must be unpadded and day must be two digits")
 
 
-def replace_once(path: str, pattern: str, replacement: str) -> tuple[Path, str]:
+def replace_once(path: str, pattern: str, replacement: str) -> None:
     file = ROOT / path
     content = file.read_text()
     updated, count = re.subn(pattern, replacement, content, flags=re.MULTILINE)
     if count != 1:
         raise SystemExit(f"expected one version field in {path}, found {count}")
-    return file, updated
+    file.write_text(updated)
 
 
 def main() -> None:
@@ -41,31 +41,27 @@ def main() -> None:
     version = sys.argv[1]
     validate_version(version)
 
-    updates = [
-        replace_once("Cargo.toml", r'^version = "\d+\.\d+\.\d+"$', f'version = "{version}"'),
-        replace_once(
-            "Cargo.toml",
-            r'^(uri-agent-plugin-sdk = \{ version = ")=\d+\.\d+\.\d+(".*)$',
-            rf'\g<1>={version}\g<2>',
-        ),
-        replace_once(
-            "sdk/Cargo.toml",
-            r'^version = "\d+\.\d+\.\d+"$',
-            f'version = "{version}"',
-        ),
-        replace_once(
-            "sdk/README.md",
-            r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
-            rf'\g<1>{version}\g<2>',
-        ),
-        replace_once(
-            "src/wasm_plugin.rs",
-            r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
-            rf'\g<1>{version}\g<2>',
-        ),
-    ]
-    for path, content in updates:
-        path.write_text(content)
+    replace_once("Cargo.toml", r'^version = "\d+\.\d+\.\d+"$', f'version = "{version}"')
+    replace_once(
+        "Cargo.toml",
+        r'^(uri-agent-plugin-sdk = \{ version = ")=\d+\.\d+\.\d+(".*)$',
+        rf'\g<1>={version}\g<2>',
+    )
+    replace_once(
+        "sdk/Cargo.toml",
+        r'^version = "\d+\.\d+\.\d+"$',
+        f'version = "{version}"',
+    )
+    replace_once(
+        "sdk/README.md",
+        r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
+        rf'\g<1>{version}\g<2>',
+    )
+    replace_once(
+        "src/wasm_plugin.rs",
+        r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
+        rf'\g<1>{version}\g<2>',
+    )
 
     subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
