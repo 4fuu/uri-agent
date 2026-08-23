@@ -11,7 +11,7 @@ Protocols load their operational guidance on demand from `<protocol>://help`. Lo
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 
-URI Agent is currently a pre-1.0 project installed from source. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
+URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
 
 ## Why URI Agent
 
@@ -36,16 +36,43 @@ exec(uri: string, body?: any)
 
 ### Requirements
 
-- a stable Rust toolchain and Git;
 - credentials for a supported model provider;
 - a terminal with standard keyboard input. Mouse support is optional.
 
-### Install from source
+### Install
+
+With Homebrew on macOS or Linux:
+
+```bash
+brew tap 4fuu/uri-agent https://github.com/4fuu/uri-agent
+brew install 4fuu/uri-agent/uri-agent
+```
+
+With Scoop on 64-bit Windows:
+
+```powershell
+scoop bucket add uri-agent https://github.com/4fuu/uri-agent
+scoop install uri-agent
+```
+
+On x86-64 or ARM64 Linux, the installer verifies the release checksum and writes to `~/.local/bin`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/4fuu/uri-agent/main/scripts/install.sh | sh
+```
+
+To build from crates.io, install a stable Rust toolchain and run:
+
+```bash
+cargo install --locked uri-agent
+```
+
+To build the current repository instead:
 
 ```bash
 git clone https://github.com/4fuu/uri-agent.git
 cd uri-agent
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ### Start your first session

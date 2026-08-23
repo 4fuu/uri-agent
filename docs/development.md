@@ -184,6 +184,30 @@ For documentation-only changes, the full Rust suite is unnecessary unless code o
 - detailed `docs/` content stays English-only;
 - protocol behavior changes are also reflected in `<protocol>://help`.
 
+## Release process
+
+URI Agent and `uri-agent-plugin-sdk` share a Cargo version in the form `YYYY.MDD.REVISION`. The calendar date uses `Asia/Hong_Kong`: the month is not padded, the day is always two digits, and the revision starts at zero for the first release that day. For example, `2026.823.0` is the first release on 2026-08-23.
+
+Prepare a release on `main` with:
+
+```bash
+python3 scripts/set-version.py 2026.823.0
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo check
+```
+
+The manually dispatched `release.yml` workflow accepts only a version whose date matches the current date in `Asia/Hong_Kong`. It reruns verification, publishes the SDK before the application crate, builds Linux, macOS, and Windows archives, generates `SHA256SUMS`, updates the in-repository Homebrew formula and Scoop manifest, commits that metadata to `main`, creates the `v<version>` GitHub Release, and exercises all three installation paths. The workflow aborts if `main` moves while release jobs are running.
+
+Before the first release:
+
+1. make the repository public and create a protected GitHub environment named `release`;
+2. add a crates.io API token as the environment secret `CARGO_REGISTRY_TOKEN`, because crates.io requires a token for each crate's first publication;
+3. allow GitHub Actions to write repository contents and ensure the release job can push its package-metadata commit to `main`.
+
+After both crates have been published once, configure a crates.io trusted publisher for each crate with repository `4fuu/uri-agent`, workflow `release.yml`, and environment `release`. Then delete the `CARGO_REGISTRY_TOKEN` secret. Later releases use crates.io OIDC authentication automatically.
+
 ## Documentation ownership
 
 - Root READMEs own project fit, critical warnings, the shortest successful setup, and navigation.

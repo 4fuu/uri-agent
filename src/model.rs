@@ -1250,11 +1250,11 @@ fn add_cache_control_to_message(message: &mut Value, cache_control: &Value) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AuthClient {
     inner: reqwest::Client,
     strip_x_api_key: bool,
-    transform: ModelRequestTransform,
+    transform: Option<ModelRequestTransform>,
 }
 
 impl AuthClient {
@@ -1265,9 +1265,13 @@ impl AuthClient {
         if self.strip_x_api_key {
             request.headers_mut().remove("x-api-key");
         }
-        self.transform.transform_headers(request.headers_mut());
-        let (parts, body) = request.into_parts();
-        let body = self.transform.transform_bytes(body.into());
+        let (mut parts, body) = request.into_parts();
+        let body = if let Some(transform) = &self.transform {
+            transform.transform_headers(&mut parts.headers);
+            transform.transform_bytes(body.into())
+        } else {
+            body.into()
+        };
         http::Request::from_parts(parts, body)
     }
 }
@@ -1369,11 +1373,11 @@ impl RigBackend {
         let request_client = AuthClient {
             inner: reqwest::Client::new(),
             strip_x_api_key: anthropic_oauth,
-            transform: ModelRequestTransform {
+            transform: Some(ModelRequestTransform {
                 model: model.clone(),
                 thinking,
                 session_id: session_id.map(str::to_string),
-            },
+            }),
         };
         let client = match model.api.as_str() {
             "openai-responses" => RigClient::OpenAiResponses(
@@ -1403,11 +1407,11 @@ impl RigBackend {
                     .http_headers(headers)
                     .http_client(AuthClient {
                         inner: reqwest::Client::new(),
-                        transform: ModelRequestTransform {
+                        transform: Some(ModelRequestTransform {
                             model: model.clone(),
                             thinking,
                             session_id: session_id.map(str::to_string),
-                        },
+                        }),
                         strip_x_api_key: anthropic_oauth,
                     });
                 if anthropic_oauth {
@@ -1673,6 +1677,40 @@ mod tests {
             .transform_bytes(bytes::Bytes::from(bytes)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn default_auth_client_is_a_pass_through() {
+        let request = http::Request::builder()
+            .header("x-api-key", "test-key")
+            .body(bytes::Bytes::from_static(br#"{"input":"unchanged"}"#))
+            .unwrap();
+
+        let prepared = AuthClient::default().prepare(request);
+
+        assert_eq!(prepared.headers()["x-api-key"], "test-key");
+        assert_eq!(prepared.body(), br#"{"input":"unchanged"}"#.as_slice());
+    }
+
+    #[test]
+    fn configured_auth_client_applies_request_transforms() {
+        let client = AuthClient {
+            transform: Some(ModelRequestTransform {
+                model: catalog_model("openai-responses", json!({})),
+                thinking: ThinkingLevel::Off,
+                session_id: None,
+            }),
+            ..Default::default()
+        };
+        let request = http::Request::builder()
+            .body(bytes::Bytes::from_static(br#"{"input":"hello"}"#))
+            .unwrap();
+
+        let prepared = client.prepare(request);
+        let body: Value = serde_json::from_slice(prepared.body()).unwrap();
+
+        assert_eq!(body["input"], "hello");
+        assert_eq!(body["store"], false);
     }
 
     #[test]

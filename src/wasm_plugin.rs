@@ -92,14 +92,14 @@ replace the file and reload.
 
 ## Rust SDK
 
-Add the SDK crate from the URI Agent repository:
+Add the SDK crate from crates.io:
 
 ```toml
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-uri-agent-plugin-sdk = {{ git = "https://github.com/4fuu/uri-agent" }}
+uri-agent-plugin-sdk = "2026.823.0"
 ```
 
 Minimal plugin:

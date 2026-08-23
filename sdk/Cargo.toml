@@ -1,11 +1,14 @@
 [package]
 name = "uri-agent-plugin-sdk"
-version = "0.1.0"
+version = "2026.823.0"
 edition = "2021"
 license = "MIT"
 description = "Rust guest SDK for URI Agent Extism WebAssembly protocol plugins"
 repository = "https://github.com/4fuu/uri-agent"
 readme = "README.md"
+keywords = ["agent", "extism", "plugin", "wasm"]
+categories = ["api-bindings", "wasm"]
+include = ["src/**", "Cargo.lock", "LICENSE", "README.md"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

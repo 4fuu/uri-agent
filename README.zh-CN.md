@@ -11,7 +11,7 @@ URI Agent 是一个终端 coding agent，核心是固定且精简的模型接口
 > [!WARNING]
 > URI Agent 不提供沙箱。文件与 Shell 协议使用 `uri-agent` 进程本身的权限运行。请只使用可信的项目和配置。
 
-URI Agent 目前是从源码安装的 pre-1.0 项目。模型请求及其所需上下文会发送给你选择的 Provider；除非启用离线模式，URI Agent 还会从 pi.dev 获取模型目录元数据。
+URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变化。模型请求及其所需上下文会发送给你选择的 Provider；除非启用离线模式，URI Agent 还会从 pi.dev 获取模型目录元数据。
 
 ## 为什么使用 URI Agent
 
@@ -36,16 +36,43 @@ exec(uri: string, body?: any)
 
 ### 环境要求
 
-- stable Rust 工具链与 Git；
 - 受支持模型 Provider 的凭据；
 - 支持标准键盘输入的终端。鼠标支持可选。
 
-### 从源码安装
+### 安装
+
+在 macOS 或 Linux 上使用 Homebrew：
+
+```bash
+brew tap 4fuu/uri-agent https://github.com/4fuu/uri-agent
+brew install 4fuu/uri-agent/uri-agent
+```
+
+在 64 位 Windows 上使用 Scoop：
+
+```powershell
+scoop bucket add uri-agent https://github.com/4fuu/uri-agent
+scoop install uri-agent
+```
+
+在 x86-64 或 ARM64 Linux 上，安装脚本会校验 Release checksum，并写入 `~/.local/bin`：
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/4fuu/uri-agent/main/scripts/install.sh | sh
+```
+
+如需从 crates.io 构建，请先安装 stable Rust 工具链，再运行：
+
+```bash
+cargo install --locked uri-agent
+```
+
+如需构建仓库中的当前代码：
 
 ```bash
 git clone https://github.com/4fuu/uri-agent.git
 cd uri-agent
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ### 启动第一个会话

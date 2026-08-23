@@ -1,17 +1,17 @@
 # URI Agent plugin SDK
 
-This crate provides Rust guest types, ABI exports, and host calls for trusted URI Agent Extism WebAssembly protocol plugins. Runtime installation, reload behavior, permissions, and limits are documented in [WASM plugins](../docs/plugins.md).
+This crate provides Rust guest types, ABI exports, and host calls for trusted URI Agent Extism WebAssembly protocol plugins. Runtime installation, reload behavior, permissions, and limits are documented in [WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md).
 
 ## Use the SDK
 
-Configure a `cdylib` guest that depends on this repository:
+Configure a `cdylib` guest that depends on the SDK:
 
 ```toml
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-uri-agent-plugin-sdk = { git = "https://github.com/4fuu/uri-agent" }
+uri-agent-plugin-sdk = "2026.823.0"
 ```
 
 Define a manifest and handler, then use `define_plugin!` to generate `uri_agent_manifest` and `uri_agent_handle`:
@@ -63,7 +63,7 @@ fn use_token_without_exposing_it() -> Result<(), String> {
 }
 ```
 
-The request grants direct access to any variable in URI Agent's Agent environment manager; variable names are not declared in the manifest. It is a source-audit marker for trusted plugins, not an interactive approval or sandbox boundary. The host rejects `environment_variable` calls from a plugin whose manifest omitted the request. Runtime storage and trust details are in [WASM plugins](../docs/plugins.md#agent-environment-access).
+The request grants direct access to any variable in URI Agent's Agent environment manager; variable names are not declared in the manifest. It is a source-audit marker for trusted plugins, not an interactive approval or sandbox boundary. The host rejects `environment_variable` calls from a plugin whose manifest omitted the request. Runtime storage and trust details are in [WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md#agent-environment-access).
 
 ## Request provider credential access
 
@@ -89,7 +89,7 @@ fn use_provider_key_without_exposing_it() -> Result<(), String> {
 
 The request grants API-key reads for any provider and is a source-audit marker,
 not an interactive approval. It exposes neither OAuth refresh data nor Agent
-environment values. See [Provider credential access](../docs/plugins.md#provider-credential-access).
+environment values. See [Provider credential access](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md#provider-credential-access).
 
 Build the module for WASI:
 
@@ -98,4 +98,4 @@ rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1
 ```
 
-The buildable [`examples/wasm-plugin`](../examples/wasm-plugin/) project contains a complete guest. Read `wasm_plugin://help` in URI Agent for the active installation directory and exact model-facing workflow.
+The buildable [`examples/wasm-plugin`](https://github.com/4fuu/uri-agent/tree/main/examples/wasm-plugin) project contains a complete guest. Read `wasm_plugin://help` in URI Agent for the active installation directory and exact model-facing workflow.
