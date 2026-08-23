@@ -43,8 +43,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
-use rig::message::{Message, UserContent};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,6 +75,8 @@ const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
 const TAIL_BUTTON_RIGHT_INSET: usize = 2;
 const WEB_SEARCH_LOGIN_PROVIDERS: &[&str] = &["parallel", "exa"];
+const IMAGE_TOKEN_PREFIX: &str = "🖼 #";
+const IMAGE_MARKER_PREFIX: &str = "[Image #";
 
 pub struct TuiInfo {
     pub cwd: PathBuf,
@@ -121,7 +122,6 @@ struct DisplayBlock {
     turn_result: bool,
     parent_process: Option<u64>,
     process: Option<ProcessDisplay>,
-    images: usize,
 }
 
 struct ToolDisplay {
@@ -267,6 +267,22 @@ struct ComposerVisualRow {
     logical_row: usize,
     start_col: usize,
     end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageTokenSpan {
+    id: u64,
+    start_byte: usize,
+    end_byte: usize,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CursorSnap {
+    Backward,
+    Forward,
+    Nearest,
 }
 
 #[derive(Clone)]
@@ -530,7 +546,8 @@ struct App {
     completion_generation: u64,
     completion_task: Option<tokio::task::JoinHandle<()>>,
     completions: Option<ComposerCompletions>,
-    pending_images: Vec<ImageAttachment>,
+    composer_images: BTreeMap<u64, ImageAttachment>,
+    next_composer_image_id: u64,
     clipboard_image_loading: bool,
     usage: UsageTotals,
     last_cache_hit: Option<f64>,
@@ -554,9 +571,9 @@ impl App {
     ) -> Self {
         let mut input = TextArea::default();
         if !draft.is_empty() {
-            input.insert_str(&draft);
+            input.insert_str(strip_image_references(&draft));
         }
-        style_input(&mut input, false, 0, false);
+        style_input(&mut input, false);
         Self {
             input,
             blocks: Vec::new(),
@@ -610,7 +627,8 @@ impl App {
             completion_generation: 0,
             completion_task: None,
             completions: None,
-            pending_images: Vec::new(),
+            composer_images: BTreeMap::new(),
+            next_composer_image_id: 1,
             clipboard_image_loading: false,
             usage: UsageTotals::default(),
             last_cache_hit: None,
@@ -709,18 +727,7 @@ impl App {
             | EventKind::SessionContext { .. }
             | EventKind::ModelSettingsChanged { .. }
             | EventKind::Task { .. } => {}
-            EventKind::ModelMessage { message } => {
-                let count = user_message_image_count(&message);
-                if count > 0
-                    && let Some(block) = self
-                        .blocks
-                        .iter_mut()
-                        .rev()
-                        .find(|block| block.kind == BlockKind::User)
-                {
-                    block.images = count;
-                }
-            }
+            EventKind::ModelMessage { .. } => {}
             EventKind::User { text } => {
                 self.reasoning_folded_during_stream = false;
                 self.busy = true;
@@ -898,12 +905,7 @@ impl App {
                 .find_map(|(index, _)| self.block_visible(index).then_some(index))
                 .unwrap_or_default();
         }
-        style_input(
-            &mut self.input,
-            self.busy,
-            self.pending_images.len(),
-            self.clipboard_image_loading,
-        );
+        self.sync_composer_chrome();
     }
 
     fn apply_transient(&mut self, kind: EventKind) {
@@ -991,7 +993,6 @@ impl App {
                     id: process_id,
                     steps: process_end - turn_start,
                 }),
-                images: 0,
             },
         );
         if let Some(result) = result {
@@ -1016,12 +1017,7 @@ impl App {
                 BlockKind::Assistant | BlockKind::Notice | BlockKind::Error
             );
         }
-        style_input(
-            &mut self.input,
-            false,
-            self.pending_images.len(),
-            self.clipboard_image_loading,
-        );
+        self.sync_composer_chrome();
     }
 
     fn push(
@@ -1045,7 +1041,6 @@ impl App {
             turn_result: false,
             parent_process: None,
             process: None,
-            images: 0,
         });
     }
 
@@ -1063,7 +1058,6 @@ impl App {
 
     fn submit(&mut self) -> Option<(String, Vec<ImageAttachment>)> {
         if self.clipboard_image_loading {
-            self.set_flash("Still reading the clipboard image");
             return None;
         }
         if self.busy {
@@ -1079,13 +1073,13 @@ impl App {
             self.overlay = Some(Overlay::Delivery);
             return None;
         }
-        let text = self.input.lines().join("\n");
+        let (text, images) = self.composer_submission();
         if text.trim().is_empty() {
             return None;
         }
-        let images = self.pending_images.clone();
+        self.reset_composer_images(&images);
         self.input = TextArea::default();
-        style_input(&mut self.input, true, images.len(), false);
+        self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
         self.dismiss_completions();
         self.busy = true;
@@ -1095,28 +1089,44 @@ impl App {
         Some((text, images))
     }
 
-    fn remove_last_image(&mut self) {
-        if self.pending_images.pop().is_some() {
-            let remaining = self.pending_images.len();
-            self.set_flash(format!(
-                "Removed the latest image attachment · {remaining} remaining"
-            ));
-        } else {
-            self.set_flash("No image attachment to remove");
-        }
+    fn composer_submission(&self) -> (String, Vec<ImageAttachment>) {
+        prepare_image_submission(&self.draft_text(), &self.composer_images)
+    }
+
+    fn reset_composer_images(&mut self, images: &[ImageAttachment]) {
+        self.composer_images = images
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, image)| (index as u64 + 1, image))
+            .collect();
+        self.next_composer_image_id = images.len() as u64 + 1;
+    }
+
+    fn insert_composer_text(&mut self, text: impl AsRef<str>) -> bool {
+        expand_composer_selection_to_image_tokens(&mut self.input, &self.composer_images);
+        let inserted = self.input.insert_str(text);
         self.sync_composer_chrome();
+        inserted
+    }
+
+    fn insert_composer_newline(&mut self) {
+        expand_composer_selection_to_image_tokens(&mut self.input, &self.composer_images);
+        self.input.insert_newline();
+        self.sync_composer_chrome();
+    }
+
+    fn insert_clipboard_image(&mut self, bytes: Vec<u8>) {
+        let id = self.next_composer_image_id;
+        self.next_composer_image_id = self.next_composer_image_id.saturating_add(1);
+        self.composer_images.insert(id, ImageAttachment::png(bytes));
+        self.insert_composer_text(image_token_label(id));
     }
 
     fn finish_clipboard_image_read(&mut self, result: Result<Vec<u8>>) {
         self.clipboard_image_loading = false;
         match result {
-            Ok(bytes) => {
-                self.pending_images.push(ImageAttachment::png(bytes));
-                self.set_flash(format!(
-                    "Image attached for the next message · {} total",
-                    self.pending_images.len()
-                ));
-            }
+            Ok(bytes) => self.insert_clipboard_image(bytes),
             Err(error) => self.set_flash(format!("Clipboard image failed: {error:#}")),
         }
         self.sync_composer_chrome();
@@ -1126,16 +1136,10 @@ impl App {
         self.clipboard_image_loading = false;
         let mut text_inserted = false;
         match result {
-            Ok(clipboard::ClipboardContent::Image(bytes)) => {
-                self.pending_images.push(ImageAttachment::png(bytes));
-                self.set_flash(format!(
-                    "Image inserted in the composer · {} total",
-                    self.pending_images.len()
-                ));
-            }
+            Ok(clipboard::ClipboardContent::Image(bytes)) => self.insert_clipboard_image(bytes),
             Ok(clipboard::ClipboardContent::Text(text)) => {
                 if self.overlay == Some(Overlay::Composer) {
-                    self.input.insert_str(text);
+                    self.insert_composer_text(text);
                     text_inserted = true;
                 }
             }
@@ -1146,17 +1150,36 @@ impl App {
     }
 
     fn sync_composer_chrome(&mut self) {
-        style_input(
-            &mut self.input,
-            self.busy,
-            self.pending_images.len(),
-            self.clipboard_image_loading,
-        );
+        style_input(&mut self.input, self.busy);
+        self.input.clear_custom_highlight();
+        let highlights = self
+            .input
+            .lines()
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                image_token_spans(line)
+                    .into_iter()
+                    .filter(|token| self.composer_images.contains_key(&token.id))
+                    .map(move |token| (row, token.start_byte, token.end_byte))
+            })
+            .collect::<Vec<_>>();
+        for (row, start, end) in highlights {
+            self.input.custom_highlight(
+                ((row, start), (row, end)),
+                Style::default()
+                    .fg(WARM)
+                    .bg(ROW_ACTIVE)
+                    .add_modifier(Modifier::BOLD),
+                5,
+            );
+        }
     }
 
     fn clear_accepted_draft(&mut self) {
         self.input = TextArea::default();
-        self.pending_images.clear();
+        self.composer_images.clear();
+        self.next_composer_image_id = 1;
         self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
         self.dismiss_completions();
@@ -1166,11 +1189,44 @@ impl App {
 
     fn restore_to_draft(&mut self, text: &str) {
         let current = self.draft_text();
-        let restored = [text, current.as_str()]
+        let restored_text = collapse_image_markers(text, self.composer_images.len());
+        let restored = [restored_text.as_str(), current.as_str()]
             .into_iter()
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
+        self.input = TextArea::default();
+        self.input.insert_str(restored);
+        self.sync_composer_chrome();
+        self.dismiss_completions();
+        self.overlay = Some(Overlay::Composer);
+    }
+
+    fn restore_pending_to_draft(&mut self, text: &str, images: Vec<ImageAttachment>) {
+        let queued_store = images
+            .into_iter()
+            .enumerate()
+            .map(|(index, image)| (index as u64 + 1, image))
+            .collect::<BTreeMap<_, _>>();
+        let queued = ensure_image_markers(text, queued_store.len());
+        let queued = collapse_image_markers(&queued, queued_store.len());
+        let (queued, mut queued_images) = prepare_composer_images(&queued, &queued_store);
+        let (current, current_images) =
+            prepare_composer_images(&self.draft_text(), &self.composer_images);
+        let offset = queued_images.len() as u64;
+        let current_ids = current_images
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (index as u64 + 1, index as u64 + 1 + offset))
+            .collect::<BTreeMap<_, _>>();
+        let current = rewrite_image_token_ids(&current, &current_ids);
+        let restored = [queued.as_str(), current.as_str()]
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        queued_images.extend(current_images);
+        self.reset_composer_images(&queued_images);
         self.input = TextArea::default();
         self.input.insert_str(restored);
         self.sync_composer_chrome();
@@ -1183,6 +1239,7 @@ impl App {
     }
 
     fn edit_composer(&mut self, key: KeyEvent, action: Option<&str>) {
+        let old_cursor = self.input.cursor();
         let movement = match action {
             Some("cursor_up") => Some(if self.input.cursor().0 == 0 {
                 CursorMove::Head
@@ -1199,11 +1256,32 @@ impl App {
             Some("word_back") => Some(CursorMove::WordBack),
             Some("word_forward") => Some(CursorMove::WordForward),
             Some("delete_word") => {
-                self.input.delete_word();
+                if composer_has_selection(&self.input) {
+                    expand_composer_selection_to_image_tokens(
+                        &mut self.input,
+                        &self.composer_images,
+                    );
+                    self.input.delete_word();
+                } else if !delete_adjacent_image_token(
+                    &mut self.input,
+                    &self.composer_images,
+                    false,
+                ) {
+                    self.input.delete_word();
+                }
                 None
             }
             Some("delete_next_word") => {
-                self.input.delete_next_word();
+                if composer_has_selection(&self.input) {
+                    expand_composer_selection_to_image_tokens(
+                        &mut self.input,
+                        &self.composer_images,
+                    );
+                    self.input.delete_next_word();
+                } else if !delete_adjacent_image_token(&mut self.input, &self.composer_images, true)
+                {
+                    self.input.delete_next_word();
+                }
                 None
             }
             Some("undo") => {
@@ -1215,7 +1293,30 @@ impl App {
                 None
             }
             _ => {
-                self.input.input(key);
+                let selected = composer_has_selection(&self.input);
+                if selected && composer_key_edits(key) {
+                    expand_composer_selection_to_image_tokens(
+                        &mut self.input,
+                        &self.composer_images,
+                    );
+                }
+                let deleted_token = !selected
+                    && match key.code {
+                        KeyCode::Backspace => delete_adjacent_image_token(
+                            &mut self.input,
+                            &self.composer_images,
+                            false,
+                        ),
+                        KeyCode::Delete => delete_adjacent_image_token(
+                            &mut self.input,
+                            &self.composer_images,
+                            true,
+                        ),
+                        _ => false,
+                    };
+                if !deleted_token {
+                    self.input.input(key);
+                }
                 None
             }
         };
@@ -1229,6 +1330,16 @@ impl App {
             }
             self.input.move_cursor(movement);
         }
+        let cursor = self.input.cursor();
+        let direction = match key.code {
+            KeyCode::Left => CursorSnap::Backward,
+            KeyCode::Right => CursorSnap::Forward,
+            _ if cursor < old_cursor => CursorSnap::Backward,
+            _ if cursor > old_cursor => CursorSnap::Forward,
+            _ => CursorSnap::Nearest,
+        };
+        snap_composer_cursor(&mut self.input, &self.composer_images, direction);
+        self.sync_composer_chrome();
     }
 
     fn begin_completion_query(&mut self) -> (u64, TuiCompletionContext) {
@@ -1309,6 +1420,7 @@ impl App {
             self.dismiss_completions();
             return false;
         }
+        self.sync_composer_chrome();
         self.dismiss_completions();
         true
     }
@@ -1677,6 +1789,281 @@ impl App {
     }
 }
 
+fn image_token_label(id: u64) -> String {
+    format!("{IMAGE_TOKEN_PREFIX}{id}")
+}
+
+fn numbered_image_spans(
+    line: &str,
+    prefix: &'static str,
+    closing: Option<u8>,
+) -> Vec<ImageTokenSpan> {
+    line.match_indices(prefix)
+        .filter_map(|(start_byte, _)| {
+            let digits_start = start_byte + prefix.len();
+            let digits = line[digits_start..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            if digits == 0 {
+                return None;
+            }
+            let mut end_byte = digits_start + digits;
+            if let Some(closing) = closing {
+                if line.as_bytes().get(end_byte) != Some(&closing) {
+                    return None;
+                }
+                end_byte += 1;
+            }
+            let id = line[digits_start..digits_start + digits].parse().ok()?;
+            Some(ImageTokenSpan {
+                id,
+                start_byte,
+                end_byte,
+                start_col: line[..start_byte].chars().count(),
+                end_col: line[..end_byte].chars().count(),
+            })
+        })
+        .collect()
+}
+
+fn image_token_spans(line: &str) -> Vec<ImageTokenSpan> {
+    numbered_image_spans(line, IMAGE_TOKEN_PREFIX, None)
+}
+
+fn image_marker_spans(line: &str) -> Vec<ImageTokenSpan> {
+    numbered_image_spans(line, IMAGE_MARKER_PREFIX, Some(b']'))
+}
+
+fn rewrite_image_references(
+    text: &str,
+    ids: &BTreeMap<u64, u64>,
+    spans: fn(&str) -> Vec<ImageTokenSpan>,
+    marker: bool,
+) -> String {
+    text.split('\n')
+        .map(|line| {
+            let mut rewritten = String::with_capacity(line.len());
+            let mut cursor = 0;
+            for token in spans(line) {
+                let Some(id) = ids.get(&token.id) else {
+                    continue;
+                };
+                rewritten.push_str(&line[cursor..token.start_byte]);
+                if marker {
+                    rewritten.push_str(&format!("[Image #{id}]"));
+                } else {
+                    rewritten.push_str(&image_token_label(*id));
+                }
+                cursor = token.end_byte;
+            }
+            rewritten.push_str(&line[cursor..]);
+            rewritten
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rewrite_image_token_ids(text: &str, ids: &BTreeMap<u64, u64>) -> String {
+    rewrite_image_references(text, ids, image_token_spans, false)
+}
+
+fn strip_image_references_with(text: &str, spans: fn(&str) -> Vec<ImageTokenSpan>) -> String {
+    text.split('\n')
+        .map(|line| {
+            let mut stripped = String::with_capacity(line.len());
+            let mut cursor = 0;
+            for token in spans(line) {
+                stripped.push_str(&line[cursor..token.start_byte]);
+                cursor = token.end_byte;
+            }
+            stripped.push_str(&line[cursor..]);
+            stripped
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_image_references(text: &str) -> String {
+    strip_image_references_with(
+        &strip_image_references_with(text, image_token_spans),
+        image_marker_spans,
+    )
+}
+
+fn collapse_image_markers(text: &str, image_count: usize) -> String {
+    let ids = (1..=image_count as u64)
+        .map(|id| (id, id))
+        .collect::<BTreeMap<_, _>>();
+    rewrite_image_references(text, &ids, image_marker_spans, false)
+}
+
+fn ensure_image_markers(text: &str, image_count: usize) -> String {
+    let present = text
+        .split('\n')
+        .flat_map(image_marker_spans)
+        .filter_map(|token| usize::try_from(token.id).ok())
+        .filter(|id| *id <= image_count)
+        .collect::<HashSet<_>>();
+    let missing = (1..=image_count)
+        .filter(|id| !present.contains(id))
+        .map(|id| format!("[Image #{id}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match (text.trim().is_empty(), missing.is_empty()) {
+        (_, true) => text.to_string(),
+        (true, false) => missing,
+        (false, false) => format!("{text} {missing}"),
+    }
+}
+
+fn prepare_image_references(
+    text: &str,
+    image_store: &BTreeMap<u64, ImageAttachment>,
+) -> (BTreeMap<u64, u64>, Vec<ImageAttachment>) {
+    let mut ids = BTreeMap::new();
+    let mut images = Vec::new();
+    for line in text.split('\n') {
+        for token in image_token_spans(line) {
+            if ids.contains_key(&token.id) {
+                continue;
+            }
+            let Some(image) = image_store.get(&token.id) else {
+                continue;
+            };
+            let id = images.len() as u64 + 1;
+            ids.insert(token.id, id);
+            images.push(image.clone());
+        }
+    }
+    (ids, images)
+}
+
+fn prepare_composer_images(
+    text: &str,
+    image_store: &BTreeMap<u64, ImageAttachment>,
+) -> (String, Vec<ImageAttachment>) {
+    let (ids, images) = prepare_image_references(text, image_store);
+    (rewrite_image_token_ids(text, &ids), images)
+}
+
+fn prepare_image_submission(
+    text: &str,
+    image_store: &BTreeMap<u64, ImageAttachment>,
+) -> (String, Vec<ImageAttachment>) {
+    let (ids, images) = prepare_image_references(text, image_store);
+    (
+        rewrite_image_references(text, &ids, image_token_spans, true),
+        images,
+    )
+}
+
+fn composer_key_edits(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        || matches!(key.code, KeyCode::Char(_))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+fn select_composer_range(
+    input: &mut TextArea<'static>,
+    start: (usize, usize),
+    end: (usize, usize),
+) {
+    input.cancel_selection();
+    input.move_cursor(CursorMove::Jump(
+        end.0.min(u16::MAX as usize) as u16,
+        end.1.min(u16::MAX as usize) as u16,
+    ));
+    input.start_selection();
+    input.move_cursor(CursorMove::Jump(
+        start.0.min(u16::MAX as usize) as u16,
+        start.1.min(u16::MAX as usize) as u16,
+    ));
+}
+
+fn expand_composer_selection_to_image_tokens(
+    input: &mut TextArea<'static>,
+    image_store: &BTreeMap<u64, ImageAttachment>,
+) -> bool {
+    let Some((mut start, mut end)) = input.selection_range().filter(|(start, end)| start != end)
+    else {
+        return false;
+    };
+    let original = (start, end);
+    for (row, line) in input.lines().iter().enumerate() {
+        for token in image_token_spans(line)
+            .into_iter()
+            .filter(|token| image_store.contains_key(&token.id))
+        {
+            let token_start = (row, token.start_col);
+            let token_end = (row, token.end_col);
+            if start < token_end && token_start < end {
+                start = start.min(token_start);
+                end = end.max(token_end);
+            }
+        }
+    }
+    if (start, end) != original {
+        select_composer_range(input, start, end);
+    }
+    true
+}
+
+fn delete_adjacent_image_token(
+    input: &mut TextArea<'static>,
+    image_store: &BTreeMap<u64, ImageAttachment>,
+    forward: bool,
+) -> bool {
+    let (row, column) = input.cursor();
+    let Some(token) = image_token_spans(&input.lines()[row])
+        .into_iter()
+        .filter(|token| image_store.contains_key(&token.id))
+        .find(|token| {
+            if forward {
+                token.start_col == column || token.start_col < column && column < token.end_col
+            } else {
+                token.end_col == column || token.start_col < column && column < token.end_col
+            }
+        })
+    else {
+        return false;
+    };
+    select_composer_range(input, (row, token.start_col), (row, token.end_col));
+    input.insert_str("")
+}
+
+fn snap_composer_cursor(
+    input: &mut TextArea<'static>,
+    image_store: &BTreeMap<u64, ImageAttachment>,
+    direction: CursorSnap,
+) {
+    let (row, column) = input.cursor();
+    let Some(token) = image_token_spans(&input.lines()[row])
+        .into_iter()
+        .filter(|token| image_store.contains_key(&token.id))
+        .find(|token| token.start_col < column && column < token.end_col)
+    else {
+        return;
+    };
+    let column = match direction {
+        CursorSnap::Backward => token.start_col,
+        CursorSnap::Forward => token.end_col,
+        CursorSnap::Nearest => {
+            if column - token.start_col < token.end_col - column {
+                token.start_col
+            } else {
+                token.end_col
+            }
+        }
+    };
+    input.move_cursor(CursorMove::Jump(
+        row.min(u16::MAX as usize) as u16,
+        column.min(u16::MAX as usize) as u16,
+    ));
+}
+
 fn hit_target<T: Copy>(regions: &[HitRegion<T>], mouse: MouseEvent) -> Option<T> {
     regions
         .iter()
@@ -1798,12 +2185,7 @@ impl TuiTerminal {
             app.busy = true;
             app.busy_since = Some(Instant::now());
             app.activity = Some(Activity::Thinking);
-            style_input(
-                &mut app.input,
-                true,
-                app.pending_images.len(),
-                app.clipboard_image_loading,
-            );
+            app.sync_composer_chrome();
         }
 
         let services = LoopServices {
@@ -2061,8 +2443,8 @@ async fn apply_action(
                 .await
             {
                 Ok(()) => {
-                    app.pending_images.clear();
-                    app.sync_composer_chrome();
+                    app.composer_images.clear();
+                    app.next_composer_image_id = 1;
                     let _ = services.runtime.session().save_draft("").await;
                 }
                 Err(error) => {
@@ -2099,10 +2481,8 @@ async fn apply_action(
             Ok(None)
         }
         Action::RestorePending => {
-            if let Some((message, mut images)) = services.runtime.cancel_latest_pending().await {
-                images.append(&mut app.pending_images);
-                app.pending_images = images;
-                app.restore_to_draft(&message.text);
+            if let Some((message, images)) = services.runtime.cancel_latest_pending().await {
+                app.restore_pending_to_draft(&message.text, images);
                 app.pending_messages = services.runtime.pending_messages().await;
                 app.set_flash("Pending message restored to draft");
             } else {
@@ -2270,11 +2650,11 @@ fn handle_paste(app: &mut App, text: String) {
             }
         }
         Some(Overlay::Composer) => {
-            app.input.insert_str(text);
+            app.insert_composer_text(text);
         }
         None => {
             app.overlay = Some(Overlay::Composer);
-            app.input.insert_str(text);
+            app.insert_composer_text(text);
         }
         _ => {}
     }
@@ -2473,7 +2853,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
         }
         Some("reference") => {
             app.overlay = Some(Overlay::Composer);
-            app.input.insert_char('@');
+            app.insert_composer_text("@");
             Action::RefreshCompletions
         }
         Some("paste") => {
@@ -2483,10 +2863,6 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
         Some("paste_image") => {
             app.overlay = Some(Overlay::Composer);
             Action::ReadClipboardImage
-        }
-        Some("remove_last_image") => {
-            app.remove_last_image();
-            Action::Continue
         }
         Some("command") => {
             app.reset_command_search();
@@ -2631,7 +3007,7 @@ async fn handle_overlay_key(
                         })
                 }
                 Some("newline") => {
-                    app.input.insert_newline();
+                    app.insert_composer_newline();
                     Action::RefreshCompletions
                 }
                 Some("paste") => Action::ReadClipboard,
@@ -2642,10 +3018,6 @@ async fn handle_overlay_key(
                     } else {
                         Action::Continue
                     }
-                }
-                Some("remove_last_image") => {
-                    app.remove_last_image();
-                    Action::Continue
                 }
                 Some("copy") => {
                     copy_composer_selection(app);
@@ -2848,13 +3220,13 @@ fn confirm_delivery(app: &App) -> Action {
     let Some(delivery) = app.delivery.as_ref() else {
         return Action::Continue;
     };
-    let prompt = app.draft_text();
+    let (prompt, images) = app.composer_submission();
     if prompt.trim().is_empty() {
         return Action::Continue;
     }
     Action::Enqueue {
         prompt,
-        images: app.pending_images.clone(),
+        images,
         kind: if delivery.selected == 0 {
             PendingMessageKind::Queued
         } else {
@@ -3458,7 +3830,18 @@ fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         return false;
     }
 
-    let cursor = composer_cursor_at(view, &app.input, mouse.column, mouse.row);
+    let mut cursor = composer_cursor_at(view, &app.input, mouse.column, mouse.row);
+    if let Some(token) = image_token_spans(&app.input.lines()[cursor.0])
+        .into_iter()
+        .filter(|token| app.composer_images.contains_key(&token.id))
+        .find(|token| token.start_col < cursor.1 && cursor.1 < token.end_col)
+    {
+        cursor.1 = if cursor.1 - token.start_col < token.end_col - cursor.1 {
+            token.start_col
+        } else {
+            token.end_col
+        };
+    }
     if starting {
         app.input.cancel_selection();
         app.input
@@ -4495,12 +4878,9 @@ async fn save_settings(
 
 fn start_clipboard_image_read(app: &mut App, sender: mpsc::UnboundedSender<BackgroundEvent>) {
     if app.clipboard_image_loading {
-        app.set_flash("A clipboard image is already being read");
         return;
     }
     app.clipboard_image_loading = true;
-    app.sync_composer_chrome();
-    app.set_flash("Reading an image from the clipboard…");
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(clipboard::read_image_png)
             .await
@@ -4512,11 +4892,9 @@ fn start_clipboard_image_read(app: &mut App, sender: mpsc::UnboundedSender<Backg
 
 fn start_clipboard_read(app: &mut App, sender: mpsc::UnboundedSender<BackgroundEvent>) {
     if app.clipboard_image_loading {
-        app.set_flash("The clipboard is already being read");
         return;
     }
     app.clipboard_image_loading = true;
-    app.sync_composer_chrome();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(clipboard::read_preferred)
             .await
@@ -5465,16 +5843,6 @@ fn transcript_block_items(
                     background,
                 ));
             }
-            if block.images > 0 {
-                rows.push(transcript_block_item(
-                    block,
-                    vec![Span::styled(
-                        image_count_label(block.images),
-                        Style::default().fg(MUTED),
-                    )],
-                    background,
-                ));
-            }
         }
         BlockKind::Assistant => {
             for mut line in markdown::render(&block.text, message_width) {
@@ -5817,41 +6185,7 @@ fn fixed_bottom_notices(app: &App) -> Vec<(String, Color)> {
             WARM,
         ));
     }
-    if app.clipboard_image_loading || !app.pending_images.is_empty() {
-        notices.push((
-            pending_image_notice(app.pending_images.len(), app.clipboard_image_loading),
-            WARM,
-        ));
-    }
     notices
-}
-
-fn pending_image_notice(count: usize, loading: bool) -> String {
-    match (count, loading) {
-        (0, true) => "reading clipboard…".to_string(),
-        (count, false) => format!(
-            "{count} image{} ready · alt+backspace remove",
-            if count == 1 { "" } else { "s" }
-        ),
-        (count, true) => format!(
-            "{count} image{} ready · reading another…",
-            if count == 1 { "" } else { "s" }
-        ),
-    }
-}
-
-fn image_count_label(count: usize) -> String {
-    format!("{count} image{}", if count == 1 { "" } else { "s" })
-}
-
-fn user_message_image_count(message: &Message) -> usize {
-    match message {
-        Message::User { content } => content
-            .iter()
-            .filter(|part| matches!(part, UserContent::Image(_)))
-            .count(),
-        _ => 0,
-    }
 }
 
 fn bottom_notice_lines(notices: &[(String, Color)], width: u16) -> Vec<Line<'static>> {
@@ -6073,12 +6407,7 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
                 section += 1;
             }
             let composer_area = sections[section];
-            style_input(
-                &mut app.input,
-                app.busy,
-                app.pending_images.len(),
-                app.clipboard_image_loading,
-            );
+            app.sync_composer_chrome();
             frame.render_widget(&app.input, composer_area);
             if let Some(position) = composer_cursor_position(frame, &app.input, composer_area) {
                 frame.set_cursor_position(position);
@@ -6890,28 +7219,12 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
     }
 }
 
-fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, image_loading: bool) {
+fn style_input(input: &mut TextArea<'static>, busy: bool) {
     let border = ACCENT;
-    let title = match (image_count, image_loading) {
-        (0, false) => " MESSAGE ".to_string(),
-        (0, true) => " MESSAGE · reading clipboard… ".to_string(),
-        (count, false) => format!(
-            " MESSAGE · {count} image{} ",
-            if count == 1 { "" } else { "s" }
-        ),
-        (count, true) => format!(
-            " MESSAGE · {count} image{} · reading another… ",
-            if count == 1 { "" } else { "s" }
-        ),
-    };
-    let footer = if busy && image_count == 0 {
+    let footer = if busy {
         " Enter choose delivery · Shift+Enter newline · Esc keep draft "
-    } else if busy {
-        " Enter choose delivery · Alt+Backspace remove latest image "
-    } else if image_count == 0 {
-        " Enter send · Shift+Enter newline · Alt+V image "
     } else {
-        " Enter send · Alt+Backspace remove latest image "
+        " Enter send · Shift+Enter newline · Alt+V image "
     };
     input.set_block(
         Block::default()
@@ -6919,7 +7232,7 @@ fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, im
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border))
             .title(Line::styled(
-                title,
+                " MESSAGE ",
                 Style::default().fg(border).add_modifier(Modifier::BOLD),
             ))
             .title_bottom(Line::styled(footer, Style::default().fg(MUTED)).right_aligned())
@@ -8227,7 +8540,6 @@ mod tests {
             text: "follow up".to_string(),
             kind: PendingMessageKind::Queued,
         });
-        app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
         render_to_string(&mut app, 100, 24);
         let baseline_height = app.transcript_height;
         app.set_flash("Older notification");
@@ -8244,9 +8556,8 @@ mod tests {
 
         assert!(row("Newer notification") < row("Older notification"));
         assert!(row("Older notification") < row("1 pending"));
-        assert!(row("1 pending") < row("1 image ready"));
         let activity_row = rows.len() - 2;
-        assert!(row("1 image ready") < activity_row);
+        assert!(row("1 pending") < activity_row);
         assert!(rows[activity_row].contains("thinking"));
         let footer = rows.last().unwrap();
         assert!(footer.starts_with("model · effort off"));
@@ -9155,53 +9466,126 @@ mod tests {
 
         app.clipboard_image_loading = true;
         assert!(!app.finish_clipboard_read(Ok(clipboard::ClipboardContent::Image(vec![1, 2]))));
-        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.draft_text(), "pasted🖼 #1");
+        let (prompt, images) = app.composer_submission();
+        assert_eq!(prompt, "pasted[Image #1]");
+        assert_eq!(images, [ImageAttachment::png(vec![1, 2])]);
     }
 
     #[test]
-    fn clipboard_images_wait_for_the_next_submit_and_are_removed_latest_first() {
+    fn clipboard_image_token_is_inserted_at_the_caret() {
         let mut app = test_app();
-        let first = ImageAttachment::png(vec![1]);
-        let second = ImageAttachment::png(vec![2]);
-        app.pending_images.extend([first.clone(), second]);
-
-        app.remove_last_image();
-        assert_eq!(app.pending_images.as_slice(), std::slice::from_ref(&first));
         app.overlay = Some(Overlay::Composer);
-        app.input.insert_str("inspect this");
+        app.insert_composer_text("beforeafter");
+        app.input.move_cursor(CursorMove::Jump(0, 6));
+
+        app.finish_clipboard_image_read(Ok(vec![1]));
+
+        assert_eq!(app.draft_text(), "before🖼 #1after");
+        assert_eq!(app.input.cursor(), (0, 10));
+    }
+
+    #[test]
+    fn image_tokens_are_crossed_and_deleted_atomically() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.insert_clipboard_image(vec![1]);
+
+        app.input.move_cursor(CursorMove::Head);
+        app.edit_composer(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), None);
+        assert_eq!(app.input.cursor(), (0, "🖼 #1".chars().count()));
+        app.edit_composer(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), None);
+        assert_eq!(app.input.cursor(), (0, 0));
+
+        app.edit_composer(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), None);
+        assert!(app.draft_text().is_empty());
+        assert!(app.composer_submission().1.is_empty());
+
+        app.input.undo();
+        app.sync_composer_chrome();
+        assert_eq!(app.draft_text(), "🖼 #1");
+        app.input.move_cursor(CursorMove::End);
+        app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
+        assert!(app.draft_text().is_empty());
+        assert!(app.composer_submission().1.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_selection_that_touches_a_token_removes_the_whole_image() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.insert_composer_text("before ");
+        app.insert_clipboard_image(vec![1]);
+        app.insert_composer_text(" after");
+        app.input.move_cursor(CursorMove::Jump(0, 8));
+        app.input.start_selection();
+        app.input.move_cursor(CursorMove::Jump(0, 10));
+
+        app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
+
+        assert_eq!(app.draft_text(), "before  after");
+        assert!(app.composer_submission().1.is_empty());
+    }
+
+    #[test]
+    fn deleting_one_image_token_keeps_and_renumbers_the_other_on_submit() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.insert_clipboard_image(vec![1]);
+        app.insert_composer_text(" ");
+        app.insert_clipboard_image(vec![2]);
+        app.input.move_cursor(CursorMove::Jump(0, 4));
+        app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
+
+        assert_eq!(app.draft_text(), " 🖼 #2");
+        let (prompt, images) = app.composer_submission();
+        assert_eq!(prompt, " [Image #1]");
+        assert_eq!(images, [ImageAttachment::png(vec![2])]);
+    }
+
+    #[test]
+    fn clipboard_images_wait_for_the_next_submit() {
+        let mut app = test_app();
+        let image = ImageAttachment::png(vec![1]);
+        app.overlay = Some(Overlay::Composer);
+        app.insert_composer_text("inspect this ");
+        app.insert_clipboard_image(vec![1]);
         app.clipboard_image_loading = true;
         assert!(app.submit().is_none());
-        assert_eq!(app.draft_text(), "inspect this");
-        assert_eq!(app.pending_images.as_slice(), std::slice::from_ref(&first));
+        assert_eq!(app.draft_text(), "inspect this 🖼 #1");
+        assert_eq!(
+            app.composer_submission().1.as_slice(),
+            std::slice::from_ref(&image)
+        );
 
         app.clipboard_image_loading = false;
         let (prompt, images) = app.submit().unwrap();
-        assert_eq!(prompt, "inspect this");
-        assert_eq!(images.as_slice(), std::slice::from_ref(&first));
-        assert_eq!(app.pending_images, [first]);
+        assert_eq!(prompt, "inspect this [Image #1]");
+        assert_eq!(images, [image]);
+        assert!(app.draft_text().is_empty());
+
+        app.busy = false;
+        app.restore_to_draft(&prompt);
+        assert_eq!(app.draft_text(), "inspect this 🖼 #1");
+        assert_eq!(app.composer_submission().0, prompt);
     }
 
     #[test]
-    fn clipboard_read_completion_updates_pending_state_without_opening_composer() {
+    fn clipboard_read_completion_inserts_a_token_without_a_success_notice() {
         let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
         app.clipboard_image_loading = true;
 
         app.finish_clipboard_image_read(Ok(vec![1, 2, 3]));
 
         assert!(!app.clipboard_image_loading);
-        assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
-        assert!(app.overlay.is_none());
-        assert!(
-            app.visible_flashes()
-                .next_back()
-                .unwrap()
-                .contains("next message")
-        );
+        assert_eq!(app.draft_text(), "🖼 #1");
+        assert!(app.visible_flashes().next().is_none());
 
         app.clipboard_image_loading = true;
         app.finish_clipboard_image_read(Err(anyhow!("clipboard unavailable")));
         assert!(!app.clipboard_image_loading);
-        assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
+        assert_eq!(app.draft_text(), "🖼 #1");
         assert!(
             app.visible_flashes()
                 .next_back()
@@ -9211,65 +9595,96 @@ mod tests {
     }
 
     #[test]
-    fn pending_clipboard_images_keep_a_status_notice() {
+    fn composer_shows_image_tokens_without_external_image_chrome() {
         let mut app = test_app();
-        app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
-        let welcome = render_to_string(&mut app, 100, 24);
-        assert!(welcome.contains("1 image ready"));
-        assert!(welcome.contains("alt+backspace remove"));
+        app.skip_splash();
+        app.overlay = Some(Overlay::Composer);
+        app.insert_clipboard_image(vec![1, 2, 3]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let cells = terminal.backend().buffer().content();
+        let symbols = cells.iter().map(|cell| cell.symbol()).collect::<Vec<_>>();
+        let token = "🖼 #1".chars().map(|c| c.to_string()).collect::<Vec<_>>();
+        let start = symbols
+            .windows(token.len())
+            .position(|window| {
+                window
+                    .iter()
+                    .zip(&token)
+                    .all(|(cell, token)| *cell == token)
+            })
+            .expect("image token should be rendered");
+        for cell in &cells[start..start + token.len()] {
+            assert_eq!(cell.fg, WARM);
+            assert_eq!(cell.bg, ROW_ACTIVE);
+        }
+        let rendered = cells
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            "answer".to_string(),
-            None,
-            false,
-            true,
-        );
-        let conversation = render_to_string(&mut app, 100, 24);
-        assert!(conversation.contains("1 image ready"));
-        let footer = conversation
-            .lines()
-            .find(|line| line.contains("········"))
-            .expect("conversation footer");
-        assert!(footer.contains("model"));
-        assert!(!footer.contains("image"));
+        assert!(rendered.contains("🖼 #1"));
+        assert!(!rendered.contains("MESSAGE · 1 image"));
+        assert!(!rendered.contains("image ready"));
+        assert!(!rendered.contains("Alt+Backspace"));
     }
 
     #[test]
-    fn sent_user_messages_show_an_image_count_without_changing_copied_text() {
+    fn mouse_clicks_snap_to_image_token_edges() {
         let mut app = test_app();
-        apply_event(
-            &mut app,
-            0,
-            EventKind::User {
-                text: "look at this".into(),
-            },
-        );
-        apply_event(
-            &mut app,
-            1,
-            EventKind::ModelMessage {
-                message: Message::User {
-                    content: vec![
-                        UserContent::text("look at this"),
-                        UserContent::image_base64(
-                            "abc",
-                            Some(rig::message::ImageMediaType::PNG),
-                            None,
-                        ),
-                    ],
-                },
-            },
-        );
+        app.skip_splash();
+        app.overlay = Some(Overlay::Composer);
+        app.insert_clipboard_image(vec![1]);
+        render_to_string(&mut app, 80, 24);
+        let inner = app.composer_view.as_ref().unwrap().inner;
 
-        assert_eq!(app.blocks[0].text, "look at this");
-        assert_eq!(app.blocks[0].images, 1);
-        app.busy = false;
-        app.activity = None;
-        let rendered = render_to_string(&mut app, 80, 24);
-        assert!(rendered.contains("look at this"));
-        assert!(rendered.contains("1 image"));
+        assert!(handle_composer_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 1,
+                row: inner.y,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(app.input.cursor(), (0, 0));
+        app.composer_mouse_selecting = false;
+        assert!(handle_composer_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 4,
+                row: inner.y,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(app.input.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn restoring_pending_images_merges_and_renumbers_composer_tokens() {
+        let mut app = test_app();
+        app.insert_clipboard_image(vec![2]);
+
+        app.restore_pending_to_draft("queued [Image #1]", vec![ImageAttachment::png(vec![1])]);
+
+        assert_eq!(app.draft_text(), "queued 🖼 #1\n\n🖼 #2");
+        let (prompt, images) = app.composer_submission();
+        assert_eq!(prompt, "queued [Image #1]\n\n[Image #2]");
+        assert_eq!(
+            images,
+            [ImageAttachment::png(vec![1]), ImageAttachment::png(vec![2])]
+        );
+    }
+
+    #[test]
+    fn persisted_drafts_drop_image_tokens_without_binary_attachments() {
+        assert_eq!(
+            strip_image_references("before 🖼 #1\nafter [Image #20]"),
+            "before \nafter "
+        );
     }
 
     #[test]
@@ -9281,7 +9696,7 @@ mod tests {
         app.overlay = Some(Overlay::Composer);
         app.input.insert_str("adjust the implementation");
         let image = ImageAttachment::png(vec![1, 2, 3]);
-        app.pending_images.push(image.clone());
+        app.insert_clipboard_image(vec![1, 2, 3]);
 
         assert!(app.submit().is_none());
         assert!(app.overlay == Some(Overlay::Delivery));
@@ -9292,7 +9707,7 @@ mod tests {
                 prompt,
                 images,
                 kind: PendingMessageKind::Queued,
-            } if prompt == "adjust the implementation"
+            } if prompt == "adjust the implementation[Image #1]"
                 && images.as_slice() == std::slice::from_ref(&image)
         ));
 
@@ -9303,7 +9718,7 @@ mod tests {
                 prompt,
                 images,
                 kind: PendingMessageKind::Guidance,
-            } if prompt == "adjust the implementation"
+            } if prompt == "adjust the implementation[Image #1]"
                 && images.as_slice() == std::slice::from_ref(&image)
         ));
         let rendered = render_to_string(&mut app, 100, 24);
@@ -9507,15 +9922,16 @@ mod tests {
     }
 
     #[test]
-    fn composer_shows_pending_image_count_and_removal_shortcut() {
+    fn composer_footer_does_not_show_image_count_or_removal_shortcut() {
         let mut app = test_app();
         app.overlay = Some(Overlay::Composer);
-        app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
+        app.insert_clipboard_image(vec![1, 2, 3]);
 
         let rendered = render_to_string(&mut app, 80, 24);
 
-        assert!(rendered.contains("MESSAGE · 1 image"));
-        assert!(rendered.contains("Alt+Backspace remove latest image"));
+        assert!(rendered.contains("🖼 #1"));
+        assert!(!rendered.contains("MESSAGE · 1 image"));
+        assert!(!rendered.contains("Alt+Backspace"));
     }
 
     #[test]

@@ -22,7 +22,6 @@ map("main", "space", "compose");
 map("main", "@", "reference");
 map("main", "ctrl+v", "paste");
 map("main", "alt+v", "paste_image");
-map("main", "alt+backspace", "remove_last_image");
 map("main", ":", "command");
 map("main", "?", "help");
 map("main", "r", "jump_reasoning");
@@ -64,7 +63,6 @@ map("composer", "ctrl+delete", "delete_next_word");
 map("composer", "tab", "complete");
 map("composer", "ctrl+v", "paste");
 map("composer", "alt+v", "paste_image");
-map("composer", "alt+backspace", "remove_last_image");
 map("composer", "ctrl+z", "undo");
 map("composer", "ctrl+shift+z", "redo");
 map("composer", "ctrl+c", "copy");
@@ -346,10 +344,7 @@ mod tests {
             keymap.action("main", "alt+v").as_deref(),
             Some("paste_image")
         );
-        assert_eq!(
-            keymap.action("main", "alt+backspace").as_deref(),
-            Some("remove_last_image")
-        );
+        assert_eq!(keymap.action("main", "alt+backspace"), None);
         assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);
@@ -411,10 +406,7 @@ mod tests {
             keymap.action("composer", "alt+v").as_deref(),
             Some("paste_image")
         );
-        assert_eq!(
-            keymap.action("composer", "alt+backspace").as_deref(),
-            Some("remove_last_image")
-        );
+        assert_eq!(keymap.action("composer", "alt+backspace"), None);
         assert_eq!(keymap.action("composer", "ctrl+z").as_deref(), Some("undo"));
         assert_eq!(
             keymap.action("composer", "ctrl+shift+z").as_deref(),
