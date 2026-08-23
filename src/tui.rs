@@ -204,6 +204,17 @@ impl Activity {
     }
 }
 
+struct FlashNotice {
+    message: String,
+    created: Instant,
+}
+
+impl FlashNotice {
+    fn visible_at(&self, now: Instant) -> bool {
+        now.duration_since(self.created) < flash_duration(&self.message)
+    }
+}
+
 fn retry_delay_label(delay_ms: u64) -> String {
     if delay_ms < 1_000 {
         format!("{delay_ms}ms")
@@ -461,8 +472,7 @@ struct App {
     reasoning_folded_during_stream: bool,
     next_process_id: u64,
     info: TuiInfo,
-    flash: Option<String>,
-    flash_at: Option<Instant>,
+    flashes: Vec<FlashNotice>,
     model_selector: Option<ModelSelector>,
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
@@ -539,8 +549,7 @@ impl App {
             reasoning_folded_during_stream: false,
             next_process_id: 0,
             info,
-            flash: None,
-            flash_at: None,
+            flashes: Vec::new(),
             model_selector: None,
             catalog_refreshing: false,
             settings: None,
@@ -1156,15 +1165,25 @@ impl App {
     }
 
     fn set_flash(&mut self, message: impl Into<String>) {
-        self.flash = Some(message.into());
-        self.flash_at = Some(Instant::now());
+        let now = Instant::now();
+        self.flashes.retain(|notice| notice.visible_at(now));
+        self.flashes.push(FlashNotice {
+            message: message.into(),
+            created: now,
+        });
     }
 
-    fn visible_flash(&self) -> Option<&str> {
-        self.flash.as_deref().filter(|message| {
-            self.flash_at
-                .is_some_and(|created| created.elapsed() < flash_duration(message))
-        })
+    fn visible_flashes(&self) -> impl DoubleEndedIterator<Item = &str> {
+        let now = Instant::now();
+        self.flashes
+            .iter()
+            .filter(move |notice| notice.visible_at(now))
+            .map(|notice| notice.message.as_str())
+    }
+
+    fn prune_flashes(&mut self) {
+        let now = Instant::now();
+        self.flashes.retain(|notice| notice.visible_at(now));
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -4283,13 +4302,13 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_brand(frame, app, area, true);
         return;
     }
+    app.prune_flashes();
     let idle = app.blocks.is_empty();
-    let notice = status_notice(app)
-        .map(|(message, color)| (status_notice_lines(&message, area.width), color));
-    let notice_height = notice
-        .as_ref()
-        .map_or(0, |(lines, _)| lines.len().min(u16::MAX as usize) as u16);
-    let constraints = match (idle, notice.is_some()) {
+    let notices = bottom_notices(app);
+    let notice_lines = bottom_notice_lines(&notices, area.width);
+    let has_notices = !notice_lines.is_empty();
+    let notice_height = notice_lines.len().min(u16::MAX as usize) as u16;
+    let constraints = match (idle, has_notices) {
         (true, false) => vec![Constraint::Min(3)],
         (true, true) => vec![Constraint::Min(3), Constraint::Length(notice_height)],
         (false, false) => vec![Constraint::Min(3), Constraint::Length(1)],
@@ -4308,14 +4327,14 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         areas[0]
     } else {
         render_transcript(frame, app, areas[0]);
-        let footer_area = if notice.is_some() { areas[2] } else { areas[1] };
+        let footer_area = if has_notices { areas[2] } else { areas[1] };
         render_footer(frame, app, footer_area);
         areas[0]
     };
-    if let Some((lines, color)) = notice {
+    if has_notices {
         frame.render_widget(
-            Paragraph::new(lines)
-                .style(Style::default().fg(color).bg(SURFACE))
+            Paragraph::new(notice_lines)
+                .style(Style::default().bg(SURFACE))
                 .block(Block::new().padding(Padding::horizontal(1))),
             areas[1],
         );
@@ -4422,8 +4441,8 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ]
 }
 
-/// Minimal conversation footer. Project, usage, and extension details stay
-/// available through the bottom-anchored status panel.
+/// Minimal conversation footer. Live activity follows the model while project,
+/// usage, and extension details stay in the bottom-anchored status panel.
 fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -4439,16 +4458,33 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         available,
     );
     let context_width = context.width();
-    let model_limit = available.saturating_sub(context_width + 2);
+    let left_limit = available.saturating_sub(context_width + 2);
+    let activity = footer_activity(app)
+        .map(|activity| single_line_preview(&activity, left_limit))
+        .unwrap_or_default();
+    let activity_width = activity.width();
+    let activity_gap = usize::from(!activity.is_empty()) * 2;
+    let model_limit = left_limit.saturating_sub(activity_width + activity_gap);
     let model = single_line_preview(&compact_model(app), model_limit);
     let model_width = model.width();
-    let gap = available.saturating_sub(model_width + context_width);
+    let activity_gap = if model.is_empty() || activity.is_empty() {
+        0
+    } else {
+        activity_gap
+    };
+    let gap = available.saturating_sub(model_width + activity_gap + activity_width + context_width);
     let mut spans = Vec::new();
     if !model.is_empty() {
         spans.push(Span::styled(
             model,
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ));
+    }
+    if activity_gap > 0 {
+        spans.push(Span::raw(" ".repeat(activity_gap)));
+    }
+    if !activity.is_empty() {
+        spans.push(Span::styled(activity, Style::default().fg(ACCENT)));
     }
     if gap > 0 {
         spans.push(Span::raw(" ".repeat(gap)));
@@ -4467,6 +4503,26 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         area,
         target: AppHit::Status,
     });
+}
+
+fn footer_activity(app: &App) -> Option<String> {
+    if !app.busy {
+        return None;
+    }
+    let activity = app
+        .activity
+        .as_ref()
+        .map(Activity::label)
+        .unwrap_or_else(|| "working".to_string());
+    let elapsed = app
+        .busy_since
+        .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
+        .unwrap_or_default();
+    Some(format!(
+        "{} {activity}{elapsed}  {}",
+        animation::spinner(app.frame),
+        animation::activity(app.frame, 8)
+    ))
 }
 
 fn compact_model(app: &App) -> String {
@@ -4988,48 +5044,31 @@ fn wrapped_block_lines(text: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-fn status_notice(app: &App) -> Option<(String, Color)> {
-    let (message, color) = if app.busy {
-        let activity = app
-            .activity
-            .as_ref()
-            .map(Activity::label)
-            .unwrap_or_else(|| "working".to_string());
-        let elapsed = app
-            .busy_since
-            .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
-            .unwrap_or_default();
-        let pending = if app.pending_messages.is_empty() {
-            String::new()
-        } else {
-            format!(" · {} pending", app.pending_messages.len())
-        };
-        (
-            format!(
-                "{} {activity}{elapsed}{pending}  {}",
-                animation::spinner(app.frame),
-                animation::activity(app.frame, 8)
-            ),
-            ACCENT,
-        )
-    } else if !app.pending_messages.is_empty() {
+fn bottom_notices(app: &App) -> Vec<(String, Color)> {
+    let mut notices = app
+        .visible_flashes()
+        .rev()
+        .map(|flash| {
+            (
+                flash.to_string(),
+                if flash_is_error(flash) { ERROR } else { WARM },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !app.pending_messages.is_empty() {
         let restore = app
             .keymap
             .key_for("composer", "restore_pending")
             .unwrap_or_else(|| "Alt+Up".to_string());
-        (
+        notices.push((
             format!(
                 " {} pending · open composer and restore with {restore}",
                 app.pending_messages.len(),
             ),
             WARM,
-        )
-    } else if let Some(flash) = app.visible_flash() {
-        (
-            flash.to_string(),
-            if flash_is_error(flash) { ERROR } else { WARM },
-        )
-    } else if app.jump != JumpKind::All {
+        ));
+    }
+    if app.jump != JumpKind::All {
         let label = match app.jump {
             JumpKind::Reasoning => "thinking",
             JumpKind::Tool => "tools",
@@ -5042,22 +5081,21 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
             .position(|index| *index == app.selected_block)
             .map(|index| index + 1)
             .unwrap_or(0);
-        (
+        notices.push((
             format!(
                 "{label} {position}/{}   esc clear   enter open",
                 indices.len()
             ),
             WARM,
-        )
-    } else if app.clipboard_image_loading || !app.pending_images.is_empty() {
-        (
+        ));
+    }
+    if app.clipboard_image_loading || !app.pending_images.is_empty() {
+        notices.push((
             pending_image_notice(app.pending_images.len(), app.clipboard_image_loading),
             WARM,
-        )
-    } else {
-        return None;
-    };
-    Some((message, color))
+        ));
+    }
+    notices
 }
 
 fn pending_image_notice(count: usize, loading: bool) -> String {
@@ -5088,10 +5126,14 @@ fn user_message_image_count(message: &Message) -> usize {
     }
 }
 
-fn status_notice_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    wrapped_block_lines(message, width.saturating_sub(2).max(1) as usize)
-        .into_iter()
-        .map(Line::raw)
+fn bottom_notice_lines(notices: &[(String, Color)], width: u16) -> Vec<Line<'static>> {
+    notices
+        .iter()
+        .flat_map(|(message, color)| {
+            wrapped_block_lines(message, width.saturating_sub(2).max(1) as usize)
+                .into_iter()
+                .map(move |line| Line::styled(line, Style::default().fg(*color)))
+        })
         .collect()
 }
 
@@ -7270,7 +7312,7 @@ mod tests {
 
         let width = 24;
         let height = 12;
-        let notice_height = status_notice_lines(message, width).len();
+        let notice_height = bottom_notice_lines(&[(message.to_string(), WARM)], width).len();
         assert!(notice_height > 1);
 
         let backend = TestBackend::new(width, height);
@@ -7302,6 +7344,47 @@ mod tests {
     }
 
     #[test]
+    fn new_notifications_stack_upward_above_fixed_statuses() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            false,
+        );
+        app.busy = true;
+        app.activity = Some(Activity::Thinking);
+        app.pending_messages.push(PendingMessage {
+            id: 1,
+            text: "follow up".to_string(),
+            kind: PendingMessageKind::Queued,
+        });
+        app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
+        app.set_flash("Older notification");
+        app.set_flash("Newer notification");
+
+        let rendered = render_to_string(&mut app, 100, 24);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let row = |text: &str| {
+            rows.iter()
+                .position(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("missing {text:?}"))
+        };
+
+        assert!(row("Newer notification") < row("Older notification"));
+        assert!(row("Older notification") < row("1 pending"));
+        assert!(row("1 pending") < row("1 image ready"));
+        assert!(row("1 image ready") < row("model · effort off"));
+        let footer = rows.last().unwrap();
+        assert!(footer.starts_with("model · effort off"));
+        assert!(footer.contains("thinking"));
+        assert!(footer.trim_end().ends_with("········ 0.0%/128k"));
+    }
+
+    #[test]
     fn flash_residence_time_scales_with_character_count() {
         assert_eq!(flash_duration(""), FLASH_MIN_DURATION);
         assert_eq!(flash_duration("é"), flash_duration("e\u{301}"));
@@ -7313,12 +7396,16 @@ mod tests {
 
         let elapsed = flash_duration(short) + Duration::from_millis(10);
         let mut app = test_app();
-        app.flash = Some(short.to_string());
-        app.flash_at = Some(Instant::now() - elapsed);
-        assert_eq!(app.visible_flash(), None);
-        app.flash = Some(long);
-        app.flash_at = Some(Instant::now() - elapsed);
-        assert!(app.visible_flash().is_some());
+        app.flashes.push(FlashNotice {
+            message: short.to_string(),
+            created: Instant::now() - elapsed,
+        });
+        assert!(app.visible_flashes().next().is_none());
+        app.flashes.push(FlashNotice {
+            message: long,
+            created: Instant::now() - elapsed,
+        });
+        assert!(app.visible_flashes().next().is_some());
     }
 
     #[test]
@@ -8139,13 +8226,23 @@ mod tests {
         assert!(!app.clipboard_image_loading);
         assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
         assert!(app.overlay.is_none());
-        assert!(app.visible_flash().unwrap().contains("next message"));
+        assert!(
+            app.visible_flashes()
+                .next_back()
+                .unwrap()
+                .contains("next message")
+        );
 
         app.clipboard_image_loading = true;
         app.finish_clipboard_image_read(Err(anyhow!("clipboard unavailable")));
         assert!(!app.clipboard_image_loading);
         assert_eq!(app.pending_images, [ImageAttachment::png(vec![1, 2, 3])]);
-        assert!(app.visible_flash().unwrap().contains("failed"));
+        assert!(
+            app.visible_flashes()
+                .next_back()
+                .unwrap()
+                .contains("failed")
+        );
     }
 
     #[test]
@@ -9451,7 +9548,10 @@ mod tests {
         let mut app = test_app();
         open_search(&mut app);
         assert!(app.overlay.is_none());
-        assert_eq!(app.visible_flash(), Some("No conversation text to search"));
+        assert_eq!(
+            app.visible_flashes().next_back(),
+            Some("No conversation text to search")
+        );
 
         app.selector = Some(SelectorState::new(
             SelectorKind::Resume,
@@ -9736,8 +9836,8 @@ mod tests {
         assert!(app.busy);
         let rendered = render_to_string(&mut app, 100, 24);
         let rows = rendered.lines().collect::<Vec<_>>();
-        assert!(rows[22].contains("thinking"));
         assert!(rows[23].starts_with("model · effort off"));
+        assert!(rows[23].contains("thinking"));
         assert!(rows[23].trim_end().ends_with("········ 0.0%/128k"));
         app.apply(SessionEvent {
             sequence: 2,
@@ -9749,6 +9849,8 @@ mod tests {
             },
         });
         assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.lines().last().unwrap().contains("running file"));
         app.apply(SessionEvent {
             sequence: 3,
             at: chrono::Utc::now(),
