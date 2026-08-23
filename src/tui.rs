@@ -159,6 +159,7 @@ enum EditingSetting {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppHit {
     Transcript(usize),
+    TranscriptTail,
     Delivery(usize),
     Palette(usize),
     Task(usize),
@@ -2958,6 +2959,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             let activate = is_double_click(&mut app.last_click, target);
             match target {
                 AppHit::Transcript(_) => unreachable!(),
+                AppHit::TranscriptTail => unreachable!(),
                 AppHit::Delivery(index) => {
                     if let Some(delivery) = app.delivery.as_mut() {
                         delivery.selected = index;
@@ -3106,8 +3108,17 @@ fn activate_transcript_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         MouseEventKind::Down(MouseButton::Right) => true,
         _ => return false,
     };
-    let Some(AppHit::Transcript(index)) = hit_target(&app.hit_regions, mouse) else {
-        return false;
+    let index = match hit_target(&app.hit_regions, mouse) {
+        Some(AppHit::TranscriptTail) if !open_document => {
+            app.last_click = None;
+            app.transcript_offset =
+                transcript_live_tail(app.transcript_rows, app.transcript_height);
+            app.transcript_follow_tail = true;
+            app.transcript_center_selected = false;
+            return true;
+        }
+        Some(AppHit::Transcript(index)) => index,
+        _ => return false,
     };
     if !app
         .blocks
@@ -4308,27 +4319,40 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let notice_lines = bottom_notice_lines(&notices, area.width);
     let has_notices = !notice_lines.is_empty();
     let notice_height = notice_lines.len().min(u16::MAX as usize) as u16;
+    let live_activity = footer_activity(app);
+    let footer_height = 1 + u16::from(live_activity.is_some());
     let constraints = match (idle, has_notices) {
         (true, false) => vec![Constraint::Min(3)],
         (true, true) => vec![Constraint::Min(3), Constraint::Length(notice_height)],
-        (false, false) => vec![Constraint::Min(3), Constraint::Length(1)],
+        (false, false) => vec![Constraint::Min(3), Constraint::Length(footer_height)],
         (false, true) => vec![
             Constraint::Min(3),
             Constraint::Length(notice_height),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ],
     };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+    let footer_area = if idle {
+        None
+    } else if has_notices {
+        Some(areas[2])
+    } else {
+        Some(areas[1])
+    };
     let content = if idle {
         render_brand(frame, app, areas[0], false);
         areas[0]
     } else {
         render_transcript(frame, app, areas[0]);
-        let footer_area = if has_notices { areas[2] } else { areas[1] };
-        render_footer(frame, app, footer_area);
+        render_footer(
+            frame,
+            app,
+            footer_area.expect("conversation footer area"),
+            live_activity.as_deref(),
+        );
         areas[0]
     };
     if has_notices {
@@ -4354,6 +4378,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
         capture_surface(frame, app, selectable_area);
         render_selection(frame, app);
+    }
+    if app.overlay.is_none()
+        && let Some(footer_area) = footer_area.filter(|area| area.height == 1)
+    {
+        render_floating_tail_button(frame, app, footer_area);
     }
 }
 
@@ -4443,7 +4472,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
 /// Minimal conversation footer. Live activity follows the model while project,
 /// usage, and extension details stay in the bottom-anchored status panel.
-fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity: Option<&str>) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -4458,51 +4487,112 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         available,
     );
     let context_width = context.width();
-    let left_limit = available.saturating_sub(context_width + 2);
-    let activity = footer_activity(app)
-        .map(|activity| single_line_preview(&activity, left_limit))
-        .unwrap_or_default();
-    let activity_width = activity.width();
-    let activity_gap = usize::from(!activity.is_empty()) * 2;
-    let model_limit = left_limit.saturating_sub(activity_width + activity_gap);
+    let model_limit = available.saturating_sub(context_width + 2);
     let model = single_line_preview(&compact_model(app), model_limit);
     let model_width = model.width();
-    let activity_gap = if model.is_empty() || activity.is_empty() {
-        0
-    } else {
-        activity_gap
-    };
-    let gap = available.saturating_sub(model_width + activity_gap + activity_width + context_width);
-    let mut spans = Vec::new();
+    let gap = available.saturating_sub(model_width + context_width);
+    let mut base = Vec::new();
     if !model.is_empty() {
-        spans.push(Span::styled(
+        base.push(Span::styled(
             model,
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ));
     }
-    if activity_gap > 0 {
-        spans.push(Span::raw(" ".repeat(activity_gap)));
-    }
-    if !activity.is_empty() {
-        spans.push(Span::styled(activity, Style::default().fg(ACCENT)));
-    }
     if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
+        base.push(Span::raw(" ".repeat(gap)));
     }
-    spans.push(Span::styled(
+    base.push(Span::styled(
         context,
         Style::default()
             .fg(context_color(percent))
             .add_modifier(Modifier::BOLD),
     ));
+    let mut lines = Vec::new();
+    if area.height > 1
+        && let Some(activity) = live_activity
+    {
+        let show_tail_button = transcript_away_from_tail(app) && available > 0;
+        let tail_button = if " ↓ bottom ".width() <= available {
+            " ↓ bottom "
+        } else {
+            "↓"
+        };
+        let tail_button_width = usize::from(show_tail_button) * tail_button.width();
+        let activity_x = if model_width > 0 { model_width + 2 } else { 0 }
+            .min(available.saturating_sub(tail_button_width));
+        let activity_limit = available
+            .saturating_sub(activity_x + tail_button_width + usize::from(show_tail_button) * 2);
+        let activity = single_line_preview(activity, activity_limit);
+        let activity_width = activity.width();
+        let activity_gap =
+            available.saturating_sub(activity_x + activity_width + tail_button_width);
+        let mut activity_line = vec![Span::raw(" ".repeat(activity_x))];
+        if !activity.is_empty() {
+            activity_line.push(Span::styled(activity, Style::default().fg(ACCENT)));
+        }
+        if activity_gap > 0 {
+            activity_line.push(Span::raw(" ".repeat(activity_gap)));
+        }
+        if show_tail_button {
+            let button_x = area.right().saturating_sub(tail_button_width as u16);
+            activity_line.push(Span::styled(
+                tail_button,
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(ROW_ACTIVE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            app.hit_regions.insert(
+                0,
+                HitRegion {
+                    area: Rect::new(button_x, area.y, tail_button_width as u16, 1),
+                    target: AppHit::TranscriptTail,
+                },
+            );
+        }
+        lines.push(Line::from(activity_line));
+    }
+    lines.push(Line::from(base));
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
+        Paragraph::new(lines).style(Style::default().bg(SURFACE)),
         area,
     );
     app.hit_regions.push(HitRegion {
         area,
         target: AppHit::Status,
     });
+}
+
+fn render_floating_tail_button(frame: &mut Frame<'_>, app: &mut App, footer_area: Rect) {
+    if !transcript_away_from_tail(app) || footer_area.width == 0 || footer_area.y == 0 {
+        return;
+    }
+    let area = Rect::new(
+        footer_area.right().saturating_sub(1),
+        footer_area.y.saturating_sub(1),
+        1,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new("↓").style(
+            Style::default()
+                .fg(ACCENT)
+                .bg(ROW_ACTIVE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
+    app.hit_regions.insert(
+        0,
+        HitRegion {
+            area,
+            target: AppHit::TranscriptTail,
+        },
+    );
+}
+
+fn transcript_away_from_tail(app: &App) -> bool {
+    app.transcript_offset != transcript_live_tail(app.transcript_rows, app.transcript_height)
 }
 
 fn footer_activity(app: &App) -> Option<String> {
@@ -7384,10 +7474,12 @@ mod tests {
         assert!(row("Newer notification") < row("Older notification"));
         assert!(row("Older notification") < row("1 pending"));
         assert!(row("1 pending") < row("1 image ready"));
-        assert!(row("1 image ready") < row("model · effort off"));
+        let activity_row = rows.len() - 2;
+        assert!(row("1 image ready") < activity_row);
+        assert!(rows[activity_row].contains("thinking"));
         let footer = rows.last().unwrap();
         assert!(footer.starts_with("model · effort off"));
-        assert!(footer.contains("thinking"));
+        assert!(!footer.contains("thinking"));
         assert!(footer.trim_end().ends_with("········ 0.0%/128k"));
     }
 
@@ -9163,6 +9255,96 @@ mod tests {
     }
 
     #[test]
+    fn scrolled_transcript_shows_a_mouse_button_that_returns_to_the_live_tail() {
+        let mut app = test_app();
+        for index in 0..30 {
+            app.push(
+                BlockKind::Assistant,
+                "AGENT",
+                format!("message {index}"),
+                None,
+                false,
+                true,
+            );
+        }
+        app.selected_block = 12;
+        render_to_string(&mut app, 80, 12);
+        app.scroll_transcript(-3);
+        app.busy = true;
+        app.activity = Some(Activity::Thinking);
+
+        let rendered = render_to_string(&mut app, 80, 12);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        let activity = rows[10];
+        let footer = rows[11];
+        assert_eq!(
+            activity
+                .chars()
+                .position(|character| !character.is_whitespace()),
+            Some(compact_model(&app).width() + 2)
+        );
+        assert!(activity.contains("thinking"));
+        assert!(activity.ends_with(" ↓ bottom "));
+        assert!(footer.starts_with("model · effort off"));
+        assert!(footer.trim_end().ends_with("········ 0.0%/128k"));
+        assert!(!footer.contains("↓ bottom"));
+        let button = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == AppHit::TranscriptTail)
+            .copied()
+            .expect("return-to-bottom mouse target");
+        assert_eq!(button.area, Rect::new(70, 10, 10, 1));
+
+        let narrow = render_to_string(&mut app, 12, 12);
+        assert!(narrow.lines().nth(10).unwrap().contains("↓ bottom"));
+        let narrow_button = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == AppHit::TranscriptTail)
+            .expect("narrow return-to-bottom mouse target");
+        assert_eq!(narrow_button.area, Rect::new(2, 10, 10, 1));
+
+        app.busy = false;
+        app.activity = None;
+        let rendered = render_to_string(&mut app, 80, 12);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        assert!(rows[10].ends_with('↓'));
+        assert!(!rows[11].contains('↓'));
+        let floating_button = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == AppHit::TranscriptTail)
+            .copied()
+            .expect("floating return-to-bottom mouse target");
+        assert_eq!(floating_button.area, Rect::new(79, 10, 1, 1));
+        assert_eq!(app.selectable.as_ref().unwrap().cells[10][79], " ");
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: floating_button.area.x,
+            row: floating_button.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(activate_transcript_mouse(&mut app, click));
+        assert_eq!(app.selected_block, 12);
+        assert!(app.transcript_follow_tail);
+        assert_eq!(
+            app.transcript_offset,
+            transcript_live_tail(app.transcript_rows, app.transcript_height)
+        );
+
+        let rendered = render_to_string(&mut app, 80, 12);
+        assert!(rendered.contains("message 29"));
+        assert!(!rendered.contains('↓'));
+        assert!(
+            app.hit_regions
+                .iter()
+                .all(|region| region.target != AppHit::TranscriptTail)
+        );
+    }
+
+    #[test]
     fn manual_scroll_can_lift_the_final_row_to_the_viewport_middle() {
         let mut app = test_app();
         for index in 0..30 {
@@ -9843,8 +10025,8 @@ mod tests {
         assert!(app.busy);
         let rendered = render_to_string(&mut app, 100, 24);
         let rows = rendered.lines().collect::<Vec<_>>();
+        assert!(rows[22].contains("thinking"));
         assert!(rows[23].starts_with("model · effort off"));
-        assert!(rows[23].contains("thinking"));
         assert!(rows[23].trim_end().ends_with("········ 0.0%/128k"));
         app.apply(SessionEvent {
             sequence: 2,
@@ -9857,7 +10039,7 @@ mod tests {
         });
         assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
         let rendered = render_to_string(&mut app, 100, 24);
-        assert!(rendered.lines().last().unwrap().contains("running file"));
+        assert!(rendered.lines().nth(22).unwrap().contains("running file"));
         app.apply(SessionEvent {
             sequence: 3,
             at: chrono::Utc::now(),
