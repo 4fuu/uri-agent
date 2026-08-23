@@ -15,7 +15,7 @@ use crate::plugin::{
     TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
-use crate::runtime::{AgentRuntime, ImageAttachment};
+use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
 use crate::session::{EventKind, SessionEvent, SessionSummary, SessionUpdate};
 use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
@@ -43,7 +43,7 @@ use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 use tui_term::widget::PseudoTerminal;
 use tui_textarea::{CursorMove, TextArea, WrapMode};
@@ -127,6 +127,7 @@ struct ProcessDisplay {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Overlay {
     Composer,
+    Delivery,
     Command,
     Status,
     Help,
@@ -158,6 +159,7 @@ enum EditingSetting {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppHit {
     Transcript(usize),
+    Delivery(usize),
     Palette(usize),
     Task(usize),
     Model(usize),
@@ -326,6 +328,10 @@ struct SelectorState {
     selected: usize,
 }
 
+struct DeliveryState {
+    selected: usize,
+}
+
 impl SelectorState {
     fn new(kind: SelectorKind, title: impl Into<String>, items: Vec<SelectorItem>) -> Self {
         let mut selector = Self {
@@ -435,6 +441,7 @@ struct App {
     selected_task: usize,
     selected_block: usize,
     overlay: Option<Overlay>,
+    delivery: Option<DeliveryState>,
     overlay_scroll: u16,
     jump: JumpKind,
     busy: bool,
@@ -482,6 +489,7 @@ struct App {
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
     last_interrupt_press: Option<(String, Instant)>,
+    pending_messages: Vec<PendingMessage>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
     tui_document: Option<TuiDocument>,
@@ -511,6 +519,7 @@ impl App {
             selected_task: 0,
             selected_block: 0,
             overlay: None,
+            delivery: None,
             overlay_scroll: 0,
             jump: JumpKind::All,
             busy: false,
@@ -558,6 +567,7 @@ impl App {
             last_cache_hit: None,
             branch: None,
             last_interrupt_press: None,
+            pending_messages: Vec::new(),
             commands,
             tui,
             tui_document: None,
@@ -573,7 +583,7 @@ impl App {
     }
 
     fn animations_paused(&self) -> bool {
-        self.overlay == Some(Overlay::Composer)
+        matches!(self.overlay, Some(Overlay::Composer | Overlay::Delivery))
     }
 
     fn interrupt_on_double_press(&mut self, key: KeyEvent, key_name: &str) -> bool {
@@ -1003,12 +1013,20 @@ impl App {
     }
 
     fn submit(&mut self) -> Option<(String, Vec<ImageAttachment>)> {
-        if self.busy {
-            self.set_flash("A turn is already running");
-            return None;
-        }
         if self.clipboard_image_loading {
             self.set_flash("Still reading the clipboard image");
+            return None;
+        }
+        if self.busy {
+            if matches!(self.activity, Some(Activity::Compacting)) {
+                self.set_flash("Wait for compaction to finish");
+                return None;
+            }
+            if self.draft_text().trim().is_empty() {
+                return None;
+            }
+            self.delivery = Some(DeliveryState { selected: 0 });
+            self.overlay = Some(Overlay::Delivery);
             return None;
         }
         let text = self.input.lines().join("\n");
@@ -1060,6 +1078,28 @@ impl App {
             self.pending_images.len(),
             self.clipboard_image_loading,
         );
+    }
+
+    fn clear_accepted_draft(&mut self) {
+        self.input = TextArea::default();
+        self.pending_images.clear();
+        self.sync_composer_chrome();
+        self.composer_mouse_selecting = false;
+        self.delivery = None;
+        self.overlay = None;
+    }
+
+    fn restore_to_draft(&mut self, text: &str) {
+        let current = self.draft_text();
+        let restored = [text, current.as_str()]
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.input = TextArea::default();
+        self.input.insert_str(restored);
+        self.sync_composer_chrome();
+        self.overlay = Some(Overlay::Composer);
     }
 
     fn draft_text(&self) -> String {
@@ -1462,6 +1502,7 @@ impl App {
         self.settings = None;
         self.model_selector = None;
         self.tui_document = None;
+        self.delivery = None;
         self.overlay = None;
         self.overlay_scroll = 0;
     }
@@ -1548,6 +1589,7 @@ impl TuiTerminal {
             effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
         let session = runtime.session().clone();
         let mut receiver = session.subscribe();
+        let mut pending_receiver = runtime.subscribe_pending_messages();
         let keymap = Keymap::load(Some(&info.cwd)).await?;
         let show_splash = std::mem::take(&mut self.first_session);
         let mut app = App::new(
@@ -1559,6 +1601,7 @@ impl TuiTerminal {
             draft,
             show_splash,
         );
+        app.pending_messages = pending_receiver.borrow().clone();
         app.protocol_source = Some(protocols);
         for event in session.snapshot().await {
             app.apply(event);
@@ -1583,7 +1626,14 @@ impl TuiTerminal {
             catalog,
             output,
         };
-        run_loop(&mut self.terminal, &mut app, services, &mut receiver).await
+        run_loop(
+            &mut self.terminal,
+            &mut app,
+            services,
+            &mut receiver,
+            &mut pending_receiver,
+        )
+        .await
     }
 }
 
@@ -1607,6 +1657,7 @@ async fn run_loop(
     app: &mut App,
     services: LoopServices,
     receiver: &mut tokio::sync::broadcast::Receiver<SessionUpdate>,
+    pending_receiver: &mut watch::Receiver<Vec<PendingMessage>>,
 ) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
@@ -1692,6 +1743,11 @@ async fn run_loop(
                     return persist_and_exit(app, &services, TuiOutcome::Quit).await;
                 }
             },
+            changed = pending_receiver.changed() => {
+                if changed.is_ok() {
+                    app.pending_messages = pending_receiver.borrow().clone();
+                }
+            },
             Some(event) = background_rx.recv() => {
                 finish_background(app, &services, event).await;
             },
@@ -1732,6 +1788,13 @@ enum Action {
         prompt: String,
         images: Vec<ImageAttachment>,
     },
+    Enqueue {
+        prompt: String,
+        images: Vec<ImageAttachment>,
+        kind: PendingMessageKind,
+    },
+    RestorePending,
+    UpgradePending,
     ReadClipboardImage,
     InterruptTurn,
     Compact,
@@ -1777,23 +1840,67 @@ async fn apply_action(
             }
         }
         Action::Submit { prompt, images } => {
-            let _ = services.runtime.session().save_draft("").await;
             match services
                 .runtime
-                .start_turn_with_images(prompt, images)
+                .start_turn_with_images(prompt.clone(), images)
                 .await
             {
                 Ok(()) => {
                     app.pending_images.clear();
                     app.sync_composer_chrome();
+                    let _ = services.runtime.session().save_draft("").await;
                 }
                 Err(error) => {
                     app.busy = false;
                     app.busy_since = None;
                     app.activity = None;
-                    app.sync_composer_chrome();
+                    app.restore_to_draft(&prompt);
                     app.set_flash(format!("Cannot start turn: {error:#}"));
                 }
+            }
+            Ok(None)
+        }
+        Action::Enqueue {
+            prompt,
+            images,
+            kind,
+        } => {
+            match services
+                .runtime
+                .enqueue_message_with_images(prompt, images, kind)
+                .await
+            {
+                Ok(_) => {
+                    app.clear_accepted_draft();
+                    app.pending_messages = services.runtime.pending_messages().await;
+                    let _ = services.runtime.session().save_draft("").await;
+                }
+                Err(error) => {
+                    app.delivery = None;
+                    app.overlay = Some(Overlay::Composer);
+                    app.set_flash(format!("Cannot add pending message: {error:#}"));
+                }
+            }
+            Ok(None)
+        }
+        Action::RestorePending => {
+            if let Some((message, mut images)) = services.runtime.cancel_latest_pending().await {
+                images.append(&mut app.pending_images);
+                app.pending_images = images;
+                app.restore_to_draft(&message.text);
+                app.pending_messages = services.runtime.pending_messages().await;
+                app.set_flash("Pending message restored to draft");
+            } else {
+                app.set_flash("No pending message to restore");
+            }
+            Ok(None)
+        }
+        Action::UpgradePending => {
+            if services.runtime.upgrade_latest_queued().await.is_some() {
+                app.pending_messages = services.runtime.pending_messages().await;
+                app.set_flash("Queued message upgraded to guidance");
+            } else {
+                app.set_flash("No queued message to upgrade");
             }
             Ok(None)
         }
@@ -2196,6 +2303,8 @@ async fn handle_overlay_key(
                 copy_composer_selection(app);
                 Action::Continue
             }
+            Some("restore_pending") => Action::RestorePending,
+            Some("upgrade_pending") => Action::UpgradePending,
             Some("close") => {
                 app.composer_mouse_selecting = false;
                 app.overlay = None;
@@ -2206,6 +2315,28 @@ async fn handle_overlay_key(
                 app.edit_composer(key, action);
                 Action::Continue
             }
+        },
+        Overlay::Delivery => match app.keymap.action("list", key_name).as_deref() {
+            Some("previous") => {
+                if let Some(delivery) = app.delivery.as_mut() {
+                    delivery.selected = wrapped_index(delivery.selected, -1, 2);
+                }
+                Action::Continue
+            }
+            Some("next") => {
+                if let Some(delivery) = app.delivery.as_mut() {
+                    delivery.selected = wrapped_index(delivery.selected, 1, 2);
+                }
+                Action::Continue
+            }
+            Some("confirm") => confirm_delivery(app),
+            Some("close") => {
+                app.delivery = None;
+                app.overlay = Some(Overlay::Composer);
+                Action::Continue
+            }
+            Some("quit") => Action::Quit,
+            _ => Action::Continue,
         },
         Overlay::Command => match apply_command_key(app, key, key_name) {
             CommandKey::Quit => Action::Quit,
@@ -2360,6 +2491,25 @@ async fn handle_overlay_key(
                 _ => Action::Continue,
             }
         }
+    }
+}
+
+fn confirm_delivery(app: &App) -> Action {
+    let Some(delivery) = app.delivery.as_ref() else {
+        return Action::Continue;
+    };
+    let prompt = app.draft_text();
+    if prompt.trim().is_empty() {
+        return Action::Continue;
+    }
+    Action::Enqueue {
+        prompt,
+        images: app.pending_images.clone(),
+        kind: if delivery.selected == 0 {
+            PendingMessageKind::Queued
+        } else {
+            PendingMessageKind::Guidance
+        },
     }
 }
 
@@ -2710,6 +2860,11 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             Some(Overlay::Command) => {
                 app.move_command_selection(-1);
             }
+            Some(Overlay::Delivery) => {
+                if let Some(delivery) = app.delivery.as_mut() {
+                    delivery.selected = wrapped_index(delivery.selected, -1, 2);
+                }
+            }
             Some(Overlay::Selector) => {
                 if let Some(selector) = app.selector.as_mut() {
                     selector.move_selection(-1);
@@ -2735,6 +2890,11 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         MouseEventKind::ScrollDown => match app.overlay {
             Some(Overlay::Command) => {
                 app.move_command_selection(1);
+            }
+            Some(Overlay::Delivery) => {
+                if let Some(delivery) = app.delivery.as_mut() {
+                    delivery.selected = wrapped_index(delivery.selected, 1, 2);
+                }
             }
             Some(Overlay::Selector) => {
                 if let Some(selector) = app.selector.as_mut() {
@@ -2769,6 +2929,14 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             let activate = is_double_click(&mut app.last_click, target);
             match target {
                 AppHit::Transcript(_) => unreachable!(),
+                AppHit::Delivery(index) => {
+                    if let Some(delivery) = app.delivery.as_mut() {
+                        delivery.selected = index;
+                        if activate {
+                            return confirm_delivery(app);
+                        }
+                    }
+                }
                 AppHit::Palette(index) => {
                     app.command_selected = index;
                     return confirm_command(app, services).await;
@@ -3126,7 +3294,7 @@ fn open_pty(app: &mut App) {
     app.close_floats();
     let size = crossterm::terminal::size().unwrap_or((80, 24));
     let frame = Rect::new(0, 0, size.0, size.1);
-    let area = overlay_area(frame, Overlay::Terminal);
+    let area = overlay_area(frame, app, Overlay::Terminal);
     let inner = area.inner(Margin {
         horizontal: 1,
         vertical: 1,
@@ -4112,7 +4280,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     let selectable_area = if let Some(overlay) = app.overlay {
         app.hit_regions.clear();
-        let area = overlay_area(frame.area(), overlay);
+        let area = overlay_area(frame.area(), app, overlay);
         app.overlay_bounds = Some(area);
         render_overlay(frame, app, overlay);
         Some(area.inner(Margin {
@@ -4776,13 +4944,30 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
             .busy_since
             .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
             .unwrap_or_default();
+        let pending = if app.pending_messages.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} pending", app.pending_messages.len())
+        };
         (
             format!(
-                "{} {activity}{elapsed}  {}",
+                "{} {activity}{elapsed}{pending}  {}",
                 animation::spinner(app.frame),
                 animation::activity(app.frame, 8)
             ),
             ACCENT,
+        )
+    } else if !app.pending_messages.is_empty() {
+        let restore = app
+            .keymap
+            .key_for("composer", "restore_pending")
+            .unwrap_or_else(|| "Alt+Up".to_string());
+        (
+            format!(
+                " {} pending · open composer and restore with {restore}",
+                app.pending_messages.len(),
+            ),
+            WARM,
         )
     } else if let Some(flash) = app.visible_flash() {
         (
@@ -4989,11 +5174,12 @@ fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
     }
 }
 
-fn overlay_area(frame: Rect, overlay: Overlay) -> Rect {
+fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
         Overlay::Status => bottom_float(frame, 14),
-        Overlay::Composer => bottom_float(frame, 8),
+        Overlay::Composer => bottom_float(frame, 8 + pending_preview_height(app)),
+        Overlay::Delivery => bottom_float(frame, 9),
         Overlay::Text | Overlay::Oauth => Rect::new(
             2,
             frame.height.saturating_sub(12).max(2),
@@ -5025,7 +5211,7 @@ fn active_protocols(app: &App) -> Vec<ProtocolDescriptor> {
 }
 
 fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
-    let area = overlay_area(frame.area(), overlay);
+    let area = overlay_area(frame.area(), app, overlay);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -5035,18 +5221,35 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         .padding(Padding::uniform(1));
     match overlay {
         Overlay::Composer => {
+            let sections = if app.pending_messages.is_empty() {
+                vec![area]
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(pending_preview_height(app)),
+                        Constraint::Min(8),
+                    ])
+                    .split(area)
+                    .to_vec()
+            };
+            if let Some(preview) = sections.get(1).map(|_| sections[0]) {
+                render_pending_messages(frame, app, preview);
+            }
+            let composer_area = *sections.last().unwrap_or(&area);
             style_input(
                 &mut app.input,
                 app.busy,
                 app.pending_images.len(),
                 app.clipboard_image_loading,
             );
-            frame.render_widget(&app.input, area);
-            if let Some(position) = composer_cursor_position(frame, &app.input, area) {
+            frame.render_widget(&app.input, composer_area);
+            if let Some(position) = composer_cursor_position(frame, &app.input, composer_area) {
                 frame.set_cursor_position(position);
-                app.composer_view = composer_view(&app.input, area, position);
+                app.composer_view = composer_view(&app.input, composer_area, position);
             }
         }
+        Overlay::Delivery => render_delivery(frame, app, area, block),
         Overlay::Command => render_command(frame, app, area, block),
         Overlay::Status => render_status(frame, app, area, block),
         Overlay::Help => {
@@ -5381,6 +5584,121 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
     }
 }
 
+const PENDING_PREVIEW_LIMIT: usize = 4;
+
+fn pending_preview_height(app: &App) -> u16 {
+    if app.pending_messages.is_empty() {
+        0
+    } else {
+        1 + app.pending_messages.len().min(PENDING_PREVIEW_LIMIT) as u16
+            + u16::from(app.pending_messages.len() > PENDING_PREVIEW_LIMIT)
+    }
+}
+
+fn render_pending_messages(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let restore = app
+        .keymap
+        .key_for("composer", "restore_pending")
+        .unwrap_or_else(|| "alt+up".to_string());
+    let upgrade = app
+        .keymap
+        .key_for("composer", "upgrade_pending")
+        .unwrap_or_else(|| "alt+enter".to_string());
+    let mut lines = vec![Line::styled(
+        single_line_preview(
+            &format!("Pending · {restore} restore latest · {upgrade} upgrade latest queue"),
+            area.width as usize,
+        ),
+        Style::default().fg(MUTED).bg(SURFACE),
+    )];
+    let hidden = app
+        .pending_messages
+        .len()
+        .saturating_sub(PENDING_PREVIEW_LIMIT);
+    for message in app.pending_messages.iter().skip(hidden) {
+        let label = match message.kind {
+            PendingMessageKind::Queued => "QUEUE",
+            PendingMessageKind::Guidance => "GUIDE",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {label:<5} "),
+                Style::default().fg(ACCENT).bg(SURFACE),
+            ),
+            Span::styled(
+                single_line_preview(
+                    &message.text.replace(['\r', '\n'], " ↵ "),
+                    area.width.saturating_sub(8) as usize,
+                ),
+                Style::default().fg(TEXT).bg(SURFACE),
+            ),
+        ]));
+    }
+    if hidden > 0 {
+        lines.push(Line::styled(
+            format!(" … {hidden} earlier pending"),
+            Style::default().fg(MUTED).bg(SURFACE),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE)),
+        area,
+    );
+}
+
+fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let Some(delivery) = app.delivery.as_ref() else {
+        return;
+    };
+    let inner = block.inner(area);
+    frame.render_widget(
+        block.title(" SEND WHILE RUNNING · ↑/↓ select · Enter choose · Esc back "),
+        area,
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(2)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(single_line_preview(&app.draft_text(), inner.width as usize))
+            .style(Style::default().fg(MUTED)),
+        sections[0],
+    );
+    let choices = [
+        ("Queue", "Run after the current turn finishes"),
+        ("Guidance", "Add before the next model request"),
+    ];
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(index, (title, description))| {
+            let selected = delivery.selected == index;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!("{title:<12}"),
+                    Style::default().fg(if selected { ACCENT } else { TEXT }),
+                ),
+                Span::styled(*description, Style::default().fg(MUTED)),
+            ]))
+            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        });
+    let mut state = ListState::default().with_selected(Some(delivery.selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for index in 0..choices.len() {
+        let y = sections[1].y.saturating_add(index as u16);
+        if y < sections[1].bottom() {
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(sections[1].x, y, sections[1].width, 1),
+                target: AppHit::Delivery(index),
+            });
+        }
+    }
+}
+
 fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
     let Some(selector) = app.selector.as_ref() else {
@@ -5659,7 +5977,7 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
 }
 
 fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, image_loading: bool) {
-    let border = if busy { MUTED } else { ACCENT };
+    let border = ACCENT;
     let title = match (image_count, image_loading) {
         (0, false) => " MESSAGE ".to_string(),
         (0, true) => " MESSAGE · reading clipboard image… ".to_string(),
@@ -5672,7 +5990,11 @@ fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, im
             if count == 1 { "" } else { "s" }
         ),
     };
-    let footer = if image_count == 0 {
+    let footer = if busy && image_count == 0 {
+        " Enter choose delivery · Shift+Enter newline · Esc keep draft "
+    } else if busy {
+        " Enter choose delivery · Alt+Backspace remove latest image "
+    } else if image_count == 0 {
         " Enter send · Shift+Enter newline "
     } else {
         " Enter send · Alt+Backspace remove latest image "
@@ -5690,7 +6012,7 @@ fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, im
             .style(Style::default().bg(SURFACE)),
     );
     input.set_placeholder_text(if busy {
-        "A turn is already running"
+        "Add guidance or queue a follow-up…"
     } else {
         "Ask URI Agent to build, explain, or fix…"
     });
@@ -7596,7 +7918,7 @@ mod tests {
         assert!(!footer.contains("build clean"));
 
         assert_eq!(
-            overlay_area(Rect::new(0, 0, 100, 24), Overlay::Status),
+            overlay_area(Rect::new(0, 0, 100, 24), &app, Overlay::Status),
             Rect::new(2, 10, 96, 14)
         );
         app.overlay = Some(Overlay::Status);
@@ -7815,6 +8137,95 @@ mod tests {
         let rendered = render_to_string(&mut app, 80, 24);
         assert!(rendered.contains("look at this"));
         assert!(rendered.contains("1 image"));
+    }
+
+    #[test]
+    fn running_composer_enter_opens_queue_or_guidance_delivery() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.busy = true;
+        app.activity = Some(Activity::Thinking);
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("adjust the implementation");
+        let image = ImageAttachment::png(vec![1, 2, 3]);
+        app.pending_images.push(image.clone());
+
+        assert!(app.submit().is_none());
+        assert!(app.overlay == Some(Overlay::Delivery));
+        assert!(app.animations_paused());
+        assert!(matches!(
+            confirm_delivery(&app),
+            Action::Enqueue {
+                prompt,
+                images,
+                kind: PendingMessageKind::Queued,
+            } if prompt == "adjust the implementation"
+                && images.as_slice() == std::slice::from_ref(&image)
+        ));
+
+        app.delivery.as_mut().unwrap().selected = 1;
+        assert!(matches!(
+            confirm_delivery(&app),
+            Action::Enqueue {
+                prompt,
+                images,
+                kind: PendingMessageKind::Guidance,
+            } if prompt == "adjust the implementation"
+                && images.as_slice() == std::slice::from_ref(&image)
+        ));
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("SEND WHILE RUNNING"));
+        assert!(rendered.contains("Queue"));
+        assert!(rendered.contains("Guidance"));
+        assert_eq!(
+            app.hit_regions
+                .iter()
+                .filter(|region| matches!(region.target, AppHit::Delivery(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn composer_previews_pending_messages_and_restores_them_in_order() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.busy = true;
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("current draft");
+        app.pending_messages = vec![
+            PendingMessage {
+                id: 0,
+                text: "queued follow-up".to_string(),
+                kind: PendingMessageKind::Queued,
+            },
+            PendingMessage {
+                id: 1,
+                text: "guide now".to_string(),
+                kind: PendingMessageKind::Guidance,
+            },
+        ];
+
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("QUEUE"));
+        assert!(rendered.contains("queued follow-up"));
+        assert!(rendered.contains("GUIDE"));
+        assert!(rendered.contains("guide now"));
+        assert_eq!(
+            app.keymap.action("composer", "alt+up").as_deref(),
+            Some("restore_pending")
+        );
+        assert_eq!(
+            app.keymap.action("composer", "alt+enter").as_deref(),
+            Some("upgrade_pending")
+        );
+
+        app.restore_to_draft("guide now");
+        app.restore_to_draft("queued follow-up");
+        assert_eq!(
+            app.draft_text(),
+            "queued follow-up\n\nguide now\n\ncurrent draft"
+        );
     }
 
     #[test]

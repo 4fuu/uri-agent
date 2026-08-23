@@ -63,6 +63,8 @@ map("composer", "alt+backspace", "remove_last_image");
 map("composer", "ctrl+z", "undo");
 map("composer", "ctrl+shift+z", "redo");
 map("composer", "ctrl+c", "copy");
+map("composer", "alt+up", "restore_pending");
+map("composer", "alt+enter", "upgrade_pending");
 map("composer", "esc", "close");
 
 map("list", "down", "next");

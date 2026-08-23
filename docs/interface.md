@@ -14,13 +14,15 @@ Select a process row with the arrow keys or mouse and press `Enter` to reveal or
 
 ## Composer and commands
 
-Press `Space` to open the rounded, bottom-anchored composer. An empty composer shows a placeholder; while a turn is running, its muted state explains that another turn cannot be submitted:
+Press `Space` to open the rounded, bottom-anchored composer. An empty composer shows a placeholder. The composer remains editable while a turn is running and shows messages waiting for delivery:
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Send the request |
+| `Enter` | Send when idle; while running, choose Queue or Guidance |
 | `Shift+Enter` | Insert a newline |
 | `Ctrl+Enter` or `Ctrl+J` | Insert a newline |
+| `Alt+Up` | Restore the latest undelivered Queue or Guidance message to the draft |
+| `Alt+Enter` | Upgrade the latest queued message to Guidance |
 | `Up`/`Down` | Move between lines; at the first or last line, move to the start or end of the draft |
 | `Home`/`End`, `Ctrl+A`/`Ctrl+E` | Move to the start or end of the current line |
 | `Ctrl+Home`/`Ctrl+End` | Move to the start or end of the draft |
@@ -33,6 +35,10 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 Click to place the caret, or drag across the draft to select editable text. `Ctrl+C`, `Ctrl+Shift+C`, `Cmd+C`, or right-click copies the selected draft through OSC52.
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 Long logical lines soft-wrap at the visible composer edge; only the newline shortcuts above insert a newline into the submitted text.
+
+While a turn is running, `Enter` opens a keyboard- and mouse-selectable delivery float. **Guidance** is appended as user input after the current assistant response and its tool calls finish, immediately before the next model request. It does not interrupt an in-flight model request or tool operation. **Queue** waits until the active agent run reaches its terminal response, then starts a new user turn. Guidance takes priority over queued follow-ups at a shared boundary.
+
+The composer preview contains only messages that have not been taken for delivery. `Alt+Up` removes the newest such message and prepends it to the current draft; `Alt+Enter` changes the newest queued follow-up to Guidance. Once the runtime takes a message at its delivery boundary, it leaves the preview and can no longer be restored or upgraded. If URI Agent exits first, all still-undelivered messages are restored ahead of the saved draft.
 
 While a turn is running, press `Esc` twice within 500 milliseconds to interrupt its current model request or tool operation. The first press keeps the active surface's normal `Esc` behavior, such as closing a float, preserving the composer draft, or clearing a row filter. The interrupted turn records an error and a complete turn boundary so another request can be sent normally. The embedded terminal keeps its separate double-`Esc` behavior: it closes the terminal float instead of interrupting the model turn.
 
@@ -153,7 +159,7 @@ Each session records its provider, model, and thinking effort. Model or effort c
 
 `Esc` keeps draft text in the composer. URI Agent writes the current draft to SQLite when the TUI exits or switches sessions. Before the first message, it stores the draft separately by project so preserving a draft does not create an empty session record.
 
-Switching sessions leaves an active turn running against its original session. Exiting URI Agent cancels each active turn's in-flight wait and joins it after its interruption error and turn boundary are durable; the user does not need to wait for the model to finish naturally.
+Switching sessions leaves an active turn and its undelivered messages attached to the original session. Exiting URI Agent cancels each active turn's in-flight wait and joins it after its interruption error and turn boundary are durable; any messages that were not taken for delivery return to that session's draft, so the user does not need to wait for the model to finish naturally.
 
 ### Frozen startup context
 

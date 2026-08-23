@@ -20,6 +20,7 @@ URI Agent is currently a pre-1.0 project installed from source. Model requests a
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
 - **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
+- **Live course correction:** while a turn runs, queue a follow-up for afterward or guide the next model request; undelivered messages remain editable.
 - **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface.
 
 The model-facing interface remains:

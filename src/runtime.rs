@@ -15,7 +15,7 @@ use rig::message::{
     AssistantContent, ImageMediaType, Message, Text, ToolCall, ToolResultContent, UserContent,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +67,33 @@ struct ActiveTurn {
     handle: JoinHandle<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingMessageKind {
+    Queued,
+    Guidance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingMessage {
+    pub id: u64,
+    pub text: String,
+    pub kind: PendingMessageKind,
+}
+
+#[derive(Clone)]
+struct PendingMessageEntry {
+    message: PendingMessage,
+    content: Vec<UserContent>,
+    clipboard_images: Vec<ImageAttachment>,
+}
+
+#[derive(Default)]
+struct PendingState {
+    accepting: bool,
+    next_id: u64,
+    messages: VecDeque<PendingMessageEntry>,
+}
+
 pub struct AgentRuntime {
     backend: RwLock<Option<Arc<dyn ModelBackend>>>,
     protocols: Arc<ProtocolRegistry>,
@@ -76,6 +103,8 @@ pub struct AgentRuntime {
     estimated_tokens: AtomicUsize,
     turn: Mutex<()>,
     active_turn: Mutex<Option<ActiveTurn>>,
+    pending: Mutex<PendingState>,
+    pending_updates: watch::Sender<Vec<PendingMessage>>,
 }
 
 impl AgentRuntime {
@@ -86,6 +115,7 @@ impl AgentRuntime {
         system_prompt: String,
         limits: ModelLimits,
     ) -> Self {
+        let (pending_updates, _) = watch::channel(Vec::new());
         Self {
             backend: RwLock::new(backend),
             protocols,
@@ -95,6 +125,8 @@ impl AgentRuntime {
             estimated_tokens: AtomicUsize::new(0),
             turn: Mutex::new(()),
             active_turn: Mutex::new(None),
+            pending: Mutex::new(PendingState::default()),
+            pending_updates,
         }
     }
 
@@ -137,6 +169,99 @@ impl AgentRuntime {
             .await
             .as_ref()
             .is_some_and(|turn| !turn.handle.is_finished())
+    }
+
+    pub fn subscribe_pending_messages(&self) -> watch::Receiver<Vec<PendingMessage>> {
+        self.pending_updates.subscribe()
+    }
+
+    pub async fn pending_messages(&self) -> Vec<PendingMessage> {
+        self.pending
+            .lock()
+            .await
+            .messages
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
+
+    pub async fn enqueue_message(
+        &self,
+        prompt: String,
+        kind: PendingMessageKind,
+    ) -> Result<PendingMessage> {
+        self.enqueue_message_with_images(prompt, Vec::new(), kind)
+            .await
+    }
+
+    pub(crate) async fn enqueue_message_with_images(
+        &self,
+        prompt: String,
+        clipboard_images: Vec<ImageAttachment>,
+        kind: PendingMessageKind,
+    ) -> Result<PendingMessage> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            bail!("message is empty")
+        }
+        let backend = self
+            .backend
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
+        let content = self
+            .user_content(prompt, &clipboard_images, backend.as_ref())
+            .await?;
+        let mut pending = self.pending.lock().await;
+        if !pending.accepting {
+            bail!("the active turn has already finished")
+        }
+        let message = PendingMessage {
+            id: pending.next_id,
+            text: prompt.to_string(),
+            kind,
+        };
+        pending.next_id = pending.next_id.saturating_add(1);
+        pending.messages.push_back(PendingMessageEntry {
+            message: message.clone(),
+            content,
+            clipboard_images,
+        });
+        self.publish_pending(&pending);
+        Ok(message)
+    }
+
+    pub(crate) async fn cancel_latest_pending(
+        &self,
+    ) -> Option<(PendingMessage, Vec<ImageAttachment>)> {
+        let mut pending = self.pending.lock().await;
+        let entry = pending.messages.pop_back()?;
+        self.publish_pending(&pending);
+        Some((entry.message, entry.clipboard_images))
+    }
+
+    pub async fn upgrade_latest_queued(&self) -> Option<PendingMessage> {
+        let mut pending = self.pending.lock().await;
+        let entry = pending
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.message.kind == PendingMessageKind::Queued)?;
+        entry.message.kind = PendingMessageKind::Guidance;
+        let message = entry.message.clone();
+        self.publish_pending(&pending);
+        Some(message)
+    }
+
+    fn publish_pending(&self, pending: &PendingState) {
+        self.pending_updates.send_replace(
+            pending
+                .messages
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect(),
+        );
     }
 
     pub async fn compact(&self) -> Result<()> {
@@ -182,13 +307,70 @@ impl AgentRuntime {
             }
             let _ = previous.handle.await;
         }
+        {
+            let mut pending = self.pending.lock().await;
+            if !pending.messages.is_empty() {
+                bail!("restore pending messages before starting a new turn")
+            }
+            pending.accepting = true;
+        }
         let (cancel, receiver) = watch::channel(None);
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
-            let _ = runtime.run_turn_with_cancel(prompt, images, receiver).await;
+            runtime.run_active_turn(prompt, images, receiver).await;
         });
         *active = Some(ActiveTurn { cancel, handle });
         Ok(())
+    }
+
+    async fn run_active_turn(
+        self: Arc<Self>,
+        prompt: String,
+        images: Vec<ImageAttachment>,
+        mut cancel: watch::Receiver<Option<TurnCancellation>>,
+    ) {
+        let mut input = PendingMessageEntry {
+            message: PendingMessage {
+                id: u64::MAX,
+                text: prompt,
+                kind: PendingMessageKind::Queued,
+            },
+            content: Vec::new(),
+            clipboard_images: images,
+        };
+        let mut prepared = false;
+        let mut pending_index = None;
+        loop {
+            let mut input_delivered = false;
+            let result = self
+                .run_turn_with_cancel(
+                    input.message.text.clone(),
+                    prepared.then_some(input.content.clone()),
+                    if prepared {
+                        &[]
+                    } else {
+                        &input.clipboard_images
+                    },
+                    !prepared,
+                    &mut input_delivered,
+                    &mut cancel,
+                )
+                .await;
+            if result.is_err() {
+                if prepared && !input_delivered {
+                    self.restore_pending_entry(pending_index.unwrap_or_default(), input)
+                        .await;
+                }
+                self.stop_accepting_pending().await;
+                return;
+            }
+            let Some((index, next)) = self.take_next_pending_or_stop().await else {
+                return;
+            };
+            input = next;
+            pending_index = Some(index);
+            prepared = true;
+        }
     }
 
     /// Request cancellation of the active turn without blocking the caller
@@ -207,11 +389,11 @@ impl AgentRuntime {
     /// Cancel the active request/tool operation, then wait until the worker has
     /// durably recorded its interrupted terminal boundary.
     pub async fn shutdown(&self) {
-        let Some(active) = self.active_turn.lock().await.take() else {
-            return;
-        };
-        let _ = active.cancel.send(Some(TurnCancellation::Shutdown));
-        let _ = active.handle.await;
+        if let Some(active) = self.active_turn.lock().await.take() {
+            let _ = active.cancel.send(Some(TurnCancellation::Shutdown));
+            let _ = active.handle.await;
+        }
+        self.restore_pending_to_draft().await;
     }
 
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
@@ -223,15 +405,27 @@ impl AgentRuntime {
         prompt: String,
         images: Vec<ImageAttachment>,
     ) -> Result<()> {
-        let (_cancel_tx, cancel) = watch::channel(None);
-        self.run_turn_with_cancel(prompt, images, cancel).await
+        let (_cancel_tx, mut cancel) = watch::channel(None);
+        let mut input_delivered = false;
+        self.run_turn_with_cancel(
+            prompt,
+            None,
+            &images,
+            false,
+            &mut input_delivered,
+            &mut cancel,
+        )
+        .await
     }
 
     async fn run_turn_with_cancel(
         &self,
         prompt: String,
-        clipboard_images: Vec<ImageAttachment>,
-        mut cancel: watch::Receiver<Option<TurnCancellation>>,
+        prepared_content: Option<Vec<UserContent>>,
+        clipboard_images: &[ImageAttachment],
+        take_initial_guidance: bool,
+        input_delivered: &mut bool,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<()> {
         let _turn = self.turn.lock().await;
         let prompt = prompt.trim();
@@ -250,40 +444,42 @@ impl AgentRuntime {
                 return Err(anyhow!(text));
             }
         };
-        let mut images = memory_image_attachments(clipboard_images);
-        let path_images = match image_attachments(prompt, self.session.project_directory()).await {
-            Ok(images) => images,
-            Err(error) => {
-                let text = format!("{error:#}");
-                self.session
-                    .append(EventKind::Error { text: text.clone() })
-                    .await?;
-                return Err(anyhow!(text));
+        let content = match prepared_content {
+            Some(content) => {
+                if content
+                    .iter()
+                    .any(|item| matches!(item, UserContent::Image(_)))
+                    && !backend.accepts_image_input()
+                {
+                    let text = "the active model does not accept image input".to_string();
+                    self.session
+                        .append(EventKind::Error { text: text.clone() })
+                        .await?;
+                    return Err(anyhow!(text));
+                }
+                content
             }
+            None => match self
+                .user_content(prompt, clipboard_images, backend.as_ref())
+                .await
+            {
+                Ok(content) => content,
+                Err(error) => {
+                    let text = format!("{error:#}");
+                    self.session
+                        .append(EventKind::Error { text: text.clone() })
+                        .await?;
+                    return Err(anyhow!(text));
+                }
+            },
         };
-        images.extend(path_images);
-        if !images.is_empty() && !backend.accepts_image_input() {
-            let text = "the active model does not accept image input".to_string();
-            self.session
-                .append(EventKind::Error { text: text.clone() })
-                .await?;
-            return Err(anyhow!(text));
-        }
-        let mut content = vec![UserContent::text(prompt)];
-        content.extend(images);
-        self.session
-            .append_batch(vec![
-                EventKind::User {
-                    text: prompt.to_string(),
-                },
-                EventKind::ModelMessage {
-                    message: Message::User { content },
-                },
-            ])
-            .await
-            .context("cannot persist user turn boundary")?;
+        self.append_user_input(prompt.to_string(), content, false)
+            .await?;
+        *input_delivered = true;
 
-        let result = self.run_tool_loop(backend, &mut cancel).await;
+        let result = self
+            .run_tool_loop(backend, take_initial_guidance, cancel)
+            .await;
         match result {
             Ok(()) => {
                 self.session.append(EventKind::TurnFinished).await?;
@@ -302,15 +498,148 @@ impl AgentRuntime {
         }
     }
 
+    async fn user_content(
+        &self,
+        prompt: &str,
+        clipboard_images: &[ImageAttachment],
+        backend: &dyn ModelBackend,
+    ) -> Result<Vec<UserContent>> {
+        let mut images = memory_image_attachments(clipboard_images);
+        images.extend(image_attachments(prompt, self.session.project_directory()).await?);
+        if !images.is_empty() && !backend.accepts_image_input() {
+            bail!("the active model does not accept image input")
+        }
+        let mut content = vec![UserContent::text(prompt)];
+        content.extend(images);
+        Ok(content)
+    }
+
+    async fn append_user_input(
+        &self,
+        text: String,
+        content: Vec<UserContent>,
+        finish_previous: bool,
+    ) -> Result<()> {
+        let mut events = Vec::with_capacity(3);
+        if finish_previous {
+            events.push(EventKind::TurnFinished);
+        }
+        events.extend([
+            EventKind::User { text },
+            EventKind::ModelMessage {
+                message: Message::User { content },
+            },
+        ]);
+        self.session
+            .append_batch(events)
+            .await
+            .context("cannot persist user turn boundary")?;
+        Ok(())
+    }
+
+    async fn take_guidance(&self) -> Option<(usize, PendingMessageEntry)> {
+        let mut pending = self.pending.lock().await;
+        let index = pending
+            .messages
+            .iter()
+            .position(|entry| entry.message.kind == PendingMessageKind::Guidance)?;
+        let entry = pending.messages.remove(index)?;
+        self.publish_pending(&pending);
+        Some((index, entry))
+    }
+
+    async fn take_next_pending_or_stop(&self) -> Option<(usize, PendingMessageEntry)> {
+        let mut pending = self.pending.lock().await;
+        let index = pending
+            .messages
+            .iter()
+            .position(|entry| entry.message.kind == PendingMessageKind::Guidance)
+            .or_else(|| (!pending.messages.is_empty()).then_some(0));
+        let Some(index) = index else {
+            pending.accepting = false;
+            return None;
+        };
+        let entry = pending.messages.remove(index)?;
+        self.publish_pending(&pending);
+        Some((index, entry))
+    }
+
+    async fn append_pending_input(
+        &self,
+        index: usize,
+        entry: PendingMessageEntry,
+        finish_previous: bool,
+    ) -> Result<()> {
+        if let Err(error) = self
+            .append_user_input(
+                entry.message.text.clone(),
+                entry.content.clone(),
+                finish_previous,
+            )
+            .await
+        {
+            self.restore_pending_entry(index, entry).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn restore_pending_entry(&self, index: usize, entry: PendingMessageEntry) {
+        let mut pending = self.pending.lock().await;
+        pending.accepting = false;
+        let index = index.min(pending.messages.len());
+        pending.messages.insert(index, entry);
+        self.publish_pending(&pending);
+    }
+
+    async fn stop_accepting_pending(&self) {
+        self.pending.lock().await.accepting = false;
+    }
+
+    async fn restore_pending_to_draft(&self) {
+        let messages = {
+            let mut pending = self.pending.lock().await;
+            pending.accepting = false;
+            let messages = pending
+                .messages
+                .drain(..)
+                .map(|entry| entry.message.text)
+                .collect::<Vec<_>>();
+            self.publish_pending(&pending);
+            messages
+        };
+        if messages.is_empty() {
+            return;
+        }
+        let draft = self.session.draft().await;
+        let restored = messages
+            .into_iter()
+            .chain((!draft.trim().is_empty()).then_some(draft))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let _ = self.session.save_draft(&restored).await;
+    }
+
     async fn run_tool_loop(
         &self,
         backend: Arc<dyn ModelBackend>,
+        take_initial_guidance: bool,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<()> {
         let mut overflow_retried = false;
+        let mut has_model_response = false;
+        let mut guidance_ready = false;
+        if take_initial_guidance && let Some((index, guidance)) = self.take_guidance().await {
+            self.append_pending_input(index, guidance, false).await?;
+            guidance_ready = true;
+        }
         for _ in 0..MAX_TOOL_ROUNDS {
             self.compact_with(backend.as_ref(), false, false, cancel)
                 .await?;
+            if !guidance_ready && let Some((index, guidance)) = self.take_guidance().await {
+                self.append_pending_input(index, guidance, has_model_response)
+                    .await?;
+            }
             let mut model_retries = HashMap::new();
             let response = loop {
                 match self.complete_once(backend.as_ref(), cancel).await {
@@ -335,6 +664,7 @@ impl AgentRuntime {
                     }
                 }
             };
+            guidance_ready = false;
             let assistant_message = Message::Assistant {
                 id: None,
                 content: response.content.clone(),
@@ -350,6 +680,7 @@ impl AgentRuntime {
                 .append_batch(events)
                 .await
                 .context("cannot persist assistant turn boundary")?;
+            has_model_response = true;
 
             let tool_calls = response
                 .content
@@ -359,11 +690,20 @@ impl AgentRuntime {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if tool_calls.is_empty() {
-                return Ok(());
-            }
             for call in tool_calls {
                 self.execute_tool(call, cancel).await?;
+            }
+            if let Some((index, guidance)) = self.take_guidance().await {
+                self.append_pending_input(index, guidance, true).await?;
+                guidance_ready = true;
+                continue;
+            }
+            if response
+                .content
+                .iter()
+                .all(|content| !matches!(content, AssistantContent::ToolCall(_)))
+            {
+                return Ok(());
             }
         }
         bail!("model exceeded {MAX_TOOL_ROUNDS} consecutive tool rounds")
@@ -771,12 +1111,12 @@ fn model_retry_reason(failure: &ModelFailure, policy: ModelRetryPolicy) -> Strin
     reason
 }
 
-fn memory_image_attachments(images: Vec<ImageAttachment>) -> Vec<UserContent> {
+fn memory_image_attachments(images: &[ImageAttachment]) -> Vec<UserContent> {
     images
-        .into_iter()
+        .iter()
         .map(|image| {
             UserContent::image_base64(
-                base64::engine::general_purpose::STANDARD.encode(image.bytes),
+                base64::engine::general_purpose::STANDARD.encode(&image.bytes),
                 Some(ImageMediaType::PNG),
                 None,
             )
@@ -938,6 +1278,13 @@ mod tests {
         release: tokio::sync::Notify,
     }
 
+    struct GatedBackend {
+        responses: Mutex<VecDeque<Result<ModelResponse>>>,
+        requests: Mutex<Vec<ModelRequest>>,
+        started: mpsc::UnboundedSender<()>,
+        release: tokio::sync::Semaphore,
+    }
+
     fn scripted_failure(
         kind: ModelFailureKind,
         retry_after: Option<Duration>,
@@ -996,6 +1343,24 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelBackend for GatedBackend {
+        fn accepts_image_input(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _deltas: mpsc::UnboundedSender<ModelDelta>,
+        ) -> Result<ModelResponse> {
+            self.requests.lock().await.push(request);
+            let _ = self.started.send(());
+            self.release.acquire().await.unwrap().forget();
+            self.responses.lock().await.pop_front().unwrap()
+        }
+    }
+
     fn fake_usage() -> Usage {
         Usage {
             input_tokens: 1_000,
@@ -1039,6 +1404,351 @@ mod tests {
             limits,
         ));
         (runtime, session, output_directory)
+    }
+
+    fn tool_call_response(id: &str) -> Result<ModelResponse> {
+        Ok(ModelResponse {
+            content: vec![AssistantContent::ToolCall(ToolCall::new(
+                ToolCallId::new(id).unwrap(),
+                ToolFunction::new(
+                    "read".to_string(),
+                    serde_json::json!({"uri": "missing://help"}),
+                ),
+            ))],
+            usage: None,
+        })
+    }
+
+    fn text_response(text: &str) -> Result<ModelResponse> {
+        Ok(ModelResponse {
+            content: vec![AssistantContent::text(text)],
+            usage: None,
+        })
+    }
+
+    async fn wait_for_turn(runtime: &AgentRuntime) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.turn_running().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn should settle");
+    }
+
+    #[tokio::test]
+    async fn guidance_reaches_the_next_model_boundary_before_queued_follow_up() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([
+                tool_call_response("first-call"),
+                text_response("current turn complete"),
+                text_response("queued turn complete"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        let queued = runtime
+            .enqueue_message("follow up".into(), PendingMessageKind::Queued)
+            .await
+            .unwrap();
+        let guidance = runtime
+            .enqueue_message("change direction".into(), PendingMessageKind::Guidance)
+            .await
+            .unwrap();
+        assert_eq!(runtime.pending_messages().await, [queued.clone(), guidance]);
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        {
+            let requests = backend.requests.lock().await;
+            assert_eq!(
+                requests[1].history.last(),
+                Some(&Message::user("change direction"))
+            );
+            assert!(!requests[1].history.contains(&Message::user("follow up")));
+        }
+        assert_eq!(runtime.pending_messages().await, [queued]);
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        {
+            let requests = backend.requests.lock().await;
+            assert_eq!(
+                requests[2].history.last(),
+                Some(&Message::user("follow up"))
+            );
+        }
+        assert!(runtime.pending_messages().await.is_empty());
+
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        let user_messages = session
+            .snapshot()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::User { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_messages, ["initial", "change direction", "follow up"]);
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn guidance_queued_during_compaction_reaches_the_following_model_request() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([
+                text_response("summary"),
+                text_response("guided answer"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend.clone(),
+            ModelLimits {
+                context_window: 64,
+                ..ModelLimits::default()
+            },
+        )
+        .await;
+        let old_context = "old context ".repeat(100);
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: old_context.clone(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user(old_context),
+                },
+                EventKind::AssistantText {
+                    text: "old answer".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("old answer"),
+                },
+                EventKind::TurnFinished,
+            ])
+            .await
+            .unwrap();
+
+        runtime.start_turn("current task".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        assert!(!backend.requests.lock().await[0].tools);
+        runtime
+            .enqueue_message("new constraint".into(), PendingMessageKind::Guidance)
+            .await
+            .unwrap();
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        {
+            let requests = backend.requests.lock().await;
+            assert!(requests[1].tools);
+            assert_eq!(
+                requests[1].history.last(),
+                Some(&Message::user("new constraint"))
+            );
+        }
+        assert!(runtime.pending_messages().await.is_empty());
+
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn queued_message_can_be_upgraded_until_guidance_is_delivered() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([
+                tool_call_response("first-call"),
+                text_response("guided"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, _session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        let queued = runtime
+            .enqueue_message("urgent correction".into(), PendingMessageKind::Queued)
+            .await
+            .unwrap();
+        let upgraded = runtime.upgrade_latest_queued().await.unwrap();
+        assert_eq!(upgraded.id, queued.id);
+        assert_eq!(upgraded.kind, PendingMessageKind::Guidance);
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        assert!(runtime.pending_messages().await.is_empty());
+        assert!(runtime.cancel_latest_pending().await.is_none());
+        assert_eq!(
+            backend.requests.lock().await[1].history.last(),
+            Some(&Message::user("urgent correction"))
+        );
+
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn queued_and_guidance_messages_can_be_restored_before_delivery() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([text_response("done")])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, _session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        runtime
+            .enqueue_message("queued".into(), PendingMessageKind::Queued)
+            .await
+            .unwrap();
+        runtime
+            .enqueue_message("guidance".into(), PendingMessageKind::Guidance)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.cancel_latest_pending().await.unwrap().0.text,
+            "guidance"
+        );
+        assert_eq!(
+            runtime.cancel_latest_pending().await.unwrap().0.text,
+            "queued"
+        );
+        assert!(runtime.pending_messages().await.is_empty());
+
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        assert_eq!(backend.requests.lock().await.len(), 1);
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn queued_clipboard_images_are_delivered_and_restored_with_their_messages() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([
+                text_response("current turn complete"),
+                text_response("follow-up complete"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, _session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        let delivered_image = ImageAttachment::png(b"queued-image".to_vec());
+        let restored_image = ImageAttachment::png(b"restored-image".to_vec());
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        runtime
+            .enqueue_message_with_images(
+                "inspect queued image".into(),
+                vec![delivered_image],
+                PendingMessageKind::Queued,
+            )
+            .await
+            .unwrap();
+        runtime
+            .enqueue_message_with_images(
+                "restore this image".into(),
+                vec![restored_image.clone()],
+                PendingMessageKind::Queued,
+            )
+            .await
+            .unwrap();
+
+        let (restored, images) = runtime.cancel_latest_pending().await.unwrap();
+        assert_eq!(restored.text, "restore this image");
+        assert_eq!(images, [restored_image]);
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        let requests = backend.requests.lock().await;
+        let Message::User { content } = requests[1].history.last().unwrap() else {
+            panic!("queued user message should be last")
+        };
+        assert_eq!(
+            content.first(),
+            Some(&UserContent::text("inspect queued image"))
+        );
+        assert!(matches!(
+            content.get(1),
+            Some(UserContent::Image(image))
+                if matches!(&image.data, rig::message::DocumentSourceKind::Base64(data)
+                    if base64::engine::general_purpose::STANDARD.decode(data).unwrap()
+                        == b"queued-image")
+        ));
+        drop(requests);
+
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn failed_follow_up_delivery_returns_the_message_to_the_pending_queue() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([text_response("current turn complete")])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        session.save_draft("existing draft").await.unwrap();
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        runtime
+            .enqueue_message("not delivered".into(), PendingMessageKind::Queued)
+            .await
+            .unwrap();
+        runtime.set_backend(None, None).await;
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+
+        assert_eq!(runtime.pending_messages().await[0].text, "not delivered");
+        runtime.shutdown().await;
+        assert!(runtime.pending_messages().await.is_empty());
+        assert_eq!(session.draft().await, "not delivered\n\nexisting draft");
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[test]
