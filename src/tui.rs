@@ -4571,7 +4571,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     app.prune_flashes();
     let idle = app.blocks.is_empty();
-    let notices = bottom_notices(app);
+    let notices = fixed_bottom_notices(app);
     let notice_lines = bottom_notice_lines(&notices, area.width);
     let has_notices = !notice_lines.is_empty();
     let notice_height = notice_lines.len().min(u16::MAX as usize) as u16;
@@ -4598,6 +4598,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         Some(areas[1])
     };
+    let notice_area = has_notices.then(|| areas[1]);
     let content = if idle {
         render_brand(frame, app, areas[0], false);
         areas[0]
@@ -4611,12 +4612,28 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         );
         areas[0]
     };
-    if has_notices {
+    if let Some(notice_area) = notice_area {
         frame.render_widget(
             Paragraph::new(notice_lines)
                 .style(Style::default().bg(SURFACE))
                 .block(Block::new().padding(Padding::horizontal(1))),
-            areas[1],
+            notice_area,
+        );
+    }
+    let flash_lines = bottom_notice_lines(&transient_notices(app), area.width);
+    if !flash_lines.is_empty() {
+        let bottom = notice_area
+            .or(footer_area)
+            .map_or(area.bottom(), |bottom_area| bottom_area.y);
+        let height = flash_lines
+            .len()
+            .min(bottom.saturating_sub(area.y) as usize) as u16;
+        let flash_area = Rect::new(area.x, bottom.saturating_sub(height), area.width, height);
+        frame.render_widget(
+            Paragraph::new(flash_lines)
+                .style(Style::default().bg(SURFACE))
+                .block(Block::new().padding(Padding::horizontal(1))),
+            flash_area,
         );
     }
     let selectable_area = if let Some(overlay) = app.overlay {
@@ -5403,9 +5420,8 @@ fn wrapped_block_lines(text: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-fn bottom_notices(app: &App) -> Vec<(String, Color)> {
-    let mut notices = app
-        .visible_flashes()
+fn transient_notices(app: &App) -> Vec<(String, Color)> {
+    app.visible_flashes()
         .rev()
         .map(|flash| {
             (
@@ -5413,7 +5429,11 @@ fn bottom_notices(app: &App) -> Vec<(String, Color)> {
                 if flash_is_error(flash) { ERROR } else { WARM },
             )
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn fixed_bottom_notices(app: &App) -> Vec<(String, Color)> {
+    let mut notices = Vec::new();
     if let Some((key, _)) = app
         .last_interrupt_press
         .as_ref()
@@ -7610,6 +7630,54 @@ mod tests {
     }
 
     #[test]
+    fn transient_notifications_overlay_without_reflowing_base_surfaces() {
+        let mut welcome = test_app();
+        let baseline = render_to_string(&mut welcome, 100, 24);
+        let baseline_project_row = baseline
+            .lines()
+            .position(|line| line.contains("/workspace"))
+            .unwrap();
+        welcome.set_flash("Older notification");
+        welcome.set_flash("Newer notification");
+        let notified = render_to_string(&mut welcome, 100, 24);
+        let notified_project_row = notified
+            .lines()
+            .position(|line| line.contains("/workspace"))
+            .unwrap();
+        assert_eq!(notified_project_row, baseline_project_row);
+
+        let mut conversation = test_app();
+        conversation.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            false,
+        );
+        render_to_string(&mut conversation, 100, 24);
+        let baseline_height = conversation.transcript_height;
+        conversation.set_flash("Older notification");
+        conversation.set_flash("Newer notification");
+        let notified = render_to_string(&mut conversation, 100, 24);
+        assert_eq!(conversation.transcript_height, baseline_height);
+        assert!(
+            notified
+                .lines()
+                .nth(21)
+                .unwrap()
+                .contains("Newer notification")
+        );
+        assert!(
+            notified
+                .lines()
+                .nth(22)
+                .unwrap()
+                .contains("Older notification")
+        );
+    }
+
+    #[test]
     fn conversation_footer_only_shows_context_model_and_effort() {
         let mut app = test_app();
         app.push(
@@ -7742,10 +7810,13 @@ mod tests {
             kind: PendingMessageKind::Queued,
         });
         app.pending_images.push(ImageAttachment::png(vec![1, 2, 3]));
+        render_to_string(&mut app, 100, 24);
+        let baseline_height = app.transcript_height;
         app.set_flash("Older notification");
         app.set_flash("Newer notification");
 
         let rendered = render_to_string(&mut app, 100, 24);
+        assert_eq!(app.transcript_height, baseline_height);
         let rows = rendered.lines().collect::<Vec<_>>();
         let row = |text: &str| {
             rows.iter()
