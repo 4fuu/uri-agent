@@ -5055,6 +5055,13 @@ fn bottom_notices(app: &App) -> Vec<(String, Color)> {
             )
         })
         .collect::<Vec<_>>();
+    if let Some((key, _)) = app
+        .last_interrupt_press
+        .as_ref()
+        .filter(|(_, at)| app.busy && at.elapsed() < DOUBLE_CLICK_INTERVAL)
+    {
+        notices.push((format!("press {key} again to interrupt"), WARM));
+    }
     if !app.pending_messages.is_empty() {
         let restore = app
             .keymap
@@ -9971,9 +9978,17 @@ mod tests {
         assert!(keymap_help(&app.keymap).contains("interrupt on double press"));
         assert!(!app.interrupt_on_double_press(escape, "esc"));
         app.busy = true;
+        app.set_flash("Existing notification");
         assert!(!app.interrupt_on_double_press(escape, "esc"));
+        let rendered = render_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("press esc again to interrupt"));
+        assert!(
+            rendered.find("Existing notification").unwrap()
+                < rendered.find("press esc again to interrupt").unwrap()
+        );
         assert!(!app.interrupt_on_double_press(repeat, "esc"));
         assert!(app.interrupt_on_double_press(escape, "esc"));
+        assert!(!render_to_string(&mut app, 80, 24).contains("press esc again to interrupt"));
         assert!(!app.interrupt_on_double_press(escape, "esc"));
 
         let unrelated = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
