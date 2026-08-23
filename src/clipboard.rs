@@ -47,6 +47,7 @@ fn write_dynamic_png(image: DynamicImage) -> Result<Vec<u8>> {
     Ok(output.into_inner())
 }
 
+#[cfg(windows)]
 fn encoded_bytes_to_png(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Ok(bytes.to_vec());
@@ -55,6 +56,7 @@ fn encoded_bytes_to_png(bytes: &[u8]) -> Result<Vec<u8>> {
     write_dynamic_png(image)
 }
 
+#[cfg(windows)]
 fn dib_bytes_to_png(dib: &[u8]) -> Result<Vec<u8>> {
     if let Ok(decoder) = image::codecs::bmp::BmpDecoder::new_without_file_header(Cursor::new(dib))
         && let Ok(image) = DynamicImage::from_decoder(decoder)
@@ -67,6 +69,7 @@ fn dib_bytes_to_png(dib: &[u8]) -> Result<Vec<u8>> {
     write_dynamic_png(image)
 }
 
+#[cfg(windows)]
 fn wrap_dib_as_bmp(dib: &[u8]) -> Result<Vec<u8>> {
     if dib.starts_with(b"BM") {
         return Ok(dib.to_vec());
@@ -86,6 +89,7 @@ fn wrap_dib_as_bmp(dib: &[u8]) -> Result<Vec<u8>> {
     Ok(bmp)
 }
 
+#[cfg(windows)]
 fn dib_pixel_data_offset(dib: &[u8]) -> Result<u32> {
     if dib.len() < 4 {
         bail!("clipboard DIB is too small");
@@ -214,12 +218,14 @@ mod tests {
         assert!(format!("{error:#}").contains("buffer size"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn valid_png_bytes_are_returned_unchanged() {
         let png = encode_png(1, 1, vec![12, 34, 56, 255]).unwrap();
         assert_eq!(encoded_bytes_to_png(&png).unwrap(), png);
     }
 
+    #[cfg(windows)]
     #[test]
     fn thirty_two_bit_dib_is_decoded_as_png() {
         let dib = packed_dib32(1, 1, &[56, 34, 12, 255]);
@@ -231,6 +237,7 @@ mod tests {
         assert_eq!(&decoded.into_raw()[..3], &[12, 34, 56]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn wrapped_dib_keeps_a_bmp_file_header() {
         let dib = packed_dib32(1, 1, &[56, 34, 12, 255]);
@@ -240,12 +247,14 @@ mod tests {
         assert_eq!(&bmp[10..14], &54u32.to_le_bytes());
     }
 
+    #[cfg(windows)]
     #[test]
     fn invalid_dib_is_rejected() {
         let error = dib_bytes_to_png(&[1, 2, 3, 4]).unwrap_err();
         assert!(format!("{error:#}").contains("DIB"));
     }
 
+    #[cfg(windows)]
     fn packed_dib32(width: i32, height: i32, pixels_bgra: &[u8]) -> Vec<u8> {
         let mut dib = vec![0_u8; 40];
         dib[0..4].copy_from_slice(&40u32.to_le_bytes());
