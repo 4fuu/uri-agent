@@ -3125,15 +3125,47 @@ fn consume_copy_click_release(app: &mut App, mouse: MouseEvent) -> bool {
 }
 
 fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
-    if !matches!(app.overlay, Some(Overlay::Document | Overlay::Status))
-        || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         || !app
             .overlay_bounds
             .is_some_and(|area| !area.contains((mouse.column, mouse.row).into()))
     {
         return false;
     }
-    app.overlay = None;
+
+    match app.overlay {
+        Some(Overlay::Composer) => {
+            app.composer_mouse_selecting = false;
+            app.overlay = None;
+        }
+        Some(Overlay::Delivery) => {
+            app.delivery = None;
+            app.overlay = Some(Overlay::Composer);
+        }
+        Some(Overlay::Command) => {
+            app.reset_command_search();
+            app.overlay = None;
+        }
+        Some(
+            Overlay::Status
+            | Overlay::Help
+            | Overlay::Protocols
+            | Overlay::Tasks
+            | Overlay::Models
+            | Overlay::Plugin,
+        ) => app.overlay = None,
+        Some(Overlay::Document) => {
+            app.document = None;
+            app.overlay = None;
+        }
+        Some(Overlay::Selector) => {
+            app.selector = None;
+            app.overlay = None;
+        }
+        Some(Overlay::Settings | Overlay::Text | Overlay::Oauth | Overlay::Terminal) | None => {
+            return false;
+        }
+    }
     app.overlay_scroll = 0;
     app.selection = None;
     true
@@ -8663,67 +8695,147 @@ mod tests {
     }
 
     #[test]
-    fn clicking_outside_closes_the_document_and_status_floats() {
+    fn clicking_outside_dismisses_cancelable_floats() {
         let mut app = test_app();
-        app.overlay = Some(Overlay::Document);
-        app.overlay_scroll = 6;
-        app.selection = Some(TextSelection {
-            start: (20, 8),
-            end: (24, 8),
-        });
-        render_to_string(&mut app, 100, 24);
-        let bounds = app.overlay_bounds.expect("rendered document bounds");
-        let click = |column, row| MouseEvent {
+        let bounds = Rect::new(10, 5, 60, 16);
+        let outside_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
+            column: bounds.x.saturating_sub(1),
+            row: bounds.y,
             modifiers: KeyModifiers::NONE,
         };
 
-        assert!(!close_float_on_outside_click(
-            &mut app,
-            click(bounds.x, bounds.y)
-        ));
-        assert!(app.overlay == Some(Overlay::Document));
+        for overlay in [
+            Overlay::Status,
+            Overlay::Help,
+            Overlay::Protocols,
+            Overlay::Tasks,
+            Overlay::Models,
+            Overlay::Plugin,
+        ] {
+            app.overlay = Some(overlay);
+            app.overlay_bounds = Some(bounds);
+            app.overlay_scroll = 6;
+            app.selection = Some(TextSelection {
+                start: (20, 8),
+                end: (24, 8),
+            });
 
-        assert!(close_float_on_outside_click(
-            &mut app,
-            click(bounds.x.saturating_sub(1), bounds.y)
-        ));
+            assert!(close_float_on_outside_click(&mut app, outside_click));
+            assert!(app.overlay.is_none());
+            assert_eq!(app.overlay_scroll, 0);
+            assert!(app.selection.is_none());
+        }
+    }
+
+    #[test]
+    fn clicking_outside_uses_each_float_cancel_semantics() {
+        let mut app = test_app();
+        let bounds = Rect::new(10, 5, 60, 16);
+        let outside_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bounds.x.saturating_sub(1),
+            row: bounds.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.input.insert_str("keep this draft");
+        app.composer_mouse_selecting = true;
+        app.overlay = Some(Overlay::Composer);
+        app.overlay_bounds = Some(bounds);
+        assert!(close_float_on_outside_click(&mut app, outside_click));
         assert!(app.overlay.is_none());
-        assert_eq!(app.overlay_scroll, 0);
-        assert!(app.selection.is_none());
+        assert_eq!(app.draft_text(), "keep this draft");
+        assert!(!app.composer_mouse_selecting);
 
+        app.delivery = Some(DeliveryState { selected: 1 });
+        app.overlay = Some(Overlay::Delivery);
+        app.overlay_bounds = Some(bounds);
+        assert!(close_float_on_outside_click(&mut app, outside_click));
+        assert!(app.overlay == Some(Overlay::Composer));
+        assert!(app.delivery.is_none());
+
+        app.command_query = "status".to_string();
+        app.command_selected = 2;
+        app.command_stem = Some("stat".to_string());
+        app.overlay = Some(Overlay::Command);
+        app.overlay_bounds = Some(bounds);
+        assert!(close_float_on_outside_click(&mut app, outside_click));
+        assert!(app.overlay.is_none());
+        assert!(app.command_query.is_empty());
+        assert_eq!(app.command_selected, 0);
+        assert!(app.command_stem.is_none());
+
+        app.document = Some(("DETAIL".to_string(), "body".to_string()));
+        app.overlay = Some(Overlay::Document);
+        app.overlay_bounds = Some(bounds);
+        assert!(close_float_on_outside_click(&mut app, outside_click));
+        assert!(app.overlay.is_none());
+        assert!(app.document.is_none());
+
+        app.selector = Some(SelectorState::new(
+            SelectorKind::Search,
+            "SEARCH",
+            Vec::new(),
+        ));
+        app.overlay = Some(Overlay::Selector);
+        app.overlay_bounds = Some(bounds);
+        assert!(close_float_on_outside_click(&mut app, outside_click));
+        assert!(app.overlay.is_none());
+        assert!(app.selector.is_none());
+    }
+
+    #[test]
+    fn clicking_outside_does_not_dismiss_editing_or_active_work_floats() {
+        let mut app = test_app();
+        let bounds = Rect::new(10, 5, 60, 16);
+        let outside_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bounds.x.saturating_sub(1),
+            row: bounds.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        for overlay in [
+            Overlay::Settings,
+            Overlay::Text,
+            Overlay::Oauth,
+            Overlay::Terminal,
+        ] {
+            app.overlay = Some(overlay);
+            app.overlay_bounds = Some(bounds);
+
+            assert!(!close_float_on_outside_click(&mut app, outside_click));
+            assert!(app.overlay == Some(overlay));
+        }
+    }
+
+    #[test]
+    fn clicking_inside_or_using_another_mouse_button_does_not_dismiss_a_float() {
+        let mut app = test_app();
+        let bounds = Rect::new(10, 5, 60, 16);
         app.overlay = Some(Overlay::Status);
-        app.overlay_scroll = 6;
-        app.selection = Some(TextSelection {
-            start: (20, 8),
-            end: (24, 8),
-        });
-        render_to_string(&mut app, 100, 24);
-        let bounds = app.overlay_bounds.expect("rendered status bounds");
+        app.overlay_bounds = Some(bounds);
 
         assert!(!close_float_on_outside_click(
             &mut app,
-            click(bounds.x.saturating_add(1), bounds.y)
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: bounds.x,
+                row: bounds.y,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert!(!close_float_on_outside_click(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: bounds.x.saturating_sub(1),
+                row: bounds.y,
+                modifiers: KeyModifiers::NONE,
+            }
         ));
         assert!(app.overlay == Some(Overlay::Status));
-
-        assert!(close_float_on_outside_click(
-            &mut app,
-            click(bounds.x.saturating_sub(1), bounds.y)
-        ));
-        assert!(app.overlay.is_none());
-        assert_eq!(app.overlay_scroll, 0);
-        assert!(app.selection.is_none());
-
-        app.overlay = Some(Overlay::Help);
-        app.overlay_bounds = Some(bounds);
-        assert!(!close_float_on_outside_click(
-            &mut app,
-            click(bounds.x.saturating_sub(1), bounds.y)
-        ));
-        assert!(app.overlay == Some(Overlay::Help));
     }
 
     #[test]
