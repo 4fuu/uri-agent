@@ -1026,6 +1026,7 @@ mod tests {
     async fn agent_environment_persists_private_values_and_validates_names() {
         let directory = tempfile::tempdir().unwrap();
         let environment = AgentEnvironment::load(directory.path()).await.unwrap();
+        #[cfg(unix)]
         let path = directory.path().join("environment.json");
 
         environment

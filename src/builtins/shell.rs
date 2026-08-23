@@ -806,25 +806,27 @@ mod tests {
     #[tokio::test]
     async fn shell_execution_injects_managed_values_over_inherited_values() {
         let directory = tempfile::tempdir().unwrap();
-        let Some(executable) = find_executable("bash") else {
-            return;
-        };
         let name = format!("URI_AGENT_SHELL_ENV_TEST_{}", uuid::Uuid::now_v7().simple());
+        let (protocol, executable, script) = if cfg!(windows) {
+            let Some(executable) = find_executable("pwsh") else {
+                return;
+            };
+            ("pwsh", executable, format!("Write-Output $env:{name}"))
+        } else {
+            let Some(executable) = find_executable("bash") else {
+                return;
+            };
+            ("bash", executable, format!("printf '%s' \"${name}\""))
+        };
         // SAFETY: the process-unique variable is removed before this test returns.
         unsafe { std::env::set_var(&name, "inherited") };
         let environment = Arc::new(AgentEnvironment::load(directory.path()).await.unwrap());
         environment.set(&name, "managed".to_string()).await.unwrap();
         let values = PluginEnvironment::new(environment).snapshot().await;
 
-        let output = execute(
-            "bash",
-            &executable,
-            directory.path(),
-            &format!("printf '%s' \"${name}\""),
-            &values,
-        )
-        .await
-        .unwrap();
+        let output = execute(protocol, &executable, directory.path(), &script, &values)
+            .await
+            .unwrap();
         // SAFETY: the process-unique variable is no longer used.
         unsafe { std::env::remove_var(&name) };
         let output = String::from_utf8(output).unwrap();
