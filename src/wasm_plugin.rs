@@ -78,10 +78,10 @@ Last reload diagnostics: {diagnostics}
    then rename it to `<name>.wasm` in the same directory. The rename is the
    atomic enable step. Hidden files, nested files, and files that do not end in
    `.wasm` are ignored.
-5. Call `exec("wasm_plugin://reload")`. Reload builds a complete replacement
-   protocol set before swapping it into the running agent. Existing calls keep
-   their old runtime until they finish. Invalid or conflicting modules are
-   skipped and reported.
+5. Call `exec("wasm_plugin://reload")`. The call returns after reload builds a
+   complete replacement protocol set and swaps it into the running agent.
+   Existing calls keep their old runtime until they finish. Invalid or
+   conflicting modules are skipped and reported.
 6. Read each newly active `<protocol>://help` before using that protocol.
 
 To remove a plugin, delete its `.wasm` file and reload. To update one, atomically
@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn reload_replaces_the_complete_dynamic_protocol_set() {
+    async fn reload_exec_returns_after_replacing_the_complete_dynamic_protocol_set() {
         let directory = tempfile::tempdir().unwrap();
         let (registry, manager, output) = registry_with_manager(directory.path()).await;
         let plugin_directory = manager.directory();
@@ -1076,7 +1076,8 @@ mod tests {
         .await
         .unwrap();
 
-        registry.exec("wasm_plugin://reload", None).await.unwrap();
+        let reloaded = registry.exec("wasm_plugin://reload", None).await.unwrap();
+        assert!(reloaded.contains(r#"Active protocols: ["first"]"#));
         assert!(registry.read("first://value", None).await.is_ok());
         let help = registry.read("wasm_plugin://help", None).await.unwrap();
         assert!(help.contains(r#"Active dynamic protocols: ["first"]"#));

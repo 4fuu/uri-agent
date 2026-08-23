@@ -1,7 +1,6 @@
+use super::atomic_write;
 use super::file::resolve_path;
-use super::{atomic_write, render_task, render_task_list};
 use crate::plugin::{Plugin, PluginHost};
-use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -17,32 +16,37 @@ const MOVE_TO: &str = "*** Move to: ";
 const END_OF_FILE: &str = "*** End of File";
 const HELP: &str = r#"# apply_patch
 
-Apply a Codex-style multi-file patch asynchronously.
+Apply a Codex-style multi-file patch and return the final result.
 
 Call `exec` with `apply_patch://apply`. The body must be the patch string itself:
 
 ```text
 *** Begin Patch
-*** Add File: path/to/new.txt
-+new content
-*** Update File: path/to/existing.txt
-@@ optional landmark
--old line
-+new line
-*** Delete File: path/to/remove.txt
+*** Add File: <path>
++<new content>
+*** Update File: <path>
+@@ <optional landmark>
+-<old line>
++<new line>
+*** Delete File: <path>
 *** End Patch
 ```
 
-An Update File may put `*** Move to: new/path` immediately after its header.
-Update lines begin with a space for context, `-` for removal, or `+` for
-addition. `*** End of File` anchors the preceding chunk at EOF. Add File content
-lines must all begin with `+`. Relative paths resolve from the startup working
-directory; absolute paths are accepted.
+Replace each `<path>` with the project-relative or absolute path for that
+operation. Replace the other placeholders with the patch context and content
+required by the project. Use `@@` without `<optional landmark>` when no landmark
+is needed. An Update File may put `*** Move to: <new path>` immediately after
+its header. Update lines begin with a space for context, `-` for removal, or `+`
+for addition. `*** End of File` anchors the preceding chunk at EOF. Add File
+content lines must all begin with `+`. Relative paths resolve from the startup
+working directory; absolute paths are accepted.
 
 Operations run in patch order and each write is atomic, but the complete patch
-is not transactional: a later failure does not undo earlier operations. The
-immediate result contains a task URI; read that URI for the final summary or
-error.
+is not transactional: a later failure does not undo earlier operations. `exec`
+returns the final summary after all operations succeed; errors are returned
+directly.
+
+`read` supports only `apply_patch://help`.
 "#;
 
 #[derive(Clone)]
@@ -82,24 +86,18 @@ impl Protocol for ApplyPatchProtocol {
     async fn read(
         &self,
         request: ProtocolRequest<'_>,
-        context: ProtocolContext,
+        _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        match request.target {
-            "help" => Ok(HELP.as_bytes().to_vec()),
-            "tasks" => Ok(render_task_list(&context.tasks, "apply_patch").await),
-            target => {
-                let id = target.strip_prefix("tasks/").ok_or_else(|| {
-                    anyhow!("expected apply_patch://help or apply_patch://tasks/<id>")
-                })?;
-                render_task(&context.tasks, "apply_patch", id).await
-            }
+        if request.target != "help" {
+            bail!("expected apply_patch://help");
         }
+        Ok(HELP.as_bytes().to_vec())
     }
 
     async fn exec(
         &self,
         request: ProtocolRequest<'_>,
-        context: ProtocolContext,
+        _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if !matches!(request.target, "" | "apply") {
             bail!("expected apply_patch://apply");
@@ -107,18 +105,8 @@ impl Protocol for ApplyPatchProtocol {
         let patch = request
             .body
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow!("apply_patch body must be a patch string"))?
-            .to_string();
-        let cwd = self.cwd.clone();
-        let record = context.tasks.allocate("apply_patch", "apply patch").await;
-        let id = record.id.clone();
-        let tasks = context.tasks.clone();
-        tasks
-            .spawn(record, async move {
-                Ok(apply_patch(&cwd, &patch).await?.into_bytes())
-            })
-            .await;
-        Ok(prompts::task_accepted("apply_patch", &id).into_bytes())
+            .ok_or_else(|| anyhow!("apply_patch body must be a patch string"))?;
+        Ok(apply_patch(&self.cwd, patch).await?.into_bytes())
     }
 }
 
@@ -533,11 +521,10 @@ fn normalize_for_match(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{TaskManager, TaskStatus};
-    use std::time::Duration;
+    use crate::task::TaskManager;
 
     #[tokio::test]
-    async fn protocol_accepts_a_patch_task_and_exposes_its_final_result() {
+    async fn protocol_exec_returns_the_completed_patch_directly() {
         let directory = tempfile::tempdir().unwrap();
         let protocol = ApplyPatchProtocol::new(directory.path());
         let tasks = TaskManager::new();
@@ -547,37 +534,55 @@ mod tests {
         let patch = serde_json::Value::String(
             "*** Begin Patch\n*** Add File: added.txt\n+added\n*** End Patch".to_string(),
         );
+        let help = protocol
+            .read(
+                ProtocolRequest {
+                    uri: "apply_patch://help",
+                    target: "help",
+                    body: None,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("*** Add File: <path>"));
+        assert!(help.contains("returns the final summary"));
 
-        let accepted = protocol
+        let output = protocol
             .exec(
                 ProtocolRequest {
                     uri: "apply_patch://apply",
                     target: "apply",
                     body: Some(&patch),
                 },
-                context,
+                context.clone(),
             )
             .await
             .unwrap();
-        let accepted = String::from_utf8(accepted).unwrap();
-        let id = accepted
-            .lines()
-            .next()
-            .and_then(|line| line.strip_prefix("Task accepted: "))
-            .unwrap();
-        let result = tasks.wait(id, Duration::from_secs(1)).await.unwrap();
 
-        assert_eq!(result.status, TaskStatus::Completed);
-        assert!(
-            String::from_utf8(result.content)
-                .unwrap()
-                .contains("A added.txt")
-        );
+        assert!(String::from_utf8(output).unwrap().contains("A added.txt"));
         assert_eq!(
             fs::read_to_string(directory.path().join("added.txt"))
                 .await
                 .unwrap(),
             "added\n"
+        );
+        assert!(tasks.list().await.is_empty());
+        assert!(
+            protocol
+                .read(
+                    ProtocolRequest {
+                        uri: "apply_patch://tasks",
+                        target: "tasks",
+                        body: None,
+                    },
+                    context,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("apply_patch://help")
         );
     }
 

@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol. Use this for protocol help, resources, task status, and completed results.";
 
-pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Use this to start protocol operations. Execution may finish immediately or continue asynchronously. If the returned content includes a task URI, use read on that URI to inspect status and final output; task acceptance alone is not completion.";
+pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Exact behavior is protocol-specific; read `<protocol>://help` before use. Operations normally return their final result directly. Necessary long-running operations may instead return a managed task URI; use `read` on that URI to inspect status and final output. Task acceptance is not completion.";
 
 #[derive(Clone, Debug)]
 pub struct ProtocolPrompt {
@@ -14,11 +14,11 @@ pub struct ProtocolPrompt {
 
 pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> String {
     let mut prompt = String::from(
-        "You are a general-purpose agent.\n\
-         You are running in URI Agent.\n\
-         You have exactly two tools: read and exec.\n\
-         Use read to retrieve information through registered protocols.\n\
-         Use exec to perform actions through registered protocols.\n\
+        "You are a general-purpose agent running in URI Agent with exactly two tools: read and exec.\n\
+         Use read to retrieve information and exec to perform actions through registered protocols.\n\
+         Angle-bracketed values in protocol addresses, such as <protocol>, are placeholders.\n\
+         The same placeholder convention applies throughout protocol help.\n\
+         Replace placeholders with the required values without including the angle brackets.\n\
          Before using a protocol for the first time, you must call read on \
          <protocol>://help to learn its contract.\n\
          Verify relevant results before claiming work is complete.\n\n\
@@ -83,10 +83,9 @@ mod tests {
             &[],
         );
         assert!(prompt.starts_with(
-            "You are a general-purpose agent.\n\
-             You are running in URI Agent.\n\
-             You have exactly two tools: read and exec."
+            "You are a general-purpose agent running in URI Agent with exactly two tools: read and exec."
         ));
+        assert!(prompt.contains("same placeholder convention applies throughout protocol help"));
         assert!(prompt.contains("Before using a protocol for the first time"));
         assert!(prompt.contains("- file: Read files."));
         assert!(!prompt.contains("file://help"));

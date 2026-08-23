@@ -38,7 +38,7 @@ Reload constructs a replacement set before changing the active registry:
 
 A directory-level failure leaves the old set active. Calls that already captured an old protocol keep its runtime until they finish; new calls use the replacement set.
 
-Reload returns the active protocol names and tells the model to read each new `<protocol>://help`. Diagnostics are stored as JSON in the session output directory rather than embedded in model-facing text; help reports their count and a readable `file://` address. The TUI protocol list reads the live registry and reflects the replacement set.
+The reload `exec` call returns only after the replacement set is active. Its result lists the active protocol names and tells the model to read each new `<protocol>://help`. Diagnostics are stored as JSON in the session output directory rather than embedded in model-facing text; help reports their count and a readable `file://` address. The TUI protocol list reads the live registry and reflects the replacement set.
 
 Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state.
 

@@ -1,6 +1,6 @@
 # Protocols, tasks, output, and Skills
 
-URI Agent keeps the model-facing tool surface fixed while allowing the application to register new capabilities. This document describes that boundary, built-in protocols, asynchronous execution, output preservation, and Skill loading.
+URI Agent keeps the model-facing tool surface fixed while allowing the application to register new capabilities. This document describes that boundary, built-in protocols, execution semantics, managed tasks, output preservation, and Skill loading.
 
 For the exact runtime syntax of a protocol, read `<protocol>://help`. Those help routes are the canonical model-facing operation reference.
 
@@ -44,6 +44,7 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
 | `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash is enabled |
 | `pwsh` | `read`, `exec` | Run PowerShell 7 commands as managed tasks when `pwsh` is enabled |
+| `wasm_plugin` | `read`, `exec` | Reload trusted WASM protocols and return the completed reload report |
 | `<name>-skill` | `read` | Load one discovered Skill and its bundled files |
 
 Shell plugins detect their own executables at startup. On Windows, the `pwsh`
@@ -85,7 +86,7 @@ read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
 
 ### `replace`
 
-`replace` starts an asynchronous exact replacement:
+`replace` performs an exact replacement and returns after the write succeeds:
 
 ```text
 exec(
@@ -94,11 +95,11 @@ exec(
 )
 ```
 
-`old_text` must be nonempty and occur exactly once. Missing and ambiguous matches fail without changing the file. A successful write atomically replaces the destination file.
+`old_text` must be nonempty and occur exactly once. Missing and ambiguous matches fail directly from `exec` without changing the file. A successful write atomically replaces the destination file.
 
 ### `apply_patch`
 
-`apply_patch` accepts a patch string and starts an asynchronous multi-file operation:
+`apply_patch` accepts a patch string and returns the final summary after applying it:
 
 ```text
 exec("apply_patch://apply", "*** Begin Patch\n...\n*** End Patch")
@@ -157,7 +158,7 @@ No match contributes no prompt content. The plugin never invokes a detected prog
 
 ## Managed tasks
 
-Execution is asynchronous by default. An accepted request normally returns before the operation is complete:
+Protocol execution returns its final result directly by default. Necessary long-running operations may instead become managed tasks. The built-in shell protocols use managed tasks because command duration is unbounded:
 
 ```text
 exec("bash://run", "cargo test")
@@ -165,7 +166,7 @@ exec("bash://run", "cargo test")
 → Read status: bash://tasks/<id>
 ```
 
-Acceptance is not success. Read the returned route to observe `pending`, `running`, `completed`, `failed`, or `cancelled` status and the eventual content. Protocols expose task lists and individual tasks through their own read routes; the shared task manager does not create a generic model-facing task protocol.
+Acceptance is not success. Read the returned route to observe `pending`, `running`, `completed`, `failed`, or `cancelled` status and the eventual content. Task IDs increase within their in-process manager as lowercase hexadecimal values: they start at `001`, remain at least three digits wide, and expand after `fff`. Protocols expose task lists and individual tasks through their own read routes; the shared task manager does not create a generic model-facing task protocol.
 
 Shell protocols offer a bounded wait when the immediate result is useful:
 

@@ -89,7 +89,7 @@ Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI 
 
 The [`docs/` index](docs/README.md) organizes detailed documentation by task:
 
-- [Protocols, tasks, output, and Skills](docs/protocols.md) — model-facing routing, built-ins, asynchronous execution, output preservation, and Skill discovery.
+- [Protocols, tasks, output, and Skills](docs/protocols.md) — model-facing routing, built-ins, execution semantics, managed tasks, output preservation, and Skill discovery.
 - [WASM plugins](docs/plugins.md) — installation, reload, trust boundaries, ABI, SDK, and runtime limits.
 - [Models and configuration](docs/configuration.md) — catalog behavior, authentication, settings precedence, CLI flags, thinking levels, and custom providers.
 - [Terminal interface and sessions](docs/interface.md) — composer and commands, keymaps, embedded terminal, image attachments, persistence, resume, and compaction.

@@ -89,7 +89,7 @@ URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body
 
 [`docs/` 索引](docs/README.md)按任务组织详细的英文文档：
 
-- [Protocols, tasks, output, and Skills](docs/protocols.md) — 模型路由、内置协议、异步执行、完整输出保留与 Skill 发现。
+- [Protocols, tasks, output, and Skills](docs/protocols.md) — 模型路由、内置协议、执行语义、受管任务、完整输出保留与 Skill 发现。
 - [WASM plugins](docs/plugins.md) — 安装、reload、信任边界、ABI、SDK 与运行限制。
 - [Models and configuration](docs/configuration.md) — 模型目录、认证、配置优先级、CLI 参数、thinking 等级与自定义 Provider。
 - [Terminal interface and sessions](docs/interface.md) — 输入与命令、快捷键、内嵌终端、图片附件、持久化、会话恢复与上下文压缩。

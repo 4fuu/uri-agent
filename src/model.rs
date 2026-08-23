@@ -1837,6 +1837,16 @@ mod tests {
             ["read", "exec"]
         );
         assert!(
+            tools[1]
+                .description
+                .contains("Exact behavior is protocol-specific")
+        );
+        assert!(
+            tools[1]
+                .description
+                .contains("return their final result directly")
+        );
+        assert!(
             tools[0].parameters["properties"]["body"]
                 .get("type")
                 .is_none()

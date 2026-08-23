@@ -29,7 +29,7 @@ protocol / command / TUI registries <------------+
    runtime model loop <----> append-only SQLite session
           |
           v
- read/exec dispatch ----> managed tasks ----> bounded or preserved output
+ read/exec dispatch ----> direct result or managed task ----> bounded or preserved output
 ```
 
 For a resumed session, the stored `SessionContext` replaces newly generated prompt and Skill context. Current startup discovery must not reinterpret historical sessions.
@@ -93,7 +93,9 @@ The shared routing and execution lifecycle is in [Protocols, tasks, output, and 
 
 ### Execution and persistence
 
-- Asynchronous task acceptance is not completion. Status and final content remain available through the owning protocol's read route.
+- Protocol execution returns its final result directly by default.
+- Use a managed task only when an operation necessarily runs long enough that keeping the tool call open is inappropriate.
+- Managed task acceptance is not completion. Status and final content remain available through the owning protocol's read route.
 - URI syntax belongs to its protocol; the registry must not interpret protocol-specific options.
 - Shell cancellation terminates child processes, not only the parent future.
 - File writes remain atomic. Exact replacement rejects missing and ambiguous matches.

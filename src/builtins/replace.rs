@@ -1,7 +1,6 @@
+use super::atomic_write;
 use super::file::resolve_path;
-use super::{atomic_write, render_task, render_task_list};
 use crate::plugin::{Plugin, PluginHost};
-use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -11,18 +10,22 @@ use tokio::fs;
 
 const HELP: &str = r#"# replace
 
-Replace one exact text match asynchronously.
+Replace one exact text match and return the final result.
 
-Call `exec` with `replace://path` and this body:
+Call `exec` with `replace://<path>` and this body:
 
 ```json
-{"old_text":"unique text to replace","new_text":"replacement"}
+{"old_text":"<old text>","new_text":"<replacement>"}
 ```
 
-Relative paths resolve from the startup working directory; absolute paths are
-accepted. `old_text` must be nonempty and occur exactly once. The file is
-replaced atomically. The immediate result contains a task URI; read that URI to
-inspect completion or failure.
+Replace `<path>` with the project-relative or absolute path of the file to edit,
+`<old text>` with the exact project text to find, and `<replacement>` with its
+new content. Relative paths resolve from the startup working directory.
+`old_text` must be nonempty and occur exactly once. The file is replaced
+atomically. `exec` returns after the replacement succeeds; validation and write
+errors are returned directly.
+
+`read` supports only `replace://help`.
 "#;
 
 #[derive(Clone)]
@@ -62,42 +65,28 @@ impl Protocol for ReplaceProtocol {
     async fn read(
         &self,
         request: ProtocolRequest<'_>,
-        context: ProtocolContext,
+        _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        match request.target {
-            "help" => Ok(HELP.as_bytes().to_vec()),
-            "tasks" => Ok(render_task_list(&context.tasks, "replace").await),
-            target => {
-                let id = target
-                    .strip_prefix("tasks/")
-                    .ok_or_else(|| anyhow!("expected replace://help or replace://tasks/<id>"))?;
-                render_task(&context.tasks, "replace", id).await
-            }
+        if request.target != "help" {
+            bail!("expected replace://help");
         }
+        Ok(HELP.as_bytes().to_vec())
     }
 
     async fn exec(
         &self,
         request: ProtocolRequest<'_>,
-        context: ProtocolContext,
+        _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target.is_empty() {
             bail!("replace target path cannot be empty");
         }
-        let body = request.body.cloned();
+        let body = request
+            .body
+            .ok_or_else(|| anyhow!("replace body is required"))?;
         let path = resolve_path(&self.cwd, request.target);
-        let label = format!("replace {}", path.display());
-        let record = context.tasks.allocate("replace", label).await;
-        let id = record.id.clone();
-        let tasks = context.tasks.clone();
-        tasks
-            .spawn(record, async move {
-                let body = body.ok_or_else(|| anyhow!("replace body is required"))?;
-                replace_exact(&path, &body).await?;
-                Ok(format!("Updated {}\n", path.display()).into_bytes())
-            })
-            .await;
-        Ok(prompts::task_accepted("replace", &id).into_bytes())
+        replace_exact(&path, body).await?;
+        Ok(format!("Updated {}\n", path.display()).into_bytes())
     }
 }
 
@@ -138,6 +127,67 @@ async fn replace_exact(path: &Path, body: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::TaskManager;
+
+    #[tokio::test]
+    async fn protocol_exec_returns_the_completed_replacement_directly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "alpha beta\n").await.unwrap();
+        let protocol = ReplaceProtocol::new(directory.path());
+        let tasks = TaskManager::new();
+        let context = ProtocolContext {
+            tasks: tasks.clone(),
+        };
+        let body = serde_json::json!({"old_text": "beta", "new_text": "gamma"});
+        let help = protocol
+            .read(
+                ProtocolRequest {
+                    uri: "replace://help",
+                    target: "help",
+                    body: None,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(help)
+                .unwrap()
+                .contains("replace://<path>")
+        );
+
+        let output = protocol
+            .exec(
+                ProtocolRequest {
+                    uri: "replace://file.txt",
+                    target: "file.txt",
+                    body: Some(&body),
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert!(String::from_utf8(output).unwrap().contains("Updated"));
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha gamma\n");
+        assert!(tasks.list().await.is_empty());
+        assert!(
+            protocol
+                .read(
+                    ProtocolRequest {
+                        uri: "replace://tasks",
+                        target: "tasks",
+                        body: None,
+                    },
+                    context,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("replace://help")
+        );
+    }
 
     #[tokio::test]
     async fn exact_replace_is_atomic_and_rejects_missing_or_ambiguous_matches() {

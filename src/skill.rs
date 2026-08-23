@@ -7,9 +7,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn help(skill_md: &str, skill_directory: &Path) -> String {
+fn help(skill_md: &str, skill_directory: &Path, protocol: &str) -> String {
     format!(
-        "{skill_md}\n\nSkill files: file://{}/\n",
+        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\n",
         display_path(skill_directory)
     )
 }
@@ -111,7 +111,7 @@ impl Protocol for SkillProtocol {
                     self.snapshot.path.display()
                 )
             })?;
-            return Ok(help(&skill_md, root).into_bytes());
+            return Ok(help(&skill_md, root, &self.protocol).into_bytes());
         }
         let relative = Path::new(request.target);
         if relative.is_absolute() {
@@ -312,11 +312,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            String::from_utf8(help)
-                .unwrap()
-                .contains("Skill files: file://")
-        );
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("Skill files: file://"));
+        assert!(help.contains("code-review-skill://<relative-path>"));
+        assert!(help.contains("relative to this Skill directory"));
         let resource = skill
             .read(
                 ProtocolRequest {

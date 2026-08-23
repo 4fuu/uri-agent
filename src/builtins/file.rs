@@ -18,9 +18,12 @@ Read files and directories.
 
 Current working directory: `file://{}`
 
-- `file://relative/path` resolves from the current working directory.
-- `file:///absolute/path` reads an absolute path.
-- Add `?offset=N&limit=N` to read a bounded range of text lines.
+- Use `file://<path>` to read a file or directory. Replace `<path>` with a
+  project-relative path or an absolute filesystem path; relative paths resolve
+  from the current working directory.
+- Add `?offset=<line>&limit=<count>` to read a bounded range. `<line>` is the
+  one-based starting line or directory-entry position, and `<count>` is the
+  maximum number of lines or entries to return.
 - Add `?line_numbers=true` to prefix file content with one-based line numbers. Line numbers are disabled by default.
 - Reading a directory returns a bounded directory listing.
 - Full outputs saved by the system are exposed as `file://` addresses.
@@ -235,6 +238,8 @@ mod tests {
     fn help_reports_display_path_and_opt_in_line_numbers() {
         let help = help(Path::new(r"\\?\C:\Users\4fu\project"));
         assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
+        assert!(help.contains("`file://<path>`"));
+        assert!(help.contains("`?offset=<line>&limit=<count>`"));
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
     }

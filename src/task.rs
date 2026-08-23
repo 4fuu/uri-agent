@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -59,6 +59,7 @@ pub struct TaskNotice {
 pub struct TaskManager {
     inner: Arc<RwLock<HashMap<String, TaskRecord>>>,
     notices: broadcast::Sender<TaskNotice>,
+    next_id: Arc<AtomicU64>,
 }
 
 impl Default for TaskManager {
@@ -73,6 +74,7 @@ impl TaskManager {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             notices,
+            next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -82,7 +84,7 @@ impl TaskManager {
 
     pub async fn allocate(&self, protocol: &str, label: impl Into<String>) -> TaskRecord {
         let record = TaskRecord {
-            id: Uuid::now_v7().simple().to_string(),
+            id: format_task_id(self.next_id.fetch_add(1, Ordering::Relaxed)),
             protocol: protocol.to_string(),
             label: label.into(),
             status: TaskStatus::Pending,
@@ -206,9 +208,28 @@ impl TaskManager {
     }
 }
 
+fn format_task_id(sequence: u64) -> String {
+    format!("{sequence:03x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_ids_are_lowercase_hex_with_a_three_digit_minimum() {
+        assert_eq!(format_task_id(1), "001");
+        assert_eq!(format_task_id(0xabc), "abc");
+        assert_eq!(format_task_id(0xfff), "fff");
+        assert_eq!(format_task_id(0x1000), "1000");
+    }
+
+    #[tokio::test]
+    async fn task_manager_allocates_monotonic_ids() {
+        let tasks = TaskManager::new();
+        assert_eq!(tasks.allocate("test", "first").await.id, "001");
+        assert_eq!(tasks.allocate("test", "second").await.id, "002");
+    }
 
     #[tokio::test]
     async fn bounded_wait_is_uri_independent_and_does_not_cancel_on_timeout() {

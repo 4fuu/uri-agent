@@ -30,13 +30,13 @@ Call `exec` with `bash://run` and pass the command string directly as the body:
 exec("bash://run", "cargo test")
 ```
 
-Add `?wait=N` to wait up to N seconds (maximum 300), for example
-`bash://?wait=30`. If the wait window expires, the command keeps running and
-the result contains its task URI.
+Add `?wait=<seconds>` to wait for an integer number of seconds from 0 through
+300; for example, `bash://?wait=30`. If the wait window expires, the command
+keeps running and the result contains its task URI.
 
-Read `bash://tasks/<id>` for status and bounded output. If that output exceeds
-the system limit, the result includes a `file://` address containing the full
-output.
+Read `bash://tasks/<id>` for status and bounded output, using the task ID
+returned by `exec`. If that output exceeds the system limit, the result includes
+a `file://` address containing the full output.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -64,16 +64,16 @@ exec("pwsh://run", "Get-ChildItem -Path . -Force")
 Commands already run as managed tasks. Do not create another background layer
 inside the command. Use the returned task URI to inspect the task later.
 
-Add `?wait=N` to wait up to N seconds (maximum 300), for example
-`pwsh://?wait=30`. If the wait window expires, the command keeps running and
-the result contains its task URI.
+Add `?wait=<seconds>` to wait for an integer number of seconds from 0 through
+300; for example, `pwsh://?wait=30`. If the wait window expires, the command
+keeps running and the result contains its task URI.
 
 PowerShell source and plain-text output use UTF-8. Task success follows the
 final PowerShell or native command, and native exit codes are preserved.
 
-Read `pwsh://tasks/<id>` for status and bounded output. If that output exceeds
-the system limit, the result includes a `file://` address containing the full
-output.
+Read `pwsh://tasks/<id>` for status and bounded output, using the task ID
+returned by `exec`. If that output exceeds the system limit, the result includes
+a `file://` address containing the full output.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -580,8 +580,12 @@ mod tests {
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
         assert!(PWSH_HELP.contains("Do not create another background layer"));
+        assert!(PWSH_HELP.contains("`?wait=<seconds>`"));
+        assert!(PWSH_HELP.contains("`pwsh://tasks/<id>`"));
         assert!(PWSH_HELP.contains("`pwsh://?wait=30`"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
+        assert!(BASH_HELP.contains("`?wait=<seconds>`"));
+        assert!(BASH_HELP.contains("`bash://tasks/<id>`"));
         assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }
 
