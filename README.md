@@ -41,7 +41,7 @@ exec(uri: string, body?: any)
 
 ### Install
 
-With Homebrew on macOS or Linux:
+With Homebrew on macOS:
 
 ```bash
 brew tap 4fuu/uri-agent https://github.com/4fuu/uri-agent

@@ -15,8 +15,8 @@ command -v tar >/dev/null 2>&1 || fail "tar is required"
 
 [ "$(uname -s)" = Linux ] || fail "this installer supports Linux; use Homebrew on macOS"
 case $(uname -m) in
-    x86_64 | amd64) target=x86_64-unknown-linux-gnu ;;
-    aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+    x86_64 | amd64) target=x86_64-unknown-linux-musl ;;
+    aarch64 | arm64) target=aarch64-unknown-linux-musl ;;
     *) fail "unsupported Linux architecture: $(uname -m)" ;;
 esac
 

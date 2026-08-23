@@ -9,8 +9,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/4fuu/uri-agent"
 TARGETS = {
-    "linux_arm": ("aarch64-unknown-linux-gnu", "tar.gz"),
-    "linux_intel": ("x86_64-unknown-linux-gnu", "tar.gz"),
+    "linux_arm": ("aarch64-unknown-linux-musl", "tar.gz"),
+    "linux_intel": ("x86_64-unknown-linux-musl", "tar.gz"),
     "mac_arm": ("aarch64-apple-darwin", "tar.gz"),
     "mac_intel": ("x86_64-apple-darwin", "tar.gz"),
     "windows_intel": ("x86_64-pc-windows-msvc", "zip"),
@@ -56,8 +56,6 @@ def formula(version: str, checksums: dict[str, str]) -> str:
 
     mac_arm_url, mac_arm_sha = source("mac_arm")
     mac_intel_url, mac_intel_sha = source("mac_intel")
-    linux_arm_url, linux_arm_sha = source("linux_arm")
-    linux_intel_url, linux_intel_sha = source("linux_intel")
     return f'''class UriAgent < Formula
   desc "Protocol-oriented coding agent with a focused terminal interface"
   homepage "{REPOSITORY}"
@@ -71,16 +69,6 @@ def formula(version: str, checksums: dict[str, str]) -> str:
     else
       url "{mac_intel_url}"
       sha256 "{mac_intel_sha}"
-    end
-  end
-
-  on_linux do
-    if Hardware::CPU.arm?
-      url "{linux_arm_url}"
-      sha256 "{linux_arm_sha}"
-    else
-      url "{linux_intel_url}"
-      sha256 "{linux_intel_sha}"
     end
   end
 
