@@ -9,6 +9,22 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+const HELP: &str = r#"# replace
+
+Replace one exact text match asynchronously.
+
+Call `exec` with `replace://path` and this body:
+
+```json
+{"old_text":"unique text to replace","new_text":"replacement"}
+```
+
+Relative paths resolve from the startup working directory; absolute paths are
+accepted. `old_text` must be nonempty and occur exactly once. The file is
+replaced atomically. The immediate result contains a task URI; read that URI to
+inspect completion or failure.
+"#;
+
 #[derive(Clone)]
 pub(super) struct ReplaceProtocol {
     cwd: PathBuf,
@@ -49,7 +65,7 @@ impl Protocol for ReplaceProtocol {
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         match request.target {
-            "help" => Ok(prompts::REPLACE_HELP.as_bytes().to_vec()),
+            "help" => Ok(HELP.as_bytes().to_vec()),
             "tasks" => Ok(render_task_list(&context.tasks, "replace").await),
             target => {
                 let id = target

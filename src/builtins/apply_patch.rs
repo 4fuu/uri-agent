@@ -15,6 +15,35 @@ const DELETE_FILE: &str = "*** Delete File: ";
 const UPDATE_FILE: &str = "*** Update File: ";
 const MOVE_TO: &str = "*** Move to: ";
 const END_OF_FILE: &str = "*** End of File";
+const HELP: &str = r#"# apply_patch
+
+Apply a Codex-style multi-file patch asynchronously.
+
+Call `exec` with `apply_patch://apply`. The body must be the patch string itself:
+
+```text
+*** Begin Patch
+*** Add File: path/to/new.txt
++new content
+*** Update File: path/to/existing.txt
+@@ optional landmark
+-old line
++new line
+*** Delete File: path/to/remove.txt
+*** End Patch
+```
+
+An Update File may put `*** Move to: new/path` immediately after its header.
+Update lines begin with a space for context, `-` for removal, or `+` for
+addition. `*** End of File` anchors the preceding chunk at EOF. Add File content
+lines must all begin with `+`. Relative paths resolve from the startup working
+directory; absolute paths are accepted.
+
+Operations run in patch order and each write is atomic, but the complete patch
+is not transactional: a later failure does not undo earlier operations. The
+immediate result contains a task URI; read that URI for the final summary or
+error.
+"#;
 
 #[derive(Clone)]
 pub(super) struct ApplyPatchProtocol {
@@ -56,7 +85,7 @@ impl Protocol for ApplyPatchProtocol {
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         match request.target {
-            "help" => Ok(prompts::APPLY_PATCH_HELP.as_bytes().to_vec()),
+            "help" => Ok(HELP.as_bytes().to_vec()),
             "tasks" => Ok(render_task_list(&context.tasks, "apply_patch").await),
             target => {
                 let id = target.strip_prefix("tasks/").ok_or_else(|| {

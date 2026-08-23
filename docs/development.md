@@ -43,16 +43,16 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
 | `src/model.rs` | Rig provider adapters, model request compatibility, multimodal support, and the two tool schemas |
 | `src/clipboard.rs` | Cross-platform clipboard image reads and PNG encoding |
-| `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and built-in protocol help |
+| `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, binary-hint, file, exact replacement, Codex patch, Bash, and PowerShell plugins |
+| `src/builtins/` | Built-in project-instruction, binary-hint, file, exact replacement, Codex patch, Bash, and PowerShell plugins, including their protocol help |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, and status registration |
-| `src/wasm_plugin.rs` | Persistent module discovery, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
+| `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
 | `examples/wasm-plugin/` | Buildable Rust guest plugin example |
 | `src/task.rs` | In-process task lifecycle, waiting, cancellation, records, and notices |
 | `src/output.rs` | Inline output limits, previews, and complete-output persistence |
-| `src/skill.rs` | Skill discovery, frontmatter, protocol naming, snapshots, and resource containment |
+| `src/skill.rs` | Skill discovery, frontmatter, protocol naming and help, snapshots, and resource containment |
 | `src/session.rs` | SQLite schema, session boundaries, frozen context, events, drafts, checkpoints, and replay |
 | `src/compaction.rs` | Context estimation, complete-turn compaction boundaries, summaries, and retained history |
 | `src/runtime.rs` | User turns, image attachments, model/tool loop, tool-call correlation, and compaction triggers |
@@ -139,7 +139,7 @@ The active keys, interactions, and visible behavior are owned by [Terminal inter
 When adding or changing a protocol:
 
 1. update its implementation and descriptor;
-2. update its `<protocol>://help` contract in `src/prompts.rs`;
+2. update its `<protocol>://help` contract in the owning protocol module;
 3. preserve opaque registry routing and body pass-through;
 4. add focused normal-path and boundary-condition tests;
 5. update [protocol documentation](protocols.md) when public cross-cutting behavior changes.

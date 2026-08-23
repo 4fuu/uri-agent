@@ -1,6 +1,5 @@
 use crate::config::display_path;
 use crate::plugin::{Plugin, PluginHost};
-use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -10,6 +9,27 @@ use tokio::fs;
 
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 2_000;
+
+fn help(cwd: &Path) -> String {
+    format!(
+        r#"# file
+
+Read files and directories.
+
+Current working directory: `file://{}`
+
+- `file://relative/path` resolves from the current working directory.
+- `file:///absolute/path` reads an absolute path.
+- Add `?offset=N&limit=N` to read a bounded range of text lines.
+- Add `?line_numbers=true` to prefix file content with one-based line numbers. Line numbers are disabled by default.
+- Reading a directory returns a bounded directory listing.
+- Full outputs saved by the system are exposed as `file://` addresses.
+
+The body is passed through but is not required by this built-in protocol.
+"#,
+        display_path(cwd)
+    )
+}
 
 #[derive(Clone)]
 pub(super) struct FileProtocol {
@@ -51,7 +71,7 @@ impl Protocol for FileProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
-            return Ok(prompts::file_help(&self.cwd).into_bytes());
+            return Ok(help(&self.cwd).into_bytes());
         }
 
         let (target, query) = split_query(request.target);
@@ -210,6 +230,14 @@ async fn read_directory(path: &Path, range: Range) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_reports_display_path_and_opt_in_line_numbers() {
+        let help = help(Path::new(r"\\?\C:\Users\4fu\project"));
+        assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
+        assert!(help.contains("`?line_numbers=true`"));
+        assert!(help.contains("Line numbers are disabled by default."));
+    }
 
     #[test]
     fn custom_targets_are_not_percent_decoded() {

@@ -1,5 +1,4 @@
-use crate::config::path_is_within;
-use crate::prompts;
+use crate::config::{display_path, path_is_within};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -7,6 +6,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+fn help(skill_md: &str, skill_directory: &Path) -> String {
+    format!(
+        "{skill_md}\n\nSkill files: file://{}/\n",
+        display_path(skill_directory)
+    )
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SkillSnapshot {
@@ -105,7 +111,7 @@ impl Protocol for SkillProtocol {
                     self.snapshot.path.display()
                 )
             })?;
-            return Ok(prompts::skill_help(&skill_md, root).into_bytes());
+            return Ok(help(&skill_md, root).into_bytes());
         }
         let relative = Path::new(request.target);
         if relative.is_absolute() {
