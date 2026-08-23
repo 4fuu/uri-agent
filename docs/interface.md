@@ -114,6 +114,7 @@ Configurable actions must go through the keymap. New commands that should be ava
 Ordinary clicks and drags are sent to the terminal application. Hold `Shift` while dragging to select rendered text. `Ctrl+C`, `Ctrl+Shift+C`, or right-click copies that selection through OSC52. On macOS, `Cmd+C` also works when the terminal forwards the Command modifier; terminals that reserve the shortcut require `Ctrl+Shift+C`.
 
 User prompts, assistant responses, and read-only floats support direct drag selection without Shift. Hold `Shift` while dragging reasoning or tool blocks so their ordinary clicks remain available for expand and open actions. Terminal restoration, mouse selection, and OSC52 copy must remain functional on normal exits and error paths.
+On URI Agent surfaces, a copy shortcut copies the active selection and `Esc` clears it. Any other shortcut clears the selection and continues through normal key routing, so the command panel and global panels remain available while text is selected.
 
 ## Image attachments
 

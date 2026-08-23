@@ -2137,12 +2137,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
     if app.interrupt_on_double_press(key, &key_name) {
         return Action::InterruptTurn;
     }
-    if app.selection.is_some() {
-        match app.keymap.action("selection", &key_name).as_deref() {
-            Some("copy") => copy_current_surface(app),
-            Some("close") => app.selection = None,
-            _ => {}
-        }
+    if handle_selection_key(app, &key_name) {
         return Action::Continue;
     }
     match app.keymap.action_chain(&[], &key_name).as_deref() {
@@ -2273,6 +2268,21 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
         }
         None => Action::Continue,
     }
+}
+
+fn handle_selection_key(app: &mut App, key_name: &str) -> bool {
+    if app.selection.is_none() {
+        return false;
+    }
+    match app.keymap.action("selection", key_name).as_deref() {
+        Some("copy") => copy_current_surface(app),
+        Some("close") => app.selection = None,
+        _ => {
+            app.selection = None;
+            return false;
+        }
+    }
+    true
 }
 
 async fn handle_overlay_key(
@@ -8313,6 +8323,34 @@ mod tests {
             app.keymap.action("selection", "ctrl+c").as_deref(),
             Some("copy")
         );
+    }
+
+    #[test]
+    fn selection_releases_command_and_global_panel_shortcuts() {
+        let mut app = test_app();
+        let selection = TextSelection {
+            start: (0, 0),
+            end: (1, 0),
+        };
+
+        for (key, expected_action) in [
+            (":", "command"),
+            ("f1", "help"),
+            ("f2", "settings"),
+            ("f3", "model"),
+            ("f4", "status"),
+            ("ctrl+p", "protocols"),
+            ("ctrl+t", "tasks"),
+        ] {
+            app.selection = Some(selection);
+
+            assert!(!handle_selection_key(&mut app, key));
+            assert!(app.selection.is_none());
+            assert_eq!(
+                app.keymap.action_chain(&["main"], key).as_deref(),
+                Some(expected_action)
+            );
+        }
     }
 
     #[test]
