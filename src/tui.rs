@@ -4526,9 +4526,14 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         {
             continue;
         }
-        if previous_visible
-            .is_some_and(|previous| transcript_needs_gap(previous, block.kind, block.turn_result))
-        {
+        if previous_visible.is_some_and(|(previous, previous_turn_result)| {
+            transcript_needs_gap(
+                previous,
+                previous_turn_result,
+                block.kind,
+                block.turn_result,
+            )
+        }) {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
             block_for_row.push(None);
         }
@@ -4553,7 +4558,7 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
             block_for_row.push(None);
         }
-        previous_visible = Some(block.kind);
+        previous_visible = Some((block.kind, block.turn_result));
     }
     app.transcript_rows = items.len();
     app.transcript_height = area.height as usize;
@@ -4597,9 +4602,17 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn transcript_needs_gap(previous: BlockKind, current: BlockKind, turn_result: bool) -> bool {
-    matches!((previous, current), (BlockKind::User, BlockKind::Process))
-        || (turn_result
+fn transcript_needs_gap(
+    previous: BlockKind,
+    previous_turn_result: bool,
+    current: BlockKind,
+    current_turn_result: bool,
+) -> bool {
+    (previous_turn_result
+        && matches!(previous, BlockKind::Assistant | BlockKind::Error)
+        && current == BlockKind::User)
+        || matches!((previous, current), (BlockKind::User, BlockKind::Process))
+        || (current_turn_result
             && matches!(current, BlockKind::Assistant | BlockKind::Error)
             && previous != BlockKind::User)
 }
@@ -7463,7 +7476,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_separates_folded_process_from_padded_user_prompt() {
+    fn follow_up_user_prompt_has_an_extra_blank_row_after_the_previous_result() {
         let mut app = test_app();
         app.push(
             BlockKind::Assistant,
@@ -7473,6 +7486,7 @@ mod tests {
             false,
             true,
         );
+        app.blocks[0].turn_result = true;
         app.push(
             BlockKind::User,
             "YOU",
@@ -7527,7 +7541,7 @@ mod tests {
             .find_map(|region| (region.target == AppHit::Transcript(4)).then_some(region.area.y))
             .unwrap();
 
-        assert_eq!(user_row, previous_row + 2);
+        assert_eq!(user_row, previous_row + 3);
         assert_eq!(process_row, user_row + 3);
         assert_eq!(result_row, process_row + 2);
         for row in [user_row - 1, user_row, user_row + 1] {
@@ -7538,13 +7552,24 @@ mod tests {
             terminal.backend().buffer()[(1, user_row + 2)].bg,
             Color::Reset
         );
-        for row in [user_row - 1, user_row + 1, user_row + 2] {
+        assert_eq!(
+            terminal.backend().buffer()[(1, previous_row + 1)].bg,
+            Color::Reset
+        );
+        for row in [previous_row + 1, user_row - 1, user_row + 1, user_row + 2] {
             assert!(!app.hit_regions.iter().any(|region| {
                 region.area.y == row && matches!(region.target, AppHit::Transcript(_))
             }));
         }
         assert!(transcript_needs_gap(
+            BlockKind::Assistant,
+            true,
             BlockKind::User,
+            false,
+        ));
+        assert!(transcript_needs_gap(
+            BlockKind::User,
+            false,
             BlockKind::Process,
             false
         ));
@@ -7794,16 +7819,19 @@ mod tests {
         );
         assert!(!transcript_needs_gap(
             BlockKind::User,
+            false,
             BlockKind::Tool,
             false
         ));
         assert!(!transcript_needs_gap(
             BlockKind::Reasoning,
+            false,
             BlockKind::Assistant,
             false
         ));
         assert!(!transcript_needs_gap(
             BlockKind::Reasoning,
+            false,
             BlockKind::Tool,
             false
         ));
@@ -7868,6 +7896,7 @@ mod tests {
         );
         assert!(transcript_needs_gap(
             BlockKind::Reasoning,
+            false,
             BlockKind::Assistant,
             true
         ));
