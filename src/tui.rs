@@ -59,7 +59,9 @@ const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
 const WARM: Color = Color::Rgb(239, 173, 104);
 const ERROR: Color = Color::Rgb(239, 108, 120);
-const FLASH_DURATION: Duration = Duration::from_secs(5);
+const FLASH_MIN_DURATION: Duration = Duration::from_secs(3);
+const FLASH_MAX_DURATION: Duration = Duration::from_secs(15);
+const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const EXPANDED_PREVIEW_LINES: usize = 24;
@@ -1119,9 +1121,9 @@ impl App {
     }
 
     fn visible_flash(&self) -> Option<&str> {
-        self.flash.as_deref().filter(|_| {
+        self.flash.as_deref().filter(|message| {
             self.flash_at
-                .is_some_and(|created| created.elapsed() < FLASH_DURATION)
+                .is_some_and(|created| created.elapsed() < flash_duration(message))
         })
     }
 
@@ -4072,19 +4074,24 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
     let idle = app.blocks.is_empty();
-    let notice = status_notice(app);
+    let notice = status_notice(app)
+        .map(|(message, color)| (status_notice_lines(&message, area.width), color));
+    let notice_height = notice
+        .as_ref()
+        .map_or(0, |(lines, _)| lines.len().min(u16::MAX as usize) as u16);
+    let constraints = match (idle, notice.is_some()) {
+        (true, false) => vec![Constraint::Min(3)],
+        (true, true) => vec![Constraint::Min(3), Constraint::Length(notice_height)],
+        (false, false) => vec![Constraint::Min(3), Constraint::Length(1)],
+        (false, true) => vec![
+            Constraint::Min(3),
+            Constraint::Length(notice_height),
+            Constraint::Length(1),
+        ],
+    };
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(match (idle, notice.is_some()) {
-            (true, false) => [Constraint::Min(3)].as_slice(),
-            (true, true) | (false, false) => [Constraint::Min(3), Constraint::Length(1)].as_slice(),
-            (false, true) => [
-                Constraint::Min(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ]
-            .as_slice(),
-        })
+        .constraints(constraints)
         .split(area);
     let content = if idle {
         render_brand(frame, app, areas[0], false);
@@ -4095,9 +4102,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_footer(frame, app, footer_area);
         areas[0]
     };
-    if let Some((message, color)) = notice {
+    if let Some((lines, color)) = notice {
         frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(color).bg(SURFACE)),
+            Paragraph::new(lines)
+                .style(Style::default().fg(color).bg(SURFACE))
+                .block(Block::new().padding(Padding::horizontal(1))),
             areas[1],
         );
     }
@@ -4769,7 +4778,7 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
             .unwrap_or_default();
         (
             format!(
-                " {} {activity}{elapsed}  {}",
+                "{} {activity}{elapsed}  {}",
                 animation::spinner(app.frame),
                 animation::activity(app.frame, 8)
             ),
@@ -4777,7 +4786,7 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
         )
     } else if let Some(flash) = app.visible_flash() {
         (
-            format!(" {flash}"),
+            flash.to_string(),
             if flash_is_error(flash) { ERROR } else { WARM },
         )
     } else if app.jump != JumpKind::All {
@@ -4795,7 +4804,7 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
             .unwrap_or(0);
         (
             format!(
-                " {label} {position}/{}   esc clear   enter open",
+                "{label} {position}/{}   esc clear   enter open",
                 indices.len()
             ),
             WARM,
@@ -4813,13 +4822,13 @@ fn status_notice(app: &App) -> Option<(String, Color)> {
 
 fn pending_image_notice(count: usize, loading: bool) -> String {
     match (count, loading) {
-        (0, true) => " reading clipboard image…".to_string(),
+        (0, true) => "reading clipboard image…".to_string(),
         (count, false) => format!(
-            " {count} image{} ready · alt+backspace remove",
+            "{count} image{} ready · alt+backspace remove",
             if count == 1 { "" } else { "s" }
         ),
         (count, true) => format!(
-            " {count} image{} ready · reading another…",
+            "{count} image{} ready · reading another…",
             if count == 1 { "" } else { "s" }
         ),
     }
@@ -4837,6 +4846,22 @@ fn user_message_image_count(message: &Message) -> usize {
             .count(),
         _ => 0,
     }
+}
+
+fn status_notice_lines(message: &str, width: u16) -> Vec<Line<'static>> {
+    wrapped_block_lines(message, width.saturating_sub(2).max(1) as usize)
+        .into_iter()
+        .map(Line::raw)
+        .collect()
+}
+
+fn flash_duration(message: &str) -> Duration {
+    let characters = message.graphemes(true).count() as u64;
+    FLASH_MIN_DURATION
+        .saturating_add(Duration::from_millis(
+            characters.saturating_mul(FLASH_MILLIS_PER_CHARACTER),
+        ))
+        .min(FLASH_MAX_DURATION)
 }
 
 fn flash_is_error(flash: &str) -> bool {
@@ -6849,6 +6874,74 @@ mod tests {
         assert_eq!(hit_target(&app.hit_regions, click), Some(AppHit::Status));
         open_status(&mut app);
         assert!(app.overlay == Some(Overlay::Status));
+    }
+
+    #[test]
+    fn bottom_notifications_wrap_completely_in_narrow_windows() {
+        let mut app = test_app();
+        app.skip_splash();
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            false,
+        );
+        let message = "Detailed notification text wraps completely inside a narrow terminal window";
+        app.set_flash(message);
+
+        let width = 24;
+        let height = 12;
+        let notice_height = status_notice_lines(message, width).len();
+        assert!(notice_height > 1);
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .collect::<Vec<_>>();
+        let notice_start = height as usize - notice_height - 1;
+        let notice_rows = &rows[notice_start..notice_start + notice_height];
+        let rendered_notice = notice_rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for word in message.split_whitespace() {
+            assert!(rendered_notice.contains(word), "missing {word:?}");
+        }
+        assert!(
+            notice_rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|cell| cell.bg == SURFACE)
+        );
+    }
+
+    #[test]
+    fn flash_residence_time_scales_with_character_count() {
+        assert_eq!(flash_duration(""), FLASH_MIN_DURATION);
+        assert_eq!(flash_duration("é"), flash_duration("e\u{301}"));
+
+        let short = "Saved";
+        let long = "Long notification text ".repeat(8);
+        assert!(flash_duration(&long) > flash_duration(short));
+        assert_eq!(flash_duration(&"x".repeat(1_000)), FLASH_MAX_DURATION);
+
+        let elapsed = flash_duration(short) + Duration::from_millis(10);
+        let mut app = test_app();
+        app.flash = Some(short.to_string());
+        app.flash_at = Some(Instant::now() - elapsed);
+        assert_eq!(app.visible_flash(), None);
+        app.flash = Some(long);
+        app.flash_at = Some(Instant::now() - elapsed);
+        assert!(app.visible_flash().is_some());
     }
 
     #[test]
