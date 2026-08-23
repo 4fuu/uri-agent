@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/4fuu/uri-agent/releases/download/v2026.823.0/uri-agent-2026.823.0-x86_64-pc-windows-msvc.zip",
-            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+            "hash": "23bfaf1dc6aa8dc63f6e5244fc7804424c6dd91bac652164a30ef883410fa192"
         }
     },
     "bin": "uri-agent.exe",

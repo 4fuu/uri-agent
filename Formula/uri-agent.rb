@@ -7,20 +7,20 @@ class UriAgent < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/4fuu/uri-agent/releases/download/v2026.823.0/uri-agent-2026.823.0-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "21a9c5267816e9e911e937b001d6d45f14c5a8a83ae7016f26f1c637f3b72e7e"
     else
       url "https://github.com/4fuu/uri-agent/releases/download/v2026.823.0/uri-agent-2026.823.0-x86_64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "f8c8cf2e0453854b4701d5eb22e1feed57e866cb7bcb991077d93f2646e3d980"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/4fuu/uri-agent/releases/download/v2026.823.0/uri-agent-2026.823.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "019f8af3f7c266b0df0d4e8cfe0a3cb5b7319c8c45b849ce151cf642f4b7d9aa"
     else
       url "https://github.com/4fuu/uri-agent/releases/download/v2026.823.0/uri-agent-2026.823.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "9ed14816e3880a72bc4826bdbae8dc5e0b131ecb9d2e095f55383803b52e30e1"
     end
   end
 
