@@ -65,6 +65,32 @@ fn use_token_without_exposing_it() -> Result<(), String> {
 
 The request grants direct access to any variable in URI Agent's Agent environment manager; variable names are not declared in the manifest. It is a source-audit marker for trusted plugins, not an interactive approval or sandbox boundary. The host rejects `environment_variable` calls from a plugin whose manifest omitted the request. Runtime storage and trust details are in [WASM plugins](../docs/plugins.md#agent-environment-access).
 
+## Request provider credential access
+
+To resolve API keys saved through `:login` or supplied through conventional
+provider process environment variables, request the credential capability and
+look up provider IDs dynamically:
+
+```rust
+fn manifest() -> PluginManifest {
+    PluginManifest::new([/* protocol descriptors */])
+        .request_credentials_access()
+}
+
+#[cfg(target_family = "wasm")]
+fn use_provider_key_without_exposing_it() -> Result<(), String> {
+    let key = uri_agent_plugin_sdk::provider_api_key("parallel")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Parallel is not logged in".to_string())?;
+    // Pass `key` to the intended provider; do not include it in plugin output.
+    Ok(())
+}
+```
+
+The request grants API-key reads for any provider and is a source-audit marker,
+not an interactive approval. It exposes neither OAuth refresh data nor Agent
+environment values. See [Provider credential access](../docs/plugins.md#provider-credential-access).
+
 Build the module for WASI:
 
 ```bash

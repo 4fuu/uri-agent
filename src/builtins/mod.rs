@@ -2,6 +2,7 @@ mod agents;
 mod apply_patch;
 mod bin_hints;
 mod file;
+mod https;
 mod replace;
 mod shell;
 mod uri_agent_docs;
@@ -20,6 +21,7 @@ pub fn plugins(cwd: &Path) -> PluginRegistry {
     plugins.add(bin_hints::BinHintsPlugin);
     plugins.add(uri_agent_docs::UriAgentDocsProtocol);
     plugins.add(file::FileProtocol::new(cwd));
+    plugins.add(https::HttpsProtocol::new());
     plugins.add(replace::ReplaceProtocol::new(cwd));
     plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
     shell::add_plugins(&mut plugins, cwd);
@@ -108,7 +110,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_distribution_declares_document_file_and_edit_plugins() {
+    fn built_in_distribution_declares_document_file_web_and_edit_plugins() {
         let directory = tempfile::tempdir().unwrap();
         let plugins = plugins(directory.path());
         let names = plugins
@@ -120,6 +122,7 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "uri-agent-docs"));
         assert!(names.iter().any(|name| name == "file"));
+        assert!(names.iter().any(|name| name == "https"));
         assert!(names.iter().any(|name| name == "replace"));
         assert!(names.iter().any(|name| name == "apply_patch"));
         assert!(!names.iter().any(|name| name == "edit"));

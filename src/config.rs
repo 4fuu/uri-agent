@@ -412,6 +412,48 @@ impl ConfigManager {
         self.active.read().await.clone()
     }
 
+    /// Resolve a provider API key outside the active model selection.
+    ///
+    /// This is used by provider-backed protocols such as web search. The
+    /// provider-specific process environment variable takes precedence over a
+    /// key saved in `auth.json`, matching active model credential resolution.
+    pub async fn provider_api_key(&self, provider: &str) -> Result<Option<String>> {
+        let files = self.files.lock().await;
+        let entry = files.auth.0.get(provider);
+        let credential_environment = entry.map(|entry| entry.env.clone()).unwrap_or_default();
+        let mut api_key = entry
+            .filter(|entry| entry.kind == "api_key")
+            .and_then(|entry| entry.key.clone());
+        let environment = api_key_environment(provider);
+        if let Ok(value) = env::var(environment)
+            && !value.trim().is_empty()
+        {
+            api_key = Some(value);
+        }
+        match api_key {
+            Some(value) => Ok(Some(
+                resolve_config_value(&value, &credential_environment).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn load_for_test(directory: &Path, cwd: &Path) -> Result<Arc<Self>> {
+        fs::create_dir_all(directory).await?;
+        fs::create_dir_all(cwd).await?;
+        let catalog = Arc::new(ModelCatalog::load(directory, true).await?);
+        Ok(Arc::new(
+            Self::load(
+                directory.to_path_buf(),
+                cwd,
+                catalog,
+                InvocationOverrides::default(),
+            )
+            .await?,
+        ))
+    }
+
     /// Resolve credentials and model metadata for settings frozen in a
     /// session, without changing the defaults used by new sessions.
     pub async fn for_session(
@@ -1323,6 +1365,35 @@ mod tests {
             serde_json::to_value(&auth).unwrap()["anthropic"]["type"],
             "oauth"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_api_keys_resolve_saved_and_process_environment_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::load_for_test(root.path(), root.path())
+            .await
+            .unwrap();
+        let provider = "uri-agent-credential-test";
+        let environment = api_key_environment(provider);
+        assert_eq!(api_key_environment("parallel"), "PARALLEL_API_KEY");
+
+        manager
+            .set_api_key(provider, "saved-key".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.provider_api_key(provider).await.unwrap().as_deref(),
+            Some("saved-key")
+        );
+
+        // SAFETY: this test uses a process-unique variable and no other test reads it.
+        unsafe { env::set_var(&environment, "process-key") };
+        assert_eq!(
+            manager.provider_api_key(provider).await.unwrap().as_deref(),
+            Some("process-key")
+        );
+        // SAFETY: this process-unique variable is no longer used.
+        unsafe { env::remove_var(environment) };
     }
 
     #[test]

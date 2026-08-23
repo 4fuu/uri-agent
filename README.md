@@ -17,6 +17,7 @@ URI Agent is currently a pre-1.0 project installed from source. Model requests a
 
 - **Stable tool surface:** adding a capability does not add another model-facing tool schema.
 - **Progressive context:** protocol and Skill instructions enter the context only when the model reads their help.
+- **Built-in web access:** read HTTPS pages as Markdown and search through a logged-in Parallel or Exa account.
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
 - **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
@@ -73,17 +74,19 @@ See [Models and configuration](docs/configuration.md) for supported API families
 
 ```text
 read("file://src/main.rs?offset=1&limit=200")
+read("https://search?limit=10", "stable Rust release notes")
+read("https://www.rust-lang.org/")
 read("uri-agent-docs://README.md")
 read("code-review-skill://help")
 exec("bash://?wait=30", "cargo test")  # Unix-like systems
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
+URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. The built-in `https` protocol reads HTTPS pages without a login and searches after `:login` saves a Parallel or Exa API key. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
 
 ## Extensions
 
-Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI here, not a security boundary: enabled plugins receive filesystem, HTTP, WASI, and built-in protocol access with the same user authority as URI Agent. Direct access to saved Agent environment values requires one explicit whole-environment request in plugin source; it is an audit marker, not an approval flow. See [WASM plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage, and reliability limits.
+Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI here, not a security boundary: enabled plugins receive filesystem, HTTP, WASI, and built-in protocol access with the same user authority as URI Agent. Direct access to saved Agent environment values or provider API keys requires an explicit capability request in plugin source; it is an audit marker, not an approval flow. See [WASM plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage, and reliability limits.
 
 ## Documentation
 

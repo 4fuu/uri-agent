@@ -1,6 +1,6 @@
 use crate::config::display_path;
 use crate::output::OutputStore;
-use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission};
+use crate::plugin::{Plugin, PluginCredentials, PluginEnvironment, PluginHost, PluginPermission};
 use crate::protocol::{
     DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRegistry,
     ProtocolRequest, split_address, validate_descriptor,
@@ -17,8 +17,8 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use uri_agent_plugin_sdk::{
-    ABI_VERSION, HANDLE_EXPORT, HOST_ENVIRONMENT, HOST_EXEC, HOST_READ, HandlerRequest,
-    MANIFEST_EXPORT, Operation, PluginManifest,
+    ABI_VERSION, HANDLE_EXPORT, HOST_CREDENTIALS, HOST_ENVIRONMENT, HOST_EXEC, HOST_READ,
+    HandlerRequest, MANIFEST_EXPORT, Operation, PluginManifest,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
@@ -143,6 +143,12 @@ Direct access to values from the Agent environment manager uses
 managed environment rather than declaring individual names. It is a visible
 source-audit marker with no interactive approval flow.
 
+Provider API keys saved through `:login` or supplied by provider-specific
+process environment variables are available through
+`uri_agent_plugin_sdk::provider_api_key(provider)`. The manifest must call
+`.request_credentials_access()` once. This grants dynamic read access to API
+keys for every provider and is likewise an explicit source-audit marker.
+
 ## Trust and permissions
 
 WASM is the stable distribution ABI, not a security boundary here. Only build
@@ -169,6 +175,8 @@ struct HostBridge {
     registry: Arc<OnceLock<Weak<ProtocolRegistry>>>,
     environment: Arc<OnceLock<PluginEnvironment>>,
     environment_allowed: Arc<OnceLock<bool>>,
+    credentials: Arc<OnceLock<PluginCredentials>>,
+    credentials_allowed: Arc<OnceLock<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -191,6 +199,8 @@ impl HostBridge {
             registry: Arc::new(OnceLock::new()),
             environment: Arc::new(OnceLock::new()),
             environment_allowed: Arc::new(OnceLock::new()),
+            credentials: Arc::new(OnceLock::new()),
+            credentials_allowed: Arc::new(OnceLock::new()),
         }
     }
 
@@ -200,6 +210,8 @@ impl HostBridge {
             registry: self.registry.clone(),
             environment: self.environment.clone(),
             environment_allowed: Arc::new(OnceLock::new()),
+            credentials: self.credentials.clone(),
+            credentials_allowed: Arc::new(OnceLock::new()),
         }
     }
 
@@ -219,6 +231,18 @@ impl HostBridge {
         self.environment_allowed
             .set(allowed)
             .map_err(|_| anyhow!("WASM plugin environment permission is already bound"))
+    }
+
+    fn bind_credentials(&self, credentials: PluginCredentials) -> Result<()> {
+        self.credentials
+            .set(credentials)
+            .map_err(|_| anyhow!("WASM plugin credentials are already bound"))
+    }
+
+    fn set_credentials_allowed(&self, allowed: bool) -> Result<()> {
+        self.credentials_allowed
+            .set(allowed)
+            .map_err(|_| anyhow!("WASM plugin credential permission is already bound"))
     }
 
     fn dispatch(&self, operation: Operation, input: &str) -> Result<String> {
@@ -259,6 +283,18 @@ impl HostBridge {
         let value = self.runtime.block_on(environment.get(name))?;
         serde_json::to_string(&value).context("cannot encode environment variable result")
     }
+
+    fn provider_api_key(&self, provider: &str) -> Result<String> {
+        if !self.credentials_allowed.get().copied().unwrap_or(false) {
+            bail!("WASM plugin did not request credential access in uri_agent_manifest");
+        }
+        let credentials = self
+            .credentials
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin credentials are not attached"))?;
+        let value = self.runtime.block_on(credentials.api_key(provider))?;
+        serde_json::to_string(&value).context("cannot encode provider API key result")
+    }
 }
 
 extism::host_fn!(uri_agent_read_host(user_data: HostBridge; input: String) -> String {
@@ -286,6 +322,15 @@ extism::host_fn!(uri_agent_environment_host(user_data: HostBridge; input: String
         .map_err(|_| anyhow!("WASM plugin environment host bridge lock is poisoned"))?
         .clone();
     bridge.environment_variable(&input)
+});
+
+extism::host_fn!(uri_agent_credentials_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin credentials host bridge lock is poisoned"))?
+        .clone();
+    bridge.provider_api_key(&input)
 });
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -441,11 +486,12 @@ impl Plugin for WasmPluginManager {
     }
 
     fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Environment]
+        vec![PluginPermission::Environment, PluginPermission::Credentials]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         self.bridge.bind_environment(host.environment()?)?;
+        self.bridge.bind_credentials(host.credentials()?)?;
         host.protocols.register(self.clone())
     }
 }
@@ -612,6 +658,7 @@ impl WasmModule {
                 .with_context(|| format!("cannot load {display}"))?;
             let manifest = read_manifest(&mut plugin, &display)?;
             permission_bridge.set_environment_allowed(manifest.permissions.environment)?;
+            permission_bridge.set_credentials_allowed(manifest.permissions.credentials)?;
             if !manifest.protocols.is_empty() && !plugin.function_exists(HANDLE_EXPORT) {
                 bail!("WASM plugin {display} does not export {HANDLE_EXPORT}");
             }
@@ -771,8 +818,16 @@ fn build_runtime(
             HOST_ENVIRONMENT,
             [ValType::I64],
             [ValType::I64],
-            user_data,
+            user_data.clone(),
             uri_agent_environment_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_CREDENTIALS,
+            [ValType::I64],
+            [ValType::I64],
+            user_data,
+            uri_agent_credentials_host,
         )
         .build()
 }
@@ -976,6 +1031,12 @@ mod tests {
         )
     }
 
+    fn credentials_manifest(name: &str) -> String {
+        format!(
+            r#"{{"abi_version":1,"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"credentials":true}}}}"#
+        )
+    }
+
     fn host_call_module_with_input(manifest: &str, host_function: &str, input: &[u8]) -> Vec<u8> {
         let stores = input
             .iter()
@@ -1032,6 +1093,9 @@ mod tests {
         let session_id = format!("wasm-test-{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 32 * 1024).await.unwrap());
         let environment = Arc::new(AgentEnvironment::load(directory).await.unwrap());
+        let credentials = crate::config::ConfigManager::load_for_test(directory, directory)
+            .await
+            .unwrap();
         let mut registry = ProtocolRegistry::new(output.clone(), TaskManager::new());
         registry.register(CaptureProtocol).unwrap();
         let manager = WasmPluginManager::new(directory, directory).await.unwrap();
@@ -1041,12 +1105,10 @@ mod tests {
         let mut plugins = PluginRegistry::new();
         plugins.add(manager.clone());
         plugins
-            .install(&mut PluginHost::new(
-                &mut registry,
-                &mut commands,
-                &mut tui,
-                environment,
-            ))
+            .install(
+                &mut PluginHost::new(&mut registry, &mut commands, &mut tui, environment)
+                    .with_credentials(credentials),
+            )
             .unwrap();
         manager
             .set_reserved_protocols(
@@ -1300,6 +1362,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("did not request environment access"));
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_credential_access_requires_one_manifest_permission_per_plugin() {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            directory.path().join("auth.json"),
+            br#"{"parallel":{"type":"api_key","key":"saved-search-key"}}"#,
+        )
+        .await
+        .unwrap();
+        let (registry, manager, output) = registry_with_manager(directory.path()).await;
+        tokio::fs::write(
+            manager.directory().join("allowed-credentials.wasm"),
+            host_call_module_with_input(
+                &credentials_manifest("allowed_credentials"),
+                HOST_CREDENTIALS,
+                b"parallel",
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("denied-credentials.wasm"),
+            host_call_module_with_input(
+                &valid_manifest("denied_credentials"),
+                HOST_CREDENTIALS,
+                b"parallel",
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        assert_eq!(
+            registry
+                .read("allowed_credentials://read", None)
+                .await
+                .unwrap(),
+            r#""saved-search-key""#
+        );
+        let error = registry
+            .read("denied_credentials://read", None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("did not request credential access"));
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 }

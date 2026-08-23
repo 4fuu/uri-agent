@@ -72,7 +72,7 @@ First-party capabilities use the plugin path exposed to linked Rust extensions:
 3. Plugins install protocols, commands, panel providers, and status providers through `PluginHost`; prompt-only plugins need no runtime registration.
 4. Protocols remain behind `read` and `exec`, while commands join the searchable panel and key-bindable command registry.
 
-Sensitive Agent environment access uses one explicit `PluginPermission::Environment` declaration. A declared plugin can obtain `PluginEnvironment` from `PluginHost` and dynamically read any user-managed variable by name or snapshot. There is no variable allowlist or approval state: the declaration is an audit marker for trusted source, while an undeclared plugin is refused by the host interface.
+Sensitive host access uses explicit plugin permissions. `PluginPermission::Environment` exposes `PluginEnvironment` for dynamic reads from the user-managed Agent environment. `PluginPermission::Credentials` exposes `PluginCredentials` for dynamic provider API-key resolution without coupling a plugin to configuration internals. Neither capability has a variable/provider allowlist or approval state: each declaration is an audit marker for trusted source, while an undeclared plugin is refused by the host interface.
 
 TUI extensions return generic documents and semantic status items. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, or panel providers; reserve prompt fragments for context required before the first tool call.
 

@@ -2098,13 +2098,22 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let manager = crate::config::ConfigManager::load_for_test(
+            &workspace.path().join("config"),
+            workspace.path(),
+        )
+        .await
+        .unwrap();
         crate::builtins::plugins(workspace.path())
-            .install(&mut crate::plugin::PluginHost::new(
-                &mut protocols,
-                &mut commands,
-                &mut tui,
-                environment,
-            ))
+            .install(
+                &mut crate::plugin::PluginHost::new(
+                    &mut protocols,
+                    &mut commands,
+                    &mut tui,
+                    environment,
+                )
+                .with_credentials(manager),
+            )
             .unwrap();
         let call = ToolCall::new(
             ToolCallId::new("read-help").unwrap(),

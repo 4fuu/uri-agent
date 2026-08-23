@@ -62,7 +62,7 @@ Every module exports `uri_agent_manifest`, which takes no input and returns:
 }
 ```
 
-An optional `permissions` object can request sensitive host capabilities. Existing ABI version 1 manifests without it continue to load with no Agent environment access.
+An optional `permissions` object can request sensitive host capabilities. Existing ABI version 1 manifests without it continue to load with no Agent environment or credential access.
 
 Protocol names must be unique within the module and satisfy the normal registry rules. Descriptions must be nonempty. Every protocol must set `can_read` to `true` and implement `read("<protocol>://help")`; `can_exec` may be `true` or `false`.
 
@@ -95,6 +95,28 @@ fn manifest() -> PluginManifest {
 After that request, `uri_agent_plugin_sdk::environment_variable(name)` can dynamically read any valid variable name. Plugins do not declare names in advance, and URI Agent does not maintain per-variable grants or show an approval prompt. A plugin without the manifest request receives an error from this host API.
 
 This declaration is deliberately an audit marker, not a sandbox boundary. Install only source you trust and review direct environment requests alongside the plugin's existing filesystem, HTTP, WASI, and built-in protocol use. The host API returns only values saved in the Agent environment manager; it does not treat the URI Agent process environment as part of that store.
+
+## Provider credential access
+
+A plugin that needs a provider API key can request the credential capability in
+its manifest:
+
+```rust
+fn manifest() -> PluginManifest {
+    PluginManifest::new(protocols).request_credentials_access()
+}
+```
+
+`uri_agent_plugin_sdk::provider_api_key(provider)` then resolves an API key
+saved through `:login` or supplied through that provider's conventional process
+environment variable. Resolution is dynamic, so a login or logout takes effect
+without reloading the plugin. The host API returns `None` when no key is
+configured and rejects calls from a plugin that omitted the manifest request.
+
+The capability grants read access to API keys for every provider; manifests do
+not declare provider IDs in advance. It does not expose OAuth refresh data or
+the Agent environment manager. Like environment access, this is a source-audit
+marker for trusted code rather than an interactive grant or sandbox boundary.
 
 ## Trust and reliability
 

@@ -40,6 +40,7 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
 | `file` | `read` | Read files and bounded directory listings |
+| `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
 | `replace` | `read`, `exec` | Atomically replace one exact text match |
 | `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
 | `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash is enabled |
@@ -83,6 +84,34 @@ read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
 ```
 
 `file://help` reports the accepted range options, active limits, and current working directory.
+
+### `https`
+
+The read-only `https` protocol fetches HTTPS resources and turns HTML into
+cleaned Markdown. JSON is pretty-printed, textual resources are returned as
+text, redirects must remain on HTTPS, requests time out after 30 seconds, and
+response bodies are limited to 5 MiB after decompression:
+
+```text
+read("https://www.rust-lang.org/")
+```
+
+Its reserved search route accepts the nonempty search query as a string body.
+The URI accepts an optional result limit from 1 through 20 and an optional
+provider (`parallel` or `exa`):
+
+```text
+read("https://search?limit=10&provider=parallel", "stable Rust release notes")
+```
+
+Without `provider`, search tries configured providers in stable order:
+Parallel, then Exa, and falls back after a provider failure. An explicit
+provider is used without fallback. A key saved by selecting either provider in
+`:login`, or supplied through `PARALLEL_API_KEY` or `EXA_API_KEY`, makes that
+provider available. Page reads do not require a search login. `https://help`
+lists the available providers; when neither provider is configured, it directs
+the model to ask the user to run `:login` without requesting a key in the
+conversation.
 
 ### `replace`
 

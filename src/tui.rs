@@ -73,6 +73,7 @@ const EXPANDED_PREVIEW_LINES: usize = 24;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
 const TAIL_BUTTON_RIGHT_INSET: usize = 2;
+const WEB_SEARCH_LOGIN_PROVIDERS: &[&str] = &["parallel", "exa"];
 
 pub struct TuiInfo {
     pub cwd: PathBuf,
@@ -3416,6 +3417,11 @@ async fn open_login(app: &mut App, catalog: &ModelCatalog) -> Action {
             items.push(login_provider_item(provider.id(), &current));
         }
     }
+    for provider in WEB_SEARCH_LOGIN_PROVIDERS {
+        if seen.insert((*provider).to_string()) {
+            items.push(login_provider_item(provider, &current));
+        }
+    }
     if items.is_empty() {
         app.set_flash("No providers available to log in");
         return Action::Continue;
@@ -3430,10 +3436,14 @@ async fn open_login(app: &mut App, catalog: &ModelCatalog) -> Action {
 }
 
 fn login_provider_item(provider: &str, current: &str) -> SelectorItem {
-    let description = match OauthProvider::from_id(provider) {
-        Some(kind) if kind.offers_api_key() => format!("OAuth or API key · {}", kind.name()),
-        Some(kind) => format!("OAuth · {}", kind.name()),
-        None => "API key".to_string(),
+    let description = if WEB_SEARCH_LOGIN_PROVIDERS.contains(&provider) {
+        "Web search · API key".to_string()
+    } else {
+        match OauthProvider::from_id(provider) {
+            Some(kind) if kind.offers_api_key() => format!("OAuth or API key · {}", kind.name()),
+            Some(kind) => format!("OAuth · {}", kind.name()),
+            None => "API key".to_string(),
+        }
     };
     SelectorItem {
         id: provider.to_string(),
@@ -3488,9 +3498,22 @@ fn open_login_method(app: &mut App, provider: String) -> Action {
 }
 
 fn open_api_key_prompt(app: &mut App, provider: String) {
+    let message = match provider.as_str() {
+        "parallel" => concat!(
+            "Create or copy a key at https://platform.parallel.ai/settings?tab=api-keys, ",
+            "then paste it here. Enter saves, Esc cancels."
+        )
+        .to_string(),
+        "exa" => concat!(
+            "Create or copy a key at https://dashboard.exa.ai/api-keys, then paste it here. ",
+            "Enter saves, Esc cancels."
+        )
+        .to_string(),
+        _ => format!("Paste the API key for {provider}. Enter saves, Esc cancels."),
+    };
     app.text_prompt = Some(TextPrompt {
         title: format!("API KEY · {provider}"),
-        message: format!("Paste the API key for {provider}. Enter saves, Esc cancels."),
+        message,
         value: String::new(),
         secret: true,
         purpose: TextPurpose::ApiKey { provider },
@@ -10712,5 +10735,26 @@ mod tests {
             "复制内容"
         );
         assert_eq!(complete_surface_text(surface), "复制内容");
+    }
+
+    #[test]
+    fn web_search_providers_use_api_key_login_prompts() {
+        let parallel = login_provider_item("parallel", "openai");
+        assert_eq!(parallel.description, "Web search · API key");
+
+        let mut app = test_app();
+        open_api_key_prompt(&mut app, "parallel".to_string());
+        let prompt = app.text_prompt.as_ref().unwrap();
+        assert!(prompt.secret);
+        assert!(prompt.message.contains("platform.parallel.ai"));
+
+        open_api_key_prompt(&mut app, "exa".to_string());
+        assert!(
+            app.text_prompt
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("dashboard.exa.ai")
+        );
     }
 }

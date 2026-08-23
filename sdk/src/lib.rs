@@ -20,6 +20,7 @@ pub const HOST_NAMESPACE: &str = "extism:host/user";
 pub const HOST_READ: &str = "uri_agent_read";
 pub const HOST_EXEC: &str = "uri_agent_exec";
 pub const HOST_ENVIRONMENT: &str = "uri_agent_environment";
+pub const HOST_CREDENTIALS: &str = "uri_agent_credentials";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +49,15 @@ impl PluginManifest {
         self.permissions.environment = true;
         self
     }
+
+    /// Request read access to saved and provider-environment API keys.
+    ///
+    /// This explicit declaration is an audit marker for trusted plugin source;
+    /// URI Agent does not present an interactive approval prompt.
+    pub fn request_credentials_access(mut self) -> Self {
+        self.permissions.credentials = true;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,11 +65,13 @@ impl PluginManifest {
 pub struct PluginPermissions {
     #[serde(default, skip_serializing_if = "is_false")]
     pub environment: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub credentials: bool,
 }
 
 impl PluginPermissions {
     fn is_empty(&self) -> bool {
-        !self.environment
+        !self.environment && !self.credentials
     }
 }
 
@@ -129,6 +141,7 @@ mod host {
         pub fn uri_agent_read(input: String) -> String;
         pub fn uri_agent_exec(input: String) -> String;
         pub fn uri_agent_environment(input: String) -> String;
+        pub fn uri_agent_credentials(input: String) -> String;
     }
 }
 
@@ -149,6 +162,14 @@ pub fn exec(uri: &str, body: Option<&Value>) -> Result<String, Error> {
 #[cfg(target_family = "wasm")]
 pub fn environment_variable(name: &str) -> Result<Option<String>, Error> {
     let output = unsafe { host::uri_agent_environment(name.to_string())? };
+    Ok(serde_json::from_str(&output)?)
+}
+
+/// Resolve a saved or provider-environment API key after requesting credential
+/// access in the plugin manifest.
+#[cfg(target_family = "wasm")]
+pub fn provider_api_key(provider: &str) -> Result<Option<String>, Error> {
+    let output = unsafe { host::uri_agent_credentials(provider.to_string())? };
     Ok(serde_json::from_str(&output)?)
 }
 
@@ -215,12 +236,16 @@ mod tests {
         let manifest = PluginManifest::new([]).request_environment_access();
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["permissions"]["environment"], true);
+        let manifest = PluginManifest::new([]).request_credentials_access();
+        let value = serde_json::to_value(manifest).unwrap();
+        assert_eq!(value["permissions"]["credentials"], true);
         let legacy: PluginManifest = serde_json::from_value(serde_json::json!({
             "abi_version": ABI_VERSION,
             "protocols": []
         }))
         .unwrap();
         assert!(!legacy.permissions.environment);
+        assert!(!legacy.permissions.credentials);
 
         let request: HandlerRequest = serde_json::from_value(serde_json::json!({
             "protocol": "example",

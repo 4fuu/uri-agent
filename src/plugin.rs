@@ -1,4 +1,4 @@
-use crate::config::AgentEnvironment;
+use crate::config::{AgentEnvironment, ConfigManager};
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -423,6 +423,9 @@ pub enum PluginPermission {
     /// Read the user-managed Agent environment. This declaration is an audit
     /// marker for trusted plugin code, not an interactive approval boundary.
     Environment,
+    /// Resolve saved or provider-environment API keys. This declaration is an
+    /// audit marker for trusted plugin code, not an interactive approval boundary.
+    Credentials,
 }
 
 #[derive(Clone)]
@@ -444,11 +447,27 @@ impl PluginEnvironment {
     }
 }
 
+#[derive(Clone)]
+pub struct PluginCredentials {
+    manager: Arc<ConfigManager>,
+}
+
+impl PluginCredentials {
+    pub(crate) fn new(manager: Arc<ConfigManager>) -> Self {
+        Self { manager }
+    }
+
+    pub async fn api_key(&self, provider: &str) -> Result<Option<String>> {
+        self.manager.provider_api_key(provider).await
+    }
+}
+
 pub struct PluginHost<'a> {
     pub protocols: &'a mut ProtocolRegistry,
     pub commands: &'a mut CommandRegistry,
     pub tui: &'a mut TuiRegistry,
     environment: Arc<AgentEnvironment>,
+    credentials: Option<Arc<ConfigManager>>,
     permissions: HashSet<PluginPermission>,
 }
 
@@ -464,8 +483,14 @@ impl<'a> PluginHost<'a> {
             commands,
             tui,
             environment,
+            credentials: None,
             permissions: HashSet::new(),
         }
+    }
+
+    pub fn with_credentials(mut self, manager: Arc<ConfigManager>) -> Self {
+        self.credentials = Some(manager);
+        self
     }
 
     pub fn environment(&self) -> Result<PluginEnvironment> {
@@ -473,6 +498,17 @@ impl<'a> PluginHost<'a> {
             bail!("plugin did not request Agent environment access");
         }
         Ok(PluginEnvironment::new(self.environment.clone()))
+    }
+
+    pub fn credentials(&self) -> Result<PluginCredentials> {
+        if !self.permissions.contains(&PluginPermission::Credentials) {
+            bail!("plugin did not request credential access");
+        }
+        let manager = self
+            .credentials
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("plugin credential access is not attached"))?;
+        Ok(PluginCredentials::new(manager))
     }
 }
 
@@ -772,6 +808,11 @@ mod tests {
         environment: Arc<std::sync::OnceLock<PluginEnvironment>>,
     }
 
+    struct CredentialPlugin {
+        requests_credentials: bool,
+        credentials: Arc<std::sync::OnceLock<PluginCredentials>>,
+    }
+
     impl Plugin for PromptOnlyPlugin {
         fn startup_notices(&self) -> Vec<String> {
             vec!["plugin startup notice".to_string()]
@@ -798,6 +839,21 @@ mod tests {
             self.environment
                 .set(host.environment()?)
                 .map_err(|_| anyhow::anyhow!("environment was already captured"))
+        }
+    }
+
+    impl Plugin for CredentialPlugin {
+        fn permissions(&self) -> Vec<PluginPermission> {
+            self.requests_credentials
+                .then_some(PluginPermission::Credentials)
+                .into_iter()
+                .collect()
+        }
+
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            self.credentials
+                .set(host.credentials()?)
+                .map_err(|_| anyhow::anyhow!("credentials were already captured"))
         }
     }
 
@@ -953,6 +1009,54 @@ mod tests {
             Some("added later")
         );
         assert_eq!(reader.snapshot().await.len(), 2);
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_must_request_credential_access_once_for_dynamic_reads() {
+        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        let manager = ConfigManager::load_for_test(&output, &output)
+            .await
+            .unwrap();
+        manager
+            .set_api_key("parallel", "first".to_string())
+            .await
+            .unwrap();
+
+        let denied_capture = Arc::new(std::sync::OnceLock::new());
+        let mut denied = PluginRegistry::new();
+        denied.add(CredentialPlugin {
+            requests_credentials: false,
+            credentials: denied_capture,
+        });
+        let mut host = PluginHost::new(&mut protocols, &mut commands, &mut tui, environment)
+            .with_credentials(manager.clone());
+        let error = denied.install(&mut host).unwrap_err();
+        assert!(format!("{error:#}").contains("did not request credential access"));
+        assert!(host.credentials().is_err());
+
+        let allowed_capture = Arc::new(std::sync::OnceLock::new());
+        let mut allowed = PluginRegistry::new();
+        allowed.add(CredentialPlugin {
+            requests_credentials: true,
+            credentials: allowed_capture.clone(),
+        });
+        allowed.install(&mut host).unwrap();
+        let reader = allowed_capture.get().unwrap();
+        assert_eq!(
+            reader.api_key("parallel").await.unwrap().as_deref(),
+            Some("first")
+        );
+
+        manager
+            .set_api_key("exa", "added later".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.api_key("exa").await.unwrap().as_deref(),
+            Some("added later")
+        );
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 }

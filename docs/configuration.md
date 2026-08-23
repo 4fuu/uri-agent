@@ -59,10 +59,12 @@ Offline mode still loads `models-store.json` and `models.json`; it only disables
 | `kimi-coding` | Subscription device-code login |
 | `xai` | SuperGrok or X Premium device-code login |
 | `radius` | Browser or device-code login |
+| `parallel` | API key for built-in web search |
+| `exa` | API key for built-in web search |
 
 Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent attempts to refresh expired entries that include a refresh token. On Unix, URI Agent creates `auth.json` with mode `0600` and the configuration directory with mode `0700`.
 
-Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`.
+Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` search protocol recognizes `PARALLEL_API_KEY` and `EXA_API_KEY`.
 
 ### Credential precedence
 
@@ -77,6 +79,11 @@ models.json apiKey
 ```
 
 The command-line API key is process-only and is not written to `auth.json`.
+
+Web search credentials are independent of the active model. Parallel and Exa
+resolve a key from `auth.json`, overridden by that provider's process
+environment variable. `models.json apiKey`, `URI_AGENT_API_KEY`, and
+`--api-key` configure model requests and are not web-search credentials.
 
 ## Configuration locations
 

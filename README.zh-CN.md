@@ -17,6 +17,7 @@ URI Agent 目前是从源码安装的 pre-1.0 项目。模型请求及其所需�
 
 - **稳定的工具面：**增加能力不会增加新的模型工具 schema。
 - **渐进式上下文：**只有模型读取协议或 Skill 帮助时，相应说明才进入上下文。
+- **内置网络能力：**把 HTTPS 网页读取为 Markdown，并通过已登录的 Parallel 或 Exa 服务进行搜索。
 - **可观察的执行过程：**异步工作的状态和最终输出都通过协议的读取路由提供。
 - **便携的可信扩展：**Extism WASM 模块可以添加支持热重载的协议，而不改变模型工具面。
 - **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
@@ -73,17 +74,19 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 
 ```text
 read("file://src/main.rs?offset=1&limit=200")
+read("https://search?limit=10", "stable Rust release notes")
+read("https://www.rust-lang.org/")
 read("uri-agent-docs://README.md")
 read("code-review-skill://help")
 exec("bash://?wait=30", "cargo test")  # Unix-like 系统
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
+URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。内置 `https` 协议无需登录即可读取 HTTPS 网页；通过 `:login` 保存 Parallel 或 Exa API key 后即可搜索。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
 
 ## 扩展
 
-可信 WASM 模块可以添加运行时加载的协议。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。直接读取已保存的 Agent 环境变量时，插件源码必须显式申请一次整体环境变量能力；它只是审计标记，不是批准流程。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
+可信 WASM 模块可以添加运行时加载的协议。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。直接读取已保存的 Agent 环境变量或 Provider API key 时，插件源码必须显式申请相应能力；它只是审计标记，不是批准流程。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
 
 ## 文档
 

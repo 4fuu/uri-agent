@@ -24,12 +24,13 @@ dirs = "6"
 extism = { version = "1.21", default-features = false, features = ["http", "register-filesystem", "register-http", "wasmtime-default-features"] }
 futures-util = "0.3"
 getrandom = "0.2"
+html-to-markdown-rs = { version = "3.9.2", default-features = false }
 http = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
 portable-pty = "0.9"
 pulldown-cmark = { version = "0.10", default-features = false }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls"] }
 rig = { package = "rig-core", git = "https://github.com/0xPlaygrounds/rig", rev = "abe338a" }
 rhai = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
