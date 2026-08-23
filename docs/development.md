@@ -42,11 +42,11 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
 | `src/model.rs` | Rig provider adapters, model request compatibility, multimodal support, and the two tool schemas |
-| `src/clipboard.rs` | Cross-platform clipboard image reads and PNG encoding |
+| `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, exact replacement, Codex patch, Bash, and PowerShell plugins, including their protocol help |
-| `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, and status registration |
+| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, session archive, exact replacement, Codex patch, Bash, and PowerShell plugins, including their protocol help |
+| `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, status, and composer completion registration |
 | `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
 | `examples/wasm-plugin/` | Buildable Rust guest plugin example |
@@ -69,12 +69,12 @@ First-party capabilities use the plugin path exposed to linked Rust extensions:
 
 1. A [`Plugin`](../src/plugin.rs) may declare protocol descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen.
 2. `PluginRegistry` validates descriptor names, rejects duplicates, collects notices, and preserves registration order for prompt fragments.
-3. Plugins install protocols, commands, panel providers, and status providers through `PluginHost`; prompt-only plugins need no runtime registration.
+3. Plugins install protocols, commands, panel providers, status providers, and composer completion providers through `PluginHost`; prompt-only plugins need no runtime registration.
 4. Protocols remain behind `read` and `exec`, while commands join the searchable panel and key-bindable command registry.
 
 Sensitive host access uses explicit plugin permissions. `PluginPermission::Environment` exposes `PluginEnvironment` for dynamic reads from the user-managed Agent environment. `PluginPermission::Credentials` exposes `PluginCredentials` for dynamic provider API-key resolution without coupling a plugin to configuration internals. Neither capability has a variable/provider allowlist or approval state: each declaration is an audit marker for trusted source, while an undeclared plugin is refused by the host interface.
 
-TUI extensions return generic documents and semantic status items. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, or panel providers; reserve prompt fragments for context required before the first tool call.
+TUI extensions return generic documents, semantic status items, or text replacement candidates for the composer. Completion providers receive the current lines and character-based cursor position, then return a replacement range and labeled candidates; the TUI owns popup rendering, stale-result rejection, selection, and insertion. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, or panel providers; reserve prompt fragments for context required before the first tool call.
 
 URI Agent does not load native dynamic libraries. Third-party runtime protocols use the trusted [WASM plugin](plugins.md) path instead.
 
@@ -116,6 +116,7 @@ The exact Skill rules are in [Skills](protocols.md#skills); the user-visible per
 - The TUI is one conversation surface. Do not introduce Browse, Insert, or Detail modes, a slash-command syntax, or a second command path.
 - Keep the interface keyboard-complete, with arrow keys and mouse input as first-class paths.
 - Route configurable keys through the layered Rhai keymap, commands through `CommandRegistry`, and extension UI through generic `PluginHost` registrations.
+- Keep completion triggers and candidate generation in providers. The composer may understand generic ranges and candidates, but not file or session reference syntax.
 - Preserve mouse hit regions for selectable lists and command panels.
 - Preserve terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
 

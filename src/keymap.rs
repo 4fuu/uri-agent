@@ -19,7 +19,9 @@ map("global", "super+c", "copy");
 map("global", "esc", "interrupt_on_double_press");
 
 map("main", "space", "compose");
-map("main", "@", "paste_image");
+map("main", "@", "reference");
+map("main", "ctrl+v", "paste");
+map("main", "alt+v", "paste_image");
 map("main", "alt+backspace", "remove_last_image");
 map("main", ":", "command");
 map("main", "?", "help");
@@ -59,6 +61,9 @@ map("composer", "alt+right", "word_forward");
 map("composer", "alt+shift+right", "word_forward");
 map("composer", "ctrl+backspace", "delete_word");
 map("composer", "ctrl+delete", "delete_next_word");
+map("composer", "tab", "complete");
+map("composer", "ctrl+v", "paste");
+map("composer", "alt+v", "paste_image");
 map("composer", "alt+backspace", "remove_last_image");
 map("composer", "ctrl+z", "undo");
 map("composer", "ctrl+shift+z", "redo");
@@ -335,7 +340,12 @@ mod tests {
         assert_eq!(keymap.action("main", "？").as_deref(), Some("help"));
         assert_eq!(keymap.action("main", "space").as_deref(), Some("compose"));
         assert_eq!(keymap.action("main", "i"), None);
-        assert_eq!(keymap.action("main", "@").as_deref(), Some("paste_image"));
+        assert_eq!(keymap.action("main", "@").as_deref(), Some("reference"));
+        assert_eq!(keymap.action("main", "ctrl+v").as_deref(), Some("paste"));
+        assert_eq!(
+            keymap.action("main", "alt+v").as_deref(),
+            Some("paste_image")
+        );
         assert_eq!(
             keymap.action("main", "alt+backspace").as_deref(),
             Some("remove_last_image")
@@ -388,6 +398,18 @@ mod tests {
         assert_eq!(
             keymap.action("composer", "ctrl+delete").as_deref(),
             Some("delete_next_word")
+        );
+        assert_eq!(
+            keymap.action("composer", "tab").as_deref(),
+            Some("complete")
+        );
+        assert_eq!(
+            keymap.action("composer", "ctrl+v").as_deref(),
+            Some("paste")
+        );
+        assert_eq!(
+            keymap.action("composer", "alt+v").as_deref(),
+            Some("paste_image")
         );
         assert_eq!(
             keymap.action("composer", "alt+backspace").as_deref(),

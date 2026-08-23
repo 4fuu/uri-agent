@@ -3,6 +3,26 @@ use arboard::{Clipboard, Error as ClipboardError};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use std::io::Cursor;
 
+pub enum ClipboardContent {
+    Image(Vec<u8>),
+    Text(String),
+}
+
+/// Prefer an image from the clipboard and fall back to text.
+///
+/// Clipboard access is blocking and must be called from `spawn_blocking`.
+pub fn read_preferred() -> Result<ClipboardContent> {
+    if let Ok(image) = read_image_png() {
+        return Ok(ClipboardContent::Image(image));
+    }
+    let mut clipboard = Clipboard::new().context("cannot access the system clipboard")?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(ClipboardContent::Text(text)),
+        Err(ClipboardError::ContentNotAvailable) => bail!("the clipboard is empty"),
+        Err(error) => Err(anyhow!(error)).context("cannot read text from the clipboard"),
+    }
+}
+
 /// Read the current clipboard image and encode it as PNG.
 ///
 /// Clipboard access is blocking and must be called from `spawn_blocking`.

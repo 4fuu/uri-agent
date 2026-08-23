@@ -7,7 +7,7 @@ For the active plugin directory and exact model-facing install and reload contra
 ## Choose an extension path
 
 - Use a WASM plugin for a runtime-loaded third-party protocol with a portable ABI.
-- Use a linked Rust extension for a first-party capability compiled into URI Agent. Linked extensions can register protocols, commands, panels, status providers, and startup prompt fragments; see [Linked Rust extensions](development.md#linked-rust-extensions).
+- Use a linked Rust extension for a first-party capability compiled into URI Agent. Linked extensions can register protocols, commands, panels, status providers, composer completion providers, and startup prompt fragments; see [Linked Rust extensions](development.md#linked-rust-extensions).
 
 Both paths keep protocol operations behind `read` and `exec`. URI Agent does not load native dynamic libraries.
 
@@ -44,7 +44,7 @@ Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic p
 
 ## ABI version 1
 
-ABI version 1 lets a module contribute protocols. It does not contribute system prompt fragments, commands, panels, or status providers. Exports use Extism's bytes-in/bytes-out functions and may be implemented with any compatible PDK.
+ABI version 1 lets a module contribute protocols. It does not contribute system prompt fragments, commands, panels, status providers, or composer completions. Exports use Extism's bytes-in/bytes-out functions and may be implemented with any compatible PDK.
 
 Every module exports `uri_agent_manifest`, which takes no input and returns:
 

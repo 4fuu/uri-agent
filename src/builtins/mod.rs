@@ -4,6 +4,7 @@ mod bin_hints;
 mod file;
 mod https;
 mod replace;
+mod sessions;
 mod shell;
 mod uri_agent_docs;
 
@@ -24,6 +25,7 @@ pub fn plugins(cwd: &Path) -> PluginRegistry {
     plugins.add(https::HttpsProtocol::new());
     plugins.add(replace::ReplaceProtocol::new(cwd));
     plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
+    plugins.add(sessions::SessionsPlugin::new(cwd));
     shell::add_plugins(&mut plugins, cwd);
     plugins
 }

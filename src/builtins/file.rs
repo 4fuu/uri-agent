@@ -1,14 +1,21 @@
 use crate::config::display_path;
-use crate::plugin::{Plugin, PluginHost};
+use crate::plugin::{
+    Plugin, PluginHost, TuiCompletionContext, TuiCompletionItem, TuiCompletionProvider,
+    TuiCompletions, TuiTextPosition, TuiTextRange,
+};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use ignore::{DirEntry, WalkBuilder};
+use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 2_000;
+const MAX_COMPLETIONS: usize = 20;
+const MAX_SCANNED_FILES: usize = 50_000;
 
 fn help(cwd: &Path) -> String {
     format!(
@@ -53,8 +60,151 @@ impl Plugin for FileProtocol {
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        host.protocols.register(self.clone())
+        host.protocols.register(self.clone())?;
+        host.tui.register_completion("files", self.clone())
     }
+}
+
+#[async_trait]
+impl TuiCompletionProvider for FileProtocol {
+    async fn complete(&self, context: &TuiCompletionContext) -> Result<Option<TuiCompletions>> {
+        let Some((start, query)) = file_reference_query(context) else {
+            return Ok(None);
+        };
+        let cwd = self.cwd.clone();
+        let items = tokio::task::spawn_blocking(move || file_suggestions(&cwd, &query))
+            .await
+            .context("file completion worker stopped unexpectedly")??;
+        Ok((!items.is_empty()).then_some(TuiCompletions {
+            replacement: TuiTextRange {
+                start: TuiTextPosition {
+                    line: context.cursor.line,
+                    column: start,
+                },
+                end: context.cursor,
+            },
+            items,
+        }))
+    }
+}
+
+fn file_reference_query(context: &TuiCompletionContext) -> Option<(usize, String)> {
+    let line = context.lines.get(context.cursor.line)?;
+    let prefix = line.chars().take(context.cursor.column).collect::<String>();
+    let start = prefix
+        .chars()
+        .enumerate()
+        .filter_map(|(index, character)| character.is_whitespace().then_some(index + 1))
+        .last()
+        .unwrap_or_default();
+    let token = prefix.chars().skip(start).collect::<String>();
+    let query = token.strip_prefix('@')?;
+    if query.starts_with('@') || query.contains(['"', '\'']) {
+        return None;
+    }
+    Some((
+        start,
+        query.strip_prefix("file://").unwrap_or(query).to_string(),
+    ))
+}
+
+fn file_suggestions(cwd: &Path, query: &str) -> Result<Vec<TuiCompletionItem>> {
+    let query = query.replace('\\', "/").to_lowercase();
+    let root = cwd.to_path_buf();
+    let root_for_filter = root.clone();
+    let mut walker = WalkBuilder::new(cwd);
+    walker
+        .standard_filters(true)
+        .hidden(false)
+        .filter_entry(move |entry| include_completion_entry(&root_for_filter, entry));
+    let mut candidates = Vec::new();
+    for entry in walker.build().take(MAX_SCANNED_FILES) {
+        let entry = entry.with_context(|| format!("cannot scan files under {}", cwd.display()))?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(cwd) else {
+            continue;
+        };
+        let path = completion_path(relative);
+        if path.is_empty() || path.contains(['\n', '\r']) || path.contains(['"', '\'']) {
+            continue;
+        }
+        let Some(score) = file_match_score(&path.to_lowercase(), &query) else {
+            continue;
+        };
+        candidates.push((score, Reverse(path.matches('/').count()), path));
+    }
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    Ok(candidates
+        .into_iter()
+        .take(MAX_COMPLETIONS)
+        .map(|(_, _, path)| {
+            let insert_path = if path.chars().any(char::is_whitespace) {
+                format!("@\"file://{path}\" ")
+            } else {
+                format!("@file://{path} ")
+            };
+            let description = Path::new(&path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map_or_else(
+                    || "project file".to_string(),
+                    |parent| parent.display().to_string(),
+                );
+            TuiCompletionItem {
+                insert_text: insert_path,
+                label: path,
+                description,
+            }
+        })
+        .collect())
+}
+
+fn include_completion_entry(root: &Path, entry: &DirEntry) -> bool {
+    entry.path() == root
+        || entry
+            .path()
+            .strip_prefix(root)
+            .ok()
+            .and_then(|path| path.components().next())
+            .is_none_or(|component| component.as_os_str() != ".git")
+}
+
+fn completion_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn file_match_score(path: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(path.matches('/').count() * 20 + path.len());
+    }
+    if path == query {
+        return Some(0);
+    }
+    if path.starts_with(query) {
+        return Some(1);
+    }
+    if let Some(position) = path.find(query) {
+        return Some(position + 2);
+    }
+    let mut cursor = 0usize;
+    let mut score = 100usize;
+    for needle in query.chars() {
+        let suffix = path.get(cursor..)?;
+        let position = suffix.find(needle)?;
+        score = score.saturating_add(position);
+        cursor = cursor.saturating_add(position + needle.len_utf8());
+    }
+    Some(score)
 }
 
 #[async_trait]
@@ -271,6 +421,52 @@ mod tests {
                 .line_numbers
         );
         assert!(Range::parse(Some("line_numbers=1")).is_err());
+    }
+
+    #[test]
+    fn file_completion_handles_tokens_and_leaves_double_at_for_other_providers() {
+        let context = TuiCompletionContext {
+            cwd: PathBuf::from("/project"),
+            session_id: "session".to_string(),
+            lines: vec!["inspect @src/ma".to_string()],
+            cursor: TuiTextPosition {
+                line: 0,
+                column: 15,
+            },
+        };
+        assert_eq!(
+            file_reference_query(&context),
+            Some((8, "src/ma".to_string()))
+        );
+
+        let mut session_context = context;
+        session_context.lines = vec!["inspect @@old".to_string()];
+        session_context.cursor.column = 13;
+        assert_eq!(file_reference_query(&session_context), None);
+
+        let uri_context = TuiCompletionContext {
+            lines: vec!["inspect @file://src/ma".to_string()],
+            cursor: TuiTextPosition {
+                line: 0,
+                column: 22,
+            },
+            ..session_context
+        };
+        assert_eq!(
+            file_reference_query(&uri_context),
+            Some((8, "src/ma".to_string()))
+        );
+    }
+
+    #[test]
+    fn file_completion_quotes_paths_with_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("design notes.md"), "notes").unwrap();
+
+        let items = file_suggestions(directory.path(), "design").unwrap();
+
+        assert_eq!(items[0].label, "design notes.md");
+        assert_eq!(items[0].insert_text, "@\"file://design notes.md\" ");
     }
 
     #[tokio::test]

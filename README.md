@@ -23,7 +23,7 @@ URI Agent is an early release and may change between dated versions. Model reque
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
 - **Live course correction:** while a turn runs, queue a follow-up for afterward or guide the next model request; undelivered messages remain editable.
 - **Reusable Agent environment:** save tokens once for future Agent shell commands while keeping values out of project and session files.
-- **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface.
+- **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface, with `@` file and `@@` session references.
 
 The model-facing interface remains:
 
@@ -101,6 +101,7 @@ See [Models and configuration](docs/configuration.md) for supported API families
 
 ```text
 read("file://src/main.rs?offset=1&limit=200")
+read("sessions://search", {"query":"refresh token"})
 read("https://search?limit=10", "stable Rust release notes")
 read("https://www.rust-lang.org/")
 read("uri-agent-docs://README.md")

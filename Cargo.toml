@@ -29,6 +29,7 @@ futures-util = "0.3"
 getrandom = "0.2"
 html-to-markdown-rs = { version = "3.9.2", default-features = false }
 http = "1"
+ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
 portable-pty = "0.9"
 pulldown-cmark = { version = "0.10", default-features = false }

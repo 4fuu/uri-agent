@@ -301,6 +301,44 @@ pub trait TuiPanelProvider: Send + Sync {
     async fn open(&self, context: TuiPanelContext) -> Result<TuiDocument>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TuiTextPosition {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TuiTextRange {
+    pub start: TuiTextPosition,
+    pub end: TuiTextPosition,
+}
+
+#[derive(Clone, Debug)]
+pub struct TuiCompletionContext {
+    pub cwd: PathBuf,
+    pub session_id: String,
+    pub lines: Vec<String>,
+    pub cursor: TuiTextPosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiCompletionItem {
+    pub insert_text: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiCompletions {
+    pub replacement: TuiTextRange,
+    pub items: Vec<TuiCompletionItem>,
+}
+
+#[async_trait]
+pub trait TuiCompletionProvider: Send + Sync {
+    async fn complete(&self, context: &TuiCompletionContext) -> Result<Option<TuiCompletions>>;
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TuiStatusTone {
     #[default]
@@ -366,6 +404,7 @@ pub struct TuiPanelSpec {
 pub struct TuiRegistry {
     panels: BTreeMap<String, TuiPanelSpec>,
     status: BTreeMap<String, Arc<dyn TuiStatusProvider>>,
+    completions: BTreeMap<String, Arc<dyn TuiCompletionProvider>>,
 }
 
 impl TuiRegistry {
@@ -415,6 +454,34 @@ impl TuiRegistry {
             .values()
             .filter_map(|provider| provider.status(context))
             .collect()
+    }
+
+    pub fn register_completion(
+        &mut self,
+        id: impl Into<String>,
+        provider: impl TuiCompletionProvider + 'static,
+    ) -> Result<()> {
+        let id = id.into();
+        validate_name(&id)?;
+        if self.completions.contains_key(&id) {
+            bail!("TUI completion provider is already registered: {id}");
+        }
+        self.completions.insert(id, Arc::new(provider));
+        Ok(())
+    }
+
+    pub async fn completions(
+        &self,
+        context: &TuiCompletionContext,
+    ) -> Result<Option<TuiCompletions>> {
+        for provider in self.completions.values() {
+            if let Some(completions) = provider.complete(context).await?
+                && !completions.items.is_empty()
+            {
+                return Ok(Some(completions));
+            }
+        }
+        Ok(None)
     }
 }
 

@@ -40,6 +40,7 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
 | `file` | `read` | Read files and bounded directory listings |
+| `sessions` | `read` | Discover, search, and read bounded saved session history without changing it |
 | `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
 | `replace` | `read`, `exec` | Atomically replace one exact text match |
 | `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
@@ -84,6 +85,25 @@ read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
 ```
 
 `file://help` reports the accepted range options, active limits, and current working directory.
+
+### `sessions`
+
+The read-only `sessions` protocol discovers and searches saved URI Agent sessions. Discovery is scoped to the current project by default; `scope: "all"` searches every project, and an optional `cwd` narrows that cross-project scope:
+
+```text
+read("sessions://recent")
+read("sessions://search", {"query":"refresh token"})
+read("sessions://search", {"query":"billing migration","scope":"all"})
+```
+
+Read an exact session ID to retrieve its newest visible records. Use the returned `before` cursor to page backward, and request `include_tools` only when tool evidence is needed:
+
+```text
+read("sessions://<session-id>")
+read("sessions://<session-id>", {"include_tools":true,"limit":20})
+```
+
+User, assistant, and terminal error text is returned by default. Thinking, usage, model replay payloads, compaction summaries, and TUI metadata are always excluded; tool calls and results are excluded unless requested. Results are bounded and marked as untrusted reference data. Archive access opens the SQLite database read-only and does not initialize, migrate, resume, append, rename, or delete sessions. Read `sessions://help` for the body fields and limits.
 
 ### `https`
 

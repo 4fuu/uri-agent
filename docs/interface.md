@@ -28,6 +28,9 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 | `Ctrl+Home`/`Ctrl+End` | Move to the start or end of the draft |
 | `Ctrl+Left`/`Ctrl+Right`, `Alt+Left`/`Alt+Right` | Move by word |
 | `Ctrl+Backspace`/`Ctrl+Delete` | Delete the previous or next word |
+| `Tab` | Insert the selected `@` or `@@` completion |
+| `Ctrl+V` | Paste text, or insert a clipboard image when the terminal forwards the key to URI Agent |
+| `Alt+V` | Explicitly insert the current clipboard image |
 | `Alt+Backspace` | Remove the most recently attached clipboard image |
 | `Ctrl+Z`/`Ctrl+Shift+Z` | Undo or redo an edit |
 | `Esc` | Close the composer and preserve the draft |
@@ -35,6 +38,10 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 Click to place the caret, or drag across the draft to select editable text. `Ctrl+C`, `Ctrl+Shift+C`, `Cmd+C`, or right-click copies the selected draft through OSC52.
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
 Long logical lines soft-wrap at the visible composer edge; only the newline shortcuts above insert a newline into the submitted text.
+
+Type `@` at the start of a token to list project files and insert an `@file://<path>` reference. Type `@@` to list saved sessions from the current project and insert a stable `@@<session-id>` reference. `Up` and `Down` select an open candidate, `Tab` or `Enter` inserts it, `Esc` closes the candidates without closing the composer, and mouse selection is supported. File and session matching run through linked completion providers; the composer only handles generic replacement ranges and candidates.
+
+Pressing `@` on the conversation surface opens the composer with the same file completion, so reference entry has one interaction path.
 
 While a turn is running, `Enter` opens a keyboard- and mouse-selectable delivery float. **Guidance** is appended as user input after the current assistant response and its tool calls finish, immediately before the next model request. It does not interrupt an in-flight model request or tool operation. **Queue** waits until the active agent run reaches its terminal response, then starts a new user turn. Guidance takes priority over queued follow-ups at a shared boundary.
 
@@ -81,7 +88,7 @@ Saved values apply to future Agent `bash` and `pwsh` commands without a restart.
 
 | Surface | Useful defaults |
 | --- | --- |
-| Conversation | `@` attach a clipboard image, `Alt+Backspace` remove the latest pending image, `Up`/`Down` select, `Ctrl+Up`/`Ctrl+Down` scroll, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
+| Conversation | `@` open the composer and list file references, `Alt+V` insert a clipboard image, `Alt+Backspace` remove the latest pending image, `Up`/`Down` select, `Ctrl+Up`/`Ctrl+Down` scroll, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
 | Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
 | Global | Double `Esc` interrupts a running turn; `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
 | Copy | `Ctrl+C` or right-click copies an active selection; without a selection, right-click opens a reasoning or tool block's full document; `Ctrl+Shift+C` copies the selection or visible surface; `Cmd+C` is accepted when the terminal forwards it |
@@ -127,17 +134,17 @@ On URI Agent surfaces, a copy shortcut copies the active selection and `Esc` cle
 
 ## Image attachments
 
-From the conversation surface, press `@` to read the current system clipboard image into an in-memory attachment list. This does not open the composer: press `Space` separately when ready to write the message. The read runs in the background, and URI Agent reports whether the image was attached. While images are pending or a clipboard read is in progress, a status line above the footer (or at the bottom of the welcome view) keeps the count visible after the flash expires. Submitting is disabled until an in-progress clipboard read finishes, so the image cannot arrive after its intended message has already been sent.
+Clipboard attachments live in the composer. Normal terminal paste inserts text and opens the composer when used from the conversation surface. When a terminal forwards `Ctrl+V` as a key event, URI Agent reads the system clipboard itself, prefers an image, and falls back to text. Because some terminals consume `Ctrl+V`, `Alt+V` is the reliable explicit image shortcut from either the conversation or composer surface; from the conversation it opens the composer first. Clipboard reads run in the background. Submitting is disabled until a read finishes, so an image cannot arrive after its intended message has already been sent.
 
-The composer title also shows the number of pending images. `Alt+Backspace` removes the most recently attached image from the conversation or the composer, while `Esc` preserves both the text draft and pending images. The next non-empty message includes all pending clipboard images and clears them once the runtime accepts the turn. The user prompt then shows a muted image count for clipboard and path attachments; copied user text stays the original prompt. Unsent clipboard images are process-local: they are not written to SQLite and are discarded when the process exits or the user switches sessions. Pressing `@` inside the composer continues to insert ordinary text for `@path` attachments.
+The composer title shows the number of inserted images, and a fixed status keeps the count visible if the composer is closed. `Alt+Backspace` removes the most recently inserted image, while `Esc` preserves both the text draft and images. The next non-empty message includes all clipboard images and clears them once the runtime accepts the turn. The user prompt then shows a muted image count for clipboard and path attachments; copied user text stays the original prompt. Unsent clipboard images are process-local: they are not written to SQLite and are discarded when the process exits or the user switches sessions.
 
-For a model whose catalog `input` includes `image`, add a standalone `@path` argument to the composer text:
+For a model whose catalog `input` includes `image`, add a standalone `@file://<path>` argument to the composer text:
 
 ```text
-Describe @screenshots/error.png and suggest a fix.
+Describe @file://screenshots/error.png and suggest a fix.
 ```
 
-URI Agent encodes clipboard images as PNG. For paths, it recognizes PNG, JPEG, GIF, and WebP extensions, validates the file signature, and adds the binary image as multimodal user content. Clipboard and path images can be included in the same message. The original text, including each `@path`, remains part of the user message.
+URI Agent encodes clipboard images as PNG. For paths, it recognizes PNG, JPEG, GIF, and WebP extensions, validates the file signature, and adds the binary image as multimodal user content. Clipboard and path images can be included in the same message. The original text, including each `@file://<path>`, remains part of the user message.
 
 Relative paths resolve from the project. Absolute paths are accepted only when their canonical location remains inside the canonical project directory. Symlink escapes are rejected. If the active model is text-only, a request containing a recognized image attachment fails explicitly.
 
@@ -164,6 +171,8 @@ The canonical startup directory is the project boundary and is recorded with eve
 - `--session <id>` resumes that ID only if it belongs to this project;
 - `--session latest` selects the same project-scoped latest session;
 - `:resume` lists sessions for the current project, including each session's model and configured effort.
+
+The built-in `sessions` extension separately provides read-only archive discovery. `@@` completion remains project-scoped, while model-facing discovery can use `scope: "all"` when the user asks for context from another project. Exact reads return a bounded linear event history; URI Agent sessions do not have Pi's branch or entry tree semantics. Archive reads never resume or modify a session.
 
 Each session records its provider, model, and thinking effort. Model or effort changes append a settings event, and resume restores the latest session settings instead of applying the defaults for a new session.
 

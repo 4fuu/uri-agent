@@ -23,7 +23,7 @@ URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变�
 - **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
 - **运行中调整方向：**当前 turn 运行时，可以排队稍后跟进，也可以引导下一次模型请求；尚未生效的消息仍可编辑。
 - **可复用的 Agent 环境变量：**token 只需保存一次，后续 Agent Shell 命令即可使用，同时不会写入项目和会话文件。
-- **完整键盘操作的 TUI：**会话、输入、命令、模型选择、设置和终端集中在同一界面。
+- **完整键盘操作的 TUI：**会话、输入、命令、模型选择、设置和终端集中在同一界面，并支持 `@` 文件引用和 `@@` 会话引用。
 
 模型可见接口始终是：
 
@@ -101,6 +101,7 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 
 ```text
 read("file://src/main.rs?offset=1&limit=200")
+read("sessions://search", {"query":"refresh token"})
 read("https://search?limit=10", "stable Rust release notes")
 read("https://www.rust-lang.org/")
 read("uri-agent-docs://README.md")

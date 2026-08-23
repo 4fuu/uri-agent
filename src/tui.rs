@@ -14,8 +14,9 @@ use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
-    CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiDocument, TuiPanelContext,
-    TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
+    CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiCompletionContext, TuiCompletions,
+    TuiDocument, TuiPanelContext, TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
+    TuiTextPosition, TuiTextRange,
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
@@ -68,6 +69,7 @@ const FLASH_MIN_DURATION: Duration = Duration::from_secs(3);
 const FLASH_MAX_DURATION: Duration = Duration::from_secs(15);
 const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
+const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const EXPANDED_PREVIEW_LINES: usize = 24;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
@@ -169,6 +171,7 @@ enum EditingSetting {
 enum AppHit {
     Transcript(usize),
     TranscriptTail,
+    Completion(usize),
     Delivery(usize),
     Palette(usize),
     Task(usize),
@@ -459,6 +462,11 @@ struct FloatTerminal {
     last_escape: Option<Instant>,
 }
 
+struct ComposerCompletions {
+    result: TuiCompletions,
+    selected: usize,
+}
+
 /// Cumulative token usage of the whole session, replayed from usage events.
 #[derive(Default)]
 struct UsageTotals {
@@ -519,6 +527,9 @@ struct App {
     selection: Option<TextSelection>,
     composer_view: Option<ComposerView>,
     composer_mouse_selecting: bool,
+    completion_generation: u64,
+    completion_task: Option<tokio::task::JoinHandle<()>>,
+    completions: Option<ComposerCompletions>,
     pending_images: Vec<ImageAttachment>,
     clipboard_image_loading: bool,
     usage: UsageTotals,
@@ -596,6 +607,9 @@ impl App {
             selection: None,
             composer_view: None,
             composer_mouse_selecting: false,
+            completion_generation: 0,
+            completion_task: None,
+            completions: None,
             pending_images: Vec::new(),
             clipboard_image_loading: false,
             usage: UsageTotals::default(),
@@ -1060,6 +1074,7 @@ impl App {
             if self.draft_text().trim().is_empty() {
                 return None;
             }
+            self.dismiss_completions();
             self.delivery = Some(DeliveryState { selected: 0 });
             self.overlay = Some(Overlay::Delivery);
             return None;
@@ -1072,6 +1087,7 @@ impl App {
         self.input = TextArea::default();
         style_input(&mut self.input, true, images.len(), false);
         self.composer_mouse_selecting = false;
+        self.dismiss_completions();
         self.busy = true;
         self.busy_since = Some(Instant::now());
         self.activity = Some(Activity::Thinking);
@@ -1106,6 +1122,29 @@ impl App {
         self.sync_composer_chrome();
     }
 
+    fn finish_clipboard_read(&mut self, result: Result<clipboard::ClipboardContent>) -> bool {
+        self.clipboard_image_loading = false;
+        let mut text_inserted = false;
+        match result {
+            Ok(clipboard::ClipboardContent::Image(bytes)) => {
+                self.pending_images.push(ImageAttachment::png(bytes));
+                self.set_flash(format!(
+                    "Image inserted in the composer · {} total",
+                    self.pending_images.len()
+                ));
+            }
+            Ok(clipboard::ClipboardContent::Text(text)) => {
+                if self.overlay == Some(Overlay::Composer) {
+                    self.input.insert_str(text);
+                    text_inserted = true;
+                }
+            }
+            Err(error) => self.set_flash(format!("Clipboard paste failed: {error:#}")),
+        }
+        self.sync_composer_chrome();
+        text_inserted
+    }
+
     fn sync_composer_chrome(&mut self) {
         style_input(
             &mut self.input,
@@ -1120,6 +1159,7 @@ impl App {
         self.pending_images.clear();
         self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
+        self.dismiss_completions();
         self.delivery = None;
         self.overlay = None;
     }
@@ -1134,6 +1174,7 @@ impl App {
         self.input = TextArea::default();
         self.input.insert_str(restored);
         self.sync_composer_chrome();
+        self.dismiss_completions();
         self.overlay = Some(Overlay::Composer);
     }
 
@@ -1188,6 +1229,88 @@ impl App {
             }
             self.input.move_cursor(movement);
         }
+    }
+
+    fn begin_completion_query(&mut self) -> (u64, TuiCompletionContext) {
+        if let Some(task) = self.completion_task.take() {
+            task.abort();
+        }
+        self.completion_generation = self.completion_generation.wrapping_add(1);
+        self.completions = None;
+        let (line, column) = self.input.cursor();
+        (
+            self.completion_generation,
+            TuiCompletionContext {
+                cwd: self.info.cwd.clone(),
+                session_id: self.info.session_id.clone(),
+                lines: self.input.lines().to_vec(),
+                cursor: TuiTextPosition { line, column },
+            },
+        )
+    }
+
+    fn finish_completion_query(&mut self, generation: u64, result: Result<Option<TuiCompletions>>) {
+        if generation != self.completion_generation || self.overlay != Some(Overlay::Composer) {
+            return;
+        }
+        self.completion_task = None;
+        match result {
+            Ok(Some(result)) if !result.items.is_empty() => {
+                self.completions = Some(ComposerCompletions {
+                    result,
+                    selected: 0,
+                });
+            }
+            Ok(_) => self.completions = None,
+            Err(error) => {
+                self.completions = None;
+                self.set_flash(format!("Composer completion failed: {error:#}"));
+            }
+        }
+    }
+
+    fn dismiss_completions(&mut self) {
+        if let Some(task) = self.completion_task.take() {
+            task.abort();
+        }
+        self.completion_generation = self.completion_generation.wrapping_add(1);
+        self.completions = None;
+    }
+
+    fn move_completion(&mut self, amount: isize) {
+        let Some(completions) = self.completions.as_mut() else {
+            return;
+        };
+        completions.selected =
+            wrapped_index(completions.selected, amount, completions.result.items.len());
+    }
+
+    fn select_completion(&mut self, index: usize) -> bool {
+        let Some(completions) = self.completions.as_mut() else {
+            return false;
+        };
+        if index >= completions.result.items.len() {
+            return false;
+        }
+        completions.selected = index;
+        self.accept_completion()
+    }
+
+    fn accept_completion(&mut self) -> bool {
+        let Some(completions) = self.completions.as_ref() else {
+            return false;
+        };
+        let Some(item) = completions.result.items.get(completions.selected) else {
+            return false;
+        };
+        let replacement = completions.result.replacement;
+        let insert_text = item.insert_text.clone();
+        if !replace_composer_range(&mut self.input, replacement, &insert_text) {
+            self.dismiss_completions();
+            return false;
+        }
+        self.dismiss_completions();
+        true
     }
 
     fn set_flash(&mut self, message: impl Into<String>) {
@@ -1548,6 +1671,7 @@ impl App {
         self.model_selector = None;
         self.tui_document = None;
         self.delivery = None;
+        self.dismiss_completions();
         self.overlay = None;
         self.overlay_scroll = 0;
     }
@@ -1774,7 +1898,11 @@ async fn run_loop(
                                 app.set_flash(format!("Terminal paste failed: {error:#}"));
                             }
                         } else {
+                            app.skip_splash();
                             handle_paste(app, text);
+                            if app.overlay == Some(Overlay::Composer) {
+                                start_completion_query(app, background_tx.clone());
+                            }
                         }
                     }
                     Event::Mouse(mouse) => {
@@ -1817,7 +1945,7 @@ async fn run_loop(
                 }
             },
             Some(event) = background_rx.recv() => {
-                finish_background(app, &services, event).await;
+                finish_background(app, &services, background_tx.clone(), event).await;
             },
         }
         if pty_finished(app)? {
@@ -1847,6 +1975,11 @@ enum BackgroundEvent {
     CatalogRefreshed(Result<ActiveSettings>),
     OauthFinished(Result<OauthToken>),
     ClipboardImageRead(Result<Vec<u8>>),
+    ClipboardRead(Result<clipboard::ClipboardContent>),
+    Completions {
+        generation: u64,
+        result: Result<Option<TuiCompletions>>,
+    },
 }
 
 enum Action {
@@ -1864,6 +1997,8 @@ enum Action {
     RestorePending,
     UpgradePending,
     ReadClipboardImage,
+    ReadClipboard,
+    RefreshCompletions,
     InterruptTurn,
     Compact,
     OpenModels(String),
@@ -1986,6 +2121,14 @@ async fn apply_action(
         }
         Action::ReadClipboardImage => {
             start_clipboard_image_read(app, background_tx);
+            Ok(None)
+        }
+        Action::ReadClipboard => {
+            start_clipboard_read(app, background_tx);
+            Ok(None)
+        }
+        Action::RefreshCompletions => {
+            start_completion_query(app, background_tx);
             Ok(None)
         }
         Action::InterruptTurn => {
@@ -2129,8 +2272,48 @@ fn handle_paste(app: &mut App, text: String) {
         Some(Overlay::Composer) => {
             app.input.insert_str(text);
         }
+        None => {
+            app.overlay = Some(Overlay::Composer);
+            app.input.insert_str(text);
+        }
         _ => {}
     }
+}
+
+fn replace_composer_range(
+    input: &mut TextArea<'static>,
+    range: TuiTextRange,
+    replacement: &str,
+) -> bool {
+    if (range.start.line, range.start.column) > (range.end.line, range.end.column) {
+        return false;
+    }
+    let lines = input.lines();
+    let valid_position = |position: TuiTextPosition| {
+        lines
+            .get(position.line)
+            .is_some_and(|line| position.column <= line.chars().count())
+    };
+    if !valid_position(range.start) || !valid_position(range.end) {
+        return false;
+    }
+    let Ok(start_line) = u16::try_from(range.start.line) else {
+        return false;
+    };
+    let Ok(start_column) = u16::try_from(range.start.column) else {
+        return false;
+    };
+    let Ok(end_line) = u16::try_from(range.end.line) else {
+        return false;
+    };
+    let Ok(end_column) = u16::try_from(range.end.column) else {
+        return false;
+    };
+    input.cancel_selection();
+    input.move_cursor(CursorMove::Jump(end_line, end_column));
+    input.start_selection();
+    input.move_cursor(CursorMove::Jump(start_line, start_column));
+    input.insert_str(replacement)
 }
 
 async fn dispatch_ui_command(
@@ -2162,6 +2345,7 @@ async fn dispatch_ui_command(
     match command {
         CoreCommand::Compose => {
             app.skip_splash();
+            app.dismiss_completions();
             app.overlay = Some(Overlay::Composer);
             Action::Continue
         }
@@ -2283,10 +2467,23 @@ async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Ac
     match app.keymap.action("main", &key_name).as_deref() {
         Some("quit") => Action::Quit,
         Some("compose") => {
+            app.dismiss_completions();
             app.overlay = Some(Overlay::Composer);
             Action::Continue
         }
-        Some("paste_image") => Action::ReadClipboardImage,
+        Some("reference") => {
+            app.overlay = Some(Overlay::Composer);
+            app.input.insert_char('@');
+            Action::RefreshCompletions
+        }
+        Some("paste") => {
+            app.overlay = Some(Overlay::Composer);
+            Action::ReadClipboard
+        }
+        Some("paste_image") => {
+            app.overlay = Some(Overlay::Composer);
+            Action::ReadClipboardImage
+        }
         Some("remove_last_image") => {
             app.remove_last_image();
             Action::Continue
@@ -2398,39 +2595,77 @@ async fn handle_overlay_key(
     services: &LoopServices,
 ) -> Action {
     match overlay {
-        Overlay::Composer => match app.keymap.action("composer", key_name).as_deref() {
-            Some("submit") => {
-                app.submit()
-                    .map_or(Action::Continue, |(prompt, images)| Action::Submit {
-                        prompt,
-                        images,
-                    })
+        Overlay::Composer => {
+            let composer_action = app.keymap.action("composer", key_name);
+            if app.completions.is_some() {
+                match (key_name, composer_action.as_deref()) {
+                    ("tab", _) | (_, Some("submit")) => {
+                        app.accept_completion();
+                        return Action::RefreshCompletions;
+                    }
+                    ("backtab" | "shift+tab" | "shift+backtab", _) => {
+                        app.move_completion(-1);
+                        return Action::Continue;
+                    }
+                    (_, Some("cursor_up")) => {
+                        app.move_completion(-1);
+                        return Action::Continue;
+                    }
+                    (_, Some("cursor_down")) => {
+                        app.move_completion(1);
+                        return Action::Continue;
+                    }
+                    (_, Some("close")) => {
+                        app.dismiss_completions();
+                        return Action::Continue;
+                    }
+                    _ => {}
+                }
             }
-            Some("newline") => {
-                app.input.insert_newline();
-                Action::Continue
+            match composer_action.as_deref() {
+                Some("submit") => {
+                    app.submit()
+                        .map_or(Action::Continue, |(prompt, images)| Action::Submit {
+                            prompt,
+                            images,
+                        })
+                }
+                Some("newline") => {
+                    app.input.insert_newline();
+                    Action::RefreshCompletions
+                }
+                Some("paste") => Action::ReadClipboard,
+                Some("paste_image") => Action::ReadClipboardImage,
+                Some("complete") => {
+                    if app.accept_completion() {
+                        Action::RefreshCompletions
+                    } else {
+                        Action::Continue
+                    }
+                }
+                Some("remove_last_image") => {
+                    app.remove_last_image();
+                    Action::Continue
+                }
+                Some("copy") => {
+                    copy_composer_selection(app);
+                    Action::Continue
+                }
+                Some("restore_pending") => Action::RestorePending,
+                Some("upgrade_pending") => Action::UpgradePending,
+                Some("close") => {
+                    app.composer_mouse_selecting = false;
+                    app.dismiss_completions();
+                    app.overlay = None;
+                    Action::Continue
+                }
+                Some("quit") => Action::Quit,
+                action => {
+                    app.edit_composer(key, action);
+                    Action::RefreshCompletions
+                }
             }
-            Some("remove_last_image") => {
-                app.remove_last_image();
-                Action::Continue
-            }
-            Some("copy") => {
-                copy_composer_selection(app);
-                Action::Continue
-            }
-            Some("restore_pending") => Action::RestorePending,
-            Some("upgrade_pending") => Action::UpgradePending,
-            Some("close") => {
-                app.composer_mouse_selecting = false;
-                app.overlay = None;
-                Action::Continue
-            }
-            Some("quit") => Action::Quit,
-            action => {
-                app.edit_composer(key, action);
-                Action::Continue
-            }
-        },
+        }
         Overlay::Delivery => match app.keymap.action("list", key_name).as_deref() {
             Some("previous") => {
                 if let Some(delivery) = app.delivery.as_mut() {
@@ -3036,6 +3271,9 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
     if handle_composer_mouse(app, mouse) {
         return Action::Continue;
     }
+    if handle_completion_mouse(app, mouse) {
+        return Action::RefreshCompletions;
+    }
     if is_selection_copy_click(app, mouse) {
         copy_current_surface(app);
         app.copy_click_release_pending = true;
@@ -3081,7 +3319,8 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                     settings.selected = wrapped_index(settings.selected, -1, 5);
                 }
             }
-            Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
+            Some(Overlay::Composer) => app.move_completion(-1),
+            Some(Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
             Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_sub(3),
             None => app.scroll_transcript(-3),
         },
@@ -3112,7 +3351,8 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                     settings.selected = wrapped_index(settings.selected, 1, 5);
                 }
             }
-            Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
+            Some(Overlay::Composer) => app.move_completion(1),
+            Some(Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
             Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_add(3),
             None => app.scroll_transcript(3),
         },
@@ -3128,6 +3368,10 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             match target {
                 AppHit::Transcript(_) => unreachable!(),
                 AppHit::TranscriptTail => unreachable!(),
+                AppHit::Completion(index) => {
+                    app.select_completion(index);
+                    return Action::RefreshCompletions;
+                }
                 AppHit::Delivery(index) => {
                     if let Some(delivery) = app.delivery.as_mut() {
                         delivery.selected = index;
@@ -3339,6 +3583,7 @@ fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
     match app.overlay {
         Some(Overlay::Composer) => {
             app.composer_mouse_selecting = false;
+            app.dismiss_completions();
             app.overlay = None;
         }
         Some(Overlay::Delivery) => {
@@ -3378,6 +3623,16 @@ fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
     app.overlay_scroll = 0;
     app.selection = None;
     true
+}
+
+fn handle_completion_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Some(AppHit::Completion(index)) = hit_target(&app.hit_regions, mouse) else {
+        return false;
+    };
+    app.select_completion(index)
 }
 
 fn begin_direct_transcript_selection(app: &mut App, mouse: MouseEvent) -> bool {
@@ -4255,6 +4510,36 @@ fn start_clipboard_image_read(app: &mut App, sender: mpsc::UnboundedSender<Backg
     });
 }
 
+fn start_clipboard_read(app: &mut App, sender: mpsc::UnboundedSender<BackgroundEvent>) {
+    if app.clipboard_image_loading {
+        app.set_flash("The clipboard is already being read");
+        return;
+    }
+    app.clipboard_image_loading = true;
+    app.sync_composer_chrome();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(clipboard::read_preferred)
+            .await
+            .context("clipboard reader stopped unexpectedly")
+            .and_then(|result| result);
+        let _ = sender.send(BackgroundEvent::ClipboardRead(result));
+    });
+}
+
+fn start_completion_query(app: &mut App, sender: mpsc::UnboundedSender<BackgroundEvent>) {
+    if app.overlay != Some(Overlay::Composer) {
+        app.dismiss_completions();
+        return;
+    }
+    let (generation, context) = app.begin_completion_query();
+    let tui = app.tui.clone();
+    app.completion_task = Some(tokio::spawn(async move {
+        time::sleep(COMPLETION_DEBOUNCE).await;
+        let result = tui.completions(&context).await;
+        let _ = sender.send(BackgroundEvent::Completions { generation, result });
+    }));
+}
+
 fn start_catalog_refresh(
     app: &mut App,
     services: &LoopServices,
@@ -4278,7 +4563,12 @@ fn start_catalog_refresh(
     });
 }
 
-async fn finish_background(app: &mut App, services: &LoopServices, event: BackgroundEvent) {
+async fn finish_background(
+    app: &mut App,
+    services: &LoopServices,
+    background_tx: mpsc::UnboundedSender<BackgroundEvent>,
+    event: BackgroundEvent,
+) {
     match event {
         BackgroundEvent::CatalogRefreshed(result) => {
             app.catalog_refreshing = false;
@@ -4354,6 +4644,14 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
         }
         BackgroundEvent::ClipboardImageRead(result) => {
             app.finish_clipboard_image_read(result);
+        }
+        BackgroundEvent::ClipboardRead(result) => {
+            if app.finish_clipboard_read(result) {
+                start_completion_query(app, background_tx);
+            }
+        }
+        BackgroundEvent::Completions { generation, result } => {
+            app.finish_completion_query(generation, result);
         }
     }
 }
@@ -5530,7 +5828,7 @@ fn fixed_bottom_notices(app: &App) -> Vec<(String, Color)> {
 
 fn pending_image_notice(count: usize, loading: bool) -> String {
     match (count, loading) {
-        (0, true) => "reading clipboard image…".to_string(),
+        (0, true) => "reading clipboard…".to_string(),
         (count, false) => format!(
             "{count} image{} ready · alt+backspace remove",
             if count == 1 { "" } else { "s" }
@@ -5705,7 +6003,10 @@ fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
         Overlay::Status => bottom_float(frame, 14),
-        Overlay::Composer => bottom_float(frame, 8 + pending_preview_height(app)),
+        Overlay::Composer => bottom_float(
+            frame,
+            8 + pending_preview_height(app) + completion_preview_height(app),
+        ),
         Overlay::Delivery => bottom_float(frame, 9),
         Overlay::Text | Overlay::Oauth => Rect::new(
             2,
@@ -5748,22 +6049,30 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
         .padding(Padding::uniform(1));
     match overlay {
         Overlay::Composer => {
-            let sections = if app.pending_messages.is_empty() {
-                vec![area]
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(pending_preview_height(app)),
-                        Constraint::Min(8),
-                    ])
-                    .split(area)
-                    .to_vec()
-            };
-            if let Some(preview) = sections.get(1).map(|_| sections[0]) {
-                render_pending_messages(frame, app, preview);
+            let pending_height = pending_preview_height(app);
+            let completion_height = completion_preview_height(app);
+            let mut constraints = Vec::new();
+            if pending_height > 0 {
+                constraints.push(Constraint::Length(pending_height));
             }
-            let composer_area = *sections.last().unwrap_or(&area);
+            if completion_height > 0 {
+                constraints.push(Constraint::Length(completion_height));
+            }
+            constraints.push(Constraint::Min(8));
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(area);
+            let mut section = 0;
+            if pending_height > 0 {
+                render_pending_messages(frame, app, sections[section]);
+                section += 1;
+            }
+            if completion_height > 0 {
+                render_composer_completions(frame, app, sections[section]);
+                section += 1;
+            }
+            let composer_area = sections[section];
             style_input(
                 &mut app.input,
                 app.busy,
@@ -6112,6 +6421,71 @@ fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block
 }
 
 const PENDING_PREVIEW_LIMIT: usize = 4;
+const COMPLETION_PREVIEW_LIMIT: usize = 6;
+
+fn completion_preview_height(app: &App) -> u16 {
+    app.completions.as_ref().map_or(0, |completions| {
+        completions.result.items.len().min(COMPLETION_PREVIEW_LIMIT) as u16 + 2
+    })
+}
+
+fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(completions) = app.completions.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(MUTED))
+        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .title(" REFERENCES · ↑↓ select · Enter/Tab insert ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let count = completions.result.items.len().min(inner.height as usize);
+    let offset = completions
+        .selected
+        .saturating_sub(count.saturating_sub(1))
+        .min(completions.result.items.len().saturating_sub(count));
+    let lines = completions
+        .result
+        .items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(count)
+        .map(|(index, item)| {
+            let selected = index == completions.selected;
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    item.label.clone(),
+                    Style::default()
+                        .fg(if selected { ACCENT } else { TEXT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    format!("  {}", item.description),
+                    Style::default().fg(MUTED),
+                ),
+            ])
+            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+    for (row, index) in (offset..offset + count).enumerate() {
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(inner.x, inner.y.saturating_add(row as u16), inner.width, 1),
+            target: AppHit::Completion(index),
+        });
+    }
+}
 
 fn pending_preview_height(app: &App) -> u16 {
     if app.pending_messages.is_empty() {
@@ -6520,7 +6894,7 @@ fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, im
     let border = ACCENT;
     let title = match (image_count, image_loading) {
         (0, false) => " MESSAGE ".to_string(),
-        (0, true) => " MESSAGE · reading clipboard image… ".to_string(),
+        (0, true) => " MESSAGE · reading clipboard… ".to_string(),
         (count, false) => format!(
             " MESSAGE · {count} image{} ",
             if count == 1 { "" } else { "s" }
@@ -6535,7 +6909,7 @@ fn style_input(input: &mut TextArea<'static>, busy: bool, image_count: usize, im
     } else if busy {
         " Enter choose delivery · Alt+Backspace remove latest image "
     } else if image_count == 0 {
-        " Enter send · Shift+Enter newline "
+        " Enter send · Shift+Enter newline · Alt+V image "
     } else {
         " Enter send · Alt+Backspace remove latest image "
     };
@@ -8687,6 +9061,101 @@ mod tests {
         assert!(app.draft_text().is_empty());
         assert!(app.overlay.is_none());
         assert!(!app.animations_paused());
+    }
+
+    #[test]
+    fn composer_applies_generic_completion_ranges_and_rejects_stale_results() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.input.insert_str("open @@old");
+        app.completion_generation = 4;
+        let result = TuiCompletions {
+            replacement: TuiTextRange {
+                start: TuiTextPosition { line: 0, column: 5 },
+                end: TuiTextPosition {
+                    line: 0,
+                    column: 10,
+                },
+            },
+            items: vec![crate::plugin::TuiCompletionItem {
+                insert_text: "@@session-id ".to_string(),
+                label: "Earlier session".to_string(),
+                description: "session-id".to_string(),
+            }],
+        };
+
+        app.finish_completion_query(3, Ok(Some(result.clone())));
+        assert!(app.completions.is_none());
+        app.finish_completion_query(4, Ok(Some(result)));
+        assert!(app.accept_completion());
+        assert_eq!(app.draft_text(), "open @@session-id ");
+        assert!(app.completions.is_none());
+    }
+
+    #[test]
+    fn composer_completion_popup_is_visible_and_mouse_selectable() {
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.completions = Some(ComposerCompletions {
+            result: TuiCompletions {
+                replacement: TuiTextRange {
+                    start: TuiTextPosition { line: 0, column: 0 },
+                    end: TuiTextPosition { line: 0, column: 0 },
+                },
+                items: vec![crate::plugin::TuiCompletionItem {
+                    insert_text: "@src/main.rs ".to_string(),
+                    label: "src/main.rs".to_string(),
+                    description: "src".to_string(),
+                }],
+            },
+            selected: 0,
+        });
+
+        let rendered = render_to_string(&mut app, 80, 24);
+
+        assert!(rendered.contains("REFERENCES · ↑↓ select · Enter/Tab insert"));
+        assert!(rendered.contains("src/main.rs"));
+        assert!(
+            app.hit_regions
+                .iter()
+                .any(|region| region.target == AppHit::Completion(0))
+        );
+        let region = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == AppHit::Completion(0))
+            .copied()
+            .unwrap();
+        assert!(handle_completion_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.area.x,
+                row: region.area.y,
+                modifiers: KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(app.draft_text(), "@src/main.rs ");
+    }
+
+    #[test]
+    fn smart_clipboard_result_inserts_text_or_an_image_into_the_composer() {
+        let mut pasted_from_main = test_app();
+        handle_paste(&mut pasted_from_main, "main paste".to_string());
+        assert!(pasted_from_main.overlay == Some(Overlay::Composer));
+        assert_eq!(pasted_from_main.draft_text(), "main paste");
+
+        let mut app = test_app();
+        app.overlay = Some(Overlay::Composer);
+        app.clipboard_image_loading = true;
+        assert!(
+            app.finish_clipboard_read(Ok(clipboard::ClipboardContent::Text("pasted".to_string())))
+        );
+        assert_eq!(app.draft_text(), "pasted");
+
+        app.clipboard_image_loading = true;
+        assert!(!app.finish_clipboard_read(Ok(clipboard::ClipboardContent::Image(vec![1, 2]))));
+        assert_eq!(app.pending_images.len(), 1);
     }
 
     #[test]

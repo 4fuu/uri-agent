@@ -12,7 +12,7 @@ use tokio::fs;
 use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
     Connection,
-    rusqlite::{OptionalExtension, params},
+    rusqlite::{OpenFlags, OptionalExtension, params},
 };
 use uuid::Uuid;
 
@@ -31,6 +31,220 @@ pub struct SessionSummary {
     pub model: String,
     pub thinking: ThinkingLevel,
     pub preview: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArchivedSessionSummary {
+    pub id: String,
+    pub updated_at: DateTime<Utc>,
+    pub cwd: PathBuf,
+    pub provider: String,
+    pub model: String,
+    pub thinking: ThinkingLevel,
+    pub first_message: String,
+    pub message_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArchivedSession {
+    pub summary: ArchivedSessionSummary,
+    pub events: Vec<SessionEvent>,
+}
+
+/// Read-only access to saved sessions for linked extensions.
+///
+/// Archive reads never initialize, migrate, or otherwise write the database.
+#[derive(Clone, Debug)]
+pub struct SessionArchive {
+    database_path: PathBuf,
+    project: PathBuf,
+}
+
+impl SessionArchive {
+    pub fn for_project(cwd: &Path) -> Self {
+        Self::at(session_database_path(cwd), cwd)
+    }
+
+    pub(crate) fn at(database_path: PathBuf, cwd: &Path) -> Self {
+        Self {
+            database_path,
+            project: cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()),
+        }
+    }
+
+    pub async fn list_for_project(&self) -> Result<Vec<ArchivedSessionSummary>> {
+        let project = self.project.clone();
+        Ok(self
+            .list_all()
+            .await?
+            .into_iter()
+            .filter(|session| {
+                if cfg!(windows) {
+                    session
+                        .cwd
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&project.to_string_lossy())
+                } else {
+                    session.cwd == project
+                }
+            })
+            .collect())
+    }
+
+    pub async fn list_all(&self) -> Result<Vec<ArchivedSessionSummary>> {
+        let Some(connection) = open_archive_database(&self.database_path).await? else {
+            return Ok(Vec::new());
+        };
+        connection
+            .call(|db| {
+                let mut statement = db.prepare(
+                    "SELECT id, updated_at, cwd, provider, model, thinking,
+                        (SELECT payload_json FROM events
+                         WHERE events.session_id = sessions.id AND kind = 'user'
+                         ORDER BY sequence ASC LIMIT 1),
+                        (SELECT COUNT(*) FROM events
+                         WHERE events.session_id = sessions.id AND kind = 'user')
+                     FROM sessions
+                     ORDER BY updated_at DESC, id DESC",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })?;
+                let mut sessions = Vec::new();
+                for row in rows {
+                    let (id, updated_at, cwd, provider, model, thinking, payload, message_count) =
+                        row?;
+                    let first_message = payload
+                        .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
+                        .and_then(|kind| match kind {
+                            EventKind::User { text } => Some(text),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+                        .map(|value| value.with_timezone(&Utc))
+                        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+                    sessions.push(ArchivedSessionSummary {
+                        id,
+                        updated_at,
+                        cwd: PathBuf::from(cwd),
+                        provider,
+                        model,
+                        thinking: thinking.parse().unwrap_or_default(),
+                        first_message,
+                        message_count: usize::try_from(message_count).unwrap_or_default(),
+                    });
+                }
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(sessions)
+            })
+            .await
+            .context("cannot list archived sessions")
+    }
+
+    pub async fn load(&self, id: &str) -> Result<Option<ArchivedSession>> {
+        validate_session_id(id)?;
+        let Some(connection) = open_archive_database(&self.database_path).await? else {
+            return Ok(None);
+        };
+        let id = id.to_string();
+        connection
+            .call(move |db| {
+                let summary = db
+                    .query_row(
+                        "SELECT id, updated_at, cwd, provider, model, thinking,
+                            (SELECT payload_json FROM events
+                             WHERE events.session_id = sessions.id AND kind = 'user'
+                             ORDER BY sequence ASC LIMIT 1),
+                            (SELECT COUNT(*) FROM events
+                             WHERE events.session_id = sessions.id AND kind = 'user')
+                         FROM sessions WHERE id = ?1",
+                        [&id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                                row.get::<_, i64>(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((id, updated_at, cwd, provider, model, thinking, payload, message_count)) =
+                    summary
+                else {
+                    return Ok::<_, tokio_rusqlite::rusqlite::Error>(None);
+                };
+                let mut statement = db.prepare(
+                    "SELECT sequence, at, payload_json FROM events
+                     WHERE session_id = ?1 ORDER BY sequence",
+                )?;
+                let rows = statement.query_map([&id], |row| {
+                    let sequence = row.get::<_, i64>(0)?;
+                    let at = row.get::<_, String>(1)?;
+                    let payload = row.get::<_, String>(2)?;
+                    let at = DateTime::parse_from_rfc3339(&at)
+                        .map_err(|error| {
+                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                tokio_rusqlite::rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?
+                        .with_timezone(&Utc);
+                    let kind = serde_json::from_str(&payload).map_err(|error| {
+                        tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            tokio_rusqlite::rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(SessionEvent {
+                        sequence: sequence as u64,
+                        at,
+                        kind,
+                    })
+                })?;
+                let events = rows.collect::<Result<Vec<_>, _>>()?;
+                let first_message = payload
+                    .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
+                    .and_then(|kind| match kind {
+                        EventKind::User { text } => Some(text),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+                    .map(|value| value.with_timezone(&Utc))
+                    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+                Ok(Some(ArchivedSession {
+                    summary: ArchivedSessionSummary {
+                        id,
+                        updated_at,
+                        cwd: PathBuf::from(cwd),
+                        provider,
+                        model,
+                        thinking: thinking.parse().unwrap_or_default(),
+                        first_message,
+                        message_count: usize::try_from(message_count).unwrap_or_default(),
+                    },
+                    events,
+                }))
+            })
+            .await
+            .context("cannot read archived session")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -792,6 +1006,19 @@ fn session_database_path(fallback: &Path) -> PathBuf {
     dirs::data_dir()
         .map(|path| path.join("uri-agent/sessions.db"))
         .unwrap_or_else(|| fallback.join(".uri-agent/sessions.db"))
+}
+
+async fn open_archive_database(path: &Path) -> Result<Option<Connection>> {
+    if !fs::try_exists(path)
+        .await
+        .with_context(|| format!("cannot inspect session database: {}", path.display()))?
+    {
+        return Ok(None);
+    }
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .await
+        .map(Some)
+        .with_context(|| format!("cannot open session archive: {}", path.display()))
 }
 
 async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> {

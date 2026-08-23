@@ -1134,6 +1134,7 @@ async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>>
         let Some(path) = argument.strip_prefix('@').filter(|path| !path.is_empty()) else {
             continue;
         };
+        let path = path.strip_prefix("file://").unwrap_or(path);
         let path = PathBuf::from(path);
         let path = if path.is_absolute() {
             path
@@ -1784,6 +1785,10 @@ mod tests {
             prompt_arguments(r#"inspect "@my shot.png""#),
             ["inspect", "@my shot.png"]
         );
+        assert_eq!(
+            prompt_arguments(r#"inspect @"file://my shot.png""#),
+            ["inspect", "@file://my shot.png"]
+        );
     }
 
     #[tokio::test]
@@ -1804,6 +1809,11 @@ mod tests {
                     && matches!(&image.data, rig::message::DocumentSourceKind::Base64(data)
                         if base64::engine::general_purpose::STANDARD.decode(data).unwrap().starts_with(b"\x89PNG"))
         ));
+
+        let uri_attachments = image_attachments("inspect @file://screen.png", workspace.path())
+            .await
+            .unwrap();
+        assert_eq!(uri_attachments.len(), 1);
 
         let absolute = image_attachments(&format!("inspect @{}", path.display()), workspace.path())
             .await
