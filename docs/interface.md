@@ -6,7 +6,7 @@ URI Agent presents one conversation surface with floating controls for compositi
 
 Startup may show a short animated splash before the first conversation. Session switches keep the terminal interface active; `:new` opens a fresh welcome view directly instead of replaying the splash. An empty conversation keeps the centered animated brand and shows only the working directory and active provider/model with its thinking effort below it, followed by a locally centered compose/command/help key hint. If no usable model is configured, the provider/model line prompts for `:login`. Usage, context pressure, Git branch, and extension status are omitted from this welcome state.
 
-After the first record appears, the transcript uses the available content area and a minimal, low-contrast footer stays on the bottom row. It keeps the active model and effort at the left edge and the animated context meter plus `percentage/context-window-size` at the right edge. During live activity such as thinking or tool execution, the footer expands upward by one row; activity begins at the model's usual trailing position on that upper row. Fixed statuses such as pending messages or an active filter remain visible immediately above the footer. Transient notifications overlay the welcome or conversation instead of resizing it. They stack above fixed statuses, with each newer notification above the earlier ones, then expire independently; all bottom notices wrap to the available width. Transient notifications remain visible longer as their character count grows, within a bounded reading interval. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
+After the first record appears, the transcript uses the available content area and a minimal, low-contrast footer stays on the bottom row. It keeps the active model and effort at the left edge and the animated context meter plus `percentage/context-window-size` at the right edge. The meter uses provider-reported usage when available. `≈` marks an estimate or an API baseline plus estimated trailing messages; `?` means a compaction invalidated the old baseline and no new provider usage has arrived. During live activity such as thinking or tool execution, the footer expands upward by one row; activity begins at the model's usual trailing position on that upper row. Fixed statuses such as pending messages or an active filter remain visible immediately above the footer. Transient notifications overlay the welcome or conversation instead of resizing it. They stack above fixed statuses, with each newer notification above the earlier ones, then expire independently; all bottom notices wrap to the available width. Transient notifications remain visible longer as their character count grows, within a bounded reading interval. Branding, project, branch, token, extension, separator, and shortcut-hint details are omitted from the compact row. Click the footer, press `F4`, or run `:status` to open the bottom-anchored project, session, usage, and extension panel, where the model row also includes effort.
 
 The base conversation surface uses the terminal's default background. User prompts use a padded teal band distinct from the footer, while assistant responses remain on the terminal background. Both use the full transcript width without decorative prefixes or selection rails, so copied text contains only message content. Assistant responses render as Markdown documents, including highlighted headings at every level, emphasis, links, lists, quotes, code blocks, and responsive tables. User prompts and final assistant responses never fold. A follow-up prompt has one blank row between the previous turn's final response and its teal top padding. The teal padding supplies the blank row between a prompt and the first reasoning, tool, or assistant block. While a turn runs, intermediate assistant text, reasoning, and tools remain visible in event order. When the turn finishes, everything before its final response folds into one `Process` row, separated from the padded user prompt by one additional blank row; a turn with no intermediate blocks has no empty process row. The final response, or the terminal error for a failed turn, remains visible after one blank row. Restored sessions reconstruct the same default-collapsed process row from their persisted turn boundaries.
 
@@ -65,7 +65,7 @@ Core commands are registered through `CommandRegistry`:
 | `:login`, `:logout` | Manage provider credentials |
 | `:resume`, `:new` | Switch project sessions or create one |
 | `:search` or `:find` | Search text already shown in the current conversation and jump to a matching block |
-| `:compact` | Request a context checkpoint after usage exceeds 20% |
+| `:compact` | Request a context checkpoint when older completed history is available |
 | `:set-env` | Add or replace an Agent environment variable through a masked value prompt |
 | `:set-terminal`, `:terminal` | Configure and open the embedded terminal |
 | `:help` | Show the active commands and keymap |
@@ -212,7 +212,9 @@ Each retry is recorded as a visible session event containing its reason, delay, 
 
 ### Context compaction
 
-URI Agent estimates replay size against the selected model's context window. Before an overflowing request, it may ask the model for a durable summary of older history and append a compaction checkpoint. Replay then uses:
+URI Agent measures replay size against the selected model's context window. The most recent valid ordinary API response is authoritative; messages after that response are estimated until the next response. A full estimate is used before the first response and includes the frozen system prompt, registered tool definitions, message content, and bounded image costs. A compaction invalidates usage from the earlier replay, so context remains unknown until the next ordinary API response.
+
+Automatic compaction is checked after an agent run and before accepting the next prompt, with a final request-time check as a fallback. When the configured threshold is crossed, URI Agent asks the model for a durable summary of older history and appends a compaction checkpoint. Replay then uses:
 
 ```text
 frozen system prompt
@@ -221,14 +223,10 @@ frozen system prompt
 + events after the checkpoint
 ```
 
-Summary generation uses a dedicated compaction system prompt and does not
-expose registered tools. Normal execution resumes with the session's frozen
-system prompt unchanged.
+Summary generation uses a dedicated compaction system prompt and does not expose registered tools. Conversation messages are serialized as untrusted data, large tool results and total summary input are bounded, and an earlier checkpoint is supplied explicitly for updating. Summary output is capped at 80% of the configured reserve. Normal execution resumes with the session's frozen system prompt unchanged.
 
 Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the retention budget, URI Agent may summarize its older prefix and retain its recent suffix. A retained suffix never starts with a tool result, so a tool call is not separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
 
-If a provider still reports context overflow, URI Agent makes one forced compaction-and-retry attempt for that user turn. This recovery has its own budget: it neither consumes nor resets transient-failure counters. A second overflow settles as an error instead of retrying indefinitely.
+Explicit provider errors, successful responses whose reported input exceeds the context window, and recoverable `length` stops participate in overflow handling. A usable successful response is preserved and followed by compaction. A failed or truncated response can make one forced compaction-and-retry attempt for that user turn and does not enter replay before that retry. This recovery has its own budget: it neither consumes nor resets transient-failure counters. A second overflow settles without retrying indefinitely.
 
-Run `:compact` to request an earlier checkpoint once estimated context usage is
-strictly above 20%. The command also fails clearly when there is not enough
-completed history to summarize.
+Run `:compact` to request an earlier checkpoint at any context usage. The command fails clearly when there is not enough completed history to summarize. Automatic compaction can be disabled and its reserve and retained-history budgets changed through `settings.json`; see [Settings fields and precedence](configuration.md#settings-fields-and-precedence).

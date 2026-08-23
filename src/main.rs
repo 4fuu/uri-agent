@@ -225,6 +225,7 @@ async fn run_session(
         frozen_context.system_prompt,
         limits,
     ));
+    runtime.set_compaction_settings(active.compaction).await;
     runtime.refresh_context_estimate().await;
     let commands = Arc::new(commands);
     let tui = Arc::new(tui);
@@ -340,6 +341,8 @@ async fn show_session(
                 model_ready,
                 provider_count,
                 context_tokens: runtime.estimated_context(),
+                context_accuracy: runtime.context_usage().accuracy,
+                compaction_enabled: active.compaction.enabled,
                 terminal: active.terminal,
             },
             draft,

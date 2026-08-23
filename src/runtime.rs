@@ -3,14 +3,14 @@ use crate::compaction;
 use crate::config::{display_path, path_is_within};
 use crate::model::{
     ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelFailurePhase, ModelRequest,
-    ModelResponse, looks_like_context_overflow,
+    ModelResponse, looks_like_context_overflow, tool_definitions,
 };
 use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
 use crate::task::TaskManager;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use rig::completion::Usage;
+use rig::completion::{FinishReason, Usage};
 use rig::message::{
     AssistantContent, ImageMediaType, Message, Text, ToolCall, ToolResultContent, UserContent,
 };
@@ -18,7 +18,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock as SyncRwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -100,7 +100,8 @@ pub struct AgentRuntime {
     session: Session,
     system_prompt: String,
     limits: RwLock<ModelLimits>,
-    estimated_tokens: AtomicUsize,
+    context_usage: SyncRwLock<compaction::ContextUsage>,
+    compaction_settings: RwLock<compaction::Settings>,
     turn: Mutex<()>,
     active_turn: Mutex<Option<ActiveTurn>>,
     pending: Mutex<PendingState>,
@@ -122,7 +123,11 @@ impl AgentRuntime {
             session,
             system_prompt,
             limits: RwLock::new(limits),
-            estimated_tokens: AtomicUsize::new(0),
+            context_usage: SyncRwLock::new(compaction::ContextUsage {
+                tokens: 0,
+                accuracy: compaction::ContextAccuracy::Estimated,
+            }),
+            compaction_settings: RwLock::new(compaction::Settings::default()),
             turn: Mutex::new(()),
             active_turn: Mutex::new(None),
             pending: Mutex::new(PendingState::default()),
@@ -134,18 +139,40 @@ impl AgentRuntime {
         &self.session
     }
 
-    /// Estimated tokens the next model request would carry, used by the
-    /// footer's context meter the same way pi estimates its context usage.
+    /// Tokens the next model request would carry. Provider usage is the
+    /// baseline when available; only messages after that response are estimated.
     pub fn estimated_context(&self) -> usize {
-        self.estimated_tokens.load(Ordering::Relaxed)
+        self.context_usage().tokens
+    }
+
+    pub fn context_usage(&self) -> compaction::ContextUsage {
+        *self
+            .context_usage
+            .read()
+            .expect("context usage lock poisoned")
     }
 
     pub async fn refresh_context_estimate(&self) {
-        let history = self.session.model_history().await;
-        self.estimated_tokens.store(
-            compaction::estimate_tokens(&self.system_prompt, &history),
-            Ordering::Relaxed,
+        let model = self.session.model_settings().await;
+        let context = self
+            .session
+            .model_context(&model.provider, &model.model)
+            .await;
+        let usage = compaction::context_usage(
+            &self.system_prompt,
+            &context.history,
+            &tool_definitions(),
+            context.latest_api_usage,
+            context.after_compaction,
         );
+        *self
+            .context_usage
+            .write()
+            .expect("context usage lock poisoned") = usage;
+    }
+
+    pub async fn set_compaction_settings(&self, settings: compaction::Settings) {
+        *self.compaction_settings.write().await = settings;
     }
 
     pub async fn set_backend(
@@ -266,12 +293,6 @@ impl AgentRuntime {
 
     pub async fn compact(&self) -> Result<()> {
         let _turn = self.turn.lock().await;
-        let history = self.session.model_history().await;
-        let context_window = self.limits.read().await.context_window.max(1);
-        let context_tokens = compaction::estimate_tokens(&self.system_prompt, &history);
-        if !compaction::manual_compaction_allowed(context_tokens, context_window) {
-            bail!("manual compaction requires context usage above 20%")
-        }
         let backend = self
             .backend
             .read()
@@ -473,6 +494,8 @@ impl AgentRuntime {
                 }
             },
         };
+        self.compact_with(backend.as_ref(), false, false, cancel)
+            .await?;
         self.append_user_input(prompt.to_string(), content, false)
             .await?;
         *input_delivered = true;
@@ -641,10 +664,35 @@ impl AgentRuntime {
                     .await?;
             }
             let mut model_retries = HashMap::new();
-            let response = loop {
+            let (response, force_post_compaction) = loop {
                 match self.complete_once(backend.as_ref(), cancel).await {
-                    Ok(response) => break response,
+                    Ok(response) => {
+                        let settings = *self.compaction_settings.read().await;
+                        let context_window = self.limits.read().await.context_window.max(1);
+                        if settings.enabled
+                            && !overflow_retried
+                            && is_recoverable_length(
+                                &response,
+                                context_window,
+                                backend.desired_max_output_tokens(),
+                            )
+                            && self
+                                .compact_with(backend.as_ref(), true, false, cancel)
+                                .await?
+                        {
+                            overflow_retried = true;
+                            self.record_usage(response.usage, response.context_tokens, false)
+                                .await?;
+                            continue;
+                        }
+                        let force_post_compaction = settings.enabled
+                            && is_successful_context_overflow(&response, context_window);
+                        break (response, force_post_compaction);
+                    }
                     Err(error) if !overflow_retried && is_context_overflow(&error) => {
+                        if !self.compaction_settings.read().await.enabled {
+                            return Err(error);
+                        }
                         overflow_retried = true;
                         if !self
                             .compact_with(backend.as_ref(), true, false, cancel)
@@ -670,7 +718,10 @@ impl AgentRuntime {
                 content: response.content.clone(),
             };
             let mut events = self.assistant_events(&response.content);
-            if let Some(usage) = self.usage_event(response.usage).await {
+            if let Some(usage) = self
+                .usage_event(response.usage, response.context_tokens, true)
+                .await
+            {
                 events.insert(0, usage);
             }
             events.push(EventKind::ModelMessage {
@@ -680,6 +731,7 @@ impl AgentRuntime {
                 .append_batch(events)
                 .await
                 .context("cannot persist assistant turn boundary")?;
+            self.refresh_context_estimate().await;
             has_model_response = true;
 
             let tool_calls = response
@@ -703,6 +755,16 @@ impl AgentRuntime {
                 .iter()
                 .all(|content| !matches!(content, AssistantContent::ToolCall(_)))
             {
+                let compaction = self
+                    .compact_with(backend.as_ref(), force_post_compaction, false, cancel)
+                    .await;
+                if let Err(error) = compaction {
+                    self.session
+                        .append(EventKind::Notice {
+                            text: format!("Automatic context compaction failed: {error:#}"),
+                        })
+                        .await?;
+                }
                 return Ok(());
             }
         }
@@ -716,28 +778,55 @@ impl AgentRuntime {
         manual: bool,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<bool> {
-        let history = self.session.model_history().await;
-        let context_window = self.limits.read().await.context_window.max(1);
-        if !force && !compaction::should_compact(&self.system_prompt, &history, context_window) {
+        let settings = *self.compaction_settings.read().await;
+        if !force && !settings.enabled {
             return Ok(false);
         }
-        let preparation = if force && !manual {
-            compaction::prepare(&self.system_prompt, &history, context_window, force)
-        } else {
-            compaction::prepare_preserving_latest_turn(
-                &self.system_prompt,
-                &history,
-                context_window,
-                force,
-            )
-        };
-        let Some(preparation) = preparation else {
+        self.refresh_context_estimate().await;
+        let context_usage = self.context_usage();
+        if !force && context_usage.accuracy == compaction::ContextAccuracy::Unknown {
+            return Ok(false);
+        }
+        let history = self.session.model_history().await;
+        let context_window = self.limits.read().await.context_window.max(1);
+        if !force
+            && !compaction::should_compact_usage(context_usage.tokens, context_window, settings)
+        {
+            return Ok(false);
+        }
+        // Pi permits a single oversized latest turn to be split at a valid
+        // message boundary. URI Agent additionally preserves tool-call/result
+        // pairing when selecting that boundary.
+        let preparation = compaction::prepare_with_settings(
+            &self.system_prompt,
+            &history,
+            context_window,
+            force,
+            settings,
+        );
+        let Some(mut preparation) = preparation else {
             return Ok(false);
         };
+        preparation.tokens_before = self.context_usage().tokens;
+        let previous_summary = self.session.latest_compaction_summary().await;
+        let summary_output_tokens = settings.summary_output_tokens(context_window).max(1);
+        let summary_history = compaction::summary_history(
+            &preparation,
+            previous_summary.as_deref(),
+            context_window
+                .saturating_sub(summary_output_tokens)
+                .saturating_mul(4),
+        );
         let request = ModelRequest {
             system: compaction::SUMMARY_SYSTEM_PROMPT.to_string(),
-            history: compaction::summary_history(&preparation),
+            estimated_context: compaction::estimate_request_tokens(
+                compaction::SUMMARY_SYSTEM_PROMPT,
+                &summary_history,
+                &[],
+            ),
+            history: summary_history,
             tools: false,
+            max_output_tokens: Some(summary_output_tokens),
         };
         let mut model_retries = HashMap::new();
         let (response, summary) = loop {
@@ -789,7 +878,8 @@ impl AgentRuntime {
                 }
             }
         };
-        self.record_usage(response.usage).await?;
+        self.record_usage(response.usage, response.context_tokens, false)
+            .await?;
         let replacement = compaction::replacement_history(&summary, &preparation.retained);
         self.session
             .append_compaction(summary, preparation.tokens_before, replacement, manual)
@@ -801,15 +891,25 @@ impl AgentRuntime {
     /// Persist one response's token usage, priced with the active model's
     /// catalog rates. A zero-valued report is the sentinel for missing
     /// metrics and carries no information worth an event.
-    async fn record_usage(&self, usage: Option<Usage>) -> Result<()> {
-        let Some(event) = self.usage_event(usage).await else {
+    async fn record_usage(
+        &self,
+        usage: Option<Usage>,
+        context_tokens: Option<usize>,
+        context: bool,
+    ) -> Result<()> {
+        let Some(event) = self.usage_event(usage, context_tokens, context).await else {
             return Ok(());
         };
         self.session.append(event).await?;
         Ok(())
     }
 
-    async fn usage_event(&self, usage: Option<Usage>) -> Option<EventKind> {
+    async fn usage_event(
+        &self,
+        usage: Option<Usage>,
+        context_tokens: Option<usize>,
+        context: bool,
+    ) -> Option<EventKind> {
         let usage = usage?;
         if usage.input_tokens == 0 && usage.output_tokens == 0 {
             return None;
@@ -820,12 +920,19 @@ impl AgentRuntime {
             usage.cached_input_tokens,
             usage.cache_creation_input_tokens,
         );
+        let model = self.session.model_settings().await;
         Some(EventKind::Usage {
             input: usage.input_tokens,
             output: usage.output_tokens,
             cache_read: usage.cached_input_tokens,
             cache_write: usage.cache_creation_input_tokens,
             cost,
+            total: context_tokens
+                .and_then(|tokens| u64::try_from(tokens).ok())
+                .unwrap_or_default(),
+            context,
+            provider: model.provider,
+            model: model.model,
         })
     }
 
@@ -834,15 +941,14 @@ impl AgentRuntime {
         backend: &dyn ModelBackend,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<ModelResponse> {
+        self.refresh_context_estimate().await;
         let history = self.session.model_history().await;
-        self.estimated_tokens.store(
-            compaction::estimate_tokens(&self.system_prompt, &history),
-            Ordering::Relaxed,
-        );
         let request = ModelRequest {
             system: self.system_prompt.clone(),
             history,
             tools: true,
+            estimated_context: self.context_usage().tokens,
+            max_output_tokens: None,
         };
         let (deltas, mut receiver) = mpsc::unbounded_channel();
         let completion = backend.complete(request, deltas);
@@ -969,6 +1075,7 @@ impl AgentRuntime {
             ])
             .await
             .context("cannot persist tool result boundary")?;
+        self.refresh_context_estimate().await;
         Ok(())
     }
 
@@ -1015,6 +1122,37 @@ fn is_context_overflow(error: &anyhow::Error) -> bool {
         return failure.kind() == ModelFailureKind::ContextOverflow;
     }
     looks_like_context_overflow(&format!("{error:#}"))
+}
+
+fn reported_input_tokens(response: &ModelResponse) -> u64 {
+    response.usage.as_ref().map_or(0, |usage| {
+        usage
+            .input_tokens
+            .saturating_add(usage.cached_input_tokens)
+            .saturating_add(usage.cache_creation_input_tokens)
+    })
+}
+
+fn is_successful_context_overflow(response: &ModelResponse, context_window: usize) -> bool {
+    matches!(response.finish_reason, None | Some(FinishReason::Stop))
+        && reported_input_tokens(response) > context_window as u64
+}
+
+fn is_recoverable_length(
+    response: &ModelResponse,
+    context_window: usize,
+    desired_max_output: usize,
+) -> bool {
+    if !matches!(response.finish_reason, Some(FinishReason::Length)) {
+        return false;
+    }
+    let output = response
+        .usage
+        .as_ref()
+        .map_or(0, |usage| usage.output_tokens as usize);
+    (desired_max_output > 0 && output < desired_max_output)
+        || (output == 0
+            && reported_input_tokens(response) as usize >= context_window.saturating_mul(99) / 100)
 }
 
 fn model_retry_policy(kind: ModelFailureKind) -> Option<ModelRetryPolicy> {
@@ -1312,7 +1450,15 @@ mod tests {
                     let _ = deltas.send(ModelDelta::Text(text.text.clone()));
                 }
             }
-            Ok(ModelResponse { content, usage })
+            let context_tokens = usage
+                .as_ref()
+                .and_then(|usage| (usage.total_tokens > 0).then_some(usage.total_tokens as usize));
+            Ok(ModelResponse {
+                content,
+                usage,
+                context_tokens,
+                finish_reason: Some(FinishReason::Stop),
+            })
         }
     }
 
@@ -1340,6 +1486,8 @@ mod tests {
             Ok(ModelResponse {
                 content: vec![AssistantContent::text("released")],
                 usage: None,
+                context_tokens: None,
+                finish_reason: Some(FinishReason::Stop),
             })
         }
     }
@@ -1366,6 +1514,7 @@ mod tests {
         Usage {
             input_tokens: 1_000,
             output_tokens: 500,
+            total_tokens: 1_650,
             cached_input_tokens: 100,
             cache_creation_input_tokens: 50,
             ..Usage::new()
@@ -1417,6 +1566,8 @@ mod tests {
                 ),
             ))],
             usage: None,
+            context_tokens: None,
+            finish_reason: Some(FinishReason::ToolCalls),
         })
     }
 
@@ -1424,6 +1575,8 @@ mod tests {
         Ok(ModelResponse {
             content: vec![AssistantContent::text(text)],
             usage: None,
+            context_tokens: None,
+            finish_reason: Some(FinishReason::Stop),
         })
     }
 
@@ -2180,7 +2333,18 @@ mod tests {
                     cache_read,
                     cache_write,
                     cost,
-                } => Some((*input, *output, *cache_read, *cache_write, *cost)),
+                    total,
+                    context,
+                    ..
+                } => Some((
+                    *input,
+                    *output,
+                    *cache_read,
+                    *cache_write,
+                    *cost,
+                    *total,
+                    *context,
+                )),
                 _ => None,
             })
             .expect("a reported usage becomes a session event");
@@ -2190,7 +2354,13 @@ mod tests {
         assert_eq!(usage.3, 50);
         let expected = (1_000.0 * 3.0 + 500.0 * 15.0 + 100.0 * 0.3 + 50.0 * 3.75) / 1_000_000.0;
         assert!((usage.4 - expected).abs() < f64::EPSILON);
-        assert!(runtime.estimated_context() > 0);
+        assert_eq!(usage.5, 1_650);
+        assert!(usage.6);
+        assert_eq!(runtime.estimated_context(), 1_650);
+        assert_eq!(
+            runtime.context_usage().accuracy,
+            compaction::ContextAccuracy::Api
+        );
 
         drop(runtime);
         drop(session);
@@ -2268,7 +2438,7 @@ mod tests {
             4
         );
         let replay = session.model_history().await;
-        assert_eq!(replay.len(), 3);
+        assert_eq!(replay.len(), 2);
         assert!(
             serde_json::to_string(&replay[0])
                 .unwrap()
@@ -2278,12 +2448,23 @@ mod tests {
         assert_eq!(requests[0].system, compaction::SUMMARY_SYSTEM_PROMPT);
         assert!(!requests[0].system.contains("frozen system"));
         assert!(!requests[0].tools);
+        assert_eq!(requests[0].max_output_tokens, Some(12));
+        assert_eq!(requests[0].history.len(), 1);
+        assert!(
+            serde_json::to_string(&requests[0].history[0])
+                .unwrap()
+                .contains("<conversation>")
+        );
+        assert_eq!(
+            runtime.context_usage().accuracy,
+            compaction::ContextAccuracy::Unknown
+        );
 
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[tokio::test]
-    async fn manual_compaction_rejects_context_at_or_below_twenty_percent() {
+    async fn manual_compaction_allows_small_summarizable_history() {
         let workspace = tempfile::tempdir().unwrap();
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let session = crate::session::Session::open_at(
@@ -2316,7 +2497,13 @@ mod tests {
                 .unwrap(),
         );
         let output_directory = output.directory().to_path_buf();
-        let backend = Arc::new(FakeBackend::default());
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("summary")],
+                None,
+            )])),
+            ..FakeBackend::default()
+        });
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
@@ -2328,19 +2515,15 @@ mod tests {
             },
         );
 
-        let error = runtime.compact().await.unwrap_err();
+        runtime.compact().await.unwrap();
 
-        assert_eq!(
-            error.to_string(),
-            "manual compaction requires context usage above 20%"
-        );
-        assert!(backend.requests.lock().await.is_empty());
+        assert_eq!(backend.requests.lock().await.len(), 1);
         assert!(
-            !session
+            session
                 .snapshot()
                 .await
                 .iter()
-                .any(|event| matches!(event.kind, EventKind::Compaction { .. }))
+                .any(|event| matches!(event.kind, EventKind::Compaction { manual: true, .. }))
         );
 
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -2426,10 +2609,14 @@ mod tests {
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("summary")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("answer")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
             ])),
             requests: Mutex::new(Vec::new()),
@@ -2485,14 +2672,20 @@ mod tests {
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("  \n")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("summary")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("answer")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
             ])),
             requests: Mutex::new(Vec::new()),
@@ -2552,6 +2745,95 @@ mod tests {
     }
 
     #[test]
+    fn successful_and_length_stop_overflows_use_provider_usage() {
+        let usage = Usage {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            total_tokens: 100_000,
+            ..Usage::new()
+        };
+        let successful = ModelResponse {
+            content: vec![AssistantContent::text("answer")],
+            usage: Some(usage),
+            context_tokens: Some(100_000),
+            finish_reason: Some(FinishReason::Stop),
+        };
+        assert!(is_successful_context_overflow(&successful, 99_000));
+
+        let truncated = ModelResponse {
+            content: vec![AssistantContent::text("partial")],
+            usage: Some(usage),
+            context_tokens: Some(100_000),
+            finish_reason: Some(FinishReason::Length),
+        };
+        assert!(is_recoverable_length(&truncated, 100_000, 8_192));
+    }
+
+    #[tokio::test]
+    async fn threshold_compaction_runs_after_provider_usage_is_recorded() {
+        let workspace = tempfile::tempdir().unwrap();
+        let usage = Usage {
+            input_tokens: 89_000,
+            output_tokens: 1_000,
+            total_tokens: 90_000,
+            ..Usage::new()
+        };
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("answer")],
+                    usage: Some(usage),
+                    context_tokens: Some(90_000),
+                    finish_reason: Some(FinishReason::Stop),
+                }),
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::text("summary")],
+                    usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
+                }),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let limits = ModelLimits {
+            context_window: 100_000,
+            ..ModelLimits::default()
+        };
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), limits).await;
+        for message in [
+            Message::user("x".repeat(100_000)),
+            Message::assistant("old answer"),
+        ] {
+            session
+                .append(EventKind::ModelMessage { message })
+                .await
+                .unwrap();
+        }
+
+        runtime.run_turn("new task".to_string()).await.unwrap();
+
+        let requests = backend.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools);
+        assert!(!requests[1].tools);
+        drop(requests);
+        assert!(
+            session
+                .snapshot()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::Compaction { .. }))
+        );
+        assert_eq!(
+            runtime.context_usage().accuracy,
+            compaction::ContextAccuracy::Unknown
+        );
+
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[test]
     fn retry_budgets_are_distinct_and_permanent_errors_are_not_retried() {
         for (kind, expected) in [
             (ModelFailureKind::RateLimit, 6),
@@ -2608,6 +2890,8 @@ mod tests {
         responses.push_back(Ok(ModelResponse {
             content: vec![AssistantContent::text("recovered")],
             usage: None,
+            context_tokens: None,
+            finish_reason: Some(FinishReason::Stop),
         }));
         let backend = Arc::new(ScriptedBackend {
             responses: Mutex::new(responses),
@@ -2690,6 +2974,8 @@ mod tests {
         responses.push_back(Ok(ModelResponse {
             content: vec![AssistantContent::text("recovered")],
             usage: None,
+            context_tokens: None,
+            finish_reason: Some(FinishReason::Stop),
         }));
         let backend = Arc::new(ScriptedBackend {
             responses: Mutex::new(responses),
@@ -2803,10 +3089,14 @@ mod tests {
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("summary of old work")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("answer after retry")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
             ])),
             requests: Mutex::new(Vec::new()),
@@ -2871,6 +3161,8 @@ mod tests {
                 Ok(ModelResponse {
                     content: vec![AssistantContent::text("summary")],
                     usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::Stop),
                 }),
                 Err(anyhow!("prompt is too long")),
             ])),

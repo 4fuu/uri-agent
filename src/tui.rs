@@ -5,6 +5,7 @@ mod model_selector;
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
 use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
 use crate::clipboard;
+use crate::compaction::ContextAccuracy;
 use crate::config::{
     ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, display_path,
     validate_environment_name,
@@ -88,6 +89,8 @@ pub struct TuiInfo {
     pub model_ready: bool,
     pub provider_count: usize,
     pub context_tokens: usize,
+    pub context_accuracy: ContextAccuracy,
+    pub compaction_enabled: bool,
     pub terminal: Option<String>,
 }
 
@@ -848,6 +851,7 @@ impl App {
                 cache_read,
                 cache_write,
                 cost,
+                ..
             } => {
                 self.usage.input += input;
                 self.usage.output += output;
@@ -881,9 +885,7 @@ impl App {
                 self.push(
                     BlockKind::Compaction,
                     "COMPACTION",
-                    format!(
-                        "Estimated context before compaction: {tokens_before} tokens\n\n{summary}"
-                    ),
+                    format!("Context before compaction: {tokens_before} tokens\n\n{summary}"),
                     None,
                     false,
                     false,
@@ -2238,7 +2240,9 @@ async fn run_loop(
     animation.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
     loop {
-        app.info.context_tokens = services.runtime.estimated_context();
+        let context = services.runtime.context_usage();
+        app.info.context_tokens = context.tokens;
+        app.info.context_accuracy = context.accuracy;
         terminal.draw(|frame| render(frame, app))?;
         tokio::select! {
             _ = animation.tick(), if !app.animations_paused() => {
@@ -5061,6 +5065,8 @@ async fn apply_active(
         .update_model_settings(&active.provider, &active.model, active.thinking)
         .await?;
     runtime.set_backend(backend, limits).await;
+    runtime.set_compaction_settings(active.compaction).await;
+    runtime.refresh_context_estimate().await;
     output.set_limit(active.output_limit);
     app.info.provider.clone_from(&active.provider);
     app.info.model.clone_from(&active.model);
@@ -5069,6 +5075,7 @@ async fn apply_active(
     app.info.context_window = context_window;
     app.info.model_ready = model_ready;
     app.info.provider_count = catalog.providers().await.len();
+    app.info.compaction_enabled = active.compaction.enabled;
     app.info.terminal.clone_from(&active.terminal);
     Ok(())
 }
@@ -5471,10 +5478,19 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity
     }
     let percent = context_percent(app);
     let available = area.width as usize;
+    let usage = match app.info.context_accuracy {
+        ContextAccuracy::Api => format!("{percent:.1}%"),
+        ContextAccuracy::Hybrid | ContextAccuracy::Estimated => format!("≈{percent:.1}%"),
+        ContextAccuracy::Unknown => "?".to_string(),
+    };
+    let progress = if app.info.context_accuracy == ContextAccuracy::Unknown {
+        animation::progress(app.frame, 8, 0.0)
+    } else {
+        animation::progress(app.frame, 8, percent / 100.0)
+    };
     let context = single_line_preview(
         &format!(
-            "{} {percent:.1}%/{}",
-            animation::progress(app.frame, 8, percent / 100.0),
+            "{progress} {usage}/{}",
             format_tokens(app.info.context_window as u64),
         ),
         available,
@@ -5638,6 +5654,30 @@ fn context_percent(app: &App) -> f64 {
         app.info.context_tokens as f64 / app.info.context_window as f64 * 100.0
     } else {
         0.0
+    }
+}
+
+fn context_status(app: &App, percent: f64) -> String {
+    let compaction = if app.info.compaction_enabled {
+        "automatic compaction"
+    } else {
+        "automatic compaction disabled"
+    };
+    match app.info.context_accuracy {
+        ContextAccuracy::Api => format!(
+            "{} / {} · {percent:.1}% · {compaction}",
+            format_tokens(app.info.context_tokens as u64),
+            format_tokens(app.info.context_window as u64),
+        ),
+        ContextAccuracy::Hybrid | ContextAccuracy::Estimated => format!(
+            "≈{} / {} · ≈{percent:.1}% · {compaction}",
+            format_tokens(app.info.context_tokens as u64),
+            format_tokens(app.info.context_window as u64),
+        ),
+        ContextAccuracy::Unknown => format!(
+            "unknown / {} · {compaction}",
+            format_tokens(app.info.context_window as u64),
+        ),
     }
 }
 
@@ -6619,11 +6659,7 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<
         status_row("STATE", state, Style::default().fg(ACCENT)),
         status_row(
             "CONTEXT",
-            format!(
-                "{} / {} · {percent:.1}% · automatic compaction",
-                format_tokens(app.info.context_tokens as u64),
-                format_tokens(app.info.context_window as u64),
-            ),
+            context_status(app, percent),
             Style::default()
                 .fg(context_color(percent))
                 .add_modifier(Modifier::BOLD),
@@ -7813,6 +7849,8 @@ mod tests {
                 model_ready: true,
                 provider_count: 1,
                 context_tokens: 0,
+                context_accuracy: ContextAccuracy::Api,
+                compaction_enabled: true,
                 terminal: None,
             },
             Keymap::with_defaults().unwrap(),
@@ -8637,6 +8675,10 @@ mod tests {
                 cache_read: 500,
                 cache_write: 0,
                 cost: 0.0123,
+                total: 2_600,
+                context: true,
+                provider: "test".to_string(),
+                model: "model".to_string(),
             },
         });
         let rendered = render_to_string(&mut app, 100, 24);
@@ -8659,6 +8701,19 @@ mod tests {
         assert!(rendered.contains("$0.0123"));
         // Usage events remain available in status without adding transcript blocks.
         assert_eq!(app.blocks.len(), 1);
+    }
+
+    #[test]
+    fn context_status_distinguishes_api_estimates_and_unknown_usage() {
+        let mut app = test_app();
+        app.info.context_tokens = 12_800;
+
+        app.info.context_accuracy = ContextAccuracy::Api;
+        assert!(context_status(&app, 10.0).starts_with("12k /"));
+        app.info.context_accuracy = ContextAccuracy::Estimated;
+        assert!(context_status(&app, 10.0).starts_with("≈12k /"));
+        app.info.context_accuracy = ContextAccuracy::Unknown;
+        assert!(context_status(&app, 10.0).starts_with("unknown /"));
     }
 
     #[test]
@@ -10924,6 +10979,7 @@ mod tests {
             auth_kind: AuthKind::None,
             output_limit: 32 * 1024,
             thinking: ThinkingLevel::High,
+            compaction: crate::compaction::Settings::default(),
             provider_source: ValueSource::Global,
             model_source: ValueSource::Global,
             api_key_source: ValueSource::Default,
@@ -11201,6 +11257,7 @@ mod tests {
             auth_kind: AuthKind::ApiKey,
             output_limit: 32 * 1024,
             thinking: ThinkingLevel::Off,
+            compaction: crate::compaction::Settings::default(),
             provider_source: ValueSource::Global,
             model_source: ValueSource::Global,
             api_key_source: ValueSource::Global,

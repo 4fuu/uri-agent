@@ -337,6 +337,18 @@ pub enum EventKind {
         cache_read: u64,
         cache_write: u64,
         cost: f64,
+        /// Provider-reported total tokens for the completed request, before
+        /// any API-specific normalization used for price accounting.
+        #[serde(default)]
+        total: u64,
+        /// Whether this usage belongs to a successful ordinary assistant
+        /// message and is therefore valid as a context-meter baseline.
+        #[serde(default = "default_true")]
+        context: bool,
+        #[serde(default)]
+        provider: String,
+        #[serde(default)]
+        model: String,
     },
     Error {
         text: String,
@@ -354,6 +366,17 @@ struct State {
     events: Vec<SessionEvent>,
     persisted: bool,
     model_settings: SessionModelSettings,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelContext {
+    pub history: Vec<Message>,
+    pub latest_api_usage: Option<(usize, usize)>,
+    pub after_compaction: bool,
 }
 
 #[derive(Clone)]
@@ -698,6 +721,10 @@ impl Session {
     }
 
     pub async fn model_history(&self) -> Vec<Message> {
+        self.model_context("", "").await.history
+    }
+
+    pub(crate) async fn model_context(&self, provider: &str, model: &str) -> ModelContext {
         let state = self.state.lock().await;
         let latest_compaction = state
             .events
@@ -712,17 +739,58 @@ impl Session {
                 _ => None,
             })
             .unwrap_or_default();
-        history.extend(
-            state
-                .events
-                .iter()
-                .skip(latest_compaction.map_or(0, |index| index + 1))
-                .filter_map(|event| match &event.kind {
-                    EventKind::ModelMessage { message } => Some(message.clone()),
-                    _ => None,
-                }),
-        );
-        history
+        let mut latest_api_usage = None;
+        let mut pending_usage = None;
+        for event in state
+            .events
+            .iter()
+            .skip(latest_compaction.map_or(0, |index| index + 1))
+        {
+            match &event.kind {
+                EventKind::Usage {
+                    total,
+                    context,
+                    provider: usage_provider,
+                    model: usage_model,
+                    ..
+                } => {
+                    pending_usage = (*context
+                        && *total > 0
+                        && (provider.is_empty()
+                            || usage_provider.is_empty()
+                            || usage_provider == provider)
+                        && (model.is_empty() || usage_model.is_empty() || usage_model == model))
+                        .then_some(*total as usize);
+                }
+                EventKind::ModelMessage { message } => {
+                    history.push(message.clone());
+                    if matches!(message, Message::Assistant { .. })
+                        && let Some(tokens) = pending_usage.take()
+                    {
+                        latest_api_usage = Some((history.len() - 1, tokens));
+                    }
+                }
+                _ => {}
+            }
+        }
+        ModelContext {
+            history,
+            latest_api_usage,
+            after_compaction: latest_compaction.is_some(),
+        }
+    }
+
+    pub async fn latest_compaction_summary(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::Compaction { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
     }
 
     pub async fn append_compaction(
@@ -1295,6 +1363,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_usage_baseline_is_restored_with_its_assistant_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first = session(&path, Some("usage-baseline")).await;
+        first
+            .append_batch(vec![
+                EventKind::User {
+                    text: "question".to_string(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("question"),
+                },
+                EventKind::Usage {
+                    input: 1_000,
+                    output: 200,
+                    cache_read: 34,
+                    cache_write: 0,
+                    cost: 0.0,
+                    total: 1_234,
+                    context: true,
+                    provider: "test".to_string(),
+                    model: "model".to_string(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("answer"),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("follow-up"),
+                },
+            ])
+            .await
+            .unwrap();
+        drop(first);
+
+        let reopened = session(&path, Some("usage-baseline")).await;
+        let context = reopened.model_context("test", "model").await;
+        assert_eq!(context.history.len(), 3);
+        assert_eq!(context.latest_api_usage, Some((1, 1_234)));
+        assert!(!context.after_compaction);
+    }
+
+    #[tokio::test]
     async fn session_context_is_frozen_on_creation_and_reused_on_resume() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
@@ -1418,6 +1528,9 @@ mod tests {
         drop(compacted);
         let reopened = session(&path, Some("compacted")).await;
         assert_eq!(reopened.model_history().await.len(), 2);
+        let context = reopened.model_context("test", "model").await;
+        assert!(context.latest_api_usage.is_none());
+        assert!(context.after_compaction);
     }
 
     #[tokio::test]

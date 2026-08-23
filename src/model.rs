@@ -1,5 +1,4 @@
 use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits, ThinkingLevel};
-use crate::compaction;
 use crate::config::{ActiveSettings, AuthKind, resolve_config_value};
 use crate::prompts;
 use anyhow::{Context, Result, bail};
@@ -8,7 +7,9 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use rig::client::CompletionClient;
-use rig::completion::{CompletionError, CompletionModel as RigCompletionModel, ToolDefinition};
+use rig::completion::{
+    CompletionError, CompletionModel as RigCompletionModel, FinishReason, ToolDefinition,
+};
 use rig::http_client::HttpClientExt;
 use rig::message::{AssistantContent, Message};
 use rig::providers::{anthropic, gemini, openai};
@@ -32,11 +33,15 @@ pub struct ModelRequest {
     pub system: String,
     pub history: Vec<Message>,
     pub tools: bool,
+    pub estimated_context: usize,
+    pub max_output_tokens: Option<usize>,
 }
 
 pub struct ModelResponse {
     pub content: Vec<AssistantContent>,
     pub usage: Option<rig::completion::Usage>,
+    pub context_tokens: Option<usize>,
+    pub finish_reason: Option<FinishReason>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -409,6 +414,10 @@ pub trait ModelBackend: Send + Sync {
 
     fn accepts_image_input(&self) -> bool {
         false
+    }
+
+    fn desired_max_output_tokens(&self) -> usize {
+        0
     }
 }
 
@@ -1514,8 +1523,12 @@ impl ModelBackend for RigBackend {
         request: ModelRequest,
         deltas: mpsc::UnboundedSender<ModelDelta>,
     ) -> Result<ModelResponse> {
-        let estimated = compaction::estimate_tokens(&request.system, &request.history);
-        let max_tokens = clamp_max_tokens_to_context(&self.limits, estimated);
+        let max_tokens = clamp_max_tokens_to_context(&self.limits, request.estimated_context).min(
+            request
+                .max_output_tokens
+                .and_then(|tokens| u64::try_from(tokens).ok())
+                .unwrap_or(u64::MAX),
+        );
         let mut response = match &self.client {
             RigClient::OpenAiResponses(model) => {
                 complete_with(model, request, max_tokens, deltas).await
@@ -1532,6 +1545,10 @@ impl ModelBackend for RigBackend {
             RigClient::Anthropic(_) => "anthropic-messages",
             RigClient::Gemini(_) => "google-generative-ai",
         };
+        response.context_tokens = response
+            .usage
+            .as_ref()
+            .and_then(|usage| (usage.total_tokens > 0).then_some(usage.total_tokens as usize));
         if let Some(usage) = &mut response.usage {
             normalize_usage_for_api(api, usage);
         }
@@ -1540,6 +1557,10 @@ impl ModelBackend for RigBackend {
 
     fn accepts_image_input(&self) -> bool {
         self.accepts_images
+    }
+
+    fn desired_max_output_tokens(&self) -> usize {
+        self.limits.max_tokens as usize
     }
 }
 
@@ -1616,6 +1637,11 @@ where
     Ok(ModelResponse {
         content: stream.choice.clone(),
         usage: stream.response.as_ref().map(|final_| final_.usage),
+        context_tokens: None,
+        finish_reason: stream
+            .response
+            .as_ref()
+            .and_then(|final_| final_.finish_reason.clone()),
     })
 }
 

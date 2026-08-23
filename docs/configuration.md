@@ -133,6 +133,9 @@ The dedicated linked Rust and WASM host interface requires an explicitly request
 | `defaultThinkingLevel` | Fallback reasoning effort | `off` |
 | `modelThinkingLevels` | Per-model effort keyed by `provider/model` | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
+| `compaction.enabled` | Run threshold and overflow compaction automatically | `true` |
+| `compaction.reserveTokens` | Context held back by the automatic-compaction threshold | `16384` |
+| `compaction.keepRecentTokens` | Approximate recent replay retained after compaction | `20000` |
 
 Settings are resolved from lowest to highest priority:
 
@@ -155,6 +158,18 @@ Relevant environment variables are:
 | `URI_AGENT_TERMINAL` | Embedded terminal command |
 
 When the project settings file already exists, changes made through model selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
+
+Compaction fields merge individually across global and project settings. Token values must be greater than zero. For models with small context windows, the effective reserve and recent-history budgets are each capped at one quarter of the model context window. Disabling automatic compaction also disables automatic provider-overflow recovery; `:compact` remains available.
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  }
+}
+```
 
 ## Thinking effort
 

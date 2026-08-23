@@ -1,4 +1,5 @@
 use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel, api_key_environment};
+use crate::compaction;
 use crate::oauth::{self, OauthToken};
 use crate::session::SessionChoice;
 use anyhow::{Context, Result, anyhow, bail};
@@ -176,6 +177,7 @@ pub struct ActiveSettings {
     pub output_limit: usize,
     pub thinking: ThinkingLevel,
     pub terminal: Option<String>,
+    pub compaction: compaction::Settings,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
     pub api_key_source: ValueSource,
@@ -222,6 +224,21 @@ struct SettingsFile {
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction: Option<CompactionFile>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CompactionFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reserve_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_recent_tokens: Option<usize>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -740,6 +757,8 @@ async fn calculate_active(
     }
     let terminal = (!terminal.trim().is_empty()).then_some(terminal.trim().to_string());
 
+    let compaction = compaction_settings(&files.global, &files.project)?;
+
     let configured_entry = files.auth.0.get(&provider);
     let credential_environment = configured_entry
         .map(|entry| entry.env.clone())
@@ -800,6 +819,7 @@ async fn calculate_active(
         output_limit,
         thinking,
         terminal,
+        compaction,
         provider_source,
         model_source,
         api_key_source,
@@ -876,6 +896,32 @@ fn setting<T: Clone>(default: T, global: Option<T>, project: Option<T>) -> (T, V
     } else {
         (default, ValueSource::Default)
     }
+}
+
+fn compaction_settings(
+    global: &SettingsFile,
+    project: &SettingsFile,
+) -> Result<compaction::Settings> {
+    let global = global.compaction.as_ref();
+    let project = project.compaction.as_ref();
+    let settings = compaction::Settings {
+        enabled: project
+            .and_then(|settings| settings.enabled)
+            .or_else(|| global.and_then(|settings| settings.enabled))
+            .unwrap_or(true),
+        reserve_tokens: project
+            .and_then(|settings| settings.reserve_tokens)
+            .or_else(|| global.and_then(|settings| settings.reserve_tokens))
+            .unwrap_or(compaction::DEFAULT_RESERVE_TOKENS),
+        keep_recent_tokens: project
+            .and_then(|settings| settings.keep_recent_tokens)
+            .or_else(|| global.and_then(|settings| settings.keep_recent_tokens))
+            .unwrap_or(compaction::DEFAULT_KEEP_RECENT_TOKENS),
+    };
+    if settings.reserve_tokens == 0 || settings.keep_recent_tokens == 0 {
+        bail!("compaction reserveTokens and keepRecentTokens must be greater than zero");
+    }
+    Ok(settings)
 }
 
 fn model_setting_key(provider: &str, model: &str) -> String {
@@ -1313,6 +1359,7 @@ mod tests {
             output_limit: DEFAULT_OUTPUT_LIMIT,
             thinking: ThinkingLevel::Off,
             terminal: None,
+            compaction: compaction::Settings::default(),
             provider_source,
             model_source,
             api_key_source: ValueSource::Default,
@@ -1334,6 +1381,39 @@ mod tests {
         assert_eq!(
             serde_json::to_value(settings).unwrap()["terminal"],
             "pwsh -NoLogo"
+        );
+    }
+
+    #[test]
+    fn compaction_settings_merge_nested_global_and_project_fields() {
+        let global: SettingsFile = serde_json::from_value(serde_json::json!({
+            "compaction": {
+                "enabled": false,
+                "reserveTokens": 12_000,
+                "keepRecentTokens": 18_000
+            }
+        }))
+        .unwrap();
+        let project: SettingsFile = serde_json::from_value(serde_json::json!({
+            "compaction": {
+                "enabled": true,
+                "keepRecentTokens": 9_000
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            compaction_settings(&global, &project).unwrap(),
+            compaction::Settings {
+                enabled: true,
+                reserve_tokens: 12_000,
+                keep_recent_tokens: 9_000,
+            }
+        );
+        assert!(
+            compaction_settings(&SettingsFile::default(), &SettingsFile::default())
+                .unwrap()
+                .enabled
         );
     }
 
