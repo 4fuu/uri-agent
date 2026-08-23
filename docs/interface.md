@@ -65,7 +65,7 @@ Core commands are registered through `CommandRegistry`:
 | `:help` | Show the active commands and keymap |
 | `:quit` or `:q` | Exit URI Agent |
 
-`:login` includes model providers plus the Parallel and Exa web-search providers. Selecting Parallel or Exa opens a masked API-key prompt with that provider's key-management URL. Saved search credentials take effect immediately in the built-in `https` protocol and appear in `:logout` like other stored credentials.
+`:login` includes model providers plus the Parallel and Exa web providers. Selecting Parallel or Exa opens a masked API-key prompt with that provider's key-management URL. Saved credentials take effect immediately for search and page extraction in the built-in `https` protocol and appear in `:logout` like other stored credentials.
 
 Conversation search includes user, assistant, reasoning, tool, notice, compaction, and error text currently loaded in the transcript. Type to filter the results, use the arrow keys to choose one and press `Enter`, or click a result to return to that block. It is unavailable before the conversation has any text and while the `:resume` session selector is open.
 

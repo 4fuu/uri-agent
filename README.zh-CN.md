@@ -17,7 +17,7 @@ URI Agent 目前是从源码安装的 pre-1.0 项目。模型请求及其所需�
 
 - **稳定的工具面：**增加能力不会增加新的模型工具 schema。
 - **渐进式上下文：**只有模型读取协议或 Skill 帮助时，相应说明才进入上下文。
-- **内置网络能力：**把 HTTPS 网页读取为 Markdown，并通过已登录的 Parallel 或 Exa 服务进行搜索。
+- **内置网络能力：**通过已登录的 Parallel 或 Exa 服务搜索和提取 HTTPS 网页；两者均未配置时在本地转换网页。
 - **可观察的执行过程：**异步工作的状态和最终输出都通过协议的读取路由提供。
 - **便携的可信扩展：**Extism WASM 模块可以添加支持热重载的协议，而不改变模型工具面。
 - **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
@@ -82,7 +82,7 @@ exec("bash://?wait=30", "cargo test")  # Unix-like 系统
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。内置 `https` 协议无需登录即可读取 HTTPS 网页；通过 `:login` 保存 Parallel 或 Exa API key 后即可搜索。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
+URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。通过 `:login` 保存 Parallel 或 Exa API key 后，内置 `https` 协议会使用该服务商进行搜索和网页提取。两个网络服务商均未登录时，搜索会请求登录，网页读取则回退到本地 HTTPS 获取和 HTML-to-Markdown 转换。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
 
 ## 扩展
 

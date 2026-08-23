@@ -414,7 +414,7 @@ impl ConfigManager {
 
     /// Resolve a provider API key outside the active model selection.
     ///
-    /// This is used by provider-backed protocols such as web search. The
+    /// This is used by provider-backed protocols such as web access. The
     /// provider-specific process environment variable takes precedence over a
     /// key saved in `auth.json`, matching active model credential resolution.
     pub async fn provider_api_key(&self, provider: &str) -> Result<Option<String>> {

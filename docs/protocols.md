@@ -87,18 +87,18 @@ read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
 
 ### `https`
 
-The read-only `https` protocol fetches HTTPS resources and turns HTML into
-cleaned Markdown. JSON is pretty-printed, textual resources are returned as
-text, redirects must remain on HTTPS, requests time out after 30 seconds, and
-response bodies are limited to 5 MiB after decompression:
+The read-only `https` protocol searches and extracts pages through Parallel or
+Exa when that provider is logged in. Page reads use the first configured
+provider in stable order (Parallel, then Exa) and try the next configured
+provider after an API failure:
 
 ```text
 read("https://www.rust-lang.org/")
 ```
 
 Its reserved search route accepts the nonempty search query as a string body.
-The URI accepts an optional result limit from 1 through 20 and an optional
-provider (`parallel` or `exa`):
+The URI accepts an optional result limit from 1 through 20, an optional
+provider (`parallel` or `exa`), and provider-specific options:
 
 ```text
 read("https://search?limit=10&provider=parallel", "stable Rust release notes")
@@ -108,10 +108,17 @@ Without `provider`, search tries configured providers in stable order:
 Parallel, then Exa, and falls back after a provider failure. An explicit
 provider is used without fallback. A key saved by selecting either provider in
 `:login`, or supplied through `PARALLEL_API_KEY` or `EXA_API_KEY`, makes that
-provider available. Page reads do not require a search login. `https://help`
-lists the available providers; when neither provider is configured, it directs
-the model to ask the user to run `:login` without requesting a key in the
-conversation.
+provider available for both search and extraction.
+
+`https://help` stays concise and shows common options for the first logged-in
+provider. `https://help/parallel` and `https://help/exa` own each provider's
+supported model-facing search options. When neither provider is configured,
+help directs the model to ask the user to run `:login` without requesting a key
+in the conversation. Page reads then remain available through direct local
+HTTPS fetching: HTML is cleaned and converted to Markdown, JSON is
+pretty-printed, and other textual resources are returned as text. Local reads
+do not execute JavaScript or extract PDFs. Redirects must remain on HTTPS,
+requests time out after 30 seconds, and response bodies are limited to 5 MiB.
 
 ### `replace`
 

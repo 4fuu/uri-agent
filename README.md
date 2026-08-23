@@ -17,7 +17,7 @@ URI Agent is currently a pre-1.0 project installed from source. Model requests a
 
 - **Stable tool surface:** adding a capability does not add another model-facing tool schema.
 - **Progressive context:** protocol and Skill instructions enter the context only when the model reads their help.
-- **Built-in web access:** read HTTPS pages as Markdown and search through a logged-in Parallel or Exa account.
+- **Built-in web access:** search and extract HTTPS pages through a logged-in Parallel or Exa account, with local page conversion when neither is configured.
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
 - **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
@@ -82,7 +82,7 @@ exec("bash://?wait=30", "cargo test")  # Unix-like systems
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. The built-in `https` protocol reads HTTPS pages without a login and searches after `:login` saves a Parallel or Exa API key. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
+URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. After `:login` saves a Parallel or Exa API key, the built-in `https` protocol uses that provider for search and page extraction. Without either web-provider login, search asks for login while page reads fall back to local HTTPS fetching and HTML-to-Markdown conversion. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
 
 ## Extensions
 
