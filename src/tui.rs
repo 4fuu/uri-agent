@@ -65,6 +65,9 @@ const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const EXPANDED_PREVIEW_LINES: usize = 24;
+const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
+const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
+const TAIL_BUTTON_RIGHT_INSET: usize = 2;
 
 pub struct TuiInfo {
     pub cwd: PathBuf,
@@ -4511,22 +4514,22 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity
     if area.height > 1
         && let Some(activity) = live_activity
     {
-        let show_tail_button = transcript_away_from_tail(app) && available > 0;
-        let tail_button = if " ↓ bottom ".width() <= available {
-            " ↓ bottom "
+        let show_tail_button = transcript_before_live_tail(app) && available > 0;
+        let tail_button = if TAIL_BUTTON_LABEL.width() <= available {
+            TAIL_BUTTON_LABEL
         } else {
             "↓"
         };
         let tail_button_width = usize::from(show_tail_button) * tail_button.width();
-        let activity_x = if model_width > 0 { model_width + 2 } else { 0 }
-            .min(available.saturating_sub(tail_button_width));
-        let activity_limit = available
-            .saturating_sub(activity_x + tail_button_width + usize::from(show_tail_button) * 2);
+        let tail_button_inset = usize::from(show_tail_button)
+            * TAIL_BUTTON_RIGHT_INSET.min(available.saturating_sub(tail_button_width));
+        let tail_controls_width = tail_button_width + tail_button_inset;
+        let activity_limit =
+            available.saturating_sub(tail_controls_width + usize::from(show_tail_button) * 2);
         let activity = single_line_preview(activity, activity_limit);
         let activity_width = activity.width();
-        let activity_gap =
-            available.saturating_sub(activity_x + activity_width + tail_button_width);
-        let mut activity_line = vec![Span::raw(" ".repeat(activity_x))];
+        let activity_gap = available.saturating_sub(activity_width + tail_controls_width);
+        let mut activity_line = Vec::new();
         if !activity.is_empty() {
             activity_line.push(Span::styled(activity, Style::default().fg(ACCENT)));
         }
@@ -4534,7 +4537,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity
             activity_line.push(Span::raw(" ".repeat(activity_gap)));
         }
         if show_tail_button {
-            let button_x = area.right().saturating_sub(tail_button_width as u16);
+            let button_x = area
+                .right()
+                .saturating_sub((tail_button_width + tail_button_inset) as u16);
             activity_line.push(Span::styled(
                 tail_button,
                 Style::default()
@@ -4549,6 +4554,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity
                     target: AppHit::TranscriptTail,
                 },
             );
+            if tail_button_inset > 0 {
+                activity_line.push(Span::raw(" ".repeat(tail_button_inset)));
+            }
         }
         lines.push(Line::from(activity_line));
     }
@@ -4564,17 +4572,25 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity
 }
 
 fn render_floating_tail_button(frame: &mut Frame<'_>, app: &mut App, footer_area: Rect) {
-    if !transcript_away_from_tail(app) || footer_area.width == 0 || footer_area.y == 0 {
+    if !transcript_before_live_tail(app) || footer_area.width == 0 || footer_area.y == 0 {
         return;
     }
+    let available = footer_area.width as usize;
+    let label = if FLOATING_TAIL_BUTTON_LABEL.width() <= available {
+        FLOATING_TAIL_BUTTON_LABEL
+    } else {
+        "↓"
+    };
+    let width = label.width();
+    let inset = TAIL_BUTTON_RIGHT_INSET.min(available.saturating_sub(width));
     let area = Rect::new(
-        footer_area.right().saturating_sub(1),
+        footer_area.right().saturating_sub((width + inset) as u16),
         footer_area.y.saturating_sub(1),
-        1,
+        width as u16,
         1,
     );
     frame.render_widget(
-        Paragraph::new("↓").style(
+        Paragraph::new(label).style(
             Style::default()
                 .fg(ACCENT)
                 .bg(ROW_ACTIVE)
@@ -4591,8 +4607,8 @@ fn render_floating_tail_button(frame: &mut Frame<'_>, app: &mut App, footer_area
     );
 }
 
-fn transcript_away_from_tail(app: &App) -> bool {
-    app.transcript_offset != transcript_live_tail(app.transcript_rows, app.transcript_height)
+fn transcript_before_live_tail(app: &App) -> bool {
+    app.transcript_offset < transcript_live_tail(app.transcript_rows, app.transcript_height)
 }
 
 fn footer_activity(app: &App) -> Option<String> {
@@ -9281,10 +9297,10 @@ mod tests {
             activity
                 .chars()
                 .position(|character| !character.is_whitespace()),
-            Some(compact_model(&app).width() + 2)
+            Some(0)
         );
         assert!(activity.contains("thinking"));
-        assert!(activity.ends_with(" ↓ bottom "));
+        assert!(activity.contains(TAIL_BUTTON_LABEL));
         assert!(footer.starts_with("model · effort off"));
         assert!(footer.trim_end().ends_with("········ 0.0%/128k"));
         assert!(!footer.contains("↓ bottom"));
@@ -9294,7 +9310,7 @@ mod tests {
             .find(|region| region.target == AppHit::TranscriptTail)
             .copied()
             .expect("return-to-bottom mouse target");
-        assert_eq!(button.area, Rect::new(70, 10, 10, 1));
+        assert_eq!(button.area, Rect::new(68, 10, 10, 1));
 
         let narrow = render_to_string(&mut app, 12, 12);
         assert!(narrow.lines().nth(10).unwrap().contains("↓ bottom"));
@@ -9303,13 +9319,13 @@ mod tests {
             .iter()
             .find(|region| region.target == AppHit::TranscriptTail)
             .expect("narrow return-to-bottom mouse target");
-        assert_eq!(narrow_button.area, Rect::new(2, 10, 10, 1));
+        assert_eq!(narrow_button.area, Rect::new(0, 10, 10, 1));
 
         app.busy = false;
         app.activity = None;
         let rendered = render_to_string(&mut app, 80, 12);
         let rows = rendered.lines().collect::<Vec<_>>();
-        assert!(rows[10].ends_with('↓'));
+        assert_eq!(rows[10].chars().nth(76), Some('↓'));
         assert!(!rows[11].contains('↓'));
         let floating_button = app
             .hit_regions
@@ -9317,8 +9333,12 @@ mod tests {
             .find(|region| region.target == AppHit::TranscriptTail)
             .copied()
             .expect("floating return-to-bottom mouse target");
-        assert_eq!(floating_button.area, Rect::new(79, 10, 1, 1));
-        assert_eq!(app.selectable.as_ref().unwrap().cells[10][79], " ");
+        assert_eq!(floating_button.area, Rect::new(75, 10, 3, 1));
+        assert!(
+            app.selectable.as_ref().unwrap().cells[10][75..78]
+                .iter()
+                .all(|cell| cell == " ")
+        );
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -9336,6 +9356,31 @@ mod tests {
 
         let rendered = render_to_string(&mut app, 80, 12);
         assert!(rendered.contains("message 29"));
+        assert!(!rendered.contains('↓'));
+        assert!(
+            app.hit_regions
+                .iter()
+                .all(|region| region.target != AppHit::TranscriptTail)
+        );
+
+        app.scroll_transcript(3);
+        assert!(
+            app.transcript_offset
+                > transcript_live_tail(app.transcript_rows, app.transcript_height)
+        );
+        app.busy = true;
+        app.activity = Some(Activity::Thinking);
+        let rendered = render_to_string(&mut app, 80, 12);
+        assert!(!rendered.contains("↓ bottom"));
+        assert!(
+            app.hit_regions
+                .iter()
+                .all(|region| region.target != AppHit::TranscriptTail)
+        );
+
+        app.busy = false;
+        app.activity = None;
+        let rendered = render_to_string(&mut app, 80, 12);
         assert!(!rendered.contains('↓'));
         assert!(
             app.hit_regions
