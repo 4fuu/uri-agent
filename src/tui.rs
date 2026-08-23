@@ -26,10 +26,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::terminal::supports_keyboard_enhancement;
 use futures_util::StreamExt;
 use portable_pty::CommandBuilder;
 use ratatui::buffer::CellWidth;
@@ -1600,18 +1602,34 @@ pub struct TuiServices {
 pub struct TuiTerminal {
     terminal: DefaultTerminal,
     first_session: bool,
+    keyboard_enhancement: bool,
 }
 
 impl TuiTerminal {
     pub fn new() -> Result<Self> {
         let terminal = ratatui::try_init()?;
-        if let Err(error) = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste) {
+        let keyboard_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
+        let setup = if keyboard_enhancement {
+            execute!(
+                stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+                EnableMouseCapture,
+                EnableBracketedPaste
+            )
+        } else {
+            execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)
+        };
+        if let Err(error) = setup {
+            if keyboard_enhancement {
+                let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+            }
             ratatui::restore();
             return Err(error.into());
         }
         Ok(Self {
             terminal,
             first_session: true,
+            keyboard_enhancement,
         })
     }
 
@@ -1685,6 +1703,9 @@ impl TuiTerminal {
 impl Drop for TuiTerminal {
     fn drop(&mut self) {
         let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+        if self.keyboard_enhancement {
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
         ratatui::restore();
     }
 }
