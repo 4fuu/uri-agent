@@ -5,7 +5,10 @@ mod model_selector;
 use self::model_selector::{ModelSelector, context_label, model_label, reasoning};
 use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
 use crate::clipboard;
-use crate::config::{ActiveSettings, AuthKind, ConfigManager, display_path};
+use crate::config::{
+    ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, display_path,
+    validate_environment_name,
+};
 use crate::keymap::{Keymap, canonical_key};
 use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
@@ -269,6 +272,7 @@ struct CommandMatch {
 struct SettingsState {
     active: ActiveSettings,
     model: Option<CatalogModel>,
+    environment_count: usize,
     selected: usize,
     editing: Option<EditingSetting>,
     api_key: String,
@@ -278,11 +282,16 @@ struct SettingsState {
 }
 
 impl SettingsState {
-    async fn load(active: ActiveSettings, catalog: &ModelCatalog) -> Self {
+    async fn load(
+        active: ActiveSettings,
+        catalog: &ModelCatalog,
+        environment: &AgentEnvironment,
+    ) -> Self {
         let model = active.catalog_model(catalog).await;
         Self {
             output_limit: active.output_limit.to_string(),
             thinking: active.thinking,
+            environment_count: environment.names().await.len(),
             active,
             model,
             selected: 0,
@@ -332,6 +341,7 @@ enum SelectorKind {
     Resume,
     Search,
     Effort { provider: String, model: String },
+    Environment { return_to_settings: bool },
 }
 
 struct SelectorState {
@@ -411,8 +421,17 @@ impl SelectorState {
 }
 
 enum TextPurpose {
-    ApiKey { provider: String },
+    ApiKey {
+        provider: String,
+    },
     CopilotDomain,
+    EnvironmentName {
+        return_to_settings: bool,
+    },
+    EnvironmentValue {
+        name: String,
+        return_to_settings: bool,
+    },
     SetTerminal,
 }
 
@@ -1571,6 +1590,7 @@ pub struct TuiServices {
     pub tui: Arc<TuiRegistry>,
     pub tasks: TaskManager,
     pub manager: Arc<ConfigManager>,
+    pub environment: Arc<AgentEnvironment>,
     pub catalog: Arc<ModelCatalog>,
     pub output: Arc<OutputStore>,
     pub info: TuiInfo,
@@ -1603,6 +1623,7 @@ impl TuiTerminal {
             tui,
             tasks,
             manager,
+            environment,
             catalog,
             output,
             mut info,
@@ -1646,6 +1667,7 @@ impl TuiTerminal {
             runtime,
             tasks,
             manager,
+            environment,
             catalog,
             output,
         };
@@ -1671,6 +1693,7 @@ struct LoopServices {
     runtime: Arc<AgentRuntime>,
     tasks: TaskManager,
     manager: Arc<ConfigManager>,
+    environment: Arc<AgentEnvironment>,
     catalog: Arc<ModelCatalog>,
     output: Arc<OutputStore>,
 }
@@ -1825,6 +1848,18 @@ enum Action {
     SelectModel,
     OpenSettings,
     SaveSettings,
+    OpenEnvironment {
+        return_to_settings: bool,
+    },
+    StoreEnvironment {
+        name: String,
+        value: String,
+        return_to_settings: bool,
+    },
+    DeleteEnvironment {
+        name: String,
+        return_to_settings: bool,
+    },
     RefreshCatalog,
     Resume(String),
     NewSession,
@@ -1965,7 +2000,8 @@ async fn apply_action(
         }
         Action::OpenSettings => {
             let active = active_for_runtime(&services.manager, &services.runtime).await?;
-            app.settings = Some(SettingsState::load(active, &services.catalog).await);
+            app.settings =
+                Some(SettingsState::load(active, &services.catalog, &services.environment).await);
             app.overlay = Some(Overlay::Settings);
             Ok(None)
         }
@@ -1976,8 +2012,28 @@ async fn apply_action(
                 &services.manager,
                 &services.catalog,
                 &services.output,
+                &services.environment,
             )
             .await;
+            Ok(None)
+        }
+        Action::OpenEnvironment { return_to_settings } => {
+            open_environment(app, &services.environment, return_to_settings).await;
+            Ok(None)
+        }
+        Action::StoreEnvironment {
+            name,
+            value,
+            return_to_settings,
+        } => {
+            store_environment(app, &services.environment, name, value, return_to_settings).await;
+            Ok(None)
+        }
+        Action::DeleteEnvironment {
+            name,
+            return_to_settings,
+        } => {
+            delete_environment(app, &services.environment, &name, return_to_settings).await;
             Ok(None)
         }
         Action::RefreshCatalog => {
@@ -2130,6 +2186,10 @@ async fn dispatch_ui_command(
             Action::Continue
         }
         CoreCommand::Quit => Action::Quit,
+        CoreCommand::SetEnvironment => {
+            open_environment_name_prompt(app, false);
+            Action::Continue
+        }
         CoreCommand::SetTerminal => {
             open_set_terminal_prompt(app);
             Action::Continue
@@ -2620,6 +2680,37 @@ async fn handle_selector_key(
     key_name: &str,
     services: &LoopServices,
 ) -> Action {
+    let environment_return = app.selector.as_ref().and_then(|selector| {
+        if let SelectorKind::Environment { return_to_settings } = &selector.kind {
+            Some(*return_to_settings)
+        } else {
+            None
+        }
+    });
+    if let Some(return_to_settings) = environment_return {
+        match app
+            .keymap
+            .action_chain(&["environment", "selector"], key_name)
+            .as_deref()
+        {
+            Some("add") => {
+                app.selector = None;
+                open_environment_name_prompt(app, return_to_settings);
+                return Action::Continue;
+            }
+            Some("remove") => {
+                return app
+                    .selector
+                    .as_ref()
+                    .and_then(SelectorState::selected_item)
+                    .map_or(Action::Continue, |item| Action::DeleteEnvironment {
+                        name: item.id.clone(),
+                        return_to_settings,
+                    });
+            }
+            _ => {}
+        }
+    }
     match apply_selector_key(app, key, key_name) {
         SelectorKey::Quit => Action::Quit,
         SelectorKey::Confirm => confirm_selector(app, services).await,
@@ -2635,8 +2726,14 @@ fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -> SelectorK
     match app.keymap.action("selector", key_name).as_deref() {
         Some("quit") => SelectorKey::Quit,
         Some("close") => {
+            let return_to_settings = matches!(
+                &selector.kind,
+                SelectorKind::Environment {
+                    return_to_settings: true
+                }
+            );
             app.selector = None;
-            app.overlay = None;
+            app.overlay = return_to_settings.then_some(Overlay::Settings);
             SelectorKey::Continue
         }
         Some("previous") => {
@@ -2673,8 +2770,13 @@ async fn confirm_selector(app: &mut App, services: &LoopServices) -> Action {
         return Action::Continue;
     };
     let Some(item) = selector.selected_item().cloned() else {
-        app.overlay = None;
         app.set_flash("Nothing is selected");
+        if matches!(&selector.kind, SelectorKind::Environment { .. }) {
+            app.selector = Some(selector);
+            app.overlay = Some(Overlay::Selector);
+        } else {
+            app.overlay = None;
+        }
         return Action::Continue;
     };
     app.overlay = None;
@@ -2716,6 +2818,10 @@ async fn confirm_selector(app: &mut App, services: &LoopServices) -> Action {
             set_effort(app, services, &provider, &model, thinking).await;
             Action::Continue
         }
+        SelectorKind::Environment { return_to_settings } => {
+            open_environment_value_prompt(app, item.id, return_to_settings);
+            Action::Continue
+        }
     }
 }
 
@@ -2727,9 +2833,25 @@ fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
     match app.keymap.action("text", key_name).as_deref() {
         Some("quit") => Action::Quit,
         Some("cancel") => {
-            app.text_prompt = None;
+            let return_to_environment = app.text_prompt.take().is_some_and(|prompt| {
+                matches!(
+                    prompt.purpose,
+                    TextPurpose::EnvironmentName {
+                        return_to_settings: true
+                    } | TextPurpose::EnvironmentValue {
+                        return_to_settings: true,
+                        ..
+                    }
+                )
+            });
             app.overlay = None;
-            Action::Continue
+            if return_to_environment {
+                Action::OpenEnvironment {
+                    return_to_settings: true,
+                }
+            } else {
+                Action::Continue
+            }
         }
         Some("backspace") => {
             prompt.value.pop();
@@ -2747,6 +2869,24 @@ fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
                     provider: "github-copilot".to_string(),
                     method: "oauth".to_string(),
                     extra: std::collections::BTreeMap::from([("domain".to_string(), prompt.value)]),
+                },
+                TextPurpose::EnvironmentName { return_to_settings } => {
+                    let name = prompt.value.trim().to_string();
+                    if let Err(error) = validate_environment_name(&name) {
+                        open_environment_name_prompt(app, return_to_settings);
+                        app.set_flash(format!("Invalid environment variable name: {error}"));
+                    } else {
+                        open_environment_value_prompt(app, name, return_to_settings);
+                    }
+                    Action::Continue
+                }
+                TextPurpose::EnvironmentValue {
+                    name,
+                    return_to_settings,
+                } => Action::StoreEnvironment {
+                    name,
+                    value: prompt.value,
+                    return_to_settings,
                 },
                 TextPurpose::SetTerminal => Action::SaveTerminal(prompt.value),
             }
@@ -2837,11 +2977,11 @@ fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
             Action::Continue
         }
         Some("previous") => {
-            settings.selected = wrapped_index(settings.selected, -1, 4);
+            settings.selected = wrapped_index(settings.selected, -1, 5);
             Action::Continue
         }
         Some("next") => {
-            settings.selected = wrapped_index(settings.selected, 1, 4);
+            settings.selected = wrapped_index(settings.selected, 1, 5);
             Action::Continue
         }
         Some("edit") => match settings.selected {
@@ -2856,6 +2996,9 @@ fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
                 settings.output_limit.clear();
                 Action::Continue
             }
+            4 => Action::OpenEnvironment {
+                return_to_settings: true,
+            },
             _ => Action::Continue,
         },
         Some("save") => Action::SaveSettings,
@@ -2913,7 +3056,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = wrapped_index(settings.selected, -1, 4);
+                    settings.selected = wrapped_index(settings.selected, -1, 5);
                 }
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
@@ -2944,7 +3087,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
             }
             Some(Overlay::Settings) => {
                 if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = wrapped_index(settings.selected, 1, 4);
+                    settings.selected = wrapped_index(settings.selected, 1, 5);
                 }
             }
             Some(Overlay::Composer | Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
@@ -2994,6 +3137,11 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
                                 3 => {
                                     settings.editing = Some(EditingSetting::OutputLimit);
                                     settings.output_limit.clear();
+                                }
+                                4 => {
+                                    return Action::OpenEnvironment {
+                                        return_to_settings: true,
+                                    };
                                 }
                                 _ => {}
                             }
@@ -3192,8 +3340,14 @@ fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
             app.overlay = None;
         }
         Some(Overlay::Selector) => {
+            let return_to_settings = matches!(
+                app.selector.as_ref().map(|selector| &selector.kind),
+                Some(SelectorKind::Environment {
+                    return_to_settings: true
+                })
+            );
             app.selector = None;
-            app.overlay = None;
+            app.overlay = return_to_settings.then_some(Overlay::Settings);
         }
         Some(Overlay::Settings | Overlay::Text | Overlay::Oauth | Overlay::Terminal) | None => {
             return false;
@@ -3330,6 +3484,98 @@ fn open_copilot_domain_prompt(app: &mut App) {
         value: String::new(),
         secret: false,
         purpose: TextPurpose::CopilotDomain,
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+async fn open_environment(app: &mut App, environment: &AgentEnvironment, return_to_settings: bool) {
+    let items = environment
+        .names()
+        .await
+        .into_iter()
+        .map(|name| SelectorItem {
+            id: name.clone(),
+            title: name,
+            description: "configured · Enter replaces value".to_string(),
+            search_text: None,
+        })
+        .collect();
+    app.selector = Some(SelectorState::new(
+        SelectorKind::Environment { return_to_settings },
+        "AGENT ENVIRONMENT · Ctrl+N add · Delete remove",
+        items,
+    ));
+    app.overlay = Some(Overlay::Selector);
+}
+
+async fn store_environment(
+    app: &mut App,
+    environment: &AgentEnvironment,
+    name: String,
+    value: String,
+    return_to_settings: bool,
+) {
+    match environment.set(&name, value).await {
+        Ok(()) => {
+            if let Some(settings) = app.settings.as_mut() {
+                settings.environment_count = environment.names().await.len();
+            }
+            app.set_flash(format!("Agent environment variable {name} saved"));
+            if return_to_settings {
+                open_environment(app, environment, true).await;
+            } else {
+                app.selector = None;
+                app.overlay = None;
+            }
+        }
+        Err(error) => {
+            app.set_flash(format!("Could not save {name}: {error:#}"));
+            open_environment_value_prompt(app, name, return_to_settings);
+        }
+    }
+}
+
+async fn delete_environment(
+    app: &mut App,
+    environment: &AgentEnvironment,
+    name: &str,
+    return_to_settings: bool,
+) {
+    match environment.remove(name).await {
+        Ok(true) => app.set_flash(format!("Agent environment variable {name} removed")),
+        Ok(false) => app.set_flash(format!(
+            "Agent environment variable {name} was not configured"
+        )),
+        Err(error) => app.set_flash(format!("Could not remove {name}: {error:#}")),
+    }
+    if let Some(settings) = app.settings.as_mut() {
+        settings.environment_count = environment.names().await.len();
+    }
+    open_environment(app, environment, return_to_settings).await;
+}
+
+fn open_environment_name_prompt(app: &mut App, return_to_settings: bool) {
+    app.text_prompt = Some(TextPrompt {
+        title: "ADD AGENT ENVIRONMENT".to_string(),
+        message: "Variable name, for example NPM_TOKEN".to_string(),
+        value: String::new(),
+        secret: false,
+        purpose: TextPurpose::EnvironmentName { return_to_settings },
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+fn open_environment_value_prompt(app: &mut App, name: String, return_to_settings: bool) {
+    app.text_prompt = Some(TextPrompt {
+        title: format!("SET {name}"),
+        message: "Value is stored privately and injected into future Agent shell commands."
+            .to_string(),
+        value: String::new(),
+        secret: true,
+        purpose: TextPurpose::EnvironmentValue {
+            name,
+            return_to_settings,
+        },
     });
     app.overlay = Some(Overlay::Text);
 }
@@ -3896,6 +4142,7 @@ async fn save_settings(
     manager: &ConfigManager,
     catalog: &ModelCatalog,
     output: &OutputStore,
+    environment: &AgentEnvironment,
 ) {
     let Some(settings) = app.settings.as_ref() else {
         return;
@@ -3937,7 +4184,7 @@ async fn save_settings(
             active_for_runtime(manager, runtime).await?
         };
         apply_active(app, runtime, catalog, output, &active).await?;
-        app.settings = Some(SettingsState::load(active, catalog).await);
+        app.settings = Some(SettingsState::load(active, catalog, environment).await);
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -4003,8 +4250,14 @@ async fn finish_background(app: &mut App, services: &LoopServices, event: Backgr
                 )
                 .await?;
                 if app.settings.is_some() {
-                    app.settings =
-                        Some(SettingsState::load(active.clone(), &services.catalog).await);
+                    app.settings = Some(
+                        SettingsState::load(
+                            active.clone(),
+                            &services.catalog,
+                            &services.environment,
+                        )
+                        .await,
+                    );
                 }
                 if let Some(query) = app
                     .model_selector
@@ -6101,7 +6354,20 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
         ("Credential", credential),
         ("Thinking", settings.thinking.to_string()),
         ("Output limit", output_limit),
+        (
+            "Agent environment",
+            format!(
+                "{} variable{} · Enter manages",
+                settings.environment_count,
+                if settings.environment_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        ),
     ];
+    let row_count = rows.len();
     let mut lines = vec![
         Line::styled(
             "Use :login / :logout for credentials. Enter edits the selected field.",
@@ -6130,7 +6396,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
             .wrap(Wrap { trim: false }),
         area,
     );
-    for index in 0..4 {
+    for index in 0..row_count {
         app.hit_regions.push(HitRegion {
             area: Rect::new(
                 inner.x,
@@ -9569,6 +9835,8 @@ mod tests {
         apply_command_key(&mut app, tab, "tab");
         assert_eq!(app.command_query, "search");
         apply_command_key(&mut app, tab, "tab");
+        assert_eq!(app.command_query, "set-env");
+        apply_command_key(&mut app, tab, "tab");
         assert_eq!(app.command_query, "set-terminal");
         apply_command_key(&mut app, tab, "tab");
         assert_eq!(app.command_query, "settings");
@@ -9893,6 +10161,10 @@ mod tests {
             CommandTarget::Core(CoreCommand::Search)
         );
         assert_eq!(
+            commands.resolve(":set-env").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::SetEnvironment)
+        );
+        assert_eq!(
             commands.resolve("set-terminal pwsh").unwrap().arguments,
             "pwsh"
         );
@@ -9943,6 +10215,7 @@ mod tests {
         app.settings = Some(SettingsState {
             active,
             model: None,
+            environment_count: 2,
             selected: 0,
             editing: None,
             api_key: String::new(),
@@ -9955,6 +10228,8 @@ mod tests {
         assert!(rendered.contains("API key"));
         assert!(rendered.contains("Thinking"));
         assert!(rendered.contains("off"));
+        assert!(rendered.contains("Agent environment"));
+        assert!(rendered.contains("2 variables"));
         assert!(!rendered.contains("super-secret-value"));
         assert!(!rendered.contains("Editor"));
         assert!(!rendered.contains("fzf"));
@@ -9980,6 +10255,77 @@ mod tests {
         assert_eq!(
             app.settings.as_ref().unwrap().thinking,
             ThinkingLevel::Minimal
+        );
+
+        app.settings.as_mut().unwrap().selected = 4;
+        assert!(matches!(
+            handle_settings_key(&mut app, key, &key_name(key)),
+            Action::OpenEnvironment {
+                return_to_settings: true
+            }
+        ));
+    }
+
+    #[test]
+    fn environment_prompts_hide_values_and_return_to_the_manager() {
+        let mut app = test_app();
+        open_environment_name_prompt(&mut app, false);
+        app.text_prompt.as_mut().unwrap().value = "NPM_TOKEN".to_string();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(
+            handle_text_key(&mut app, enter, &key_name(enter)),
+            Action::Continue
+        ));
+        let prompt = app.text_prompt.as_mut().unwrap();
+        assert!(prompt.secret);
+        prompt.value = "super-secret-value".to_string();
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("SET NPM_TOKEN"));
+        assert!(rendered.contains("••••"));
+        assert!(!rendered.contains("super-secret-value"));
+
+        open_environment_value_prompt(&mut app, "NPM_TOKEN".to_string(), true);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+        assert!(matches!(
+            handle_text_key(&mut app, escape, &key_name(escape)),
+            Action::OpenEnvironment {
+                return_to_settings: true
+            }
+        ));
+        assert!(app.text_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn environment_manager_lists_names_without_values_and_updates_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment = AgentEnvironment::load(directory.path()).await.unwrap();
+        let mut app = test_app();
+
+        store_environment(
+            &mut app,
+            &environment,
+            "NPM_TOKEN".to_string(),
+            "super-secret-value".to_string(),
+            false,
+        )
+        .await;
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            environment.get("NPM_TOKEN").await.unwrap().as_deref(),
+            Some("super-secret-value")
+        );
+
+        open_environment(&mut app, &environment, true).await;
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("NPM_TOKEN"));
+        assert!(!rendered.contains("super-secret-value"));
+
+        delete_environment(&mut app, &environment, "NPM_TOKEN", true).await;
+        assert_eq!(environment.get("NPM_TOKEN").await.unwrap(), None);
+        assert!(
+            app.selector
+                .as_ref()
+                .is_some_and(|selector| selector.items.is_empty())
         );
     }
 

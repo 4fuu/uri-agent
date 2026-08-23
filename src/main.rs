@@ -150,11 +150,12 @@ async fn run_session(
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
     let mut commands = CommandRegistry::with_core_commands();
     let mut tui = TuiRegistry::default();
-    plugins.install(&mut PluginHost {
-        protocols: &mut protocols,
-        commands: &mut commands,
-        tui: &mut tui,
-    })?;
+    plugins.install(&mut PluginHost::new(
+        &mut protocols,
+        &mut commands,
+        &mut tui,
+        config.environment.clone(),
+    ))?;
     for snapshot in frozen_context.skills.clone() {
         let description = format!("skill {} at {}", snapshot.name, snapshot.path.display());
         let skill = match SkillProtocol::from_snapshot(snapshot) {
@@ -323,6 +324,7 @@ async fn show_session(
             tui: session_runtime.tui.clone(),
             tasks: session_runtime.tasks.clone(),
             manager: config.manager.clone(),
+            environment: config.environment.clone(),
             catalog: config.catalog.clone(),
             output: session_runtime.output.clone(),
             info: TuiInfo {

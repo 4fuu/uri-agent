@@ -9,7 +9,7 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 | Understand `read`, `exec`, protocol routing, built-ins, tasks, or output preservation | [Protocols, tasks, output, and Skills](protocols.md) |
 | Create or troubleshoot a discovered Skill | [Skills](protocols.md#skills) |
 | Build, install, reload, or audit a trusted WASM plugin | [WASM plugins](plugins.md) |
-| Configure a model, credentials, reasoning effort, output limits, offline mode, or a custom endpoint | [Models and configuration](configuration.md) |
+| Configure a model, credentials, Agent environment variables, reasoning effort, output limits, offline mode, or a custom endpoint | [Models and configuration](configuration.md) |
 | Use the TUI, commands, keymaps, embedded terminal, or image attachments | [Terminal interface and sessions](interface.md) |
 | Resume a session or understand frozen context and compaction | [Sessions and context](interface.md#sessions-and-context) |
 | Change the codebase, find module ownership, preserve product contracts, or run verification | [Architecture and development](development.md) |

@@ -43,6 +43,28 @@ define_plugin!(manifest(), handle);
 
 Every declared protocol must implement its `<protocol>://help` route. The SDK also exposes `uri_agent_plugin_sdk::read` and `uri_agent_plugin_sdk::exec` for calling URI Agent's static built-in protocols.
 
+## Request Agent environment access
+
+To read user-managed Agent environment variables, request the single capability on the manifest and then look up names dynamically:
+
+```rust
+fn manifest() -> PluginManifest {
+    PluginManifest::new([/* protocol descriptors */])
+        .request_environment_access()
+}
+
+#[cfg(target_family = "wasm")]
+fn use_token_without_exposing_it() -> Result<(), String> {
+    let token = uri_agent_plugin_sdk::environment_variable("NPM_TOKEN")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "NPM_TOKEN is not configured".to_string())?;
+    // Pass `token` to the intended service; do not include it in plugin output.
+    Ok(())
+}
+```
+
+The request grants direct access to any variable in URI Agent's Agent environment manager; variable names are not declared in the manifest. It is a source-audit marker for trusted plugins, not an interactive approval or sandbox boundary. The host rejects `environment_variable` calls from a plugin whose manifest omitted the request. Runtime storage and trust details are in [WASM plugins](../docs/plugins.md#agent-environment-access).
+
 Build the module for WASI:
 
 ```bash

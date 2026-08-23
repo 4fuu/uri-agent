@@ -1,3 +1,4 @@
+use crate::config::AgentEnvironment;
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -23,6 +24,7 @@ pub enum CoreCommand {
     Compact,
     Help,
     Quit,
+    SetEnvironment,
     SetTerminal,
     Terminal,
 }
@@ -197,7 +199,7 @@ fn core_commands() -> Vec<CommandSpec> {
         CommandSpec::new(
             "settings",
             "Settings",
-            "model, credential status, thinking, and output limit",
+            "model, credentials, thinking, output limit, and Agent environment",
             std::iter::empty::<&str>(),
             CommandTarget::Core(Settings),
         ),
@@ -256,6 +258,13 @@ fn core_commands() -> Vec<CommandSpec> {
             "close URI Agent",
             ["q"],
             CommandTarget::Core(Quit),
+        ),
+        CommandSpec::new(
+            "set-env",
+            "Add environment variable",
+            "add or replace an Agent environment variable with a masked value prompt",
+            ["environment-add"],
+            CommandTarget::Core(SetEnvironment),
         ),
         CommandSpec::new(
             "set-terminal",
@@ -409,10 +418,62 @@ impl TuiRegistry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PluginPermission {
+    /// Read the user-managed Agent environment. This declaration is an audit
+    /// marker for trusted plugin code, not an interactive approval boundary.
+    Environment,
+}
+
+#[derive(Clone)]
+pub struct PluginEnvironment {
+    environment: Arc<AgentEnvironment>,
+}
+
+impl PluginEnvironment {
+    pub(crate) fn new(environment: Arc<AgentEnvironment>) -> Self {
+        Self { environment }
+    }
+
+    pub async fn get(&self, name: &str) -> Result<Option<String>> {
+        self.environment.get(name).await
+    }
+
+    pub async fn snapshot(&self) -> BTreeMap<String, String> {
+        self.environment.snapshot().await
+    }
+}
+
 pub struct PluginHost<'a> {
     pub protocols: &'a mut ProtocolRegistry,
     pub commands: &'a mut CommandRegistry,
     pub tui: &'a mut TuiRegistry,
+    environment: Arc<AgentEnvironment>,
+    permissions: HashSet<PluginPermission>,
+}
+
+impl<'a> PluginHost<'a> {
+    pub fn new(
+        protocols: &'a mut ProtocolRegistry,
+        commands: &'a mut CommandRegistry,
+        tui: &'a mut TuiRegistry,
+        environment: Arc<AgentEnvironment>,
+    ) -> Self {
+        Self {
+            protocols,
+            commands,
+            tui,
+            environment,
+            permissions: HashSet::new(),
+        }
+    }
+
+    pub fn environment(&self) -> Result<PluginEnvironment> {
+        if !self.permissions.contains(&PluginPermission::Environment) {
+            bail!("plugin did not request Agent environment access");
+        }
+        Ok(PluginEnvironment::new(self.environment.clone()))
+    }
 }
 
 pub trait Plugin: Send + Sync {
@@ -431,6 +492,12 @@ pub trait Plugin: Send + Sync {
     /// frozen. A plugin may contribute prompt content without adding a protocol.
     fn system_prompt_fragment(&self) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Permissions requested by this trusted plugin. Requests are explicit so
+    /// source review can find sensitive host access without an approval flow.
+    fn permissions(&self) -> Vec<PluginPermission> {
+        Vec::new()
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
@@ -503,7 +570,15 @@ impl PluginRegistry {
         }
 
         for plugin in &self.plugins {
-            plugin.register(host).context("failed to register plugin")?;
+            let permissions = plugin.permissions();
+            let unique = permissions.iter().copied().collect::<HashSet<_>>();
+            if unique.len() != permissions.len() {
+                bail!("plugin declares the same permission more than once");
+            }
+            host.permissions = unique;
+            let result = plugin.register(host).context("failed to register plugin");
+            host.permissions.clear();
+            result?;
         }
 
         let installed = host
@@ -692,6 +767,11 @@ mod tests {
 
     struct PromptOnlyPlugin;
 
+    struct EnvironmentPlugin {
+        requests_environment: bool,
+        environment: Arc<std::sync::OnceLock<PluginEnvironment>>,
+    }
+
     impl Plugin for PromptOnlyPlugin {
         fn startup_notices(&self) -> Vec<String> {
             vec!["plugin startup notice".to_string()]
@@ -703,6 +783,21 @@ mod tests {
 
         fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl Plugin for EnvironmentPlugin {
+        fn permissions(&self) -> Vec<PluginPermission> {
+            self.requests_environment
+                .then_some(PluginPermission::Environment)
+                .into_iter()
+                .collect()
+        }
+
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            self.environment
+                .set(host.environment()?)
+                .map_err(|_| anyhow::anyhow!("environment was already captured"))
         }
     }
 
@@ -775,13 +870,15 @@ mod tests {
             ]
         );
         let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
 
         plugins
-            .install(&mut PluginHost {
-                protocols: &mut protocols,
-                commands: &mut commands,
-                tui: &mut tui,
-            })
+            .install(&mut PluginHost::new(
+                &mut protocols,
+                &mut commands,
+                &mut tui,
+                environment,
+            ))
             .unwrap();
 
         assert_eq!(
@@ -798,16 +895,64 @@ mod tests {
             declares_protocol: false,
         });
         let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
 
         let error = plugins
-            .install(&mut PluginHost {
-                protocols: &mut protocols,
-                commands: &mut commands,
-                tui: &mut tui,
-            })
+            .install(&mut PluginHost::new(
+                &mut protocols,
+                &mut commands,
+                &mut tui,
+                environment,
+            ))
             .unwrap_err();
 
         assert!(error.to_string().contains("declarations do not match"));
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_must_request_environment_access_once_for_dynamic_reads() {
+        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        environment
+            .set("NPM_TOKEN", "first".to_string())
+            .await
+            .unwrap();
+
+        let denied_capture = Arc::new(std::sync::OnceLock::new());
+        let mut denied = PluginRegistry::new();
+        denied.add(EnvironmentPlugin {
+            requests_environment: false,
+            environment: denied_capture,
+        });
+        let mut host =
+            PluginHost::new(&mut protocols, &mut commands, &mut tui, environment.clone());
+        let error = denied.install(&mut host).unwrap_err();
+        assert!(format!("{error:#}").contains("did not request Agent environment access"));
+        assert!(host.environment().is_err());
+
+        let allowed_capture = Arc::new(std::sync::OnceLock::new());
+        let mut allowed = PluginRegistry::new();
+        allowed.add(EnvironmentPlugin {
+            requests_environment: true,
+            environment: allowed_capture.clone(),
+        });
+        allowed.install(&mut host).unwrap();
+        let reader = allowed_capture.get().unwrap();
+        assert_eq!(
+            reader.get("NPM_TOKEN").await.unwrap().as_deref(),
+            Some("first")
+        );
+
+        environment
+            .set("DYNAMIC_TOKEN", "added later".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get("DYNAMIC_TOKEN").await.unwrap().as_deref(),
+            Some("added later")
+        );
+        assert_eq!(reader.snapshot().await.len(), 2);
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 }

@@ -67,6 +67,7 @@ pub struct Cli {
 
 pub struct Config {
     pub manager: Arc<ConfigManager>,
+    pub environment: Arc<AgentEnvironment>,
     pub catalog: Arc<ModelCatalog>,
     pub session: SessionChoice,
     pub cwd: PathBuf,
@@ -82,6 +83,7 @@ impl Config {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
         }
+        let environment = Arc::new(AgentEnvironment::load(&directory).await?);
         let offline = cli.offline
             || environment_truthy("URI_AGENT_OFFLINE")
             || environment_truthy("PI_OFFLINE");
@@ -110,6 +112,7 @@ impl Config {
         };
         Ok(Self {
             manager,
+            environment,
             catalog,
             session,
             cwd,
@@ -226,6 +229,104 @@ struct SettingsFile {
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(transparent)]
 struct AuthFile(BTreeMap<String, AuthEntry>);
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+struct EnvironmentFile(BTreeMap<String, String>);
+
+impl EnvironmentFile {
+    fn validate(&self) -> Result<()> {
+        for (name, value) in &self.0 {
+            validate_environment_name(name)?;
+            validate_environment_value(value)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct AgentEnvironment {
+    path: PathBuf,
+    values: RwLock<EnvironmentFile>,
+}
+
+impl AgentEnvironment {
+    pub async fn load(directory: &Path) -> Result<Self> {
+        let path = directory.join("environment.json");
+        let values: EnvironmentFile = read_json(&path).await?;
+        values
+            .validate()
+            .with_context(|| format!("invalid Agent environment in {}", path.display()))?;
+        if !path.exists() {
+            write_json(&path, &values, true).await?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .with_context(|| format!("cannot secure {}", path.display()))?;
+        }
+        Ok(Self {
+            path,
+            values: RwLock::new(values),
+        })
+    }
+
+    pub async fn names(&self) -> Vec<String> {
+        self.values.read().await.0.keys().cloned().collect()
+    }
+
+    pub async fn get(&self, name: &str) -> Result<Option<String>> {
+        validate_environment_name(name)?;
+        Ok(self.values.read().await.0.get(name).cloned())
+    }
+
+    pub async fn snapshot(&self) -> BTreeMap<String, String> {
+        self.values.read().await.0.clone()
+    }
+
+    pub async fn set(&self, name: &str, value: String) -> Result<()> {
+        validate_environment_name(name)?;
+        validate_environment_value(&value)?;
+        let mut values = self.values.write().await;
+        let mut next = values.clone();
+        next.0.insert(name.to_string(), value);
+        write_json(&self.path, &next, true).await?;
+        *values = next;
+        Ok(())
+    }
+
+    pub async fn remove(&self, name: &str) -> Result<bool> {
+        validate_environment_name(name)?;
+        let mut values = self.values.write().await;
+        let mut next = values.clone();
+        let removed = next.0.remove(name).is_some();
+        if removed {
+            write_json(&self.path, &next, true).await?;
+            *values = next;
+        }
+        Ok(removed)
+    }
+}
+
+pub fn validate_environment_name(name: &str) -> Result<()> {
+    let mut characters = name.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        bail!("environment variable name must match [A-Za-z_][A-Za-z0-9_]*");
+    }
+    Ok(())
+}
+
+fn validate_environment_value(value: &str) -> Result<()> {
+    if value.contains('\0') {
+        bail!("environment variable value cannot contain NUL");
+    }
+    Ok(())
+}
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct AuthEntry {
@@ -920,6 +1021,101 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_environment_persists_private_values_and_validates_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment = AgentEnvironment::load(directory.path()).await.unwrap();
+        let path = directory.path().join("environment.json");
+
+        environment
+            .set("NPM_TOKEN", "managed-secret".to_string())
+            .await
+            .unwrap();
+        environment
+            .set("SECOND_TOKEN", "second-secret".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            environment.names().await,
+            vec!["NPM_TOKEN".to_string(), "SECOND_TOKEN".to_string()]
+        );
+        assert_eq!(
+            environment.get("NPM_TOKEN").await.unwrap().as_deref(),
+            Some("managed-secret")
+        );
+        assert_eq!(environment.snapshot().await.len(), 2);
+        assert!(environment.remove("NPM_TOKEN").await.unwrap());
+        assert!(!environment.remove("NPM_TOKEN").await.unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .await
+                .unwrap();
+        }
+        let reloaded = AgentEnvironment::load(directory.path()).await.unwrap();
+        assert_eq!(reloaded.get("NPM_TOKEN").await.unwrap(), None);
+        assert_eq!(
+            reloaded.get("SECOND_TOKEN").await.unwrap().as_deref(),
+            Some("second-secret")
+        );
+        assert!(reloaded.set("1INVALID", String::new()).await.is_err());
+        assert!(reloaded.set("INVALID-NAME", String::new()).await.is_err());
+        assert!(
+            reloaded
+                .set("VALID_NAME", "nul\0value".to_string())
+                .await
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path).await.unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_environment_rejects_invalid_persisted_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("environment.json"),
+            br#"{"INVALID-NAME":"secret"}"#,
+        )
+        .await
+        .unwrap();
+
+        let error = match AgentEnvironment::load(directory.path()).await {
+            Ok(_) => panic!("invalid environment file was accepted"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("[A-Za-z_][A-Za-z0-9_]*"));
+    }
+
+    #[tokio::test]
+    async fn agent_environment_does_not_expose_unmanaged_process_variables() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment = AgentEnvironment::load(directory.path()).await.unwrap();
+        let name = format!("URI_AGENT_UNMANAGED_ENV_TEST_{}", Uuid::now_v7().simple());
+        // SAFETY: the process-unique variable is removed before this test returns.
+        unsafe { env::set_var(&name, "process-secret") };
+
+        assert_eq!(environment.get(&name).await.unwrap(), None);
+        environment
+            .set(&name, "managed-secret".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            environment.get(&name).await.unwrap().as_deref(),
+            Some("managed-secret")
+        );
+
+        // SAFETY: the process-unique variable is no longer used.
+        unsafe { env::remove_var(&name) };
+    }
 
     #[test]
     fn windows_verbatim_path_prefix_is_not_displayed() {

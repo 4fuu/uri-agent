@@ -60,6 +60,7 @@ Core commands are registered through `CommandRegistry`:
 | `:resume`, `:new` | Switch project sessions or create one |
 | `:search` or `:find` | Search text already shown in the current conversation and jump to a matching block |
 | `:compact` | Request a context checkpoint after usage exceeds 20% |
+| `:set-env` | Add or replace an Agent environment variable through a masked value prompt |
 | `:set-terminal`, `:terminal` | Configure and open the embedded terminal |
 | `:help` | Show the active commands and keymap |
 | `:quit` or `:q` | Exit URI Agent |
@@ -67,6 +68,12 @@ Core commands are registered through `CommandRegistry`:
 Conversation search includes user, assistant, reasoning, tool, notice, compaction, and error text currently loaded in the transcript. Type to filter the results, use the arrow keys to choose one and press `Enter`, or click a result to return to that block. It is unavailable before the conversation has any text and while the `:resume` session selector is open.
 
 Extensions register commands through the same registry, so they appear in the panel, help, and key-bindable action set without TUI-specific routing.
+
+### Agent environment manager
+
+`:set-env` opens separate name and masked-value prompts, then saves the variable globally. The **Agent environment** row in `:settings` shows only the number of configured variables. Press `Enter` or double-click the row to open the manager; values are never shown in its list. In the manager, `Enter` or a double-click replaces the selected value, `Ctrl+N` adds a variable, `Delete` removes the selected variable, and `Esc` returns to Settings.
+
+Saved values apply to future Agent `bash` and `pwsh` commands without a restart. They are not added to `:terminal`; see [Agent environment](configuration.md#agent-environment) for storage, scope, and plugin access.
 
 ## Default navigation
 
@@ -101,7 +108,7 @@ unmap("main", "j");
 map("composer", "ctrl+j", "newline");
 ```
 
-Bindings belong to surfaces such as `global`, `main`, `composer`, `command`, `list`, `selector`, `settings`, `models`, `document`, `selection`, and `terminal`. A surface binding is checked before a global binding.
+Bindings belong to surfaces such as `global`, `main`, `composer`, `command`, `list`, `selector`, `settings`, `environment`, `models`, `document`, `selection`, and `terminal`. A surface binding is checked before a global binding.
 
 Configurable actions must go through the keymap. New commands that should be available from the command panel or key bindings must go through `CommandRegistry`; do not add a modeless hard-coded shortcut as a separate path.
 
@@ -109,7 +116,7 @@ Configurable actions must go through the keymap. New commands that should be ava
 
 `:set-terminal` stores the command used by `:terminal`, such as `bash` or `pwsh -NoLogo`. The `URI_AGENT_TERMINAL` environment variable can override the stored command for an invocation.
 
-`:terminal` opens that command in a PTY float rooted at the project directory. Terminal input, including `Ctrl+C` when no URI Agent selection is active, is forwarded to the terminal program; resize, mouse events, and process exit are handled by the embedded terminal layer. Press `Esc` twice within 500 milliseconds to close the float; a single `Esc` is sent to the running terminal program.
+`:terminal` opens that command in a PTY float rooted at the project directory. It inherits the URI Agent process environment but deliberately does not receive values from the Agent environment manager. Terminal input, including `Ctrl+C` when no URI Agent selection is active, is forwarded to the terminal program; resize, mouse events, and process exit are handled by the embedded terminal layer. Press `Esc` twice within 500 milliseconds to close the float; a single `Esc` is sent to the running terminal program.
 
 Ordinary clicks and drags are sent to the terminal application. Hold `Shift` while dragging to select rendered text. `Ctrl+C`, `Ctrl+Shift+C`, or right-click copies that selection through OSC52. On macOS, `Cmd+C` also works when the terminal forwards the Command modifier; terminals that reserve the shortcut require `Ctrl+Shift+C`.
 

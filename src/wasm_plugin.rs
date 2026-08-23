@@ -1,6 +1,6 @@
 use crate::config::display_path;
 use crate::output::OutputStore;
-use crate::plugin::{Plugin, PluginHost};
+use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission};
 use crate::protocol::{
     DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRegistry,
     ProtocolRequest, split_address, validate_descriptor,
@@ -17,8 +17,8 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use uri_agent_plugin_sdk::{
-    ABI_VERSION, HANDLE_EXPORT, HOST_EXEC, HOST_READ, HandlerRequest, MANIFEST_EXPORT, Operation,
-    PluginManifest,
+    ABI_VERSION, HANDLE_EXPORT, HOST_ENVIRONMENT, HOST_EXEC, HOST_READ, HandlerRequest,
+    MANIFEST_EXPORT, Operation, PluginManifest,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
@@ -137,6 +137,12 @@ let a plugin call URI Agent's built-in protocols using JSON bodies. Calls into
 dynamic WASM protocols and `wasm_plugin` itself are intentionally rejected to
 prevent recursive runtime entry.
 
+Direct access to values from the Agent environment manager uses
+`uri_agent_plugin_sdk::environment_variable(name)`. The manifest must call
+`.request_environment_access()` once; this grants dynamic access to the whole
+managed environment rather than declaring individual names. It is a visible
+source-audit marker with no interactive approval flow.
+
 ## Trust and permissions
 
 WASM is the stable distribution ABI, not a security boundary here. Only build
@@ -161,6 +167,8 @@ struct PluginSet {
 struct HostBridge {
     runtime: Handle,
     registry: Arc<OnceLock<Weak<ProtocolRegistry>>>,
+    environment: Arc<OnceLock<PluginEnvironment>>,
+    environment_allowed: Arc<OnceLock<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +189,17 @@ impl HostBridge {
         Self {
             runtime: Handle::current(),
             registry: Arc::new(OnceLock::new()),
+            environment: Arc::new(OnceLock::new()),
+            environment_allowed: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn for_plugin(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            registry: self.registry.clone(),
+            environment: self.environment.clone(),
+            environment_allowed: Arc::new(OnceLock::new()),
         }
     }
 
@@ -188,6 +207,18 @@ impl HostBridge {
         self.registry
             .set(registry)
             .map_err(|_| anyhow!("WASM plugin host is already bound"))
+    }
+
+    fn bind_environment(&self, environment: PluginEnvironment) -> Result<()> {
+        self.environment
+            .set(environment)
+            .map_err(|_| anyhow!("WASM plugin environment is already bound"))
+    }
+
+    fn set_environment_allowed(&self, allowed: bool) -> Result<()> {
+        self.environment_allowed
+            .set(allowed)
+            .map_err(|_| anyhow!("WASM plugin environment permission is already bound"))
     }
 
     fn dispatch(&self, operation: Operation, input: &str) -> Result<String> {
@@ -216,6 +247,18 @@ impl HostBridge {
             }
         })
     }
+
+    fn environment_variable(&self, name: &str) -> Result<String> {
+        if !self.environment_allowed.get().copied().unwrap_or(false) {
+            bail!("WASM plugin did not request environment access in uri_agent_manifest");
+        }
+        let environment = self
+            .environment
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin environment is not attached"))?;
+        let value = self.runtime.block_on(environment.get(name))?;
+        serde_json::to_string(&value).context("cannot encode environment variable result")
+    }
 }
 
 extism::host_fn!(uri_agent_read_host(user_data: HostBridge; input: String) -> String {
@@ -234,6 +277,15 @@ extism::host_fn!(uri_agent_exec_host(user_data: HostBridge; input: String) -> St
         .map_err(|_| anyhow!("WASM plugin exec host bridge lock is poisoned"))?
         .clone();
     bridge.dispatch(Operation::Exec, &input)
+});
+
+extism::host_fn!(uri_agent_environment_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin environment host bridge lock is poisoned"))?
+        .clone();
+    bridge.environment_variable(&input)
 });
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -388,7 +440,12 @@ impl Plugin for WasmPluginManager {
         vec![Self::descriptor()]
     }
 
+    fn permissions(&self) -> Vec<PluginPermission> {
+        vec![PluginPermission::Environment]
+    }
+
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+        self.bridge.bind_environment(host.environment()?)?;
         host.protocols.register(self.clone())
     }
 }
@@ -479,16 +536,22 @@ async fn load_plugin_set(
     let mut report = ReloadReport::default();
     let mut claimed = reserved.clone();
     for path in paths {
-        let module =
-            match WasmModule::load(&path, working_directory, directory, bridge.clone()).await {
-                Ok(module) => module,
-                Err(error) => {
-                    report
-                        .diagnostics
-                        .push(format!("{}: {error:#}", display_path(&path)));
-                    continue;
-                }
-            };
+        let module = match WasmModule::load(
+            &path,
+            working_directory,
+            directory,
+            bridge.for_plugin(),
+        )
+        .await
+        {
+            Ok(module) => module,
+            Err(error) => {
+                report
+                    .diagnostics
+                    .push(format!("{}: {error:#}", display_path(&path)));
+                continue;
+            }
+        };
         if let Some(conflict) = module
             .manifest
             .protocols
@@ -543,10 +606,12 @@ impl WasmModule {
         let display = path.display().to_string();
         let working_directory = working_directory.to_path_buf();
         let plugin_directory = plugin_directory.to_path_buf();
+        let permission_bridge = bridge.clone();
         let (runtime, manifest) = tokio::task::spawn_blocking(move || {
             let mut plugin = build_runtime(bytes, &working_directory, &plugin_directory, bridge)
                 .with_context(|| format!("cannot load {display}"))?;
             let manifest = read_manifest(&mut plugin, &display)?;
+            permission_bridge.set_environment_allowed(manifest.permissions.environment)?;
             if !manifest.protocols.is_empty() && !plugin.function_exists(HANDLE_EXPORT) {
                 bail!("WASM plugin {display} does not export {HANDLE_EXPORT}");
             }
@@ -698,8 +763,16 @@ fn build_runtime(
             HOST_EXEC,
             [ValType::I64],
             [ValType::I64],
-            user_data,
+            user_data.clone(),
             uri_agent_exec_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_ENVIRONMENT,
+            [ValType::I64],
+            [ValType::I64],
+            user_data,
+            uri_agent_environment_host,
         )
         .build()
 }
@@ -775,6 +848,7 @@ async fn set_private_permissions(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentEnvironment;
     use crate::output::OutputStore;
     use crate::plugin::{CommandRegistry, PluginRegistry, TuiRegistry};
     use crate::protocol::{Protocol, ProtocolContext, ProtocolRegistry, ProtocolRequest};
@@ -896,9 +970,14 @@ mod tests {
         )
     }
 
-    fn host_call_module(manifest: &str, host_function: &str) -> Vec<u8> {
-        let request = br#"{"uri":"capture://from-plugin","body":{"answer":42}}"#;
-        let stores = request
+    fn environment_manifest(name: &str) -> String {
+        format!(
+            r#"{{"abi_version":1,"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"environment":true}}}}"#
+        )
+    }
+
+    fn host_call_module_with_input(manifest: &str, host_function: &str, input: &[u8]) -> Vec<u8> {
+        let stores = input
             .iter()
             .enumerate()
             .map(|(index, byte)| {
@@ -934,9 +1013,17 @@ mod tests {
             )
             "#,
             output_function(MANIFEST_EXPORT, manifest.as_bytes()),
-            request_length = request.len(),
+            request_length = input.len(),
         ))
         .unwrap()
+    }
+
+    fn host_call_module(manifest: &str, host_function: &str) -> Vec<u8> {
+        host_call_module_with_input(
+            manifest,
+            host_function,
+            br#"{"uri":"capture://from-plugin","body":{"answer":42}}"#,
+        )
     }
 
     async fn registry_with_manager(
@@ -944,6 +1031,7 @@ mod tests {
     ) -> (Arc<ProtocolRegistry>, WasmPluginManager, Arc<OutputStore>) {
         let session_id = format!("wasm-test-{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 32 * 1024).await.unwrap());
+        let environment = Arc::new(AgentEnvironment::load(directory).await.unwrap());
         let mut registry = ProtocolRegistry::new(output.clone(), TaskManager::new());
         registry.register(CaptureProtocol).unwrap();
         let manager = WasmPluginManager::new(directory, directory).await.unwrap();
@@ -953,11 +1041,12 @@ mod tests {
         let mut plugins = PluginRegistry::new();
         plugins.add(manager.clone());
         plugins
-            .install(&mut PluginHost {
-                protocols: &mut registry,
-                commands: &mut commands,
-                tui: &mut tui,
-            })
+            .install(&mut PluginHost::new(
+                &mut registry,
+                &mut commands,
+                &mut tui,
+                environment,
+            ))
             .unwrap();
         manager
             .set_reserved_protocols(
@@ -1098,6 +1187,7 @@ mod tests {
 
         let help = registry.read("wasm_plugin://help", None).await.unwrap();
         assert!(help.contains("wasm_plugin://reload"));
+        assert!(help.contains("request_environment_access"));
         assert!(registry.read("wasm_plugin://list", None).await.is_err());
         assert!(registry.exec("wasm_plugin://install", None).await.is_err());
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
@@ -1162,6 +1252,53 @@ mod tests {
         manager.reload().await.unwrap();
         let result = registry.exec("host_call://run", None).await.unwrap();
         assert_eq!(result, "host executed from-plugin");
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_environment_access_requires_one_manifest_permission_per_plugin() {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            directory.path().join("environment.json"),
+            br#"{"DYNAMIC_PLUGIN_TOKEN":"managed-secret"}"#,
+        )
+        .await
+        .unwrap();
+        let (registry, manager, output) = registry_with_manager(directory.path()).await;
+        tokio::fs::write(
+            manager.directory().join("allowed.wasm"),
+            host_call_module_with_input(
+                &environment_manifest("allowed_environment"),
+                HOST_ENVIRONMENT,
+                b"DYNAMIC_PLUGIN_TOKEN",
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("denied.wasm"),
+            host_call_module_with_input(
+                &valid_manifest("denied_environment"),
+                HOST_ENVIRONMENT,
+                b"DYNAMIC_PLUGIN_TOKEN",
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        assert_eq!(
+            registry
+                .read("allowed_environment://read", None)
+                .await
+                .unwrap(),
+            r#""managed-secret""#
+        );
+        let error = registry
+            .read("denied_environment://read", None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("did not request environment access"));
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 }

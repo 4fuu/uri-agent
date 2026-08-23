@@ -21,6 +21,7 @@ URI Agent 目前是从源码安装的 pre-1.0 项目。模型请求及其所需�
 - **便携的可信扩展：**Extism WASM 模块可以添加支持热重载的协议，而不改变模型工具面。
 - **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
 - **运行中调整方向：**当前 turn 运行时，可以排队稍后跟进，也可以引导下一次模型请求；尚未生效的消息仍可编辑。
+- **可复用的 Agent 环境变量：**token 只需保存一次，后续 Agent Shell 命令即可使用，同时不会写入项目和会话文件。
 - **完整键盘操作的 TUI：**会话、输入、命令、模型选择、设置和终端集中在同一界面。
 
 模型可见接口始终是：
@@ -64,6 +65,8 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 
 当界面出现协议活动，并且 assistant 根据项目内容返回答案时，第一个会话就已正常工作。按 `F1` 或运行 `:help` 可查看当前生效的命令和快捷键。
 
+运行 `:set-env` 可保存 `NPM_TOKEN` 等变量；后续 Agent Shell 命令会自动收到这些变量。设置界面只列出变量名，不显示变量值。全局作用域、私密文件存储、与 `:terminal` 的隔离以及插件访问规则见英文文档 [Agent environment](docs/configuration.md#agent-environment)。
+
 受支持的 API 系列、认证、离线模式和自定义端点见英文文档 [Models and configuration](docs/configuration.md)。
 
 ## 协议示例
@@ -79,7 +82,7 @@ URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body
 
 ## 扩展
 
-可信 WASM 模块可以添加运行时加载的协议。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
+可信 WASM 模块可以添加运行时加载的协议。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。直接读取已保存的 Agent 环境变量时，插件源码必须显式申请一次整体环境变量能力；它只是审计标记，不是批准流程。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
 
 ## 文档
 

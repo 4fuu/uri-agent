@@ -2093,12 +2093,18 @@ mod tests {
         let mut protocols = ProtocolRegistry::new(output, tasks);
         let mut commands = crate::plugin::CommandRegistry::with_core_commands();
         let mut tui = crate::plugin::TuiRegistry::default();
+        let environment = Arc::new(
+            crate::config::AgentEnvironment::load(workspace.path())
+                .await
+                .unwrap(),
+        );
         crate::builtins::plugins(workspace.path())
-            .install(&mut crate::plugin::PluginHost {
-                protocols: &mut protocols,
-                commands: &mut commands,
-                tui: &mut tui,
-            })
+            .install(&mut crate::plugin::PluginHost::new(
+                &mut protocols,
+                &mut commands,
+                &mut tui,
+                environment,
+            ))
             .unwrap();
         let call = ToolCall::new(
             ToolCallId::new("read-help").unwrap(),

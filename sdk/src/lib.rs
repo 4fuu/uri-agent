@@ -19,6 +19,7 @@ pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
 pub const HOST_READ: &str = "uri_agent_read";
 pub const HOST_EXEC: &str = "uri_agent_exec";
+pub const HOST_ENVIRONMENT: &str = "uri_agent_environment";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +27,8 @@ pub struct PluginManifest {
     pub abi_version: u32,
     #[serde(default)]
     pub protocols: Vec<ProtocolDescriptor>,
+    #[serde(default, skip_serializing_if = "PluginPermissions::is_empty")]
+    pub permissions: PluginPermissions,
 }
 
 impl PluginManifest {
@@ -33,8 +36,35 @@ impl PluginManifest {
         Self {
             abi_version: ABI_VERSION,
             protocols: protocols.into_iter().collect(),
+            permissions: PluginPermissions::default(),
         }
     }
+
+    /// Request access to user-managed Agent environment variables.
+    ///
+    /// This explicit declaration is an audit marker for trusted plugin source;
+    /// URI Agent does not present an interactive approval prompt.
+    pub fn request_environment_access(mut self) -> Self {
+        self.permissions.environment = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPermissions {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub environment: bool,
+}
+
+impl PluginPermissions {
+    fn is_empty(&self) -> bool {
+        !self.environment
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,6 +128,7 @@ mod host {
     extern "ExtismHost" {
         pub fn uri_agent_read(input: String) -> String;
         pub fn uri_agent_exec(input: String) -> String;
+        pub fn uri_agent_environment(input: String) -> String;
     }
 }
 
@@ -111,6 +142,14 @@ pub fn read(uri: &str, body: Option<&Value>) -> Result<String, Error> {
 #[cfg(target_family = "wasm")]
 pub fn exec(uri: &str, body: Option<&Value>) -> Result<String, Error> {
     call_host(uri, body, host::uri_agent_exec)
+}
+
+/// Read one user-managed environment variable after requesting environment
+/// access in the plugin manifest.
+#[cfg(target_family = "wasm")]
+pub fn environment_variable(name: &str) -> Result<Option<String>, Error> {
+    let output = unsafe { host::uri_agent_environment(name.to_string())? };
+    Ok(serde_json::from_str(&output)?)
 }
 
 #[cfg(target_family = "wasm")]
@@ -171,6 +210,17 @@ mod tests {
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["abi_version"], ABI_VERSION);
         assert_eq!(value["protocols"][0]["name"], "example");
+        assert!(value.get("permissions").is_none());
+
+        let manifest = PluginManifest::new([]).request_environment_access();
+        let value = serde_json::to_value(manifest).unwrap();
+        assert_eq!(value["permissions"]["environment"], true);
+        let legacy: PluginManifest = serde_json::from_value(serde_json::json!({
+            "abi_version": ABI_VERSION,
+            "protocols": []
+        }))
+        .unwrap();
+        assert!(!legacy.permissions.environment);
 
         let request: HandlerRequest = serde_json::from_value(serde_json::json!({
             "protocol": "example",

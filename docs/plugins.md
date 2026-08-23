@@ -62,6 +62,8 @@ Every module exports `uri_agent_manifest`, which takes no input and returns:
 }
 ```
 
+An optional `permissions` object can request sensitive host capabilities. Existing ABI version 1 manifests without it continue to load with no Agent environment access.
+
 Protocol names must be unique within the module and satisfy the normal registry rules. Descriptions must be nonempty. Every protocol must set `can_read` to `true` and implement `read("<protocol>://help")`; `can_exec` may be `true` or `false`.
 
 A module declaring a protocol also exports `uri_agent_handle`. URI Agent calls it with the selected protocol, operation, original URI, opaque target, and optional body:
@@ -79,6 +81,20 @@ A module declaring a protocol also exports `uri_agent_handle`. URI Agent calls i
 `operation` is `read` or `exec`; `body` is `null` when omitted from the tool call. Returned bytes become the protocol result, while an Extism error fails the call. A module remains instantiated until the next reload, so its in-memory state survives calls; calls into one module are serialized.
 
 Each plugin implements its protocol help through the same handler. That help must describe every supported address and body shape.
+
+## Agent environment access
+
+A plugin that directly reads values saved in URI Agent's [Agent environment manager](configuration.md#agent-environment) must request one whole-environment capability in its manifest. The Rust SDK keeps the request visible in source:
+
+```rust
+fn manifest() -> PluginManifest {
+    PluginManifest::new(protocols).request_environment_access()
+}
+```
+
+After that request, `uri_agent_plugin_sdk::environment_variable(name)` can dynamically read any valid variable name. Plugins do not declare names in advance, and URI Agent does not maintain per-variable grants or show an approval prompt. A plugin without the manifest request receives an error from this host API.
+
+This declaration is deliberately an audit marker, not a sandbox boundary. Install only source you trust and review direct environment requests alongside the plugin's existing filesystem, HTTP, WASI, and built-in protocol use. The host API returns only values saved in the Agent environment manager; it does not treat the URI Agent process environment as part of that store.
 
 ## Trust and reliability
 

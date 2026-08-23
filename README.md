@@ -21,6 +21,7 @@ URI Agent is currently a pre-1.0 project installed from source. Model requests a
 - **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
 - **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
 - **Live course correction:** while a turn runs, queue a follow-up for afterward or guide the next model request; undelivered messages remain editable.
+- **Reusable Agent environment:** save tokens once for future Agent shell commands while keeping values out of project and session files.
 - **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface.
 
 The model-facing interface remains:
@@ -64,6 +65,8 @@ URI Agent does not choose a default model. In the TUI:
 
 The first session is working when protocol activity appears and the assistant returns an answer based on the project. Press `F1` or run `:help` for the active commands and key bindings.
 
+Run `:set-env` to save a variable such as `NPM_TOKEN`; future Agent shell commands receive it automatically. Settings lists variable names without showing their values. See [Agent environment](docs/configuration.md#agent-environment) for its global scope, private file storage, `:terminal` separation, and plugin access.
+
 See [Models and configuration](docs/configuration.md) for supported API families, authentication, offline mode, and custom endpoints.
 
 ## How protocols look
@@ -79,7 +82,7 @@ URI Agent selects a protocol at the first `://`; that protocol owns the remainin
 
 ## Extensions
 
-Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI here, not a security boundary: enabled plugins receive filesystem, HTTP, WASI, and built-in protocol access with the same user authority as URI Agent. See [WASM plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage, and reliability limits.
+Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI here, not a security boundary: enabled plugins receive filesystem, HTTP, WASI, and built-in protocol access with the same user authority as URI Agent. Direct access to saved Agent environment values requires one explicit whole-environment request in plugin source; it is an audit marker, not an approval flow. See [WASM plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage, and reliability limits.
 
 ## Documentation
 

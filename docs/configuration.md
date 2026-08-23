@@ -2,7 +2,7 @@
 
 URI Agent combines the [pi model catalog](https://github.com/earendil-works/pi), local provider definitions, layered settings, and process-specific overrides. This document describes model support, authentication, file locations, precedence, and command-line configuration.
 
-Run `uri-agent --help` for the current CLI syntax. In the TUI, `:settings` shows the active provider and model, credential status and source, thinking level, and output limit.
+Run `uri-agent --help` for the current CLI syntax. In the TUI, `:settings` shows the active provider and model, credential status and source, thinking level, output limit, and Agent environment manager.
 
 ## First-time setup
 
@@ -92,6 +92,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 | --- | --- |
 | `<config>/settings.json` | Global provider, model, thinking, output, and terminal settings |
 | `<config>/auth.json` | Global provider credentials |
+| `<config>/environment.json` | Global environment variables for Agent shell commands and trusted plugins |
 | `<config>/models.json` | Custom providers, models, headers, and model overrides |
 | `<config>/models-store.json` | Generated pi catalog cache |
 | `<config>/keymap.rhai` | Global keymap overrides |
@@ -102,6 +103,16 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 Sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Terminal interface and sessions](interface.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
 
 The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings field. See [WASM plugins](plugins.md) for loading, installation, and reload behavior.
+
+## Agent environment
+
+Use `:set-env` to add or replace a variable such as `NPM_TOKEN`. The **Agent environment** row in `:settings` opens the complete manager: it displays names without values, `Enter` replaces the selected value, `Ctrl+N` adds a variable, and `Delete` removes one. Value prompts mask their input. Names use the portable form `[A-Za-z_][A-Za-z0-9_]*`.
+
+Variables are global rather than project- or session-specific. URI Agent stores them as plain text in the private `environment.json` configuration file; on Unix it enforces mode `0600` and keeps the configuration directory at `0700`. Filesystem permissions are the protection boundary—values are not encrypted.
+
+Each future Agent `bash` or `pwsh` command receives the latest saved values. A saved value overrides an inherited process variable with the same name; other process variables remain inherited normally. The manager does not modify URI Agent's own process environment, and variables are deliberately not injected into the user-controlled `:terminal` PTY.
+
+The dedicated linked Rust and WASM host interface requires an explicitly requested whole-environment capability. The request names no individual variables and has no interactive approval flow; it exists as a sensitive-access marker for source review. See [WASM plugin environment access](plugins.md#agent-environment-access).
 
 ## Settings fields and precedence
 

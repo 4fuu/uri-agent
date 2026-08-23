@@ -82,6 +82,9 @@ map("selector", "enter", "confirm");
 map("selector", "esc", "close");
 map("selector", "backspace", "backspace");
 
+map("environment", "ctrl+n", "add");
+map("environment", "delete", "remove");
+
 map("tasks", "x", "cancel");
 
 map("command", "enter", "confirm");

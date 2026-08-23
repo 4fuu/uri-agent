@@ -1,11 +1,12 @@
 use super::{render_record, render_task, render_task_list};
-use crate::plugin::{Plugin, PluginHost, PluginRegistry};
+use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, PluginRegistry};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -36,6 +37,9 @@ the result contains its task URI.
 Read `bash://tasks/<id>` for status and bounded output. If that output exceeds
 the system limit, the result includes a `file://` address containing the full
 output.
+
+User-managed Agent environment variables are injected into every command. Use
+secret values by name and do not print them unless the user explicitly asks.
 "#;
 const PWSH_HELP: &str = r#"# pwsh
 
@@ -70,6 +74,9 @@ final PowerShell or native command, and native exit codes are preserved.
 Read `pwsh://tasks/<id>` for status and bounded output. If that output exceeds
 the system limit, the result includes a `file://` address containing the full
 output.
+
+User-managed Agent environment variables are injected into every command. Use
+secret values by name and do not print them unless the user explicitly asks.
 "#;
 
 struct ProcessTreeGuard {
@@ -100,6 +107,7 @@ pub(super) struct ShellProtocol {
     name: &'static str,
     executable: PathBuf,
     cwd: PathBuf,
+    environment: Option<PluginEnvironment>,
 }
 
 impl ShellProtocol {
@@ -108,6 +116,7 @@ impl ShellProtocol {
             name,
             executable,
             cwd: cwd.to_path_buf(),
+            environment: None,
         }
     }
 }
@@ -149,9 +158,19 @@ impl Plugin for PwshPlugin {
         self.warning.iter().cloned().collect()
     }
 
+    fn permissions(&self) -> Vec<PluginPermission> {
+        self.protocol
+            .as_ref()
+            .map(|_| PluginPermission::Environment)
+            .into_iter()
+            .collect()
+    }
+
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         if let Some(protocol) = &self.protocol {
-            host.protocols.register(protocol.clone())?;
+            let mut protocol = protocol.clone();
+            protocol.environment = Some(host.environment()?);
+            host.protocols.register(protocol)?;
         }
         Ok(())
     }
@@ -190,8 +209,14 @@ impl Plugin for ShellProtocol {
         vec![self.descriptor()]
     }
 
+    fn permissions(&self) -> Vec<PluginPermission> {
+        vec![PluginPermission::Environment]
+    }
+
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        host.protocols.register(self.clone())
+        let mut protocol = self.clone();
+        protocol.environment = Some(host.environment()?);
+        host.protocols.register(protocol)
     }
 }
 
@@ -255,6 +280,10 @@ impl Protocol for ShellProtocol {
         let executable = self.executable.clone();
         let cwd = self.cwd.clone();
         let protocol = self.name.to_string();
+        let environment = self
+            .environment
+            .clone()
+            .ok_or_else(|| anyhow!("shell environment is not attached"))?;
         let record = context
             .tasks
             .allocate(self.name, command_label(&command))
@@ -263,7 +292,8 @@ impl Protocol for ShellProtocol {
         let tasks = context.tasks.clone();
         tasks
             .spawn(record, async move {
-                execute(&protocol, &executable, &cwd, &command).await
+                let environment = environment.snapshot().await;
+                execute(&protocol, &executable, &cwd, &command, &environment).await
             })
             .await;
         let Some(wait) = wait else {
@@ -327,7 +357,13 @@ fn encode_pwsh_script(script: &str) -> String {
     BASE64.encode(source)
 }
 
-async fn execute(protocol: &str, executable: &Path, cwd: &Path, script: &str) -> Result<Vec<u8>> {
+async fn execute(
+    protocol: &str,
+    executable: &Path,
+    cwd: &Path,
+    script: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
     let mut command = Command::new(executable);
     let input = if protocol == "bash" {
         command.args(["--noprofile", "--norc"]);
@@ -348,6 +384,7 @@ async fn execute(protocol: &str, executable: &Path, cwd: &Path, script: &str) ->
         command.as_std_mut().process_group(0);
     }
     let mut child = command
+        .envs(environment)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -532,7 +569,9 @@ fn supports_pwsh_7(executable: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentEnvironment;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -542,6 +581,8 @@ mod tests {
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
         assert!(PWSH_HELP.contains("Do not create another background layer"));
         assert!(PWSH_HELP.contains("`pwsh://?wait=30`"));
+        assert!(PWSH_HELP.contains("Agent environment variables are injected"));
+        assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }
 
     #[test]
@@ -674,9 +715,15 @@ mod tests {
         let script = format!(
             "$value = '{long_value}'; Write-Host '中文主机'; Write-Error '中文错误'; [pscustomobject]@{{Name='对象';State='正常'}}; Write-Output \"length=$($value.Length)\""
         );
-        let output = execute("pwsh", &executable, directory.path(), &script)
-            .await
-            .unwrap();
+        let output = execute(
+            "pwsh",
+            &executable,
+            directory.path(),
+            &script,
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("中文主机"));
         assert!(output.contains("Write-Error: 中文错误"));
@@ -689,10 +736,16 @@ mod tests {
         } else {
             "sh -c 'exit 7'"
         };
-        let error = execute("pwsh", &executable, directory.path(), native_failure)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = execute(
+            "pwsh",
+            &executable,
+            directory.path(),
+            native_failure,
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("Exit:"));
         #[cfg(unix)]
         assert!(error.contains("Exit: exit status: 7"));
@@ -706,7 +759,10 @@ mod tests {
         let Some(executable) = find_executable("bash") else {
             return;
         };
-        let shell = ShellProtocol::new("bash", executable, directory.path());
+        let mut shell = ShellProtocol::new("bash", executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
         let context = ProtocolContext {
             tasks: crate::task::TaskManager::new(),
         };
@@ -747,6 +803,35 @@ mod tests {
         assert!(completed.contains("wait-ok"));
     }
 
+    #[tokio::test]
+    async fn shell_execution_injects_managed_values_over_inherited_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(executable) = find_executable("bash") else {
+            return;
+        };
+        let name = format!("URI_AGENT_SHELL_ENV_TEST_{}", uuid::Uuid::now_v7().simple());
+        // SAFETY: the process-unique variable is removed before this test returns.
+        unsafe { std::env::set_var(&name, "inherited") };
+        let environment = Arc::new(AgentEnvironment::load(directory.path()).await.unwrap());
+        environment.set(&name, "managed".to_string()).await.unwrap();
+        let values = PluginEnvironment::new(environment).snapshot().await;
+
+        let output = execute(
+            "bash",
+            &executable,
+            directory.path(),
+            &format!("printf '%s' \"${name}\""),
+            &values,
+        )
+        .await
+        .unwrap();
+        // SAFETY: the process-unique variable is no longer used.
+        unsafe { std::env::remove_var(&name) };
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("stdout:\nmanaged"));
+        assert!(!output.contains("inherited"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_completion_does_not_wait_for_quiet_inherited_output_handles() {
@@ -758,6 +843,7 @@ mod tests {
             &executable,
             directory.path(),
             "printf finished; sleep 2 &",
+            &BTreeMap::new(),
         )
         .await
         .unwrap();
@@ -776,6 +862,7 @@ mod tests {
             &executable,
             directory.path(),
             "(for value in 1 2 3 4; do sleep 0.05; printf 'tail%s\\n' \"$value\"; done) &",
+            &BTreeMap::new(),
         )
         .await
         .unwrap();
@@ -796,8 +883,9 @@ mod tests {
         );
         let executable = find_executable("bash").unwrap();
         let cwd = directory.path().to_path_buf();
-        let execution =
-            tokio::spawn(async move { execute("bash", &executable, &cwd, &command).await });
+        let execution = tokio::spawn(async move {
+            execute("bash", &executable, &cwd, &command, &BTreeMap::new()).await
+        });
 
         for _ in 0..50 {
             if started_path.exists() {
