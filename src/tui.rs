@@ -2853,7 +2853,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, services: &LoopServices)
         app.copy_click_release_pending = true;
         return Action::Continue;
     }
-    if close_document_on_outside_click(app, mouse) {
+    if close_float_on_outside_click(app, mouse) {
         return Action::Continue;
     }
     if begin_direct_transcript_selection(app, mouse) {
@@ -3124,8 +3124,8 @@ fn consume_copy_click_release(app: &mut App, mouse: MouseEvent) -> bool {
     }
 }
 
-fn close_document_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
-    if app.overlay != Some(Overlay::Document)
+fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> bool {
+    if !matches!(app.overlay, Some(Overlay::Document | Overlay::Status))
         || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         || !app
             .overlay_bounds
@@ -8634,7 +8634,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_outside_closes_only_the_full_document_float() {
+    fn clicking_outside_closes_the_document_and_status_floats() {
         let mut app = test_app();
         app.overlay = Some(Overlay::Document);
         app.overlay_scroll = 6;
@@ -8651,13 +8651,36 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        assert!(!close_document_on_outside_click(
+        assert!(!close_float_on_outside_click(
             &mut app,
             click(bounds.x, bounds.y)
         ));
         assert!(app.overlay == Some(Overlay::Document));
 
-        assert!(close_document_on_outside_click(
+        assert!(close_float_on_outside_click(
+            &mut app,
+            click(bounds.x.saturating_sub(1), bounds.y)
+        ));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.overlay_scroll, 0);
+        assert!(app.selection.is_none());
+
+        app.overlay = Some(Overlay::Status);
+        app.overlay_scroll = 6;
+        app.selection = Some(TextSelection {
+            start: (20, 8),
+            end: (24, 8),
+        });
+        render_to_string(&mut app, 100, 24);
+        let bounds = app.overlay_bounds.expect("rendered status bounds");
+
+        assert!(!close_float_on_outside_click(
+            &mut app,
+            click(bounds.x.saturating_add(1), bounds.y)
+        ));
+        assert!(app.overlay == Some(Overlay::Status));
+
+        assert!(close_float_on_outside_click(
             &mut app,
             click(bounds.x.saturating_sub(1), bounds.y)
         ));
@@ -8667,7 +8690,7 @@ mod tests {
 
         app.overlay = Some(Overlay::Help);
         app.overlay_bounds = Some(bounds);
-        assert!(!close_document_on_outside_click(
+        assert!(!close_float_on_outside_click(
             &mut app,
             click(bounds.x.saturating_sub(1), bounds.y)
         ));
