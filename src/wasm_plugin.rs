@@ -99,7 +99,7 @@ Add the SDK crate from crates.io:
 crate-type = ["cdylib"]
 
 [dependencies]
-uri-agent-plugin-sdk = "2026.824.4"
+uri-agent-plugin-sdk = "2026.824.5"
 ```
 
 Minimal plugin:
