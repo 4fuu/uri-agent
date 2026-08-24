@@ -12,7 +12,6 @@ TARGETS = {
     "linux_arm": ("aarch64-unknown-linux-musl", "tar.gz"),
     "linux_intel": ("x86_64-unknown-linux-musl", "tar.gz"),
     "mac_arm": ("aarch64-apple-darwin", "tar.gz"),
-    "mac_intel": ("x86_64-apple-darwin", "tar.gz"),
     "windows_intel": ("x86_64-pc-windows-msvc", "zip"),
 }
 
@@ -55,21 +54,16 @@ def formula(version: str, checksums: dict[str, str]) -> str:
         return release_url(version, target, extension), checksums[asset]
 
     mac_arm_url, mac_arm_sha = source("mac_arm")
-    mac_intel_url, mac_intel_sha = source("mac_intel")
     return f'''class UriAgent < Formula
   desc "Protocol-oriented coding agent with a focused terminal interface"
   homepage "{REPOSITORY}"
   version "{version}"
   license "MIT"
+  depends_on arch: :arm64
 
   on_macos do
-    if Hardware::CPU.arm?
-      url "{mac_arm_url}"
-      sha256 "{mac_arm_sha}"
-    else
-      url "{mac_intel_url}"
-      sha256 "{mac_intel_sha}"
-    end
+    url "{mac_arm_url}"
+    sha256 "{mac_arm_sha}"
   end
 
   def install

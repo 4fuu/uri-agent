@@ -75,7 +75,7 @@ Skills 也遵循同一路径：启动时只加入每个已发现 Skill 的名称
 
 ### 安装
 
-在 macOS 上使用 Homebrew：
+在 Apple Silicon macOS 上使用 Homebrew：
 
 ```bash
 brew tap 4fuu/uri-agent https://github.com/4fuu/uri-agent

@@ -16,7 +16,7 @@ cargo check
 
 Manually dispatch `release.yml` with that version. Its date must match the current date in `Asia/Hong_Kong`.
 
-The workflow reruns verification, publishes the SDK before the application crate, builds Linux, macOS, and Windows archives, generates `SHA256SUMS`, updates the in-repository Homebrew formula and Scoop manifest, commits that metadata to `main`, creates the `v<version>` GitHub Release, and tests all three installation paths. It aborts if `main` moves while release jobs are running.
+The workflow reruns verification, publishes the SDK before the application crate, builds x86-64 and ARM64 Linux archives, an Apple Silicon macOS archive, and a 64-bit Windows archive, generates `SHA256SUMS`, updates the in-repository Homebrew formula and Scoop manifest, commits that metadata to `main`, creates the `v<version>` GitHub Release, and tests all three installation paths. It aborts if `main` moves while release jobs are running.
 
 ## First-release setup
 

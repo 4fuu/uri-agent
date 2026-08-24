@@ -49,6 +49,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          [[ "$(uname -m)" == arm64 ]]
           brew tap 4fuu/uri-agent "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
           brew install 4fuu/uri-agent/uri-agent
           uri-agent --version | grep -F "uri-agent $VERSION"

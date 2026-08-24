@@ -75,7 +75,7 @@ Catalog contents and account entitlements change; a listed model still requires 
 
 ### Install
 
-With Homebrew on macOS:
+With Homebrew on Apple Silicon macOS:
 
 ```bash
 brew tap 4fuu/uri-agent https://github.com/4fuu/uri-agent
