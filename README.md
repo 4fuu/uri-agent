@@ -51,6 +51,18 @@ Skills follow the same path: startup adds only each discovered Skill's name and 
 - **Durable, observable work:** managed tasks expose status and final output; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
 - **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
 
+## pi.dev model coverage
+
+URI Agent is compatible with the model configurations distributed through pi.dev. As of 2026-08-24, its implemented API families cover:
+
+| Catalog measure | Supported |
+| --- | ---: |
+| API families | 5 of 9 |
+| Model entries | 1,107 of 1,307 (84.7%) |
+| Provider IDs | 35 of 39 |
+
+Catalog contents and account entitlements change; a listed model still requires the matching credential, region, and subscription. See [Models and configuration](docs/configuration.md#model-catalog) for the exact API families and authentication requirements.
+
 ## Quick start
 
 ### Requirements

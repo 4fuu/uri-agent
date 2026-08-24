@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub(crate) use providers::chatgpt_account_id;
 pub use util::parse_authorization_input;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,7 +70,7 @@ impl OauthProvider {
         match self {
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
             Self::OpenRouter => "OpenRouter OAuth",
-            Self::OpenAiCodex => "OpenAI (ChatGPT Plus/Pro)",
+            Self::OpenAiCodex => "OpenAI Codex",
             Self::GitHubCopilot => "GitHub Copilot",
             Self::KimiCoding => "Kimi Code (subscription)",
             Self::Xai => "xAI (Grok/X subscription)",
@@ -93,7 +94,7 @@ impl OauthProvider {
                 OauthMethod {
                     id: "browser",
                     label: "Browser login",
-                    description: "ChatGPT Plus/Pro in the browser",
+                    description: "OpenAI account login in the browser",
                 },
                 OauthMethod {
                     id: "device_code",

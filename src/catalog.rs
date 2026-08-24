@@ -36,6 +36,7 @@ impl CatalogModel {
         matches!(
             self.api.as_str(),
             "openai-responses"
+                | "openai-codex-responses"
                 | "openai-completions"
                 | "anthropic-messages"
                 | "google-generative-ai"
@@ -873,6 +874,17 @@ mod tests {
         let (merged, warnings) = merge_catalog(&store, &ModelsFile::default());
         assert!(warnings.is_empty());
         assert_eq!(merged["azure-openai-responses"].len(), 1);
+    }
+
+    #[test]
+    fn openai_codex_catalog_models_are_runnable() {
+        let model: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "gpt-5.4", "name": "GPT-5.4", "api": "openai-codex-responses",
+            "provider": "openai-codex", "baseUrl": "https://chatgpt.com/backend-api"
+        }))
+        .unwrap();
+
+        assert!(model.supported());
     }
 
     #[test]

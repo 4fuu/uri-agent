@@ -19,11 +19,16 @@ URI Agent does not choose a default provider or model. After starting it in a pr
 URI Agent downloads provider and model records from pi.dev and merges them with the local `models.json`. The Rust/Rig backend currently runs these API families:
 
 - `openai-responses`
+- `openai-codex-responses`
 - `openai-completions`
 - `anthropic-messages`
 - `google-generative-ai`
 
-The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle.
+The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. In the pi.dev catalog checked on 2026-08-24, these five of nine API families contain 1,107 of 1,307 model entries (84.7%) across 35 of 39 provider IDs. This measures catalog entries, not account entitlement: availability still depends on the selected provider, credentials, region, and subscription, and later catalog revisions will change the counts.
+
+`openai-codex-responses` targets the ChatGPT Codex subscription endpoint and uses WebSocket streaming by default. URI Agent supplies the account ID from the OAuth access token, stable session headers and prompt cache key, and the Codex Responses request fields required for reasoning and tool calls. Within a session it reuses an idle connection, retains it for up to five idle minutes or 55 minutes total, and—when request options and history still match—continues from `previous_response_id` while sending only newly appended input. A busy connection is never shared between concurrent requests.
+
+WebSocket setup or transport failure before the first provider event falls back to SSE and disables WebSocket for the rest of that session. A failure after an event is returned instead of replaying the request over SSE, which avoids duplicated text or tool calls. An expired `previous_response_id` is retried once with the full input, and a connection-limit response is retried once on a fresh WebSocket. Requests always set `store: false`.
 
 The active backend applies catalog data relevant to requests and accounting, including:
 
@@ -63,6 +68,8 @@ Offline mode still loads `models-store.json` and `models.json`; it only disables
 | `exa` | API key for built-in web search and page extraction |
 
 Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent attempts to refresh expired entries that include a refresh token. On Unix, URI Agent creates `auth.json` with mode `0600` and the configuration directory with mode `0700`.
+
+Models using `openai-codex-responses` require the `openai-codex` OAuth entry created by the OpenAI browser or device-code login. An OpenAI Platform API key—including `OPENAI_API_KEY`, `URI_AGENT_API_KEY`, or `--api-key`—is not accepted for this subscription endpoint. Model availability is determined by the signed-in ChatGPT account and its subscription.
 
 Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` protocol recognizes `PARALLEL_API_KEY` and `EXA_API_KEY` for web search and page extraction.
 

@@ -5189,6 +5189,7 @@ dependencies = [
  "textwrap",
  "tokio",
  "tokio-rusqlite",
+ "tokio-tungstenite",
  "tokio-util",
  "tui-term",
  "tui-textarea-2",

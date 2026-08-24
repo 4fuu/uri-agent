@@ -367,7 +367,7 @@ fn credentials_from_codex(token: OauthToken) -> Result<OauthToken> {
     )])))
 }
 
-fn chatgpt_account_id(access: &str) -> Result<String> {
+pub(crate) fn chatgpt_account_id(access: &str) -> Result<String> {
     let payload = access
         .split('.')
         .nth(1)
@@ -1061,6 +1061,7 @@ fn random_hex(bytes: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn anthropic_and_copilot_client_ids_match_pi() {
@@ -1084,5 +1085,20 @@ mod tests {
             normalize_github_domain("https://company.ghe.com".into()).unwrap(),
             "company.ghe.com"
         );
+    }
+
+    #[test]
+    fn extracts_chatgpt_account_id_from_access_token() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "account-123"
+                }
+            }))
+            .unwrap(),
+        );
+        let token = format!("header.{payload}.signature");
+
+        assert_eq!(chatgpt_account_id(&token).unwrap(), "account-123");
     }
 }

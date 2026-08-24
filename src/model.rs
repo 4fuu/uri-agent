@@ -1,5 +1,7 @@
 use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits, ThinkingLevel};
+use crate::codex_websocket::CodexWebSocketTransport;
 use crate::config::{ActiveSettings, AuthKind, resolve_config_value};
+use crate::oauth;
 use crate::prompts;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -12,7 +14,7 @@ use rig::completion::{
 };
 use rig::http_client::HttpClientExt;
 use rig::message::{AssistantContent, Message};
-use rig::providers::{anthropic, gemini, openai};
+use rig::providers::{anthropic, chatgpt, gemini, openai};
 use rig::streaming::StreamedAssistantContent;
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
@@ -463,6 +465,7 @@ impl ModelRequestTransform {
         };
         match self.model.api.as_str() {
             "openai-responses" => self.openai_responses(body),
+            "openai-codex-responses" => self.openai_codex_responses(body),
             "openai-completions" => self.openai_completions(body),
             "anthropic-messages" => self.anthropic(body),
             "google-generative-ai" => self.google(body),
@@ -473,6 +476,12 @@ impl ModelRequestTransform {
 
     fn transform_headers(&self, headers: &mut HeaderMap) {
         self.apply_session_affinity(headers);
+        if self.model.api == "openai-codex-responses" {
+            headers.insert(
+                HeaderName::from_static("openai-beta"),
+                HeaderValue::from_static("responses=experimental"),
+            );
+        }
         if self.model.api != "anthropic-messages" {
             return;
         }
@@ -502,6 +511,20 @@ impl ModelRequestTransform {
     }
 
     fn apply_session_affinity(&self, headers: &mut HeaderMap) {
+        if self.model.api == "openai-codex-responses" {
+            headers.remove("session_id");
+            let Some(session_id) = self.codex_session_id() else {
+                return;
+            };
+            let insert = |headers: &mut HeaderMap, name: &'static str| {
+                if let Ok(value) = HeaderValue::from_str(&session_id) {
+                    headers.insert(HeaderName::from_static(name), value);
+                }
+            };
+            insert(headers, "session-id");
+            insert(headers, "x-client-request-id");
+            return;
+        }
         let Some(session_id) = self.session_id.as_deref() else {
             return;
         };
@@ -549,6 +572,13 @@ impl ModelRequestTransform {
         }
     }
 
+    fn codex_session_id(&self) -> Option<String> {
+        self.session_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(64).collect())
+    }
+
     fn compat_bool(&self, key: &str, default: bool) -> bool {
         self.model
             .compat(key)
@@ -578,8 +608,13 @@ impl ModelRequestTransform {
         }
     }
 
-    fn apply_tool_strictness(&self, body: &mut Map<String, Value>, default: bool) {
-        let supported = self.compat_bool("supportsStrictMode", default);
+    fn apply_tool_strictness(
+        &self,
+        body: &mut Map<String, Value>,
+        supported_default: bool,
+        value: Value,
+    ) {
+        let supported = self.compat_bool("supportsStrictMode", supported_default);
         let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
             return;
         };
@@ -597,7 +632,7 @@ impl ModelRequestTransform {
             };
             let Some(function) = function else { continue };
             if supported {
-                function.entry("strict").or_insert(Value::Bool(false));
+                function.entry("strict").or_insert_with(|| value.clone());
             } else {
                 function.remove("strict");
             }
@@ -612,7 +647,12 @@ impl ModelRequestTransform {
                 Value::String(session_id.clone()),
             );
         }
-        self.apply_tool_strictness(body, false);
+        let (strict_supported, strict_value) = if self.model.api == "openai-codex-responses" {
+            (true, Value::Null)
+        } else {
+            (false, Value::Bool(false))
+        };
+        self.apply_tool_strictness(body, strict_supported, strict_value);
         if self.model.reasoning() {
             if self.thinking.enabled() {
                 body.insert(
@@ -636,6 +676,24 @@ impl ModelRequestTransform {
             }
         }
         self.apply_sampling_params(body);
+    }
+
+    fn openai_codex_responses(&self, body: &mut Map<String, Value>) {
+        self.openai_responses(body);
+        if !self.thinking.enabled() {
+            body.remove("reasoning");
+        }
+        body.insert("stream".to_string(), Value::Bool(true));
+        body.insert(
+            "include".to_string(),
+            json!(["reasoning.encrypted_content"]),
+        );
+        body.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+        body.insert("parallel_tool_calls".to_string(), Value::Bool(true));
+        body.insert("text".to_string(), json!({"verbosity": "low"}));
+        if let Some(session_id) = self.codex_session_id() {
+            body.insert("prompt_cache_key".to_string(), Value::String(session_id));
+        }
     }
 
     fn completions_compat(&self, key: &str, default: bool) -> bool {
@@ -759,7 +817,7 @@ impl ModelRequestTransform {
             self.model.provider.as_str(),
             "moonshotai" | "moonshotai-cn" | "together" | "cloudflare-ai-gateway" | "nvidia"
         );
-        self.apply_tool_strictness(body, strict_default);
+        self.apply_tool_strictness(body, strict_default, Value::Bool(false));
         self.apply_developer_role(body);
         self.apply_openai_cache_control(body);
         self.apply_reasoning_replay_compat(body);
@@ -1264,6 +1322,7 @@ pub(crate) struct AuthClient {
     inner: reqwest::Client,
     strip_x_api_key: bool,
     transform: Option<ModelRequestTransform>,
+    codex_websocket: Option<CodexWebSocketTransport>,
 }
 
 impl AuthClient {
@@ -1323,7 +1382,16 @@ impl HttpClientExt for AuthClient {
     where
         T: Into<bytes::Bytes> + Send,
     {
-        HttpClientExt::send_streaming(&self.inner, self.prepare(req))
+        let inner = self.inner.clone();
+        let request = self.prepare(req);
+        let codex_websocket = self.codex_websocket.clone();
+        async move {
+            if let Some(codex_websocket) = codex_websocket {
+                codex_websocket.send(inner, request).await
+            } else {
+                HttpClientExt::send_streaming(&inner, request).await
+            }
+        }
     }
 }
 
@@ -1335,6 +1403,7 @@ pub(crate) struct RigBackend {
 
 pub(crate) enum RigClient {
     OpenAiResponses(openai::responses_api::ResponsesCompletionModel<AuthClient>),
+    OpenAiCodexResponses(chatgpt::ResponsesCompletionModel<AuthClient>),
     OpenAiCompletions(openai::completion::CompletionModel<AuthClient>),
     Anthropic(anthropic::completion::CompletionModel<AuthClient>),
     Gemini(gemini::completion::CompletionModel<AuthClient>),
@@ -1349,6 +1418,16 @@ impl RigBackend {
         thinking: ThinkingLevel,
         session_id: Option<&str>,
     ) -> Result<Self> {
+        if model.api == "openai-codex-responses" {
+            if model.provider != "openai-codex" {
+                bail!("openai-codex-responses is only supported for the openai-codex provider");
+            }
+            if auth_kind != AuthKind::Oauth {
+                bail!(
+                    "openai-codex-responses requires ChatGPT/Codex subscription OAuth; run :login and select OpenAI"
+                );
+            }
+        }
         let mut headers = resolved_headers(model, environment).await?;
         if model
             .metadata
@@ -1379,6 +1458,10 @@ impl RigBackend {
         }
         let limits = model.limits();
         let thinking = clamp_thinking_level(model, thinking);
+        let codex_account_id = (model.api == "openai-codex-responses")
+            .then(|| oauth::chatgpt_account_id(api_key))
+            .transpose()
+            .context("invalid ChatGPT/Codex OAuth access token")?;
         let request_client = AuthClient {
             inner: reqwest::Client::new(),
             strip_x_api_key: anthropic_oauth,
@@ -1387,6 +1470,8 @@ impl RigBackend {
                 thinking,
                 session_id: session_id.map(str::to_string),
             }),
+            codex_websocket: (model.api == "openai-codex-responses")
+                .then(|| CodexWebSocketTransport::new(session_id.zip(codex_account_id.as_deref()))),
         };
         let client = match model.api.as_str() {
             "openai-responses" => RigClient::OpenAiResponses(
@@ -1399,6 +1484,30 @@ impl RigBackend {
                     .context("cannot initialize OpenAI provider")?
                     .completion_model(&model.id),
             ),
+            "openai-codex-responses" => {
+                let account_id = codex_account_id.expect("Codex account ID validated above");
+                RigClient::OpenAiCodexResponses(
+                    chatgpt::Client::builder()
+                        .api_key(chatgpt::ChatGPTAuth::AccessToken {
+                            access_token: api_key.to_string(),
+                            account_id: Some(account_id),
+                        })
+                        .base_url(normalize_chatgpt_codex_base_url(&model.base_url))
+                        .http_headers(headers)
+                        .http_client(request_client)
+                        .default_instructions("")
+                        .originator("pi")
+                        .user_agent(format!(
+                            "uri-agent/{} ({} {}; pi)",
+                            env!("CARGO_PKG_VERSION"),
+                            std::env::consts::OS,
+                            std::env::consts::ARCH
+                        ))
+                        .build()
+                        .context("cannot initialize ChatGPT/Codex provider")?
+                        .completion_model(&model.id),
+                )
+            }
             "openai-completions" => RigClient::OpenAiCompletions(
                 openai::CompletionsClient::builder()
                     .api_key(api_key)
@@ -1421,6 +1530,7 @@ impl RigBackend {
                             thinking,
                             session_id: session_id.map(str::to_string),
                         }),
+                        codex_websocket: None,
                         strip_x_api_key: anthropic_oauth,
                     });
                 if anthropic_oauth {
@@ -1516,6 +1626,23 @@ fn normalize_gemini_base_url(base_url: &str) -> &str {
         .unwrap_or_else(|| base_url.trim_end_matches('/'))
 }
 
+fn normalize_chatgpt_codex_base_url(base_url: &str) -> String {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let base_url = if base_url.is_empty() {
+        "https://chatgpt.com/backend-api"
+    } else {
+        base_url
+    };
+    if let Some(base_url) = base_url.strip_suffix("/codex/responses") {
+        return format!("{base_url}/codex");
+    }
+    if base_url.ends_with("/codex") {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/codex")
+    }
+}
+
 #[async_trait]
 impl ModelBackend for RigBackend {
     async fn complete(
@@ -1533,6 +1660,9 @@ impl ModelBackend for RigBackend {
             RigClient::OpenAiResponses(model) => {
                 complete_with(model, request, max_tokens, deltas).await
             }
+            RigClient::OpenAiCodexResponses(model) => {
+                complete_with(model, request, max_tokens, deltas).await
+            }
             RigClient::OpenAiCompletions(model) => {
                 complete_with(model, request, max_tokens, deltas).await
             }
@@ -1541,6 +1671,7 @@ impl ModelBackend for RigBackend {
         }?;
         let api = match &self.client {
             RigClient::OpenAiResponses(_) => "openai-responses",
+            RigClient::OpenAiCodexResponses(_) => "openai-codex-responses",
             RigClient::OpenAiCompletions(_) => "openai-completions",
             RigClient::Anthropic(_) => "anthropic-messages",
             RigClient::Gemini(_) => "google-generative-ai",
@@ -1567,7 +1698,10 @@ impl ModelBackend for RigBackend {
 fn normalize_usage_for_api(api: &str, usage: &mut rig::completion::Usage) {
     if matches!(
         api,
-        "openai-responses" | "openai-completions" | "google-generative-ai"
+        "openai-responses"
+            | "openai-codex-responses"
+            | "openai-completions"
+            | "google-generative-ai"
     ) {
         usage.input_tokens = usage
             .input_tokens
@@ -1677,6 +1811,16 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use futures_util::SinkExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        Request as WebSocketRequest, Response as WebSocketResponse,
+    };
 
     fn catalog_model(api: &str, metadata: Value) -> CatalogModel {
         let mut model = CatalogModel {
@@ -1703,6 +1847,195 @@ mod tests {
             .transform_bytes(bytes::Bytes::from(bytes)),
         )
         .unwrap()
+    }
+
+    fn codex_access_token() -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "account-123"
+                }
+            }))
+            .unwrap(),
+        );
+        format!("header.{payload}.signature")
+    }
+
+    fn codex_model(base_url: String) -> CatalogModel {
+        let mut model = catalog_model(
+            "openai-codex-responses",
+            json!({
+                "reasoning": true,
+                "thinkingLevelMap": {"high": "xhigh"},
+                "contextWindow": 128000,
+                "maxTokens": 32768
+            }),
+        );
+        model.id = "gpt-5.4".to_string();
+        model.provider = "openai-codex".to_string();
+        model.base_url = base_url;
+        model
+    }
+
+    async fn server_once(
+        status: &str,
+        content_type: &str,
+        body: String,
+    ) -> (
+        String,
+        oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Request-Id: codex-request-1\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "client closed before sending HTTP headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                if attempt == 0 {
+                    assert!(headers.to_ascii_lowercase().contains("upgrade: websocket"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or_default();
+                while request.len() < header_end + content_length {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let _ = request_tx.send(String::from_utf8(request).unwrap());
+                stream.write_all(response.as_bytes()).await.unwrap();
+                break;
+            }
+        });
+        (format!("http://{address}/backend-api"), request_rx, task)
+    }
+
+    fn request_json(request: &str) -> Value {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
+    fn codex_completed_event(response_id: &str, message_id: &str, text: &str) -> Value {
+        json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "error": null,
+                "incomplete_details": null,
+                "instructions": null,
+                "max_output_tokens": null,
+                "model": "gpt-5.4",
+                "usage": {
+                    "input_tokens": 4,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 1,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 5
+                },
+                "output": [{
+                    "type": "message",
+                    "id": message_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "annotations": [], "text": text}]
+                }],
+                "tools": []
+            }
+        })
+    }
+
+    async fn read_codex_websocket_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> Value {
+        let request = websocket.next().await.unwrap().unwrap();
+        let WebSocketMessage::Text(request) = request else {
+            panic!("expected WebSocket text request")
+        };
+        serde_json::from_str(&request).unwrap()
+    }
+
+    async fn send_codex_websocket_response(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        response_id: &str,
+        message_id: &str,
+        text: &str,
+    ) {
+        websocket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "sequence_number": 1,
+                    "delta": text
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(WebSocketMessage::Text(
+                codex_completed_event(response_id, message_id, text)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn complete_codex_history(
+        backend: &RigBackend,
+        history: Vec<Message>,
+    ) -> Result<ModelResponse> {
+        let (deltas, _) = mpsc::unbounded_channel();
+        backend
+            .complete(
+                ModelRequest {
+                    system: "system".to_string(),
+                    history,
+                    tools: false,
+                    estimated_context: 0,
+                    max_output_tokens: None,
+                },
+                deltas,
+            )
+            .await
     }
 
     #[test]
@@ -1737,6 +2070,687 @@ mod tests {
 
         assert_eq!(body["input"], "hello");
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn codex_request_transform_matches_pi_sse_contract() {
+        let model = codex_model("https://chatgpt.com/backend-api".to_string());
+        let session_id = "x".repeat(80);
+        let transform = ModelRequestTransform {
+            model,
+            thinking: ThinkingLevel::High,
+            session_id: Some(session_id),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("random-rig-id"));
+        transform.transform_headers(&mut headers);
+        let body: Value = serde_json::from_slice(
+            &transform.transform_bytes(bytes::Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.4",
+                    "tools": [{"type": "function", "name": "read"}]
+                }))
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(headers["openai-beta"], "responses=experimental");
+        assert_eq!(headers["session-id"], "x".repeat(64));
+        assert_eq!(headers["x-client-request-id"], "x".repeat(64));
+        assert!(!headers.contains_key("session_id"));
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["prompt_cache_key"], "x".repeat(64));
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["tools"][0]["strict"], Value::Null);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        let off = transformed(
+            codex_model("https://chatgpt.com/backend-api".to_string()),
+            ThinkingLevel::Off,
+            json!({}),
+        );
+        assert!(off.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn codex_base_url_adds_the_backend_path_once() {
+        assert_eq!(
+            normalize_chatgpt_codex_base_url("https://chatgpt.com/backend-api"),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(
+            normalize_chatgpt_codex_base_url("https://chatgpt.com/backend-api/codex/"),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(
+            normalize_chatgpt_codex_base_url("https://chatgpt.com/backend-api/codex/responses/"),
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(
+            normalize_chatgpt_codex_base_url(""),
+            "https://chatgpt.com/backend-api/codex"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // Required by tungstenite's handshake callback result type.
+    async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (handshake_tx, handshake_rx) = oneshot::channel();
+        let (requests_tx, requests_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut handshake_tx = Some(handshake_tx);
+            let mut websocket = accept_hdr_async(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    let capture = (request.uri().clone(), request.headers().clone());
+                    let _ = handshake_tx.take().unwrap().send(capture);
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut requests = Vec::new();
+            for (index, (response_id, message_id, text)) in [
+                ("resp_1", "msg_1", "first answer"),
+                ("resp_2", "msg_2", "second answer"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                requests.push(read_codex_websocket_request(&mut websocket).await);
+                send_codex_websocket_response(&mut websocket, response_id, message_id, text).await;
+                assert_eq!(index, requests.len() - 1);
+            }
+            let _ = requests_tx.send(requests);
+            let _ = websocket.close(None).await;
+        });
+        let backend = RigBackend::new(
+            &codex_model(format!("http://{address}/backend-api")),
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::Off,
+            Some("codex-reuse-session"),
+        )
+        .await
+        .unwrap();
+        let (deltas, _) = mpsc::unbounded_channel();
+        let first = backend
+            .complete(
+                ModelRequest {
+                    system: "system".to_string(),
+                    history: vec![Message::user("first question")],
+                    tools: false,
+                    estimated_context: 0,
+                    max_output_tokens: None,
+                },
+                deltas,
+            )
+            .await
+            .unwrap();
+        let resumed_backend = RigBackend::new(
+            &codex_model(format!("http://{address}/backend-api")),
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::Off,
+            Some("codex-reuse-session"),
+        )
+        .await
+        .unwrap();
+        let (deltas, _) = mpsc::unbounded_channel();
+        let second = resumed_backend
+            .complete(
+                ModelRequest {
+                    system: "system".to_string(),
+                    history: vec![
+                        Message::user("first question"),
+                        Message::Assistant {
+                            id: None,
+                            content: first.content,
+                        },
+                        Message::user("second question"),
+                    ],
+                    tools: false,
+                    estimated_context: 0,
+                    max_output_tokens: None,
+                },
+                deltas,
+            )
+            .await
+            .unwrap();
+        let (uri, headers) = handshake_rx.await.unwrap();
+        let requests = requests_rx.await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(uri.path(), "/backend-api/codex/responses");
+        assert_eq!(headers["chatgpt-account-id"], "account-123");
+        assert_eq!(headers["originator"], "pi");
+        assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+        assert_eq!(headers["session-id"], "codex-reuse-session");
+        assert_eq!(headers["x-client-request-id"], "codex-reuse-session");
+        assert!(
+            headers["authorization"]
+                .to_str()
+                .unwrap()
+                .starts_with("Bearer header.")
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["type"], "response.create");
+        assert_eq!(requests[0]["store"], false);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert_eq!(
+            requests[1]["previous_response_id"], "resp_1",
+            "second request did not use continuation: {:#?}",
+            requests[1]
+        );
+        assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[1]["input"][0]["role"], "user");
+        assert_eq!(
+            requests[1]["input"][0]["content"][0]["text"],
+            "second question"
+        );
+        assert!(second.content.iter().any(
+            |content| matches!(content, AssistantContent::Text(text) if text.text == "second answer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_retries_stale_continuation_with_full_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = read_codex_websocket_request(&mut websocket).await;
+            send_codex_websocket_response(&mut websocket, "resp_1", "msg_1", "first answer").await;
+            let continuation = read_codex_websocket_request(&mut websocket).await;
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({"type": "codex.rate_limits", "remaining": 1})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "code": "previous_response_not_found",
+                            "message": "continuation expired"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut retry_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let retry = read_codex_websocket_request(&mut retry_websocket).await;
+            send_codex_websocket_response(&mut retry_websocket, "resp_2", "msg_2", "second answer")
+                .await;
+            let _ = requests_tx.send(vec![first, continuation, retry]);
+        });
+        let backend = RigBackend::new(
+            &codex_model(format!("http://{address}/backend-api")),
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::Off,
+            Some("codex-stale-session"),
+        )
+        .await
+        .unwrap();
+        let first = complete_codex_history(&backend, vec![Message::user("first question")])
+            .await
+            .unwrap();
+        let second = complete_codex_history(
+            &backend,
+            vec![
+                Message::user("first question"),
+                Message::Assistant {
+                    id: None,
+                    content: first.content,
+                },
+                Message::user("second question"),
+            ],
+        )
+        .await
+        .unwrap();
+        let requests = requests_rx.await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(requests[1]["previous_response_id"], "resp_1");
+        assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+        assert!(requests[2].get("previous_response_id").is_none());
+        let retry_input = requests[2]["input"].as_array().unwrap();
+        assert_eq!(retry_input.len(), 3);
+        assert_eq!(retry_input[0]["role"], "user");
+        assert_eq!(retry_input[1]["role"], "assistant");
+        assert_eq!(retry_input[2]["role"], "user");
+        assert!(second.content.iter().any(
+            |content| matches!(content, AssistantContent::Text(text) if text.text == "second answer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_retries_connection_limit_on_a_new_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = read_codex_websocket_request(&mut websocket).await;
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "code": "websocket_connection_limit_reached",
+                            "message": "retry on another connection"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut retry_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let retry = read_codex_websocket_request(&mut retry_websocket).await;
+            send_codex_websocket_response(
+                &mut retry_websocket,
+                "resp_1",
+                "msg_1",
+                "retried answer",
+            )
+            .await;
+            let _ = requests_tx.send(vec![first, retry]);
+        });
+        let backend = RigBackend::new(
+            &codex_model(format!("http://{address}/backend-api")),
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::Off,
+            Some("codex-limit-session"),
+        )
+        .await
+        .unwrap();
+        let response = complete_codex_history(&backend, vec![Message::user("question")])
+            .await
+            .unwrap();
+        let requests = requests_rx.await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("previous_response_id").is_none());
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[0]["input"], requests[1]["input"]);
+        assert!(response.content.iter().any(
+            |content| matches!(content, AssistantContent::Text(text) if text.text == "retried answer")
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_websocket_does_not_fall_back_after_output_starts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reconnected_tx, reconnected_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _request = read_codex_websocket_request(&mut websocket).await;
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_1",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "sequence_number": 1,
+                        "delta": "partial"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+            let reconnected = tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_ok();
+            let _ = reconnected_tx.send(reconnected);
+        });
+        let backend = RigBackend::new(
+            &codex_model(format!("http://{address}/backend-api")),
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::Off,
+            Some("codex-no-replay-session"),
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            complete_codex_history(&backend, vec![Message::user("question")]),
+        )
+        .await
+        .expect("Codex stream did not terminate after WebSocket close");
+        let reconnected = reconnected_rx.await.unwrap();
+        server.await.unwrap();
+
+        assert!(result.is_err());
+        assert!(!reconnected, "request was replayed after output started");
+    }
+
+    #[tokio::test]
+    async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
+        let terminal_response = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "gpt-5.4",
+            "usage": {
+                "input_tokens": 11,
+                "input_tokens_details": {"cached_tokens": 3},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 16
+            },
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "annotations": [], "text": "你好"}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{\"uri\":\"file://README.md\"}",
+                    "status": "completed"
+                }
+            ],
+            "tools": []
+        });
+        let events = [
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "sequence_number": 1,
+                "delta": "检查"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "content_index": 0,
+                "sequence_number": 2,
+                "delta": "你"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "content_index": 0,
+                "sequence_number": 3,
+                "delta": "好"
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item_id": "fc_1",
+                "output_index": 2,
+                "sequence_number": 4,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "",
+                    "status": "in_progress"
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 2,
+                "sequence_number": 5,
+                "delta": "{\"uri\":\"file://README.md\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item_id": "fc_1",
+                "output_index": 2,
+                "sequence_number": 6,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{\"uri\":\"file://README.md\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "sequence_number": 7,
+                "response": terminal_response
+            }),
+        ];
+        let mut sse = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        sse.push_str("data: [DONE]\n\n");
+        let (base_url, request_rx, server) = server_once("200 OK", "text/event-stream", sse).await;
+        let backend = RigBackend::new(
+            &codex_model(base_url),
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::High,
+            Some("codex-sse-stream-session"),
+        )
+        .await
+        .unwrap();
+        let (deltas_tx, mut deltas_rx) = mpsc::unbounded_channel();
+
+        let response = backend
+            .complete(
+                ModelRequest {
+                    system: "System instructions".to_string(),
+                    history: vec![Message::user("hello")],
+                    tools: true,
+                    estimated_context: 100,
+                    max_output_tokens: Some(4096),
+                },
+                deltas_tx,
+            )
+            .await
+            .unwrap();
+        let request = request_rx.await.unwrap();
+        server.await.unwrap();
+        let request_body = request_json(&request);
+        let request_headers = request
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .to_ascii_lowercase();
+
+        assert!(request.starts_with("POST /backend-api/codex/responses HTTP/1.1"));
+        assert!(request_headers.contains("authorization: bearer header."));
+        assert!(request_headers.contains("chatgpt-account-id: account-123"));
+        assert!(request_headers.contains("originator: pi"));
+        assert!(request_headers.contains("openai-beta: responses=experimental"));
+        assert!(request_headers.contains("session-id: codex-sse-stream-session"));
+        assert!(request_headers.contains("x-client-request-id: codex-sse-stream-session"));
+        assert!(!request_headers.contains("session_id:"));
+        assert!(request_headers.contains("user-agent: uri-agent/"));
+        assert_eq!(request_body["model"], "gpt-5.4");
+        assert_eq!(request_body["instructions"], "System instructions");
+        assert_eq!(request_body["input"][0]["role"], "user");
+        assert_eq!(request_body["tools"].as_array().unwrap().len(), 2);
+        assert!(
+            request_body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("strict") == Some(&Value::Null))
+        );
+        assert_eq!(request_body["reasoning"]["effort"], "xhigh");
+        assert_eq!(request_body["prompt_cache_key"], "codex-sse-stream-session");
+        assert_eq!(request_body["store"], false);
+        assert_eq!(request_body["stream"], true);
+        assert_eq!(request_body["parallel_tool_calls"], true);
+        assert_eq!(request_body["text"]["verbosity"], "low");
+        assert!(request_body.get("max_output_tokens").is_none());
+
+        let deltas = std::iter::from_fn(|| deltas_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(matches!(&deltas[0], ModelDelta::Reasoning(text) if text == "检查"));
+        assert_eq!(
+            deltas
+                .iter()
+                .filter_map(|delta| match delta {
+                    ModelDelta::Text(text) => Some(text.as_str()),
+                    ModelDelta::Reasoning(_) => None,
+                })
+                .collect::<String>(),
+            "你好"
+        );
+        assert!(response.content.iter().any(|content| {
+            matches!(content, AssistantContent::ToolCall(call)
+                if call.function.name == "read"
+                    && call.function.arguments == json!({"uri": "file://README.md"}))
+        }));
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.reasoning_tokens, 2);
+        assert_eq!(response.context_tokens, Some(16));
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    #[tokio::test]
+    async fn codex_backend_requires_oauth_and_preserves_subscription_errors() {
+        let mut model = codex_model("https://chatgpt.com/backend-api".to_string());
+        model.provider = "custom-codex".to_string();
+        let error = RigBackend::new(
+            &model,
+            &codex_access_token(),
+            &Default::default(),
+            AuthKind::Oauth,
+            ThinkingLevel::Off,
+            Some("session-123"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("openai-codex provider"));
+
+        model.provider = "openai-codex".to_string();
+        let error = RigBackend::new(
+            &model,
+            "ordinary-openai-api-key",
+            &Default::default(),
+            AuthKind::ApiKey,
+            ThinkingLevel::Off,
+            Some("session-123"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("requires ChatGPT/Codex subscription OAuth")
+        );
+
+        for (index, (status, body, expected)) in [
+            (
+                "401 Unauthorized",
+                r#"{"error":{"message":"expired access token"}}"#,
+                ModelFailureKind::Authentication,
+            ),
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"message":"Monthly usage limit reached"}}"#,
+                ModelFailureKind::Quota,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (base_url, _request_rx, server) =
+                server_once(status, "application/json", body.to_string()).await;
+            let session_id = format!("codex-provider-error-{index}");
+            let backend = RigBackend::new(
+                &codex_model(base_url),
+                &codex_access_token(),
+                &Default::default(),
+                AuthKind::Oauth,
+                ThinkingLevel::Off,
+                Some(&session_id),
+            )
+            .await
+            .unwrap();
+            let (deltas, _) = mpsc::unbounded_channel();
+            let error = backend
+                .complete(
+                    ModelRequest {
+                        system: "system".to_string(),
+                        history: vec![Message::user("hello")],
+                        tools: false,
+                        estimated_context: 0,
+                        max_output_tokens: None,
+                    },
+                    deltas,
+                )
+                .await
+                .err()
+                .unwrap();
+            server.await.unwrap();
+            let failure = error.downcast_ref::<ModelFailure>().unwrap();
+            assert_eq!(failure.kind(), expected);
+            assert!(
+                error
+                    .to_string()
+                    .contains(if expected == ModelFailureKind::Quota {
+                        "Monthly usage limit reached"
+                    } else {
+                        "expired access token"
+                    })
+            );
+        }
     }
 
     #[test]
