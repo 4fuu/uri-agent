@@ -344,6 +344,7 @@ async fn show_session(
                 context_accuracy: runtime.context_usage().accuracy,
                 compaction_enabled: active.compaction.enabled,
                 terminal: active.terminal,
+                key_display: active.key_display,
             },
             draft,
         })

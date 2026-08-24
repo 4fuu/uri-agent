@@ -133,6 +133,7 @@ The dedicated linked Rust and WASM host interface requires an explicitly request
 | `defaultThinkingLevel` | Fallback reasoning effort | `off` |
 | `modelThinkingLevels` | Per-model effort keyed by `provider/model` | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
+| `keyDisplay` | Key-hint style: `auto`, `macos`, or `text` | `auto` |
 | `compaction.enabled` | Run threshold and overflow compaction automatically | `true` |
 | `compaction.reserveTokens` | Context held back by the automatic-compaction threshold | `16384` |
 | `compaction.keepRecentTokens` | Approximate recent replay retained after compaction | `20000` |
@@ -156,13 +157,17 @@ Relevant environment variables are:
 | `URI_AGENT_OUTPUT_LIMIT` | Inline output bytes |
 | `URI_AGENT_THINKING` | Thinking level |
 | `URI_AGENT_TERMINAL` | Embedded terminal command |
+| `URI_AGENT_KEY_DISPLAY` | Key-hint style |
 
 When the project settings file already exists, changes made through model selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
 
 Compaction fields merge individually across global and project settings. Token values must be greater than zero. For models with small context windows, the effective reserve and recent-history budgets are each capped at one quarter of the model context window. Disabling automatic compaction also disables automatic provider-overflow recovery; `:compact` remains available.
 
+`keyDisplay: "auto"` uses macOS symbols when URI Agent itself runs on macOS and text labels elsewhere. Set it to `"macos"` when a macOS terminal is controlling URI Agent on a remote non-macOS host, or to `"text"` to force labels such as `Ctrl+R` and `Shift+Enter`. The resolved macOS style also adds Command aliases for Settings, paste, undo, and redo without removing the portable Control and Option bindings. A terminal may consume Command shortcuts before URI Agent receives them, so the portable bindings remain available. Keymaps and their display style are loaded when the TUI starts.
+
 ```json
 {
+  "keyDisplay": "macos",
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,

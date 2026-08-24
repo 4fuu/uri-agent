@@ -10,7 +10,7 @@ use crate::config::{
     ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, display_path,
     validate_environment_name,
 };
-use crate::keymap::{Keymap, canonical_key};
+use crate::keymap::{KeyDisplayStyle, KeyStroke, Keymap};
 use crate::model::{clamp_thinking_level, configured_backend};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
@@ -92,6 +92,7 @@ pub struct TuiInfo {
     pub context_accuracy: ContextAccuracy,
     pub compaction_enabled: bool,
     pub terminal: Option<String>,
+    pub key_display: KeyDisplayStyle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -576,7 +577,7 @@ impl App {
         if !draft.is_empty() {
             input.insert_str(strip_image_references(&draft));
         }
-        style_input(&mut input, false);
+        style_input(&mut input, false, &keymap);
         Self {
             input,
             blocks: Vec::new(),
@@ -1152,7 +1153,7 @@ impl App {
     }
 
     fn sync_composer_chrome(&mut self) {
-        style_input(&mut self.input, self.busy);
+        style_input(&mut self.input, self.busy, &self.keymap);
         self.input.clear_custom_highlight();
         let highlights = self
             .input
@@ -2166,7 +2167,7 @@ impl TuiTerminal {
         let session = runtime.session().clone();
         let mut receiver = session.subscribe();
         let mut pending_receiver = runtime.subscribe_pending_messages();
-        let keymap = Keymap::load(Some(&info.cwd)).await?;
+        let keymap = Keymap::load(Some(&info.cwd), info.key_display).await?;
         let show_splash = std::mem::take(&mut self.first_session);
         let mut app = App::new(
             protocols.descriptors(),
@@ -4140,18 +4141,24 @@ fn open_login_method(app: &mut App, provider: String) -> Action {
 }
 
 fn open_api_key_prompt(app: &mut App, provider: String) {
-    let message = match provider.as_str() {
+    let instructions = match provider.as_str() {
         "parallel" => concat!(
             "Create or copy a key at https://platform.parallel.ai/settings?tab=api-keys, ",
-            "then paste it here. Enter saves, Esc cancels."
+            "then paste it here."
         )
         .to_string(),
-        "exa" => concat!(
-            "Create or copy a key at https://dashboard.exa.ai/api-keys, then paste it here. ",
-            "Enter saves, Esc cancels."
-        )
-        .to_string(),
-        _ => format!("Paste the API key for {provider}. Enter saves, Esc cancels."),
+        "exa" => "Create or copy a key at https://dashboard.exa.ai/api-keys, then paste it here."
+            .to_string(),
+        _ => format!("Paste the API key for {provider}."),
+    };
+    let controls = action_hints(
+        &app.keymap,
+        &[("text", "confirm", "saves"), ("text", "cancel", "cancels")],
+    );
+    let message = if controls.is_empty() {
+        instructions
+    } else {
+        format!("{instructions} {controls}.")
     };
     app.text_prompt = Some(TextPrompt {
         title: format!("API KEY · {provider}"),
@@ -4175,6 +4182,10 @@ fn open_copilot_domain_prompt(app: &mut App) {
 }
 
 async fn open_environment(app: &mut App, environment: &AgentEnvironment, return_to_settings: bool) {
+    let replace = app.keymap.key_hint("selector", "confirm").map_or_else(
+        || "configured".to_string(),
+        |key| format!("configured · {key} replaces value"),
+    );
     let items = environment
         .names()
         .await
@@ -4182,13 +4193,20 @@ async fn open_environment(app: &mut App, environment: &AgentEnvironment, return_
         .map(|name| SelectorItem {
             id: name.clone(),
             title: name,
-            description: "configured · Enter replaces value".to_string(),
+            description: replace.clone(),
             search_text: None,
         })
         .collect();
+    let hints = action_hints(
+        &app.keymap,
+        &[
+            ("environment", "add", "add"),
+            ("environment", "remove", "remove"),
+        ],
+    );
     app.selector = Some(SelectorState::new(
         SelectorKind::Environment { return_to_settings },
-        "AGENT ENVIRONMENT · Ctrl+N add · Delete remove",
+        panel_title("AGENT ENVIRONMENT", hints).trim().to_string(),
         items,
     ));
     app.overlay = Some(Overlay::Selector);
@@ -4267,10 +4285,18 @@ fn open_environment_value_prompt(app: &mut App, name: String, return_to_settings
 }
 
 fn open_set_terminal_prompt(app: &mut App) {
+    let controls = action_hints(
+        &app.keymap,
+        &[("text", "confirm", "saves"), ("text", "cancel", "cancels")],
+    );
+    let message = if controls.is_empty() {
+        "Command used by :terminal, for example pwsh or bash.".to_string()
+    } else {
+        format!("Command used by :terminal, for example pwsh or bash. {controls}.")
+    };
     app.text_prompt = Some(TextPrompt {
         title: "SET TERMINAL".to_string(),
-        message: "Command used by :terminal, for example pwsh or bash. Enter saves, Esc cancels."
-            .to_string(),
+        message,
         value: app.info.terminal.clone().unwrap_or_default(),
         secret: false,
         purpose: TextPurpose::SetTerminal,
@@ -4768,58 +4794,7 @@ fn is_ignored_tui_key(key: KeyEvent, selection_active: bool) -> bool {
 }
 
 fn key_name(key: KeyEvent) -> String {
-    let mut modifiers = Vec::new();
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        modifiers.push("ctrl");
-    }
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        modifiers.push("alt");
-    }
-    if key.modifiers.contains(KeyModifiers::SHIFT)
-        && !matches!(key.code, KeyCode::Char(character) if !character.is_ascii_alphabetic())
-    {
-        modifiers.push("shift");
-    }
-    if key.modifiers.contains(KeyModifiers::SUPER) {
-        modifiers.push("super");
-    }
-    let code = match key.code {
-        KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::Right => "right".to_string(),
-        KeyCode::Up => "up".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::Home => "home".to_string(),
-        KeyCode::End => "end".to_string(),
-        KeyCode::PageUp => "pageup".to_string(),
-        KeyCode::PageDown => "pagedown".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::BackTab => "backtab".to_string(),
-        KeyCode::Delete => "delete".to_string(),
-        KeyCode::Insert => "insert".to_string(),
-        KeyCode::F(number) => format!("f{number}"),
-        KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(character) => {
-            let name: String = character.to_lowercase().collect();
-            canonical_key(&name).to_string()
-        }
-        KeyCode::Null => "null".to_string(),
-        KeyCode::Esc => "esc".to_string(),
-        KeyCode::CapsLock => "capslock".to_string(),
-        KeyCode::ScrollLock => "scrolllock".to_string(),
-        KeyCode::NumLock => "numlock".to_string(),
-        KeyCode::PrintScreen => "printscreen".to_string(),
-        KeyCode::Pause => "pause".to_string(),
-        KeyCode::Menu => "menu".to_string(),
-        KeyCode::KeypadBegin => "keypadbegin".to_string(),
-        KeyCode::Media(_) | KeyCode::Modifier(_) => return String::new(),
-    };
-    if modifiers.is_empty() {
-        code
-    } else {
-        format!("{}+{code}", modifiers.join("+"))
-    }
+    KeyStroke::from_event(key).map_or_else(String::new, |key| key.canonical())
 }
 
 async fn save_settings(
@@ -5441,18 +5416,14 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     } else {
         Line::styled("No model configured. Run :login", Style::default().fg(WARM))
     };
-    let compose = app
-        .keymap
-        .key_for("main", "compose")
-        .unwrap_or_else(|| "space".to_string());
-    let command = app
-        .keymap
-        .key_for("main", "command")
-        .unwrap_or_else(|| ":".to_string());
-    let help = app
-        .keymap
-        .key_for("main", "help")
-        .unwrap_or_else(|| "?".to_string());
+    let hints = action_hints(
+        &app.keymap,
+        &[
+            ("main", "compose", "compose"),
+            ("main", "command", "commands"),
+            ("main", "help", "help"),
+        ],
+    );
     vec![
         Line::styled(
             single_line_preview(&footer_cwd(&app.info.cwd), width.saturating_sub(1)),
@@ -5461,10 +5432,7 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         model,
         Line::default(),
         Line::styled(
-            single_line_preview(
-                &format!("{compose} compose · {command} commands · {help} help"),
-                width.saturating_sub(1),
-            ),
+            single_line_preview(&hints, width.saturating_sub(1)),
             Style::default().fg(MUTED),
         ),
     ]
@@ -5867,11 +5835,15 @@ fn transcript_block_items(
         _ if selected => ROW_ACTIVE,
         _ => BG,
     };
-    let open_key = app
-        .keymap
-        .key_for("main", "open")
-        .unwrap_or_else(|| "o".to_string())
-        .to_ascii_uppercase();
+    let open_hint = app.keymap.key_hint("main", "open").map_or_else(
+        || "right-click opens full".to_string(),
+        |key| format!("{key} or right-click opens full"),
+    );
+    let expand_hint = app.keymap.key_hint("main", "toggle").map_or_else(
+        || "select to expand".to_string(),
+        |key| format!("{key} to expand"),
+    );
+    let collapsed_hint = format!("  ▸ {expand_hint}");
     let mut rows = Vec::new();
 
     match block.kind {
@@ -5907,9 +5879,9 @@ fn transcript_block_items(
                     ),
                     Span::styled(
                         if block.expanded {
-                            "  ▾"
+                            "  ▾".to_string()
                         } else {
-                            "  ▸ Enter to expand"
+                            collapsed_hint.clone()
                         },
                         Style::default().fg(MUTED),
                     ),
@@ -5930,9 +5902,9 @@ fn transcript_block_items(
                     ),
                     Span::styled(
                         if block.expanded {
-                            "  ▾"
+                            "  ▾".to_string()
                         } else {
-                            "  ▸ Enter to expand"
+                            collapsed_hint.clone()
                         },
                         Style::default().fg(MUTED),
                     ),
@@ -5947,7 +5919,8 @@ fn transcript_block_items(
                         extra,
                         "earlier",
                         true,
-                        &open_key,
+                        &open_hint,
+                        &expand_hint,
                         background,
                         block.parent_process.is_some(),
                     ));
@@ -5970,7 +5943,8 @@ fn transcript_block_items(
                         extra,
                         "more",
                         true,
-                        &open_key,
+                        &open_hint,
+                        &expand_hint,
                         background,
                         block.parent_process.is_some(),
                     ));
@@ -6030,7 +6004,8 @@ fn transcript_block_items(
                         extra,
                         "more",
                         true,
-                        &open_key,
+                        &open_hint,
+                        &expand_hint,
                         background,
                         block.parent_process.is_some(),
                     ));
@@ -6081,7 +6056,8 @@ fn transcript_block_items(
                     extra,
                     "more",
                     block.expanded,
-                    &open_key,
+                    &open_hint,
+                    &expand_hint,
                     background,
                     block.parent_process.is_some(),
                 ));
@@ -6111,7 +6087,8 @@ fn transcript_hint(
     extra: usize,
     position: &str,
     expanded: bool,
-    open_key: &str,
+    open_hint: &str,
+    expand_hint: &str,
     background: Color,
     nested: bool,
 ) -> ListItem<'static> {
@@ -6120,11 +6097,7 @@ fn transcript_hint(
         Span::styled(
             format!(
                 "… {extra} {position} lines · {}",
-                if expanded {
-                    format!("{open_key} or right-click opens full")
-                } else {
-                    "Enter expands".to_string()
-                }
+                if expanded { open_hint } else { expand_hint }
             ),
             Style::default().fg(MUTED),
         ),
@@ -6189,20 +6162,26 @@ fn fixed_bottom_notices(app: &App) -> Vec<(String, Color)> {
         .as_ref()
         .filter(|(_, at)| app.busy && at.elapsed() < DOUBLE_CLICK_INTERVAL)
     {
+        let key = app.keymap.display_key(key).unwrap_or_else(|| key.clone());
         notices.push((format!("press {key} again to interrupt"), WARM));
     }
     if !app.pending_messages.is_empty() {
-        let restore = app
-            .keymap
-            .key_for("composer", "restore_pending")
-            .unwrap_or_else(|| "Alt+Up".to_string());
-        notices.push((
-            format!(
-                " {} pending · open composer and restore with {restore}",
-                app.pending_messages.len(),
-            ),
-            WARM,
-        ));
+        let restore = app.keymap.key_hint("composer", "restore_pending");
+        let message = restore.map_or_else(
+            || {
+                format!(
+                    " {} pending · open composer to review",
+                    app.pending_messages.len()
+                )
+            },
+            |restore| {
+                format!(
+                    " {} pending · open composer and restore with {restore}",
+                    app.pending_messages.len(),
+                )
+            },
+        );
+        notices.push((message, WARM));
     }
     if app.jump != JumpKind::All {
         let label = match app.jump {
@@ -6217,13 +6196,16 @@ fn fixed_bottom_notices(app: &App) -> Vec<(String, Color)> {
             .position(|index| *index == app.selected_block)
             .map(|index| index + 1)
             .unwrap_or(0);
-        notices.push((
-            format!(
-                "{label} {position}/{}   esc clear   enter open",
-                indices.len()
-            ),
-            WARM,
-        ));
+        let hints = action_hints(
+            &app.keymap,
+            &[("main", "clear", "clear"), ("main", "toggle", "open")],
+        );
+        let message = if hints.is_empty() {
+            format!("{label} {position}/{}", indices.len())
+        } else {
+            format!("{label} {position}/{}   {hints}", indices.len())
+        };
+        notices.push((message, WARM));
     }
     notices
 }
@@ -6274,12 +6256,44 @@ fn keymap_help(keymap: &Keymap) -> String {
     ] {
         output.push_str(title);
         output.push('\n');
-        for (key, action) in keymap.bindings_for(mode) {
+        for (key, action) in keymap.display_bindings_for(mode) {
             output.push_str(&format!("  {key:<16} {}\n", action.replace('_', " ")));
         }
         output.push('\n');
     }
     output
+}
+
+fn key_alternatives(keymap: &Keymap, bindings: &[(&str, &str)]) -> Option<String> {
+    let mut keys = Vec::new();
+    for (mode, action) in bindings {
+        if let Some(key) = keymap.key_hint(mode, action)
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    (!keys.is_empty()).then(|| keys.join("/"))
+}
+
+fn action_hints(keymap: &Keymap, hints: &[(&str, &str, &str)]) -> String {
+    hints
+        .iter()
+        .filter_map(|(mode, action, label)| {
+            keymap
+                .key_hint(mode, action)
+                .map(|key| format!("{key} {label}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn panel_title(name: &str, hints: String) -> String {
+    if hints.is_empty() {
+        format!(" {name} ")
+    } else {
+        format!(" {name} · {hints} ")
+    }
 }
 
 fn command_help(commands: &CommandRegistry) -> String {
@@ -6592,6 +6606,18 @@ fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
 }
 
 fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let mut hints = app
+        .keymap
+        .key_hint("terminal", "escape")
+        .map(|key| format!("double {key} close"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let shift = app
+        .keymap
+        .modifier_hint("shift")
+        .unwrap_or_else(|| "Shift".to_string());
+    hints.push(format!("{shift}-drag select"));
+    let title = panel_title("TERMINAL", hints.join(" · "));
     let resize_error = {
         let Some(pty) = app.pty.as_mut() else {
             return;
@@ -6609,7 +6635,7 @@ fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ACCENT))
                     .style(Style::default().bg(SURFACE))
-                    .title(" TERMINAL · double Esc close · Shift-drag select "),
+                    .title(title),
             ),
             area,
         );
@@ -6738,7 +6764,11 @@ fn status_row(
 
 fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    frame.render_widget(block.title(" COMMAND · Tab complete "), area);
+    let title = panel_title(
+        "COMMAND",
+        action_hints(&app.keymap, &[("command", "complete", "complete")]),
+    );
+    frame.render_widget(block.title(title), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
@@ -6798,12 +6828,28 @@ fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, area: Rect)
     let Some(completions) = app.completions.as_ref() else {
         return;
     };
+    let select = key_alternatives(
+        &app.keymap,
+        &[("composer", "cursor_up"), ("composer", "cursor_down")],
+    );
+    let insert = key_alternatives(
+        &app.keymap,
+        &[("composer", "submit"), ("composer", "complete")],
+    );
+    let hints = [
+        select.map(|keys| format!("{keys} select")),
+        insert.map(|keys| format!("{keys} insert")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(MUTED))
         .style(Style::default().bg(SURFACE).fg(TEXT))
-        .title(" REFERENCES · ↑↓ select · Enter/Tab insert ");
+        .title(panel_title("REFERENCES", hints));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let count = completions.result.items.len().min(inner.height as usize);
@@ -6862,19 +6908,20 @@ fn pending_preview_height(app: &App) -> u16 {
 }
 
 fn render_pending_messages(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let restore = app
-        .keymap
-        .key_for("composer", "restore_pending")
-        .unwrap_or_else(|| "alt+up".to_string());
-    let upgrade = app
-        .keymap
-        .key_for("composer", "upgrade_pending")
-        .unwrap_or_else(|| "alt+enter".to_string());
+    let hints = action_hints(
+        &app.keymap,
+        &[
+            ("composer", "restore_pending", "restore latest"),
+            ("composer", "upgrade_pending", "upgrade latest queue"),
+        ],
+    );
+    let heading = if hints.is_empty() {
+        "Pending".to_string()
+    } else {
+        format!("Pending · {hints}")
+    };
     let mut lines = vec![Line::styled(
-        single_line_preview(
-            &format!("Pending · {restore} restore latest · {upgrade} upgrade latest queue"),
-            area.width as usize,
-        ),
+        single_line_preview(&heading, area.width as usize),
         Style::default().fg(MUTED).bg(SURFACE),
     )];
     let hidden = app
@@ -6917,8 +6964,20 @@ fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
         return;
     };
     let inner = block.inner(area);
+    let select = key_alternatives(&app.keymap, &[("list", "previous"), ("list", "next")]);
+    let mut hints = select
+        .map(|keys| format!("{keys} select"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let actions = action_hints(
+        &app.keymap,
+        &[("list", "confirm", "choose"), ("list", "close", "back")],
+    );
+    if !actions.is_empty() {
+        hints.push(actions);
+    }
     frame.render_widget(
-        block.title(" SEND WHILE RUNNING · ↑/↓ select · Enter choose · Esc back "),
+        block.title(panel_title("SEND WHILE RUNNING", hints.join(" · "))),
         area,
     );
     let sections = Layout::default()
@@ -7023,7 +7082,11 @@ fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
 
 fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    frame.render_widget(block.title(" MODELS · Ctrl+R refresh "), area);
+    let title = panel_title(
+        "MODELS",
+        action_hints(&app.keymap, &[("models", "refresh", "refresh")]),
+    );
+    frame.render_widget(block.title(title), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -7152,30 +7215,45 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
     } else {
         format!("{} bytes", settings.output_limit)
     };
-    let rows = [
-        ("Model", format!("{} / {model}", settings.provider())),
-        ("Credential", credential),
-        ("Thinking", settings.thinking.to_string()),
-        ("Output limit", output_limit),
-        (
-            "Agent environment",
+    let edit = app.keymap.key_hint("settings", "edit");
+    let environment = edit.as_ref().map_or_else(
+        || {
             format!(
-                "{} variable{} · Enter manages",
+                "{} variable{}",
                 settings.environment_count,
                 if settings.environment_count == 1 {
                     ""
                 } else {
                     "s"
                 }
-            ),
-        ),
+            )
+        },
+        |key| {
+            format!(
+                "{} variable{} · {key} manages",
+                settings.environment_count,
+                if settings.environment_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        },
+    );
+    let rows = [
+        ("Model", format!("{} / {model}", settings.provider())),
+        ("Credential", credential),
+        ("Thinking", settings.thinking.to_string()),
+        ("Output limit", output_limit),
+        ("Agent environment", environment),
     ];
+    let edit_help = edit.map_or_else(
+        || "Use :login / :logout for credentials.".to_string(),
+        |key| format!("Use :login / :logout for credentials. {key} edits the selected field."),
+    );
     let row_count = rows.len();
     let mut lines = vec![
-        Line::styled(
-            "Use :login / :logout for credentials. Enter edits the selected field.",
-            Style::default().fg(MUTED),
-        ),
+        Line::styled(edit_help, Style::default().fg(MUTED)),
         Line::default(),
     ];
     for (index, (label, value)) in rows.into_iter().enumerate() {
@@ -7193,9 +7271,13 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Bloc
         ]));
         lines.push(Line::default());
     }
+    let title = panel_title(
+        "SETTINGS",
+        action_hints(&app.keymap, &[("settings", "save", "save")]),
+    );
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block.title(" SETTINGS · s save "))
+            .block(block.title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -7223,7 +7305,11 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
         return;
     }
     let inner = block.inner(area);
-    frame.render_widget(block.title(" TASKS · x cancel "), area);
+    let title = panel_title(
+        "TASKS",
+        action_hints(&app.keymap, &[("tasks", "cancel", "cancel")]),
+    );
+    frame.render_widget(block.title(title), area);
     let items = app.task_records.iter().enumerate().map(|(index, task)| {
         ListItem::new(format!(
             "{} {:9} {}",
@@ -7255,13 +7341,28 @@ fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'
     }
 }
 
-fn style_input(input: &mut TextArea<'static>, busy: bool) {
+fn style_input(input: &mut TextArea<'static>, busy: bool, keymap: &Keymap) {
     let border = ACCENT;
-    let footer = if busy {
-        " Enter choose delivery · Shift+Enter newline · Esc keep draft "
+    let hints = if busy {
+        action_hints(
+            keymap,
+            &[
+                ("composer", "submit", "choose delivery"),
+                ("composer", "newline", "newline"),
+                ("composer", "close", "keep draft"),
+            ],
+        )
     } else {
-        " Enter send · Shift+Enter newline · Alt+V image "
+        action_hints(
+            keymap,
+            &[
+                ("composer", "submit", "send"),
+                ("composer", "newline", "newline"),
+                ("composer", "paste_image", "image"),
+            ],
+        )
     };
+    let footer = format!(" {hints} ");
     input.set_block(
         Block::default()
             .borders(Borders::ALL)
@@ -7852,6 +7953,7 @@ mod tests {
                 context_accuracy: ContextAccuracy::Api,
                 compaction_enabled: true,
                 terminal: None,
+                key_display: KeyDisplayStyle::Text,
             },
             Keymap::with_defaults().unwrap(),
             String::new(),
@@ -8377,7 +8479,7 @@ mod tests {
         let rendered = render_to_string(&mut app, 100, 24);
         assert!(rendered.contains("/workspace"));
         assert!(rendered.contains("test / model · effort off"));
-        assert!(rendered.contains("space compose · : commands · ? help"));
+        assert!(rendered.contains("Space compose · : commands · ? help"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("ctx "));
 
@@ -8393,8 +8495,8 @@ mod tests {
             Some(38)
         );
         let hint_row = project_row + 3;
-        assert!(lines[hint_row].contains("space compose · : commands · ? help"));
-        assert_eq!(lines[hint_row].find("space compose"), Some(33));
+        assert!(lines[hint_row].contains("Space compose · : commands · ? help"));
+        assert_eq!(lines[hint_row].find("Space compose"), Some(33));
         assert_eq!(lines.len() - hint_row - 1, 7);
     }
 
@@ -9381,7 +9483,7 @@ mod tests {
         let rendered = render_to_string(&mut app, 80, 24);
         assert!(rendered.contains("/workspace"));
         assert!(rendered.contains("test / model · effort off"));
-        assert!(rendered.contains("space compose · : commands · ? help"));
+        assert!(rendered.contains("Space compose · : commands · ? help"));
         assert!(!rendered.contains("tokens"));
         assert!(!rendered.contains("ctx "));
     }
@@ -9479,7 +9581,7 @@ mod tests {
 
         let rendered = render_to_string(&mut app, 80, 24);
 
-        assert!(rendered.contains("REFERENCES · ↑↓ select · Enter/Tab insert"));
+        assert!(rendered.contains("REFERENCES · Up/Down select · Enter/Tab insert"));
         assert!(rendered.contains("src/main.rs"));
         assert!(
             app.hit_regions
@@ -10986,6 +11088,7 @@ mod tests {
             output_limit_source: ValueSource::Global,
             thinking_source: ValueSource::Global,
             terminal: None,
+            key_display: KeyDisplayStyle::Text,
             terminal_source: ValueSource::Default,
             credential_environment: BTreeMap::new(),
         };
@@ -11264,6 +11367,7 @@ mod tests {
             output_limit_source: ValueSource::Global,
             thinking_source: ValueSource::Global,
             terminal: None,
+            key_display: KeyDisplayStyle::Text,
             terminal_source: ValueSource::Global,
             credential_environment: BTreeMap::new(),
         };
@@ -11599,6 +11703,25 @@ mod tests {
     }
 
     #[test]
+    fn macos_key_display_formats_composer_panel_and_help_hints() {
+        let mut app = test_app();
+        app.keymap = Keymap::with_display_style(KeyDisplayStyle::Macos).unwrap();
+        app.overlay = Some(Overlay::Composer);
+        app.sync_composer_chrome();
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("↩ send · ⇧↩ newline · ⌥V image"));
+
+        app.overlay = Some(Overlay::Models);
+        let rendered = render_to_string(&mut app, 100, 24);
+        assert!(rendered.contains("MODELS · ⌃R refresh"));
+
+        let help = keymap_help(&app.keymap);
+        assert!(help.contains("⌘C"));
+        assert!(help.contains("⌘V"));
+        assert!(help.contains("⌘Z"));
+    }
+
+    #[test]
     fn double_escape_gesture_requires_two_press_events_during_a_running_turn() {
         let mut app = test_app();
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -11611,14 +11734,14 @@ mod tests {
         app.set_flash("Existing notification");
         assert!(!app.interrupt_on_double_press(escape, "esc"));
         let rendered = render_to_string(&mut app, 80, 24);
-        assert!(rendered.contains("press esc again to interrupt"));
+        assert!(rendered.contains("press Esc again to interrupt"));
         assert!(
             rendered.find("Existing notification").unwrap()
-                < rendered.find("press esc again to interrupt").unwrap()
+                < rendered.find("press Esc again to interrupt").unwrap()
         );
         assert!(!app.interrupt_on_double_press(repeat, "esc"));
         assert!(app.interrupt_on_double_press(escape, "esc"));
-        assert!(!render_to_string(&mut app, 80, 24).contains("press esc again to interrupt"));
+        assert!(!render_to_string(&mut app, 80, 24).contains("press Esc again to interrupt"));
         assert!(!app.interrupt_on_double_press(escape, "esc"));
 
         let unrelated = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);

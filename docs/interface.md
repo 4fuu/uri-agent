@@ -29,9 +29,9 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 | `Ctrl+Left`/`Ctrl+Right`, `Alt+Left`/`Alt+Right` | Move by word |
 | `Ctrl+Backspace`/`Ctrl+Delete` | Delete the previous or next word |
 | `Tab` | Insert the selected `@` or `@@` completion |
-| `Ctrl+V` | Paste text, or insert a clipboard image when the terminal forwards the key to URI Agent |
+| `Ctrl+V`, or `Cmd+V` with the macOS key style | Paste text, or insert a clipboard image when the terminal forwards the key to URI Agent |
 | `Alt+V` | Explicitly insert the current clipboard image |
-| `Ctrl+Z`/`Ctrl+Shift+Z` | Undo or redo an edit |
+| `Ctrl+Z`/`Ctrl+Shift+Z`, or `Cmd+Z`/`Cmd+Shift+Z` with the macOS key style | Undo or redo an edit |
 | `Esc` | Close the composer and preserve the draft |
 
 Click to place the caret, or drag across the draft to select editable text. `Ctrl+C`, `Ctrl+Shift+C`, `Cmd+C`, or right-click copies the selected draft through OSC52.
@@ -89,7 +89,7 @@ Saved values apply to future Agent `bash` and `pwsh` commands without a restart.
 | --- | --- |
 | Conversation | `@` open the composer and list file references, `Alt+V` insert a clipboard image, `Up`/`Down` select, `Ctrl+Up`/`Ctrl+Down` scroll, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
 | Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
-| Global | Double `Esc` interrupts a running turn; `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+P` protocols, `Ctrl+T` tasks |
+| Global | Double `Esc` interrupts a running turn; `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+,` settings, `Ctrl+P` protocols, `Ctrl+T` tasks; the macOS key style also accepts `Cmd+,` |
 | Copy | `Ctrl+C` or right-click copies an active selection; without a selection, right-click opens a reasoning or tool block's full document; `Ctrl+Shift+C` copies the selection or visible surface; `Cmd+C` is accepted when the terminal forwards it |
 
 Arrow keys and mouse input are first-class. The mouse wheel and `Ctrl+Up`/`Ctrl+Down` scroll the conversation viewport without changing the selected block. Manual scrolling can move the final transcript row up to the middle of the viewport; this virtual tail space is not persisted conversation content. New output follows the real content bottom until the user scrolls away. When the viewport is showing content above the live tail, the activity row shows a padded `↓ bottom` mouse button above and slightly inset from the context meter. Without an activity row, a padded `↓` button floats at the same inset without taking layout space. The button stays hidden in virtual space past the live tail. Click either button or press `End` to resume following the tail. Keyboard navigation keeps an off-screen destination visible and centers it when the transcript has enough room. Selection wraps from the last item to the first and from the first item to the last in every selectable list. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
@@ -115,6 +115,12 @@ map("main", "x", "copy");
 unmap("main", "j");
 map("composer", "ctrl+j", "newline");
 ```
+
+Key names are parsed into a normalized key stroke when the keymap loads. Modifier names are case-insensitive; `control` aliases `ctrl`, `option` aliases `alt`, and `cmd` or `command` aliases `super`. Invalid key names fail startup with the owning keymap file in the error instead of creating an unreachable binding.
+
+All visible action hints are resolved back through the effective keymap after global and project overrides. The default text style renders labels such as `Ctrl+R`, `Shift+Enter`, and `Alt+Up`. The macOS style renders the same strokes as `⌃R`, `⇧↩`, and `⌥↑`, and renders `super` as Command (`⌘`). This keeps panel titles, composer guidance, pending-message controls, transcript actions, and `F1` help synchronized with user overrides.
+
+Configure the style with `keyDisplay` in `settings.json` or `URI_AGENT_KEY_DISPLAY`; see [Settings fields and precedence](configuration.md#settings-fields-and-precedence). `auto` selects macOS symbols when URI Agent runs locally on macOS. For a macOS terminal connected to URI Agent on Linux or Windows, select `macos` explicitly because the remote process cannot reliably detect the client operating system. The macOS style adds Command aliases for Settings, paste, undo, and redo while retaining all portable bindings. Command shortcuts work only when the terminal forwards them.
 
 Bindings belong to surfaces such as `global`, `main`, `composer`, `command`, `list`, `selector`, `settings`, `environment`, `models`, `document`, `selection`, and `terminal`. A surface binding is checked before a global binding.
 

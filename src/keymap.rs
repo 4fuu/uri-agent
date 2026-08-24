@@ -1,8 +1,11 @@
 use crate::config::config_directory;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rhai::{Engine, ImmutableString};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
 
@@ -145,14 +148,227 @@ map("terminal", "ctrl+shift+c", "copy");
 map("terminal", "super+c", "copy");
 "#;
 
-#[derive(Clone, Default)]
+const MACOS_KEYMAP: &str = r#"
+map("global", "super+,", "settings");
+map("main", "super+v", "paste");
+map("composer", "super+v", "paste");
+map("composer", "super+z", "undo");
+map("composer", "super+shift+z", "redo");
+"#;
+
+const CONTROL: u8 = 1;
+const ALT: u8 = 1 << 1;
+const SHIFT: u8 = 1 << 2;
+const SUPER: u8 = 1 << 3;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyDisplayStyle {
+    #[default]
+    Auto,
+    Macos,
+    Text,
+}
+
+impl KeyDisplayStyle {
+    fn resolve(self) -> Self {
+        match self {
+            Self::Auto if cfg!(target_os = "macos") => Self::Macos,
+            Self::Auto => Self::Text,
+            style => style,
+        }
+    }
+}
+
+impl FromStr for KeyDisplayStyle {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "macos" | "mac" => Ok(Self::Macos),
+            "text" => Ok(Self::Text),
+            _ => bail!("key display style must be auto, macos, or text"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct KeyStroke {
+    modifiers: u8,
+    code: String,
+}
+
+impl KeyStroke {
+    pub fn from_event(key: KeyEvent) -> Option<Self> {
+        let mut modifiers = 0;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            modifiers |= CONTROL;
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            modifiers |= ALT;
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && !matches!(key.code, KeyCode::Char(character) if !character.is_ascii_alphabetic())
+        {
+            modifiers |= SHIFT;
+        }
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            modifiers |= SUPER;
+        }
+        let code = match key.code {
+            KeyCode::Backspace => "backspace".to_string(),
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::Left => "left".to_string(),
+            KeyCode::Right => "right".to_string(),
+            KeyCode::Up => "up".to_string(),
+            KeyCode::Down => "down".to_string(),
+            KeyCode::Home => "home".to_string(),
+            KeyCode::End => "end".to_string(),
+            KeyCode::PageUp => "pageup".to_string(),
+            KeyCode::PageDown => "pagedown".to_string(),
+            KeyCode::Tab => "tab".to_string(),
+            KeyCode::BackTab => "backtab".to_string(),
+            KeyCode::Delete => "delete".to_string(),
+            KeyCode::Insert => "insert".to_string(),
+            KeyCode::F(number) => format!("f{number}"),
+            KeyCode::Char(' ') => "space".to_string(),
+            KeyCode::Char(character) => {
+                canonical_code(&character.to_lowercase().collect::<String>())
+            }
+            KeyCode::Null => "null".to_string(),
+            KeyCode::Esc => "esc".to_string(),
+            KeyCode::CapsLock => "capslock".to_string(),
+            KeyCode::ScrollLock => "scrolllock".to_string(),
+            KeyCode::NumLock => "numlock".to_string(),
+            KeyCode::PrintScreen => "printscreen".to_string(),
+            KeyCode::Pause => "pause".to_string(),
+            KeyCode::Menu => "menu".to_string(),
+            KeyCode::KeypadBegin => "keypadbegin".to_string(),
+            KeyCode::Media(_) | KeyCode::Modifier(_) => return None,
+        };
+        Some(Self { modifiers, code })
+    }
+
+    pub fn canonical(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers & CONTROL != 0 {
+            parts.push("ctrl");
+        }
+        if self.modifiers & ALT != 0 {
+            parts.push("alt");
+        }
+        if self.modifiers & SHIFT != 0 {
+            parts.push("shift");
+        }
+        if self.modifiers & SUPER != 0 {
+            parts.push("super");
+        }
+        parts.push(&self.code);
+        parts.join("+")
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        let mut remaining = normalized.as_str();
+        let mut modifiers = 0;
+        while let Some((prefix, rest)) = remaining.split_once('+') {
+            let modifier = match prefix {
+                "ctrl" | "control" => CONTROL,
+                "alt" | "option" => ALT,
+                "shift" => SHIFT,
+                "super" | "cmd" | "command" => SUPER,
+                _ => break,
+            };
+            modifiers |= modifier;
+            remaining = rest;
+        }
+        let code = canonical_code(remaining);
+        if !valid_code(&code) {
+            bail!("invalid key {value:?}");
+        }
+        Ok(Self { modifiers, code })
+    }
+
+    fn display(&self, style: KeyDisplayStyle) -> String {
+        match style {
+            KeyDisplayStyle::Macos => self.display_macos(),
+            KeyDisplayStyle::Text | KeyDisplayStyle::Auto => self.display_text(),
+        }
+    }
+
+    fn display_modifiers(&self, style: KeyDisplayStyle) -> String {
+        match style {
+            KeyDisplayStyle::Macos => {
+                let mut output = String::new();
+                if self.modifiers & CONTROL != 0 {
+                    output.push('⌃');
+                }
+                if self.modifiers & ALT != 0 {
+                    output.push('⌥');
+                }
+                if self.modifiers & SHIFT != 0 {
+                    output.push('⇧');
+                }
+                if self.modifiers & SUPER != 0 {
+                    output.push('⌘');
+                }
+                output
+            }
+            KeyDisplayStyle::Text | KeyDisplayStyle::Auto => {
+                let mut parts = Vec::new();
+                if self.modifiers & CONTROL != 0 {
+                    parts.push("Ctrl");
+                }
+                if self.modifiers & ALT != 0 {
+                    parts.push("Alt");
+                }
+                if self.modifiers & SHIFT != 0 {
+                    parts.push("Shift");
+                }
+                if self.modifiers & SUPER != 0 {
+                    parts.push("Super");
+                }
+                parts.join("+")
+            }
+        }
+    }
+
+    fn display_text(&self) -> String {
+        let modifiers = self.display_modifiers(KeyDisplayStyle::Text);
+        let code = display_code(&self.code, false);
+        if modifiers.is_empty() {
+            code
+        } else {
+            format!("{modifiers}+{code}")
+        }
+    }
+
+    fn display_macos(&self) -> String {
+        let mut output = self.display_modifiers(KeyDisplayStyle::Macos);
+        output.push_str(&display_code(&self.code, true));
+        output
+    }
+}
+
+#[derive(Clone)]
 pub struct Keymap {
-    bindings: Arc<Mutex<BTreeMap<(String, String), String>>>,
+    bindings: Arc<Mutex<BTreeMap<(String, KeyStroke), String>>>,
+    display_style: KeyDisplayStyle,
+}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Self {
+            bindings: Arc::default(),
+            display_style: KeyDisplayStyle::Text,
+        }
+    }
 }
 
 impl Keymap {
-    pub async fn load(project: Option<&Path>) -> Result<Self> {
-        let keymap = Self::with_defaults()?;
+    pub async fn load(project: Option<&Path>, display_style: KeyDisplayStyle) -> Result<Self> {
+        let keymap = Self::with_display_style(display_style)?;
         let global = config_directory()?.join("keymap.rhai");
         keymap.evaluate_file(&global).await?;
         if let Some(project) = project {
@@ -163,9 +379,21 @@ impl Keymap {
         Ok(keymap)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_defaults() -> Result<Self> {
-        let keymap = Self::default();
+        Self::with_display_style(KeyDisplayStyle::Text)
+    }
+
+    pub(crate) fn with_display_style(display_style: KeyDisplayStyle) -> Result<Self> {
+        let display_style = display_style.resolve();
+        let keymap = Self {
+            display_style,
+            ..Self::default()
+        };
         keymap.evaluate(DEFAULT_KEYMAP, "built-in keymap")?;
+        if display_style == KeyDisplayStyle::Macos {
+            keymap.evaluate(MACOS_KEYMAP, "built-in macOS keymap")?;
+        }
         Ok(keymap)
     }
 
@@ -174,12 +402,12 @@ impl Keymap {
     }
 
     pub fn action_chain(&self, modes: &[&str], key: &str) -> Option<String> {
-        let key = canonical_key(key);
+        let key = KeyStroke::parse(key).ok()?;
         let bindings = self.bindings.lock().unwrap();
         modes
             .iter()
-            .find_map(|mode| bindings.get(&(mode.to_string(), key.to_string())))
-            .or_else(|| bindings.get(&("global".to_string(), key.to_string())))
+            .find_map(|mode| bindings.get(&(mode.to_string(), key.clone())))
+            .or_else(|| bindings.get(&("global".to_string(), key)))
             .cloned()
     }
 
@@ -190,16 +418,48 @@ impl Keymap {
             .filter(|((binding_mode, _), binding_action)| {
                 binding_mode == mode && binding_action.as_str() == action
             })
-            .min_by_key(|((_, key), _)| key_preference(key))
+            .min_by_key(|((_, key), _)| key_preference(key, self.display_style))
             .or_else(|| {
                 bindings
                     .iter()
                     .filter(|((binding_mode, _), binding_action)| {
                         binding_mode == "global" && binding_action.as_str() == action
                     })
-                    .min_by_key(|((_, key), _)| key_preference(key))
+                    .min_by_key(|((_, key), _)| key_preference(key, self.display_style))
             })
-            .map(|((_, key), _)| key.clone())
+            .map(|((_, key), _)| key.canonical())
+    }
+
+    pub fn key_hint(&self, mode: &str, action: &str) -> Option<String> {
+        let bindings = self.bindings.lock().unwrap();
+        bindings
+            .iter()
+            .filter(|((binding_mode, _), binding_action)| {
+                binding_mode == mode && binding_action.as_str() == action
+            })
+            .min_by_key(|((_, key), _)| key_preference(key, self.display_style))
+            .or_else(|| {
+                bindings
+                    .iter()
+                    .filter(|((binding_mode, _), binding_action)| {
+                        binding_mode == "global" && binding_action.as_str() == action
+                    })
+                    .min_by_key(|((_, key), _)| key_preference(key, self.display_style))
+            })
+            .map(|((_, key), _)| key.display(self.display_style))
+    }
+
+    pub fn display_key(&self, key: &str) -> Option<String> {
+        KeyStroke::parse(key)
+            .ok()
+            .map(|key| key.display(self.display_style))
+    }
+
+    pub fn modifier_hint(&self, modifier: &str) -> Option<String> {
+        KeyStroke::parse(&format!("{modifier}+x"))
+            .ok()
+            .map(|key| key.display_modifiers(self.display_style))
+            .filter(|hint| !hint.is_empty())
     }
 
     pub fn bindings_for(&self, mode: &str) -> Vec<(String, String)> {
@@ -207,7 +467,21 @@ impl Keymap {
         bindings
             .iter()
             .filter(|((binding_mode, _), _)| binding_mode == mode)
+            .map(|((_, key), action)| (key.canonical(), action.clone()))
+            .collect()
+    }
+
+    pub fn display_bindings_for(&self, mode: &str) -> Vec<(String, String)> {
+        let bindings = self.bindings.lock().unwrap();
+        let mut bindings = bindings
+            .iter()
+            .filter(|((binding_mode, _), _)| binding_mode == mode)
             .map(|((_, key), action)| (key.clone(), action.clone()))
+            .collect::<Vec<_>>();
+        bindings.sort_by_key(|(key, _)| key_preference(key, self.display_style));
+        bindings
+            .into_iter()
+            .map(|(key, action)| (key.display(self.display_style), action))
             .collect()
     }
 
@@ -233,41 +507,131 @@ impl Keymap {
     fn evaluate(&self, source: &str, label: &str) -> Result<()> {
         let mut engine = Engine::new();
         engine.set_max_operations(100_000);
+        let invalid_keys = Arc::new(Mutex::new(Vec::new()));
         let mapped = self.bindings.clone();
+        let map_errors = invalid_keys.clone();
         engine.register_fn(
             "map",
             move |mode: ImmutableString, key: ImmutableString, action: ImmutableString| {
-                mapped.lock().unwrap().insert(
-                    (mode.to_string(), canonical_key(&key).to_string()),
-                    action.to_string(),
-                );
+                match KeyStroke::parse(&key) {
+                    Ok(key) => {
+                        mapped
+                            .lock()
+                            .unwrap()
+                            .insert((mode.to_string(), key), action.to_string());
+                    }
+                    Err(error) => map_errors.lock().unwrap().push(error.to_string()),
+                }
             },
         );
         let unmapped = self.bindings.clone();
+        let unmap_errors = invalid_keys.clone();
         engine.register_fn(
             "unmap",
-            move |mode: ImmutableString, key: ImmutableString| {
-                unmapped
-                    .lock()
-                    .unwrap()
-                    .remove(&(mode.to_string(), canonical_key(&key).to_string()));
+            move |mode: ImmutableString, key: ImmutableString| match KeyStroke::parse(&key) {
+                Ok(key) => {
+                    unmapped.lock().unwrap().remove(&(mode.to_string(), key));
+                }
+                Err(error) => unmap_errors.lock().unwrap().push(error.to_string()),
             },
         );
         engine
             .eval::<()>(source)
-            .with_context(|| format!("cannot evaluate {label}"))
+            .with_context(|| format!("cannot evaluate {label}"))?;
+        if let Some(error) = invalid_keys.lock().unwrap().first() {
+            bail!("cannot evaluate {label}: {error}");
+        }
+        Ok(())
     }
 }
 
-pub(crate) fn canonical_key(key: &str) -> &str {
-    match key {
-        "：" => ":",
-        "？" => "?",
-        other => other,
+fn canonical_code(code: &str) -> String {
+    match code {
+        "：" => ":".to_string(),
+        "？" => "?".to_string(),
+        other => other.to_string(),
     }
 }
 
-fn key_preference(key: &str) -> (usize, &str) {
+fn valid_code(code: &str) -> bool {
+    const NAMED_KEYS: [&str; 24] = [
+        "backspace",
+        "enter",
+        "left",
+        "right",
+        "up",
+        "down",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "tab",
+        "backtab",
+        "delete",
+        "insert",
+        "space",
+        "null",
+        "esc",
+        "capslock",
+        "scrolllock",
+        "numlock",
+        "printscreen",
+        "pause",
+        "menu",
+        "keypadbegin",
+    ];
+    code.chars().count() == 1
+        || NAMED_KEYS.contains(&code)
+        || code
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| number > 0)
+}
+
+fn display_code(code: &str, macos: bool) -> String {
+    if macos {
+        match code {
+            "left" => return "←".to_string(),
+            "right" => return "→".to_string(),
+            "up" => return "↑".to_string(),
+            "down" => return "↓".to_string(),
+            "enter" => return "↩".to_string(),
+            "backspace" => return "⌫".to_string(),
+            "delete" => return "⌦".to_string(),
+            "tab" => return "⇥".to_string(),
+            "backtab" => return "⇤".to_string(),
+            "pageup" => return "⇞".to_string(),
+            "pagedown" => return "⇟".to_string(),
+            "home" => return "↖".to_string(),
+            "end" => return "↘".to_string(),
+            _ => {}
+        }
+    }
+    match code {
+        "esc" => "Esc".to_string(),
+        "pageup" => "PageUp".to_string(),
+        "pagedown" => "PageDown".to_string(),
+        "backtab" => "BackTab".to_string(),
+        "keypadbegin" => "KeypadBegin".to_string(),
+        code if code.starts_with('f')
+            && code[1..]
+                .chars()
+                .all(|character| character.is_ascii_digit()) =>
+        {
+            code.to_ascii_uppercase()
+        }
+        code if code.chars().count() == 1 => code.to_uppercase(),
+        code => {
+            let mut characters = code.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn key_preference(key: &KeyStroke, style: KeyDisplayStyle) -> (usize, usize, String) {
     const CONVENTIONAL_KEYS: [&str; 15] = [
         "up",
         "down",
@@ -288,10 +652,41 @@ fn key_preference(key: &str) -> (usize, &str) {
     (
         CONVENTIONAL_KEYS
             .iter()
-            .position(|candidate| candidate == &key)
+            .position(|candidate| candidate == &key.code)
             .unwrap_or(CONVENTIONAL_KEYS.len()),
-        key,
+        modifier_preference(key.modifiers, style),
+        key.canonical(),
     )
+}
+
+fn modifier_preference(modifiers: u8, style: KeyDisplayStyle) -> usize {
+    let ordered = if style == KeyDisplayStyle::Macos {
+        [
+            0,
+            SHIFT,
+            SUPER,
+            SUPER | SHIFT,
+            CONTROL,
+            CONTROL | SHIFT,
+            ALT,
+            ALT | SHIFT,
+        ]
+    } else {
+        [
+            0,
+            SHIFT,
+            CONTROL,
+            CONTROL | SHIFT,
+            ALT,
+            ALT | SHIFT,
+            SUPER,
+            SUPER | SHIFT,
+        ]
+    };
+    ordered
+        .iter()
+        .position(|candidate| *candidate == modifiers)
+        .unwrap_or(ordered.len() + modifiers.count_ones() as usize)
 }
 
 #[cfg(test)]
@@ -443,6 +838,89 @@ mod tests {
         assert_eq!(
             keymap.action("terminal", "super+c").as_deref(),
             Some("copy")
+        );
+    }
+
+    #[test]
+    fn key_strokes_normalize_events_and_configuration_aliases() {
+        let event = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            KeyStroke::from_event(event).unwrap().canonical(),
+            "shift+super+c"
+        );
+        assert_eq!(
+            KeyStroke::parse("Command+Shift+C").unwrap().canonical(),
+            "shift+super+c"
+        );
+        assert_eq!(
+            KeyStroke::parse("Option+Left").unwrap().canonical(),
+            "alt+left"
+        );
+        assert_eq!(KeyStroke::parse("？").unwrap().canonical(), "?");
+    }
+
+    #[test]
+    fn invalid_rhai_keys_fail_during_keymap_loading() {
+        let keymap = Keymap::default();
+        let error = keymap
+            .evaluate(r#"map("main", "ctrl+not-a-key", "copy");"#, "test keymap")
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid key"));
+    }
+
+    #[test]
+    fn text_and_macos_styles_format_the_effective_binding() {
+        let text = Keymap::with_display_style(KeyDisplayStyle::Text).unwrap();
+        assert_eq!(
+            text.key_hint("composer", "newline").as_deref(),
+            Some("Shift+Enter")
+        );
+        assert_eq!(
+            text.key_hint("composer", "paste_image").as_deref(),
+            Some("Alt+V")
+        );
+        assert_eq!(
+            text.key_hint("global", "copy").as_deref(),
+            Some("Ctrl+Shift+C")
+        );
+
+        let macos = Keymap::with_display_style(KeyDisplayStyle::Macos).unwrap();
+        assert_eq!(macos.key_hint("main", "previous").as_deref(), Some("↑"));
+        assert_eq!(macos.key_hint("composer", "newline").as_deref(), Some("⇧↩"));
+        assert_eq!(
+            macos.key_hint("composer", "paste_image").as_deref(),
+            Some("⌥V")
+        );
+        assert_eq!(macos.key_hint("global", "copy").as_deref(), Some("⌘C"));
+        assert_eq!(macos.key_hint("main", "paste").as_deref(), Some("⌘V"));
+        assert_eq!(macos.modifier_hint("shift").as_deref(), Some("⇧"));
+        assert_eq!(macos.action("composer", "cmd+z").as_deref(), Some("undo"));
+    }
+
+    #[test]
+    fn displayed_hints_follow_user_overrides_and_unmaps() {
+        let keymap = Keymap::with_display_style(KeyDisplayStyle::Macos).unwrap();
+        keymap
+            .evaluate(
+                r#"
+                unmap("composer", "shift+enter");
+                unmap("composer", "ctrl+enter");
+                unmap("composer", "ctrl+j");
+                map("composer", "cmd+k", "newline");
+                "#,
+                "test keymap",
+            )
+            .unwrap();
+        assert_eq!(
+            keymap.key_hint("composer", "newline").as_deref(),
+            Some("⌘K")
+        );
+        assert_eq!(
+            keymap.action("composer", "super+k").as_deref(),
+            Some("newline")
         );
     }
 }

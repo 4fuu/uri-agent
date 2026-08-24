@@ -1,5 +1,6 @@
 use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel, api_key_environment};
 use crate::compaction;
+use crate::keymap::KeyDisplayStyle;
 use crate::oauth::{self, OauthToken};
 use crate::session::SessionChoice;
 use anyhow::{Context, Result, anyhow, bail};
@@ -177,6 +178,7 @@ pub struct ActiveSettings {
     pub output_limit: usize,
     pub thinking: ThinkingLevel,
     pub terminal: Option<String>,
+    pub key_display: KeyDisplayStyle,
     pub compaction: compaction::Settings,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
@@ -224,6 +226,8 @@ struct SettingsFile {
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_display: Option<KeyDisplayStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionFile>,
     #[serde(flatten)]
@@ -757,6 +761,17 @@ async fn calculate_active(
     }
     let terminal = (!terminal.trim().is_empty()).then_some(terminal.trim().to_string());
 
+    let (mut key_display, _) = setting(
+        KeyDisplayStyle::Auto,
+        files.global.key_display,
+        files.project.key_display,
+    );
+    if let Ok(value) = env::var("URI_AGENT_KEY_DISPLAY")
+        && !value.trim().is_empty()
+    {
+        key_display = value.parse().context("invalid URI_AGENT_KEY_DISPLAY")?;
+    }
+
     let compaction = compaction_settings(&files.global, &files.project)?;
 
     let configured_entry = files.auth.0.get(&provider);
@@ -819,6 +834,7 @@ async fn calculate_active(
         output_limit,
         thinking,
         terminal,
+        key_display,
         compaction,
         provider_source,
         model_source,
@@ -1359,6 +1375,7 @@ mod tests {
             output_limit: DEFAULT_OUTPUT_LIMIT,
             thinking: ThinkingLevel::Off,
             terminal: None,
+            key_display: KeyDisplayStyle::Auto,
             compaction: compaction::Settings::default(),
             provider_source,
             model_source,
@@ -1381,6 +1398,19 @@ mod tests {
         assert_eq!(
             serde_json::to_value(settings).unwrap()["terminal"],
             "pwsh -NoLogo"
+        );
+    }
+
+    #[test]
+    fn key_display_is_a_settings_field() {
+        let settings: SettingsFile = serde_json::from_value(serde_json::json!({
+            "keyDisplay": "macos"
+        }))
+        .unwrap();
+        assert_eq!(settings.key_display, Some(KeyDisplayStyle::Macos));
+        assert_eq!(
+            serde_json::to_value(settings).unwrap()["keyDisplay"],
+            "macos"
         );
     }
 
