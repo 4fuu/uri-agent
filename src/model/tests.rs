@@ -1336,33 +1336,58 @@ fn gemini_uses_level_for_v3_and_budget_for_v25() {
 }
 
 #[test]
-fn antigravity_uses_gemini_levels_and_claude_budgets() {
+fn antigravity_uses_numeric_route_budgets_and_v1internal_generation_fields() {
     let mut gemini = catalog_model(
         "antigravity",
         json!({
             "reasoning": true,
-            "compat": {"antigravityModel": "gemini-pro-agent"}
+            "maxTokens": 65535,
+            "thinkingLevelMap": {"off": null, "low": "low", "medium": "medium", "high": "high"},
+            "compat": {
+                "antigravityRoutes": {
+                    "low": {"model": "gemini-3.1-pro-low", "thinkingBudget": 1001, "maxOutputTokens": 65535},
+                    "medium": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535},
+                    "high": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535}
+                }
+            }
         }),
     );
-    gemini.id = "gemini-3.1-pro-high".to_string();
-    let gemini_body = transformed(gemini, ThinkingLevel::High, json!({}));
-    assert_eq!(
-        gemini_body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-        "HIGH"
+    gemini.id = "gemini-3.1-pro".to_string();
+    let gemini_body = transformed(
+        gemini,
+        ThinkingLevel::High,
+        json!({"generationConfig": {"topK": 20, "maxOutputTokens": 999999}}),
     );
+    assert_eq!(
+        gemini_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        10_001
+    );
+    assert!(
+        gemini_body["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none()
+    );
+    assert_eq!(gemini_body["generationConfig"]["topK"], 20);
+    assert_eq!(gemini_body["generationConfig"]["topP"], 1.0);
+    assert_eq!(gemini_body["generationConfig"]["maxOutputTokens"], 65_535);
 
     let mut claude = catalog_model(
         "antigravity",
         json!({
             "reasoning": true,
-            "compat": {"antigravityModel": "claude-opus-4-6-thinking"}
+            "maxTokens": 64000,
+            "compat": {
+                "antigravityRoutes": {
+                    "medium": {"model": "claude-opus-4-6-thinking", "thinkingBudget": 16384, "maxOutputTokens": 64000}
+                }
+            }
         }),
     );
     claude.id = "claude-opus-4-6".to_string();
     let claude_body = transformed(claude, ThinkingLevel::Medium, json!({}));
     assert_eq!(
         claude_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-        8_192
+        16_384
     );
     assert_eq!(
         claude_body["generationConfig"]["thinkingConfig"]["includeThoughts"],

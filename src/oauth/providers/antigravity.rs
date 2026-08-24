@@ -16,17 +16,19 @@ const REDIRECT_URI: &str = "http://localhost:8085/callback";
 const DEFAULT_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const DEFAULT_CLIENT_SECRET: &str = "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";
-const DEFAULT_USER_AGENT_VERSION: &str = "1.23.2";
-const CONTROL_BASE_URLS: [&str; 2] = [
-    "https://cloudcode-pa.googleapis.com",
+const DEFAULT_USER_AGENT_VERSION: &str = "4.3.0";
+const CONTROL_BASE_URLS: [&str; 3] = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
     "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
 ];
-const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+const SCOPES: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+const EXTRA_EXPIRY_SKEW_MILLIS: i64 = 10 * 60 * 1000;
 
 struct ClientIdentity {
     client_id: String,
     client_secret: String,
-    user_agent: String,
+    oauth_user_agent: String,
 }
 
 pub(in crate::oauth) fn start_antigravity()
@@ -86,6 +88,7 @@ pub(in crate::oauth) async fn refresh_antigravity(token: &OauthToken) -> Result<
     let identity = client_identity();
     let response = http_client()?
         .post(TOKEN_URL)
+        .header("User-Agent", &identity.oauth_user_agent)
         .form_urlencoded(&[
             ("client_id", &identity.client_id),
             ("client_secret", &identity.client_secret),
@@ -95,7 +98,8 @@ pub(in crate::oauth) async fn refresh_antigravity(token: &OauthToken) -> Result<
         .send()
         .await
         .context("Antigravity OAuth refresh failed")?;
-    let mut refreshed = read_token_form(response, "Antigravity").await?;
+    let mut refreshed =
+        with_antigravity_expiry_skew(read_token_form(response, "Antigravity").await?);
     if refreshed.refresh.is_empty() {
         refreshed.refresh.clone_from(&token.refresh);
     }
@@ -114,17 +118,14 @@ fn client_identity() -> ClientIdentity {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
-    let user_agent = configured("ANTIGRAVITY_USER_AGENT").unwrap_or_else(|| {
-        let version = configured("ANTIGRAVITY_USER_AGENT_VERSION")
-            .unwrap_or_else(|| DEFAULT_USER_AGENT_VERSION.to_string());
-        format!("antigravity/{version} windows/amd64")
-    });
+    let version = configured("ANTIGRAVITY_USER_AGENT_VERSION")
+        .unwrap_or_else(|| DEFAULT_USER_AGENT_VERSION.to_string());
     ClientIdentity {
         client_id: configured("ANTIGRAVITY_OAUTH_CLIENT_ID")
             .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string()),
         client_secret: configured("ANTIGRAVITY_OAUTH_CLIENT_SECRET")
             .unwrap_or_else(|| DEFAULT_CLIENT_SECRET.to_string()),
-        user_agent,
+        oauth_user_agent: format!("vscode/1.X.X (Antigravity/{version})"),
     }
 }
 
@@ -135,6 +136,7 @@ async fn exchange_code(
 ) -> Result<OauthToken> {
     let response = http_client()?
         .post(TOKEN_URL)
+        .header("User-Agent", &identity.oauth_user_agent)
         .form_urlencoded(&[
             ("client_id", &identity.client_id),
             ("client_secret", &identity.client_secret),
@@ -146,7 +148,14 @@ async fn exchange_code(
         .send()
         .await
         .context("Antigravity OAuth token exchange failed")?;
-    read_token_form(response, "Antigravity").await
+    Ok(with_antigravity_expiry_skew(
+        read_token_form(response, "Antigravity").await?,
+    ))
+}
+
+fn with_antigravity_expiry_skew(mut token: OauthToken) -> OauthToken {
+    token.expires = token.expires.saturating_sub(EXTRA_EXPIRY_SKEW_MILLIS);
+    token
 }
 
 async fn enrich_token(
@@ -154,12 +163,9 @@ async fn enrich_token(
     identity: &ClientIdentity,
     require_project: bool,
 ) -> Result<OauthToken> {
-    token.extra.insert(
-        "userAgent".to_string(),
-        Value::String(identity.user_agent.clone()),
-    );
     if let Ok(user) = http_client()?
         .get(USER_INFO_URL)
+        .header("User-Agent", &identity.oauth_user_agent)
         .bearer_auth(&token.access)
         .send()
         .await
@@ -172,7 +178,7 @@ async fn enrich_token(
             .insert("email".to_string(), Value::String(email.to_string()));
     }
 
-    match discover_project(&token.access, &identity.user_agent).await {
+    match discover_project(&token.access, &identity.oauth_user_agent).await {
         Ok(project) => {
             token
                 .extra
@@ -361,8 +367,9 @@ fn default_tier_id(value: &Value) -> Option<String> {
 
 fn ide_version(user_agent: &str) -> &str {
     user_agent
-        .strip_prefix("antigravity/")
-        .and_then(|value| value.split_whitespace().next())
+        .split("Antigravity/")
+        .nth(1)
+        .and_then(|value| value.split([')', ' ']).next())
         .filter(|value| !value.is_empty())
         .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
@@ -378,7 +385,7 @@ mod tests {
             "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
         );
         assert!(!DEFAULT_CLIENT_SECRET.is_empty());
-        assert_eq!(DEFAULT_USER_AGENT_VERSION, "1.23.2");
+        assert_eq!(DEFAULT_USER_AGENT_VERSION, "4.3.0");
     }
 
     #[test]
@@ -417,6 +424,6 @@ mod tests {
 
     #[test]
     fn ide_version_comes_from_the_explicit_user_agent() {
-        assert_eq!(ide_version("antigravity/1.23.2 windows/amd64"), "1.23.2");
+        assert_eq!(ide_version("vscode/1.X.X (Antigravity/4.3.0)"), "4.3.0");
     }
 }

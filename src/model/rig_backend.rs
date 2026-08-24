@@ -224,6 +224,7 @@ impl RigBackend {
             .then(|| {
                 AntigravityTransport::new(
                     model,
+                    thinking,
                     session_id,
                     manager.ok_or_else(|| {
                         anyhow::anyhow!("Antigravity credential store is unavailable")

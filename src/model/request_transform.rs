@@ -1,4 +1,5 @@
 use crate::catalog::{CatalogModel, ThinkingLevel};
+use crate::model::antigravity::resolve_route;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
@@ -806,33 +807,40 @@ impl ModelRequestTransform {
     }
 
     fn antigravity(&self, body: &mut Map<String, Value>) {
-        let upstream = self
-            .model
-            .compat("antigravityModel")
-            .and_then(Value::as_str)
-            .unwrap_or(&self.model.id);
-        if !upstream.starts_with("claude-") {
-            self.google(body);
-            return;
-        }
-        let Some(config) = body
-            .entry("generationConfig")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-        else {
+        let Some(route) = resolve_route(&self.model, self.thinking) else {
             return;
         };
-        if self.thinking.enabled() {
+        if !body.get("generationConfig").is_some_and(Value::is_object) {
+            body.insert("generationConfig".to_string(), Value::Object(Map::new()));
+        }
+        let config = body
+            .get_mut("generationConfig")
+            .and_then(Value::as_object_mut)
+            .expect("generationConfig was normalized to an object");
+        config.entry("topK").or_insert(json!(40));
+        config.entry("topP").or_insert(json!(1.0));
+        if route.thinking_budget > 0 {
             config.insert(
                 "thinkingConfig".to_string(),
                 json!({
-                    "thinkingBudget": self.thinking.budget(),
-                    "includeThoughts": true
+                    "thinkingBudget": route.thinking_budget,
+                    "includeThoughts": route.include_thoughts
                 }),
             );
         } else {
             config.remove("thinkingConfig");
         }
+        let mut max_output_tokens = config
+            .get("maxOutputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(route.max_output_tokens);
+        if route.thinking_budget > 0 && max_output_tokens <= route.thinking_budget {
+            max_output_tokens = route.thinking_budget.saturating_add(8_192);
+        }
+        config.insert(
+            "maxOutputTokens".to_string(),
+            json!(max_output_tokens.min(route.max_output_tokens)),
+        );
     }
 
     fn google_budget(&self) -> i64 {

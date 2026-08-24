@@ -79,28 +79,47 @@ Models using `openai-codex-responses` require the `openai-codex` OAuth entry cre
 > [!WARNING]
 > This integration uses undocumented Google Antigravity OAuth and Cloud Code endpoints. It is unsupported, can change without notice, and may conflict with provider terms or trigger account restrictions. Use it only for protocol experiments with an account you can afford to lose after assessing the applicable terms. Do not treat it as a production or stable authentication path.
 
-Like the reference implementation, URI Agent includes the extracted Antigravity OAuth client identity and defaults to User-Agent version `1.23.2`, so `:login` works without environment setup. These unofficial embedded values may stop working or increase the account and provider-terms risks described above. The following process variables remain available as optional overrides:
+Like the reference implementation, URI Agent includes the extracted Antigravity OAuth client identity, so `:login` works without environment setup. OAuth requests identify as `vscode/1.X.X (Antigravity/4.3.0)`; generation requests use the corresponding Antigravity 4.3.0 Chrome/Electron fingerprint for the current platform. These unofficial embedded values may stop working or increase the account and provider-terms risks described above. The following process variables remain available as optional overrides:
 
 ```bash
 export ANTIGRAVITY_OAUTH_CLIENT_ID='<google-oauth-client-id>'
 export ANTIGRAVITY_OAUTH_CLIENT_SECRET='<google-oauth-client-secret>'
 export ANTIGRAVITY_USER_AGENT='<complete-antigravity-user-agent>'
-# Or override only the version used by antigravity/<version> windows/amd64:
+# Or override the Antigravity version in the default OAuth and generation fingerprints:
 export ANTIGRAVITY_USER_AGENT_VERSION='<version>'
 uri-agent --cwd /path/to/project
 ```
 
-Overrides must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Run `:login`, choose **Google Antigravity**, and select an `antigravity` model. Login uses Google OAuth with PKCE, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
+Overrides must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Run `:login`, choose **Google Antigravity**, and select an `antigravity` model. Login uses Google OAuth with PKCE and the `openid` and Cloud Code scopes, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Control and generation requests try the sandbox, daily, and production Cloud Code endpoints in that order when a transport or retryable server error requires fallback. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
 
-The built-in text-model records map public selector IDs to private routes through `compat.antigravityModel`; for example, `gemini-3.1-pro-high` maps to `gemini-pro-agent` and `claude-opus-4-6` maps to `claude-opus-4-6-thinking`. A local `models.json` can overlay a mapping when the private service changes:
+The selector exposes canonical models rather than the private low/medium/high route IDs. The selected effort chooses both the private model and its numeric thinking budget:
+
+| Selector model | Effort routes |
+| --- | --- |
+| `gemini-3.7-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
+| `gemini-3.5-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
+| `gemini-3.1-pro` | `low` 1,001; `medium` or `high` 10,001 |
+| `gemini-3.1-flash-lite` | no thinking |
+| `claude-sonnet-4-6` | `off`; `low` 8,192; `medium` 16,384; `high` 24,576; `max` 32,768 |
+| `claude-opus-4-6` | `low` 8,192; `medium` 16,384; `high` 24,576; `max` 32,768 |
+
+Older physical IDs remain runnable for saved sessions but are hidden from the selector. Gemini 3.6 aliases use the Gemini 3.7 Flash routes, and Gemini 2.5 Flash aliases use the non-thinking Gemini 3.1 Flash Lite route. A local `models.json` can overlay individual effort routes when the private service changes:
 
 ```json
 {
   "providers": {
     "antigravity": {
       "modelOverrides": {
-        "gemini-3.1-pro-high": {
-          "compat": { "antigravityModel": "replacement-private-route" }
+        "gemini-3.7-flash": {
+          "compat": {
+            "antigravityRoutes": {
+              "high": {
+                "model": "replacement-private-route",
+                "thinkingBudget": 10000,
+                "maxOutputTokens": 65536
+              }
+            }
+          }
         }
       }
     }
@@ -108,7 +127,11 @@ The built-in text-model records map public selector IDs to private routes throug
 }
 ```
 
-Requests use the private `v1internal:streamGenerateContent` SSE operation and retain Gemini thought signatures across tool rounds. URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
+`compat.antigravityModel` remains a fallback for custom and legacy records that do not define `antigravityRoutes`.
+
+Requests use the private `v1internal:streamGenerateContent` SSE operation. URI Agent sends numeric `thinkingBudget` values, preserves and mirrors Gemini thought signatures across tool rounds, normalizes tool schemas and `toolConfig`, and adds stable missing Claude tool IDs. A 401 refreshes the OAuth token once; a project-header 403 retries once without that header. After these transport-specific repairs and endpoint fallbacks are exhausted, failures retain URI Agent's normal model retry classification and budget.
+
+URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 
 Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` protocol recognizes `PARALLEL_API_KEY` and `EXA_API_KEY` for web search and page extraction.
 

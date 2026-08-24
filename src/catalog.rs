@@ -60,6 +60,13 @@ impl CatalogModel {
             .unwrap_or(false)
     }
 
+    fn hidden(&self) -> bool {
+        self.metadata
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     pub fn accepts_input(&self, modality: &str) -> bool {
         self.metadata
             .get("input")
@@ -451,16 +458,22 @@ impl ModelCatalog {
             .get(provider)
             .into_iter()
             .flatten()
-            .filter(|model| model.supported())
+            .filter(|model| model.supported() && !model.hidden())
             .cloned()
             .collect()
     }
 
     pub async fn model(&self, provider: &str, model: &str) -> Option<CatalogModel> {
-        self.models(provider)
+        self.inner
+            .read()
             .await
+            .models
+            .get(provider)
             .into_iter()
+            .flatten()
+            .filter(|entry| entry.supported())
             .find(|entry| entry.id == model)
+            .cloned()
     }
 
     pub async fn configured_api_key(&self, provider: &str) -> Option<String> {
@@ -665,87 +678,403 @@ fn merge_catalog(
 }
 
 fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
-    let models = [
+    let tiered = |id: &str, name: &str, context_window: u64, max_tokens: u64, routes: Value| {
+        antigravity_model(
+            id,
+            name,
+            true,
+            (context_window, max_tokens),
+            false,
+            serde_json::json!({
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": null,
+                "max": null
+            }),
+            routes,
+        )
+    };
+    let gemini_37_routes = serde_json::json!({
+        "low": {"model": "gemini-3.7-flash-low", "thinkingBudget": 1000, "maxOutputTokens": 65536},
+        "medium": {"model": "gemini-3.7-flash-medium", "thinkingBudget": 4000, "maxOutputTokens": 65536},
+        "high": {"model": "gemini-3.7-flash-high", "thinkingBudget": 10000, "maxOutputTokens": 65536}
+    });
+    let gemini_35_routes = serde_json::json!({
+        "low": {"model": "gemini-3.5-flash-extra-low", "thinkingBudget": 1000, "maxOutputTokens": 65536},
+        "medium": {"model": "gemini-3.5-flash-low", "thinkingBudget": 4000, "maxOutputTokens": 65536},
+        "high": {"model": "gemini-3-flash-agent", "thinkingBudget": 10000, "maxOutputTokens": 65536}
+    });
+    let gemini_31_routes = serde_json::json!({
+        "low": {"model": "gemini-3.1-pro-low", "thinkingBudget": 1001, "maxOutputTokens": 65535},
+        "medium": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535},
+        "high": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535}
+    });
+    let claude_sonnet_routes = serde_json::json!({
+        "off": {"model": "claude-sonnet-4-6", "thinkingBudget": 0, "maxOutputTokens": 64000, "includeThoughts": false},
+        "low": {"model": "claude-sonnet-4-6", "thinkingBudget": 8192, "maxOutputTokens": 64000},
+        "medium": {"model": "claude-sonnet-4-6", "thinkingBudget": 16384, "maxOutputTokens": 64000},
+        "high": {"model": "claude-sonnet-4-6", "thinkingBudget": 24576, "maxOutputTokens": 64000},
+        "max": {"model": "claude-sonnet-4-6", "thinkingBudget": 32768, "maxOutputTokens": 64000}
+    });
+    let claude_opus_routes = serde_json::json!({
+        "low": {"model": "claude-opus-4-6-thinking", "thinkingBudget": 8192, "maxOutputTokens": 64000},
+        "medium": {"model": "claude-opus-4-6-thinking", "thinkingBudget": 16384, "maxOutputTokens": 64000},
+        "high": {"model": "claude-opus-4-6-thinking", "thinkingBudget": 24576, "maxOutputTokens": 64000},
+        "max": {"model": "claude-opus-4-6-thinking", "thinkingBudget": 32768, "maxOutputTokens": 64000}
+    });
+
+    let mut models = BTreeMap::from([
+        (
+            "gemini-3.7-flash".to_string(),
+            tiered(
+                "gemini-3.7-flash",
+                "Gemini 3.7 Flash",
+                1_000_000,
+                65_536,
+                gemini_37_routes.clone(),
+            ),
+        ),
+        (
+            "gemini-3.5-flash".to_string(),
+            tiered(
+                "gemini-3.5-flash",
+                "Gemini 3.5 Flash",
+                1_000_000,
+                65_536,
+                gemini_35_routes.clone(),
+            ),
+        ),
+        (
+            "gemini-3.1-pro".to_string(),
+            tiered(
+                "gemini-3.1-pro",
+                "Gemini 3.1 Pro",
+                1_048_576,
+                65_535,
+                gemini_31_routes.clone(),
+            ),
+        ),
+        (
+            "gemini-3.1-flash-lite".to_string(),
+            antigravity_model(
+                "gemini-3.1-flash-lite",
+                "Gemini 3.1 Flash Lite",
+                false,
+                (1_048_576, 16_384),
+                false,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "off": {"model": "gemini-3.1-flash-lite", "thinkingBudget": 0, "maxOutputTokens": 16384, "includeThoughts": false}
+                }),
+            ),
+        ),
+        (
+            "claude-sonnet-4-6".to_string(),
+            antigravity_model(
+                "claude-sonnet-4-6",
+                "Claude Sonnet 4.6",
+                true,
+                (200_000, 64_000),
+                false,
+                serde_json::json!({
+                    "off": "off", "minimal": null, "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": null, "max": "max"
+                }),
+                claude_sonnet_routes.clone(),
+            ),
+        ),
+        (
+            "claude-opus-4-6".to_string(),
+            antigravity_model(
+                "claude-opus-4-6",
+                "Claude Opus 4.6",
+                true,
+                (200_000, 64_000),
+                false,
+                serde_json::json!({
+                    "off": null, "minimal": null, "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": null, "max": "max"
+                }),
+                claude_opus_routes.clone(),
+            ),
+        ),
+    ]);
+
+    let legacy = [
         ("claude-fable-5", "Claude Fable 5", "claude-fable-5"),
         ("claude-opus-4-8", "Claude Opus 4.8", "claude-opus-4-8"),
         ("claude-opus-4-7", "Claude Opus 4.7", "claude-opus-4-7"),
-        (
-            "claude-opus-4-6",
-            "Claude Opus 4.6",
-            "claude-opus-4-6-thinking",
-        ),
-        (
-            "claude-sonnet-4-6",
-            "Claude Sonnet 4.6",
-            "claude-sonnet-4-6",
-        ),
         (
             "claude-sonnet-4-5",
             "Claude Sonnet 4.5",
             "claude-sonnet-4-5",
         ),
-        ("gemini-2.5-flash", "Gemini 2.5 Flash", "gemini-2.5-flash"),
-        (
-            "gemini-2.5-flash-lite",
-            "Gemini 2.5 Flash Lite",
-            "gemini-2.5-flash-lite",
-        ),
         ("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-2.5-pro"),
-        ("gemini-3-flash", "Gemini 3 Flash", "gemini-3-flash"),
         ("gemini-3-pro-low", "Gemini 3 Pro Low", "gemini-3-pro-low"),
         (
             "gemini-3-pro-high",
             "Gemini 3 Pro High",
             "gemini-3-pro-high",
         ),
+    ];
+    for (id, name, upstream) in legacy {
+        models.insert(id.to_string(), legacy_antigravity_model(id, name, upstream));
+    }
+    for (id, name, context_window, max_tokens, routes) in [
         (
-            "gemini-3.1-pro-low",
-            "Gemini 3.1 Pro Low",
-            "gemini-3.1-pro-low",
+            "gemini-3-flash",
+            "Gemini 3 Flash",
+            1_000_000,
+            65_536,
+            gemini_35_routes.clone(),
+        ),
+        (
+            "gemini-3.5-flash-high",
+            "Gemini 3.5 Flash High",
+            1_000_000,
+            65_536,
+            gemini_35_routes.clone(),
         ),
         (
             "gemini-3.1-pro-high",
             "Gemini 3.1 Pro High",
-            "gemini-pro-agent",
-        ),
-        ("gemini-3.6-flash", "Gemini 3.6 Flash", "gemini-3.6-flash"),
-        (
-            "gemini-3.6-flash-low",
-            "Gemini 3.6 Flash Low",
-            "gemini-3.6-flash-low",
+            1_048_576,
+            65_535,
+            gemini_31_routes.clone(),
         ),
         (
-            "gemini-3.6-flash-medium",
-            "Gemini 3.6 Flash Medium",
-            "gemini-3.6-flash-medium",
+            "gemini-pro",
+            "Gemini Pro",
+            1_048_576,
+            65_535,
+            gemini_31_routes.clone(),
+        ),
+        (
+            "gemini-3.7-flash-high",
+            "Gemini 3.7 Flash High",
+            1_000_000,
+            65_536,
+            gemini_37_routes.clone(),
+        ),
+        (
+            "gemini-3.7-flash-tiered",
+            "Gemini 3.7 Flash Tiered",
+            1_000_000,
+            65_536,
+            gemini_37_routes.clone(),
+        ),
+        (
+            "gemini-3.6-flash",
+            "Gemini 3.6 Flash",
+            1_000_000,
+            65_536,
+            gemini_37_routes.clone(),
         ),
         (
             "gemini-3.6-flash-high",
             "Gemini 3.6 Flash High",
-            "gemini-3.6-flash-high",
+            1_000_000,
+            65_536,
+            gemini_37_routes.clone(),
         ),
-    ]
-    .into_iter()
-    .map(|(id, name, upstream)| {
         (
+            "gemini-3.6-flash-tiered",
+            "Gemini 3.6 Flash Tiered",
+            1_000_000,
+            65_536,
+            gemini_37_routes.clone(),
+        ),
+    ] {
+        models.insert(
             id.to_string(),
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "api": "antigravity",
-                "provider": "antigravity",
-                "baseUrl": "https://cloudcode-pa.googleapis.com",
-                "reasoning": true,
-                "input": ["text", "image"],
-                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                "contextWindow": 1048576,
-                "maxTokens": 64000,
-                "compat": {"antigravityModel": upstream}
-            }),
-        )
-    })
-    .collect();
+            tiered(id, name, context_window, max_tokens, routes),
+        );
+        models
+            .get_mut(id)
+            .and_then(Value::as_object_mut)
+            .expect("built-in Antigravity model")
+            .insert("hidden".to_string(), Value::Bool(true));
+    }
+    for (id, name, level, route) in [
+        (
+            "gemini-3.1-pro-low",
+            "Gemini 3.1 Pro Low",
+            "low",
+            gemini_31_routes["low"].clone(),
+        ),
+        (
+            "gemini-3.6-flash-low",
+            "Gemini 3.6 Flash Low",
+            "low",
+            gemini_37_routes["low"].clone(),
+        ),
+        (
+            "gemini-3.6-flash-medium",
+            "Gemini 3.6 Flash Medium",
+            "medium",
+            gemini_37_routes["medium"].clone(),
+        ),
+        (
+            "gemini-3.7-flash-low",
+            "Gemini 3.7 Flash Low",
+            "low",
+            gemini_37_routes["low"].clone(),
+        ),
+        (
+            "gemini-3.7-flash-medium",
+            "Gemini 3.7 Flash Medium",
+            "medium",
+            gemini_37_routes["medium"].clone(),
+        ),
+        (
+            "gemini-3.5-flash-low",
+            "Gemini 3.5 Flash Low",
+            "low",
+            gemini_35_routes["low"].clone(),
+        ),
+        (
+            "gemini-3.5-flash-medium",
+            "Gemini 3.5 Flash Medium",
+            "medium",
+            gemini_35_routes["medium"].clone(),
+        ),
+    ] {
+        models.insert(
+            id.to_string(),
+            fixed_legacy_antigravity_model(id, name, level, route),
+        );
+    }
+    for (id, name, routes) in [
+        (
+            "claude-sonnet-4-6-thinking",
+            "Claude Sonnet 4.6 Thinking",
+            claude_sonnet_routes,
+        ),
+        (
+            "claude-opus-4-6-thinking",
+            "Claude Opus 4.6 Thinking",
+            claude_opus_routes,
+        ),
+    ] {
+        models.insert(
+            id.to_string(),
+            antigravity_model(
+                id,
+                name,
+                true,
+                (200_000, 64_000),
+                true,
+                serde_json::json!({
+                    "off": null, "minimal": null, "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": null, "max": "max"
+                }),
+                routes,
+            ),
+        );
+    }
+    for (id, name) in [
+        ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+        ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
+        ("gemini-2.5-flash-thinking", "Gemini 2.5 Flash Thinking"),
+    ] {
+        models.insert(
+            id.to_string(),
+            antigravity_model(
+                id,
+                name,
+                false,
+                (1_048_576, 16_384),
+                true,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "off": {"model": "gemini-3.1-flash-lite", "thinkingBudget": 0, "maxOutputTokens": 16384, "includeThoughts": false}
+                }),
+            ),
+        );
+    }
     BTreeMap::from([("antigravity".to_string(), models)])
+}
+
+fn antigravity_model(
+    id: &str,
+    name: &str,
+    reasoning: bool,
+    limits: (u64, u64),
+    hidden: bool,
+    thinking_level_map: Value,
+    routes: Value,
+) -> Value {
+    let (context_window, max_tokens) = limits;
+    let upstream = routes
+        .get("high")
+        .or_else(|| routes.get("off"))
+        .and_then(|route| route.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or(id);
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "api": "antigravity",
+        "provider": "antigravity",
+        "baseUrl": "https://cloudcode-pa.googleapis.com",
+        "reasoning": reasoning,
+        "hidden": hidden,
+        "input": ["text", "image"],
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": context_window,
+        "maxTokens": max_tokens,
+        "thinkingLevelMap": thinking_level_map,
+        "compat": {
+            "antigravityModel": upstream,
+            "antigravityRoutes": routes
+        }
+    })
+}
+
+fn legacy_antigravity_model(id: &str, name: &str, upstream: &str) -> Value {
+    antigravity_model(
+        id,
+        name,
+        true,
+        (1_048_576, 64_000),
+        true,
+        serde_json::json!({}),
+        serde_json::json!({
+            "off": {"model": upstream, "thinkingBudget": 0, "maxOutputTokens": 64000, "includeThoughts": false},
+            "minimal": {"model": upstream, "thinkingBudget": 1024, "maxOutputTokens": 64000},
+            "low": {"model": upstream, "thinkingBudget": 2048, "maxOutputTokens": 64000},
+            "medium": {"model": upstream, "thinkingBudget": 8192, "maxOutputTokens": 64000},
+            "high": {"model": upstream, "thinkingBudget": 16384, "maxOutputTokens": 64000}
+        }),
+    )
+}
+
+fn fixed_legacy_antigravity_model(id: &str, name: &str, level: &str, route: Value) -> Value {
+    let mut thinking_level_map = Map::new();
+    for candidate in ThinkingLevel::ALL {
+        thinking_level_map.insert(candidate.as_str().to_string(), Value::Null);
+    }
+    thinking_level_map.insert(level.to_string(), Value::String(level.to_string()));
+    let mut routes = Map::new();
+    routes.insert(level.to_string(), route.clone());
+    antigravity_model(
+        id,
+        name,
+        true,
+        (
+            1_048_576,
+            route
+                .get("maxOutputTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(64_000),
+        ),
+        true,
+        Value::Object(thinking_level_map),
+        Value::Object(routes),
+    )
 }
 
 fn apply_provider_defaults(model: &mut Value, provider: &UserProvider) {
@@ -901,7 +1230,7 @@ mod tests {
             "providers": {
                 "antigravity": {
                     "modelOverrides": {
-                        "gemini-3.1-pro-high": {"name": "Private Pro"}
+                        "gemini-3.7-flash": {"name": "Private Flash"}
                     }
                 }
             }
@@ -912,16 +1241,31 @@ mod tests {
         let models = &merged["antigravity"];
         let gemini = models
             .iter()
-            .find(|model| model.id == "gemini-3.1-pro-high")
+            .find(|model| model.id == "gemini-3.7-flash")
             .unwrap();
-        assert_eq!(gemini.name, "Private Pro");
+        assert_eq!(gemini.name, "Private Flash");
         assert_eq!(gemini.api, "antigravity");
         assert_eq!(
             gemini.compat("antigravityModel").and_then(Value::as_str),
-            Some("gemini-pro-agent")
+            Some("gemini-3.7-flash-high")
         );
-        assert_eq!(gemini.limits().context_window, 1_048_576);
-        assert_eq!(gemini.limits().max_tokens, 64_000);
+        assert_eq!(gemini.limits().context_window, 1_000_000);
+        assert_eq!(gemini.limits().max_tokens, 65_536);
+        assert_eq!(
+            gemini
+                .compat("antigravityRoutes")
+                .and_then(|routes| routes.get("medium"))
+                .and_then(|route| route.get("model"))
+                .and_then(Value::as_str),
+            Some("gemini-3.7-flash-medium")
+        );
+        assert!(
+            models
+                .iter()
+                .find(|model| model.id == "gemini-3.6-flash-low")
+                .is_some_and(CatalogModel::hidden)
+        );
+        assert!(!gemini.hidden());
         assert_eq!(
             models
                 .iter()
