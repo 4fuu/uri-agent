@@ -192,7 +192,14 @@ async fn run_session(
     }
     notices.extend(config.catalog.warnings().await);
 
-    let configured = match configured_backend(&active, &config.catalog, Some(session.id())).await {
+    let configured = match configured_backend(
+        &active,
+        &config.catalog,
+        Some(session.id()),
+        config.manager.clone(),
+    )
+    .await
+    {
         Ok(configured) => configured,
         Err(error) => {
             notices.push(format!("model configuration is not usable: {error:#}"));
@@ -273,7 +280,14 @@ async fn run_retained_session_inner(
         .manager
         .for_session(&settings.provider, &settings.model, settings.thinking)
         .await?;
-    let configured = match configured_backend(&active, &config.catalog, Some(session.id())).await {
+    let configured = match configured_backend(
+        &active,
+        &config.catalog,
+        Some(session.id()),
+        config.manager.clone(),
+    )
+    .await
+    {
         Ok(configured) => configured,
         Err(error) => {
             session

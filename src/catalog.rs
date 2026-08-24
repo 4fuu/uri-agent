@@ -40,6 +40,7 @@ impl CatalogModel {
                 | "openai-completions"
                 | "anthropic-messages"
                 | "google-generative-ai"
+                | "antigravity"
         )
     }
 
@@ -564,21 +565,20 @@ fn merge_catalog(
     store: &BTreeMap<String, StoreEntry>,
     user: &ModelsFile,
 ) -> (BTreeMap<String, Vec<CatalogModel>>, Vec<String>) {
-    let mut raw = store
-        .iter()
-        .map(|(provider, entry)| {
-            let models = entry
+    let mut raw = built_in_catalog();
+    for (provider, entry) in store {
+        let models = raw.entry(provider.clone()).or_default();
+        models.extend(
+            entry
                 .models
                 .iter()
                 .filter_map(|model| serde_json::to_value(model).ok())
                 .filter_map(|model| {
                     let id = model.get("id").and_then(Value::as_str)?.to_string();
                     Some((id, model))
-                })
-                .collect::<BTreeMap<_, _>>();
-            (provider.clone(), models)
-        })
-        .collect::<BTreeMap<_, _>>();
+                }),
+        );
+    }
     let mut warnings = Vec::new();
 
     for (provider_id, provider) in &user.providers {
@@ -662,6 +662,90 @@ fn merge_catalog(
         })
         .collect();
     (models, warnings)
+}
+
+fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
+    let models = [
+        ("claude-fable-5", "Claude Fable 5", "claude-fable-5"),
+        ("claude-opus-4-8", "Claude Opus 4.8", "claude-opus-4-8"),
+        ("claude-opus-4-7", "Claude Opus 4.7", "claude-opus-4-7"),
+        (
+            "claude-opus-4-6",
+            "Claude Opus 4.6",
+            "claude-opus-4-6-thinking",
+        ),
+        (
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6",
+            "claude-sonnet-4-6",
+        ),
+        (
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            "claude-sonnet-4-5",
+        ),
+        ("gemini-2.5-flash", "Gemini 2.5 Flash", "gemini-2.5-flash"),
+        (
+            "gemini-2.5-flash-lite",
+            "Gemini 2.5 Flash Lite",
+            "gemini-2.5-flash-lite",
+        ),
+        ("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-2.5-pro"),
+        ("gemini-3-flash", "Gemini 3 Flash", "gemini-3-flash"),
+        ("gemini-3-pro-low", "Gemini 3 Pro Low", "gemini-3-pro-low"),
+        (
+            "gemini-3-pro-high",
+            "Gemini 3 Pro High",
+            "gemini-3-pro-high",
+        ),
+        (
+            "gemini-3.1-pro-low",
+            "Gemini 3.1 Pro Low",
+            "gemini-3.1-pro-low",
+        ),
+        (
+            "gemini-3.1-pro-high",
+            "Gemini 3.1 Pro High",
+            "gemini-pro-agent",
+        ),
+        ("gemini-3.6-flash", "Gemini 3.6 Flash", "gemini-3.6-flash"),
+        (
+            "gemini-3.6-flash-low",
+            "Gemini 3.6 Flash Low",
+            "gemini-3.6-flash-low",
+        ),
+        (
+            "gemini-3.6-flash-medium",
+            "Gemini 3.6 Flash Medium",
+            "gemini-3.6-flash-medium",
+        ),
+        (
+            "gemini-3.6-flash-high",
+            "Gemini 3.6 Flash High",
+            "gemini-3.6-flash-high",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, upstream)| {
+        (
+            id.to_string(),
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "api": "antigravity",
+                "provider": "antigravity",
+                "baseUrl": "https://cloudcode-pa.googleapis.com",
+                "reasoning": true,
+                "input": ["text", "image"],
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "contextWindow": 1048576,
+                "maxTokens": 64000,
+                "compat": {"antigravityModel": upstream}
+            }),
+        )
+    })
+    .collect();
+    BTreeMap::from([("antigravity".to_string(), models)])
 }
 
 fn apply_provider_defaults(model: &mut Value, provider: &UserProvider) {
@@ -810,6 +894,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_models_are_built_in_and_user_overrides_remain_effective() {
+        let user: ModelsFile = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "antigravity": {
+                    "modelOverrides": {
+                        "gemini-3.1-pro-high": {"name": "Private Pro"}
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let (merged, warnings) = merge_catalog(&BTreeMap::new(), &user);
+        assert!(warnings.is_empty());
+        let models = &merged["antigravity"];
+        let gemini = models
+            .iter()
+            .find(|model| model.id == "gemini-3.1-pro-high")
+            .unwrap();
+        assert_eq!(gemini.name, "Private Pro");
+        assert_eq!(gemini.api, "antigravity");
+        assert_eq!(
+            gemini.compat("antigravityModel").and_then(Value::as_str),
+            Some("gemini-pro-agent")
+        );
+        assert_eq!(gemini.limits().context_window, 1_048_576);
+        assert_eq!(gemini.limits().max_tokens, 64_000);
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.id == "claude-opus-4-6")
+                .and_then(|model| model.compat("antigravityModel"))
+                .and_then(Value::as_str),
+            Some("claude-opus-4-6-thinking")
+        );
+    }
 
     #[test]
     fn pi_provider_payloads_and_user_overrides_merge_by_model_id() {

@@ -1334,3 +1334,38 @@ fn gemini_uses_level_for_v3_and_budget_for_v25() {
         -1
     );
 }
+
+#[test]
+fn antigravity_uses_gemini_levels_and_claude_budgets() {
+    let mut gemini = catalog_model(
+        "antigravity",
+        json!({
+            "reasoning": true,
+            "compat": {"antigravityModel": "gemini-pro-agent"}
+        }),
+    );
+    gemini.id = "gemini-3.1-pro-high".to_string();
+    let gemini_body = transformed(gemini, ThinkingLevel::High, json!({}));
+    assert_eq!(
+        gemini_body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+
+    let mut claude = catalog_model(
+        "antigravity",
+        json!({
+            "reasoning": true,
+            "compat": {"antigravityModel": "claude-opus-4-6-thinking"}
+        }),
+    );
+    claude.id = "claude-opus-4-6".to_string();
+    let claude_body = transformed(claude, ThinkingLevel::Medium, json!({}));
+    assert_eq!(
+        claude_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        8_192
+    );
+    assert_eq!(
+        claude_body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+        true
+    );
+}

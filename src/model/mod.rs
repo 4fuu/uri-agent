@@ -1,8 +1,10 @@
 //! Model contracts and provider facade.
 //!
 //! Provider HTTP integration and request compatibility are implemented by the
-//! Rig backend, while the Codex streaming transport remains private to it.
+//! Rig backend, while the Codex and experimental Antigravity streaming
+//! transports remain private to it.
 
+mod antigravity;
 mod codex_websocket;
 mod failure;
 mod request_transform;

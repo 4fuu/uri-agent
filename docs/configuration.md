@@ -24,7 +24,9 @@ URI Agent downloads provider and model records from pi.dev and merges them with 
 - `anthropic-messages`
 - `google-generative-ai`
 
-The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. In the pi.dev catalog checked on 2026-08-24, these five of nine API families contain 1,107 of 1,307 model entries (84.7%) across 35 of 39 provider IDs. This measures catalog entries, not account entitlement: availability still depends on the selected provider, credentials, region, and subscription, and later catalog revisions will change the counts.
+URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol). It is not part of the pi.dev coverage count.
+
+The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. In the pi.dev catalog checked on 2026-08-24, the five public families above contain 1,107 of 1,307 model entries (84.7%) across 35 of 39 provider IDs. This measures catalog entries, not account entitlement: availability still depends on the selected provider, credentials, region, and subscription, and later catalog revisions will change the counts.
 
 `openai-codex-responses` targets the ChatGPT Codex subscription endpoint and uses WebSocket streaming by default. URI Agent supplies the account ID from the OAuth access token, stable session headers and prompt cache key, and the Codex Responses request fields required for reasoning and tool calls. Within a session it reuses an idle connection, retains it for up to five idle minutes or 55 minutes total, and—when request options and history still match—continues from `previous_response_id` while sending only newly appended input. A busy connection is never shared between concurrent requests.
 
@@ -57,6 +59,7 @@ Offline mode still loads `models-store.json` and `models.json`; it only disables
 
 | Provider ID | Login |
 | --- | --- |
+| `antigravity` | Experimental Google browser OAuth for the private Antigravity protocol |
 | `anthropic` | Claude Pro/Max browser OAuth |
 | `openrouter` | Browser PKCE |
 | `openai-codex` | Browser or device-code login |
@@ -70,6 +73,40 @@ Offline mode still loads `models-store.json` and `models.json`; it only disables
 Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent attempts to refresh expired entries that include a refresh token. On Unix, URI Agent creates `auth.json` with mode `0600` and the configuration directory with mode `0700`.
 
 Models using `openai-codex-responses` require the `openai-codex` OAuth entry created by the OpenAI browser or device-code login. An OpenAI Platform API key—including `OPENAI_API_KEY`, `URI_AGENT_API_KEY`, or `--api-key`—is not accepted for this subscription endpoint. Model availability is determined by the signed-in ChatGPT account and its subscription.
+
+### Experimental Antigravity private protocol
+
+> [!WARNING]
+> This integration uses undocumented Google Antigravity OAuth and Cloud Code endpoints. It is unsupported, can change without notice, and may conflict with provider terms or trigger account restrictions. Use it only for protocol experiments with an account you can afford to lose after assessing the applicable terms. Do not treat it as a production or stable authentication path.
+
+URI Agent does not include a third party's OAuth client identity. Before starting URI Agent, provide an OAuth client whose allowed callback includes `http://localhost:8085/callback`, plus the complete User-Agent value that should be sent to the private service:
+
+```bash
+export ANTIGRAVITY_OAUTH_CLIENT_ID='<google-oauth-client-id>'
+export ANTIGRAVITY_OAUTH_CLIENT_SECRET='<google-oauth-client-secret>'
+export ANTIGRAVITY_USER_AGENT='<complete-antigravity-user-agent>'
+uri-agent --cwd /path/to/project
+```
+
+These must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Then run `:login`, choose **Antigravity (experimental)**, and select an `antigravity` model. Login uses Google OAuth with PKCE, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
+
+The built-in text-model records map public selector IDs to private routes through `compat.antigravityModel`; for example, `gemini-3.1-pro-high` maps to `gemini-pro-agent` and `claude-opus-4-6` maps to `claude-opus-4-6-thinking`. A local `models.json` can overlay a mapping when the private service changes:
+
+```json
+{
+  "providers": {
+    "antigravity": {
+      "modelOverrides": {
+        "gemini-3.1-pro-high": {
+          "compat": { "antigravityModel": "replacement-private-route" }
+        }
+      }
+    }
+  }
+}
+```
+
+Requests use the private `v1internal:streamGenerateContent` SSE operation and retain Gemini thought signatures across tool rounds. URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 
 Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` protocol recognizes `PARALLEL_API_KEY` and `EXA_API_KEY` for web search and page extraction.
 

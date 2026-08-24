@@ -2503,6 +2503,7 @@ pub(super) async fn store_api_key(
         apply_active(
             app,
             &services.runtime,
+            &services.manager,
             &services.catalog,
             &services.output,
             &active,
@@ -2524,6 +2525,7 @@ pub(super) async fn logout_provider(app: &mut App, services: &LoopServices, prov
         apply_active(
             app,
             &services.runtime,
+            &services.manager,
             &services.catalog,
             &services.output,
             &active,
@@ -2563,7 +2565,7 @@ pub(super) async fn open_models(
 pub(super) async fn select_model(
     app: &mut App,
     runtime: &AgentRuntime,
-    manager: &ConfigManager,
+    manager: &Arc<ConfigManager>,
     catalog: &ModelCatalog,
     output: &OutputStore,
 ) {
@@ -2580,7 +2582,7 @@ pub(super) async fn select_model(
     let result = async {
         manager.set_model(&model.provider, &model.id).await?;
         let active = manager.current().await;
-        apply_active(app, runtime, catalog, output, &active).await?;
+        apply_active(app, runtime, manager, catalog, output, &active).await?;
         Ok::<_, anyhow::Error>(active)
     }
     .await;
@@ -2687,6 +2689,7 @@ pub(super) async fn set_effort(
             apply_active(
                 app,
                 &services.runtime,
+                &services.manager,
                 &services.catalog,
                 &services.output,
                 &active,
@@ -2732,7 +2735,7 @@ pub(super) fn key_name(key: KeyEvent) -> String {
 pub(super) async fn save_settings(
     app: &mut App,
     runtime: &AgentRuntime,
-    manager: &ConfigManager,
+    manager: &Arc<ConfigManager>,
     catalog: &ModelCatalog,
     output: &OutputStore,
     environment: &AgentEnvironment,
@@ -2776,7 +2779,7 @@ pub(super) async fn save_settings(
         } else {
             active_for_runtime(manager, runtime).await?
         };
-        apply_active(app, runtime, catalog, output, &active).await?;
+        apply_active(app, runtime, manager, catalog, output, &active).await?;
         app.settings = Some(SettingsState::load(active, catalog, environment).await);
         Ok::<_, anyhow::Error>(())
     }
@@ -2873,6 +2876,7 @@ pub(super) async fn finish_background(
                 apply_active(
                     app,
                     &services.runtime,
+                    &services.manager,
                     &services.catalog,
                     &services.output,
                     &active,
@@ -2921,6 +2925,7 @@ pub(super) async fn finish_background(
                         apply_active(
                             app,
                             &services.runtime,
+                            &services.manager,
                             &services.catalog,
                             &services.output,
                             &active,
@@ -2954,11 +2959,18 @@ pub(super) async fn finish_background(
 pub(super) async fn apply_active(
     app: &mut App,
     runtime: &AgentRuntime,
+    manager: &Arc<ConfigManager>,
     catalog: &ModelCatalog,
     output: &OutputStore,
     active: &ActiveSettings,
 ) -> Result<()> {
-    let configured = configured_backend(active, catalog, Some(runtime.session().id())).await?;
+    let configured = configured_backend(
+        active,
+        catalog,
+        Some(runtime.session().id()),
+        manager.clone(),
+    )
+    .await?;
     let model_ready = configured.is_some();
     let (backend, limits) = match configured {
         Some((backend, limits)) => (Some(backend), Some(limits)),

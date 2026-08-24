@@ -1,3 +1,4 @@
+use super::antigravity::AntigravityTransport;
 use super::codex_websocket::CodexWebSocketTransport;
 use super::failure::{ModelFailure, ModelFailurePhase};
 use super::request_transform::ModelRequestTransform;
@@ -5,7 +6,7 @@ use super::{
     ModelBackend, ModelDelta, ModelRequest, ModelResponse, clamp_thinking_level, tool_definitions,
 };
 use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits, ThinkingLevel};
-use crate::config::{ActiveSettings, AuthKind, resolve_config_value};
+use crate::config::{ActiveSettings, AuthKind, ConfigManager, resolve_config_value};
 use crate::oauth;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -51,6 +52,7 @@ pub(crate) struct AuthClient {
     pub(super) strip_x_api_key: bool,
     pub(super) transform: Option<ModelRequestTransform>,
     pub(super) codex_websocket: Option<CodexWebSocketTransport>,
+    pub(super) antigravity: Option<AntigravityTransport>,
 }
 
 impl AuthClient {
@@ -113,8 +115,11 @@ impl HttpClientExt for AuthClient {
         let inner = self.inner.clone();
         let request = self.prepare(req);
         let codex_websocket = self.codex_websocket.clone();
+        let antigravity = self.antigravity.clone();
         async move {
-            if let Some(codex_websocket) = codex_websocket {
+            if let Some(antigravity) = antigravity {
+                antigravity.send(inner, request).await
+            } else if let Some(codex_websocket) = codex_websocket {
                 codex_websocket.send(inner, request).await
             } else {
                 HttpClientExt::send_streaming(&inner, request).await
@@ -138,6 +143,7 @@ pub(crate) enum RigClient {
 }
 
 impl RigBackend {
+    #[cfg(test)]
     pub async fn new(
         model: &CatalogModel,
         api_key: &str,
@@ -145,6 +151,27 @@ impl RigBackend {
         auth_kind: AuthKind,
         thinking: ThinkingLevel,
         session_id: Option<&str>,
+    ) -> Result<Self> {
+        Self::new_with_manager(
+            model,
+            api_key,
+            environment,
+            auth_kind,
+            thinking,
+            session_id,
+            None,
+        )
+        .await
+    }
+
+    async fn new_with_manager(
+        model: &CatalogModel,
+        api_key: &str,
+        environment: &std::collections::BTreeMap<String, String>,
+        auth_kind: AuthKind,
+        thinking: ThinkingLevel,
+        session_id: Option<&str>,
+        manager: Option<Arc<ConfigManager>>,
     ) -> Result<Self> {
         if model.api == "openai-codex-responses" {
             if model.provider != "openai-codex" {
@@ -155,6 +182,9 @@ impl RigBackend {
                     "openai-codex-responses requires ChatGPT/Codex subscription OAuth; run :login and select OpenAI"
                 );
             }
+        }
+        if model.api == "antigravity" && auth_kind != AuthKind::Oauth {
+            bail!("Antigravity requires Google OAuth; run :login and select Antigravity");
         }
         let mut headers = resolved_headers(model, environment).await?;
         if model
@@ -190,6 +220,17 @@ impl RigBackend {
             .then(|| oauth::chatgpt_account_id(api_key))
             .transpose()
             .context("invalid ChatGPT/Codex OAuth access token")?;
+        let antigravity = (model.api == "antigravity")
+            .then(|| {
+                AntigravityTransport::new(
+                    model,
+                    session_id,
+                    manager.ok_or_else(|| {
+                        anyhow::anyhow!("Antigravity credential store is unavailable")
+                    })?,
+                )
+            })
+            .transpose()?;
         let request_client = AuthClient {
             inner: reqwest::Client::new(),
             strip_x_api_key: anthropic_oauth,
@@ -200,6 +241,7 @@ impl RigBackend {
             }),
             codex_websocket: (model.api == "openai-codex-responses")
                 .then(|| CodexWebSocketTransport::new(session_id.zip(codex_account_id.as_deref()))),
+            antigravity,
         };
         let client = match model.api.as_str() {
             "openai-responses" => RigClient::OpenAiResponses(
@@ -259,6 +301,7 @@ impl RigBackend {
                             session_id: session_id.map(str::to_string),
                         }),
                         codex_websocket: None,
+                        antigravity: None,
                         strip_x_api_key: anthropic_oauth,
                     });
                 if anthropic_oauth {
@@ -275,7 +318,7 @@ impl RigBackend {
                 }
                 RigClient::Anthropic(completion)
             }
-            "google-generative-ai" => RigClient::Gemini(
+            "google-generative-ai" | "antigravity" => RigClient::Gemini(
                 gemini::Client::builder()
                     .api_key(api_key)
                     .base_url(normalize_gemini_base_url(&model.base_url))
@@ -299,6 +342,7 @@ pub async fn configured_backend(
     settings: &ActiveSettings,
     catalog: &ModelCatalog,
     session_id: Option<&str>,
+    manager: Arc<ConfigManager>,
 ) -> Result<Option<(Arc<dyn ModelBackend>, ModelLimits)>> {
     if !settings.model_configured() {
         return Ok(None);
@@ -313,13 +357,14 @@ pub async fn configured_backend(
             settings.model
         )
     })?;
-    let backend = RigBackend::new(
+    let backend = RigBackend::new_with_manager(
         &model,
         api_key,
         &settings.credential_environment,
         settings.auth_kind,
         settings.thinking,
         session_id,
+        Some(manager),
     )
     .await?;
     let limits = backend.limits.clone();

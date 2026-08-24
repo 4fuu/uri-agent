@@ -40,13 +40,14 @@ impl ModelFailure {
     pub(super) fn from_completion_error(error: CompletionError, phase: ModelFailurePhase) -> Self {
         let status = error.provider_response_status();
         let headers = error.provider_response_headers();
-        let retry_after = parse_retry_after(headers);
         let provider_request_id = error
             .provider_request_id()
             .map(str::to_string)
             .or_else(|| request_id_from_headers(headers));
         let message = error.to_string();
         let diagnostic = error.provider_response_body().unwrap_or(&message);
+        let retry_after =
+            parse_retry_after(headers).or_else(|| parse_google_retry_info(diagnostic));
         let kind = classify_model_failure(&error, status, diagnostic);
         Self {
             kind,
@@ -340,4 +341,52 @@ fn parse_nonnegative_number(value: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn parse_google_retry_info(body: &str) -> Option<Duration> {
+    fn find(value: &serde_json::Value) -> Option<Duration> {
+        match value {
+            serde_json::Value::Object(object) => {
+                let is_retry_info = object
+                    .get("@type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.ends_with("google.rpc.RetryInfo"));
+                if is_retry_info
+                    && let Some(delay) = object
+                        .get("retryDelay")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|delay| delay.strip_suffix('s'))
+                        .and_then(parse_nonnegative_number)
+                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+                {
+                    return Some(delay);
+                }
+                object.values().find_map(find)
+            }
+            serde_json::Value::Array(values) => values.iter().find_map(find),
+            _ => None,
+        }
+    }
+
+    serde_json::from_str(body).ok().as_ref().and_then(find)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn google_rpc_retry_info_is_used_when_headers_are_absent() {
+        let body = r#"{
+            "error": {"details": [{
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": "3.250s"
+            }]}
+        }"#;
+        assert_eq!(
+            parse_google_retry_info(body),
+            Some(Duration::from_millis(3_250))
+        );
+        assert_eq!(parse_google_retry_info("not JSON"), None);
+    }
 }

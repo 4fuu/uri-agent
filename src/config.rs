@@ -625,6 +625,51 @@ impl ConfigManager {
         self.recalculate(&files).await
     }
 
+    pub async fn oauth_token(&self, provider: &str) -> Result<OauthToken> {
+        let files = self.files.lock().await;
+        let entry = files
+            .auth
+            .0
+            .get(provider)
+            .filter(|entry| entry.kind == "oauth")
+            .ok_or_else(|| anyhow!("{provider} OAuth credentials are not configured"))?;
+        oauth_token_from_entry(provider, entry)
+    }
+
+    /// Refresh one OAuth entry without holding the configuration lock during
+    /// network I/O. If another login or refresh wins the race, its newer
+    /// credential is returned instead of being overwritten.
+    pub async fn force_refresh_oauth(&self, provider: &str) -> Result<OauthToken> {
+        let before = self.oauth_token(provider).await?;
+        let refreshed = oauth::refresh_token(provider, &before).await?;
+        let mut files = self.files.lock().await;
+        let current = files
+            .auth
+            .0
+            .get(provider)
+            .filter(|entry| entry.kind == "oauth")
+            .ok_or_else(|| anyhow!("{provider} OAuth credentials were removed during refresh"))?;
+        let current_token = oauth_token_from_entry(provider, current)?;
+        if current_token.access != before.access
+            || current_token.refresh != before.refresh
+            || current_token.expires != before.expires
+        {
+            return Ok(current_token);
+        }
+        let entry = files
+            .auth
+            .0
+            .get_mut(provider)
+            .expect("OAuth entry checked above");
+        entry.access = Some(refreshed.access.clone());
+        entry.refresh = Some(refreshed.refresh.clone());
+        entry.expires = Some(refreshed.expires);
+        entry.extra.clone_from(&refreshed.extra);
+        write_json(&self.auth_path(), &files.auth, true).await?;
+        self.recalculate(&files).await?;
+        Ok(refreshed)
+    }
+
     pub async fn clear_api_key(&self, provider: &str) -> Result<ActiveSettings> {
         let mut files = self.files.lock().await;
         files.auth.0.remove(provider);
@@ -778,12 +823,17 @@ async fn calculate_active(
     let credential_environment = configured_entry
         .map(|entry| entry.env.clone())
         .unwrap_or_default();
-    let models_key = catalog.configured_api_key(&provider).await;
+    let private_oauth = provider == "antigravity";
+    let models_key = if private_oauth {
+        None
+    } else {
+        catalog.configured_api_key(&provider).await
+    };
     let (mut api_key, mut api_key_source, mut auth_kind) = match configured_entry {
         Some(entry) if entry.kind == "oauth" => {
             (entry.access.clone(), ValueSource::Global, AuthKind::Oauth)
         }
-        Some(entry) if entry.kind == "api_key" && entry.key.is_some() => {
+        Some(entry) if !private_oauth && entry.kind == "api_key" && entry.key.is_some() => {
             (entry.key.clone(), ValueSource::Global, AuthKind::ApiKey)
         }
         _ => (models_key, ValueSource::ModelsFile, AuthKind::None),
@@ -791,32 +841,34 @@ async fn calculate_active(
     if auth_kind == AuthKind::None && api_key.is_some() {
         auth_kind = AuthKind::ApiKey;
     }
-    let provider_environment = api_key_environment(&provider);
-    let mut environments = vec![
-        provider_environment.clone(),
-        "URI_AGENT_API_KEY".to_string(),
-    ];
-    if provider == "anthropic" {
-        environments.insert(0, "ANTHROPIC_OAUTH_TOKEN".to_string());
-        environments.insert(1, "ANTHROPIC_AUTH_TOKEN".to_string());
-    }
-    for environment in environments {
-        if let Ok(value) = env::var(&environment)
-            && !value.trim().is_empty()
-        {
-            api_key = Some(value);
-            api_key_source = ValueSource::Environment(environment.clone());
-            auth_kind = if environment.contains("OAUTH") {
-                AuthKind::Oauth
-            } else {
-                AuthKind::ApiKey
-            };
+    if !private_oauth {
+        let provider_environment = api_key_environment(&provider);
+        let mut environments = vec![
+            provider_environment.clone(),
+            "URI_AGENT_API_KEY".to_string(),
+        ];
+        if provider == "anthropic" {
+            environments.insert(0, "ANTHROPIC_OAUTH_TOKEN".to_string());
+            environments.insert(1, "ANTHROPIC_AUTH_TOKEN".to_string());
         }
-    }
-    if let Some(value) = &invocation.api_key {
-        api_key = Some(value.clone());
-        api_key_source = ValueSource::CommandLine;
-        auth_kind = AuthKind::ApiKey;
+        for environment in environments {
+            if let Ok(value) = env::var(&environment)
+                && !value.trim().is_empty()
+            {
+                api_key = Some(value);
+                api_key_source = ValueSource::Environment(environment.clone());
+                auth_kind = if environment.contains("OAUTH") {
+                    AuthKind::Oauth
+                } else {
+                    AuthKind::ApiKey
+                };
+            }
+        }
+        if let Some(value) = &invocation.api_key {
+            api_key = Some(value.clone());
+            api_key_source = ValueSource::CommandLine;
+            auth_kind = AuthKind::ApiKey;
+        }
     }
     api_key = match api_key {
         Some(value) => Some(resolve_config_value(&value, &credential_environment).await?),
@@ -843,6 +895,24 @@ async fn calculate_active(
         thinking_source,
         terminal_source,
         credential_environment,
+    })
+}
+
+fn oauth_token_from_entry(provider: &str, entry: &AuthEntry) -> Result<OauthToken> {
+    let refresh = entry
+        .refresh
+        .clone()
+        .ok_or_else(|| anyhow!("{provider} OAuth credential has no refresh token"))?;
+    let access = entry
+        .access
+        .clone()
+        .ok_or_else(|| anyhow!("{provider} OAuth credential has no access token"))?;
+    Ok(OauthToken {
+        kind: "oauth".to_string(),
+        refresh,
+        access,
+        expires: entry.expires.unwrap_or(0),
+        extra: entry.extra.clone(),
     })
 }
 
@@ -1475,6 +1545,59 @@ mod tests {
             serde_json::to_value(&auth).unwrap()["anthropic"]["type"],
             "oauth"
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_accepts_only_its_stored_oauth_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(&project).await.unwrap();
+        fs::write(
+            directory.join("models.json"),
+            br#"{"providers":{"antigravity":{"apiKey":"models-key"}}}"#,
+        )
+        .await
+        .unwrap();
+        let catalog = Arc::new(ModelCatalog::load(&directory, true).await.unwrap());
+        let manager = ConfigManager::load(
+            directory,
+            &project,
+            catalog,
+            InvocationOverrides {
+                provider: Some("antigravity".to_string()),
+                model: Some("gemini-3.1-pro-high".to_string()),
+                api_key: Some("command-line-key".to_string()),
+                ..InvocationOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        manager
+            .set_api_key("antigravity", "stored-api-key".to_string())
+            .await
+            .unwrap();
+        assert_eq!(manager.current().await.api_key, None);
+
+        let token = OauthToken {
+            kind: "oauth".to_string(),
+            refresh: "refresh-token".to_string(),
+            access: "oauth-access".to_string(),
+            expires: i64::MAX,
+            extra: BTreeMap::from([(
+                "projectId".to_string(),
+                Value::String("project-1".to_string()),
+            )]),
+        };
+        let active = manager
+            .set_oauth("antigravity", token.clone())
+            .await
+            .unwrap();
+        assert_eq!(active.api_key.as_deref(), Some("oauth-access"));
+        assert_eq!(active.auth_kind, AuthKind::Oauth);
+        assert_eq!(manager.oauth_token("antigravity").await.unwrap(), token);
     }
 
     #[tokio::test]

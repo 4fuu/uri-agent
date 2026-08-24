@@ -24,6 +24,9 @@ URI Agent 把其他 Agent 加载 Skills 的方式延伸到了所有能力：启�
 
 URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变化。模型请求及其所需上下文会发送给你选择的 Provider；除非启用离线模式，URI Agent 还会从 pi.dev 获取模型目录元数据。
 
+> [!WARNING]
+> 可选的 Antigravity 集成是一套实验性、无官方支持的私有协议，可能随时失效，也可能使登录的 Google 账号受到 Provider 限制。请在了解风险后仅用于实验；配置方式和限制见英文文档 [Experimental Antigravity setup and limitations](docs/configuration.md#experimental-antigravity-private-protocol)。
+
 ## 约 2.5 KB 的固定启动基线
 
 以当前源码为准，在 Unix、启用 Bash、包含 8 个内置协议且不计项目与环境附加内容时，固定启动基线为：

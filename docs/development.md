@@ -41,7 +41,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/main.rs` | Application assembly, plugin installation, Skill registration, and runtime/TUI wiring |
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
-| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, Codex WebSocket transport, multimodal support, and the two tool schemas |
+| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, Codex WebSocket and experimental Antigravity transports, multimodal support, and the two tool schemas |
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |

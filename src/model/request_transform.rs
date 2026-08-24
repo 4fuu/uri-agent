@@ -23,6 +23,7 @@ impl ModelRequestTransform {
             "openai-completions" => self.openai_completions(body),
             "anthropic-messages" => self.anthropic(body),
             "google-generative-ai" => self.google(body),
+            "antigravity" => self.antigravity(body),
             _ => {}
         }
         serde_json::to_vec(&value).map_or(bytes, bytes::Bytes::from)
@@ -801,6 +802,36 @@ impl ModelRequestTransform {
                 "thinkingConfig".to_string(),
                 json!({"thinkingBudget": self.google_budget(), "includeThoughts": true}),
             );
+        }
+    }
+
+    fn antigravity(&self, body: &mut Map<String, Value>) {
+        let upstream = self
+            .model
+            .compat("antigravityModel")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.model.id);
+        if !upstream.starts_with("claude-") {
+            self.google(body);
+            return;
+        }
+        let Some(config) = body
+            .entry("generationConfig")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+        else {
+            return;
+        };
+        if self.thinking.enabled() {
+            config.insert(
+                "thinkingConfig".to_string(),
+                json!({
+                    "thinkingBudget": self.thinking.budget(),
+                    "includeThoughts": true
+                }),
+            );
+        } else {
+            config.remove("thinkingConfig");
         }
     }
 

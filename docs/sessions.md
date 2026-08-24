@@ -50,7 +50,9 @@ URI Agent retries transient failures for normal model calls and context-summary 
 | Request conflict (`409`) | 4 | 500ms exponential, capped at 8s |
 | Empty completed response | 4 | 1s exponential, capped at 8s |
 
-Fallback delays add up to 25% jitter. `Retry-After` or `retry-after-ms` takes precedence, capped at 60 seconds. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
+Fallback delays add up to 25% jitter. `Retry-After` or `retry-after-ms` takes precedence, capped at 60 seconds. When those headers are absent, a Google RPC `RetryInfo.retryDelay` in the response body supplies the same delay. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
+
+The experimental Antigravity transport performs two bounded repairs before this generic policy sees a failure. An expired token or the first `401` refreshes the stored OAuth credential once. A Gemini `400` that specifically reports an invalid thought signature replaces persisted Gemini signatures with the private protocol's dummy marker and retries once. It does not replay `429` or `5xx` responses internally; those retain their normal runtime classification and retry budget. Inference uses the daily host for discovered Pro or Ultra tiers and the production host for other tiers, without switching hosts after an error because a token can be valid for only one of them.
 
 Because the counters are independent, alternating failure classes can consume up to 28 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time limit.
 

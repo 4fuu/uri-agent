@@ -14,6 +14,7 @@ pub use util::parse_authorization_input;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OauthProvider {
+    Antigravity,
     Anthropic,
     OpenRouter,
     OpenAiCodex,
@@ -31,7 +32,8 @@ pub struct OauthMethod {
 }
 
 impl OauthProvider {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::Antigravity,
         Self::Anthropic,
         Self::OpenRouter,
         Self::OpenAiCodex,
@@ -43,6 +45,7 @@ impl OauthProvider {
 
     pub fn from_id(id: &str) -> Option<Self> {
         Some(match id {
+            "antigravity" => Self::Antigravity,
             "anthropic" => Self::Anthropic,
             "openrouter" => Self::OpenRouter,
             "openai-codex" => Self::OpenAiCodex,
@@ -56,6 +59,7 @@ impl OauthProvider {
 
     pub fn id(self) -> &'static str {
         match self {
+            Self::Antigravity => "antigravity",
             Self::Anthropic => "anthropic",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCodex => "openai-codex",
@@ -68,6 +72,7 @@ impl OauthProvider {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Antigravity => "Antigravity (experimental)",
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
             Self::OpenRouter => "OpenRouter OAuth",
             Self::OpenAiCodex => "OpenAI Codex",
@@ -80,6 +85,11 @@ impl OauthProvider {
 
     pub fn methods(self) -> &'static [OauthMethod] {
         match self {
+            Self::Antigravity => &[OauthMethod {
+                id: "oauth",
+                label: "Experimental Google OAuth",
+                description: "Private, unsupported Antigravity protocol",
+            }],
             Self::Anthropic => &[OauthMethod {
                 id: "oauth",
                 label: "Claude Pro/Max",
@@ -133,7 +143,7 @@ impl OauthProvider {
     }
 
     pub fn offers_api_key(self) -> bool {
-        !matches!(self, Self::OpenAiCodex)
+        !matches!(self, Self::Antigravity | Self::OpenAiCodex)
     }
 }
 
@@ -223,6 +233,7 @@ pub fn start_login(
         method
     };
     match kind {
+        OauthProvider::Antigravity => providers::start_antigravity(),
         OauthProvider::Anthropic => providers::start_anthropic(),
         OauthProvider::OpenRouter => providers::start_openrouter(),
         OauthProvider::OpenAiCodex if method == "device_code" => providers::start_codex_device(),
@@ -244,6 +255,7 @@ pub async fn refresh_token(provider: &str, token: &OauthToken) -> Result<OauthTo
         bail!("provider {provider} has no OAuth refresh");
     };
     match kind {
+        OauthProvider::Antigravity => providers::refresh_antigravity(token).await,
         OauthProvider::Anthropic => providers::refresh_anthropic(&token.refresh).await,
         OauthProvider::OpenRouter => Ok(token.clone()),
         OauthProvider::OpenAiCodex => providers::refresh_codex(&token.refresh).await,
@@ -309,7 +321,8 @@ mod tests {
 
     #[test]
     fn pi_oauth_providers_are_registered() {
-        assert_eq!(OauthProvider::ALL.len(), 7);
+        assert_eq!(OauthProvider::ALL.len(), 8);
+        assert!(oauth_enabled("antigravity"));
         assert!(oauth_enabled("anthropic"));
         assert!(oauth_enabled("openrouter"));
         assert!(oauth_enabled("openai-codex"));
@@ -320,6 +333,7 @@ mod tests {
         assert!(!oauth_enabled("openai"));
         assert_eq!(OauthProvider::OpenAiCodex.methods().len(), 2);
         assert!(!OauthProvider::OpenAiCodex.offers_api_key());
+        assert!(!OauthProvider::Antigravity.offers_api_key());
     }
 
     #[test]
