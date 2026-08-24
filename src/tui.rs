@@ -4027,17 +4027,28 @@ fn begin_direct_transcript_selection(app: &mut App, mouse: MouseEvent) -> bool {
     if app.overlay.is_some() || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return false;
     }
-    let Some(AppHit::Transcript(index)) = hit_target(&app.hit_regions, mouse) else {
-        return false;
+    let index = match hit_target(&app.hit_regions, mouse) {
+        Some(AppHit::Transcript(index)) => Some(index),
+        None if !app.blocks.is_empty()
+            && app
+                .selectable
+                .as_ref()
+                .is_some_and(|surface| surface.area.contains((mouse.column, mouse.row).into())) =>
+        {
+            None
+        }
+        _ => return false,
     };
-    if !app
-        .blocks
-        .get(index)
-        .is_some_and(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
-    {
-        return false;
+    if let Some(index) = index {
+        if !app
+            .blocks
+            .get(index)
+            .is_some_and(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+        {
+            return false;
+        }
+        app.selected_block = index;
     }
-    app.selected_block = index;
     app.transcript_follow_tail = false;
     update_mouse_selection(app, mouse, false)
 }
@@ -9357,6 +9368,53 @@ mod tests {
             true
         ));
         assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn virtual_transcript_tail_supports_direct_reverse_drag_selection() {
+        let mut app = test_app();
+        for index in 0..30 {
+            app.push(
+                BlockKind::Assistant,
+                "AGENT",
+                format!("message {index}"),
+                None,
+                false,
+                true,
+            );
+        }
+        render_to_string(&mut app, 80, 12);
+        app.scroll_transcript(isize::MAX);
+        render_to_string(&mut app, 80, 12);
+        let final_row = app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(29)).then_some(region.area.y))
+            .unwrap();
+        let tail_row = app.transcript_height.saturating_sub(1) as u16;
+        assert!(tail_row > final_row);
+        assert!(!app.hit_regions.iter().any(|region| {
+            region.area.y == tail_row && matches!(region.target, AppHit::Transcript(_))
+        }));
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: tail_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 1,
+            row: final_row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(begin_direct_transcript_selection(&mut app, down));
+        assert!(update_mouse_selection(&mut app, drag, true));
+        assert!(
+            selected_surface_text(app.selectable.as_ref().unwrap(), app.selection.unwrap())
+                .contains("message 29")
+        );
     }
 
     #[test]

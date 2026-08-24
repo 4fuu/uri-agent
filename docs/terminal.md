@@ -38,7 +38,7 @@ Configurable actions must go through the keymap. Commands available from the pan
 
 Clicks and drags normally go to the terminal application. Hold `Shift` while dragging to select rendered text, then use `Ctrl+C`, `Ctrl+Shift+C`, or right-click to copy through OSC52. On macOS, `Cmd+C` also works when the terminal forwards the modifier.
 
-User prompts, assistant responses, and read-only floats support direct drag selection. Hold `Shift` for reasoning and tool blocks so ordinary clicks remain available for folding and opening. On URI Agent surfaces, a copy shortcut copies the active selection, `Esc` clears it, and any other shortcut clears it before continuing through normal key routing. Terminal restoration, selection, and OSC52 copy remain active on normal and error exits.
+User prompts, assistant responses, blank conversation space (including the virtual tail), and read-only floats support direct drag selection. Hold `Shift` for reasoning and tool blocks so ordinary clicks remain available for folding and opening. On URI Agent surfaces, a copy shortcut copies the active selection, `Esc` clears it, and any other shortcut clears it before continuing through normal key routing. Terminal restoration, selection, and OSC52 copy remain active on normal and error exits.
 
 ## Image attachments
 
