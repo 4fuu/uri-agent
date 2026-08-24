@@ -864,9 +864,23 @@ mod tests {
         );
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = [0_u8; 1024];
-            stream.read_exact(&mut buffer[..1]).await.unwrap();
+            // Read the full request before responding: closing the socket with
+            // unread request data makes Windows reset the connection, which
+            // discards the response before the client can read it.
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    panic!("client closed before sending HTTP headers");
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
             stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = stream.shutdown().await;
         });
         (
             Url::parse(&format!("http://{address}/redirect")).unwrap(),
