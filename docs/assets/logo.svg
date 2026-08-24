@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 452 240" role="img" aria-labelledby="title description">
+  <title id="title">URI Agent logo</title>
+  <desc id="description">The pixel URI wordmark from the terminal welcome screen.</desc>
+  <defs>
+    <pattern id="dither" width="8" height="8" patternUnits="userSpaceOnUse">
+      <rect width="8" height="8" fill="#68d2c2"/>
+      <rect width="2" height="2" fill="#0b1118"/>
+      <rect x="4" y="4" width="2" height="2" fill="#0b1118"/>
+    </pattern>
+  </defs>
+  <rect x="12" y="12" width="428" height="216" rx="42" fill="#0b1118"/>
+  <rect x="13" y="13" width="426" height="214" rx="41" fill="none" stroke="#1f2a37" stroke-width="2"/>
+  <path fill="#68d2c2" d="M56 50h20v20H56zM136 50h20v20h-20zM176 50h80v20h-80zM296 50h100v20H296zM56 70h20v20H56zM136 70h20v20h-20zM176 70h20v20h-20zM256 70h20v20h-20zM336 70h20v20h-20zM56 90h20v20H56zM136 90h20v20h-20zM176 90h20v20h-20zM256 90h20v20h-20zM336 90h20v20h-20zM56 110h20v20H56zM136 110h20v20h-20zM176 110h80v20h-80zM336 110h20v20h-20zM56 130h20v20H56zM136 130h20v20h-20zM176 130h20v20h-20zM216 130h20v20h-20zM336 130h20v20h-20zM56 150h20v20H56zM136 150h20v20h-20zM176 150h20v20h-20zM236 150h20v20h-20zM336 150h20v20h-20zM76 170h60v20H76zM176 170h20v20h-20zM256 170h20v20h-20zM296 170h100v20H296z"/>
+  <path fill="url(#dither)" d="M56 50h20v20H56zM136 50h20v20h-20zM216 50h20v20h-20zM296 50h20v20h-20zM376 50h20v20h-20z"/>
+</svg>

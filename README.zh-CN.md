@@ -1,22 +1,45 @@
+<p align="center">
+  <img src="docs/assets/logo.svg" width="420" alt="URI Agent 标志">
+</p>
+
 # URI Agent
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent 是一个终端 coding agent，核心是固定且精简的模型接口。模型始终只看到 `read` 和 `exec` 两个工具，并通过 `file://...`、`bash://...` 等协议地址访问文件、Shell、编辑能力、Skills 与扩展。
+URI Agent 是一个把上下文渐进加载与按需加载作为核心设计目标的终端 coding agent。新会话只从一个很小的路由层开始：`read` 和 `exec` 两个通用工具，加上每个可用协议的一行索引。文件、Shell、编辑、网络、Skills 与扩展的详细说明都不会预先载入。
 
-协议按需从 `<protocol>://help` 加载操作说明。长时间操作会成为系统管理的任务；超长输出仍可通过 `file://` 地址读取；会话历史则保存在 SQLite 中。
+模型首次使用一项能力前，会从 `<protocol>://help` 读取它的契约；只有该协议的说明会在此时进入会话。增加能力只会增加一条协议索引，而不是再增加一套模型工具 schema 或整份说明书。长时间操作会成为系统管理的任务；超长输出仍可通过 `file://` 地址读取；会话历史则保存在 SQLite 中。
 
 > [!WARNING]
 > URI Agent 不提供沙箱。文件与 Shell 协议使用 `uri-agent` 进程本身的权限运行。请只使用可信的项目和配置。
 
 URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变化。模型请求及其所需上下文会发送给你选择的 Provider；除非启用离线模式，URI Agent 还会从 pi.dev 获取模型目录元数据。
 
+## 渐进加载有多轻量
+
+以当前源码为准，在 Unix、启用 Bash、包含 8 个内置协议且不计项目与环境附加内容时，固定启动基线为：
+
+| 组成 | 包含内容 | UTF-8 大小 |
+| --- | --- | ---: |
+| 系统提示词 | 路由规则与内置协议索引 | 1,159 bytes（1.159 KB） |
+| `read` + `exec` 定义 | 两个紧凑的内部工具 schema | 1,326 bytes（1.326 KB） |
+| **合计** | 固定系统提示词与工具 | **2,485 bytes（2.485 KB）** |
+
+```text
+约 2.5 KB 固定基线
+    → read("<protocol>://help")
+    → 只加载该协议的契约
+    → 执行当前任务所需的读取与操作
+```
+
+Skills 也遵循同一路径：启动时只加入每个已发现 Skill 的名称和描述；模型选择该 Skill 后，才会加载它的 `SKILL.md` 与配套资源。实际启动上下文还会按需加入项目的 `AGENTS.md`（如果存在）和一条简短的已检测命令行工具提示。上表只衡量 URI Agent 的固定基线；内部工具定义按紧凑 JSON 序列化，不包含不同 Provider 的请求包装。
+
 ## 为什么使用 URI Agent
 
+- **按需加载上下文：**协议说明、Skill 指令与资源只在当前任务需要时载入。
 - **稳定的工具面：**增加能力不会增加新的模型工具 schema。
-- **渐进式上下文：**只有模型读取协议或 Skill 帮助时，相应说明才进入上下文。
 - **内置网络能力：**通过已登录的 Parallel 或 Exa 服务搜索和提取 HTTPS 网页；两者均未配置时在本地转换网页。
 - **可观察的执行过程：**异步工作的状态和最终输出都通过协议的读取路由提供。
 - **便携的可信扩展：**Extism WASM 模块可以添加支持热重载的协议，而不改变模型工具面。

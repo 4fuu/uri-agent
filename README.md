@@ -1,22 +1,45 @@
+<p align="center">
+  <img src="docs/assets/logo.svg" width="420" alt="URI Agent logo">
+</p>
+
 # URI Agent
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is a terminal coding agent built around a fixed, minimal model interface. The model always sees two tools—`read` and `exec`—and reaches files, shells, edits, Skills, and extensions through protocol addresses such as `file://...` and `bash://...`.
+URI Agent is a terminal coding agent built to push progressive disclosure and on-demand context loading as far as possible. A new session begins with a small router: exactly two generic tools—`read` and `exec`—plus a one-line index of available protocols. Detailed instructions for files, shells, edits, web access, Skills, and extensions are not preloaded.
 
-Protocols load their operational guidance on demand from `<protocol>://help`. Long-running operations become managed tasks, oversized output remains available through a `file://` address, and session history is stored in SQLite.
+Before using a capability, the model reads its contract from `<protocol>://help`; only that protocol's guidance then enters the conversation. Adding a capability adds a protocol entry instead of another model-facing tool schema or manual. Long-running operations become managed tasks, oversized output remains available through a `file://` address, and session history is stored in SQLite.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 
 URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
 
+## Progressive context, measured
+
+With the current source, the fixed startup baseline on Unix with Bash and eight built-in protocols is:
+
+| Component | Included content | UTF-8 size |
+| --- | --- | ---: |
+| System prompt | Routing rules and the built-in protocol index | 1,159 bytes (1.159 KB) |
+| `read` + `exec` definitions | Both compact internal tool schemas | 1,326 bytes (1.326 KB) |
+| **Total** | Fixed system prompt and tools | **2,485 bytes (2.485 KB)** |
+
+```text
+~2.5 KB fixed baseline
+    → read("<protocol>://help")
+    → that protocol's contract
+    → task-specific reads and executions
+```
+
+Skills follow the same path: startup adds only each discovered Skill's name and description; its `SKILL.md` and bundled resources load when the model selects that Skill. Actual startup context also adds the project's `AGENTS.md`, when present, and a short detected-binary hint. The table isolates URI Agent's fixed baseline, serializes its internal tool definitions as compact JSON, and excludes provider-specific request wrappers.
+
 ## Why URI Agent
 
+- **Context on demand:** protocol manuals, Skill instructions, and resources load only when the current task needs them.
 - **Stable tool surface:** adding a capability does not add another model-facing tool schema.
-- **Progressive context:** protocol and Skill instructions enter the context only when the model reads their help.
 - **Built-in web access:** search and extract HTTPS pages through a logged-in Parallel or Exa account, with local page conversion when neither is configured.
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
 - **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
