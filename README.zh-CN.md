@@ -45,16 +45,11 @@ Skills 也遵循同一路径：启动时只加入每个已发现 Skill 的名称
 
 ## 为什么使用 URI Agent
 
-- **统一的 URI 地址空间：**从文件、Shell 到网页、会话、文档、Skills 与扩展，资源和操作都使用同一种路由模型。
-- **把 Skills 的加载方式扩展到所有能力：**先加载简短描述，只在选中或需要时加载契约、指令、资源和完整输出。
-- **调用可靠，能力灵活：**固定的 `read` / `exec` 契约保持稳定，可注册协议则可以独立演进。
-- **内置网络能力：**通过已登录的 Parallel 或 Exa 服务搜索和提取 HTTPS 网页；两者均未配置时在本地转换网页。
-- **可观察的执行过程：**异步工作的状态和最终输出都通过协议的读取路由提供。
-- **便携的可信扩展：**Extism WASM 模块可以添加支持热重载的协议，而不改变模型工具面。
-- **持久化会话：**草稿、事件、固化的会话上下文和压缩 checkpoint 都能跨重启保留。
-- **运行中调整方向：**当前 turn 运行时，可以排队稍后跟进，也可以引导下一次模型请求；尚未生效的消息仍可编辑。
-- **可复用的 Agent 环境变量：**token 只需保存一次，后续 Agent Shell 命令即可使用，同时不会写入项目和会话文件。
-- **完整键盘操作的 TUI：**会话、输入、命令、模型选择、设置和终端集中在同一界面，并支持 `@` 文件引用和 `@@` 会话引用。
+- **URI 原生的上下文渐进：**一个地址空间覆盖所有资源和操作，并像加载 Skills 一样，只在需要时载入契约、指令、资源和完整输出。
+- **调用可靠且易于扩展：**固定的 `read` / `exec` 契约保持稳定，内置、Skill、Rust 和可信 WASM 协议可以独立演进。
+- **pi.dev 模型目录与登录方式：**复用 pi.dev 的云端模型配置和 Provider 登录方式，在同一选择器中使用其目录里属于 URI Agent 已支持 API 系列的模型与服务商。
+- **工作持久且可观察：**受管任务公开状态和最终输出；只追加会话、草稿、固化上下文与压缩 checkpoint 都能跨重启保留。
+- **统一且可控的终端工作流：**内置网络访问、实时 Queue 与 Guidance、完整键盘操作以及 `@` 文件和 `@@` 会话引用都集中在同一界面。
 
 ## 快速开始
 
@@ -120,21 +115,6 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 运行 `:set-env` 可保存 `NPM_TOKEN` 等变量；后续 Agent Shell 命令会自动收到这些变量。设置界面只列出变量名，不显示变量值。全局作用域、私密文件存储、与 `:terminal` 的隔离以及插件访问规则见英文文档 [Agent environment](docs/configuration.md#agent-environment)。
 
 受支持的 API 系列、认证、离线模式和自定义端点见英文文档 [Models and configuration](docs/configuration.md)。
-
-## 协议示例
-
-```text
-read("file://src/main.rs?offset=1&limit=200")
-read("sessions://search", {"query":"refresh token"})
-read("https://search?limit=10", "stable Rust release notes")
-read("https://www.rust-lang.org/")
-read("uri-agent-docs://README.md")
-read("code-review-skill://help")
-exec("bash://?wait=30", "cargo test")  # Unix-like 系统
-exec("pwsh://?wait=30", "cargo test")  # Windows
-```
-
-URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。通过 `:login` 保存 Parallel 或 Exa API key 后，内置 `https` 协议会使用该服务商进行搜索和网页提取。两个网络服务商均未登录时，搜索会请求登录，网页读取则回退到本地 HTTPS 获取和 HTML-to-Markdown 转换。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, and output](docs/protocols.md)。
 
 ## 扩展
 

@@ -45,16 +45,11 @@ Skills follow the same path: startup adds only each discovered Skill's name and 
 
 ## Why URI Agent
 
-- **One URI address space:** resources and actions—from files and shells to web pages, sessions, documentation, Skills, and extensions—use the same routing model.
-- **Skills-style loading for every capability:** compact descriptors load first; contracts, instructions, resources, and complete output load only when selected or needed.
-- **Reliable calls, flexible capabilities:** the fixed `read` / `exec` contract stays stable while registered protocols evolve independently.
-- **Built-in web access:** search and extract HTTPS pages through a logged-in Parallel or Exa account, with local page conversion when neither is configured.
-- **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
-- **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
-- **Durable conversations:** drafts, events, frozen session context, and compaction checkpoints survive restarts.
-- **Live course correction:** while a turn runs, queue a follow-up for afterward or guide the next model request; undelivered messages remain editable.
-- **Reusable Agent environment:** save tokens once for future Agent shell commands while keeping values out of project and session files.
-- **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface, with `@` file and `@@` session references.
+- **URI-native progressive context:** one address space covers every resource and action, while Skills-style loading keeps contracts, instructions, resources, and complete output out of context until needed.
+- **Reliable and extensible:** the fixed `read` / `exec` contract stays stable while built-in, Skill, linked Rust, and trusted WASM protocols evolve independently.
+- **pi.dev models and sign-in:** URI Agent uses pi.dev's cloud model catalog and provider login methods, exposing every catalog model whose API family its backend supports through one selector.
+- **Durable, observable work:** managed tasks expose status and final output; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
+- **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
 
 ## Quick start
 
@@ -120,21 +115,6 @@ The first session is working when protocol activity appears and the assistant re
 Run `:set-env` to save a variable such as `NPM_TOKEN`; future Agent shell commands receive it automatically. Settings lists variable names without showing their values. See [Agent environment](docs/configuration.md#agent-environment) for its global scope, private file storage, `:terminal` separation, and plugin access.
 
 See [Models and configuration](docs/configuration.md) for supported API families, authentication, offline mode, and custom endpoints.
-
-## How protocols look
-
-```text
-read("file://src/main.rs?offset=1&limit=200")
-read("sessions://search", {"query":"refresh token"})
-read("https://search?limit=10", "stable Rust release notes")
-read("https://www.rust-lang.org/")
-read("uri-agent-docs://README.md")
-read("code-review-skill://help")
-exec("bash://?wait=30", "cargo test")  # Unix-like systems
-exec("pwsh://?wait=30", "cargo test")  # Windows
-```
-
-URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. After `:login` saves a Parallel or Exa API key, the built-in `https` protocol uses that provider for search and page extraction. Without either web-provider login, search asks for login while page reads fall back to local HTTPS fetching and HTML-to-Markdown conversion. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, and output](docs/protocols.md) for the shared design.
 
 ## Extensions
 
