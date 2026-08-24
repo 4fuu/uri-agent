@@ -1,7 +1,6 @@
 pub mod builtins;
 pub mod catalog;
 pub mod clipboard;
-mod codex_websocket;
 pub mod compaction;
 pub mod config;
 pub mod keymap;

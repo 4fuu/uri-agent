@@ -1,0 +1,2898 @@
+use super::*;
+
+pub(super) fn block_document(block: &DisplayBlock) -> String {
+    block_document_with_level(block, 1)
+}
+
+pub(super) fn block_document_with_level(block: &DisplayBlock, level: usize) -> String {
+    let mut document = format!("{} {}\n", "#".repeat(level), block.title);
+    if let Some(call_id) = &block.call_id {
+        document.push_str(&format!("\nCall ID: `{call_id}`\n"));
+    }
+    document.push('\n');
+    document.push_str(&block.text);
+    if !document.ends_with('\n') {
+        document.push('\n');
+    }
+    document
+}
+
+pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
+    let uri = arguments.get("uri")?.as_str()?;
+    let separator = uri.find("://").or_else(|| uri.find(':'))?;
+    (separator > 0).then(|| uri[..separator].to_string())
+}
+
+pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
+    let action = match name {
+        "read" => "Read",
+        "exec" => "Ran",
+        _ => return name.to_string(),
+    };
+    let Some(uri) = arguments.get("uri").and_then(serde_json::Value::as_str) else {
+        return action.to_string();
+    };
+    let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
+    if name == "exec"
+        && matches!(protocol, "bash" | "pwsh")
+        && let Some(command) = arguments.get("body").and_then(serde_json::Value::as_str)
+    {
+        return format!(
+            "$ {}",
+            single_line_preview(command.lines().next().unwrap_or_default(), 76)
+        );
+    }
+    if name == "exec" && protocol == "apply_patch" {
+        let files = arguments
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .map(patch_targets)
+            .unwrap_or_default();
+        if let Some(first) = files.first() {
+            let more = files.len().saturating_sub(1);
+            return format!(
+                "Patched {}{}",
+                single_line_preview(first, 64),
+                if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        return "Applied patch".to_string();
+    }
+    if name == "exec" && protocol == "replace" {
+        return format!("Edited {}", single_line_preview(target, 72));
+    }
+    if name == "read" && protocol == "file" {
+        return format!("Read {}", single_line_preview(target, 76));
+    }
+    if target == "help" {
+        return format!("Read {protocol} help");
+    }
+    format!("{action} {}", single_line_preview(uri, 76))
+}
+
+pub(super) fn patch_targets(patch: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in patch.lines() {
+        let path = ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix));
+        if let Some(path) = path
+            && !targets.iter().any(|target| target == path)
+        {
+            targets.push(path.to_string());
+        }
+    }
+    targets
+}
+
+pub(super) fn tool_detail_lines(
+    block: &DisplayBlock,
+    width: usize,
+    limit: usize,
+) -> (Vec<(String, Color)>, usize) {
+    let mut logical = Vec::new();
+    if let Some(tool) = &block.tool {
+        if let Some(uri) = tool
+            .arguments
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+        {
+            logical.push((format!("↳ {uri}"), MUTED));
+        } else {
+            logical.push((format!("↳ {}", tool.name), MUTED));
+        }
+        tool_argument_details(&tool.arguments, &mut logical);
+        if let Some(output) = &tool.output {
+            for (index, line) in output.lines().enumerate() {
+                logical.push((
+                    format!("{} {line}", if index == 0 { "└" } else { " " }),
+                    if block.failed { ERROR } else { MUTED },
+                ));
+            }
+        }
+    } else if let Some((_, result)) = block
+        .text
+        .split_once("\n\nRESULT\n")
+        .or_else(|| block.text.split_once("\n\nERROR\n"))
+    {
+        for (index, line) in result.lines().enumerate() {
+            logical.push((
+                format!("{} {line}", if index == 0 { "└" } else { " " }),
+                if block.failed { ERROR } else { MUTED },
+            ));
+        }
+    }
+    if logical.is_empty() {
+        logical.push(("Waiting for result…".to_string(), MUTED));
+    }
+
+    let mut wrapped = Vec::new();
+    for (line, color) in logical {
+        let lines = wrapped_block_lines(&line, width.max(1));
+        wrapped.extend(lines.into_iter().map(|line| (line, color)));
+    }
+    let extra = wrapped.len().saturating_sub(limit);
+    wrapped.truncate(limit);
+    (wrapped, extra)
+}
+
+pub(super) fn tool_argument_details(
+    arguments: &serde_json::Value,
+    lines: &mut Vec<(String, Color)>,
+) {
+    if let Some(fields) = arguments.as_object() {
+        for (key, value) in fields {
+            if matches!(key.as_str(), "uri" | "body") {
+                continue;
+            }
+            lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
+        }
+    }
+    let Some(body) = arguments.get("body") else {
+        return;
+    };
+    match body {
+        serde_json::Value::String(value) => {
+            let files = patch_targets(value);
+            if !files.is_empty() {
+                lines.extend(files.into_iter().map(|file| (format!("  {file}"), MUTED)));
+            } else if value.lines().count() > 1 {
+                lines.extend(
+                    value
+                        .lines()
+                        .skip(1)
+                        .take(3)
+                        .map(|line| (format!("  {line}"), MUTED)),
+                );
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            lines.push((format!("  body: {} items", values.len()), MUTED));
+        }
+        serde_json::Value::Number(value) => lines.push((format!("  body: {value}"), MUTED)),
+        serde_json::Value::Bool(value) => lines.push((format!("  body: {value}"), MUTED)),
+        serde_json::Value::Null => {}
+    }
+}
+
+pub(super) fn json_value_summary(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => single_line_preview(value, 72),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(values) => format!("{} items", values.len()),
+        serde_json::Value::Object(values) => format!("{} fields", values.len()),
+    }
+}
+
+pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
+    app.hit_regions.clear();
+    app.overlay_bounds = None;
+    app.selectable = None;
+    app.composer_view = None;
+    if app.overlay != Some(Overlay::Composer) {
+        app.composer_mouse_selecting = false;
+    }
+    let area = frame.area();
+    frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
+    if app.showing_splash() {
+        render_brand(frame, app, area, true);
+        return;
+    }
+    app.prune_flashes();
+    let idle = app.blocks.is_empty();
+    let notices = fixed_bottom_notices(app);
+    let notice_lines = bottom_notice_lines(&notices, area.width);
+    let has_notices = !notice_lines.is_empty();
+    let notice_height = notice_lines.len().min(u16::MAX as usize) as u16;
+    let live_activity = footer_activity(app);
+    let footer_height = 1 + u16::from(live_activity.is_some());
+    let constraints = match (idle, has_notices) {
+        (true, false) => vec![Constraint::Min(3)],
+        (true, true) => vec![Constraint::Min(3), Constraint::Length(notice_height)],
+        (false, false) => vec![Constraint::Min(3), Constraint::Length(footer_height)],
+        (false, true) => vec![
+            Constraint::Min(3),
+            Constraint::Length(notice_height),
+            Constraint::Length(footer_height),
+        ],
+    };
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let footer_area = if idle {
+        None
+    } else if has_notices {
+        Some(areas[2])
+    } else {
+        Some(areas[1])
+    };
+    let notice_area = has_notices.then(|| areas[1]);
+    let content = if idle {
+        render_brand(frame, app, areas[0], false);
+        areas[0]
+    } else {
+        render_transcript(frame, app, areas[0]);
+        render_footer(
+            frame,
+            app,
+            footer_area.expect("conversation footer area"),
+            live_activity.as_deref(),
+        );
+        areas[0]
+    };
+    if let Some(notice_area) = notice_area {
+        frame.render_widget(
+            Paragraph::new(notice_lines)
+                .style(Style::default().bg(SURFACE))
+                .block(Block::new().padding(Padding::horizontal(1))),
+            notice_area,
+        );
+    }
+    let flash_lines = bottom_notice_lines(&transient_notices(app), area.width);
+    if !flash_lines.is_empty() {
+        let bottom = notice_area
+            .or(footer_area)
+            .map_or(area.bottom(), |bottom_area| bottom_area.y);
+        let height = flash_lines
+            .len()
+            .min(bottom.saturating_sub(area.y) as usize) as u16;
+        let flash_area = Rect::new(area.x, bottom.saturating_sub(height), area.width, height);
+        frame.render_widget(
+            Paragraph::new(flash_lines)
+                .style(Style::default().bg(SURFACE))
+                .block(Block::new().padding(Padding::horizontal(1))),
+            flash_area,
+        );
+    }
+    let selectable_area = if let Some(overlay) = app.overlay {
+        app.hit_regions.clear();
+        let area = overlay_area(frame.area(), app, overlay);
+        app.overlay_bounds = Some(area);
+        render_overlay(frame, app, overlay);
+        Some(area.inner(Margin {
+            horizontal: 2,
+            vertical: 2,
+        }))
+    } else {
+        Some(content)
+    };
+    if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
+        capture_surface(frame, app, selectable_area);
+        render_selection(frame, app);
+    }
+    if app.overlay.is_none()
+        && let Some(footer_area) = footer_area.filter(|area| area.height == 1)
+    {
+        render_floating_tail_button(frame, app, footer_area);
+    }
+}
+
+const WORDMARK_BOX_HEIGHT: u16 = 13;
+const WORDMARK_BOX_WIDTH: u16 = 76;
+
+pub(super) fn wordmark_box(area: Rect) -> Rect {
+    let width = area.width.clamp(1, WORDMARK_BOX_WIDTH);
+    let height = area.height.clamp(1, WORDMARK_BOX_HEIGHT);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+pub(super) fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, splash: bool) {
+    let brand_area = wordmark_box(area);
+    let progress = (app.started.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()) * 1.25;
+    let mut lines = if splash && progress < 1.0 {
+        animation::wordmark_reveal(app.frame, progress)
+    } else {
+        animation::wordmark(app.frame)
+    }
+    .into_iter()
+    .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
+    .collect::<Vec<_>>();
+    if splash {
+        lines.extend([
+            Line::default(),
+            Line::styled("press any key", Style::default().fg(MUTED)),
+        ]);
+    } else {
+        lines.push(Line::default());
+        lines.extend(welcome_lines(app, brand_area.width as usize));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        brand_area,
+    );
+}
+
+pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let model = if app.info.model_ready {
+        Line::styled(
+            single_line_preview(
+                &format!(
+                    "{} / {} · effort {}",
+                    app.info.provider, app.info.model, app.info.thinking
+                ),
+                width.saturating_sub(1),
+            ),
+            Style::default().fg(TEXT),
+        )
+    } else {
+        Line::styled("No model configured. Run :login", Style::default().fg(WARM))
+    };
+    let hints = action_hints(
+        &app.keymap,
+        &[
+            ("main", "compose", "compose"),
+            ("main", "command", "commands"),
+            ("main", "help", "help"),
+        ],
+    );
+    vec![
+        Line::styled(
+            single_line_preview(&footer_cwd(&app.info.cwd), width.saturating_sub(1)),
+            Style::default().fg(MUTED),
+        ),
+        model,
+        Line::default(),
+        Line::styled(
+            single_line_preview(&hints, width.saturating_sub(1)),
+            Style::default().fg(MUTED),
+        ),
+    ]
+}
+
+/// Minimal conversation footer. Live activity follows the model while project,
+/// usage, and extension details stay in the bottom-anchored status panel.
+pub(super) fn render_footer(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    live_activity: Option<&str>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let percent = context_percent(app);
+    let available = area.width as usize;
+    let usage = match app.info.context_accuracy {
+        ContextAccuracy::Unknown => "?".to_string(),
+        _ if show_context_estimate(app) => format!("≈{percent:.1}%"),
+        _ => format!("{percent:.1}%"),
+    };
+    let progress_frame = if app.busy { app.frame } else { 0 };
+    let progress = if app.info.context_accuracy == ContextAccuracy::Unknown {
+        animation::progress(progress_frame, 8, 0.0)
+    } else {
+        animation::progress(progress_frame, 8, percent / 100.0)
+    };
+    let context = single_line_preview(
+        &format!(
+            "{progress} {usage}/{}",
+            format_tokens(app.info.context_window as u64),
+        ),
+        available,
+    );
+    let context_width = context.width();
+    let model_limit = available.saturating_sub(context_width + 2);
+    let model = single_line_preview(&compact_model(app), model_limit);
+    let model_width = model.width();
+    let gap = available.saturating_sub(model_width + context_width);
+    let mut base = Vec::new();
+    if !model.is_empty() {
+        base.push(Span::styled(
+            model,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if gap > 0 {
+        base.push(Span::raw(" ".repeat(gap)));
+    }
+    base.push(Span::styled(
+        context,
+        Style::default()
+            .fg(context_color(percent))
+            .add_modifier(Modifier::BOLD),
+    ));
+    let mut lines = Vec::new();
+    if area.height > 1
+        && let Some(activity) = live_activity
+    {
+        let show_tail_button = transcript_before_live_tail(app) && available > 0;
+        let tail_button = if TAIL_BUTTON_LABEL.width() <= available {
+            TAIL_BUTTON_LABEL
+        } else {
+            "↓"
+        };
+        let tail_button_width = usize::from(show_tail_button) * tail_button.width();
+        let tail_button_inset = usize::from(show_tail_button)
+            * TAIL_BUTTON_RIGHT_INSET.min(available.saturating_sub(tail_button_width));
+        let tail_controls_width = tail_button_width + tail_button_inset;
+        let activity_limit =
+            available.saturating_sub(tail_controls_width + usize::from(show_tail_button) * 2);
+        let activity = single_line_preview(activity, activity_limit);
+        let activity_width = activity.width();
+        let activity_gap = available.saturating_sub(activity_width + tail_controls_width);
+        let mut activity_line = Vec::new();
+        if !activity.is_empty() {
+            activity_line.push(Span::styled(activity, Style::default().fg(ACCENT)));
+        }
+        if activity_gap > 0 {
+            activity_line.push(Span::raw(" ".repeat(activity_gap)));
+        }
+        if show_tail_button {
+            let button_x = area
+                .right()
+                .saturating_sub((tail_button_width + tail_button_inset) as u16);
+            activity_line.push(Span::styled(
+                tail_button,
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(ROW_ACTIVE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            app.hit_regions.insert(
+                0,
+                HitRegion {
+                    area: Rect::new(button_x, area.y, tail_button_width as u16, 1),
+                    target: AppHit::TranscriptTail,
+                },
+            );
+            if tail_button_inset > 0 {
+                activity_line.push(Span::raw(" ".repeat(tail_button_inset)));
+            }
+        }
+        lines.push(Line::from(activity_line));
+    }
+    lines.push(Line::from(base));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE)),
+        area,
+    );
+    app.hit_regions.push(HitRegion {
+        area,
+        target: AppHit::Status,
+    });
+}
+
+pub(super) fn render_floating_tail_button(frame: &mut Frame<'_>, app: &mut App, footer_area: Rect) {
+    if !transcript_before_live_tail(app) || footer_area.width == 0 || footer_area.y == 0 {
+        return;
+    }
+    let available = footer_area.width as usize;
+    let label = if FLOATING_TAIL_BUTTON_LABEL.width() <= available {
+        FLOATING_TAIL_BUTTON_LABEL
+    } else {
+        "↓"
+    };
+    let width = label.width();
+    let inset = TAIL_BUTTON_RIGHT_INSET.min(available.saturating_sub(width));
+    let area = Rect::new(
+        footer_area.right().saturating_sub((width + inset) as u16),
+        footer_area.y.saturating_sub(1),
+        width as u16,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(label).style(
+            Style::default()
+                .fg(ACCENT)
+                .bg(ROW_ACTIVE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
+    app.hit_regions.insert(
+        0,
+        HitRegion {
+            area,
+            target: AppHit::TranscriptTail,
+        },
+    );
+}
+
+pub(super) fn transcript_before_live_tail(app: &App) -> bool {
+    app.transcript_offset < transcript_live_tail(app.transcript_rows, app.transcript_height)
+}
+
+pub(super) fn footer_activity(app: &App) -> Option<String> {
+    if !app.busy {
+        return None;
+    }
+    let activity = app
+        .activity
+        .as_ref()
+        .map(Activity::label)
+        .unwrap_or_else(|| "working".to_string());
+    let elapsed = app
+        .busy_since
+        .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
+        .unwrap_or_default();
+    Some(format!(
+        "{} {activity}{elapsed}  {}",
+        animation::spinner(app.frame),
+        animation::activity(app.frame, 8)
+    ))
+}
+
+pub(super) fn compact_model(app: &App) -> String {
+    if !app.info.model_ready || app.info.model.is_empty() {
+        return "no-model".to_string();
+    }
+    let model = if app.info.provider_count > 1 {
+        format!("{}/{}", app.info.provider, app.info.model)
+    } else {
+        app.info.model.clone()
+    };
+    format!("{model} · effort {}", app.info.thinking)
+}
+
+pub(super) fn context_percent(app: &App) -> f64 {
+    if app.info.context_window > 0 {
+        app.info.context_tokens as f64 / app.info.context_window as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
+pub(super) fn show_context_estimate(app: &App) -> bool {
+    !app.busy
+        && matches!(
+            app.info.context_accuracy,
+            ContextAccuracy::Hybrid | ContextAccuracy::Estimated
+        )
+}
+
+pub(super) fn context_status(app: &App, percent: f64) -> String {
+    let compaction = if app.info.compaction_enabled {
+        "automatic compaction"
+    } else {
+        "automatic compaction disabled"
+    };
+    match app.info.context_accuracy {
+        ContextAccuracy::Hybrid | ContextAccuracy::Estimated if show_context_estimate(app) => {
+            format!(
+                "≈{} / {} · ≈{percent:.1}% · {compaction}",
+                format_tokens(app.info.context_tokens as u64),
+                format_tokens(app.info.context_window as u64),
+            )
+        }
+        ContextAccuracy::Unknown => format!(
+            "unknown / {} · {compaction}",
+            format_tokens(app.info.context_window as u64),
+        ),
+        ContextAccuracy::Api | ContextAccuracy::Hybrid | ContextAccuracy::Estimated => format!(
+            "{} / {} · {percent:.1}% · {compaction}",
+            format_tokens(app.info.context_tokens as u64),
+            format_tokens(app.info.context_window as u64),
+        ),
+    }
+}
+
+pub(super) fn context_color(percent: f64) -> Color {
+    if percent > 90.0 {
+        ERROR
+    } else if percent > 70.0 {
+        WARM
+    } else {
+        ACCENT
+    }
+}
+
+pub(super) fn plugin_status_items(app: &App, expanded: bool) -> Vec<TuiStatusItem> {
+    app.tui.status_items(&TuiStatusContext {
+        cwd: app.info.cwd.clone(),
+        session_id: app.info.session_id.clone(),
+        expanded,
+    })
+}
+
+pub(super) fn status_tone_style(tone: TuiStatusTone) -> Style {
+    Style::default().fg(match tone {
+        TuiStatusTone::Default => TEXT,
+        TuiStatusTone::Accent => ACCENT,
+        TuiStatusTone::Warning => WARM,
+        TuiStatusTone::Error => ERROR,
+    })
+}
+
+pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if app.blocks.is_empty() {
+        let unconfigured = app.info.provider.trim().is_empty() || app.info.model.trim().is_empty();
+        let lines = if unconfigured {
+            vec![
+                Line::styled(
+                    "No model configured. Run :login",
+                    Style::default().fg(WARM).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    "space compose   : command   :model",
+                    Style::default().fg(MUTED),
+                ),
+            ]
+        } else {
+            vec![
+                Line::styled("No messages yet", Style::default().fg(MUTED)),
+                Line::styled(
+                    "space compose   : command   :login",
+                    Style::default().fg(WARM),
+                ),
+            ]
+        };
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
+        return;
+    }
+    let message_width = area.width.saturating_sub(2).max(1) as usize;
+    let process_width = message_width.saturating_sub(2).max(1);
+    app.transcript_body_width = process_width;
+    let mut items = Vec::new();
+    let mut block_for_row = Vec::new();
+    let mut user_surface_for_row = Vec::new();
+    let mut block_rows = vec![None; app.blocks.len()];
+    let active_block = app.active_transcript_block();
+    let collapsed_processes = app.collapsed_processes();
+    let mut previous_visible = None;
+    for (index, block) in app.blocks.iter().enumerate() {
+        if block
+            .parent_process
+            .is_some_and(|process| collapsed_processes.contains(&process))
+        {
+            continue;
+        }
+        if previous_visible.is_some_and(|(previous, previous_turn_result)| {
+            transcript_needs_gap(
+                previous,
+                previous_turn_result,
+                block.kind,
+                block.turn_result,
+            )
+        }) {
+            items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
+            block_for_row.push(None);
+            user_surface_for_row.push(false);
+        }
+        if block.kind == BlockKind::User {
+            items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
+            block_for_row.push(None);
+            user_surface_for_row.push(true);
+        }
+        let first = items.len();
+        for item in transcript_block_items(
+            block,
+            index == app.selected_block,
+            Some(index) == active_block,
+            message_width,
+            process_width,
+            app,
+        ) {
+            items.push(item);
+            block_for_row.push(Some(index));
+            user_surface_for_row.push(block.kind == BlockKind::User);
+        }
+        block_rows[index] = Some((first, items.len().saturating_sub(1)));
+        if block.kind == BlockKind::User {
+            items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
+            block_for_row.push(None);
+            user_surface_for_row.push(true);
+        }
+        previous_visible = Some((block.kind, block.turn_result));
+    }
+    app.transcript_rows = items.len();
+    app.transcript_height = area.height as usize;
+    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
+    let reading_end = transcript_reading_end(app.transcript_rows, app.transcript_height);
+    if app.transcript_follow_tail {
+        app.transcript_offset = live_tail;
+    } else if app.transcript_center_selected
+        && let Some((first, _)) = block_rows.get(app.selected_block).copied().flatten()
+        && (first < app.transcript_offset
+            || first >= app.transcript_offset.saturating_add(app.transcript_height))
+    {
+        app.transcript_offset = first
+            .saturating_sub(app.transcript_height / 2)
+            .min(reading_end);
+    } else {
+        app.transcript_offset = app.transcript_offset.min(reading_end);
+    }
+    app.transcript_center_selected = false;
+    let offset = app.transcript_offset;
+    let visible = items
+        .into_iter()
+        .skip(offset)
+        .take(app.transcript_height)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(visible).block(Block::new().padding(Padding::horizontal(1))),
+        area,
+    );
+    // Ratatui resets the hidden cells behind wide glyphs even though the terminal paints their
+    // background. Restore the complete user row so later frame diffs can clear exposed tail cells.
+    let content_area = area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    for (row, user_surface) in user_surface_for_row
+        .into_iter()
+        .skip(offset)
+        .take(app.transcript_height)
+        .enumerate()
+    {
+        if user_surface {
+            frame.buffer_mut().set_style(
+                Rect::new(content_area.x, area.y + row as u16, content_area.width, 1),
+                Style::default().bg(USER_SURFACE),
+            );
+        }
+    }
+    for (row, index) in block_for_row.into_iter().enumerate().skip(offset) {
+        let y = area.y.saturating_add((row - offset) as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        if let Some(index) = index {
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(area.x, y, area.width, 1),
+                target: AppHit::Transcript(index),
+            });
+        }
+    }
+}
+
+pub(super) fn transcript_needs_gap(
+    previous: BlockKind,
+    previous_turn_result: bool,
+    current: BlockKind,
+    current_turn_result: bool,
+) -> bool {
+    (previous_turn_result
+        && matches!(previous, BlockKind::Assistant | BlockKind::Error)
+        && current == BlockKind::User)
+        || matches!((previous, current), (BlockKind::User, BlockKind::Process))
+        || (current_turn_result
+            && matches!(current, BlockKind::Assistant | BlockKind::Error)
+            && previous != BlockKind::User)
+}
+
+pub(super) fn transcript_live_tail(rows: usize, height: usize) -> usize {
+    rows.saturating_sub(height)
+}
+
+pub(super) fn transcript_reading_end(rows: usize, height: usize) -> usize {
+    rows.saturating_add(height / 2).saturating_sub(height)
+}
+
+pub(super) fn transcript_block_items(
+    block: &DisplayBlock,
+    selected: bool,
+    live: bool,
+    mut message_width: usize,
+    mut process_width: usize,
+    app: &App,
+) -> Vec<ListItem<'static>> {
+    if block.parent_process.is_some() {
+        message_width = message_width.saturating_sub(2).max(1);
+        process_width = process_width.saturating_sub(2).max(1);
+    }
+    let background = match block.kind {
+        BlockKind::User => USER_SURFACE,
+        BlockKind::Assistant => BG,
+        _ if selected => ROW_ACTIVE,
+        _ => BG,
+    };
+    let open_hint = app.keymap.key_hint("main", "open").map_or_else(
+        || "right-click opens full".to_string(),
+        |key| format!("{key} or right-click opens full"),
+    );
+    let expand_hint = app.keymap.key_hint("main", "toggle").map_or_else(
+        || "select to expand".to_string(),
+        |key| format!("{key} to expand"),
+    );
+    let collapsed_hint = format!("  ▸ {expand_hint}");
+    let mut rows = Vec::new();
+
+    match block.kind {
+        BlockKind::User => {
+            for line in wrapped_block_lines(&block.text, message_width) {
+                rows.push(transcript_block_item(
+                    block,
+                    vec![Span::styled(line, Style::default().fg(TEXT))],
+                    background,
+                ));
+            }
+        }
+        BlockKind::Assistant => {
+            for mut line in markdown::render(&block.text, message_width) {
+                if block.parent_process.is_some() {
+                    line.spans.insert(0, Span::raw("  "));
+                }
+                rows.push(ListItem::new(line).style(Style::default().bg(background)));
+            }
+        }
+        BlockKind::Process => {
+            let steps = block.process.as_ref().map_or(0, |process| process.steps);
+            rows.push(transcript_block_item(
+                block,
+                vec![
+                    Span::styled("◇ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!(
+                            "Process · {steps} step{}",
+                            if steps == 1 { "" } else { "s" }
+                        ),
+                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if block.expanded {
+                            "  ▾".to_string()
+                        } else {
+                            collapsed_hint.clone()
+                        },
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+                background,
+            ));
+        }
+        BlockKind::Reasoning => {
+            rows.push(transcript_block_item(
+                block,
+                vec![
+                    Span::styled("◇ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        if live { "Thinking…" } else { "Thought" },
+                        Style::default()
+                            .fg(if live { ACCENT } else { MUTED })
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled(
+                        if block.expanded {
+                            "  ▾".to_string()
+                        } else {
+                            collapsed_hint.clone()
+                        },
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+                background,
+            ));
+            if block.expanded {
+                let (lines, extra) =
+                    visible_block_lines(&block.text, process_width, EXPANDED_PREVIEW_LINES, live);
+                if live && extra > 0 {
+                    rows.push(transcript_hint(
+                        extra,
+                        "earlier",
+                        true,
+                        &open_hint,
+                        &expand_hint,
+                        background,
+                        block.parent_process.is_some(),
+                    ));
+                }
+                for line in lines {
+                    rows.push(transcript_block_item(
+                        block,
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(
+                                line,
+                                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                            ),
+                        ],
+                        background,
+                    ));
+                }
+                if !live && extra > 0 {
+                    rows.push(transcript_hint(
+                        extra,
+                        "more",
+                        true,
+                        &open_hint,
+                        &expand_hint,
+                        background,
+                        block.parent_process.is_some(),
+                    ));
+                }
+            }
+        }
+        BlockKind::Tool => {
+            let status = if live {
+                animation::spinner(app.frame).to_string()
+            } else if block.failed {
+                "×".to_string()
+            } else if block
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.output.as_ref())
+                .is_some()
+                || block.text.contains("\n\nRESULT\n")
+            {
+                "✓".to_string()
+            } else {
+                "·".to_string()
+            };
+            rows.push(transcript_block_item(
+                block,
+                vec![
+                    Span::styled(
+                        format!("{status} "),
+                        Style::default().fg(if block.failed { ERROR } else { WARM }),
+                    ),
+                    Span::styled(
+                        block.title.clone(),
+                        Style::default()
+                            .fg(if block.failed { ERROR } else { WARM })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if block.expanded { "  ▾" } else { "  ▸" },
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+                background,
+            ));
+            if block.expanded {
+                let (lines, extra) = tool_detail_lines(block, process_width, 8);
+                for (line, color) in lines {
+                    rows.push(transcript_block_item(
+                        block,
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(line, Style::default().fg(color)),
+                        ],
+                        background,
+                    ));
+                }
+                if extra > 0 {
+                    rows.push(transcript_hint(
+                        extra,
+                        "more",
+                        true,
+                        &open_hint,
+                        &expand_hint,
+                        background,
+                        block.parent_process.is_some(),
+                    ));
+                }
+            }
+        }
+        BlockKind::Compaction | BlockKind::Notice | BlockKind::Error => {
+            let color = match block.kind {
+                BlockKind::Compaction => ACCENT,
+                BlockKind::Notice => MUTED,
+                BlockKind::Error => ERROR,
+                _ => unreachable!(),
+            };
+            let symbol = match block.kind {
+                BlockKind::Compaction => "◇",
+                BlockKind::Notice => "·",
+                BlockKind::Error => "×",
+                _ => unreachable!(),
+            };
+            let limit = if block.expanded {
+                EXPANDED_PREVIEW_LINES
+            } else {
+                1
+            };
+            let (lines, extra) = visible_block_lines(&block.text, process_width, limit, false);
+            for (index, line) in lines.into_iter().enumerate() {
+                rows.push(transcript_block_item(
+                    block,
+                    vec![
+                        Span::styled(
+                            if index == 0 {
+                                format!("{symbol} {}  ", block.title)
+                            } else {
+                                "  ".to_string()
+                            },
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            line,
+                            Style::default().fg(if selected { TEXT } else { MUTED }),
+                        ),
+                    ],
+                    background,
+                ));
+            }
+            if extra > 0 {
+                rows.push(transcript_hint(
+                    extra,
+                    "more",
+                    block.expanded,
+                    &open_hint,
+                    &expand_hint,
+                    background,
+                    block.parent_process.is_some(),
+                ));
+            }
+        }
+    }
+
+    rows
+}
+
+pub(super) fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'static> {
+    ListItem::new(Line::from(spans)).style(Style::default().bg(background))
+}
+
+pub(super) fn transcript_block_item(
+    block: &DisplayBlock,
+    mut spans: Vec<Span<'static>>,
+    background: Color,
+) -> ListItem<'static> {
+    if block.parent_process.is_some() {
+        spans.insert(0, Span::raw("  "));
+    }
+    transcript_item(spans, background)
+}
+
+pub(super) fn transcript_hint(
+    extra: usize,
+    position: &str,
+    expanded: bool,
+    open_hint: &str,
+    expand_hint: &str,
+    background: Color,
+    nested: bool,
+) -> ListItem<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "… {extra} {position} lines · {}",
+                if expanded { open_hint } else { expand_hint }
+            ),
+            Style::default().fg(MUTED),
+        ),
+    ];
+    if nested {
+        spans.insert(0, Span::raw("  "));
+    }
+    transcript_item(spans, background)
+}
+
+pub(super) fn visible_block_lines(
+    text: &str,
+    width: usize,
+    limit: usize,
+    from_tail: bool,
+) -> (Vec<String>, usize) {
+    let mut wrapped = wrapped_block_lines(text, width);
+    let extra = wrapped.len().saturating_sub(limit);
+    if from_tail {
+        wrapped = wrapped.split_off(extra);
+    } else {
+        wrapped.truncate(limit);
+    }
+    (wrapped, extra)
+}
+
+pub(super) fn wrapped_block_lines(text: &str, width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+    for logical in text.lines() {
+        if logical.is_empty() {
+            wrapped.push(String::new());
+        } else {
+            wrapped.extend(
+                textwrap::wrap(logical, width.max(1))
+                    .into_iter()
+                    .map(|line| line.into_owned()),
+            );
+        }
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
+pub(super) fn transient_notices(app: &App) -> Vec<(String, Color)> {
+    app.visible_flashes()
+        .rev()
+        .map(|flash| {
+            (
+                flash.to_string(),
+                if flash_is_error(flash) { ERROR } else { WARM },
+            )
+        })
+        .collect()
+}
+
+pub(super) fn fixed_bottom_notices(app: &App) -> Vec<(String, Color)> {
+    let mut notices = Vec::new();
+    if let Some((key, _)) = app
+        .last_interrupt_press
+        .as_ref()
+        .filter(|(_, at)| app.busy && at.elapsed() < DOUBLE_CLICK_INTERVAL)
+    {
+        let key = app.keymap.display_key(key).unwrap_or_else(|| key.clone());
+        notices.push((format!("press {key} again to interrupt"), WARM));
+    }
+    if !app.pending_messages.is_empty() {
+        let restore = app.keymap.key_hint("composer", "restore_pending");
+        let message = restore.map_or_else(
+            || {
+                format!(
+                    " {} pending · open composer to review",
+                    app.pending_messages.len()
+                )
+            },
+            |restore| {
+                format!(
+                    " {} pending · open composer and restore with {restore}",
+                    app.pending_messages.len(),
+                )
+            },
+        );
+        notices.push((message, WARM));
+    }
+    if app.jump != JumpKind::All {
+        let label = match app.jump {
+            JumpKind::Reasoning => "thinking",
+            JumpKind::Tool => "tools",
+            JumpKind::User => "you",
+            JumpKind::All => "",
+        };
+        let indices = app.filtered_indices();
+        let position = indices
+            .iter()
+            .position(|index| *index == app.selected_block)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let hints = action_hints(
+            &app.keymap,
+            &[("main", "clear", "clear"), ("main", "toggle", "open")],
+        );
+        let message = if hints.is_empty() {
+            format!("{label} {position}/{}", indices.len())
+        } else {
+            format!("{label} {position}/{}   {hints}", indices.len())
+        };
+        notices.push((message, WARM));
+    }
+    notices
+}
+
+pub(super) fn bottom_notice_lines(notices: &[(String, Color)], width: u16) -> Vec<Line<'static>> {
+    notices
+        .iter()
+        .flat_map(|(message, color)| {
+            wrapped_block_lines(message, width.saturating_sub(2).max(1) as usize)
+                .into_iter()
+                .map(move |line| Line::styled(line, Style::default().fg(*color)))
+        })
+        .collect()
+}
+
+pub(super) fn flash_duration(message: &str) -> Duration {
+    let characters = message.graphemes(true).count() as u64;
+    FLASH_MIN_DURATION
+        .saturating_add(Duration::from_millis(
+            characters.saturating_mul(FLASH_MILLIS_PER_CHARACTER),
+        ))
+        .min(FLASH_MAX_DURATION)
+}
+
+pub(super) fn flash_is_error(flash: &str) -> bool {
+    let flash = flash.to_ascii_lowercase();
+    flash.contains("failed")
+        || flash.contains("error")
+        || flash.contains("invalid")
+        || flash.contains("could not")
+        || flash.contains("unknown")
+}
+
+pub(super) fn keymap_help(keymap: &Keymap) -> String {
+    let mut output = String::new();
+    for (title, mode) in [
+        ("CONVERSATION", "main"),
+        ("COMPOSER", "composer"),
+        ("COMMAND", "command"),
+        ("LISTS", "list"),
+        ("SELECTOR", "selector"),
+        ("MODELS", "models"),
+        ("SETTINGS", "settings"),
+        ("OAUTH", "oauth"),
+        ("TERMINAL", "terminal"),
+        ("SELECTION", "selection"),
+        ("GLOBAL", "global"),
+    ] {
+        output.push_str(title);
+        output.push('\n');
+        for (key, action) in keymap.display_bindings_for(mode) {
+            output.push_str(&format!("  {key:<16} {}\n", action.replace('_', " ")));
+        }
+        output.push('\n');
+    }
+    output
+}
+
+pub(super) fn key_alternatives(keymap: &Keymap, bindings: &[(&str, &str)]) -> Option<String> {
+    let mut keys = Vec::new();
+    for (mode, action) in bindings {
+        if let Some(key) = keymap.key_hint(mode, action)
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    (!keys.is_empty()).then(|| keys.join("/"))
+}
+
+pub(super) fn action_hints(keymap: &Keymap, hints: &[(&str, &str, &str)]) -> String {
+    hints
+        .iter()
+        .filter_map(|(mode, action, label)| {
+            keymap
+                .key_hint(mode, action)
+                .map(|key| format!("{key} {label}"))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+pub(super) fn panel_title(name: &str, hints: String) -> String {
+    if hints.is_empty() {
+        format!(" {name} ")
+    } else {
+        format!(" {name} · {hints} ")
+    }
+}
+
+pub(super) fn command_help(commands: &CommandRegistry) -> String {
+    commands
+        .list()
+        .into_iter()
+        .map(|command| format!("  :{:<14} {}\n", command.id, command.description))
+        .collect()
+}
+
+pub(super) fn common_command_prefix(names: &[String]) -> String {
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for name in &names[1..] {
+        end = first
+            .as_bytes()
+            .iter()
+            .take(end)
+            .zip(name.as_bytes())
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .count();
+    }
+    first[..end].to_string()
+}
+
+pub(super) fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<CommandMatch> {
+    let query = query.trim().trim_start_matches([':', '：']).to_lowercase();
+    if query.is_empty() {
+        return commands
+            .list()
+            .into_iter()
+            .map(|spec| CommandMatch {
+                name: spec.id.clone(),
+                spec,
+            })
+            .collect();
+    }
+
+    let mut matches = commands
+        .list()
+        .into_iter()
+        .filter_map(|spec| {
+            let name_match = std::iter::once(&spec.id)
+                .chain(spec.aliases.iter())
+                .enumerate()
+                .filter_map(|(index, name)| {
+                    fuzzy_score(&name.to_lowercase(), &query)
+                        .map(|score| (score, 0, index, name.clone()))
+                })
+                .min_by_key(|(score, source, index, _)| (*score, *source, *index));
+            let description_match = fuzzy_score(&spec.description.to_lowercase(), &query)
+                .map(|score| (score, 1, usize::MAX, spec.id.clone()));
+            let (score, source, _, name) = name_match
+                .into_iter()
+                .chain(description_match)
+                .min_by_key(|(score, source, index, _)| (*score, *source, *index))?;
+            Some((score, source, spec.id.clone(), CommandMatch { spec, name }))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    matches
+        .into_iter()
+        .map(|(_, _, _, command)| command)
+        .collect()
+}
+
+pub(super) fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
+    if query.is_empty() || haystack == query {
+        Some(0)
+    } else if haystack.starts_with(query) {
+        Some(1)
+    } else if let Some(position) = haystack.find(query) {
+        Some(position + 2)
+    } else {
+        let mut cursor = 0;
+        let mut score = 100;
+        for needle in query.chars() {
+            let suffix = haystack.get(cursor..)?;
+            let position = suffix.find(needle)?;
+            score += position;
+            cursor += position + needle.len_utf8();
+        }
+        Some(score)
+    }
+}
+
+pub(super) fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
+    match overlay {
+        Overlay::Command => centered(frame, 72, 62),
+        Overlay::Status => bottom_float(frame, 14),
+        Overlay::Composer => bottom_float(
+            frame,
+            8 + pending_preview_height(app) + completion_preview_height(app),
+        ),
+        Overlay::Delivery => bottom_float(frame, 9),
+        Overlay::Text | Overlay::Oauth => Rect::new(
+            2,
+            frame.height.saturating_sub(12).max(2),
+            frame.width.saturating_sub(4),
+            10,
+        ),
+        Overlay::Terminal => centered(frame, 92, 88),
+        Overlay::Models | Overlay::Settings | Overlay::Selector => centered(frame, 82, 78),
+        _ => centered(frame, 78, 72),
+    }
+}
+
+pub(super) fn bottom_float(frame: Rect, desired_height: u16) -> Rect {
+    let horizontal_margin = u16::from(frame.width > 4) * 2;
+    let width = frame.width.saturating_sub(horizontal_margin * 2);
+    let height = desired_height.min(frame.height).max(1);
+    Rect::new(
+        frame.x.saturating_add(horizontal_margin),
+        frame.bottom().saturating_sub(height),
+        width,
+        height,
+    )
+}
+
+pub(super) fn active_protocols(app: &App) -> Vec<ProtocolDescriptor> {
+    app.protocol_source
+        .as_ref()
+        .map_or_else(|| app.protocols.clone(), |source| source.descriptors())
+}
+
+pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
+    let area = overlay_area(frame.area(), app, overlay);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .padding(Padding::uniform(1));
+    match overlay {
+        Overlay::Composer => {
+            let pending_height = pending_preview_height(app);
+            let completion_height = completion_preview_height(app);
+            let mut constraints = Vec::new();
+            if pending_height > 0 {
+                constraints.push(Constraint::Length(pending_height));
+            }
+            if completion_height > 0 {
+                constraints.push(Constraint::Length(completion_height));
+            }
+            constraints.push(Constraint::Min(8));
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(area);
+            let mut section = 0;
+            if pending_height > 0 {
+                render_pending_messages(frame, app, sections[section]);
+                section += 1;
+            }
+            if completion_height > 0 {
+                render_composer_completions(frame, app, sections[section]);
+                section += 1;
+            }
+            let composer_area = sections[section];
+            app.sync_composer_chrome();
+            frame.render_widget(&app.input, composer_area);
+            if let Some(position) = composer_cursor_position(frame, &app.input, composer_area) {
+                frame.set_cursor_position(position);
+                app.composer_view = composer_view(&app.input, composer_area, position);
+            }
+        }
+        Overlay::Delivery => render_delivery(frame, app, area, block),
+        Overlay::Command => render_command(frame, app, area, block),
+        Overlay::Status => render_status(frame, app, area, block),
+        Overlay::Help => {
+            let text = format!(
+                "KEYS\n\n{}COMMANDS\n{}\nSESSION\n{}\n{}\n\nPROJECT\n{}",
+                keymap_help(&app.keymap),
+                command_help(&app.commands),
+                app.info.session_id,
+                app.info.model,
+                display_path(&app.info.cwd)
+            );
+            frame.render_widget(
+                Paragraph::new(text)
+                    .block(block.title(" HELP "))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Protocols => {
+            let mut lines = Vec::new();
+            for protocol in active_protocols(app) {
+                let modes = match (protocol.can_read, protocol.can_exec) {
+                    (true, true) => "read · exec",
+                    (true, false) => "read",
+                    (false, true) => "exec",
+                    (false, false) => "—",
+                };
+                lines.extend([
+                    Line::styled(
+                        format!("{}://   {modes}", protocol.name),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::styled(protocol.description, Style::default().fg(TEXT)),
+                    Line::default(),
+                ]);
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block.title(" PROTOCOLS · read <name>://help "))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Tasks => render_tasks(frame, app, area, block),
+        Overlay::Models => render_models(frame, app, area, block),
+        Overlay::Settings => render_settings(frame, app, area, block),
+        Overlay::Plugin => {
+            let document = app.tui_document.as_ref();
+            let title = document
+                .map(|document| format!(" {} ", document.title))
+                .unwrap_or_else(|| " PLUGIN PANEL ".to_string());
+            let body = document
+                .map(|document| document.body.as_str())
+                .unwrap_or("Plugin panel did not return content.");
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(block.title(title))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Document => {
+            let (title, body) = app
+                .document
+                .as_ref()
+                .map(|(title, body)| (format!(" {title} "), body.as_str()))
+                .unwrap_or((" DOCUMENT ".to_string(), "Nothing to show."));
+            frame.render_widget(
+                Paragraph::new(body)
+                    .block(block.title(title))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.overlay_scroll, 0)),
+                area,
+            );
+        }
+        Overlay::Selector => render_selector(frame, app, area, block),
+        Overlay::Text => {
+            let Some(prompt) = app.text_prompt.as_ref() else {
+                return;
+            };
+            let value = if prompt.secret {
+                format!("{}█", "•".repeat(prompt.value.chars().count().min(48)))
+            } else {
+                format!("{}█", prompt.value)
+            };
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(prompt.message.clone(), Style::default().fg(MUTED)),
+                    Line::default(),
+                    Line::styled(value, Style::default().fg(TEXT)),
+                ])
+                .block(block.title(format!(" {} ", prompt.title))),
+                area,
+            );
+        }
+        Overlay::Terminal => render_pty(frame, app, area),
+        Overlay::Oauth => {
+            let Some(oauth) = app.oauth.as_ref() else {
+                return;
+            };
+            let display = oauth.login.display();
+            let mut lines = vec![
+                Line::styled(display.instructions, Style::default().fg(MUTED)),
+                Line::default(),
+            ];
+            let device = display.user_code.clone();
+            if let Some(code) = &device {
+                lines.push(Line::styled(
+                    format!("code  {code}"),
+                    Style::default().fg(WARM).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::default());
+            }
+            if !display.url.is_empty() {
+                lines.push(Line::styled(display.url, Style::default().fg(ACCENT)));
+                lines.push(Line::default());
+            }
+            if device.is_none() {
+                lines.push(Line::styled(
+                    format!("paste {}█", oauth.paste),
+                    Style::default().fg(TEXT),
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(block.title(format!(" OAUTH · {} ", oauth.provider)))
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
+    }
+}
+
+pub(super) fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let mut hints = app
+        .keymap
+        .key_hint("terminal", "escape")
+        .map(|key| format!("double {key} close"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let shift = app
+        .keymap
+        .modifier_hint("shift")
+        .unwrap_or_else(|| "Shift".to_string());
+    hints.push(format!("{shift}-drag select"));
+    let title = panel_title("TERMINAL", hints.join(" · "));
+    let resize_error = {
+        let Some(pty) = app.pty.as_mut() else {
+            return;
+        };
+        pty.area = area;
+        let inner = area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let resize_error = pty.terminal.resize(inner.height, inner.width).err();
+        let parser = pty.terminal.screen();
+        frame.render_widget(
+            PseudoTerminal::new(parser.screen()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .style(Style::default().bg(SURFACE))
+                    .title(title),
+            ),
+            area,
+        );
+        resize_error
+    };
+    if let Some(error) = resize_error {
+        app.set_flash(format!("Embedded terminal resize failed: {error:#}"));
+    }
+}
+
+pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let branch = current_branch(app);
+    let percent = context_percent(app);
+    let project = branch.map_or_else(
+        || display_path(&app.info.cwd),
+        |branch| format!("{} · git:{branch}", display_path(&app.info.cwd)),
+    );
+    let state = app
+        .activity
+        .as_ref()
+        .map(Activity::label)
+        .unwrap_or_else(|| "ready".to_string());
+    let cache_hit = app
+        .last_cache_hit
+        .map(|rate| format!("{rate:.1}%"))
+        .unwrap_or_else(|| "—".to_string());
+    let subscription = app.info.provider == "kimi-coding";
+    let mut lines = vec![
+        status_row("PROJECT", project, Style::default().fg(ACCENT)),
+        status_row(
+            "SESSION",
+            app.info.session_id.clone(),
+            Style::default().fg(TEXT),
+        ),
+        status_row(
+            "MODEL",
+            if app.info.model_ready {
+                format!(
+                    "{} / {} · effort {}",
+                    app.info.provider, app.info.model, app.info.thinking
+                )
+            } else {
+                "not configured · :login".to_string()
+            },
+            Style::default().fg(if app.info.model_ready { TEXT } else { WARM }),
+        ),
+        status_row("STATE", state, Style::default().fg(ACCENT)),
+        status_row(
+            "CONTEXT",
+            context_status(app, percent),
+            Style::default()
+                .fg(context_color(percent))
+                .add_modifier(Modifier::BOLD),
+        ),
+        status_row(
+            "TOKENS",
+            format!(
+                "input {} · output {} · total {}",
+                format_tokens(app.usage.input),
+                format_tokens(app.usage.output),
+                format_tokens(app.usage.input.saturating_add(app.usage.output)),
+            ),
+            Style::default().fg(TEXT),
+        ),
+        status_row(
+            "CACHE",
+            format!(
+                "read {} · write {} · last hit {cache_hit}",
+                format_tokens(app.usage.cache_read),
+                format_tokens(app.usage.cache_write),
+            ),
+            Style::default().fg(TEXT),
+        ),
+        status_row(
+            "COST",
+            format!(
+                "${:.4}{}",
+                app.usage.cost,
+                if subscription { " · subscription" } else { "" }
+            ),
+            Style::default().fg(if subscription { ACCENT } else { TEXT }),
+        ),
+        status_row(
+            "PROTOCOLS",
+            format!("{} registered", active_protocols(app).len()),
+            Style::default().fg(TEXT),
+        ),
+    ];
+    let plugin_items = plugin_status_items(app, true);
+    if !plugin_items.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "EXTENSIONS",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        lines.extend(plugin_items.into_iter().map(|item| {
+            status_row(
+                single_line_preview(&item.label, 18),
+                single_line_preview(&item.value, 256),
+                status_tone_style(item.tone),
+            )
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block.title(" STATUS "))
+            .wrap(Wrap { trim: false })
+            .scroll((app.overlay_scroll, 0)),
+        area,
+    );
+}
+
+pub(super) fn status_row(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    value_style: Style,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<11}", label.into()),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value.into(), value_style),
+    ])
+}
+
+pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    let title = panel_title(
+        "COMMAND",
+        action_hints(&app.keymap, &[("command", "complete", "complete")]),
+    );
+    frame.render_widget(block.title(title), area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!("⌕ {}█", app.command_query)).style(Style::default().fg(TEXT)),
+        sections[0],
+    );
+    let commands = app.matching_commands();
+    let items = commands.iter().enumerate().map(|(index, item)| {
+        let selected = index == app.command_selected;
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(":{:<14}", item.name),
+                Style::default()
+                    .fg(if selected { ACCENT } else { TEXT })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(item.spec.description.clone(), Style::default().fg(MUTED)),
+        ]))
+        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+    });
+    let mut state = ListState::default().with_selected(Some(app.command_selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for index in state.offset()..commands.len() {
+        let y = sections[1]
+            .y
+            .saturating_add((index - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::Palette(index),
+        });
+    }
+}
+
+const PENDING_PREVIEW_LIMIT: usize = 4;
+const COMPLETION_PREVIEW_LIMIT: usize = 6;
+
+pub(super) fn completion_preview_height(app: &App) -> u16 {
+    app.completions.as_ref().map_or(0, |completions| {
+        completions.result.items.len().min(COMPLETION_PREVIEW_LIMIT) as u16 + 2
+    })
+}
+
+pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let Some(completions) = app.completions.as_ref() else {
+        return;
+    };
+    let select = key_alternatives(
+        &app.keymap,
+        &[("composer", "cursor_up"), ("composer", "cursor_down")],
+    );
+    let insert = key_alternatives(
+        &app.keymap,
+        &[("composer", "submit"), ("composer", "complete")],
+    );
+    let hints = [
+        select.map(|keys| format!("{keys} select")),
+        insert.map(|keys| format!("{keys} insert")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(MUTED))
+        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .title(panel_title("REFERENCES", hints));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let count = completions.result.items.len().min(inner.height as usize);
+    let offset = completions
+        .selected
+        .saturating_sub(count.saturating_sub(1))
+        .min(completions.result.items.len().saturating_sub(count));
+    let lines = completions
+        .result
+        .items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(count)
+        .map(|(index, item)| {
+            let selected = index == completions.selected;
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    item.label.clone(),
+                    Style::default()
+                        .fg(if selected { ACCENT } else { TEXT })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    format!("  {}", item.description),
+                    Style::default().fg(MUTED),
+                ),
+            ])
+            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+    for (row, index) in (offset..offset + count).enumerate() {
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(inner.x, inner.y.saturating_add(row as u16), inner.width, 1),
+            target: AppHit::Completion(index),
+        });
+    }
+}
+
+pub(super) fn pending_preview_height(app: &App) -> u16 {
+    if app.pending_messages.is_empty() {
+        0
+    } else {
+        1 + app.pending_messages.len().min(PENDING_PREVIEW_LIMIT) as u16
+            + u16::from(app.pending_messages.len() > PENDING_PREVIEW_LIMIT)
+    }
+}
+
+pub(super) fn render_pending_messages(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let hints = action_hints(
+        &app.keymap,
+        &[
+            ("composer", "restore_pending", "restore latest"),
+            ("composer", "upgrade_pending", "upgrade latest queue"),
+        ],
+    );
+    let heading = if hints.is_empty() {
+        "Pending".to_string()
+    } else {
+        format!("Pending · {hints}")
+    };
+    let mut lines = vec![Line::styled(
+        single_line_preview(&heading, area.width as usize),
+        Style::default().fg(MUTED).bg(SURFACE),
+    )];
+    let hidden = app
+        .pending_messages
+        .len()
+        .saturating_sub(PENDING_PREVIEW_LIMIT);
+    for message in app.pending_messages.iter().skip(hidden) {
+        let label = match message.kind {
+            PendingMessageKind::Queued => "QUEUE",
+            PendingMessageKind::Guidance => "GUIDE",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {label:<5} "),
+                Style::default().fg(ACCENT).bg(SURFACE),
+            ),
+            Span::styled(
+                single_line_preview(
+                    &message.text.replace(['\r', '\n'], " ↵ "),
+                    area.width.saturating_sub(8) as usize,
+                ),
+                Style::default().fg(TEXT).bg(SURFACE),
+            ),
+        ]));
+    }
+    if hidden > 0 {
+        lines.push(Line::styled(
+            format!(" … {hidden} earlier pending"),
+            Style::default().fg(MUTED).bg(SURFACE),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE)),
+        area,
+    );
+}
+
+pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let Some(delivery) = app.delivery.as_ref() else {
+        return;
+    };
+    let inner = block.inner(area);
+    let select = key_alternatives(&app.keymap, &[("list", "previous"), ("list", "next")]);
+    let mut hints = select
+        .map(|keys| format!("{keys} select"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let actions = action_hints(
+        &app.keymap,
+        &[("list", "confirm", "choose"), ("list", "close", "back")],
+    );
+    if !actions.is_empty() {
+        hints.push(actions);
+    }
+    frame.render_widget(
+        block.title(panel_title("SEND WHILE RUNNING", hints.join(" · "))),
+        area,
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(2)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(single_line_preview(&app.draft_text(), inner.width as usize))
+            .style(Style::default().fg(MUTED)),
+        sections[0],
+    );
+    let choices = [
+        ("Queue", "Run after the current turn finishes"),
+        ("Guidance", "Add before the next model request"),
+    ];
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(index, (title, description))| {
+            let selected = delivery.selected == index;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!("{title:<12}"),
+                    Style::default().fg(if selected { ACCENT } else { TEXT }),
+                ),
+                Span::styled(*description, Style::default().fg(MUTED)),
+            ]))
+            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        });
+    let mut state = ListState::default().with_selected(Some(delivery.selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for index in 0..choices.len() {
+        let y = sections[1].y.saturating_add(index as u16);
+        if y < sections[1].bottom() {
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(sections[1].x, y, sections[1].width, 1),
+                target: AppHit::Delivery(index),
+            });
+        }
+    }
+}
+
+pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    let Some(selector) = app.selector.as_ref() else {
+        return;
+    };
+    frame.render_widget(block.title(format!(" {} ", selector.title)), area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!("⌕ {}█", selector.query)).style(Style::default().fg(TEXT)),
+        sections[0],
+    );
+    let items = selector
+        .visible
+        .iter()
+        .enumerate()
+        .filter_map(|(position, index)| {
+            let item = selector.items.get(*index)?;
+            let selected = position == selector.selected;
+            Some(
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "› " } else { "  " },
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(
+                        format!("{:<22}", item.title),
+                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    ),
+                    Span::styled(item.description.clone(), Style::default().fg(MUTED)),
+                ]))
+                .style(Style::default().bg(if selected {
+                    ROW_ACTIVE
+                } else {
+                    SURFACE
+                })),
+            )
+        });
+    let mut state = ListState::default().with_selected(Some(selector.selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for position in state.offset()..selector.visible.len() {
+        let y = sections[1]
+            .y
+            .saturating_add((position - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::Selector(position),
+        });
+    }
+}
+
+pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    let title = panel_title(
+        "MODELS",
+        action_hints(&app.keymap, &[("models", "refresh", "refresh")]),
+    );
+    frame.render_widget(block.title(title), area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    let Some(selector) = app.model_selector.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("Model catalog is not loaded.").style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    };
+    let summary = if app.catalog_refreshing {
+        format!("{} refreshing pi.dev", animation::spinner(app.frame))
+    } else {
+        format!(
+            "{} matches · {} models · {} providers",
+            selector.visible_len(),
+            selector.model_count(),
+            selector.provider_count()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("⌕  ", Style::default().fg(ACCENT)),
+            Span::styled(selector.query(), Style::default().fg(TEXT)),
+            Span::styled("█", Style::default().fg(ACCENT)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED))
+                .title(format!(" SEARCH · {summary} ")),
+        ),
+        sections[0],
+    );
+    let name_width: usize = if sections[1].width < 60 { 18 } else { 30 };
+    let items = selector.visible().enumerate().map(|(position, model)| {
+        let selected = position == selector.selected_position();
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "{} {:<14}",
+                    if selector.is_current(model) {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    model.provider
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                format!(
+                    "{:<name_width$}",
+                    single_line_preview(model_label(model), name_width.saturating_sub(2))
+                ),
+                Style::default().fg(if selected { ACCENT } else { TEXT }),
+            ),
+            Span::styled(
+                format!(
+                    "{}{}",
+                    context_label(model.context_window()),
+                    if reasoning(model) { " · think" } else { "" }
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ]))
+        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+    });
+    let mut state = ListState::default().with_selected(Some(selector.selected_position()));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for position in state.offset()..selector.visible_len() {
+        let y = sections[1]
+            .y
+            .saturating_add((position - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::Model(position),
+        });
+    }
+    let footer = if let Some(model) = selector.selected() {
+        format!("{}/{} · {}", model.provider, model.id, model.api)
+    } else {
+        "No models match this search".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+        sections[2],
+    );
+}
+
+pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    let inner = block.inner(area);
+    let Some(settings) = app.settings.as_ref() else {
+        frame.render_widget(Paragraph::new("Loading settings…").block(block), area);
+        return;
+    };
+    let model = settings
+        .model()
+        .map(|model| {
+            if model.name.is_empty() || model.name == model.id {
+                model.id.clone()
+            } else {
+                format!("{}  ·  {}", model.name, model.id)
+            }
+        })
+        .unwrap_or_else(|| settings.active.model.clone());
+    let credential = match settings.active.auth_kind {
+        AuthKind::Oauth => format!("OAuth  ·  {}", settings.active.api_key_source.label()),
+        AuthKind::ApiKey => format!("API key  ·  {}", settings.active.api_key_source.label()),
+        AuthKind::None => "not configured  ·  :login".to_string(),
+    };
+    let output_limit = if settings.editing == Some(EditingSetting::OutputLimit) {
+        format!("{}█", settings.output_limit)
+    } else {
+        format!("{} bytes", settings.output_limit)
+    };
+    let edit = app.keymap.key_hint("settings", "edit");
+    let environment = edit.as_ref().map_or_else(
+        || {
+            format!(
+                "{} variable{}",
+                settings.environment_count,
+                if settings.environment_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        },
+        |key| {
+            format!(
+                "{} variable{} · {key} manages",
+                settings.environment_count,
+                if settings.environment_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        },
+    );
+    let rows = [
+        ("Model", format!("{} / {model}", settings.provider())),
+        ("Credential", credential),
+        ("Thinking", settings.thinking.to_string()),
+        ("Output limit", output_limit),
+        ("Agent environment", environment),
+    ];
+    let edit_help = edit.map_or_else(
+        || "Use :login / :logout for credentials.".to_string(),
+        |key| format!("Use :login / :logout for credentials. {key} edits the selected field."),
+    );
+    let row_count = rows.len();
+    let mut lines = vec![
+        Line::styled(edit_help, Style::default().fg(MUTED)),
+        Line::default(),
+    ];
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        let selected = settings.selected == index;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!("{label:<14}"),
+                Style::default().fg(if selected { ACCENT } else { MUTED }),
+            ),
+            Span::styled(value, Style::default().fg(TEXT)),
+        ]));
+        lines.push(Line::default());
+    }
+    let title = panel_title(
+        "SETTINGS",
+        action_hints(&app.keymap, &[("settings", "save", "save")]),
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block.title(title))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+    for index in 0..row_count {
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(
+                inner.x,
+                inner.y.saturating_add(2 + index as u16 * 2),
+                inner.width,
+                1,
+            ),
+            target: AppHit::Setting(index),
+        });
+    }
+}
+
+pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
+    if app.task_records.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No managed tasks in this process.")
+                .block(block.title(" TASKS "))
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+    let inner = block.inner(area);
+    let title = panel_title(
+        "TASKS",
+        action_hints(&app.keymap, &[("tasks", "cancel", "cancel")]),
+    );
+    frame.render_widget(block.title(title), area);
+    let items = app.task_records.iter().enumerate().map(|(index, task)| {
+        ListItem::new(format!(
+            "{} {:9} {}",
+            if index == app.selected_task {
+                "›"
+            } else {
+                " "
+            },
+            task.status.as_str(),
+            task.label
+        ))
+        .style(Style::default().fg(if index == app.selected_task {
+            ACCENT
+        } else {
+            TEXT
+        }))
+    });
+    let mut state = ListState::default().with_selected(Some(app.selected_task));
+    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    for index in state.offset()..app.task_records.len() {
+        let y = inner.y.saturating_add((index - state.offset()) as u16);
+        if y >= inner.bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(inner.x, y, inner.width, 1),
+            target: AppHit::Task(index),
+        });
+    }
+}
+
+pub(super) fn style_input(input: &mut TextArea<'static>, busy: bool, keymap: &Keymap) {
+    let border = ACCENT;
+    let hints = if busy {
+        action_hints(
+            keymap,
+            &[
+                ("composer", "submit", "choose delivery"),
+                ("composer", "newline", "newline"),
+                ("composer", "close", "keep draft"),
+            ],
+        )
+    } else {
+        action_hints(
+            keymap,
+            &[
+                ("composer", "submit", "send"),
+                ("composer", "newline", "newline"),
+                ("composer", "paste_image", "image"),
+            ],
+        )
+    };
+    let footer = format!(" {hints} ");
+    input.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .title(Line::styled(
+                " MESSAGE ",
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::styled(footer, Style::default().fg(MUTED)).right_aligned())
+            .style(Style::default().bg(SURFACE)),
+    );
+    input.set_placeholder_text(if busy {
+        "Add guidance or queue a follow-up…"
+    } else {
+        "Ask URI Agent to build, explain, or fix…"
+    });
+    input.set_placeholder_style(Style::default().fg(MUTED).bg(SURFACE));
+    input.set_style(Style::default().fg(TEXT).bg(SURFACE));
+    input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
+    input.set_cursor_style(Style::default().fg(SURFACE).bg(border));
+    input.set_selection_style(Style::default().fg(TEXT).bg(ACCENT));
+    input.set_wrap_mode(WrapMode::WordOrGlyph);
+}
+
+pub(super) fn composer_view(
+    input: &TextArea<'_>,
+    area: Rect,
+    cursor_position: (u16, u16),
+) -> Option<ComposerView> {
+    let inner = input.block().map_or(area, |block| block.inner(area));
+    if inner.is_empty() {
+        return None;
+    }
+    let rows = composer_visual_rows(input.lines(), inner.width as usize, input.tab_length());
+    let cursor = input.cursor();
+    let cursor_visual_row = rows.iter().enumerate().find_map(|(index, wrapped)| {
+        if wrapped.logical_row != cursor.0 {
+            return None;
+        }
+        let last_in_line = rows
+            .get(index + 1)
+            .is_none_or(|next| next.logical_row != wrapped.logical_row);
+        ((wrapped.start_col <= cursor.1)
+            && (cursor.1 < wrapped.end_col || (last_in_line && cursor.1 == wrapped.end_col)))
+            .then_some(index)
+    })?;
+    let cursor_screen_row = cursor_position.1.saturating_sub(inner.y) as usize;
+    Some(ComposerView {
+        inner,
+        top: cursor_visual_row.saturating_sub(cursor_screen_row),
+        rows,
+    })
+}
+
+pub(super) fn composer_visual_rows(
+    lines: &[String],
+    width: usize,
+    tab_length: u8,
+) -> Vec<ComposerVisualRow> {
+    let mut rows = Vec::new();
+    for (logical_row, line) in lines.iter().enumerate() {
+        let mut start_col = 0usize;
+        for (start_byte, end_byte) in composer_line_ranges(line, width.max(1), tab_length) {
+            let end_col = start_col + line[start_byte..end_byte].chars().count();
+            rows.push(ComposerVisualRow {
+                logical_row,
+                start_col,
+                end_col,
+            });
+            start_col = end_col;
+        }
+    }
+    rows
+}
+
+pub(super) fn composer_line_ranges(
+    line: &str,
+    width: usize,
+    tab_length: u8,
+) -> Vec<(usize, usize)> {
+    let chunks = UnicodeSegmentation::split_word_bound_indices(line)
+        .map(|(start, text)| (start, start + text.len()))
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    let mut start = chunks[0].0;
+    let mut end = start;
+    let mut line_width = 0usize;
+    while index < chunks.len() {
+        let chunk = chunks[index];
+        if end == start {
+            start = chunk.0;
+        }
+        let next_width = display_width_str(&line[chunk.0..chunk.1], line_width, tab_length);
+        if next_width <= width {
+            end = chunk.1;
+            line_width = next_width;
+            index += 1;
+        } else if end > start {
+            ranges.push((start, end));
+            start = end;
+            line_width = 0;
+        } else {
+            split_composer_graphemes(line, chunk.0, chunk.1, width, tab_length, &mut ranges);
+            index += 1;
+            start = chunk.1;
+            end = chunk.1;
+            line_width = 0;
+        }
+    }
+    if end > start {
+        ranges.push((start, end));
+    }
+    ranges
+}
+
+pub(super) fn split_composer_graphemes(
+    line: &str,
+    start: usize,
+    end: usize,
+    width: usize,
+    tab_length: u8,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let mut segment_start = start;
+    while segment_start < end {
+        let mut segment_end = segment_start;
+        let mut segment_width = 0usize;
+        for (offset, grapheme) in
+            UnicodeSegmentation::grapheme_indices(&line[segment_start..end], true)
+        {
+            let grapheme_start = segment_start + offset;
+            let grapheme_end = grapheme_start + grapheme.len();
+            let next_width = display_width_str(grapheme, segment_width, tab_length);
+            if segment_end != segment_start && next_width > width {
+                break;
+            }
+            segment_end = grapheme_end;
+            segment_width = next_width;
+            if segment_width > width {
+                break;
+            }
+        }
+        if segment_end == segment_start {
+            segment_end = line[segment_start..end]
+                .chars()
+                .next()
+                .map_or(end, |character| segment_start + character.len_utf8());
+        }
+        ranges.push((segment_start, segment_end));
+        segment_start = segment_end;
+    }
+}
+
+pub(super) fn display_width_str(text: &str, mut width: usize, tab_length: u8) -> usize {
+    for character in text.chars() {
+        width = display_width_to(character, width, tab_length);
+    }
+    width
+}
+
+pub(super) fn display_width_to(character: char, width: usize, tab_length: u8) -> usize {
+    if character == '\t' && tab_length > 0 {
+        let tab_length = tab_length as usize;
+        width + tab_length - width % tab_length
+    } else {
+        width + character.width().unwrap_or(0)
+    }
+}
+
+pub(super) fn composer_cursor_position(
+    frame: &mut Frame<'_>,
+    input: &TextArea<'_>,
+    area: Rect,
+) -> Option<(u16, u16)> {
+    let inner = input.block().map_or(area, |block| block.inner(area));
+    if inner.is_empty() {
+        return None;
+    }
+
+    let cursor_style = input.cursor_style();
+    let foreground = cursor_style.fg?;
+    let background = cursor_style.bg?;
+    let buffer = frame.buffer_mut();
+    for y in inner.y..inner.bottom() {
+        for x in inner.x..inner.right() {
+            let cell = buffer.cell((x, y))?;
+            if cell.fg == foreground && cell.bg == background {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+pub(super) fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let cells = (area.y..area.bottom())
+        .map(|row| {
+            let mut hidden_cells = 0;
+            (area.x..area.right())
+                .map(|column| {
+                    let Some(cell) = frame.buffer_mut().cell((column, row)) else {
+                        return String::new();
+                    };
+                    if hidden_cells > 0 {
+                        hidden_cells -= 1;
+                        return String::new();
+                    }
+                    hidden_cells = cell.cell_width().saturating_sub(1);
+                    cell.symbol().to_string()
+                })
+                .collect()
+        })
+        .collect();
+    app.selectable = Some(SelectableSurface { area, cells });
+}
+
+pub(super) fn render_selection(frame: &mut Frame<'_>, app: &App) {
+    let (Some(surface), Some(selection)) = (&app.selectable, app.selection) else {
+        return;
+    };
+    let first = selection.start;
+    let second = selection.end;
+    let (start, end) = if (first.1, first.0) <= (second.1, second.0) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    for row in start.1..=end.1 {
+        let from = if row == start.1 {
+            start.0
+        } else {
+            surface.area.x
+        };
+        let to = if row == end.1 {
+            end.0
+        } else {
+            surface.area.right().saturating_sub(1)
+        };
+        for column in from..=to {
+            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+}
+
+pub(super) fn update_mouse_selection(
+    app: &mut App,
+    mouse: MouseEvent,
+    require_shift: bool,
+) -> bool {
+    let Some(surface) = app.selectable.as_ref() else {
+        return false;
+    };
+    let point = (
+        mouse
+            .column
+            .clamp(surface.area.x, surface.area.right().saturating_sub(1)),
+        mouse
+            .row
+            .clamp(surface.area.y, surface.area.bottom().saturating_sub(1)),
+    );
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)
+            if (!require_shift || mouse.modifiers.contains(KeyModifiers::SHIFT))
+                && surface.area.contains(point.into()) =>
+        {
+            app.selection = Some(TextSelection {
+                start: point,
+                end: point,
+            });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.selection.is_some() => {
+            if let Some(selection) = app.selection.as_mut() {
+                selection.end = point;
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.selection.is_some() => {
+            let empty = if let Some(selection) = app.selection.as_mut() {
+                selection.end = point;
+                selection.start == selection.end
+            } else {
+                false
+            };
+            if empty {
+                app.selection = None;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn copy_current_surface(app: &mut App) {
+    let Some(surface) = app.selectable.as_ref() else {
+        app.set_flash("Nothing visible can be copied");
+        return;
+    };
+    let text = if let Some(selection) = app.selection {
+        selected_surface_text(surface, selection)
+    } else {
+        complete_surface_text(surface)
+    };
+    if text.trim().is_empty() {
+        app.set_flash("The selection is empty");
+        return;
+    }
+    copy_text_with_osc52(app, &text);
+    app.selection = None;
+}
+
+pub(super) fn copy_composer_selection(app: &mut App) {
+    let Some(text) = composer_selected_text(&app.input) else {
+        return;
+    };
+    copy_text_with_osc52(app, &text);
+}
+
+pub(super) fn composer_has_selection(input: &TextArea<'_>) -> bool {
+    input
+        .selection_range()
+        .is_some_and(|(start, end)| start != end)
+}
+
+pub(super) fn composer_selected_text(input: &TextArea<'_>) -> Option<String> {
+    let (start, end) = input.selection_range()?;
+    if start == end {
+        return None;
+    }
+    if start.0 == end.0 {
+        return Some(
+            input.lines()[start.0]
+                .chars()
+                .skip(start.1)
+                .take(end.1.saturating_sub(start.1))
+                .collect(),
+        );
+    }
+    let mut selected = input.lines()[start.0]
+        .chars()
+        .skip(start.1)
+        .collect::<String>();
+    for line in &input.lines()[start.0 + 1..end.0] {
+        selected.push('\n');
+        selected.push_str(line);
+    }
+    selected.push('\n');
+    selected.extend(input.lines()[end.0].chars().take(end.1));
+    Some(selected)
+}
+
+pub(super) fn copy_text_with_osc52(app: &mut App, text: &str) {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let result = write!(stdout(), "\x1b]52;c;{encoded}\x07").and_then(|()| stdout().flush());
+    app.set_flash(if result.is_ok() {
+        format!("Copied {} characters with OSC52", text.chars().count())
+    } else {
+        "Could not write OSC52 clipboard data".to_string()
+    });
+}
+
+pub(super) fn selected_surface_text(
+    surface: &SelectableSurface,
+    selection: TextSelection,
+) -> String {
+    let relative = |point: (u16, u16)| {
+        (
+            point.0.saturating_sub(surface.area.x) as usize,
+            point.1.saturating_sub(surface.area.y) as usize,
+        )
+    };
+    let first = relative(selection.start);
+    let second = relative(selection.end);
+    let ((start_x, start_y), (end_x, end_y)) = if (first.1, first.0) <= (second.1, second.0) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    surface
+        .cells
+        .iter()
+        .enumerate()
+        .skip(start_y)
+        .take(end_y.saturating_sub(start_y) + 1)
+        .map(|(row, cells)| {
+            let from = if row == start_y { start_x } else { 0 };
+            let to = if row == end_y {
+                end_x.saturating_add(1)
+            } else {
+                cells.len()
+            };
+            cells[from.min(cells.len())..to.min(cells.len())]
+                .concat()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(super) fn complete_surface_text(surface: &SelectableSurface) -> String {
+    surface
+        .cells
+        .iter()
+        .map(|cells| cells.concat().trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Pi's `formatCwdForFooter`: replace the home directory prefix with `~`.
+pub(super) fn footer_cwd(path: &Path) -> String {
+    let text = display_path(path);
+    let Some(home) = dirs::home_dir() else {
+        return text;
+    };
+    let home_text = display_path(&home);
+    if text == home_text {
+        return "~".to_string();
+    }
+    let prefix = format!("{home_text}{}", std::path::MAIN_SEPARATOR);
+    text.strip_prefix(&prefix)
+        .map(|rest| format!("~{}{rest}", std::path::MAIN_SEPARATOR))
+        .unwrap_or(text)
+}
+
+/// Pi's `formatTokens`: compact 1000-based token counts.
+pub(super) fn format_tokens(count: u64) -> String {
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 10_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else if count < 1_000_000 {
+        format!("{}k", count / 1_000)
+    } else if count < 10_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else {
+        format!("{}M", count / 1_000_000)
+    }
+}
+
+const BRANCH_CACHE_TTL: Duration = Duration::from_secs(2);
+
+pub(super) fn current_branch(app: &mut App) -> Option<String> {
+    let now = Instant::now();
+    if let Some((checked, value)) = &app.branch
+        && now.duration_since(*checked) < BRANCH_CACHE_TTL
+    {
+        return value.clone();
+    }
+    let value = git_branch(&app.info.cwd);
+    app.branch = Some((now, value.clone()));
+    value
+}
+
+/// Walk up from `cwd` to the nearest `.git`, supporting worktrees whose
+/// `.git` is a file pointing at the real gitdir. Mirrors pi's footer branch.
+pub(super) fn git_branch(cwd: &Path) -> Option<String> {
+    let mut current = Some(cwd);
+    while let Some(directory) = current {
+        let marker = directory.join(".git");
+        if marker.is_dir() {
+            return head_branch(&marker);
+        }
+        if marker.is_file() {
+            let content = std::fs::read_to_string(&marker).ok()?;
+            let target = content.trim().strip_prefix("gitdir: ")?;
+            let target = Path::new(target);
+            let gitdir = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                directory.join(target)
+            };
+            return head_branch(&gitdir);
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+pub(super) fn head_branch(gitdir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(
+        head.strip_prefix("ref: refs/heads/")
+            .unwrap_or("detached")
+            .to_string(),
+    )
+}
+
+pub(super) fn search_line_preview(text: &str, query: &str, limit: usize) -> String {
+    let line = (!query.is_empty())
+        .then(|| {
+            text.lines()
+                .find(|line| line.to_lowercase().contains(query))
+        })
+        .flatten()
+        .or_else(|| text.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or_default();
+    single_line_preview(line, limit)
+}
+
+pub(super) fn single_line_preview(text: &str, limit: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.width() <= limit {
+        normalized
+    } else if limit == 0 {
+        String::new()
+    } else if limit == 1 {
+        "…".to_string()
+    } else {
+        let mut width = 0;
+        let preview = normalized
+            .chars()
+            .take_while(|character| {
+                let character_width = character.width().unwrap_or(0);
+                if width + character_width > limit - 1 {
+                    false
+                } else {
+                    width += character_width;
+                    true
+                }
+            })
+            .collect::<String>();
+        preview + "…"
+    }
+}

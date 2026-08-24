@@ -41,11 +41,11 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/main.rs` | Application assembly, plugin installation, Skill registration, and runtime/TUI wiring |
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
-| `src/model.rs` | Rig provider adapters, model request compatibility, multimodal support, and the two tool schemas |
+| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, Codex WebSocket transport, multimodal support, and the two tool schemas |
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, session archive, exact replacement, Codex patch, Bash, and PowerShell plugins, including their protocol help |
+| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, session archive, HTTPS, exact replacement, Codex patch, Bash, and PowerShell plugins, including protocol help and provider-specific HTTPS internals |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, status, and composer completion registration |
 | `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
@@ -58,8 +58,8 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/runtime.rs` | User turns, image attachments, model/tool loop, tool-call correlation, and compaction triggers |
 | `src/keymap.rs` | Built-in Rhai mappings and global/project overrides |
 | `src/terminal.rs` | Embedded PTY lifecycle, emulation, resize, and input encoding |
-| `src/oauth/` | OAuth provider flows, callbacks, device codes, refresh, and response parsing |
-| `src/tui.rs`, `src/tui/` | Conversation state, floats, rendering, interaction, animation, and model selection |
+| `src/oauth/` | OAuth orchestration, callbacks, device codes, shared token parsing, and provider-owned login and refresh flows |
+| `src/tui.rs`, `src/tui/` | Public TUI facade, conversation state, composer, controller/input handling, rendering, animation, Markdown, model selection, and focused tests |
 
 Put behavior in the module that owns the corresponding state and contract. Before adding a wrapper, helper, or type, check whether changing the existing source of truth is clearer. A one-use abstraction is justified only when it enforces a named invariant or removes real complexity.
 
