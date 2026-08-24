@@ -90,7 +90,7 @@ export ANTIGRAVITY_USER_AGENT_VERSION='<version>'
 uri-agent --cwd /path/to/project
 ```
 
-Overrides must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Run `:login`, choose **Antigravity (experimental)**, and select an `antigravity` model. Login uses Google OAuth with PKCE, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
+Overrides must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Run `:login`, choose **Google Antigravity**, and select an `antigravity` model. Login uses Google OAuth with PKCE, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
 
 The built-in text-model records map public selector IDs to private routes through `compat.antigravityModel`; for example, `gemini-3.1-pro-high` maps to `gemini-pro-agent` and `claude-opus-4-6` maps to `claude-opus-4-6-thinking`. A local `models.json` can overlay a mapping when the private service changes:
 

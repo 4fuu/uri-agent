@@ -72,7 +72,7 @@ impl OauthProvider {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::Antigravity => "Antigravity (experimental)",
+            Self::Antigravity => "Google Antigravity",
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
             Self::OpenRouter => "OpenRouter OAuth",
             Self::OpenAiCodex => "OpenAI Codex",
@@ -331,6 +331,7 @@ mod tests {
         assert!(oauth_enabled("xai"));
         assert!(oauth_enabled("radius"));
         assert!(!oauth_enabled("openai"));
+        assert_eq!(OauthProvider::Antigravity.name(), "Google Antigravity");
         assert_eq!(OauthProvider::OpenAiCodex.methods().len(), 2);
         assert!(!OauthProvider::OpenAiCodex.offers_api_key());
         assert!(!OauthProvider::Antigravity.offers_api_key());

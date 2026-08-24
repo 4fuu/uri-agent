@@ -125,8 +125,8 @@ pub fn open_url(url: &str) {
     let url = url.to_string();
     std::thread::spawn(move || {
         let _ = if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
+            std::process::Command::new("explorer.exe")
+                .arg(&url)
                 .status()
         } else if cfg!(target_os = "macos") {
             std::process::Command::new("open").arg(&url).status()
