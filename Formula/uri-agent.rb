@@ -1,16 +1,16 @@
 class UriAgent < Formula
   desc "Protocol-oriented coding agent with a focused terminal interface"
   homepage "https://github.com/4fuu/uri-agent"
-  version "2026.824.0"
+  version "2026.824.1"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/4fuu/uri-agent/releases/download/v2026.824.0/uri-agent-2026.824.0-aarch64-apple-darwin.tar.gz"
-      sha256 "3ac016e8229218ceb09e72741cb344d8ce1f8ca03ca5530a9b9f6fc708b85a02"
+      url "https://github.com/4fuu/uri-agent/releases/download/v2026.824.1/uri-agent-2026.824.1-aarch64-apple-darwin.tar.gz"
+      sha256 "d54028341f7cadb0496fa7ecf196d775aaca4b75b8c5f591b7daffe30046a843"
     else
-      url "https://github.com/4fuu/uri-agent/releases/download/v2026.824.0/uri-agent-2026.824.0-x86_64-apple-darwin.tar.gz"
-      sha256 "d477d59f4770f0595be28103345277f798df8a27e2807ca57996432de9eaf610"
+      url "https://github.com/4fuu/uri-agent/releases/download/v2026.824.1/uri-agent-2026.824.1-x86_64-apple-darwin.tar.gz"
+      sha256 "5d7b3ec037f9a9707569bc7ae47a483377663f30c9eeeb1d151ced1355622f89"
     end
   end
 
