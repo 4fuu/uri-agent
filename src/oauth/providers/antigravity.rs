@@ -13,6 +13,10 @@ const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USER_INFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const REDIRECT_URI: &str = "http://localhost:8085/callback";
+const DEFAULT_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const DEFAULT_CLIENT_SECRET: &str = "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";
+const DEFAULT_USER_AGENT_VERSION: &str = "1.23.2";
 const CONTROL_BASE_URLS: [&str; 2] = [
     "https://cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.googleapis.com",
@@ -27,7 +31,7 @@ struct ClientIdentity {
 
 pub(in crate::oauth) fn start_antigravity()
 -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
-    let identity = client_identity()?;
+    let identity = client_identity();
     let pkce = generate_pkce()?;
     let state = random_hex(24)?;
     let url = format!(
@@ -79,7 +83,7 @@ pub(in crate::oauth) fn start_antigravity()
 }
 
 pub(in crate::oauth) async fn refresh_antigravity(token: &OauthToken) -> Result<OauthToken> {
-    let identity = client_identity()?;
+    let identity = client_identity();
     let response = http_client()?
         .post(TOKEN_URL)
         .form_urlencoded(&[
@@ -103,18 +107,25 @@ pub(in crate::oauth) async fn refresh_antigravity(token: &OauthToken) -> Result<
     }
 }
 
-fn client_identity() -> Result<ClientIdentity> {
-    let required = |name: &str| {
+fn client_identity() -> ClientIdentity {
+    let configured = |name: &str| {
         env::var(name)
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("{name} is required for experimental Antigravity OAuth"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     };
-    Ok(ClientIdentity {
-        client_id: required("ANTIGRAVITY_OAUTH_CLIENT_ID")?,
-        client_secret: required("ANTIGRAVITY_OAUTH_CLIENT_SECRET")?,
-        user_agent: required("ANTIGRAVITY_USER_AGENT")?,
-    })
+    let user_agent = configured("ANTIGRAVITY_USER_AGENT").unwrap_or_else(|| {
+        let version = configured("ANTIGRAVITY_USER_AGENT_VERSION")
+            .unwrap_or_else(|| DEFAULT_USER_AGENT_VERSION.to_string());
+        format!("antigravity/{version} windows/amd64")
+    });
+    ClientIdentity {
+        client_id: configured("ANTIGRAVITY_OAUTH_CLIENT_ID")
+            .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string()),
+        client_secret: configured("ANTIGRAVITY_OAUTH_CLIENT_SECRET")
+            .unwrap_or_else(|| DEFAULT_CLIENT_SECRET.to_string()),
+        user_agent,
+    }
 }
 
 async fn exchange_code(
@@ -359,6 +370,16 @@ fn ide_version(user_agent: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_oauth_identity_has_direct_login_defaults() {
+        assert_eq!(
+            DEFAULT_CLIENT_ID,
+            "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+        );
+        assert!(!DEFAULT_CLIENT_SECRET.is_empty());
+        assert_eq!(DEFAULT_USER_AGENT_VERSION, "1.23.2");
+    }
 
     #[test]
     fn project_and_tier_accept_reference_response_shapes() {

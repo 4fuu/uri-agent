@@ -79,16 +79,18 @@ Models using `openai-codex-responses` require the `openai-codex` OAuth entry cre
 > [!WARNING]
 > This integration uses undocumented Google Antigravity OAuth and Cloud Code endpoints. It is unsupported, can change without notice, and may conflict with provider terms or trigger account restrictions. Use it only for protocol experiments with an account you can afford to lose after assessing the applicable terms. Do not treat it as a production or stable authentication path.
 
-URI Agent does not include a third party's OAuth client identity. Before starting URI Agent, provide an OAuth client whose allowed callback includes `http://localhost:8085/callback`, plus the complete User-Agent value that should be sent to the private service:
+Like the reference implementation, URI Agent includes the extracted Antigravity OAuth client identity and defaults to User-Agent version `1.23.2`, so `:login` works without environment setup. These unofficial embedded values may stop working or increase the account and provider-terms risks described above. The following process variables remain available as optional overrides:
 
 ```bash
 export ANTIGRAVITY_OAUTH_CLIENT_ID='<google-oauth-client-id>'
 export ANTIGRAVITY_OAUTH_CLIENT_SECRET='<google-oauth-client-secret>'
 export ANTIGRAVITY_USER_AGENT='<complete-antigravity-user-agent>'
+# Or override only the version used by antigravity/<version> windows/amd64:
+export ANTIGRAVITY_USER_AGENT_VERSION='<version>'
 uri-agent --cwd /path/to/project
 ```
 
-These must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Then run `:login`, choose **Antigravity (experimental)**, and select an `antigravity` model. Login uses Google OAuth with PKCE, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
+Overrides must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Run `:login`, choose **Antigravity (experimental)**, and select an `antigravity` model. Login uses Google OAuth with PKCE, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
 
 The built-in text-model records map public selector IDs to private routes through `compat.antigravityModel`; for example, `gemini-3.1-pro-high` maps to `gemini-pro-agent` and `claude-opus-4-6` maps to `claude-opus-4-6-thinking`. A local `models.json` can overlay a mapping when the private service changes:
 
