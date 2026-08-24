@@ -24,9 +24,6 @@ Adding a capability adds a protocol entry rather than another model-facing tool 
 
 URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
 
-> [!WARNING]
-> The optional Antigravity integration is an experimental, unsupported private protocol. It can change without notice and may expose the signed-in Google account to provider restrictions. Use it only after reviewing the risk; see [Experimental Antigravity setup and limitations](docs/configuration.md#experimental-antigravity-private-protocol).
-
 ## A ~2.5 KB fixed startup baseline
 
 With the current source, the fixed startup baseline on Unix with Bash and eight built-in protocols is:
