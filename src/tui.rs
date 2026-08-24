@@ -5718,6 +5718,7 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.transcript_body_width = process_width;
     let mut items = Vec::new();
     let mut block_for_row = Vec::new();
+    let mut user_surface_for_row = Vec::new();
     let mut block_rows = vec![None; app.blocks.len()];
     let active_block = app.active_transcript_block();
     let collapsed_processes = app.collapsed_processes();
@@ -5739,10 +5740,12 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }) {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
             block_for_row.push(None);
+            user_surface_for_row.push(false);
         }
         if block.kind == BlockKind::User {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
             block_for_row.push(None);
+            user_surface_for_row.push(true);
         }
         let first = items.len();
         for item in transcript_block_items(
@@ -5755,11 +5758,13 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ) {
             items.push(item);
             block_for_row.push(Some(index));
+            user_surface_for_row.push(block.kind == BlockKind::User);
         }
         block_rows[index] = Some((first, items.len().saturating_sub(1)));
         if block.kind == BlockKind::User {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
             block_for_row.push(None);
+            user_surface_for_row.push(true);
         }
         previous_visible = Some((block.kind, block.turn_result));
     }
@@ -5791,6 +5796,25 @@ fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         List::new(visible).block(Block::new().padding(Padding::horizontal(1))),
         area,
     );
+    // Ratatui resets the hidden cells behind wide glyphs even though the terminal paints their
+    // background. Restore the complete user row so later frame diffs can clear exposed tail cells.
+    let content_area = area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    for (row, user_surface) in user_surface_for_row
+        .into_iter()
+        .skip(offset)
+        .take(app.transcript_height)
+        .enumerate()
+    {
+        if user_surface {
+            frame.buffer_mut().set_style(
+                Rect::new(content_area.x, area.y + row as u16, content_area.width, 1),
+                Style::default().bg(USER_SURFACE),
+            );
+        }
+    }
     for (row, index) in block_for_row.into_iter().enumerate().skip(offset) {
         let y = area.y.saturating_add((row - offset) as u16);
         if y >= area.bottom() {
@@ -8981,6 +9005,70 @@ mod tests {
         assert_eq!(
             terminal.backend().buffer()[(10, reasoning_row)].bg,
             ROW_ACTIVE
+        );
+    }
+
+    #[test]
+    fn user_wide_character_trailing_cell_is_styled_for_scroll_cleanup() {
+        let mut user_app = test_app();
+        user_app.push(BlockKind::User, "YOU", "a你".into(), None, false, false);
+        user_app.skip_splash();
+        let backend = TestBackend::new(8, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let user_frame = terminal
+            .draw(|frame| render(frame, &mut user_app))
+            .unwrap()
+            .buffer
+            .clone();
+        let user_row = user_app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+            .unwrap();
+
+        assert_eq!(user_frame[(2, user_row)].symbol(), "你");
+        assert_eq!(user_frame[(2, user_row)].bg, USER_SURFACE);
+        assert_eq!(user_frame[(3, user_row)].symbol(), " ");
+        assert_eq!(user_frame[(3, user_row)].bg, USER_SURFACE);
+
+        let mut replacement_app = test_app();
+        replacement_app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "filler".into(),
+            None,
+            false,
+            false,
+        );
+        replacement_app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "好".into(),
+            None,
+            false,
+            false,
+        );
+        replacement_app.skip_splash();
+        let backend = TestBackend::new(8, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let replacement_frame = terminal
+            .draw(|frame| render(frame, &mut replacement_app))
+            .unwrap()
+            .buffer
+            .clone();
+        let replacement_row = replacement_app
+            .hit_regions
+            .iter()
+            .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+            .unwrap();
+
+        assert_eq!(replacement_row, user_row);
+        assert_eq!(replacement_frame[(1, replacement_row)].symbol(), "好");
+        assert!(
+            user_frame
+                .diff(&replacement_frame)
+                .iter()
+                .any(|(x, y, cell)| *x == 3 && *y == replacement_row && cell.bg == Color::Reset)
         );
     }
 
