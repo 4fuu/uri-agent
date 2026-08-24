@@ -5447,14 +5447,15 @@ fn render_footer(frame: &mut Frame<'_>, app: &mut App, area: Rect, live_activity
     let percent = context_percent(app);
     let available = area.width as usize;
     let usage = match app.info.context_accuracy {
-        ContextAccuracy::Api => format!("{percent:.1}%"),
-        ContextAccuracy::Hybrid | ContextAccuracy::Estimated => format!("≈{percent:.1}%"),
         ContextAccuracy::Unknown => "?".to_string(),
+        _ if show_context_estimate(app) => format!("≈{percent:.1}%"),
+        _ => format!("{percent:.1}%"),
     };
+    let progress_frame = if app.busy { app.frame } else { 0 };
     let progress = if app.info.context_accuracy == ContextAccuracy::Unknown {
-        animation::progress(app.frame, 8, 0.0)
+        animation::progress(progress_frame, 8, 0.0)
     } else {
-        animation::progress(app.frame, 8, percent / 100.0)
+        animation::progress(progress_frame, 8, percent / 100.0)
     };
     let context = single_line_preview(
         &format!(
@@ -5625,6 +5626,14 @@ fn context_percent(app: &App) -> f64 {
     }
 }
 
+fn show_context_estimate(app: &App) -> bool {
+    !app.busy
+        && matches!(
+            app.info.context_accuracy,
+            ContextAccuracy::Hybrid | ContextAccuracy::Estimated
+        )
+}
+
 fn context_status(app: &App, percent: f64) -> String {
     let compaction = if app.info.compaction_enabled {
         "automatic compaction"
@@ -5632,18 +5641,20 @@ fn context_status(app: &App, percent: f64) -> String {
         "automatic compaction disabled"
     };
     match app.info.context_accuracy {
-        ContextAccuracy::Api => format!(
-            "{} / {} · {percent:.1}% · {compaction}",
-            format_tokens(app.info.context_tokens as u64),
-            format_tokens(app.info.context_window as u64),
-        ),
-        ContextAccuracy::Hybrid | ContextAccuracy::Estimated => format!(
-            "≈{} / {} · ≈{percent:.1}% · {compaction}",
-            format_tokens(app.info.context_tokens as u64),
-            format_tokens(app.info.context_window as u64),
-        ),
+        ContextAccuracy::Hybrid | ContextAccuracy::Estimated if show_context_estimate(app) => {
+            format!(
+                "≈{} / {} · ≈{percent:.1}% · {compaction}",
+                format_tokens(app.info.context_tokens as u64),
+                format_tokens(app.info.context_window as u64),
+            )
+        }
         ContextAccuracy::Unknown => format!(
             "unknown / {} · {compaction}",
+            format_tokens(app.info.context_window as u64),
+        ),
+        ContextAccuracy::Api | ContextAccuracy::Hybrid | ContextAccuracy::Estimated => format!(
+            "{} / {} · {percent:.1}% · {compaction}",
+            format_tokens(app.info.context_tokens as u64),
             format_tokens(app.info.context_window as u64),
         ),
     }
@@ -8806,6 +8817,44 @@ mod tests {
     }
 
     #[test]
+    fn context_meter_marks_only_idle_estimates_and_animates_only_while_busy() {
+        let mut app = test_app();
+        app.info.context_tokens = 64_000;
+        app.info.context_accuracy = ContextAccuracy::Estimated;
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            "answer".to_string(),
+            None,
+            false,
+            true,
+        );
+        let footer = |app: &mut App| {
+            render_to_string(app, 100, 24)
+                .lines()
+                .last()
+                .unwrap()
+                .trim_end()
+                .to_string()
+        };
+
+        app.frame = 0;
+        let idle = footer(&mut app);
+        assert!(idle.ends_with("≈50.0%/128k"));
+        app.frame = 1;
+        assert_eq!(footer(&mut app), idle);
+
+        app.busy = true;
+        app.activity = Some(Activity::Thinking);
+        app.frame = 0;
+        let active = footer(&mut app);
+        assert!(active.ends_with("50.0%/128k"));
+        assert!(!active.contains('≈'));
+        app.frame = 1;
+        assert_ne!(footer(&mut app), active);
+    }
+
+    #[test]
     fn context_status_distinguishes_api_estimates_and_unknown_usage() {
         let mut app = test_app();
         app.info.context_tokens = 12_800;
@@ -8814,6 +8863,9 @@ mod tests {
         assert!(context_status(&app, 10.0).starts_with("12k /"));
         app.info.context_accuracy = ContextAccuracy::Estimated;
         assert!(context_status(&app, 10.0).starts_with("≈12k /"));
+        app.busy = true;
+        assert!(context_status(&app, 10.0).starts_with("12k /"));
+        assert!(!context_status(&app, 10.0).contains('≈'));
         app.info.context_accuracy = ContextAccuracy::Unknown;
         assert!(context_status(&app, 10.0).starts_with("unknown /"));
     }
