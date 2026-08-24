@@ -8,16 +8,23 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is a terminal coding agent built to push progressive disclosure and on-demand context loading as far as possible. A new session begins with a small router: exactly two generic tools—`read` and `exec`—plus a one-line index of available protocols. Detailed instructions for files, shells, edits, web access, Skills, and extensions are not preloaded.
+URI Agent is a terminal coding agent where every model-facing capability for reading resources or performing actions is exposed as a URI protocol. Files, directories, edits, shells, web pages, session archives, documentation, Skills, and extensions share one address space behind exactly two tools:
 
-Before using a capability, the model reads its contract from `<protocol>://help`; only that protocol's guidance then enters the conversation. Adding a capability adds a protocol entry instead of another model-facing tool schema or manual. Long-running operations become managed tasks, oversized output remains available through a `file://` address, and session history is stored in SQLite.
+```text
+read(uri: string, body?: any)
+exec(uri: string, body?: any)
+```
+
+URI Agent extends to every capability the same loading pattern other agents use for Skills: expose a compact name and description first, then load full instructions and resources only when selected. A new session therefore preloads only routing rules and one-line protocol descriptors; detailed contracts remain at `<protocol>://help`, Skill bodies and documentation remain behind their protocols, and oversized results remain behind `file://` addresses. This preserves aggressive on-demand and progressive context loading while the fixed `read` / `exec` contract keeps tool calls reliable and registered protocols provide extreme flexibility. The fixed startup baseline remains around 2.5 KB instead of paying the context cost of every capability up front.
+
+Adding a capability adds a protocol entry rather than another model-facing tool schema or preloaded manual. Long-running operations become managed tasks, and append-only session history is stored in SQLite.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 
 URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
 
-## Progressive context, measured
+## A ~2.5 KB fixed startup baseline
 
 With the current source, the fixed startup baseline on Unix with Bash and eight built-in protocols is:
 
@@ -38,8 +45,9 @@ Skills follow the same path: startup adds only each discovered Skill's name and 
 
 ## Why URI Agent
 
-- **Context on demand:** protocol manuals, Skill instructions, and resources load only when the current task needs them.
-- **Stable tool surface:** adding a capability does not add another model-facing tool schema.
+- **One URI address space:** resources and actions—from files and shells to web pages, sessions, documentation, Skills, and extensions—use the same routing model.
+- **Skills-style loading for every capability:** compact descriptors load first; contracts, instructions, resources, and complete output load only when selected or needed.
+- **Reliable calls, flexible capabilities:** the fixed `read` / `exec` contract stays stable while registered protocols evolve independently.
 - **Built-in web access:** search and extract HTTPS pages through a logged-in Parallel or Exa account, with local page conversion when neither is configured.
 - **Observable execution:** asynchronous work exposes status and final output through protocol read routes.
 - **Portable trusted extensions:** Extism WASM modules can add hot-reloadable protocols without changing the tool surface.
@@ -47,13 +55,6 @@ Skills follow the same path: startup adds only each discovered Skill's name and 
 - **Live course correction:** while a turn runs, queue a follow-up for afterward or guide the next model request; undelivered messages remain editable.
 - **Reusable Agent environment:** save tokens once for future Agent shell commands while keeping values out of project and session files.
 - **Keyboard-complete TUI:** the conversation, composer, commands, model selection, settings, and terminal stay in one interface, with `@` file and `@@` session references.
-
-The model-facing interface remains:
-
-```text
-read(uri: string, body?: any)
-exec(uri: string, body?: any)
-```
 
 ## Quick start
 
