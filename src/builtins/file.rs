@@ -1,3 +1,4 @@
+use super::EditableText;
 use crate::config::display_path;
 use crate::plugin::{
     Plugin, PluginHost, TuiCompletionContext, TuiCompletionItem, TuiCompletionProvider,
@@ -317,7 +318,8 @@ async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
         .await
         .with_context(|| format!("cannot read {}", display_path(path)))?;
     let content = String::from_utf8_lossy(&content);
-    let lines = content.lines().collect::<Vec<_>>();
+    let content = EditableText::new(&content);
+    let lines = content.normalized().lines().collect::<Vec<_>>();
     let start = range.offset.saturating_sub(1).min(lines.len());
     let end = start.saturating_add(range.limit).min(lines.len());
     let mut output = String::new();
@@ -491,6 +493,21 @@ mod tests {
             String::from_utf8(numbered).unwrap(),
             "1 │ alpha\n2 │ beta\n"
         );
+    }
+
+    #[tokio::test]
+    async fn file_output_hides_bom_and_normalizes_line_endings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "\u{feff}alpha\r\nbeta\rgamma\r\n")
+            .await
+            .unwrap();
+
+        let output = read_file(&path, "file://file.txt", Range::parse(None).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "alpha\nbeta\ngamma\n");
     }
 
     #[tokio::test]

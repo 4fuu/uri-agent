@@ -1,5 +1,5 @@
-use super::atomic_write;
 use super::file::resolve_path;
+use super::{EditableText, atomic_write, normalize_line_endings};
 use crate::plugin::{Plugin, PluginHost};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
@@ -109,19 +109,26 @@ async fn replace_exact(path: &Path, body: &Value) -> Result<()> {
     let original = fs::read_to_string(path)
         .await
         .with_context(|| format!("cannot read {}", path.display()))?;
-    let first = original
-        .find(old_text)
+    let original = EditableText::new(&original);
+    let old_text = normalize_line_endings(old_text.strip_prefix('\u{feff}').unwrap_or(old_text));
+    let new_text = normalize_line_endings(new_text.strip_prefix('\u{feff}').unwrap_or(new_text));
+    if old_text.is_empty() {
+        bail!("old_text cannot be empty");
+    }
+    let content = original.normalized();
+    let first = content
+        .find(&old_text)
         .ok_or_else(|| anyhow!("old_text was not found in {}", path.display()))?;
     let next_start = first + old_text.chars().next().map_or(0, char::len_utf8);
-    if original[next_start..].contains(old_text) {
+    if content[next_start..].contains(&old_text) {
         bail!("old_text appears more than once in {}", path.display());
     }
 
-    let mut updated = String::with_capacity(original.len() - old_text.len() + new_text.len());
-    updated.push_str(&original[..first]);
-    updated.push_str(new_text);
-    updated.push_str(&original[first + old_text.len()..]);
-    atomic_write(path, updated.as_bytes()).await
+    let mut updated = String::with_capacity(content.len() - old_text.len() + new_text.len());
+    updated.push_str(&content[..first]);
+    updated.push_str(&new_text);
+    updated.push_str(&content[first + old_text.len()..]);
+    atomic_write(path, original.restore(&updated).as_bytes()).await
 }
 
 #[cfg(test)]
@@ -220,5 +227,83 @@ mod tests {
         .unwrap_err();
         assert!(ambiguous.to_string().contains("more than once"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), "aaa");
+    }
+
+    #[tokio::test]
+    async fn exact_replace_matches_lf_text_and_preserves_crlf_and_bom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "\u{feff}alpha\r\nbeta\r\ngamma\r\n")
+            .await
+            .unwrap();
+
+        replace_exact(
+            &path,
+            &serde_json::json!({
+                "old_text": "alpha\nbeta\n",
+                "new_text": "ALPHA\nBETA\n"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).await.unwrap(),
+            "\u{feff}ALPHA\r\nBETA\r\ngamma\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replace_ignores_fragment_bom_and_preserves_final_newline_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let with_newline = directory.path().join("with-newline.txt");
+        fs::write(&with_newline, "\u{feff}alpha\r\nbeta\r\n")
+            .await
+            .unwrap();
+
+        replace_exact(
+            &with_newline,
+            &serde_json::json!({
+                "old_text": "\u{feff}alpha\nbeta\n",
+                "new_text": "\u{feff}ALPHA\nBETA"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(with_newline).await.unwrap(),
+            "\u{feff}ALPHA\r\nBETA\r\n"
+        );
+
+        let without_newline = directory.path().join("without-newline.txt");
+        fs::write(&without_newline, "alpha\nbeta").await.unwrap();
+        replace_exact(
+            &without_newline,
+            &serde_json::json!({"old_text": "alpha\nbeta", "new_text": "ALPHA\nBETA\n"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(without_newline).await.unwrap(),
+            "ALPHA\nBETA"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replace_detects_duplicates_across_line_ending_variants() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        let original = "hello\r\nworld\r\n---\nhello\nworld\n";
+        fs::write(&path, original).await.unwrap();
+
+        let error = replace_exact(
+            &path,
+            &serde_json::json!({"old_text": "hello\nworld\n", "new_text": "replacement\n"}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("more than once"));
+        assert_eq!(fs::read_to_string(path).await.unwrap(), original);
     }
 }

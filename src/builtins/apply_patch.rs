@@ -1,5 +1,5 @@
-use super::atomic_write;
 use super::file::resolve_path;
+use super::{EditableText, atomic_write};
 use crate::plugin::{Plugin, PluginHost};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
@@ -146,11 +146,8 @@ impl UpdateChunk {
 }
 
 fn parse_patch(patch: &str) -> Result<Vec<PatchHunk>> {
-    let patch = patch.trim();
-    let lines = patch
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect::<Vec<_>>();
+    let patch = EditableText::new(patch);
+    let lines = patch.normalized().trim().split('\n').collect::<Vec<_>>();
     if lines.first().is_none_or(|line| line.trim() != BEGIN_PATCH) {
         bail!("the first line of the patch must be '{BEGIN_PATCH}'");
     }
@@ -401,10 +398,21 @@ async fn derive_updated_content(path: &Path, chunks: &[UpdateChunk]) -> Result<S
     let original = fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read file to update {}", path.display()))?;
-    let mut lines = original.split('\n').map(str::to_string).collect::<Vec<_>>();
-    if lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
+    let original = EditableText::new(&original);
+    let had_final_newline = original.normalized().ends_with('\n');
+    let mut lines = if original.normalized().is_empty() {
+        Vec::new()
+    } else {
+        let mut lines = original
+            .normalized()
+            .split('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if had_final_newline {
+            lines.pop();
+        }
+        lines
+    };
 
     let mut replacements = Vec::<(usize, usize, Vec<String>)>::new();
     let mut cursor = 0;
@@ -451,10 +459,11 @@ async fn derive_updated_content(path: &Path, chunks: &[UpdateChunk]) -> Result<S
     for (start, old_len, replacement) in replacements.into_iter().rev() {
         lines.splice(start..start + old_len, replacement);
     }
-    if !lines.last().is_some_and(String::is_empty) {
+    if had_final_newline {
         lines.push(String::new());
     }
-    Ok(lines.join("\n"))
+    let updated = lines.join("\n");
+    Ok(original.restore(&updated))
 }
 
 fn seek_sequence(lines: &[String], pattern: &[String], start: usize, eof: bool) -> Option<usize> {
@@ -640,6 +649,64 @@ mod tests {
             "moved\n"
         );
         assert!(!directory.path().join("delete.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn codex_patch_matches_lf_and_preserves_crlf_bom_and_blank_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update.txt");
+        fs::write(&path, "\u{feff}alpha\r\nbeta\r\n\r\n")
+            .await
+            .unwrap();
+        let patch = r#"*** Begin Patch
+*** Update File: update.txt
+@@
+ alpha
+-beta
++gamma
+
+*** End Patch"#;
+
+        apply_patch(directory.path(), patch).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).await.unwrap(),
+            "\u{feff}alpha\r\ngamma\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_patch_preserves_missing_final_newline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update.txt");
+        fs::write(&path, "\u{feff}alpha\r\nbeta").await.unwrap();
+        let patch = r#"*** Begin Patch
+*** Update File: update.txt
+@@
+ alpha
+-beta
++gamma
++
+*** End Patch"#;
+
+        apply_patch(directory.path(), patch).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).await.unwrap(),
+            "\u{feff}alpha\r\ngamma"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_patch_normalizes_bom_and_crlf_in_patch_input_and_updates_empty_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.txt");
+        fs::write(&path, "").await.unwrap();
+        let patch = "\u{feff}*** Begin Patch\r\n*** Update File: empty.txt\r\n@@\r\n+alpha\r\n+beta\r\n*** End Patch";
+
+        apply_patch(directory.path(), patch).await.unwrap();
+
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha\nbeta");
     }
 
     #[tokio::test]

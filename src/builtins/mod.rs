@@ -16,6 +16,73 @@ use std::path::Path;
 use tokio::fs;
 use uuid::Uuid;
 
+#[derive(Clone, Copy)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+pub(super) struct EditableText {
+    normalized: String,
+    has_bom: bool,
+    has_final_newline: bool,
+    line_ending: LineEnding,
+}
+
+impl EditableText {
+    pub(super) fn new(raw: &str) -> Self {
+        let (has_bom, text) = raw
+            .strip_prefix('\u{feff}')
+            .map_or((false, raw), |text| (true, text));
+        let line_ending = text.find('\n').map_or(LineEnding::Lf, |index| {
+            if index > 0 && text.as_bytes()[index - 1] == b'\r' {
+                LineEnding::Crlf
+            } else {
+                LineEnding::Lf
+            }
+        });
+        Self {
+            normalized: normalize_line_endings(text),
+            has_bom,
+            has_final_newline: text.ends_with(['\n', '\r']),
+            line_ending,
+        }
+    }
+
+    pub(super) fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
+    pub(super) fn restore(&self, normalized: &str) -> String {
+        let mut normalized = normalized.to_string();
+        if self.has_final_newline {
+            if !normalized.ends_with('\n') {
+                normalized.push('\n');
+            }
+        } else {
+            normalized.truncate(normalized.trim_end_matches('\n').len());
+        }
+        let content = match self.line_ending {
+            LineEnding::Lf => normalized,
+            LineEnding::Crlf => normalized.replace('\n', "\r\n"),
+        };
+        if !self.has_bom {
+            return content;
+        }
+        let mut restored = String::with_capacity('\u{feff}'.len_utf8() + content.len());
+        restored.push('\u{feff}');
+        restored.push_str(&content);
+        restored
+    }
+}
+
+pub(super) fn normalize_line_endings(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
     plugins.add(agents::AgentsPlugin::new(cwd));
@@ -110,6 +177,28 @@ async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editable_text_normalizes_and_restores_bom_and_line_endings() {
+        let crlf = EditableText::new("\u{feff}one\r\ntwo\r\n");
+        assert_eq!(crlf.normalized(), "one\ntwo\n");
+        assert_eq!(crlf.restore("ONE\ntwo\n"), "\u{feff}ONE\r\ntwo\r\n");
+        assert_eq!(crlf.restore("ONE\ntwo"), "\u{feff}ONE\r\ntwo\r\n");
+
+        let crlf_first = EditableText::new("one\r\ntwo\nthree\r");
+        assert_eq!(crlf_first.normalized(), "one\ntwo\nthree\n");
+        assert_eq!(
+            crlf_first.restore("one\nTWO\nthree\n"),
+            "one\r\nTWO\r\nthree\r\n"
+        );
+
+        let lf_first = EditableText::new("one\ntwo\r\nthree\r");
+        assert_eq!(lf_first.normalized(), "one\ntwo\nthree\n");
+        assert_eq!(lf_first.restore("one\nTWO\nthree\n"), "one\nTWO\nthree\n");
+
+        let no_final_newline = EditableText::new("one\r\ntwo");
+        assert_eq!(no_final_newline.restore("one\nTWO\n\n"), "one\r\nTWO");
+    }
 
     #[test]
     fn built_in_distribution_declares_document_file_web_and_edit_plugins() {
