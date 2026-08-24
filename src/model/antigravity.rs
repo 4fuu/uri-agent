@@ -860,21 +860,24 @@ fn clean_schema_node(schema: &mut Value, definitions: &Map<String, Value>, depth
     } else {
         "string"
     };
+    const VALID_TYPES: [&str; 6] = ["string", "number", "integer", "boolean", "array", "object"];
     if let Some(kind) = object.get_mut("type") {
         let mut nullable = false;
         let selected = match kind {
             Value::String(kind) => {
-                let kind = kind.to_ascii_lowercase();
+                let kind = kind.trim().to_ascii_lowercase();
                 nullable = kind == "null";
-                (!nullable).then_some(kind)
+                VALID_TYPES.contains(&kind.as_str()).then_some(kind)
             }
             Value::Array(kinds) => kinds.iter().find_map(|kind| {
-                let kind = kind.as_str()?.to_ascii_lowercase();
+                let kind = kind.as_str()?.trim().to_ascii_lowercase();
                 if kind == "null" {
                     nullable = true;
                     None
-                } else {
+                } else if VALID_TYPES.contains(&kind.as_str()) {
                     Some(kind)
+                } else {
+                    None
                 }
             }),
             _ => None,
@@ -1309,6 +1312,7 @@ mod tests {
                     "$defs": {"Target": {"type": "integer", "minimum": 1}},
                     "properties": {
                         "uri": {"type": "string", "minLength": 1},
+                        "body": {"type": "", "description": "Any JSON value"},
                         "target": {"$ref": "#/$defs/Target"},
                         "optional": {"type": ["string", "null"]},
                         "choice": {"anyOf": [
@@ -1318,6 +1322,14 @@ mod tests {
                         "invalid": false
                     },
                     "required": ["uri", "target", "optional", "invalid", "missing"]
+                }
+            }, {
+                "name": "exec",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "", "description": "Any JSON value"}
+                    }
                 }
             }]}],
             "toolConfig": null
@@ -1347,6 +1359,7 @@ mod tests {
         assert!(parameters.get("additionalProperties").is_none());
         assert_eq!(parameters["required"], json!(["uri", "target"]));
         assert!(parameters["properties"].get("invalid").is_none());
+        assert_eq!(parameters["properties"]["body"]["type"], "string");
         assert_eq!(parameters["properties"]["target"]["type"], "integer");
         assert_eq!(parameters["properties"]["choice"]["type"], "object");
         assert!(
@@ -1358,6 +1371,10 @@ mod tests {
         assert_eq!(
             request["systemInstruction"]["parts"][0]["text"],
             "explicit identity"
+        );
+        assert_eq!(
+            request["tools"][0]["functionDeclarations"][1]["parameters"]["properties"]["body"]["type"],
+            "string"
         );
     }
 
