@@ -203,6 +203,20 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     if app.overlay != Some(Overlay::Composer) {
         app.composer_mouse_selecting = false;
     }
+    let marquee_visible = matches!(
+        app.overlay,
+        Some(
+            Overlay::Command
+                | Overlay::Tasks
+                | Overlay::Models
+                | Overlay::Settings
+                | Overlay::Selector
+        )
+    ) || (app.overlay == Some(Overlay::Composer)
+        && app.completions.is_some());
+    if !marquee_visible {
+        app.marquee = None;
+    }
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
     if app.showing_splash() {
@@ -1274,6 +1288,15 @@ pub(super) fn panel_title(name: &str, hints: String) -> String {
     }
 }
 
+pub(super) fn fit_panel_title(title: &str, width: u16) -> String {
+    let limit = width.saturating_sub(2) as usize;
+    if title.width() <= limit {
+        title.to_string()
+    } else {
+        single_line_preview(title, limit)
+    }
+}
+
 pub(super) fn command_help(commands: &CommandRegistry) -> String {
     commands
         .list()
@@ -1486,7 +1509,10 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             }
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(" PROTOCOLS · read <name>://help "))
+                    .block(block.title(fit_panel_title(
+                        " PROTOCOLS · read <name>://help ",
+                        area.width,
+                    )))
                     .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,
@@ -1505,7 +1531,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 .unwrap_or("Plugin panel did not return content.");
             frame.render_widget(
                 Paragraph::new(body)
-                    .block(block.title(title))
+                    .block(block.title(fit_panel_title(&title, area.width)))
                     .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,
@@ -1519,7 +1545,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 .unwrap_or((" DOCUMENT ".to_string(), "Nothing to show."));
             frame.render_widget(
                 Paragraph::new(body)
-                    .block(block.title(title))
+                    .block(block.title(fit_panel_title(&title, area.width)))
                     .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,
@@ -1530,18 +1556,25 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             let Some(prompt) = app.text_prompt.as_ref() else {
                 return;
             };
+            let inner_width = block.inner(area).width as usize;
             let value = if prompt.secret {
-                format!("{}█", "•".repeat(prompt.value.chars().count().min(48)))
+                "•".repeat(prompt.value.chars().count().min(48))
             } else {
-                format!("{}█", prompt.value)
+                prompt.value.clone()
             };
+            let value = format!(
+                "{}█",
+                single_line_tail(&value, inner_width.saturating_sub(1))
+            );
+            let title = format!(" {} ", prompt.title);
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(prompt.message.clone(), Style::default().fg(MUTED)),
                     Line::default(),
                     Line::styled(value, Style::default().fg(TEXT)),
                 ])
-                .block(block.title(format!(" {} ", prompt.title))),
+                .block(block.title(fit_panel_title(&title, area.width)))
+                .wrap(Wrap { trim: false }),
                 area,
             );
         }
@@ -1550,6 +1583,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             let Some(oauth) = app.oauth.as_ref() else {
                 return;
             };
+            let inner_width = block.inner(area).width as usize;
             let display = oauth.login.display();
             let mut lines = vec![
                 Line::styled(display.instructions, Style::default().fg(MUTED)),
@@ -1569,13 +1603,17 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             }
             if device.is_none() {
                 lines.push(Line::styled(
-                    format!("paste {}█", oauth.paste),
+                    format!(
+                        "paste {}█",
+                        single_line_tail(&oauth.paste, inner_width.saturating_sub(7))
+                    ),
                     Style::default().fg(TEXT),
                 ));
             }
+            let title = format!(" OAUTH · {} ", oauth.provider);
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(format!(" OAUTH · {} ", oauth.provider)))
+                    .block(block.title(fit_panel_title(&title, area.width)))
                     .wrap(Wrap { trim: false }),
                 area,
             );
@@ -1613,7 +1651,7 @@ pub(super) fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ACCENT))
                     .style(Style::default().bg(SURFACE))
-                    .title(title),
+                    .title(fit_panel_title(&title, area.width)),
             ),
             area,
         );
@@ -1746,16 +1784,28 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
         "COMMAND",
         action_hints(&app.keymap, &[("command", "complete", "complete")]),
     );
-    frame.render_widget(block.title(title), area);
+    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
         .split(inner);
+    let query_width = sections[0].width.saturating_sub(3) as usize;
     frame.render_widget(
-        Paragraph::new(format!("⌕ {}█", app.command_query)).style(Style::default().fg(TEXT)),
+        Paragraph::new(format!(
+            "⌕ {}█",
+            single_line_tail(&app.command_query, query_width)
+        ))
+        .style(Style::default().fg(TEXT)),
         sections[0],
     );
     let commands = app.matching_commands();
+    let marquee_elapsed = commands
+        .get(app.command_selected)
+        .map(|item| app.marquee_elapsed(format!("command:{}:{}", item.spec.id, item.name)))
+        .unwrap_or_default();
+    let row_width = sections[1].width as usize;
+    let name_width = 16.min(row_width.saturating_sub(2));
+    let description_width = row_width.saturating_sub(2 + name_width);
     let items = commands.iter().enumerate().map(|(index, item)| {
         let selected = index == app.command_selected;
         ListItem::new(Line::from(vec![
@@ -1764,7 +1814,12 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!(":{:<14}", item.name),
+                list_cell(
+                    &format!(":{}", item.name),
+                    name_width,
+                    selected,
+                    marquee_elapsed,
+                ),
                 Style::default()
                     .fg(if selected { ACCENT } else { TEXT })
                     .add_modifier(if selected {
@@ -1773,7 +1828,15 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
                         Modifier::empty()
                     }),
             ),
-            Span::styled(item.spec.description.clone(), Style::default().fg(MUTED)),
+            Span::styled(
+                list_cell(
+                    &item.spec.description,
+                    description_width,
+                    selected,
+                    marquee_elapsed,
+                ),
+                Style::default().fg(MUTED),
+            ),
         ]))
         .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
     });
@@ -1803,6 +1866,21 @@ pub(super) fn completion_preview_height(app: &App) -> u16 {
 }
 
 pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let selected_key = app.completions.as_ref().and_then(|completions| {
+        completions
+            .result
+            .items
+            .get(completions.selected)
+            .map(|item| {
+                format!(
+                    "completion:{}:{}",
+                    app.completion_generation, item.insert_text
+                )
+            })
+    });
+    let marquee_elapsed = selected_key
+        .map(|key| app.marquee_elapsed(key))
+        .unwrap_or_default();
     let Some(completions) = app.completions.as_ref() else {
         return;
     };
@@ -1827,7 +1905,10 @@ pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, 
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(MUTED))
         .style(Style::default().bg(SURFACE).fg(TEXT))
-        .title(panel_title("REFERENCES", hints));
+        .title(fit_panel_title(
+            &panel_title("REFERENCES", hints),
+            area.width,
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let count = completions.result.items.len().min(inner.height as usize);
@@ -1835,6 +1916,28 @@ pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, 
         .selected
         .saturating_sub(count.saturating_sub(1))
         .min(completions.result.items.len().saturating_sub(count));
+    let row_width = inner.width as usize;
+    let available = row_width.saturating_sub(2);
+    let minimum_label_width = 8.min(available);
+    let minimum_description_width = 12.min(available.saturating_sub(minimum_label_width));
+    let desired_label_width = completions
+        .result
+        .items
+        .iter()
+        .map(|item| {
+            normalized_single_line(&item.label)
+                .width()
+                .saturating_add(2)
+        })
+        .max()
+        .unwrap_or_default()
+        .min(36);
+    let label_width = desired_label_width
+        .max(minimum_label_width)
+        .min(available.saturating_sub(minimum_description_width));
+    let label_content_width = label_width.saturating_sub(2);
+    let separator_width = label_width.saturating_sub(label_content_width);
+    let description_width = available.saturating_sub(label_width);
     let lines = completions
         .result
         .items
@@ -1850,7 +1953,7 @@ pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, 
                     Style::default().fg(ACCENT),
                 ),
                 Span::styled(
-                    item.label.clone(),
+                    list_cell(&item.label, label_content_width, selected, marquee_elapsed),
                     Style::default()
                         .fg(if selected { ACCENT } else { TEXT })
                         .add_modifier(if selected {
@@ -1859,8 +1962,14 @@ pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, 
                             Modifier::empty()
                         }),
                 ),
+                Span::raw(" ".repeat(separator_width)),
                 Span::styled(
-                    format!("  {}", item.description),
+                    list_cell(
+                        &item.description,
+                        description_width,
+                        selected,
+                        marquee_elapsed,
+                    ),
                     Style::default().fg(MUTED),
                 ),
             ])
@@ -1955,7 +2064,10 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         hints.push(actions);
     }
     frame.render_widget(
-        block.title(panel_title("SEND WHILE RUNNING", hints.join(" · "))),
+        block.title(fit_panel_title(
+            &panel_title("SEND WHILE RUNNING", hints.join(" · ")),
+            area.width,
+        )),
         area,
     );
     let sections = Layout::default()
@@ -2004,18 +2116,42 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
 
 pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
+    let selected_key = app.selector.as_ref().and_then(|selector| {
+        selector
+            .visible
+            .get(selector.selected)
+            .and_then(|index| selector.items.get(*index))
+            .map(|item| format!("selector:{}:{}", selector.title, item.id))
+    });
+    let marquee_elapsed = selected_key
+        .map(|key| app.marquee_elapsed(key))
+        .unwrap_or_default();
     let Some(selector) = app.selector.as_ref() else {
         return;
     };
-    frame.render_widget(block.title(format!(" {} ", selector.title)), area);
+    frame.render_widget(
+        block.title(fit_panel_title(
+            &format!(" {} ", selector.title),
+            area.width,
+        )),
+        area,
+    );
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
         .split(inner);
+    let query_width = sections[0].width.saturating_sub(3) as usize;
     frame.render_widget(
-        Paragraph::new(format!("⌕ {}█", selector.query)).style(Style::default().fg(TEXT)),
+        Paragraph::new(format!(
+            "⌕ {}█",
+            single_line_tail(&selector.query, query_width)
+        ))
+        .style(Style::default().fg(TEXT)),
         sections[0],
     );
+    let row_width = sections[1].width as usize;
+    let title_width = 22.min(row_width.saturating_sub(2));
+    let description_width = row_width.saturating_sub(2 + title_width);
     let items = selector
         .visible
         .iter()
@@ -2030,10 +2166,18 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
                         Style::default().fg(ACCENT),
                     ),
                     Span::styled(
-                        format!("{:<22}", item.title),
+                        list_cell(&item.title, title_width, selected, marquee_elapsed),
                         Style::default().fg(if selected { ACCENT } else { TEXT }),
                     ),
-                    Span::styled(item.description.clone(), Style::default().fg(MUTED)),
+                    Span::styled(
+                        list_cell(
+                            &item.description,
+                            description_width,
+                            selected,
+                            marquee_elapsed,
+                        ),
+                        Style::default().fg(MUTED),
+                    ),
                 ]))
                 .style(Style::default().bg(if selected {
                     ROW_ACTIVE
@@ -2064,7 +2208,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
         "MODELS",
         action_hints(&app.keymap, &[("models", "refresh", "refresh")]),
     );
-    frame.render_widget(block.title(title), area);
+    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2073,6 +2217,14 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             Constraint::Length(3),
         ])
         .split(inner);
+    let selected_key = app.model_selector.as_ref().and_then(|selector| {
+        selector
+            .selected()
+            .map(|model| format!("model:{}/{}", model.provider, model.id))
+    });
+    let marquee_elapsed = selected_key
+        .map(|key| app.marquee_elapsed(key))
+        .unwrap_or_default();
     let Some(selector) = app.model_selector.as_ref() else {
         frame.render_widget(
             Paragraph::new("Model catalog is not loaded.").style(Style::default().fg(MUTED)),
@@ -2090,53 +2242,67 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             selector.provider_count()
         )
     };
+    let query_width = sections[0].width.saturating_sub(6) as usize;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("⌕  ", Style::default().fg(ACCENT)),
-            Span::styled(selector.query(), Style::default().fg(TEXT)),
+            Span::styled(
+                single_line_tail(selector.query(), query_width),
+                Style::default().fg(TEXT),
+            ),
             Span::styled("█", Style::default().fg(ACCENT)),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MUTED))
-                .title(format!(" SEARCH · {summary} ")),
+                .title(fit_panel_title(
+                    &format!(" SEARCH · {summary} "),
+                    sections[0].width,
+                )),
         ),
         sections[0],
     );
-    let name_width: usize = if sections[1].width < 60 { 18 } else { 30 };
+    let row_width = sections[1].width as usize;
+    let desired_name_width: usize = if sections[1].width < 60 { 18 } else { 30 };
+    let provider_width = 14.min(row_width.saturating_sub(4));
     let items = selector.visible().enumerate().map(|(position, model)| {
         let selected = position == selector.selected_position();
+        let details = format!(
+            "{}{}",
+            context_label(model.context_window()),
+            if reasoning(model) { " · think" } else { "" }
+        );
+        let available = row_width.saturating_sub(4 + provider_width);
+        let minimum_name_width = 8.min(available);
+        let reserved_details = details
+            .width()
+            .min(available.saturating_sub(minimum_name_width));
+        let name_width = desired_name_width.min(available.saturating_sub(reserved_details));
+        let details_width = available.saturating_sub(name_width);
         ListItem::new(Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!(
-                    "{} {:<14}",
-                    if selector.is_current(model) {
-                        "●"
-                    } else {
-                        " "
-                    },
-                    model.provider
-                ),
+                if selector.is_current(model) {
+                    "● "
+                } else {
+                    "  "
+                },
                 Style::default().fg(MUTED),
             ),
             Span::styled(
-                format!(
-                    "{:<name_width$}",
-                    single_line_preview(model_label(model), name_width.saturating_sub(2))
-                ),
+                list_cell(&model.provider, provider_width, selected, marquee_elapsed),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                list_cell(model_label(model), name_width, selected, marquee_elapsed),
                 Style::default().fg(if selected { ACCENT } else { TEXT }),
             ),
             Span::styled(
-                format!(
-                    "{}{}",
-                    context_label(model.context_window()),
-                    if reasoning(model) { " · think" } else { "" }
-                ),
+                single_line_preview(&details, details_width),
                 Style::default().fg(MUTED),
             ),
         ]))
@@ -2162,13 +2328,24 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
         "No models match this search".to_string()
     };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+        Paragraph::new(footer)
+            .style(Style::default().fg(MUTED))
+            .wrap(Wrap { trim: false }),
         sections[2],
     );
 }
 
 pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
+    let selected_key = app.settings.as_ref().map(|settings| {
+        format!(
+            "settings:{}:{}/{}",
+            settings.selected, settings.active.provider, settings.active.model
+        )
+    });
+    let marquee_elapsed = selected_key
+        .map(|key| app.marquee_elapsed(key))
+        .unwrap_or_default();
     let Some(settings) = app.settings.as_ref() else {
         frame.render_widget(Paragraph::new("Loading settings…").block(block), area);
         return;
@@ -2230,8 +2407,14 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         |key| format!("Use :login / :logout for credentials. {key} edits the selected field."),
     );
     let row_count = rows.len();
+    let row_width = inner.width as usize;
+    let label_width = 18.min(row_width.saturating_sub(2));
+    let value_width = row_width.saturating_sub(2 + label_width);
     let mut lines = vec![
-        Line::styled(edit_help, Style::default().fg(MUTED)),
+        Line::styled(
+            single_line_preview(&edit_help, row_width),
+            Style::default().fg(MUTED),
+        ),
         Line::default(),
     ];
     for (index, (label, value)) in rows.into_iter().enumerate() {
@@ -2242,10 +2425,13 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
                 Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!("{label:<14}"),
+                list_cell(label, label_width, selected, marquee_elapsed),
                 Style::default().fg(if selected { ACCENT } else { MUTED }),
             ),
-            Span::styled(value, Style::default().fg(TEXT)),
+            Span::styled(
+                list_cell(&value, value_width, selected, marquee_elapsed),
+                Style::default().fg(TEXT),
+            ),
         ]));
         lines.push(Line::default());
     }
@@ -2254,9 +2440,7 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         action_hints(&app.keymap, &[("settings", "save", "save")]),
     );
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block.title(title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).block(block.title(fit_panel_title(&title, area.width))),
         area,
     );
     for index in 0..row_count {
@@ -2287,18 +2471,27 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
         "TASKS",
         action_hints(&app.keymap, &[("tasks", "cancel", "cancel")]),
     );
-    frame.render_widget(block.title(title), area);
+    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    let selected_key = app
+        .task_records
+        .get(app.selected_task)
+        .map(|task| format!("task:{}", task.id));
+    let marquee_elapsed = selected_key
+        .map(|key| app.marquee_elapsed(key))
+        .unwrap_or_default();
+    let label_width = (inner.width as usize).saturating_sub(12);
     let items = app.task_records.iter().enumerate().map(|(index, task)| {
-        ListItem::new(format!(
-            "{} {:9} {}",
-            if index == app.selected_task {
-                "›"
-            } else {
-                " "
-            },
-            task.status.as_str(),
-            task.label
-        ))
+        let selected = index == app.selected_task;
+        ListItem::new(Line::from(vec![
+            Span::raw(if selected { "› " } else { "  " }),
+            Span::raw(format!("{:<10}", task.status.as_str())),
+            Span::raw(list_cell(
+                &task.label,
+                label_width,
+                selected,
+                marquee_elapsed,
+            )),
+        ]))
         .style(Style::default().fg(if index == app.selected_task {
             ACCENT
         } else {
@@ -2872,7 +3065,7 @@ pub(super) fn search_line_preview(text: &str, query: &str, limit: usize) -> Stri
 }
 
 pub(super) fn single_line_preview(text: &str, limit: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized_single_line(text);
     if normalized.width() <= limit {
         normalized
     } else if limit == 0 {
@@ -2882,17 +3075,132 @@ pub(super) fn single_line_preview(text: &str, limit: usize) -> String {
     } else {
         let mut width = 0;
         let preview = normalized
-            .chars()
-            .take_while(|character| {
-                let character_width = character.width().unwrap_or(0);
-                if width + character_width > limit - 1 {
+            .graphemes(true)
+            .take_while(|grapheme| {
+                let grapheme_width = grapheme.width();
+                if width + grapheme_width > limit - 1 {
                     false
                 } else {
-                    width += character_width;
+                    width += grapheme_width;
                     true
                 }
             })
             .collect::<String>();
         preview + "…"
     }
+}
+
+pub(super) fn single_line_tail(text: &str, limit: usize) -> String {
+    let text = text.replace(['\r', '\n'], " ");
+    if text.width() <= limit {
+        return text;
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    if limit == 1 {
+        return "…".to_string();
+    }
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    let mut width = 0;
+    let start = graphemes
+        .iter()
+        .enumerate()
+        .rev()
+        .take_while(|(_, grapheme)| {
+            let grapheme_width = grapheme.width();
+            if width + grapheme_width > limit - 1 {
+                false
+            } else {
+                width += grapheme_width;
+                true
+            }
+        })
+        .last()
+        .map_or(graphemes.len(), |(index, _)| index);
+    format!("…{}", graphemes[start..].concat())
+}
+
+pub(super) const MARQUEE_HOLD_FRAMES: usize = 8;
+pub(super) const MARQUEE_STEP_FRAMES: usize = 2;
+
+pub(super) fn marquee_preview(text: &str, limit: usize, elapsed_frames: usize) -> String {
+    let normalized = normalized_single_line(text);
+    if normalized.width() <= limit {
+        return normalized;
+    }
+    if limit <= 1 {
+        return single_line_preview(&normalized, limit);
+    }
+    let graphemes = normalized.graphemes(true).collect::<Vec<_>>();
+    let mut suffix_width = 0;
+    let mut max_start = graphemes.len().saturating_sub(1);
+    for (index, grapheme) in graphemes.iter().enumerate().rev() {
+        suffix_width += grapheme.width();
+        if suffix_width > limit - 1 {
+            break;
+        }
+        max_start = index;
+    }
+    let travel_frames = max_start.saturating_mul(MARQUEE_STEP_FRAMES);
+    let cycle_frames = MARQUEE_HOLD_FRAMES
+        .saturating_mul(2)
+        .saturating_add(travel_frames.saturating_mul(2))
+        .max(1);
+    let phase = elapsed_frames % cycle_frames;
+    let start = if phase < MARQUEE_HOLD_FRAMES {
+        0
+    } else if phase < MARQUEE_HOLD_FRAMES + travel_frames {
+        (phase - MARQUEE_HOLD_FRAMES) / MARQUEE_STEP_FRAMES
+    } else if phase < MARQUEE_HOLD_FRAMES * 2 + travel_frames {
+        max_start
+    } else {
+        max_start
+            .saturating_sub((phase - MARQUEE_HOLD_FRAMES * 2 - travel_frames) / MARQUEE_STEP_FRAMES)
+    };
+    marquee_window(&graphemes, start, limit)
+}
+
+pub(super) fn list_cell(text: &str, width: usize, selected: bool, elapsed_frames: usize) -> String {
+    let content = if selected {
+        marquee_preview(text, width, elapsed_frames)
+    } else {
+        single_line_preview(text, width)
+    };
+    let padding = width.saturating_sub(content.width());
+    format!("{content}{}", " ".repeat(padding))
+}
+
+fn normalized_single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn marquee_window(graphemes: &[&str], start: usize, limit: usize) -> String {
+    let left_hidden = start > 0;
+    let left_width = usize::from(left_hidden);
+    let suffix_width = graphemes[start..].concat().width();
+    let right_hidden = suffix_width > limit.saturating_sub(left_width);
+    let content_width = limit
+        .saturating_sub(left_width)
+        .saturating_sub(usize::from(right_hidden));
+    let mut width = 0;
+    let content = graphemes[start..]
+        .iter()
+        .take_while(|grapheme| {
+            let grapheme_width = grapheme.width();
+            if width + grapheme_width > content_width {
+                false
+            } else {
+                width += grapheme_width;
+                true
+            }
+        })
+        .copied()
+        .collect::<String>();
+    format!(
+        "{}{}{}",
+        if left_hidden { "…" } else { "" },
+        content,
+        if right_hidden { "…" } else { "" }
+    )
 }

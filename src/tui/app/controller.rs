@@ -657,6 +657,7 @@ pub(super) async fn dispatch_ui_command(
             Action::Continue
         }
         CoreCommand::Models => Action::OpenModels(String::new()),
+        CoreCommand::RefreshCatalog => Action::RefreshCatalog,
         CoreCommand::Effort => {
             open_effort(app, services).await;
             Action::Continue

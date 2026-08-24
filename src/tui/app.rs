@@ -496,6 +496,11 @@ struct ComposerCompletions {
     selected: usize,
 }
 
+struct MarqueeState {
+    key: String,
+    started_at_frame: usize,
+}
+
 /// Cumulative token usage of the whole session, replayed from usage events.
 #[derive(Default)]
 struct UsageTotals {
@@ -522,6 +527,7 @@ struct App {
     activity: Option<Activity>,
     busy_since: Option<Instant>,
     frame: usize,
+    marquee: Option<MarqueeState>,
     transcript_body_width: usize,
     transcript_offset: usize,
     transcript_rows: usize,
@@ -603,6 +609,7 @@ impl App {
             activity: None,
             busy_since: None,
             frame: 0,
+            marquee: None,
             transcript_body_width: 72,
             transcript_offset: 0,
             transcript_rows: 0,
@@ -663,7 +670,21 @@ impl App {
     }
 
     fn animations_paused(&self) -> bool {
-        matches!(self.overlay, Some(Overlay::Composer | Overlay::Delivery))
+        matches!(self.overlay, Some(Overlay::Delivery))
+            || (self.overlay == Some(Overlay::Composer) && self.completions.is_none())
+    }
+
+    fn marquee_elapsed(&mut self, key: String) -> usize {
+        let frame = self.frame;
+        let marquee = self.marquee.get_or_insert_with(|| MarqueeState {
+            key: key.clone(),
+            started_at_frame: frame,
+        });
+        if marquee.key != key {
+            marquee.key = key;
+            marquee.started_at_frame = frame;
+        }
+        frame.wrapping_sub(marquee.started_at_frame)
     }
 
     fn interrupt_on_double_press(&mut self, key: KeyEvent, key_name: &str) -> bool {

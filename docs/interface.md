@@ -37,7 +37,7 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 | `Esc` | Close the composer and preserve the draft |
 
 Click to place the caret, or drag across the draft to select editable text. `Ctrl+C`, `Ctrl+Shift+C`, `Cmd+C`, or right-click copies the selected draft through OSC52.
-The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation.
+The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation unless its completion popup is open.
 Long logical lines soft-wrap at the visible composer edge; only the newline shortcuts above insert a newline into the submitted text.
 
 Type `@` at the start of a token to list project files and insert an `@file://<path>` reference. Type `@@` to list saved sessions from the current project and insert a stable `@@<session-id>` reference. `Up` and `Down` select an open candidate, `Tab` or `Enter` inserts it, `Esc` closes the candidates without closing the composer, and mouse selection is supported. File and session matching run through linked completion providers; the composer only handles generic replacement ranges and candidates.
@@ -52,6 +52,8 @@ While a turn is running, press `Esc` twice within 500 milliseconds to interrupt 
 
 Press `:` from the conversation to open the command panel. Type to fuzzy-filter registered command names, aliases, and descriptions; use `Tab` or `Shift+Tab` to complete and cycle matching commands, use the arrow keys or mouse to choose a result, press `Enter` to run it, and press `Esc` to close it. The unfiltered panel shows canonical names only. A matching alias replaces the canonical name in search results, so typing `t` can show `:thinking` for the `:effort` command; description matches keep the canonical name, and completing any match inserts its canonical command name. Commands that need a value open a selector or a separate input float. Search text filters the panel; it is not a secondary command syntax.
 
+Selectable single-line rows keep their columns and mouse targets stable. Overflowing unselected text ends with `…`; after a short pause, the selected text scrolls to reveal the hidden content and then returns. Multi-line panel bodies and details wrap instead.
+
 Core commands are registered through `CommandRegistry`:
 
 | Command | Purpose |
@@ -62,6 +64,7 @@ Core commands are registered through `CommandRegistry`:
 | `:protocols` | List registered read and exec routes |
 | `:status` | Show project, model, usage, and extension status |
 | `:model` | Search runnable models |
+| `:refresh-catalog` | Force-refresh and apply cloud model configurations |
 | `:effort` | Select thinking effort supported by the active model |
 | `:settings` | Inspect and edit active settings |
 | `:login`, `:logout` | Manage provider credentials |

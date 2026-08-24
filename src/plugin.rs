@@ -14,6 +14,7 @@ pub enum CoreCommand {
     Protocols,
     Status,
     Models,
+    RefreshCatalog,
     Effort,
     Settings,
     Login,
@@ -188,6 +189,13 @@ fn core_commands() -> Vec<CommandSpec> {
             "search all runnable models from the Pi catalog",
             ["models"],
             CommandTarget::Core(Models),
+        ),
+        CommandSpec::new(
+            "refresh-catalog",
+            "Refresh model catalog",
+            "force-refresh and apply model configurations from Pi",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(RefreshCatalog),
         ),
         CommandSpec::new(
             "effort",
@@ -755,6 +763,10 @@ mod tests {
         assert_eq!(
             registry.resolve(":models").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::Models)
+        );
+        assert_eq!(
+            registry.resolve(":refresh-catalog").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::RefreshCatalog)
         );
         assert_eq!(
             registry.resolve(":term").unwrap().spec.target,

@@ -41,7 +41,7 @@ The active backend applies catalog data relevant to requests and accounting, inc
 
 ### Refresh and offline mode
 
-Catalog entries are considered fresh for four hours. Press `Ctrl+R` in the model selector or `r` in Settings to force a refresh.
+Catalog entries are considered fresh for four hours. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to force a refresh from pi.dev and immediately apply the resulting model configurations.
 
 Use any of the following to disable pi.dev requests and rely on local catalog data:
 

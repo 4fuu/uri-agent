@@ -847,6 +847,24 @@ fn compact_footer_right_aligns_context_and_handles_narrow_widths() {
 }
 
 #[test]
+fn single_line_overflow_preserves_input_tail_and_scrolls_selected_text() {
+    assert_eq!(single_line_tail("prefix  模型", 7), "…  模型");
+    assert_eq!(single_line_tail("a  b", 4), "a  b");
+
+    assert_eq!(marquee_preview("abcdef", 4, 0), "abc…");
+    assert_eq!(
+        marquee_preview("abcdef", 4, MARQUEE_HOLD_FRAMES + MARQUEE_STEP_FRAMES),
+        "…bc…"
+    );
+    assert_eq!(
+        marquee_preview("abcdef", 4, MARQUEE_HOLD_FRAMES + 3 * MARQUEE_STEP_FRAMES),
+        "…def"
+    );
+    assert_eq!(list_cell("模型名称", 5, false, 0).width(), 5);
+    assert_eq!(single_line_preview("e\u{301}clair", 2), "e\u{301}…");
+}
+
+#[test]
 fn compact_footer_stays_minimal_while_expanded_status_keeps_usage_details() {
     let mut app = test_app();
     app.info.provider_count = 2;
@@ -1821,6 +1839,7 @@ fn composer_completion_popup_is_visible_and_mouse_selectable() {
         },
         selected: 0,
     });
+    assert!(!app.animations_paused());
 
     let rendered = render_to_string(&mut app, 80, 24);
 
@@ -3188,6 +3207,30 @@ fn command_panel_input_filters_the_selection() {
 }
 
 #[test]
+fn selected_command_description_scrolls_inside_its_single_row() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Command);
+    app.command_query = "refresh-catalog".to_string();
+
+    let initial = render_to_string(&mut app, 80, 24);
+    let initial_row = initial
+        .lines()
+        .find(|line| line.contains(":refresh-catalog"))
+        .unwrap()
+        .to_string();
+    assert!(initial_row.contains('…'));
+
+    app.frame = MARQUEE_HOLD_FRAMES + 4 * MARQUEE_STEP_FRAMES;
+    let advanced = render_to_string(&mut app, 80, 24);
+    let advanced_row = advanced
+        .lines()
+        .find(|line| line.contains(":refresh-catalog"))
+        .unwrap();
+    assert_ne!(advanced_row, initial_row);
+    assert!(advanced_row.matches('…').count() >= 1);
+}
+
+#[test]
 fn command_panel_tab_completes_and_cycles_matches() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Command);
@@ -3679,6 +3722,15 @@ fn environment_prompts_hide_values_and_return_to_the_manager() {
     assert!(!rendered.contains("super-secret-value"));
 
     open_environment_value_prompt(&mut app, "NPM_TOKEN".to_string(), true);
+    let narrow = render_to_string(&mut app, 28, 16);
+    for word in "Value is stored privately and injected into future Agent shell commands."
+        .split_whitespace()
+    {
+        assert!(
+            narrow.contains(word),
+            "missing wrapped prompt word {word:?}"
+        );
+    }
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
     assert!(matches!(
         handle_text_key(&mut app, escape, &key_name(escape)),
