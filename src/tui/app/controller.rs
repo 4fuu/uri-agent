@@ -1074,6 +1074,10 @@ pub(super) async fn handle_overlay_key(
                 app.overlay = None;
                 Action::Continue
             }
+            Some("copy") => {
+                copy_document(app);
+                Action::Continue
+            }
             Some("scroll_up") => {
                 app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
                 Action::Continue

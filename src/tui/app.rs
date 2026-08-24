@@ -85,8 +85,9 @@ const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
 const TAIL_BUTTON_RIGHT_INSET: usize = 2;
 const WEB_SEARCH_LOGIN_PROVIDERS: &[&str] = &["parallel", "exa"];
-const IMAGE_TOKEN_PREFIX: &str = "🖼 #";
+const IMAGE_TOKEN_PREFIX: &str = "[Image #";
 const IMAGE_MARKER_PREFIX: &str = "[Image #";
+const LEGACY_IMAGE_TOKEN_PREFIX: &str = "🖼 #";
 
 pub struct TuiInfo {
     pub cwd: PathBuf,

@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn image_token_label(id: u64) -> String {
-    format!("{IMAGE_TOKEN_PREFIX}{id}")
+    format!("{IMAGE_TOKEN_PREFIX}{id}]")
 }
 
 pub(super) fn numbered_image_spans(
@@ -39,7 +39,7 @@ pub(super) fn numbered_image_spans(
 }
 
 pub(super) fn image_token_spans(line: &str) -> Vec<ImageTokenSpan> {
-    numbered_image_spans(line, IMAGE_TOKEN_PREFIX, None)
+    numbered_image_spans(line, IMAGE_TOKEN_PREFIX, Some(b']'))
 }
 
 pub(super) fn image_marker_spans(line: &str) -> Vec<ImageTokenSpan> {
@@ -98,10 +98,17 @@ pub(super) fn strip_image_references_with(
         .join("\n")
 }
 
+pub(super) fn legacy_image_token_spans(line: &str) -> Vec<ImageTokenSpan> {
+    numbered_image_spans(line, LEGACY_IMAGE_TOKEN_PREFIX, None)
+}
+
 pub(super) fn strip_image_references(text: &str) -> String {
     strip_image_references_with(
-        &strip_image_references_with(text, image_token_spans),
-        image_marker_spans,
+        &strip_image_references_with(
+            &strip_image_references_with(text, image_token_spans),
+            image_marker_spans,
+        ),
+        legacy_image_token_spans,
     )
 }
 

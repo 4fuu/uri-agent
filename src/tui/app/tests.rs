@@ -1622,6 +1622,76 @@ fn final_assistant_response_has_one_blank_row_after_the_process() {
 }
 
 #[test]
+fn final_assistant_response_has_one_blank_row_after_the_user_when_there_is_no_process() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "hello".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::AssistantText {
+            text: "Hello! How can I help?".into(),
+        },
+    );
+    apply_event(&mut app, 2, EventKind::TurnFinished);
+
+    assert_eq!(app.blocks.len(), 2);
+    assert_eq!(app.blocks[0].kind, BlockKind::User);
+    assert_eq!(app.blocks[1].kind, BlockKind::Assistant);
+    assert!(app.blocks[1].turn_result);
+    assert!(
+        !app.blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::Process)
+    );
+
+    app.skip_splash();
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let user_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+        .unwrap();
+    let result_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+        .unwrap();
+
+    assert_eq!(result_row, user_row + 3);
+    assert_eq!(
+        terminal.backend().buffer()[(1, user_row + 1)].bg,
+        USER_SURFACE
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(1, user_row + 2)].bg,
+        Color::Reset
+    );
+    assert!(!app.hit_regions.iter().any(|region| {
+        region.area.y == user_row + 2 && matches!(region.target, AppHit::Transcript(_))
+    }));
+    assert!(transcript_needs_gap(
+        BlockKind::User,
+        false,
+        BlockKind::Assistant,
+        true,
+    ));
+    assert!(transcript_needs_gap(
+        BlockKind::User,
+        false,
+        BlockKind::Error,
+        true,
+    ));
+}
+
+#[test]
 fn assistant_transcript_renders_markdown_instead_of_source_markers() {
     let mut app = test_app();
     app.push(
@@ -1883,7 +1953,7 @@ fn smart_clipboard_result_inserts_text_or_an_image_into_the_composer() {
 
     app.clipboard_image_loading = true;
     assert!(!app.finish_clipboard_read(Ok(clipboard::ClipboardContent::Image(vec![1, 2]))));
-    assert_eq!(app.draft_text(), "pasted🖼 #1");
+    assert_eq!(app.draft_text(), "pasted[Image #1]");
     let (prompt, images) = app.composer_submission();
     assert_eq!(prompt, "pasted[Image #1]");
     assert_eq!(images, [ImageAttachment::png(vec![1, 2])]);
@@ -1898,8 +1968,8 @@ fn clipboard_image_token_is_inserted_at_the_caret() {
 
     app.finish_clipboard_image_read(Ok(vec![1]));
 
-    assert_eq!(app.draft_text(), "before🖼 #1after");
-    assert_eq!(app.input.cursor(), (0, 10));
+    assert_eq!(app.draft_text(), "before[Image #1]after");
+    assert_eq!(app.input.cursor(), (0, 16));
 }
 
 #[test]
@@ -1910,7 +1980,7 @@ fn image_tokens_are_crossed_and_deleted_atomically() {
 
     app.input.move_cursor(CursorMove::Head);
     app.edit_composer(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), None);
-    assert_eq!(app.input.cursor(), (0, "🖼 #1".chars().count()));
+    assert_eq!(app.input.cursor(), (0, "[Image #1]".chars().count()));
     app.edit_composer(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), None);
     assert_eq!(app.input.cursor(), (0, 0));
 
@@ -1920,7 +1990,7 @@ fn image_tokens_are_crossed_and_deleted_atomically() {
 
     app.input.undo();
     app.sync_composer_chrome();
-    assert_eq!(app.draft_text(), "🖼 #1");
+    assert_eq!(app.draft_text(), "[Image #1]");
     app.input.move_cursor(CursorMove::End);
     app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
     assert!(app.draft_text().is_empty());
@@ -1954,7 +2024,7 @@ fn deleting_one_image_token_keeps_and_renumbers_the_other_on_submit() {
     app.input.move_cursor(CursorMove::Jump(0, 4));
     app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
 
-    assert_eq!(app.draft_text(), " 🖼 #2");
+    assert_eq!(app.draft_text(), " [Image #2]");
     let (prompt, images) = app.composer_submission();
     assert_eq!(prompt, " [Image #1]");
     assert_eq!(images, [ImageAttachment::png(vec![2])]);
@@ -1969,7 +2039,7 @@ fn clipboard_images_wait_for_the_next_submit() {
     app.insert_clipboard_image(vec![1]);
     app.clipboard_image_loading = true;
     assert!(app.submit().is_none());
-    assert_eq!(app.draft_text(), "inspect this 🖼 #1");
+    assert_eq!(app.draft_text(), "inspect this [Image #1]");
     assert_eq!(
         app.composer_submission().1.as_slice(),
         std::slice::from_ref(&image)
@@ -1983,7 +2053,7 @@ fn clipboard_images_wait_for_the_next_submit() {
 
     app.busy = false;
     app.restore_to_draft(&prompt);
-    assert_eq!(app.draft_text(), "inspect this 🖼 #1");
+    assert_eq!(app.draft_text(), "inspect this [Image #1]");
     assert_eq!(app.composer_submission().0, prompt);
 }
 
@@ -1996,13 +2066,13 @@ fn clipboard_read_completion_inserts_a_token_without_a_success_notice() {
     app.finish_clipboard_image_read(Ok(vec![1, 2, 3]));
 
     assert!(!app.clipboard_image_loading);
-    assert_eq!(app.draft_text(), "🖼 #1");
+    assert_eq!(app.draft_text(), "[Image #1]");
     assert!(app.visible_flashes().next().is_none());
 
     app.clipboard_image_loading = true;
     app.finish_clipboard_image_read(Err(anyhow!("clipboard unavailable")));
     assert!(!app.clipboard_image_loading);
-    assert_eq!(app.draft_text(), "🖼 #1");
+    assert_eq!(app.draft_text(), "[Image #1]");
     assert!(
         app.visible_flashes()
             .next_back()
@@ -2022,7 +2092,10 @@ fn composer_shows_image_tokens_without_external_image_chrome() {
     terminal.draw(|frame| render(frame, &mut app)).unwrap();
     let cells = terminal.backend().buffer().content();
     let symbols = cells.iter().map(|cell| cell.symbol()).collect::<Vec<_>>();
-    let token = "🖼 #1".chars().map(|c| c.to_string()).collect::<Vec<_>>();
+    let token = "[Image #1]"
+        .chars()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>();
     let start = symbols
         .windows(token.len())
         .position(|window| {
@@ -2042,7 +2115,7 @@ fn composer_shows_image_tokens_without_external_image_chrome() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(rendered.contains("🖼 #1"));
+    assert!(rendered.contains("[Image #1]"));
     assert!(!rendered.contains("MESSAGE · 1 image"));
     assert!(!rendered.contains("image ready"));
     assert!(!rendered.contains("Alt+Backspace"));
@@ -2072,12 +2145,12 @@ fn mouse_clicks_snap_to_image_token_edges() {
         &mut app,
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: inner.x + 4,
+            column: inner.x + 9,
             row: inner.y,
             modifiers: KeyModifiers::NONE,
         }
     ));
-    assert_eq!(app.input.cursor(), (0, 4));
+    assert_eq!(app.input.cursor(), (0, 10));
 }
 
 #[test]
@@ -2087,7 +2160,7 @@ fn restoring_pending_images_merges_and_renumbers_composer_tokens() {
 
     app.restore_pending_to_draft("queued [Image #1]", vec![ImageAttachment::png(vec![1])]);
 
-    assert_eq!(app.draft_text(), "queued 🖼 #1\n\n🖼 #2");
+    assert_eq!(app.draft_text(), "queued [Image #1]\n\n[Image #2]");
     let (prompt, images) = app.composer_submission();
     assert_eq!(prompt, "queued [Image #1]\n\n[Image #2]");
     assert_eq!(
@@ -2099,7 +2172,7 @@ fn restoring_pending_images_merges_and_renumbers_composer_tokens() {
 #[test]
 fn persisted_drafts_drop_image_tokens_without_binary_attachments() {
     assert_eq!(
-        strip_image_references("before 🖼 #1\nafter [Image #20]"),
+        strip_image_references("before [Image #1]\nafter [Image #20]"),
         "before \nafter "
     );
 }
@@ -2327,7 +2400,12 @@ fn composer_is_bottom_anchored_with_a_rounded_frame_and_placeholder() {
     assert!(rows[16].contains("MESSAGE"));
     assert!(rows[17].contains("Ask URI Agent to build, explain, or fix…"));
     assert!(rows[23].starts_with("  ╰"));
-    assert!(rows[23].contains("Enter send · Shift+Enter newline"));
+    let newline_hint = if cfg!(windows) {
+        "Enter send · Ctrl+Enter newline"
+    } else {
+        "Enter send · Shift+Enter newline"
+    };
+    assert!(rows[23].contains(newline_hint));
     assert!(!rows[23].contains("Esc keep draft"));
     assert!(rows[23].ends_with("╯  "));
 }
@@ -2340,7 +2418,7 @@ fn composer_footer_does_not_show_image_count_or_removal_shortcut() {
 
     let rendered = render_to_string(&mut app, 80, 24);
 
-    assert!(rendered.contains("🖼 #1"));
+    assert!(rendered.contains("[Image #1]"));
     assert!(!rendered.contains("MESSAGE · 1 image"));
     assert!(!rendered.contains("Alt+Backspace"));
 }
@@ -2581,6 +2659,35 @@ fn opening_a_full_document_does_not_change_the_folded_state() {
             "# THINKING\n\nfull thought\n".to_string()
         ))
     );
+}
+
+#[test]
+fn document_overlay_copies_the_full_body_with_c() {
+    let mut app = test_app();
+    let thought = format!("{}more thought", "thinking line\n".repeat(40));
+    app.push(
+        BlockKind::Reasoning,
+        "THINKING",
+        thought,
+        None,
+        false,
+        false,
+    );
+    app.open_selected_document();
+
+    assert_eq!(app.keymap.action("document", "c").as_deref(), Some("copy"));
+    let expected = block_document(&app.blocks[0]);
+    assert_eq!(
+        app.document.as_ref().map(|(_, body)| body.as_str()),
+        Some(expected.as_str())
+    );
+    assert!(expected.contains("more thought"));
+    assert!(expected.lines().count() > 20);
+
+    let rendered = render_to_string(&mut app, 72, 14);
+    assert!(rendered.contains("C copy"), "{rendered}");
+    assert!(keymap_help(&app.keymap).contains("DOCUMENT"));
+    assert!(keymap_help(&app.keymap).contains("copy"));
 }
 
 #[test]

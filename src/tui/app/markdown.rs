@@ -104,7 +104,9 @@ impl Writer {
             Event::HardBreak => self.flush_line(),
             Event::Rule => {
                 self.start_block();
-                self.text(&"─".repeat(self.width.min(24)), Style::default().fg(MUTED));
+                self.start_line();
+                let rule_width = self.width.saturating_sub(self.prefix_width).max(1);
+                self.push_span(&"─".repeat(rule_width), Style::default().fg(MUTED));
                 self.flush_line();
                 self.needs_blank = true;
             }
@@ -643,5 +645,35 @@ mod tests {
         assert!(!text.contains("• ☑"));
         assert!(text.contains("  1. child"), "{text}");
         assert!(text.contains("• next"));
+    }
+
+    #[test]
+    fn thematic_break_spans_the_requested_width() {
+        let lines = render("before\n\n---\n\nafter", 40);
+        let rule = lines
+            .iter()
+            .find(|line| line.to_string().contains('─'))
+            .unwrap();
+        assert_eq!(rule.width(), 40);
+        assert_eq!(rule.to_string(), "─".repeat(40));
+        assert!(rule.spans.iter().all(|span| span.style.fg == Some(MUTED)));
+    }
+
+    #[test]
+    fn thematic_break_uses_remaining_width_inside_a_quote() {
+        let lines = render("> ---", 20);
+        let rule = lines
+            .iter()
+            .find(|line| line.to_string().contains('─'))
+            .unwrap();
+        assert_eq!(rule.width(), 20);
+        assert!(rule.to_string().starts_with("│ "));
+        assert_eq!(
+            rule.to_string()
+                .chars()
+                .filter(|character| character == &'─')
+                .count(),
+            18
+        );
     }
 }

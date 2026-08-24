@@ -10,7 +10,7 @@ After the first record, a compact footer shows the active model, effort, and con
 
 User prompts use a teal band; assistant responses render as Markdown on the terminal background. Both occupy the transcript width without decorative prefixes, so copied text contains only message content. During a turn, intermediate text, reasoning, and tools remain visible in event order. At completion they fold into one `Process` row, while the final response or terminal error stays visible. Restored sessions reconstruct the same collapsed form.
 
-Select a process, reasoning, or tool row with the keyboard or mouse and press `Enter` or click to fold or expand it. Tool summaries describe the routed URI, command, patch targets, and result instead of raw argument JSON. Press `o` or right-click to open the full document, including during streaming. Search and reasoning/tool jump actions reveal a folded parent automatically.
+Select a process, reasoning, or tool row with the keyboard or mouse and press `Enter` or click to fold or expand it. Tool summaries describe the routed URI, command, patch targets, and result instead of raw argument JSON. Press `o` or right-click to open the full document, including during streaming. In that document, press `c` to copy the complete contents. Search and reasoning/tool jump actions reveal a folded parent automatically.
 
 A click outside dismisses read-only and navigational floats, including the composer, command panel, selectors, status, help, protocols, tasks, and documents. The composer preserves its draft. Settings, text prompts, OAuth, and the embedded terminal require an explicit close so an outside click cannot discard edits or stop work.
 
@@ -21,7 +21,7 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 | Key | Action |
 | --- | --- |
 | `Enter` | Send when idle; while running, choose Queue or Guidance |
-| `Shift+Enter` | Insert a newline |
+| `Shift+Enter` | Insert a newline; Windows consoles never report Shift with Enter, so Windows shows and expects `Ctrl+Enter` instead |
 | `Ctrl+Enter` or `Ctrl+J` | Insert a newline |
 | `Alt+Up` | Restore the latest undelivered Queue or Guidance message to the draft |
 | `Alt+Enter` | Upgrade the latest queued message to Guidance |
@@ -93,9 +93,10 @@ Saved values apply to future Agent `bash` and `pwsh` commands without a restart.
 | Surface | Useful defaults |
 | --- | --- |
 | Conversation | `@` open the composer and list file references, `Alt+V` insert a clipboard image, `Up`/`Down` select, `Ctrl+Up`/`Ctrl+Down` scroll, `Enter` expand/fold, `o` open full document, `PageUp`/`PageDown` page, `Home`/`End` jump |
+| Document | `c` copy the complete contents, arrows or page keys scroll, `Esc` close |
 | Row filters | `r` reasoning, `t` tools, `h` user messages, `Esc` clear filter |
 | Global | Double `Esc` interrupts a running turn; `F1` help, `F2` settings, `F3` models, `F4` status, `Ctrl+,` settings, `Ctrl+P` protocols, `Ctrl+T` tasks; the macOS key style also accepts `Cmd+,` |
-| Copy | `Ctrl+C` or right-click copies an active selection; without a selection, right-click opens a reasoning or tool block's full document; `Ctrl+Shift+C` copies the selection or visible surface; `Cmd+C` is accepted when the terminal forwards it |
+| Copy | `Ctrl+C` or right-click copies an active selection; without a selection, right-click opens a reasoning or tool block's full document; `c` in that document copies its complete contents; `Ctrl+Shift+C` copies the selection or visible surface; `Cmd+C` is accepted when the terminal forwards it |
 
 Arrow keys and mouse input are first-class. The mouse wheel and `Ctrl+Up`/`Ctrl+Down` scroll the conversation viewport without changing the selected block. Manual scrolling can move the final transcript row up to the middle of the viewport; this virtual tail space is not persisted conversation content. New output follows the real content bottom until the user scrolls away. When the viewport is showing content above the live tail, the activity row shows a padded `↓ bottom` mouse button above and slightly inset from the context meter. Without an activity row, a padded `↓` button floats at the same inset without taking layout space. The button stays hidden in virtual space past the live tail. Click either button or press `End` to resume following the tail. Keyboard navigation keeps an off-screen destination visible and centers it when the transcript has enough room. Selection wraps from the last item to the first and from the first item to the last in every selectable list. `j` and `k` exist as optional aliases on the main and several list surfaces, but defaults and help do not require Vim knowledge.
 

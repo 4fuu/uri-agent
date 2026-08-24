@@ -796,9 +796,7 @@ pub(super) fn transcript_needs_gap(
         && matches!(previous, BlockKind::Assistant | BlockKind::Error)
         && current == BlockKind::User)
         || matches!((previous, current), (BlockKind::User, BlockKind::Process))
-        || (current_turn_result
-            && matches!(current, BlockKind::Assistant | BlockKind::Error)
-            && previous != BlockKind::User)
+        || (current_turn_result && matches!(current, BlockKind::Assistant | BlockKind::Error))
 }
 
 pub(super) fn transcript_live_tail(rows: usize, height: usize) -> usize {
@@ -1243,6 +1241,7 @@ pub(super) fn keymap_help(keymap: &Keymap) -> String {
         ("SETTINGS", "settings"),
         ("OAUTH", "oauth"),
         ("TERMINAL", "terminal"),
+        ("DOCUMENT", "document"),
         ("SELECTION", "selection"),
         ("GLOBAL", "global"),
     ] {
@@ -1538,11 +1537,13 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             );
         }
         Overlay::Document => {
-            let (title, body) = app
+            let hints = action_hints(&app.keymap, &[("document", "copy", "copy")]);
+            let (name, body) = app
                 .document
                 .as_ref()
-                .map(|(title, body)| (format!(" {title} "), body.as_str()))
-                .unwrap_or((" DOCUMENT ".to_string(), "Nothing to show."));
+                .map(|(title, body)| (title.as_str(), body.as_str()))
+                .unwrap_or(("DOCUMENT", "Nothing to show."));
+            let title = panel_title(name, hints);
             frame.render_widget(
                 Paragraph::new(body)
                     .block(block.title(fit_panel_title(&title, area.width)))
@@ -2870,6 +2871,19 @@ pub(super) fn copy_current_surface(app: &mut App) {
     }
     copy_text_with_osc52(app, &text);
     app.selection = None;
+}
+
+pub(super) fn copy_document(app: &mut App) {
+    let Some(text) = app
+        .document
+        .as_ref()
+        .map(|(_, body)| body.clone())
+        .filter(|body| !body.trim().is_empty())
+    else {
+        app.set_flash("Nothing visible can be copied");
+        return;
+    };
+    copy_text_with_osc52(app, &text);
 }
 
 pub(super) fn copy_composer_selection(app: &mut App) {

@@ -22,7 +22,7 @@ map("composer", "ctrl+j", "newline");
 
 Key names are normalized when the keymap loads. Modifier names are case-insensitive; `control` aliases `ctrl`, `option` aliases `alt`, and `cmd` or `command` aliases `super`. An invalid name stops startup and identifies the owning keymap file instead of creating an unreachable binding.
 
-Visible action hints are resolved from the effective keymap after global and project overrides. Text style renders labels such as `Ctrl+R`, `Shift+Enter`, and `Alt+Up`; macOS style renders `⌃R`, `⇧↩`, and `⌥↑`, with `super` shown as Command (`⌘`). Panel titles, composer guidance, pending-message controls, transcript actions, and `F1` help therefore stay synchronized with overrides.
+Visible action hints are resolved from the effective keymap after global and project overrides. Text style renders labels such as `Ctrl+R`, `Shift+Enter`, and `Alt+Up`; macOS style renders `⌃R`, `⇧↩`, and `⌥↑`, with `super` shown as Command (`⌘`). Panel titles, composer guidance, pending-message controls, transcript actions, and `F1` help therefore stay synchronized with overrides. On Windows, a hint prefers the Ctrl-based binding over the Shift-based one for the same key, because the Windows console never reports Shift with Enter as a key press.
 
 Set `keyDisplay` or `URI_AGENT_KEY_DISPLAY` to `auto`, `macos`, or `text`; see [Settings fields and precedence](configuration.md#settings-fields-and-precedence). `auto` selects macOS symbols only when URI Agent itself runs on macOS. Choose `macos` explicitly when a macOS terminal connects to a non-macOS host. That style adds Command aliases for Settings, paste, undo, and redo while keeping portable bindings; the terminal must still forward those shortcuts.
 
@@ -38,7 +38,7 @@ Configurable actions must go through the keymap. Commands available from the pan
 
 Clicks and drags normally go to the terminal application. Hold `Shift` while dragging to select rendered text, then use `Ctrl+C`, `Ctrl+Shift+C`, or right-click to copy through OSC52. On macOS, `Cmd+C` also works when the terminal forwards the modifier.
 
-User prompts, assistant responses, blank conversation space (including the virtual tail), and read-only floats support direct drag selection. Hold `Shift` for reasoning and tool blocks so ordinary clicks remain available for folding and opening. On URI Agent surfaces, a copy shortcut copies the active selection, `Esc` clears it, and any other shortcut clears it before continuing through normal key routing. Terminal restoration, selection, and OSC52 copy remain active on normal and error exits.
+User prompts, assistant responses, blank conversation space (including the virtual tail), and read-only floats support direct drag selection. Hold `Shift` for reasoning and tool blocks so ordinary clicks remain available for folding and opening. On URI Agent surfaces, a copy shortcut copies the active selection, `Esc` clears it, and any other shortcut clears it before continuing through normal key routing. In an open reasoning, tool, or process document, `c` copies the complete document rather than only the visible viewport. Terminal restoration, selection, and OSC52 copy remain active on normal and error exits.
 
 ## Image attachments
 

@@ -135,6 +135,7 @@ map("document", "up", "scroll_up");
 map("document", "down", "scroll_down");
 map("document", "pageup", "page_up");
 map("document", "pagedown", "page_down");
+map("document", "c", "copy");
 map("document", "esc", "close");
 
 map("selection", "y", "copy");
@@ -671,6 +672,19 @@ fn modifier_preference(modifiers: u8, style: KeyDisplayStyle) -> usize {
             ALT,
             ALT | SHIFT,
         ]
+    } else if cfg!(windows) {
+        // Windows consoles do not deliver Shift+Enter as a key press, so
+        // advertise an action's Ctrl-based binding over the Shift-based one.
+        [
+            0,
+            CONTROL,
+            SHIFT,
+            CONTROL | SHIFT,
+            ALT,
+            ALT | SHIFT,
+            SUPER,
+            SUPER | SHIFT,
+        ]
     } else {
         [
             0,
@@ -741,6 +755,8 @@ mod tests {
         );
         assert_eq!(keymap.action("main", "alt+backspace"), None);
         assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
+        assert_eq!(keymap.action("document", "c").as_deref(), Some("copy"));
+        assert_eq!(keymap.action("document", "esc").as_deref(), Some("close"));
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);
         assert_eq!(keymap.action("composer", "ctrl+c").as_deref(), Some("copy"));
@@ -874,9 +890,14 @@ mod tests {
     #[test]
     fn text_and_macos_styles_format_the_effective_binding() {
         let text = Keymap::with_display_style(KeyDisplayStyle::Text).unwrap();
+        let newline = if cfg!(windows) {
+            "Ctrl+Enter"
+        } else {
+            "Shift+Enter"
+        };
         assert_eq!(
             text.key_hint("composer", "newline").as_deref(),
-            Some("Shift+Enter")
+            Some(newline)
         );
         assert_eq!(
             text.key_hint("composer", "paste_image").as_deref(),
