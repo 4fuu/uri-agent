@@ -133,7 +133,7 @@ exec("bash://?wait=30", "cargo test")  # Unix-like 系统
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。通过 `:login` 保存 Parallel 或 Exa API key 后，内置 `https` 协议会使用该服务商进行搜索和网页提取。两个网络服务商均未登录时，搜索会请求登录，网页读取则回退到本地 HTTPS 获取和 HTML-to-Markdown 转换。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, output, and Skills](docs/protocols.md)。
+URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body 由该协议负责解释。通过 `:login` 保存 Parallel 或 Exa API key 后，内置 `https` 协议会使用该服务商进行搜索和网页提取。两个网络服务商均未登录时，搜索会请求登录，网页读取则回退到本地 HTTPS 获取和 HTML-to-Markdown 转换。`uri-agent-docs` 让与当前版本匹配的文档可从任意启动目录读取。可用的 Shell 协议取决于平台。精确的运行时契约以 `<protocol>://help` 为准；共享设计见英文文档 [Protocols, tasks, and output](docs/protocols.md)。
 
 ## 扩展
 
@@ -141,13 +141,7 @@ URI Agent 在第一个 `://` 处选择协议；剩余 target 和可选 JSON body
 
 ## 文档
 
-[`docs/` 索引](docs/README.md)按任务组织详细的英文文档：
-
-- [Protocols, tasks, output, and Skills](docs/protocols.md) — 模型路由、内置协议、执行语义、受管任务、完整输出保留与 Skill 发现。
-- [WASM plugins](docs/plugins.md) — 安装、reload、信任边界、ABI、SDK 与运行限制。
-- [Models and configuration](docs/configuration.md) — 模型目录、认证、配置优先级、CLI 参数、thinking 等级与自定义 Provider。
-- [Terminal interface and sessions](docs/interface.md) — 输入与命令、快捷键、内嵌终端、图片附件、持久化、会话恢复与上下文压缩。
-- [Architecture and development](docs/development.md) — 模块职责、不可变约束、修改规则与验证要求。
+[`docs/` 索引](docs/README.md)按任务指向各篇英文文档，分别覆盖协议、启动上下文与 Skills、WASM 插件、模型与配置、终端界面、会话与上下文压缩、开发以及发布。
 
 程序运行时，协议支持的 URI 和 body 格式以 `<protocol>://help` 为准。
 

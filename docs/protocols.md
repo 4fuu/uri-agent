@@ -1,6 +1,6 @@
-# Protocols, tasks, output, and Skills
+# Protocols, tasks, and output
 
-URI Agent keeps the model-facing tool surface fixed while allowing the application to register new capabilities. This document describes that boundary, built-in protocols, execution semantics, managed tasks, output preservation, and Skill loading.
+URI Agent keeps the model-facing tool surface fixed while allowing the application to register new capabilities. This document describes routing, built-in protocols, execution semantics, managed tasks, and output preservation. Skill discovery and resources are documented in [Startup context and Skills](context.md).
 
 For the exact runtime syntax of a protocol, read `<protocol>://help`. Those help routes are the canonical model-facing operation reference.
 
@@ -47,7 +47,7 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash is enabled |
 | `pwsh` | `read`, `exec` | Run PowerShell 7 commands as managed tasks when `pwsh` is enabled |
 | `wasm_plugin` | `read`, `exec` | Reload trusted WASM protocols and return the completed reload report |
-| `<name>-skill` | `read` | Load one discovered Skill and its bundled files |
+| `<name>-skill` | `read` | Load one [discovered Skill](context.md#skills) and its bundled files |
 
 Shell plugins detect their own executables at startup. On Windows, the `pwsh`
 plugin also verifies that PowerShell 7 or newer can start. A valid `pwsh`
@@ -178,40 +178,6 @@ URI Agent injects the latest values from its global Agent environment manager in
 
 PowerShell source and plain-text output use UTF-8. Its task status follows the final PowerShell or native command, including the native command's exact exit code.
 
-## Built-in project instructions
-
-A prompt-only built-in plugin reads `AGENTS.md` from the canonical project directory when the file exists. It appends the file's content to the bottom of a new session's system prompt in this form:
-
-```text
-<project_rule_md>
-The following content is from the project's AGENTS.md. Follow these instructions.
-
-<AGENTS.md content>
-</project_rule_md>
-```
-
-This plugin does not register a protocol, command, panel, or status provider. A missing `AGENTS.md` contributes no prompt content; other read failures stop session startup with an error. Because the complete prompt is frozen, later changes to `AGENTS.md` apply only to new sessions.
-
-## Built-in binary hints
-
-A second prompt-only built-in plugin scans `PATH` once while constructing a new session's frozen system prompt. It detects these names in fixed display order:
-
-```text
-rg, fd, fdfind, sd, bat, batcat, eza, exa, lsd, delta,
-jq, yq, fzf, xh, hyperfine, dust, duf, procs, btm, zoxide,
-doggo, gping, hexyl, choose, sad, ast-grep, broot, tokei, watchexec, glow
-```
-
-When at least one is available, the plugin contributes this exact prompt fragment, with the detected names joined by ` / `:
-
-```text
-These faster cross-platform tools are available: `rg` / `fd` / `bat`. Prefer them over their classical Unix equivalents.
-```
-
-Matching is case-insensitive and output follows the fixed list rather than `PATH` order. Duplicate names are removed, while aliases such as `fd` and `fdfind` remain separate when both exist. Missing and unreadable directories are ignored. On Unix, a match must resolve to a regular file with at least one execute bit; on Windows, its final extension must appear in `PATHEXT`, whose default is `.COM;.EXE;.BAT;.CMD` when unset.
-
-No match contributes no prompt content. The plugin never invokes a detected program and registers no protocol, command, panel, status provider, key binding, or configuration. Changes to installed binaries or `PATH` take effect only in a new session; resumed sessions reuse their frozen prompt.
-
 ## Managed tasks
 
 Protocol execution returns its final result directly by default. Necessary long-running operations may instead become managed tasks. The built-in shell protocols use managed tasks because command duration is unbounded:
@@ -244,51 +210,6 @@ When protocol output exceeds the active inline limit, URI Agent:
 
 This presentation behavior is shared by protocol reads and executions. Adjust the limit through `:settings`, configuration, `URI_AGENT_OUTPUT_LIMIT`, or `--output-limit`; see [Models and configuration](configuration.md).
 
-## Skills
-
-URI Agent discovers Skills once when it starts, in this priority order:
-
-```text
-<project>/.agents/skills
-<project>/.claude/skills
-<project>/.codex/skills
-~/.agents/skills
-~/.claude/skills
-~/.codex/skills
-```
-
-Each root may contain a `SKILL.md` directly or in one of its immediate child directories. Deeper recursive discovery is not performed.
-
-A Skill starts with YAML frontmatter containing nonempty `name` and `description` values:
-
-```yaml
----
-name: Code Review
-description: Review a change for correctness and regressions.
----
-```
-
-The name is lowercased, runs of characters outside ASCII letters and numbers become separators, and `-skill` is appended if absent. The example therefore registers:
-
-```text
-code-review-skill://help
-code-review-skill://scripts/check.py
-```
-
-The first Skill for a normalized protocol name wins. Later duplicates are skipped with a notice. A Skill that collides with an already registered protocol is also skipped with a notice.
-
-`<name>-skill://help` reads the Skill's `SKILL.md`; other targets read files relative to its directory. Absolute resource targets are rejected. Canonical path checks, including checks after following symlinks, keep resource reads inside the Skill directory.
-
-### Frozen session behavior
-
-When a session is created, URI Agent freezes:
-
-- the complete generated system prompt;
-- each selected Skill's name and description;
-- each selected Skill's canonical `SKILL.md` path.
-
-Resume reuses this snapshot instead of rediscovering current context. A same-named Skill elsewhere cannot replace the frozen one. Help and resources are still read from the frozen path, so removing that file produces an explicit error. A historical session without frozen context is invalid rather than being reinterpreted with current startup state.
-
 ## Extension protocols
 
-Capabilities may register protocols through linked Rust extensions or trusted runtime-loaded WASM modules. Both remain behind `read` and `exec`. See [WASM plugins](plugins.md) for installation, reload, ABI, permissions, and SDK usage; linked first-party extension internals belong to the [development guide](development.md#linked-rust-extensions).
+Capabilities may register protocols through linked Rust extensions, trusted runtime-loaded WASM modules, or discovered Skills. All remain behind `read` and `exec`. See [WASM plugins](plugins.md) for installation, reload, ABI, permissions, and SDK usage; [Startup context and Skills](context.md#skills) for Skill behavior; and the [development guide](development.md#linked-rust-extensions) for linked first-party internals.

@@ -89,7 +89,7 @@ URI Agent does not load native dynamic libraries. Third-party runtime protocols 
 - Prefer extending `Protocol` over adding another model-facing concept or embedding every capability in the initial prompt.
 - Reserve plugin system prompt fragments for context the model must receive before its first tool call. Prompt-only plugins do not need to register a protocol.
 
-The shared routing and execution lifecycle is in [Protocols, tasks, output, and Skills](protocols.md).
+The shared routing and execution lifecycle is in [Protocols, tasks, and output](protocols.md).
 
 ### Execution and persistence
 
@@ -109,7 +109,7 @@ The shared routing and execution lifecycle is in [Protocols, tasks, output, and 
 - Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
 - Treat the canonical launch directory as the project boundary for attachments and session selection.
 
-The exact Skill rules are in [Skills](protocols.md#skills); the user-visible persistence and compaction lifecycle is in [Sessions and context](interface.md#sessions-and-context).
+The exact Skill rules are in [Startup context and Skills](context.md); persistence and compaction are in [Sessions and context](sessions.md).
 
 ### TUI and extensions
 
@@ -120,7 +120,7 @@ The exact Skill rules are in [Skills](protocols.md#skills); the user-visible per
 - Preserve mouse hit regions for selectable lists and command panels.
 - Preserve terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
 
-The active keys, interactions, and visible behavior are owned by [Terminal interface and sessions](interface.md), with `F1` and `:help` as the runtime reference.
+Conversation behavior is owned by [Terminal interface](interface.md); keymaps, the embedded PTY, selection, and attachments are in [Keymaps, terminal, and attachments](terminal.md). `F1` and `:help` remain the runtime reference.
 
 ### Models and configuration
 
@@ -185,38 +185,18 @@ For documentation-only changes, the full Rust suite is unnecessary unless code o
 - detailed `docs/` content stays English-only;
 - protocol behavior changes are also reflected in `<protocol>://help`.
 
-## Release process
-
-URI Agent and `uri-agent-plugin-sdk` share a Cargo version in the form `YYYY.MDD.REVISION`. The calendar date uses `Asia/Hong_Kong`: the month is not padded, the day is always two digits, and the revision starts at zero for the first release that day. For example, `2026.823.0` is the first release on 2026-08-23.
-
-Prepare a release on `main` with:
-
-```bash
-python3 scripts/set-version.py 2026.823.0
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo check
-```
-
-The manually dispatched `release.yml` workflow accepts only a version whose date matches the current date in `Asia/Hong_Kong`. It reruns verification, publishes the SDK before the application crate, builds Linux, macOS, and Windows archives, generates `SHA256SUMS`, updates the in-repository Homebrew formula and Scoop manifest, commits that metadata to `main`, creates the `v<version>` GitHub Release, and exercises all three installation paths. The workflow aborts if `main` moves while release jobs are running.
-
-Before the first release:
-
-1. make the repository public and create a protected GitHub environment named `release`;
-2. add a crates.io API token as the environment secret `CARGO_REGISTRY_TOKEN`, because crates.io requires a token for each crate's first publication;
-3. allow GitHub Actions to write repository contents and ensure the release job can push its package-metadata commit to `main`.
-
-After both crates have been published once, configure a crates.io trusted publisher for each crate with repository `4fuu/uri-agent`, workflow `release.yml`, and environment `release`. Then delete the `CARGO_REGISTRY_TOKEN` secret. Later releases use crates.io OIDC authentication automatically.
-
 ## Documentation ownership
 
 - Root READMEs own project fit, critical warnings, the shortest successful setup, and navigation.
-- [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, output, and Skill detail.
+- [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, and output detail.
+- [`docs/context.md`](context.md) owns project instructions, installed binary hints, Skill discovery and resources, and frozen startup context.
 - [`docs/plugins.md`](plugins.md) owns WASM installation, reload, ABI, trust boundaries, and runtime limits; [`sdk/README.md`](../sdk/README.md) owns Rust guest SDK usage.
 - [`docs/configuration.md`](configuration.md) owns models, authentication, files, precedence, CLI override semantics, and custom providers.
-- [`docs/interface.md`](interface.md) owns TUI behavior, commands, keymaps, terminal interaction, attachments, sessions, and compaction.
+- [`docs/interface.md`](interface.md) owns the conversation surface, composer, commands, and navigation.
+- [`docs/terminal.md`](terminal.md) owns keymaps, terminal interaction, selection, copying, and attachments.
+- [`docs/sessions.md`](sessions.md) owns persistence, project scoping, frozen session context, the model/tool loop, request retries, and compaction.
 - This document owns architecture, module boundaries, engineering invariants, change rules, and verification.
+- [`docs/release.md`](release.md) owns release versioning, preparation, automation, and first-release setup.
 - `uri-agent --help` owns the exact CLI contract.
 - `<protocol>://help` owns the exact model-facing contract for one protocol.
 - [`AGENTS.md`](../AGENTS.md) remains a concise agent entry point and links here instead of duplicating the complete manual.

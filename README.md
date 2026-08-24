@@ -133,7 +133,7 @@ exec("bash://?wait=30", "cargo test")  # Unix-like systems
 exec("pwsh://?wait=30", "cargo test")  # Windows
 ```
 
-URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. After `:login` saves a Parallel or Exa API key, the built-in `https` protocol uses that provider for search and page extraction. Without either web-provider login, search asks for login while page reads fall back to local HTTPS fetching and HTML-to-Markdown conversion. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, output, and Skills](docs/protocols.md) for the shared design.
+URI Agent selects a protocol at the first `://`; that protocol owns the remaining target and optional JSON body. After `:login` saves a Parallel or Exa API key, the built-in `https` protocol uses that provider for search and page extraction. Without either web-provider login, search asks for login while page reads fall back to local HTTPS fetching and HTML-to-Markdown conversion. `uri-agent-docs` keeps version-matched documentation available from any startup working directory. Available shell protocols depend on the platform. Read `<protocol>://help` for the exact runtime contract, or see [Protocols, tasks, and output](docs/protocols.md) for the shared design.
 
 ## Extensions
 
@@ -141,13 +141,7 @@ Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI 
 
 ## Documentation
 
-The [`docs/` index](docs/README.md) organizes detailed documentation by task:
-
-- [Protocols, tasks, output, and Skills](docs/protocols.md) — model-facing routing, built-ins, execution semantics, managed tasks, output preservation, and Skill discovery.
-- [WASM plugins](docs/plugins.md) — installation, reload, trust boundaries, ABI, SDK, and runtime limits.
-- [Models and configuration](docs/configuration.md) — catalog behavior, authentication, settings precedence, CLI flags, thinking levels, and custom providers.
-- [Terminal interface and sessions](docs/interface.md) — composer and commands, keymaps, embedded terminal, image attachments, persistence, resume, and compaction.
-- [Architecture and development](docs/development.md) — module ownership, non-negotiable invariants, change rules, and verification.
+The [`docs/` index](docs/README.md) routes readers to focused guides for protocols, startup context and Skills, WASM plugins, models and configuration, the terminal interface, sessions and compaction, development, and releases.
 
 At runtime, `<protocol>://help` is the authoritative reference for a protocol's accepted URIs and body shape.
 

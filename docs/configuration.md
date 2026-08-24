@@ -107,7 +107,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 | `<project>/.uri-agent/settings.json` | Optional project settings |
 | `<project>/.uri-agent/keymap.rhai` | Optional project keymap overrides |
 
-Sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Terminal interface and sessions](interface.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
+Sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Session storage and project boundaries](sessions.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
 
 The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings field. See [WASM plugins](plugins.md) for loading, installation, and reload behavior.
 
@@ -192,7 +192,7 @@ The active model determines which levels are available. Run `:effort` to open a 
 
 Command-line flags can override the provider, model, process-only API key, project working directory, thinking effort, inline output limit, and offline catalog behavior. They can also resume the latest project session or a project-scoped session ID. Run `uri-agent --help` for the exact names, accepted values, and current syntax.
 
-`--continue-session` and `--session` conflict. Session selection remains scoped to the canonical `--cwd`; see [Sessions and context](interface.md#sessions-and-context).
+`--continue-session` and `--session` conflict. Session selection remains scoped to the canonical `--cwd`; see [Sessions and context](sessions.md).
 
 ## Custom providers and model overrides
 

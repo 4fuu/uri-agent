@@ -19,11 +19,15 @@ Before changing code, read the applicable repository map, change rules, and veri
 
 | Area | Authoritative detail |
 | --- | --- |
-| Protocol routing, built-ins, tasks, output, Skills | [`docs/protocols.md`](docs/protocols.md) |
+| Protocol routing, built-ins, tasks, output | [`docs/protocols.md`](docs/protocols.md) |
+| Project instructions, binary hints, Skills, frozen startup context | [`docs/context.md`](docs/context.md) |
 | WASM installation, reload, ABI, permissions, SDK | [`docs/plugins.md`](docs/plugins.md) |
 | Models, authentication, configuration, CLI overrides, custom providers | [`docs/configuration.md`](docs/configuration.md) |
-| TUI, commands, keymaps, terminal, attachments, sessions, compaction | [`docs/interface.md`](docs/interface.md) |
+| Conversation UI, composer, commands, navigation | [`docs/interface.md`](docs/interface.md) |
+| Keymaps, embedded terminal, selection, attachments | [`docs/terminal.md`](docs/terminal.md) |
+| Session persistence, scoping, model/tool loop, retries, compaction | [`docs/sessions.md`](docs/sessions.md) |
 | Module ownership, linked Rust extensions, invariants, change rules, verification | [`docs/development.md`](docs/development.md) |
+| Versioning and release workflow | [`docs/release.md`](docs/release.md) |
 | Documentation ownership or an unclear destination | [`docs/README.md`](docs/README.md) |
 
 Read all applicable documents for a cross-domain change; unrelated documents are not required. `uri-agent --help` defines the exact CLI contract, while `<protocol>://help` defines a protocol's exact model-facing contract. If implementation, tests, help, or documentation disagree, make them consistent.

@@ -1,0 +1,86 @@
+# Sessions and context
+
+URI Agent stores conversations as append-only sessions and preserves the exact startup context used by the model. This document covers persistence, project scoping, the model/tool loop, retries, and context compaction.
+
+## Session storage and project boundaries
+
+Sessions are stored in SQLite at:
+
+```text
+<platform-data-dir>/uri-agent/sessions.db
+```
+
+If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions.db`.
+
+A new session remains in memory until its first user message is accepted. URI Agent then writes the frozen context, queued startup events, and message in one transaction, so opening and closing an empty session creates no session record.
+
+The canonical startup directory is the project boundary recorded with every session:
+
+- a normal launch starts a new session;
+- `--continue-session` and `--session latest` select the latest session for the project;
+- `--session <id>` resumes that ID only when it belongs to the project;
+- `:resume` lists project sessions with their model and thinking effort.
+
+The read-only `sessions` protocol can search archives across projects when explicitly requested. `@@` completion remains project-scoped. Archive reads never resume or modify a session; see [`sessions`](protocols.md#sessions).
+
+Each session records its provider, model, and thinking effort. Changes append a settings event, and resume restores the latest session settings rather than defaults for a new session.
+
+URI Agent saves the composer draft when the TUI exits or switches sessions. Before the first message, it stores the draft separately by project to avoid creating an empty session. Switching sessions leaves an active turn and undelivered messages attached to the original session. On process exit, URI Agent cancels and joins active turns after their interruption records are durable, then restores messages not yet taken for delivery to the corresponding draft.
+
+## Frozen startup context
+
+A new session stores a `SessionContext` event containing the complete generated system prompt and selected Skill snapshots. Resume reuses it instead of regenerating the prompt or rebinding Skills from the current filesystem. See [Startup context and Skills](context.md) for the inputs and Skill rules.
+
+## Append-only events
+
+User and model messages, model settings, tool calls and results, usage, notices, errors, task notices, turn boundaries, and compaction checkpoints are appended as events. Normal operation and compaction do not rewrite or delete earlier events.
+
+The transcript and model-replay forms of one message commit in the same SQLite transaction. Streaming text and reasoning are provisional TUI updates; only the completed response enters durable replay. Provider tool-call identity is preserved so resumed tool conversations remain valid for the selected backend.
+
+## Model request retries
+
+URI Agent retries transient failures for normal model calls and context-summary calls. Each failure class has an independent counter within one logical call; success or a new model round resets all counters. Counts below are additional attempts after the initial request:
+
+| Failure | Retries | Fallback backoff before jitter |
+| --- | ---: | --- |
+| Rate limit (`429`) | 6 | 1s exponential, capped at 30s |
+| Network or stream transport failure | 5 | 500ms exponential, capped at 8s |
+| Server failure (`5xx`) | 5 | 1s exponential, capped at 15s |
+| Timeout or `408` | 4 | 1s exponential, capped at 10s |
+| Request conflict (`409`) | 4 | 500ms exponential, capped at 8s |
+| Empty completed response | 4 | 1s exponential, capped at 8s |
+
+Fallback delays add up to 25% jitter. `Retry-After` or `retry-after-ms` takes precedence, capped at 60 seconds. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
+
+Because the counters are independent, alternating failure classes can consume up to 28 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time limit.
+
+Each retry becomes a visible session event with its reason, delay, and count. Provisional output from a failed stream is cleared before retry and never enters model replay. Double `Esc` interrupts an active request or retry delay.
+
+## Model and tool loop
+
+A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
+
+URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different call, no call, or multiple calls resets the sequence. Repeated reads of a managed-task status URI are exempt because polling the same route is expected.
+
+## Context compaction
+
+URI Agent measures replay against the selected model's context window. The latest valid ordinary API response supplies authoritative usage; later messages are estimated until another response arrives. Before the first response, the estimate includes the frozen prompt, tool definitions, messages, and images. It counts four ASCII characters or one non-ASCII character per token and assigns 1,200 tokens to each image regardless of payload size. A compaction invalidates the previous usage baseline until the next response.
+
+Before each provider request, URI Agent caps the catalog output limit to estimated context room after a fixed 4,096-token safety margin, with a minimum request of one output token. This cap is separate from the configurable compaction reserve.
+
+Automatic compaction runs after an agent run and before the next prompt, with a final request-time check. At the configured threshold, URI Agent asks the model to summarize older history and appends a checkpoint. Replay then contains:
+
+```text
+frozen system prompt
++ checkpoint summary of older history
++ recent history retained at a valid message boundary
++ events after the checkpoint
+```
+
+Summary generation uses a dedicated prompt without registered tools and treats conversation content as untrusted data. Each tool result contributes at most a 2,000-character head-and-tail preview; an earlier checkpoint receives at most one quarter of the input token budget; and total input is bounded against the remaining context, prioritizing the newest complete messages when necessary. Output is capped at 80% of the configured reserve. The session's frozen system prompt remains unchanged.
+
+Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the budget, it may summarize the older prefix while keeping a suffix that never starts with a tool result. Original events remain in SQLite.
+
+Provider overflow errors, responses reporting input beyond the context window, and recoverable `length` stops can trigger one forced compaction-and-retry for the current turn. A `length` stop is recoverable when reported output is below the catalog output limit, or when output usage is unavailable and reported input has reached 99% of the context window. A usable response is preserved before compaction; failed or truncated output does not enter replay. This recovery has a separate retry budget and cannot loop indefinitely.
+
+Run `:compact` to request a checkpoint manually; it fails when too little completed history is available. Automatic compaction and its reserve and retained-history budgets are configured in [`settings.json`](configuration.md#settings-fields-and-precedence).
