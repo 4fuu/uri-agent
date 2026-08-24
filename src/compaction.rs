@@ -125,7 +125,14 @@ pub fn context_usage(
 }
 
 fn text_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
+    let (ascii, non_ascii) = text.chars().fold((0usize, 0usize), |counts, character| {
+        if character.is_ascii() {
+            (counts.0 + 1, counts.1)
+        } else {
+            (counts.0, counts.1 + 1)
+        }
+    });
+    ascii.div_ceil(4).saturating_add(non_ascii)
 }
 
 fn estimate_message_tokens(message: &Message) -> usize {
@@ -290,14 +297,18 @@ fn prepare_with_options(
 pub fn summary_history(
     preparation: &CompactionPreparation,
     previous_summary: Option<&str>,
-    max_input_chars: usize,
+    max_input_tokens: usize,
 ) -> Vec<Message> {
     let previous = previous_summary
         .filter(|summary| !summary.trim().is_empty())
         .map(|summary| {
             format!(
                 "<previous-checkpoint>\n{}\n</previous-checkpoint>",
-                truncate_chars(summary, max_input_chars / 4)
+                truncate_middle_tokens(
+                    summary,
+                    max_input_tokens / 4,
+                    "middle of previous checkpoint omitted",
+                )
             )
         })
         .unwrap_or_else(|| "<previous-checkpoint>none</previous-checkpoint>".to_string());
@@ -306,14 +317,15 @@ pub fn summary_history(
         .iter()
         .filter(|message| !is_compaction_handoff(message))
         .map(serialize_message)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let fixed_chars = previous
-        .chars()
-        .count()
-        .saturating_add(SUMMARY_REQUEST.chars().count())
-        .saturating_add(64);
-    let conversation = truncate_chars(&conversation, max_input_chars.saturating_sub(fixed_chars));
+        .collect::<Vec<_>>();
+    let fixed_tokens = estimate_tokens(
+        "",
+        &[Message::user(format!(
+            "{previous}\n\n<conversation>\n\n</conversation>\n\n{SUMMARY_REQUEST}"
+        ))],
+    );
+    let conversation =
+        bounded_recent_messages(&conversation, max_input_tokens.saturating_sub(fixed_tokens));
     vec![Message::user(format!(
         "{previous}\n\n<conversation>\n{conversation}\n</conversation>\n\n{SUMMARY_REQUEST}"
     ))]
@@ -402,7 +414,11 @@ fn serialize_user_content(content: &UserContent) -> String {
             format!(
                 "[tool result: {}]\n{}",
                 result.name,
-                truncate_chars(&output, MAX_SUMMARY_TOOL_RESULT_CHARS)
+                truncate_middle(
+                    &output,
+                    MAX_SUMMARY_TOOL_RESULT_CHARS,
+                    "middle of tool result omitted",
+                )
             )
         }
         other => serde_json::to_string(other).unwrap_or_else(|_| "[media]".to_string()),
@@ -428,13 +444,113 @@ fn serialize_assistant_content(content: &AssistantContent) -> String {
     }
 }
 
-fn truncate_chars(text: &str, limit: usize) -> String {
+fn truncate_middle(text: &str, limit: usize, label: &str) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
-    let mut truncated = text.chars().take(limit).collect::<String>();
-    truncated.push_str("\n… [tool result truncated for checkpoint]");
-    truncated
+    let marker = format!("\n… [{label} for checkpoint]\n");
+    let marker_chars = marker.chars().count();
+    if limit <= marker_chars {
+        return marker.chars().take(limit).collect();
+    }
+    let content_chars = limit - marker_chars;
+    let head_chars = content_chars.div_ceil(2);
+    let tail_chars = content_chars / 2;
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
+}
+
+fn truncate_middle_tokens(text: &str, limit: usize, label: &str) -> String {
+    if text_tokens(text) <= limit {
+        return text.to_string();
+    }
+    let marker = format!("\n… [{label} for checkpoint]\n");
+    let marker_tokens = text_tokens(&marker);
+    if limit <= marker_tokens {
+        return take_suffix_tokens(text, limit);
+    }
+    let content_tokens = limit - marker_tokens;
+    let head = take_prefix_tokens(text, content_tokens.div_ceil(2));
+    let tail = take_suffix_tokens(text, content_tokens / 2);
+    format!("{head}{marker}{tail}")
+}
+
+fn take_prefix_tokens(text: &str, limit: usize) -> String {
+    take_tokens(text.chars(), limit)
+}
+
+fn take_suffix_tokens(text: &str, limit: usize) -> String {
+    take_tokens(text.chars().rev(), limit)
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn take_tokens(characters: impl Iterator<Item = char>, limit: usize) -> String {
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    let mut output = String::new();
+    for character in characters {
+        let next_ascii = ascii + usize::from(character.is_ascii());
+        let next_non_ascii = non_ascii + usize::from(!character.is_ascii());
+        if next_ascii.div_ceil(4).saturating_add(next_non_ascii) > limit {
+            break;
+        }
+        ascii = next_ascii;
+        non_ascii = next_non_ascii;
+        output.push(character);
+    }
+    output
+}
+
+fn bounded_recent_messages(messages: &[String], limit: usize) -> String {
+    let complete = messages.join("\n\n");
+    if text_tokens(&complete) <= limit {
+        return complete;
+    }
+    let marker = "… [older conversation omitted for checkpoint]\n\n";
+    let marker_tokens = text_tokens(marker);
+    let Some(newest) = messages.last() else {
+        return String::new();
+    };
+    if limit <= marker_tokens {
+        return take_suffix_tokens(newest, limit);
+    }
+
+    let budget = limit - marker_tokens;
+    let mut used = 0usize;
+    let mut retained = Vec::new();
+    for message in messages.iter().rev() {
+        let separator = usize::from(!retained.is_empty()) * text_tokens("\n\n");
+        let message_tokens = text_tokens(message);
+        if used
+            .saturating_add(separator)
+            .saturating_add(message_tokens)
+            <= budget
+        {
+            used += separator + message_tokens;
+            retained.push(message.clone());
+            continue;
+        }
+        if retained.is_empty() {
+            retained.push(truncate_middle_tokens(
+                message,
+                budget,
+                "middle of newest message omitted",
+            ));
+        }
+        break;
+    }
+    retained.reverse();
+    format!("{marker}{}", retained.join("\n\n"))
 }
 
 #[cfg(test)]
@@ -450,6 +566,13 @@ mod tests {
             estimate_request_tokens("system", &history, &crate::model::tool_definitions());
 
         assert!(with_tools > without_tools);
+    }
+
+    #[test]
+    fn non_ascii_text_is_not_estimated_as_four_characters_per_token() {
+        assert_eq!(text_tokens("abcdefgh"), 2);
+        assert_eq!(text_tokens("上下文机制"), 5);
+        assert_eq!(text_tokens("abcd上下文"), 4);
     }
 
     #[test]
@@ -515,8 +638,50 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert!(serialized.contains("<previous-checkpoint>"));
         assert!(serialized.contains("<conversation>"));
-        assert!(serialized.contains("tool result truncated"));
+        assert!(serialized.contains("middle of tool result omitted"));
         assert!(serialized.chars().count() < 3_500);
+        assert!(estimate_tokens("", &history) <= 3_000);
+    }
+
+    #[test]
+    fn bounded_summary_input_keeps_the_newest_complete_messages() {
+        let preparation = CompactionPreparation {
+            summarizable: vec![
+                Message::user(format!("OLDEST-OBSOLETE {}", "x".repeat(2_000))),
+                Message::assistant("NEWEST-DECISION must survive"),
+            ],
+            retained: vec![Message::user("current turn")],
+            tokens_before: 10_000,
+        };
+
+        let history = summary_history(&preparation, None, 180);
+        let serialized = serde_json::to_string(&history[0]).unwrap();
+
+        assert!(serialized.contains("older conversation omitted"));
+        assert!(serialized.contains("NEWEST-DECISION must survive"));
+        assert!(!serialized.contains("OLDEST-OBSOLETE"));
+        assert!(estimate_tokens("", &history) <= 180);
+    }
+
+    #[test]
+    fn checkpoint_tool_result_preview_keeps_both_ends() {
+        let call_id = ToolCallId::new("call-preview").unwrap();
+        let content = UserContent::tool_result_for(
+            call_id,
+            None,
+            "exec".to_string(),
+            vec![ToolResultContent::text(format!(
+                "BEGIN-SETUP\n{}\nEND-ACTIONABLE-ERROR",
+                "middle\n".repeat(1_000)
+            ))],
+        );
+
+        let serialized = serialize_user_content(&content);
+
+        assert!(serialized.contains("BEGIN-SETUP"));
+        assert!(serialized.contains("middle of tool result omitted"));
+        assert!(serialized.contains("END-ACTIONABLE-ERROR"));
+        assert!(serialized.chars().count() <= MAX_SUMMARY_TOOL_RESULT_CHARS + 32);
     }
 
     #[test]

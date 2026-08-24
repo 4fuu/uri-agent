@@ -23,7 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
-const MAX_TOOL_ROUNDS: usize = 32;
+const TOOL_CALL_LOOP_THRESHOLD: usize = 5;
+const TOOL_CALL_ARGUMENT_SUMMARY_CHARS: usize = 400;
+const TOOL_CALL_RESULT_SUMMARY_CHARS: usize = 200;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
 const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
@@ -45,6 +47,60 @@ struct ModelRetryPolicy {
     base_delay: Duration,
     max_delay: Duration,
     reason: &'static str,
+}
+
+#[derive(Default)]
+struct ToolCallLoopGuard {
+    last_signature: Option<String>,
+    count: usize,
+}
+
+impl ToolCallLoopGuard {
+    fn record_turn(&mut self, calls: &[ToolCall], result: Option<&str>) -> Option<String> {
+        let [call] = calls else {
+            self.reset();
+            return None;
+        };
+        if is_loop_guard_exempt(call) {
+            self.reset();
+            return None;
+        }
+
+        let arguments = serde_json::to_string(&canonical_json(&call.function.arguments))
+            .unwrap_or_else(|_| call.function.arguments.to_string());
+        let signature = format!("{}:{arguments}", call.function.name);
+        if self.last_signature.as_deref() == Some(&signature) {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.last_signature = Some(signature);
+            self.count = 1;
+        }
+        if self.count != TOOL_CALL_LOOP_THRESHOLD {
+            return None;
+        }
+
+        let arguments = summarize_text(&arguments, TOOL_CALL_ARGUMENT_SUMMARY_CHARS);
+        let result = summarize_text(result.unwrap_or_default(), TOOL_CALL_RESULT_SUMMARY_CHARS);
+        let result = if result.is_empty() {
+            "(no text result)"
+        } else {
+            &result
+        };
+        Some(format!(
+            "<system-interrupt reason=\"tool_call_loop_detected\">\n\
+             You called `{}` {} consecutive times with identical arguments:\n\
+             `{arguments}`\n\n\
+             Last result (truncated): `{result}`\n\n\
+             NEVER call `{}` with those arguments again this turn. Use different arguments, choose another tool, or summarize findings and yield if complete.\n\
+             </system-interrupt>",
+            call.function.name, self.count, call.function.name
+        ))
+    }
+
+    fn reset(&mut self) {
+        self.last_signature = None;
+        self.count = 0;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -652,11 +708,12 @@ impl AgentRuntime {
         let mut overflow_retried = false;
         let mut has_model_response = false;
         let mut guidance_ready = false;
+        let mut loop_guard = ToolCallLoopGuard::default();
         if take_initial_guidance && let Some((index, guidance)) = self.take_guidance().await {
             self.append_pending_input(index, guidance, false).await?;
             guidance_ready = true;
         }
-        for _ in 0..MAX_TOOL_ROUNDS {
+        loop {
             self.compact_with(backend.as_ref(), false, false, cancel)
                 .await?;
             if !guidance_ready && let Some((index, guidance)) = self.take_guidance().await {
@@ -742,19 +799,28 @@ impl AgentRuntime {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            for call in tool_calls {
-                self.execute_tool(call, cancel).await?;
+            let mut sole_result = None;
+            for call in tool_calls.iter().cloned() {
+                let result = self.execute_tool(call, cancel).await?;
+                if tool_calls.len() == 1 {
+                    sole_result = Some(result);
+                }
+            }
+            if let Some(redirect) = loop_guard.record_turn(&tool_calls, sole_result.as_deref()) {
+                self.session
+                    .append(EventKind::ModelMessage {
+                        message: Message::user(redirect),
+                    })
+                    .await
+                    .context("cannot persist tool-call loop redirect")?;
+                self.refresh_context_estimate().await;
             }
             if let Some((index, guidance)) = self.take_guidance().await {
                 self.append_pending_input(index, guidance, true).await?;
                 guidance_ready = true;
                 continue;
             }
-            if response
-                .content
-                .iter()
-                .all(|content| !matches!(content, AssistantContent::ToolCall(_)))
-            {
+            if tool_calls.is_empty() {
                 let compaction = self
                     .compact_with(backend.as_ref(), force_post_compaction, false, cancel)
                     .await;
@@ -768,7 +834,6 @@ impl AgentRuntime {
                 return Ok(());
             }
         }
-        bail!("model exceeded {MAX_TOOL_ROUNDS} consecutive tool rounds")
     }
 
     async fn compact_with(
@@ -810,12 +875,14 @@ impl AgentRuntime {
         preparation.tokens_before = self.context_usage().tokens;
         let previous_summary = self.session.latest_compaction_summary().await;
         let summary_output_tokens = settings.summary_output_tokens(context_window).max(1);
+        let summary_system_tokens =
+            compaction::estimate_tokens(compaction::SUMMARY_SYSTEM_PROMPT, &[]);
         let summary_history = compaction::summary_history(
             &preparation,
             previous_summary.as_deref(),
             context_window
                 .saturating_sub(summary_output_tokens)
-                .saturating_mul(4),
+                .saturating_sub(summary_system_tokens),
         );
         let request = ModelRequest {
             system: compaction::SUMMARY_SYSTEM_PROMPT.to_string(),
@@ -1033,7 +1100,7 @@ impl AgentRuntime {
         &self,
         call: ToolCall,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let name = call.function.name.clone();
         let call_id = call.id.to_string();
         let dispatch = self.dispatch(&name, &call.function.arguments);
@@ -1064,7 +1131,7 @@ impl AgentRuntime {
                 EventKind::ToolResult {
                     call_id,
                     name: name.clone(),
-                    output,
+                    output: output.clone(),
                     failed,
                 },
                 EventKind::ModelMessage {
@@ -1076,7 +1143,7 @@ impl AgentRuntime {
             .await
             .context("cannot persist tool result boundary")?;
         self.refresh_context_estimate().await;
-        Ok(())
+        Ok(output)
     }
 
     async fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
@@ -1115,6 +1182,43 @@ impl AgentRuntime {
             })
             .collect()
     }
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut keys = fields.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonical_json(&fields[key])))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn is_loop_guard_exempt(call: &ToolCall) -> bool {
+    call.function.name == "read"
+        && call
+            .function
+            .arguments
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(|uri| uri.split_once("://"))
+            .is_some_and(|(_, route)| route.starts_with("tasks/"))
+}
+
+fn summarize_text(text: &str, limit: usize) -> String {
+    let summary = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.chars().count() <= limit {
+        return summary;
+    }
+    let mut summary = summary.chars().take(limit).collect::<String>();
+    summary.push('…');
+    summary
 }
 
 fn is_context_overflow(error: &anyhow::Error) -> bool {
@@ -1580,6 +1684,13 @@ mod tests {
         })
     }
 
+    fn read_call(id: &str, uri: &str) -> ToolCall {
+        ToolCall::new(
+            ToolCallId::new(id).unwrap(),
+            ToolFunction::new("read".to_string(), serde_json::json!({"uri": uri})),
+        )
+    }
+
     async fn wait_for_turn(runtime: &AgentRuntime) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while runtime.turn_running().await {
@@ -1588,6 +1699,160 @@ mod tests {
         })
         .await
         .expect("turn should settle");
+    }
+
+    #[test]
+    fn tool_call_loop_guard_resets_on_different_or_exempt_calls() {
+        let mut guard = ToolCallLoopGuard::default();
+        for index in 0..4 {
+            let call = read_call(&format!("same-{index}"), "file://same");
+            assert!(
+                guard
+                    .record_turn(std::slice::from_ref(&call), Some("same result"))
+                    .is_none()
+            );
+        }
+
+        let different = read_call("different", "file://different");
+        assert!(
+            guard
+                .record_turn(std::slice::from_ref(&different), Some("different result"))
+                .is_none()
+        );
+        for index in 0..4 {
+            let call = read_call(&format!("again-{index}"), "file://same");
+            assert!(
+                guard
+                    .record_turn(std::slice::from_ref(&call), Some("same result"))
+                    .is_none()
+            );
+        }
+        let fifth = read_call("again-4", "file://same");
+        assert!(
+            guard
+                .record_turn(std::slice::from_ref(&fifth), Some("same result"))
+                .unwrap()
+                .contains("tool_call_loop_detected")
+        );
+
+        for index in 0..6 {
+            let task = read_call(&format!("task-{index}"), "bash://tasks/001");
+            assert!(
+                guard
+                    .record_turn(std::slice::from_ref(&task), Some("running"))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_loop_guard_canonicalizes_nested_argument_key_order() {
+        let mut guard = ToolCallLoopGuard::default();
+        for index in 0..5 {
+            let arguments = if index % 2 == 0 {
+                serde_json::from_str(r#"{"uri":"file://same","body":{"b":2,"a":1}}"#)
+            } else {
+                serde_json::from_str(r#"{"body":{"a":1,"b":2},"uri":"file://same"}"#)
+            }
+            .unwrap();
+            let call = ToolCall::new(
+                ToolCallId::new(format!("ordered-{index}")).unwrap(),
+                ToolFunction::new("read".to_string(), arguments),
+            );
+            let redirect = guard.record_turn(std::slice::from_ref(&call), Some("same result"));
+            assert_eq!(redirect.is_some(), index == 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_continues_past_the_previous_fixed_round_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut responses = (0..33)
+            .map(|index| tool_call_response(&format!("call-{index}")))
+            .collect::<VecDeque<_>>();
+        responses.push_back(text_response("finished after 33 tool rounds"));
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime
+            .set_compaction_settings(compaction::Settings {
+                enabled: false,
+                ..compaction::Settings::default()
+            })
+            .await;
+
+        runtime.run_turn("keep working".into()).await.unwrap();
+
+        assert_eq!(backend.requests.lock().await.len(), 34);
+        assert!(session.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::AssistantText { text } if text == "finished after 33 tool rounds"
+        )));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn fifth_identical_tool_call_persists_a_hidden_redirect_for_replay() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut responses = (0..5)
+            .map(|index| tool_call_response(&format!("call-{index}")))
+            .collect::<VecDeque<_>>();
+        responses.push_back(text_response("stopped repeating"));
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime
+            .set_compaction_settings(compaction::Settings {
+                enabled: false,
+                ..compaction::Settings::default()
+            })
+            .await;
+        let session_id = session.id().to_string();
+
+        runtime.run_turn("inspect".into()).await.unwrap();
+
+        let requests = backend.requests.lock().await;
+        assert_eq!(requests.len(), 6);
+        assert!(requests[5].history.iter().any(|message| {
+            serde_json::to_string(message)
+                .unwrap()
+                .contains("tool_call_loop_detected")
+        }));
+        drop(requests);
+        assert!(!session.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::User { text } if text.contains("tool_call_loop_detected")
+        )));
+
+        drop(runtime);
+        drop(session);
+        let reopened = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(reopened.model_history().await.iter().any(|message| {
+            serde_json::to_string(message)
+                .unwrap()
+                .contains("tool_call_loop_detected")
+        }));
+        drop(reopened);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[tokio::test]

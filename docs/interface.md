@@ -214,11 +214,21 @@ URI Agent retries transient failures for both normal model calls and context-sum
 
 Fallback delays include up to 25% jitter. When a retryable response supplies `Retry-After` or `retry-after-ms`, that delay takes precedence and is capped at 60 seconds. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
 
+Because the counters are independent, alternating failure classes can consume up to 28 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time ceiling.
+
 Each retry is recorded as a visible session event containing its reason, delay, and retry count. Provisional text and reasoning from the failed stream are cleared before the next attempt and never enter model replay. Double `Esc` interrupts either an active request or its retry delay.
+
+### Model and tool loop
+
+A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
+
+URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect is part of persisted model replay but is not displayed as user input and does not terminate the turn. A different call, no call, or multiple calls resets the sequence. Repeated reads of a managed-task status URI are exempt because polling the same route is expected.
 
 ### Context compaction
 
-URI Agent measures replay size against the selected model's context window. The most recent valid ordinary API response is authoritative; messages after that response are estimated until the next response. A full estimate is used before the first response and includes the frozen system prompt, registered tool definitions, message content, and bounded image costs. A compaction invalidates usage from the earlier replay, so context remains unknown until the next ordinary API response.
+URI Agent measures replay size against the selected model's context window. The most recent valid ordinary API response is authoritative; messages after that response are estimated until the next response. A full estimate is used before the first response and includes the frozen system prompt, registered tool definitions, message content, and bounded image costs. The coarse estimate counts four ASCII characters or one non-ASCII character per token and assigns 1,200 tokens to each image regardless of its encoded payload size. A compaction invalidates usage from the earlier replay, so context remains unknown until the next ordinary API response.
+
+Before each provider request, the catalog output limit is capped to the estimated context room after a fixed 4,096-token safety margin, with a minimum request of one output token. This request cap is separate from the configurable compaction reserve.
 
 Automatic compaction is checked after an agent run and before accepting the next prompt, with a final request-time check as a fallback. When the configured threshold is crossed, URI Agent asks the model for a durable summary of older history and appends a compaction checkpoint. Replay then uses:
 
@@ -229,10 +239,10 @@ frozen system prompt
 + events after the checkpoint
 ```
 
-Summary generation uses a dedicated compaction system prompt and does not expose registered tools. Conversation messages are serialized as untrusted data, large tool results and total summary input are bounded, and an earlier checkpoint is supplied explicitly for updating. Summary output is capped at 80% of the configured reserve. Normal execution resumes with the session's frozen system prompt unchanged.
+Summary generation uses a dedicated compaction system prompt and does not expose registered tools. Conversation messages are serialized as untrusted data. Each tool result contributes at most a 2,000-character head-and-tail preview, an earlier checkpoint receives at most one quarter of the summary input token budget, and the total input is bounded against the remaining context. If that input is still too large, the newest complete messages take priority over the older prefix. Summary output is capped at 80% of the configured reserve. Normal execution resumes with the session's frozen system prompt unchanged.
 
 Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the retention budget, URI Agent may summarize its older prefix and retain its recent suffix. A retained suffix never starts with a tool result, so a tool call is not separated from its result. Original events remain available in SQLite even when model replay uses the checkpoint.
 
-Explicit provider errors, successful responses whose reported input exceeds the context window, and recoverable `length` stops participate in overflow handling. A usable successful response is preserved and followed by compaction. A failed or truncated response can make one forced compaction-and-retry attempt for that user turn and does not enter replay before that retry. This recovery has its own budget: it neither consumes nor resets transient-failure counters. A second overflow settles without retrying indefinitely.
+Explicit provider errors, successful responses whose reported input exceeds the context window, and recoverable `length` stops participate in overflow handling. A `length` stop is considered recoverable when reported output is below the catalog output limit, or when output usage is unavailable and reported input has reached 99% of the context window. A usable successful response is preserved and followed by compaction. A failed or truncated response can make one forced compaction-and-retry attempt for that user turn and does not enter replay before that retry. This recovery has its own budget: it neither consumes nor resets transient-failure counters. A second overflow settles without retrying indefinitely.
 
 Run `:compact` to request an earlier checkpoint at any context usage. The command fails clearly when there is not enough completed history to summarize. Automatic compaction can be disabled and its reserve and retained-history budgets changed through `settings.json`; see [Settings fields and precedence](configuration.md#settings-fields-and-precedence).
