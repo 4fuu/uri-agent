@@ -11,7 +11,7 @@ Configure a `cdylib` guest that depends on the SDK:
 crate-type = ["cdylib"]
 
 [dependencies]
-uri-agent-plugin-sdk = "2026.824.1"
+uri-agent-plugin-sdk = "2026.824.2"
 ```
 
 Define a manifest and handler, then use `define_plugin!` to generate `uri_agent_manifest` and `uri_agent_handle`:
