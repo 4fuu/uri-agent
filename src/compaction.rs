@@ -157,14 +157,6 @@ fn estimate_json_tokens(value: &Value) -> usize {
     }
 }
 
-pub fn should_compact(system_prompt: &str, history: &[Message], context_window: usize) -> bool {
-    should_compact_usage(
-        estimate_tokens(system_prompt, history),
-        context_window,
-        Settings::default(),
-    )
-}
-
 pub fn should_compact_usage(
     context_tokens: usize,
     context_window: usize,

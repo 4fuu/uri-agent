@@ -328,10 +328,6 @@ impl AgentRuntime {
         }
     }
 
-    pub async fn has_backend(&self) -> bool {
-        self.backend.read().await.is_some()
-    }
-
     pub async fn turn_running(&self) -> bool {
         self.active_turn
             .lock()

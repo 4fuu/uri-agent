@@ -74,14 +74,7 @@ impl ProtocolRegistry {
     }
 
     pub fn register(&mut self, protocol: impl Protocol + 'static) -> Result<()> {
-        self.register_arc(Arc::new(protocol))
-    }
-
-    pub fn register_boxed(&mut self, protocol: Box<dyn Protocol>) -> Result<()> {
-        self.register_arc(Arc::from(protocol))
-    }
-
-    fn register_arc(&mut self, protocol: Arc<dyn Protocol>) -> Result<()> {
+        let protocol: Arc<dyn Protocol> = Arc::new(protocol);
         let descriptor = protocol.descriptor();
         validate_descriptor(&descriptor)?;
         if self.protocols.contains_key(&descriptor.name) {

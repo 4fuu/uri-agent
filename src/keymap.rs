@@ -463,15 +463,6 @@ impl Keymap {
             .filter(|hint| !hint.is_empty())
     }
 
-    pub fn bindings_for(&self, mode: &str) -> Vec<(String, String)> {
-        let bindings = self.bindings.lock().unwrap();
-        bindings
-            .iter()
-            .filter(|((binding_mode, _), _)| binding_mode == mode)
-            .map(|((_, key), action)| (key.canonical(), action.clone()))
-            .collect()
-    }
-
     pub fn display_bindings_for(&self, mode: &str) -> Vec<(String, String)> {
         let bindings = self.bindings.lock().unwrap();
         let mut bindings = bindings

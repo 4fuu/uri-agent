@@ -26,7 +26,7 @@ URI Agent downloads provider and model records from pi.dev and merges them with 
 
 URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol). It is not part of the pi.dev coverage count.
 
-The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. In the pi.dev catalog checked on 2026-08-24, the five public families above contain 1,107 of 1,307 model entries (84.7%) across 35 of 39 provider IDs. This measures catalog entries, not account entitlement: availability still depends on the selected provider, credentials, region, and subscription, and later catalog revisions will change the counts.
+The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
 
 `openai-codex-responses` targets the ChatGPT Codex subscription endpoint and uses WebSocket streaming by default. URI Agent supplies the account ID from the OAuth access token, stable session headers and prompt cache key, and the Codex Responses request fields required for reasoning and tool calls. Within a session it reuses an idle connection, retains it for up to five idle minutes or 55 minutes total, and—when request options and history still match—continues from `previous_response_id` while sending only newly appended input. A busy connection is never shared between concurrent requests.
 

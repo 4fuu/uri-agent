@@ -118,10 +118,6 @@ impl SkillProtocol {
     pub fn protocol_name(&self) -> &str {
         &self.protocol
     }
-
-    pub fn display_name(&self) -> &str {
-        &self.snapshot.name
-    }
 }
 
 #[async_trait]
