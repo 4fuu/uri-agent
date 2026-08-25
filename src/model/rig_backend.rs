@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{OnceCell, mpsc};
+use tokio::sync::{Mutex, mpsc};
 
 pub(super) fn has_usable_assistant_content(content: &[AssistantContent]) -> bool {
     content.iter().any(|content| match content {
@@ -145,32 +145,36 @@ struct DeferredRigBackend {
     settings: ActiveSettings,
     session_id: Option<String>,
     manager: Arc<ConfigManager>,
-    backend: OnceCell<Arc<RigBackend>>,
+    backend: Mutex<Option<(String, Arc<RigBackend>)>>,
 }
 
 impl DeferredRigBackend {
-    async fn backend(&self) -> Result<&Arc<RigBackend>> {
-        self.backend
-            .get_or_try_init(|| async {
-                let api_key = self
-                    .manager
-                    .resolve_model_api_key(&self.settings)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("no credential configured; press :login"))?;
-                Ok(Arc::new(
-                    RigBackend::new_with_manager(
-                        &self.model,
-                        &api_key,
-                        &self.settings.credential_environment,
-                        self.settings.auth_kind,
-                        self.settings.thinking,
-                        self.session_id.as_deref(),
-                        Some(self.manager.clone()),
-                    )
-                    .await?,
-                ))
-            })
-            .await
+    async fn backend(&self) -> Result<Arc<RigBackend>> {
+        let api_key = self
+            .manager
+            .resolve_model_api_key(&self.settings)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no credential configured; press :login"))?;
+        let mut cached = self.backend.lock().await;
+        if let Some((cached_api_key, backend)) = cached.as_ref()
+            && cached_api_key == &api_key
+        {
+            return Ok(backend.clone());
+        }
+        let backend = Arc::new(
+            RigBackend::new_with_manager(
+                &self.model,
+                &api_key,
+                &self.settings.credential_environment,
+                self.settings.auth_kind,
+                self.settings.thinking,
+                self.session_id.as_deref(),
+                Some(self.manager.clone()),
+            )
+            .await?,
+        );
+        *cached = Some((api_key, backend.clone()));
+        Ok(backend)
     }
 }
 
@@ -396,7 +400,7 @@ pub async fn configured_backend(
         settings: settings.clone(),
         session_id: session_id.map(str::to_string),
         manager,
-        backend: OnceCell::new(),
+        backend: Mutex::new(None),
     };
     Ok(Some((Arc::new(backend), limits)))
 }
@@ -603,4 +607,74 @@ where
             .as_ref()
             .and_then(|final_| final_.finish_reason.clone()),
     })
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+    use crate::config::ValueSource;
+    use crate::oauth::OauthToken;
+
+    #[tokio::test]
+    async fn rebuilds_after_kimi_oauth_credential_rotates() {
+        let root = tempfile::tempdir().unwrap();
+        let manager =
+            ConfigManager::load_for_test(&root.path().join("config"), &root.path().join("project"))
+                .await
+                .unwrap();
+        let stale = OauthToken {
+            kind: "oauth".to_string(),
+            refresh: "stale-refresh".to_string(),
+            access: "stale-access".to_string(),
+            expires: i64::MAX,
+            extra: Default::default(),
+        };
+        manager
+            .set_oauth("kimi-coding", stale.clone())
+            .await
+            .unwrap();
+        let mut settings = manager.current().await;
+        settings.provider = "kimi-coding".to_string();
+        settings.model = "test-model".to_string();
+        settings.api_key = Some(stale.access.clone());
+        settings.auth_kind = AuthKind::Oauth;
+        settings.api_key_source = ValueSource::Global;
+        let deferred = DeferredRigBackend {
+            model: CatalogModel {
+                id: "test-model".to_string(),
+                name: "Test".to_string(),
+                api: "anthropic-messages".to_string(),
+                provider: "kimi-coding".to_string(),
+                base_url: "https://example.test".to_string(),
+                headers: Default::default(),
+                metadata: Default::default(),
+            },
+            settings,
+            session_id: None,
+            manager: manager.clone(),
+            backend: Mutex::new(None),
+        };
+        let initial_backend = deferred.backend().await.unwrap();
+        manager
+            .set_oauth(
+                "kimi-coding",
+                OauthToken {
+                    kind: "oauth".to_string(),
+                    refresh: "rotated-refresh".to_string(),
+                    access: "fresh-access".to_string(),
+                    expires: i64::MAX,
+                    extra: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let refreshed_backend = deferred.backend().await.unwrap();
+        let reused_backend = deferred.backend().await.unwrap();
+
+        assert!(!Arc::ptr_eq(&initial_backend, &refreshed_backend));
+        assert!(Arc::ptr_eq(&refreshed_backend, &reused_backend));
+        let stored = manager.oauth_token("kimi-coding").await.unwrap();
+        assert_eq!(stored.access, "fresh-access");
+        assert_eq!(stored.refresh, "rotated-refresh");
+    }
 }

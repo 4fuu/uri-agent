@@ -5,6 +5,7 @@ use crate::oauth::{self, OauthToken};
 use crate::session::SessionChoice;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -390,7 +391,7 @@ pub struct ConfigManager {
     invocation: InvocationOverrides,
     files: Mutex<ConfigFiles>,
     active: RwLock<ActiveSettings>,
-    oauth_refresh: Mutex<()>,
+    auth_update: Mutex<()>,
 }
 
 impl ConfigManager {
@@ -405,6 +406,7 @@ impl ConfigManager {
         let auth_path = directory.join("auth.json");
         let mut global: SettingsFile = read_json(&global_path).await?;
         let project = read_json(&project_path).await?;
+        let auth_lock = lock_auth_file(&directory).await?;
         let auth = read_json(&auth_path).await?;
         if !global_path.exists() {
             global.output_limit = Some(DEFAULT_OUTPUT_LIMIT);
@@ -413,6 +415,7 @@ impl ConfigManager {
         if !auth_path.exists() {
             write_json(&auth_path, &auth, true).await?;
         }
+        drop(auth_lock);
         let files = ConfigFiles {
             global,
             project,
@@ -426,7 +429,7 @@ impl ConfigManager {
             invocation,
             files: Mutex::new(files),
             active: RwLock::new(active),
-            oauth_refresh: Mutex::new(()),
+            auth_update: Mutex::new(()),
         })
     }
 
@@ -590,39 +593,43 @@ impl ConfigManager {
         if key.trim().is_empty() {
             bail!("API key cannot be empty");
         }
-        let mut files = self.files.lock().await;
-        files.auth.0.insert(
-            provider.to_string(),
-            AuthEntry {
-                kind: api_key_type(),
-                key: Some(key),
-                refresh: None,
-                access: None,
-                expires: None,
-                env: BTreeMap::new(),
-                extra: BTreeMap::new(),
-            },
-        );
-        write_json(&self.auth_path(), &files.auth, true).await?;
-        self.recalculate(&files).await
+        let provider = provider.to_string();
+        self.update_auth(move |auth| {
+            auth.0.insert(
+                provider,
+                AuthEntry {
+                    kind: api_key_type(),
+                    key: Some(key),
+                    refresh: None,
+                    access: None,
+                    expires: None,
+                    env: BTreeMap::new(),
+                    extra: BTreeMap::new(),
+                },
+            );
+            Ok(())
+        })
+        .await
     }
 
     pub async fn set_oauth(&self, provider: &str, token: OauthToken) -> Result<ActiveSettings> {
-        let mut files = self.files.lock().await;
-        files.auth.0.insert(
-            provider.to_string(),
-            AuthEntry {
-                kind: "oauth".to_string(),
-                key: None,
-                refresh: Some(token.refresh),
-                access: Some(token.access),
-                expires: Some(token.expires),
-                env: BTreeMap::new(),
-                extra: token.extra,
-            },
-        );
-        write_json(&self.auth_path(), &files.auth, true).await?;
-        self.recalculate(&files).await
+        let provider = provider.to_string();
+        self.update_auth(move |auth| {
+            auth.0.insert(
+                provider,
+                AuthEntry {
+                    kind: "oauth".to_string(),
+                    key: None,
+                    refresh: Some(token.refresh),
+                    access: Some(token.access),
+                    expires: Some(token.expires),
+                    env: BTreeMap::new(),
+                    extra: token.extra,
+                },
+            );
+            Ok(())
+        })
+        .await
     }
 
     pub async fn oauth_token(&self, provider: &str) -> Result<OauthToken> {
@@ -636,8 +643,8 @@ impl ConfigManager {
         oauth_token_from_entry(provider, entry)
     }
 
-    /// Refresh one OAuth entry without holding the configuration lock during
-    /// network I/O. If another login or refresh wins the race, its newer
+    /// Refresh one OAuth entry while serializing credential rotation across
+    /// processes. If another login or refresh wins the race, its newer
     /// credential is returned instead of being overwritten.
     pub async fn force_refresh_oauth(&self, provider: &str) -> Result<OauthToken> {
         self.refresh_oauth(provider, true).await
@@ -663,45 +670,43 @@ impl ConfigManager {
     }
 
     async fn refresh_oauth(&self, provider: &str, force: bool) -> Result<OauthToken> {
-        let _refresh = self.oauth_refresh.lock().await;
-        let before = self.oauth_token(provider).await?;
-        if !force && !before.expired() {
-            return Ok(before);
+        let observed = self.oauth_token(provider).await?;
+        if !force && !observed.expired() {
+            return Ok(observed);
         }
-        let refreshed = oauth::refresh_token(provider, &before).await?;
-        let mut files = self.files.lock().await;
-        let current = files
-            .auth
+
+        let _update = self.auth_update.lock().await;
+        let _file_lock = lock_auth_file(&self.directory).await?;
+        let mut auth: AuthFile = read_json(&self.auth_path()).await?;
+        let current = auth
             .0
             .get(provider)
             .filter(|entry| entry.kind == "oauth")
             .ok_or_else(|| anyhow!("{provider} OAuth credentials were removed during refresh"))?;
         let current_token = oauth_token_from_entry(provider, current)?;
-        if current_token.access != before.access
-            || current_token.refresh != before.refresh
-            || current_token.expires != before.expires
-        {
+        if current_token != observed || (!force && !current_token.expired()) {
+            self.install_auth(auth).await?;
             return Ok(current_token);
         }
-        let entry = files
-            .auth
-            .0
-            .get_mut(provider)
-            .expect("OAuth entry checked above");
+
+        let refreshed = oauth::refresh_token(provider, &current_token).await?;
+        let entry = auth.0.get_mut(provider).expect("OAuth entry checked above");
         entry.access = Some(refreshed.access.clone());
         entry.refresh = Some(refreshed.refresh.clone());
         entry.expires = Some(refreshed.expires);
         entry.extra.clone_from(&refreshed.extra);
-        write_json(&self.auth_path(), &files.auth, true).await?;
-        self.recalculate(&files).await?;
+        write_json(&self.auth_path(), &auth, true).await?;
+        self.install_auth(auth).await?;
         Ok(refreshed)
     }
 
     pub async fn clear_api_key(&self, provider: &str) -> Result<ActiveSettings> {
-        let mut files = self.files.lock().await;
-        files.auth.0.remove(provider);
-        write_json(&self.auth_path(), &files.auth, true).await?;
-        self.recalculate(&files).await
+        let provider = provider.to_string();
+        self.update_auth(move |auth| {
+            auth.0.remove(&provider);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn stored_credentials(&self) -> Vec<StoredCredential> {
@@ -739,6 +744,24 @@ impl ConfigManager {
         let active = calculate_active(files, &self.catalog, &self.invocation).await?;
         *self.active.write().await = active.clone();
         Ok(active)
+    }
+
+    async fn update_auth(
+        &self,
+        update: impl FnOnce(&mut AuthFile) -> Result<()>,
+    ) -> Result<ActiveSettings> {
+        let _update = self.auth_update.lock().await;
+        let _file_lock = lock_auth_file(&self.directory).await?;
+        let mut auth = read_json(&self.auth_path()).await?;
+        update(&mut auth)?;
+        write_json(&self.auth_path(), &auth, true).await?;
+        self.install_auth(auth).await
+    }
+
+    async fn install_auth(&self, auth: AuthFile) -> Result<ActiveSettings> {
+        let mut files = self.files.lock().await;
+        files.auth = auth;
+        self.recalculate(&files).await
     }
 
     pub fn directory(&self) -> &Path {
@@ -1131,6 +1154,28 @@ pub fn config_directory() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("cannot determine the platform config directory"))
 }
 
+async fn lock_auth_file(directory: &Path) -> Result<std::fs::File> {
+    fs::create_dir_all(directory).await?;
+    let path = directory.join("auth.json.lock");
+    tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("cannot open OAuth credential lock {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("cannot lock OAuth credentials {}", path.display()))?;
+        Ok(file)
+    })
+    .await
+    .context("OAuth credential lock worker failed")?
+}
+
 async fn read_json<T>(path: &Path) -> Result<T>
 where
     T: Default + for<'de> Deserialize<'de>,
@@ -1193,6 +1238,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_http_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "client closed before finishing its request");
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    async fn token_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (format!("http://{address}"), server)
+    }
 
     #[tokio::test]
     async fn agent_environment_persists_private_values_and_validates_names() {
@@ -1624,6 +1719,102 @@ mod tests {
         );
         // SAFETY: this process-unique variable is no longer used.
         unsafe { env::remove_var(environment) };
+    }
+
+    #[tokio::test]
+    async fn concurrent_managers_do_not_lose_auth_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let first = ConfigManager::load_for_test(&directory, &root.path().join("first"))
+            .await
+            .unwrap();
+        let second = ConfigManager::load_for_test(&directory, &root.path().join("second"))
+            .await
+            .unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.set_api_key("provider-one", "first-key".to_string()),
+            second.set_api_key("provider-two", "second-key".to_string()),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let saved: AuthFile = read_json(&directory.join("auth.json")).await.unwrap();
+        assert_eq!(saved.0["provider-one"].key.as_deref(), Some("first-key"));
+        assert_eq!(saved.0["provider-two"].key.as_deref(), Some("second-key"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_managers_share_one_refresh_and_preserve_omitted_token() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let first = ConfigManager::load_for_test(&directory, &root.path().join("first"))
+            .await
+            .unwrap();
+        let (gateway, server) =
+            token_server(200, r#"{"access_token":"fresh-access","expires_in":3600}"#).await;
+        let original = OauthToken {
+            kind: "oauth".to_string(),
+            refresh: "old-refresh".to_string(),
+            access: "expired-access".to_string(),
+            expires: 0,
+            extra: BTreeMap::from([("gateway".to_string(), Value::String(gateway.clone()))]),
+        };
+        first.set_oauth("radius", original).await.unwrap();
+        let second = ConfigManager::load_for_test(&directory, &root.path().join("second"))
+            .await
+            .unwrap();
+
+        let (first_token, second_token) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    first.refresh_oauth("radius", false),
+                    second.refresh_oauth("radius", false),
+                )
+            })
+            .await
+            .unwrap();
+        let first_token = first_token.unwrap();
+        let second_token = second_token.unwrap();
+        assert_eq!(first_token.access, "fresh-access");
+        assert_eq!(second_token.access, "fresh-access");
+        assert_eq!(first_token.refresh, "old-refresh");
+        assert_eq!(second_token.refresh, "old-refresh");
+
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /v1/oauth/token HTTP/1.1"));
+        assert!(request.contains("refresh_token=old-refresh"));
+        let saved: AuthFile = read_json(&directory.join("auth.json")).await.unwrap();
+        let saved = oauth_token_from_entry("radius", &saved.0["radius"]).unwrap();
+        assert_eq!(saved.access, "fresh-access");
+        assert_eq!(saved.refresh, "old-refresh");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_preserves_stored_and_in_memory_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let manager = ConfigManager::load_for_test(&directory, &root.path().join("project"))
+            .await
+            .unwrap();
+        let (gateway, server) = token_server(400, r#"{"error":"invalid_grant"}"#).await;
+        let original = OauthToken {
+            kind: "oauth".to_string(),
+            refresh: "old-refresh".to_string(),
+            access: "expired-access".to_string(),
+            expires: 0,
+            extra: BTreeMap::from([("gateway".to_string(), Value::String(gateway))]),
+        };
+        manager.set_oauth("radius", original.clone()).await.unwrap();
+
+        assert!(manager.refresh_oauth("radius", false).await.is_err());
+        server.await.unwrap();
+        assert_eq!(manager.oauth_token("radius").await.unwrap(), original);
+        let saved: AuthFile = read_json(&directory.join("auth.json")).await.unwrap();
+        assert_eq!(
+            oauth_token_from_entry("radius", &saved.0["radius"]).unwrap(),
+            original
+        );
     }
 
     #[cfg(not(windows))]

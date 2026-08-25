@@ -101,15 +101,118 @@ async fn kimi_login(
 }
 
 pub(in crate::oauth) async fn refresh_kimi(refresh: &str) -> Result<OauthToken> {
-    let response = http_client()?
-        .post(format!("{}/api/oauth/token", host()))
-        .form_urlencoded(&[
-            ("client_id", KIMI_CLIENT_ID),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
-        ])
-        .send()
-        .await
-        .context("Kimi Code token refresh failed")?;
-    read_token_form(response, "Kimi Code").await
+    refresh_kimi_at(&host(), refresh).await
+}
+
+async fn refresh_kimi_at(host: &str, refresh: &str) -> Result<OauthToken> {
+    let client = http_client()?;
+    for attempt in 0..=3 {
+        let response = client
+            .post(format!("{host}/api/oauth/token"))
+            .form_urlencoded(&[
+                ("client_id", KIMI_CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+            ])
+            .send()
+            .await;
+        match response {
+            Ok(response) if kimi_refresh_retryable(response.status()) && attempt < 3 => {}
+            Ok(response) => return read_token_form(response, "Kimi Code").await,
+            Err(_) if attempt < 3 => {}
+            Err(error) => return Err(error).context("Kimi Code token refresh failed"),
+        }
+        tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+    }
+    unreachable!("Kimi refresh loop returns after its final attempt")
+}
+
+fn kimi_refresh_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "client closed before finishing its request");
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_retries_only_transient_statuses() {
+        assert!(kimi_refresh_retryable(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(kimi_refresh_retryable(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!kimi_refresh_retryable(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!kimi_refresh_retryable(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn refresh_retries_transient_failure_and_accepts_rotation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                (500, r#"{"error":"temporary"}"#),
+                (
+                    200,
+                    r#"{"access_token":"fresh-access","refresh_token":"rotated-refresh","expires_in":3600}"#,
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut socket).await);
+                let response = format!(
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let token = refresh_kimi_at(&format!("http://{address}"), "old-refresh")
+            .await
+            .unwrap();
+        assert_eq!(token.access, "fresh-access");
+        assert_eq!(token.refresh, "rotated-refresh");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("refresh_token=old-refresh"))
+        );
+    }
 }

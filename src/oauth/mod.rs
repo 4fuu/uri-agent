@@ -254,7 +254,7 @@ pub async fn refresh_token(provider: &str, token: &OauthToken) -> Result<OauthTo
     let Some(kind) = OauthProvider::from_id(provider) else {
         bail!("provider {provider} has no OAuth refresh");
     };
-    match kind {
+    let refreshed = match kind {
         OauthProvider::Antigravity => providers::refresh_antigravity(token).await,
         OauthProvider::Anthropic => providers::refresh_anthropic(&token.refresh).await,
         OauthProvider::OpenRouter => Ok(token.clone()),
@@ -263,7 +263,25 @@ pub async fn refresh_token(provider: &str, token: &OauthToken) -> Result<OauthTo
         OauthProvider::KimiCoding => providers::refresh_kimi(&token.refresh).await,
         OauthProvider::Xai => providers::refresh_xai(&token.refresh).await,
         OauthProvider::Radius => providers::refresh_radius(token).await,
+    }?;
+    normalize_refreshed_token(kind, token, refreshed)
+}
+
+fn normalize_refreshed_token(
+    provider: OauthProvider,
+    previous: &OauthToken,
+    mut refreshed: OauthToken,
+) -> Result<OauthToken> {
+    if provider != OauthProvider::OpenRouter && refreshed.refresh.is_empty() {
+        if previous.refresh.is_empty() {
+            bail!(
+                "{} OAuth refresh returned no refresh token and the stored credential has none",
+                provider.name()
+            );
+        }
+        refreshed.refresh.clone_from(&previous.refresh);
     }
+    Ok(refreshed)
 }
 
 pub(super) struct LoginSetup {
@@ -342,5 +360,64 @@ mod tests {
         let token = OauthToken::from_response("a".into(), "r".into(), 3600);
         assert!(!token.expired());
         assert!(token.expires <= chrono::Utc::now().timestamp_millis() + 55 * 60 * 1000);
+    }
+
+    #[test]
+    fn oauth_token_expires_at_its_stored_boundary() {
+        let token = OauthToken {
+            kind: "oauth".into(),
+            access: "access".into(),
+            refresh: "refresh".into(),
+            expires: chrono::Utc::now().timestamp_millis(),
+            extra: BTreeMap::new(),
+        };
+        assert!(token.expired());
+    }
+
+    #[test]
+    fn refresh_normalization_retains_or_rotates_refresh_token() {
+        let previous = OauthToken {
+            kind: "oauth".into(),
+            access: "old-access".into(),
+            refresh: "old-refresh".into(),
+            expires: 1,
+            extra: BTreeMap::new(),
+        };
+        let omitted = OauthToken {
+            kind: "oauth".into(),
+            access: "new-access".into(),
+            refresh: String::new(),
+            expires: 2,
+            extra: BTreeMap::new(),
+        };
+        let normalized =
+            normalize_refreshed_token(OauthProvider::KimiCoding, &previous, omitted).unwrap();
+        assert_eq!(normalized.refresh, "old-refresh");
+
+        let rotated = OauthToken {
+            refresh: "rotated-refresh".into(),
+            ..normalized
+        };
+        let normalized =
+            normalize_refreshed_token(OauthProvider::KimiCoding, &previous, rotated).unwrap();
+        assert_eq!(normalized.refresh, "rotated-refresh");
+    }
+
+    #[test]
+    fn refresh_normalization_rejects_nonrenewable_credentials() {
+        let token = OauthToken {
+            kind: "oauth".into(),
+            access: "access".into(),
+            refresh: String::new(),
+            expires: 1,
+            extra: BTreeMap::new(),
+        };
+        let error = normalize_refreshed_token(OauthProvider::KimiCoding, &token, token.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("stored credential has none"));
+
+        assert!(
+            normalize_refreshed_token(OauthProvider::OpenRouter, &token, token.clone()).is_ok()
+        );
     }
 }

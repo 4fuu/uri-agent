@@ -70,7 +70,7 @@ pub(super) async fn oauth_poll_from_token_response(
     }
 }
 
-fn token_from_value(value: &Value) -> Result<OauthToken> {
+pub(super) fn token_from_value(value: &Value) -> Result<OauthToken> {
     let access = required_str(value, "access_token")?;
     let refresh = value
         .get("refresh_token")
