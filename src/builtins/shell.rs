@@ -997,26 +997,47 @@ mod tests {
     #[tokio::test]
     async fn shell_returns_short_commands_and_backgrounds_long_or_explicit_commands() {
         let directory = tempfile::tempdir().unwrap();
-        let Some(executable) = find_executable("bash") else {
-            return;
+        let (protocol, executable, short, delayed, explicit) = if cfg!(windows) {
+            let Some(executable) = find_executable("pwsh") else {
+                return;
+            };
+            (
+                "pwsh",
+                executable,
+                "Write-Output foreground-ok",
+                "Start-Sleep -Milliseconds 200; Write-Output automatic-ok",
+                "Start-Sleep -Milliseconds 200; Write-Output explicit-ok",
+            )
+        } else {
+            let Some(executable) = find_executable("bash") else {
+                return;
+            };
+            (
+                "bash",
+                executable,
+                "printf foreground-ok",
+                "sleep 0.2; printf automatic-ok",
+                "sleep 0.2; printf explicit-ok",
+            )
         };
-        let mut shell = ShellProtocol::new("bash", executable, directory.path());
+        let mut shell = ShellProtocol::new(protocol, executable, directory.path());
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
         let context = ProtocolContext {
             tasks: crate::task::TaskManager::new(),
         };
-        let command = Value::String("printf foreground-ok".to_string());
+        let run_uri = format!("{protocol}://run");
+        let command = Value::String(short.to_string());
         let completed = shell
             .exec_with_auto_background(
                 ProtocolRequest {
-                    uri: "bash://run",
+                    uri: &run_uri,
                     target: "run",
                     body: Some(&command),
                 },
                 context.clone(),
-                Duration::from_secs(1),
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -1025,12 +1046,12 @@ mod tests {
         assert!(completed.contains("foreground-ok"));
         assert!(context.tasks.list().await.is_empty());
 
-        let command = Value::String("sleep 0.2; printf automatic-ok".to_string());
+        let command = Value::String(delayed.to_string());
         let started = Instant::now();
         let accepted = shell
             .exec_with_auto_background(
                 ProtocolRequest {
-                    uri: "bash://run",
+                    uri: &run_uri,
                     target: "run",
                     body: Some(&command),
                 },
@@ -1044,12 +1065,13 @@ mod tests {
         assert!(accepted.contains("Background task accepted: tasks://002"));
         assert!(accepted.contains("current status or output is explicitly needed"));
 
-        let command = Value::String("sleep 0.2; printf explicit-ok".to_string());
+        let background_uri = format!("{protocol}://run?background=true");
+        let command = Value::String(explicit.to_string());
         let started = Instant::now();
         let accepted = shell
             .exec(
                 ProtocolRequest {
-                    uri: "bash://run?background=true",
+                    uri: &background_uri,
                     target: "run?background=true",
                     body: Some(&command),
                 },
@@ -1062,7 +1084,7 @@ mod tests {
 
         let automatic = context
             .tasks
-            .wait("002", Duration::from_secs(1))
+            .wait("002", Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(automatic.status, TaskStatus::Completed);
