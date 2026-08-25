@@ -57,11 +57,12 @@ def main() -> None:
         r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
         rf'\g<1>{version}\g<2>',
     )
-    replace_once(
-        "src/wasm_plugin.rs",
-        r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
-        rf'\g<1>{version}\g<2>',
-    )
+    for package in ("uri-agent", "uri-agent-plugin-sdk"):
+        replace_once(
+            "Cargo.lock",
+            rf'^(name = "{package}"\nversion = ")\d+\.\d+\.\d+("$)',
+            rf'\g<1>{version}\g<2>',
+        )
 
     subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
