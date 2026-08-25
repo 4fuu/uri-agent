@@ -1462,7 +1462,7 @@ fn is_recoverable_length(
 fn model_retry_policy(kind: ModelFailureKind) -> Option<ModelRetryPolicy> {
     match kind {
         ModelFailureKind::RateLimit => Some(ModelRetryPolicy {
-            max_retries: 6,
+            max_retries: 20,
             base_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(30),
             reason: "rate limit",
@@ -3814,7 +3814,7 @@ mod tests {
     #[test]
     fn retry_budgets_are_distinct_and_permanent_errors_are_not_retried() {
         for (kind, expected) in [
-            (ModelFailureKind::RateLimit, 6),
+            (ModelFailureKind::RateLimit, 20),
             (ModelFailureKind::Network, 5),
             (ModelFailureKind::Server, 5),
             (ModelFailureKind::Timeout, 4),
@@ -3978,7 +3978,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(retries, [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5), (1, 6)]);
+        assert_eq!(retries, [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5), (1, 20)]);
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 

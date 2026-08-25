@@ -45,7 +45,7 @@ URI Agent retries transient failures for normal model calls and context-summary 
 
 | Failure | Retries | Fallback backoff before jitter |
 | --- | ---: | --- |
-| Rate limit (`429`) | 6 | 1s exponential, capped at 30s |
+| Rate limit (`429`) | 20 | 1s exponential, capped at 30s |
 | Network or stream transport failure | 5 | 500ms exponential, capped at 8s |
 | Server failure (`5xx`) | 5 | 1s exponential, capped at 15s |
 | Timeout or `408` | 4 | 1s exponential, capped at 10s |
@@ -56,7 +56,7 @@ Fallback delays add up to 25% jitter. `Retry-After` or `retry-after-ms` takes pr
 
 The experimental Antigravity transport performs bounded protocol-specific recovery before this generic policy sees a failure. An expired token or the first `401` refreshes the stored OAuth credential once. The first project-header `403` retries without that header. A Gemini `400` that specifically reports an invalid thought signature replaces signatures in that request copy with the private protocol's dummy marker and retries once; persisted replay remains unchanged. Within each generic attempt, network errors, `408`, `404`, and `5xx` responses fall through the sandbox, daily, and production endpoints in order. Once those endpoints are exhausted, the final failure retains its normal runtime classification and retry budget; `429` responses are never replayed internally.
 
-Because the counters are independent, alternating failure classes can consume up to 28 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time limit.
+Because the counters are independent, alternating failure classes can consume up to 42 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time limit.
 
 Each retry becomes a visible session event with its reason, delay, and count. Provisional output from a failed stream is cleared before retry and never enters model replay. Double `Esc` interrupts an active request or retry delay.
 
