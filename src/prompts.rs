@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol. Use this for protocol help, resources, task status, and completed results.";
 
-pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Exact behavior is protocol-specific; read `<protocol>://help` before use. Operations normally return their final result directly. Necessary long-running operations may instead return a managed task URI; use `read` on that URI to inspect status and final output. Task acceptance is not completion.";
+pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Exact behavior is protocol-specific; read `<protocol>://help` before use. Operations normally return their final result directly. Long-running operations may become managed background tasks whose completion is delivered automatically; use the tasks protocol to inspect or cancel them.";
 
 #[derive(Clone, Debug)]
 pub struct ProtocolPrompt {
@@ -40,28 +40,10 @@ pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> Stri
     prompt
 }
 
-pub fn task_accepted(protocol: &str, id: &str) -> String {
+pub fn task_accepted(id: &str) -> String {
     format!(
-        "Task accepted: {id}\nRead status: read(\"{protocol}://tasks/{id}\", {{\"kind\":\"none\",\"value\":\"\"}})"
+        "Background task accepted: tasks://{id}\nCompletion will be delivered automatically. Read that URI only when current status or output is explicitly needed."
     )
-}
-
-pub fn task_snapshot(
-    id: &str,
-    status: &str,
-    started_at: &str,
-    finished_at: Option<&str>,
-    content: &str,
-) -> String {
-    let mut output = format!("Task: {id}\nStatus: {status}\nStarted: {started_at}\n");
-    if let Some(finished_at) = finished_at {
-        let _ = writeln!(output, "Finished: {finished_at}");
-    }
-    if !content.is_empty() {
-        output.push('\n');
-        output.push_str(content);
-    }
-    output
 }
 
 pub fn truncated_output(preview: &str, complete_file: &Path) -> String {
@@ -112,10 +94,10 @@ mod tests {
     }
 
     #[test]
-    fn task_acceptance_emits_a_complete_status_read() {
+    fn task_acceptance_returns_the_unified_uri_without_inviting_polling() {
         assert_eq!(
-            task_accepted("bash", "001"),
-            "Task accepted: 001\nRead status: read(\"bash://tasks/001\", {\"kind\":\"none\",\"value\":\"\"})"
+            task_accepted("001"),
+            "Background task accepted: tasks://001\nCompletion will be delivered automatically. Read that URI only when current status or output is explicitly needed."
         );
     }
 }

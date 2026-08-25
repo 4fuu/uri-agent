@@ -45,12 +45,12 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, session archive, HTTPS, exact replacement, Codex patch, Bash, and PowerShell plugins, including protocol help and provider-specific HTTPS internals |
+| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, session archive, HTTPS, exact replacement, Codex patch, unified tasks, Bash, and PowerShell plugins, including protocol help and provider-specific HTTPS internals |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, status, and composer completion registration |
 | `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
 | `examples/wasm-plugin/` | Buildable Rust guest plugin example |
-| `src/task.rs` | In-process task lifecycle, waiting, cancellation, records, and notices |
+| `src/task.rs` | In-process task lifecycle, foreground-to-background promotion, capacity, progress, waiting, cancellation, records, and notices |
 | `src/output.rs` | Inline output limits, previews, and complete-output persistence |
 | `src/skill.rs` | Skill discovery, frontmatter, protocol naming and help, snapshots, and resource containment |
 | `src/session.rs` | SQLite schema, session boundaries, frozen context, events, drafts, checkpoints, and replay |
@@ -96,8 +96,8 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 ### Execution and persistence
 
 - Protocol execution returns its final result directly by default.
-- Use a managed task only when an operation necessarily runs long enough that keeping the tool call open is inappropriate.
-- Managed task acceptance is not completion. Status and final content remain available through the owning protocol's read route.
+- Use a managed task only when an operation necessarily runs long enough that keeping the tool call open is inappropriate, or when the caller explicitly requests background execution.
+- Managed task acceptance is not completion. Status, latest output, final content, and cancellation remain available through the unified `tasks` protocol.
 - URI syntax belongs to its protocol; the registry must not interpret protocol-specific options.
 - Shell cancellation terminates child processes, not only the parent future.
 - File writes remain atomic. Exact replacement rejects missing and ambiguous matches.

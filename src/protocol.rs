@@ -130,6 +130,10 @@ impl ProtocolRegistry {
             .collect()
     }
 
+    pub(crate) fn tasks(&self) -> TaskManager {
+        self.context.tasks.clone()
+    }
+
     pub async fn read(&self, uri: &str, body: Option<&Value>) -> Result<String> {
         self.dispatch_read(uri, body, true).await
     }

@@ -38,8 +38,8 @@ read("capture://a://b?not=a url", {"kind":"none","value":""})
 ```
 
 Protocols own their target syntax. `file` interprets `?offset`, `?limit`, and
-`?line_numbers`; `bash` and `pwsh` interpret `?wait`; the registry treats all
-of those characters as opaque.
+`?line_numbers`; `bash` and `pwsh` interpret `?background=true` and
+`?timeout=<seconds>`; the registry treats all of those characters as opaque.
 
 Protocol names must be unique. Registration fails rather than silently replacing an existing protocol.
 
@@ -53,8 +53,9 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
 | `replace` | `read`, `exec` | Atomically replace one exact text match |
 | `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
-| `bash` | `read`, `exec` | Run Bash commands as managed tasks when Bash is enabled |
-| `pwsh` | `read`, `exec` | Run PowerShell 7 commands as managed tasks when `pwsh` is enabled |
+| `tasks` | `read`, `exec` | Inspect and cancel background tasks from every protocol |
+| `bash` | `read`, `exec` | Run Bash commands in the foreground or as managed background tasks when Bash is enabled |
+| `pwsh` | `read`, `exec` | Run PowerShell 7 commands in the foreground or as managed background tasks when `pwsh` is enabled |
 | `wasm_plugin` | `read`, `exec` | Reload trusted WASM protocols and return the completed reload report |
 | `<name>-skill` | `read` | Load one [discovered Skill](context.md#skills) and its bundled files |
 
@@ -185,29 +186,48 @@ Commands run from the startup working directory. Bash starts without profile or 
 
 URI Agent injects the latest values from its global Agent environment manager into every new shell command. Managed values override inherited process variables with the same name. The user-controlled `:terminal` is separate and does not receive them; see [Agent environment](configuration.md#agent-environment).
 
-PowerShell source and plain-text output use UTF-8. Its task status follows the final PowerShell or native command, including the native command's exact exit code.
+PowerShell source and plain-text output use UTF-8. Command status follows the final PowerShell or native command, including the native command's exact exit code.
 
 ## Managed tasks
 
-Protocol execution returns its final result directly by default. Necessary long-running operations may instead become managed tasks. The built-in shell protocols use managed tasks because command duration is unbounded:
+Protocol execution returns its final result directly by default. Bash and PowerShell commands therefore start in the foreground. If a command is still running after about 60 seconds, URI Agent converts that same process into a managed background task without restarting it:
 
 ```text
 exec("bash://run", {"kind":"text","value":"cargo test"})
-→ Task accepted: <id>
-→ Read status: read("bash://tasks/<id>", {"kind":"none","value":""})
+→ Exit: exit status: 0
+  ...
+
+# If it remains active past the foreground window:
+→ Background task accepted: tasks://<id>
 ```
 
-Acceptance is not success. Read the returned route to observe `pending`, `running`, `completed`, `failed`, or `cancelled` status and the eventual content. Task IDs increase within their in-process manager as lowercase hexadecimal values: they start at `001`, remain at least three digits wide, and expand after `fff`. Protocols expose task lists and individual tasks through their own read routes; the shared task manager does not create a generic model-facing task protocol.
-
-Shell protocols offer a bounded wait when the immediate result is useful:
+Use `background=true` when the command should become a task immediately:
 
 ```text
-exec("bash://?wait=30", {"kind":"text","value":"cargo test"})
+exec("bash://run?background=true", {"kind":"text","value":"cargo test"})
 ```
 
-If the wait window expires, the task keeps running and the response still includes its task URI. `?wait=N` belongs to `bash` and `pwsh`; it is not a registry option. Read the active shell protocol's help for the accepted range.
+Foreground and background commands share one execution deadline. `timeout` is an integer number of seconds, omission defaults to 1,800 seconds (30 minutes), and `timeout=0` disables the deadline:
 
-Cancellation must terminate the spawned process, not only the Rust future that waits for it.
+```text
+exec("bash://run?timeout=120", {"kind":"text","value":"cargo test"})
+```
+
+The deadline is unchanged when an operation moves to the background. Timing out produces a failed task for background work or a direct `exec` error for foreground work, and terminates the process tree. Interrupting a shell tool call before automatic background conversion cancels its process rather than leaving detached work behind. Shell help tells the model not to create another background layer inside the command.
+
+The shared `tasks` protocol covers work from every protocol:
+
+```text
+read("tasks://summary", {"kind":"none","value":""})
+read("tasks://<id>", {"kind":"none","value":""})
+exec("tasks://<id>/cancel", {"kind":"none","value":""})
+```
+
+Task acceptance is not success. A task record exposes `pending`, `running`, `completed`, `failed`, or `cancelled` state, its originating protocol, label, duration, bounded latest output while active, and complete terminal output. Task IDs increase within their in-process manager as lowercase hexadecimal values: they start at `001`, remain at least three digits wide, and expand after `fff`. Settled background records remain available for the lifetime of the session runtime. At most 16 background tasks may be pending or running at once; an explicit background request fails at capacity, while automatic conversion keeps waiting in the foreground.
+
+When a background task reaches `completed`, `failed`, or `cancelled`, URI Agent sends the model an automatic hidden notification containing the `tasks://` URI, status, and at most the latest 20 lines and 4,000 characters of output. The notification continues the active turn at its next model boundary or starts a model turn when idle, so the model must not poll. Task output is identified as untrusted data. Reading an individual terminal task or a summary that already presents it suppresses the duplicate notification. Notifications are delivered in batches of at most 10 and approximately 16,000 output characters.
+
+Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree, not only the Rust future that waits for it.
 
 ## Complete output preservation
 

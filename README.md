@@ -22,7 +22,7 @@ payloads.
 
 URI Agent extends to every capability the same loading pattern other agents use for Skills: expose a compact name and description first, then load full instructions and resources only when selected. A new session therefore preloads only routing rules and one-line protocol descriptors; detailed contracts remain at `<protocol>://help`, Skill bodies and documentation remain behind their protocols, and oversized results remain behind `file://` addresses. This preserves aggressive on-demand and progressive context loading while the fixed `read` / `exec` contract keeps tool calls reliable and registered protocols provide extreme flexibility. The fixed startup baseline remains around 3.7 KB instead of paying the context cost of every capability up front.
 
-Adding a capability adds a protocol entry rather than another model-facing tool schema or preloaded manual. Long-running operations become managed tasks, and append-only session history is stored in SQLite.
+Adding a capability adds a protocol entry rather than another model-facing tool schema or preloaded manual. Shell commands return directly when short, automatically become managed background tasks when long, and notify the model on completion without polling. Append-only session history is stored in SQLite.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
@@ -31,13 +31,13 @@ URI Agent is an early release and may change between dated versions. Model reque
 
 ## A ~3.7 KB fixed startup baseline
 
-With the current source, the fixed startup baseline on Unix with Bash and eight built-in protocols is:
+With the current source, the fixed startup baseline on Unix with Bash and nine built-in protocols is:
 
 | Component | Included content | UTF-8 size |
 | --- | --- | ---: |
-| System prompt | Routing rules and the built-in protocol index | 1,410 bytes (1.410 KB) |
-| `read` + `exec` definitions | Both compact internal tool schemas | 2,248 bytes (2.248 KB) |
-| **Total** | Fixed system prompt and tools | **3,658 bytes (3.658 KB)** |
+| System prompt | Routing rules and the built-in protocol index | 1,495 bytes (1.495 KB) |
+| `read` + `exec` definitions | Both compact internal tool schemas | 2,236 bytes (2.236 KB) |
+| **Total** | Fixed system prompt and tools | **3,731 bytes (3.731 KB)** |
 
 ```text
 ~3.7 KB fixed baseline
@@ -53,7 +53,7 @@ Skills follow the same path: startup adds only each discovered Skill's name and 
 - **URI-native progressive context:** one address space covers every resource and action, while Skills-style loading keeps contracts, instructions, resources, and complete output out of context until needed.
 - **Reliable and extensible:** the fixed `read` / `exec` contract stays stable while built-in, Skill, linked Rust, and trusted WASM protocols evolve independently.
 - **pi.dev models and sign-in:** URI Agent uses pi.dev's cloud model catalog and provider login methods, exposing every catalog model whose API family its backend supports through one selector.
-- **Durable, observable work:** managed tasks expose status and final output; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
+- **Durable, observable work:** managed tasks expose status and final output and automatically notify the model on completion; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
 - **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
 
 ## pi.dev model coverage

@@ -62,7 +62,7 @@ Each retry becomes a visible session event with its reason, delay, and count. Pr
 
 A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
 
-URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different call, no call, or multiple calls resets the sequence. Repeated reads of a managed-task status URI are exempt because polling the same route is expected.
+URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different call, no call, or multiple calls resets the sequence. Background task completion is delivered automatically, so repeated identical `tasks://` reads are polling and receive the same loop protection as other calls.
 
 ## Context compaction
 

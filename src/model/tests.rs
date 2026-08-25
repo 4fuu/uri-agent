@@ -1122,6 +1122,16 @@ fn model_only_sees_two_tools_with_a_required_typed_body_envelope() {
             .description
             .contains("return their final result directly")
     );
+    assert!(
+        tools[1]
+            .description
+            .contains("completion is delivered automatically")
+    );
+    assert!(
+        tools[1]
+            .description
+            .contains("use the tasks protocol to inspect or cancel them")
+    );
     for tool in tools {
         assert_eq!(tool.parameters["required"], json!(["uri", "body"]));
         let body = &tool.parameters["properties"]["body"];

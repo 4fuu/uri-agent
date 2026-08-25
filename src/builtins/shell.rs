@@ -1,7 +1,7 @@
-use super::{render_record, render_task, render_task_list};
 use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, PluginRegistry};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::task::{PromoteBackground, TaskManager, TaskRecord, TaskStatus};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{self, Instant};
+use tokio_util::sync::CancellationToken;
 
 const PWSH_SOURCE_BOOTSTRAP: &str = "$__uri_agent_source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($__uri_agent_source))";
 const PWSH_UTF8_PREFIX: &str = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ";
@@ -20,9 +21,12 @@ const PWSH_EXIT_EPILOGUE: &str = "\n; $__uri_agent_ok = $?; $__uri_agent_native 
 const PWSH_WINDOWS_WARNING: &str =
     "PowerShell 7 or newer was not found on Windows; pwsh:// is disabled.";
 const EXIT_OUTPUT_IDLE_GRACE: Duration = Duration::from_millis(100);
+const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BASH_HELP: &str = r#"# bash
 
-Run Bash commands as managed asynchronous tasks.
+Run Bash commands. Commands start in the foreground and normally return their
+final result in the same `exec` call.
 
 Call `exec` with `bash://run` and encode the command as a text body:
 
@@ -30,26 +34,33 @@ Call `exec` with `bash://run` and encode the command as a text body:
 exec("bash://run", {"kind":"text","value":"cargo test"})
 ```
 
-Add `?wait=<seconds>` to wait for an integer number of seconds from 0 through
-300; for example, `bash://?wait=30`. If the wait window expires, the command
-keeps running and the result contains its task URI.
-
-Read `bash://tasks/<id>` for status and bounded output, using the task ID
-returned by `exec`:
+If a foreground command is still running after about 60 seconds, URI Agent
+automatically converts the same process into a background task without
+restarting it. Use `background=true` to return a task immediately:
 
 ```text
-read("bash://tasks/<id>", {"kind":"none","value":""})
+exec("bash://run?background=true", {"kind":"text","value":"cargo test"})
 ```
 
-If that output exceeds the system limit, the result includes a `file://`
-address containing the full output.
+Foreground and background commands share one execution timeout. `timeout` is
+an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
+and `timeout=0` disables the timeout:
+
+```text
+exec("bash://run?timeout=120", {"kind":"text","value":"cargo test"})
+```
+
+Do not add another background layer inside the command. Background task status,
+output, and cancellation use the unified `tasks://` protocol. Completion is
+delivered automatically, so do not poll.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
 "#;
 const PWSH_HELP: &str = r#"# pwsh
 
-Run PowerShell 7 commands as managed asynchronous tasks.
+Run PowerShell 7 commands. Commands start in the foreground and normally return
+their final result in the same `exec` call.
 
 Write PowerShell 7 syntax rather than Unix shell syntax. Use multiline commands
 with normal indentation when they improve readability; do not collapse them
@@ -67,25 +78,24 @@ Call `exec` with `pwsh://run` and encode the command as a text body:
 exec("pwsh://run", {"kind":"text","value":"Get-ChildItem -Path . -Force"})
 ```
 
-Commands already run as managed tasks. Do not create another background layer
-inside the command. Use the returned task URI to inspect the task later.
-
-Add `?wait=<seconds>` to wait for an integer number of seconds from 0 through
-300; for example, `pwsh://?wait=30`. If the wait window expires, the command
-keeps running and the result contains its task URI.
-
-PowerShell source and plain-text output use UTF-8. Task success follows the
-final PowerShell or native command, and native exit codes are preserved.
-
-Read `pwsh://tasks/<id>` for status and bounded output, using the task ID
-returned by `exec`:
+If a foreground command is still running after about 60 seconds, URI Agent
+automatically converts the same process into a background task without
+restarting it. Use `background=true` to return a task immediately:
 
 ```text
-read("pwsh://tasks/<id>", {"kind":"none","value":""})
+exec("pwsh://run?background=true", {"kind":"text","value":"cargo test"})
 ```
 
-If that output exceeds the system limit, the result includes a `file://`
-address containing the full output.
+Foreground and background commands share one execution timeout. `timeout` is
+an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
+and `timeout=0` disables the timeout.
+
+Do not add another background layer inside the command. Background task status,
+output, and cancellation use the unified `tasks://` protocol. Completion is
+delivered automatically, so do not poll.
+
+PowerShell source and plain-text output use UTF-8. Command success follows the
+final PowerShell or native command, and native exit codes are preserved.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -94,6 +104,53 @@ secret values by name and do not print them unless the user explicitly asks.
 struct ProcessTreeGuard {
     pid: u32,
     armed: bool,
+}
+
+struct ForegroundTaskGuard {
+    tasks: TaskManager,
+    id: String,
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl ForegroundTaskGuard {
+    fn new(tasks: TaskManager, id: String, cancellation: CancellationToken) -> Self {
+        Self {
+            tasks,
+            id,
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ForegroundTaskGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+            let tasks = self.tasks.clone();
+            let id = self.id.clone();
+            tokio::spawn(async move {
+                if tasks
+                    .wait_until_terminal(&id)
+                    .await
+                    .is_some_and(|record| !record.background)
+                {
+                    tasks.remove(&id).await;
+                }
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShellOptions {
+    background: bool,
+    timeout: Option<Duration>,
 }
 
 impl ProcessTreeGuard {
@@ -238,9 +295,9 @@ impl Protocol for ShellProtocol {
         ProtocolDescriptor {
             name: self.name.to_string(),
             description: if self.name == "bash" {
-                "Run Bash commands as managed asynchronous tasks."
+                "Run Bash commands in the foreground or as managed background tasks."
             } else {
-                "Run PowerShell commands as managed asynchronous tasks."
+                "Run PowerShell commands in the foreground or as managed background tasks."
             }
             .to_string(),
             can_read: true,
@@ -251,7 +308,7 @@ impl Protocol for ShellProtocol {
     async fn read(
         &self,
         request: ProtocolRequest<'_>,
-        context: ProtocolContext,
+        _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         match request.target {
             "help" => Ok(if self.name == "bash" {
@@ -261,17 +318,7 @@ impl Protocol for ShellProtocol {
             }
             .as_bytes()
             .to_vec()),
-            "tasks" => Ok(render_task_list(&context.tasks, self.name).await),
-            target => {
-                let id = target.strip_prefix("tasks/").ok_or_else(|| {
-                    anyhow!(
-                        "expected {}://help or {}://tasks/<id>",
-                        self.name,
-                        self.name
-                    )
-                })?;
-                render_task(&context.tasks, self.name, id).await
-            }
+            _ => bail!("expected {}://help", self.name),
         }
     }
 
@@ -280,14 +327,19 @@ impl Protocol for ShellProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let (target, wait) = parse_target(request.target)?;
-        if !matches!(target, "" | "run") {
-            bail!(
-                "expected {}://run or {}://?wait=<seconds>",
-                self.name,
-                self.name
-            );
-        }
+        self.exec_with_auto_background(request, context, AUTO_BACKGROUND_AFTER)
+            .await
+    }
+}
+
+impl ShellProtocol {
+    async fn exec_with_auto_background(
+        &self,
+        request: ProtocolRequest<'_>,
+        context: ProtocolContext,
+        auto_background_after: Duration,
+    ) -> Result<Vec<u8>> {
+        let options = parse_target(request.target)?;
         let command = command_from_body(request.body)?.to_string();
         let executable = self.executable.clone();
         let cwd = self.cwd.clone();
@@ -296,50 +348,145 @@ impl Protocol for ShellProtocol {
             .environment
             .clone()
             .ok_or_else(|| anyhow!("shell environment is not attached"))?;
-        let record = context
-            .tasks
-            .allocate(self.name, command_label(&command))
-            .await;
+        let record = if options.background {
+            context
+                .tasks
+                .allocate_background(self.name, command_label(&command))
+                .await?
+        } else {
+            context
+                .tasks
+                .allocate(self.name, command_label(&command))
+                .await
+        };
         let id = record.id.clone();
         let tasks = context.tasks.clone();
+        let mut foreground = (!options.background).then(|| {
+            ForegroundTaskGuard::new(tasks.clone(), id.clone(), record.cancellation.clone())
+        });
+        let progress_tasks = tasks.clone();
+        let progress_id = id.clone();
         tasks
             .spawn(record, async move {
                 let environment = environment.snapshot().await;
-                execute(&protocol, &executable, &cwd, &command, &environment).await
+                execute(
+                    &protocol,
+                    &executable,
+                    &cwd,
+                    &command,
+                    &environment,
+                    options.timeout,
+                    Some((&progress_tasks, &progress_id)),
+                )
+                .await
             })
             .await;
-        let Some(wait) = wait else {
-            return Ok(prompts::task_accepted(self.name, &id).into_bytes());
-        };
+        if options.background {
+            return Ok(prompts::task_accepted(&id).into_bytes());
+        }
         let record = context
             .tasks
-            .wait(&id, wait)
+            .wait(&id, auto_background_after)
             .await
             .ok_or_else(|| anyhow!("task disappeared: {id}"))?;
         if record.status.terminal() {
-            return Ok(render_record(&record).into_bytes());
+            let result = finish_foreground(&context.tasks, record).await;
+            foreground
+                .as_mut()
+                .expect("foreground commands have a cancellation guard")
+                .disarm();
+            return result;
         }
-        Ok(format!(
-            "{}\nWait window elapsed; the task is still {}.",
-            prompts::task_accepted(self.name, &id),
-            record.status.as_str()
-        )
-        .into_bytes())
+        match context.tasks.promote_background(&id).await {
+            PromoteBackground::Promoted => {
+                foreground
+                    .as_mut()
+                    .expect("foreground commands have a cancellation guard")
+                    .disarm();
+                Ok(prompts::task_accepted(&id).into_bytes())
+            }
+            PromoteBackground::Terminal(record) => {
+                let result = finish_foreground(&context.tasks, record).await;
+                foreground
+                    .as_mut()
+                    .expect("foreground commands have a cancellation guard")
+                    .disarm();
+                result
+            }
+            PromoteBackground::AtCapacity => {
+                let record = context
+                    .tasks
+                    .wait_until_terminal(&id)
+                    .await
+                    .ok_or_else(|| anyhow!("task disappeared: {id}"))?;
+                let result = finish_foreground(&context.tasks, record).await;
+                foreground
+                    .as_mut()
+                    .expect("foreground commands have a cancellation guard")
+                    .disarm();
+                result
+            }
+        }
     }
 }
 
-fn parse_target(target: &str) -> Result<(&str, Option<Duration>)> {
-    let Some((target, query)) = target.rsplit_once('?') else {
-        return Ok((target, None));
-    };
-    let seconds = query
-        .strip_prefix("wait=")
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| anyhow!("shell wait must be an integer number of seconds"))?;
-    if seconds > 300 {
-        bail!("shell wait cannot exceed 300 seconds");
+async fn finish_foreground(tasks: &TaskManager, record: TaskRecord) -> Result<Vec<u8>> {
+    tasks.remove(&record.id).await;
+    match record.status {
+        TaskStatus::Completed => Ok(record.content),
+        TaskStatus::Failed => Err(anyhow!(
+            String::from_utf8_lossy(&record.content).into_owned()
+        )),
+        TaskStatus::Cancelled => bail!("shell command was cancelled"),
+        TaskStatus::Pending | TaskStatus::Running => {
+            bail!("shell command did not reach a terminal state")
+        }
     }
-    Ok((target, Some(Duration::from_secs(seconds))))
+}
+
+fn parse_target(target: &str) -> Result<ShellOptions> {
+    let (route, query) = target
+        .split_once('?')
+        .map_or((target, None), |(route, query)| (route, Some(query)));
+    if route != "run" {
+        bail!("expected shell target run");
+    }
+    let mut background = false;
+    let mut timeout = DEFAULT_TIMEOUT;
+    let mut saw_background = false;
+    let mut saw_timeout = false;
+    if let Some(query) = query {
+        if query.is_empty() {
+            bail!("shell query cannot be empty");
+        }
+        for option in query.split('&') {
+            let (name, value) = option
+                .split_once('=')
+                .ok_or_else(|| anyhow!("shell options must use name=value"))?;
+            match name {
+                "background" if !saw_background => {
+                    background = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => bail!("shell background must be true or false"),
+                    };
+                    saw_background = true;
+                }
+                "timeout" if !saw_timeout => {
+                    timeout = Duration::from_secs(value.parse::<u64>().map_err(|_| {
+                        anyhow!("shell timeout must be an integer number of seconds")
+                    })?);
+                    saw_timeout = true;
+                }
+                "background" | "timeout" => bail!("duplicate shell option: {name}"),
+                _ => bail!("unknown shell option: {name}"),
+            }
+        }
+    }
+    Ok(ShellOptions {
+        background,
+        timeout: (!timeout.is_zero()).then_some(timeout),
+    })
 }
 
 fn command_from_body(body: Option<&Value>) -> Result<&str> {
@@ -375,7 +522,16 @@ async fn execute(
     cwd: &Path,
     script: &str,
     environment: &BTreeMap<String, String>,
+    timeout: Option<Duration>,
+    progress: Option<(&TaskManager, &str)>,
 ) -> Result<Vec<u8>> {
+    let deadline = timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| anyhow!("shell timeout is too large"))
+        })
+        .transpose()?;
     let mut command = Command::new(executable);
     let input = if protocol == "bash" {
         command.args(["--noprofile", "--norc"]);
@@ -412,7 +568,21 @@ async fn execute(
         .stdin
         .take()
         .ok_or_else(|| anyhow!("failed to open shell stdin"))?;
-    stdin.write_all(input.as_bytes()).await?;
+    if let Some(deadline) = deadline {
+        match time::timeout_at(deadline, stdin.write_all(input.as_bytes())).await {
+            Ok(result) => result?,
+            Err(_) => {
+                bail!(
+                    "Command timed out after {} seconds.",
+                    timeout
+                        .expect("a deadline is only present when a timeout is configured")
+                        .as_secs()
+                )
+            }
+        }
+    } else {
+        stdin.write_all(input.as_bytes()).await?;
+    }
     drop(stdin);
 
     let mut stdout = Some(
@@ -432,14 +602,23 @@ async fn execute(
     let mut stdout_buffer = [0_u8; 8192];
     let mut stderr_buffer = [0_u8; 8192];
     let mut status = None;
+    let mut timed_out = false;
     let output_idle = time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
+    let deadline = time::sleep_until(
+        deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
+    );
     tokio::pin!(output_idle);
+    tokio::pin!(deadline);
 
     loop {
         if status.is_some() && stdout.is_none() && stderr.is_none() {
             break;
         }
         tokio::select! {
+            _ = &mut deadline, if timeout.is_some() => {
+                timed_out = true;
+                break;
+            }
             result = child.wait(), if status.is_none() => {
                 status = Some(result?);
                 output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
@@ -456,6 +635,9 @@ async fn execute(
                     stdout = None;
                 } else {
                     stdout_content.extend_from_slice(&stdout_buffer[..count]);
+                    if let Some((tasks, id)) = progress {
+                        tasks.append_latest_output(id, &stdout_buffer[..count]).await;
+                    }
                     if status.is_some() {
                         output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
                     }
@@ -473,6 +655,9 @@ async fn execute(
                     stderr = None;
                 } else {
                     stderr_content.extend_from_slice(&stderr_buffer[..count]);
+                    if let Some((tasks, id)) = progress {
+                        tasks.append_latest_output(id, &stderr_buffer[..count]).await;
+                    }
                     if status.is_some() {
                         output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
                     }
@@ -482,21 +667,36 @@ async fn execute(
         }
     }
 
+    if timed_out {
+        let mut result = format!(
+            "Command timed out after {} seconds.\n",
+            timeout
+                .expect("the timeout branch is only enabled when configured")
+                .as_secs()
+        )
+        .into_bytes();
+        append_stream_output(&mut result, &stdout_content, &stderr_content);
+        return Err(anyhow!(String::from_utf8_lossy(&result).into_owned()));
+    }
     let status = status.ok_or_else(|| anyhow!("shell process exited without a status"))?;
     process_tree.disarm();
     let mut result = format!("Exit: {status}\n").into_bytes();
-    if !stdout_content.is_empty() {
-        result.extend_from_slice(b"\nstdout:\n");
-        result.extend_from_slice(&stdout_content);
-    }
-    if !stderr_content.is_empty() {
-        result.extend_from_slice(b"\nstderr:\n");
-        result.extend_from_slice(&stderr_content);
-    }
+    append_stream_output(&mut result, &stdout_content, &stderr_content);
     if status.success() {
         Ok(result)
     } else {
         Err(anyhow!(String::from_utf8_lossy(&result).into_owned()))
+    }
+}
+
+fn append_stream_output(result: &mut Vec<u8>, stdout: &[u8], stderr: &[u8]) {
+    if !stdout.is_empty() {
+        result.extend_from_slice(b"\nstdout:\n");
+        result.extend_from_slice(stdout);
+    }
+    if !stderr.is_empty() {
+        result.extend_from_slice(b"\nstderr:\n");
+        result.extend_from_slice(stderr);
     }
 }
 
@@ -591,26 +791,47 @@ mod tests {
         assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
-        assert!(PWSH_HELP.contains("Do not create another background layer"));
-        assert!(PWSH_HELP.contains("`?wait=<seconds>`"));
-        assert!(PWSH_HELP.contains("`pwsh://tasks/<id>`"));
-        assert!(PWSH_HELP.contains("`pwsh://?wait=30`"));
+        assert!(PWSH_HELP.contains("Do not add another background layer"));
+        assert!(PWSH_HELP.contains("`background=true`"));
+        assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
+        assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
+        assert!(PWSH_HELP.contains("do not poll"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
-        assert!(BASH_HELP.contains("`?wait=<seconds>`"));
-        assert!(BASH_HELP.contains("`bash://tasks/<id>`"));
+        assert!(BASH_HELP.contains("`background=true`"));
+        assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
+        assert!(BASH_HELP.contains("unified `tasks://` protocol"));
+        assert!(!BASH_HELP.contains("?wait="));
         assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }
 
     #[test]
-    fn shell_plugin_parses_its_own_wait_option() {
-        assert_eq!(parse_target("run").unwrap(), ("run", None));
+    fn shell_plugin_parses_background_and_timeout_options() {
         assert_eq!(
-            parse_target("?wait=30").unwrap(),
-            ("", Some(Duration::from_secs(30)))
+            parse_target("run").unwrap(),
+            ShellOptions {
+                background: false,
+                timeout: Some(DEFAULT_TIMEOUT),
+            }
         );
-        assert!(parse_target("run?wait=not-a-number").is_err());
-        assert!(parse_target("run?wait=301").is_err());
+        assert_eq!(
+            parse_target("run?background=true&timeout=0").unwrap(),
+            ShellOptions {
+                background: true,
+                timeout: None,
+            }
+        );
+        assert_eq!(
+            parse_target("run?timeout=30&background=false").unwrap(),
+            ShellOptions {
+                background: false,
+                timeout: Some(Duration::from_secs(30)),
+            }
+        );
+        assert!(parse_target("run?timeout=not-a-number").is_err());
+        assert!(parse_target("run?background=yes").is_err());
+        assert!(parse_target("run?timeout=1&timeout=2").is_err());
         assert!(parse_target("run?other=30").is_err());
+        assert!(parse_target("?timeout=30").is_err());
     }
 
     #[test]
@@ -737,6 +958,8 @@ mod tests {
             directory.path(),
             &script,
             &BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -758,6 +981,8 @@ mod tests {
             directory.path(),
             native_failure,
             &BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap_err()
@@ -770,7 +995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_is_async_by_default_and_can_opt_into_a_bounded_wait() {
+    async fn shell_returns_short_commands_and_backgrounds_long_or_explicit_commands() {
         let directory = tempfile::tempdir().unwrap();
         let Some(executable) = find_executable("bash") else {
             return;
@@ -782,13 +1007,50 @@ mod tests {
         let context = ProtocolContext {
             tasks: crate::task::TaskManager::new(),
         };
-        let command = Value::String("sleep 0.2; printf async-ok".to_string());
+        let command = Value::String("printf foreground-ok".to_string());
+        let completed = shell
+            .exec_with_auto_background(
+                ProtocolRequest {
+                    uri: "bash://run",
+                    target: "run",
+                    body: Some(&command),
+                },
+                context.clone(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let completed = String::from_utf8(completed).unwrap();
+        assert!(completed.contains("Exit:"));
+        assert!(completed.contains("foreground-ok"));
+        assert!(context.tasks.list().await.is_empty());
+
+        let command = Value::String("sleep 0.2; printf automatic-ok".to_string());
+        let started = Instant::now();
+        let accepted = shell
+            .exec_with_auto_background(
+                ProtocolRequest {
+                    uri: "bash://run",
+                    target: "run",
+                    body: Some(&command),
+                },
+                context.clone(),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(150));
+        let accepted = String::from_utf8(accepted).unwrap();
+        assert!(accepted.contains("Background task accepted: tasks://002"));
+        assert!(accepted.contains("current status or output is explicitly needed"));
+
+        let command = Value::String("sleep 0.2; printf explicit-ok".to_string());
         let started = Instant::now();
         let accepted = shell
             .exec(
                 ProtocolRequest {
-                    uri: "bash://run",
-                    target: "run",
+                    uri: "bash://run?background=true",
+                    target: "run?background=true",
                     body: Some(&command),
                 },
                 context.clone(),
@@ -796,27 +1058,20 @@ mod tests {
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_millis(150));
-        assert!(
-            String::from_utf8(accepted)
-                .unwrap()
-                .contains("Task accepted")
-        );
+        assert!(String::from_utf8(accepted).unwrap().contains("tasks://003"));
 
-        let command = Value::String("printf wait-ok".to_string());
-        let completed = shell
-            .exec(
-                ProtocolRequest {
-                    uri: "bash://?wait=2",
-                    target: "?wait=2",
-                    body: Some(&command),
-                },
-                context,
-            )
+        let automatic = context
+            .tasks
+            .wait("002", Duration::from_secs(1))
             .await
             .unwrap();
-        let completed = String::from_utf8(completed).unwrap();
-        assert!(completed.contains("Status: completed"));
-        assert!(completed.contains("wait-ok"));
+        assert_eq!(automatic.status, TaskStatus::Completed);
+        assert!(
+            String::from_utf8(automatic.content)
+                .unwrap()
+                .contains("automatic-ok")
+        );
+        context.tasks.cancel("003").await;
     }
 
     #[tokio::test]
@@ -840,9 +1095,17 @@ mod tests {
         environment.set(&name, "managed".to_string()).await.unwrap();
         let values = PluginEnvironment::new(environment).snapshot().await;
 
-        let output = execute(protocol, &executable, directory.path(), &script, &values)
-            .await
-            .unwrap();
+        let output = execute(
+            protocol,
+            &executable,
+            directory.path(),
+            &script,
+            &values,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         // SAFETY: the process-unique variable is no longer used.
         unsafe { std::env::remove_var(&name) };
         let output = String::from_utf8(output).unwrap();
@@ -862,6 +1125,8 @@ mod tests {
             directory.path(),
             "printf finished; sleep 2 &",
             &BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -881,11 +1146,97 @@ mod tests {
             directory.path(),
             "(for value in 1 2 3 4; do sleep 0.05; printf 'tail%s\\n' \"$value\"; done) &",
             &BTreeMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();
 
         assert!(String::from_utf8(output).unwrap().contains("tail4"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_preserves_observed_output_and_terminates_the_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let leaked_path = directory.path().join("leaked");
+        let command = format!(
+            "printf partial; (sleep 0.3; printf leaked > '{}') & wait",
+            leaked_path.display()
+        );
+        let executable = find_executable("bash").unwrap();
+
+        let error = execute(
+            "bash",
+            &executable,
+            directory.path(),
+            &command,
+            &BTreeMap::new(),
+            Some(Duration::from_millis(50)),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        time::sleep(Duration::from_millis(500)).await;
+
+        assert!(error.contains("Command timed out"));
+        assert!(error.contains("stdout:\npartial"));
+        assert!(!leaked_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_foreground_shell_call_cancels_its_managed_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let started_path = directory.path().join("started");
+        let leaked_path = directory.path().join("leaked");
+        let command = Value::String(format!(
+            "printf started > '{}'; (sleep 0.3; printf leaked > '{}') & wait",
+            started_path.display(),
+            leaked_path.display()
+        ));
+        let executable = find_executable("bash").unwrap();
+        let mut shell = ShellProtocol::new("bash", executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
+        let context = ProtocolContext {
+            tasks: TaskManager::new(),
+        };
+
+        {
+            let execution = shell.exec_with_auto_background(
+                ProtocolRequest {
+                    uri: "bash://run",
+                    target: "run",
+                    body: Some(&command),
+                },
+                context.clone(),
+                Duration::from_secs(60),
+            );
+            tokio::pin!(execution);
+            for _ in 0..100 {
+                if started_path.exists() {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut execution => panic!("command unexpectedly settled: {result:?}"),
+                    _ = time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            assert!(started_path.exists());
+        }
+        for _ in 0..100 {
+            if context.tasks.get("001").await.is_none() {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        time::sleep(Duration::from_millis(500)).await;
+
+        assert!(context.tasks.get("001").await.is_none());
+        assert!(!leaked_path.exists());
     }
 
     #[cfg(unix)]
@@ -902,7 +1253,16 @@ mod tests {
         let executable = find_executable("bash").unwrap();
         let cwd = directory.path().to_path_buf();
         let execution = tokio::spawn(async move {
-            execute("bash", &executable, &cwd, &command, &BTreeMap::new()).await
+            execute(
+                "bash",
+                &executable,
+                &cwd,
+                &command,
+                &BTreeMap::new(),
+                None,
+                None,
+            )
+            .await
         });
 
         for _ in 0..50 {

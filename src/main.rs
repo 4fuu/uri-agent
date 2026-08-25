@@ -223,7 +223,6 @@ async fn run_session(
     for notice in notices {
         session.append(EventKind::Notice { text: notice }).await?;
     }
-    forward_task_notices(session.clone(), tasks.clone());
     let context_window = limits.context_window;
     let runtime = Arc::new(AgentRuntime::new(
         backend,
@@ -232,6 +231,7 @@ async fn run_session(
         frozen_context.system_prompt,
         limits,
     ));
+    forward_task_notices(session.clone(), tasks.clone(), Arc::downgrade(&runtime));
     runtime.set_compaction_settings(active.compaction).await;
     runtime.refresh_context_estimate().await;
     let commands = Arc::new(commands);
