@@ -95,9 +95,12 @@ and direct tools use the trusted [WASM plugin](plugins.md) path instead.
   the selected protocol unchanged.
 - Protocol names are unique. A protocol may implement `read`, `exec`, or both.
 - Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
-- Prefer a protocol for simple string inputs and a typed direct tool when
-  structured or escape-heavy arguments would otherwise require nested
-  serialization. Do not embed every capability in the initial prompt.
+- Keep protocol bodies semantically plain text when practical. Put operation
+  selection and bounded options in the protocol-owned URI path or query. If a
+  capability needs complex structured arguments, or its common calls require
+  substantial escaping, register a typed direct model tool through the owning
+  plugin instead of encoding that payload in a protocol body. Do not embed
+  every capability in the initial prompt.
 - Reserve plugin system prompt fragments for context the model must receive before its first tool call. Prompt-only plugins do not need to register a protocol.
 
 The shared routing and execution lifecycle is in [Protocols, tasks, and output](protocols.md).
