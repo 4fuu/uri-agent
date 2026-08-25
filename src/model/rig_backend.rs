@@ -22,7 +22,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 
 pub(super) fn has_usable_assistant_content(content: &[AssistantContent]) -> bool {
     content.iter().any(|content| match content {
@@ -140,6 +140,40 @@ pub(crate) enum RigClient {
     OpenAiCompletions(openai::completion::CompletionModel<AuthClient>),
     Anthropic(anthropic::completion::CompletionModel<AuthClient>),
     Gemini(gemini::completion::CompletionModel<AuthClient>),
+}
+
+struct DeferredRigBackend {
+    model: CatalogModel,
+    settings: ActiveSettings,
+    session_id: Option<String>,
+    manager: Arc<ConfigManager>,
+    backend: OnceCell<Arc<RigBackend>>,
+}
+
+impl DeferredRigBackend {
+    async fn backend(&self) -> Result<&Arc<RigBackend>> {
+        self.backend
+            .get_or_try_init(|| async {
+                let api_key = self
+                    .manager
+                    .resolve_model_api_key(&self.settings)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("no credential configured; press :login"))?;
+                Ok(Arc::new(
+                    RigBackend::new_with_manager(
+                        &self.model,
+                        &api_key,
+                        &self.settings.credential_environment,
+                        self.settings.auth_kind,
+                        self.settings.thinking,
+                        self.session_id.as_deref(),
+                        Some(self.manager.clone()),
+                    )
+                    .await?,
+                ))
+            })
+            .await
+    }
 }
 
 impl RigBackend {
@@ -348,9 +382,9 @@ pub async fn configured_backend(
     if !settings.model_configured() {
         return Ok(None);
     }
-    let Some(api_key) = settings.api_key.as_deref() else {
+    if settings.api_key.is_none() {
         return Ok(None);
-    };
+    }
     let model = settings.catalog_model(catalog).await.ok_or_else(|| {
         anyhow::anyhow!(
             "model {}/{} is not available in the runnable Pi catalog",
@@ -358,17 +392,14 @@ pub async fn configured_backend(
             settings.model
         )
     })?;
-    let backend = RigBackend::new_with_manager(
-        &model,
-        api_key,
-        &settings.credential_environment,
-        settings.auth_kind,
-        settings.thinking,
-        session_id,
-        Some(manager),
-    )
-    .await?;
-    let limits = backend.limits.clone();
+    let limits = model.limits();
+    let backend = DeferredRigBackend {
+        model,
+        settings: settings.clone(),
+        session_id: session_id.map(str::to_string),
+        manager,
+        backend: OnceCell::new(),
+    };
     Ok(Some((Arc::new(backend), limits)))
 }
 
@@ -466,6 +497,29 @@ impl ModelBackend for RigBackend {
 
     fn desired_max_output_tokens(&self) -> usize {
         self.limits.max_tokens as usize
+    }
+}
+
+#[async_trait]
+impl ModelBackend for DeferredRigBackend {
+    async fn prepare(&self) -> Result<()> {
+        self.backend().await.map(|_| ())
+    }
+
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        deltas: mpsc::UnboundedSender<ModelDelta>,
+    ) -> Result<ModelResponse> {
+        self.backend().await?.complete(request, deltas).await
+    }
+
+    fn accepts_image_input(&self) -> bool {
+        self.model.accepts_input("image")
+    }
+
+    fn desired_max_output_tokens(&self) -> usize {
+        self.model.max_tokens() as usize
     }
 }
 

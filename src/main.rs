@@ -1,17 +1,19 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use clap::Parser;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
 use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
-use uri_agent::plugin::{CommandRegistry, PluginHost, TuiRegistry};
+use uri_agent::plugin::{CommandRegistry, PluginHost, PluginRegistry, TuiRegistry};
 use uri_agent::prompts::ProtocolPrompt;
 use uri_agent::protocol::ProtocolRegistry;
-use uri_agent::runtime::{AgentRuntime, forward_task_notices};
+use uri_agent::runtime::{AgentRuntime, RuntimeInitializer, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice, SessionContext};
-use uri_agent::skill::SkillProtocol;
+use uri_agent::skill::{SkillProtocol, SkillProtocolSource};
 use uri_agent::task::TaskManager;
 use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
 use uri_agent::wasm_plugin::WasmPluginManager;
@@ -23,6 +25,106 @@ struct SessionRuntime {
     tui: Arc<TuiRegistry>,
     tasks: TaskManager,
     output: Arc<OutputStore>,
+}
+
+struct SessionInitializer {
+    session: Session,
+    plugins: Arc<PluginRegistry>,
+    cwd: PathBuf,
+    prompt_protocols: Vec<ProtocolPrompt>,
+    reserved_protocols: HashSet<String>,
+    skill_source: SkillProtocolSource,
+    wasm_plugins: WasmPluginManager,
+    startup_notices: Vec<String>,
+}
+
+#[async_trait]
+impl RuntimeInitializer for SessionInitializer {
+    async fn initialize(&self) -> Result<String> {
+        let (context, skills, mut notices) = if self.session.is_new() {
+            let plugins = self.plugins.clone();
+            let cwd = self.cwd.clone();
+            let mut prompt_protocols = self.prompt_protocols.clone();
+            let mut protocol_names = self.reserved_protocols.clone();
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let prompt_fragments = plugins.system_prompt_fragments()?;
+                let (discovered_skills, mut notices) = uri_agent::skill::discover(&cwd);
+                let mut skills = Vec::new();
+                let mut skill_snapshots = Vec::new();
+                for skill in discovered_skills {
+                    let snapshot = skill.snapshot();
+                    let protocol = skill.protocol_name().to_string();
+                    if !protocol_names.insert(protocol.clone()) {
+                        notices.push(format!(
+                            "skipped skill {} because protocol {}:// is already registered",
+                            snapshot.path.display(),
+                            protocol
+                        ));
+                        continue;
+                    }
+                    prompt_protocols.push(ProtocolPrompt {
+                        name: protocol,
+                        description: format!("Skill “{}”: {}", snapshot.name, snapshot.description),
+                    });
+                    skill_snapshots.push(snapshot);
+                    skills.push(skill);
+                }
+                prompt_protocols.sort_by(|left, right| left.name.cmp(&right.name));
+                let context = SessionContext {
+                    system_prompt: uri_agent::prompts::system_prompt(
+                        &prompt_protocols,
+                        &prompt_fragments,
+                    ),
+                    skills: skill_snapshots,
+                };
+                Ok((context, skills, notices))
+            })
+            .await??
+        } else {
+            let context = self.session.context().await;
+            let mut skills = Vec::new();
+            let mut notices = Vec::new();
+            for snapshot in context.skills.clone() {
+                let description = format!("skill {} at {}", snapshot.name, snapshot.path.display());
+                match SkillProtocol::from_snapshot(snapshot) {
+                    Ok(skill) => skills.push(skill),
+                    Err(error) => notices.push(format!("skipped {description}: {error:#}")),
+                }
+            }
+            (context, skills, notices)
+        };
+
+        if self.session.is_new() {
+            self.session.initialize_context(context.clone()).await?;
+        }
+        let mut reserved_protocols = self.reserved_protocols.clone();
+        reserved_protocols.extend(skills.iter().map(|skill| skill.protocol_name().to_string()));
+        self.skill_source.replace(skills);
+        self.wasm_plugins
+            .set_reserved_protocols(reserved_protocols)?;
+
+        let wasm_plugins = self.wasm_plugins.clone();
+        let session = self.session.clone();
+        tokio::spawn(async move {
+            let notice = match wasm_plugins.initialize().await {
+                Ok(report) if !report.diagnostics.is_empty() => Some(format!(
+                    "skipped {} WASM plugin(s); read wasm_plugin://help for diagnostics",
+                    report.diagnostics.len()
+                )),
+                Ok(_) => None,
+                Err(error) => Some(format!("WASM plugin initialization failed: {error:#}")),
+            };
+            if let Some(text) = notice {
+                let _ = session.append(EventKind::Notice { text }).await;
+            }
+        });
+
+        notices.extend(self.startup_notices.clone());
+        for text in notices {
+            self.session.append(EventKind::Notice { text }).await?;
+        }
+        Ok(context.system_prompt)
+    }
 }
 
 #[tokio::main]
@@ -75,59 +177,30 @@ async fn run_session(
     let mut plugins = uri_agent::builtins::plugins(&config.cwd);
     let wasm_plugins = WasmPluginManager::new(config.manager.directory(), &config.cwd).await?;
     plugins.add(wasm_plugins.clone());
-    let plugin_notices = plugins.startup_notices();
+    let mut startup_notices = plugins.startup_notices();
     let plugin_protocols = plugins.protocol_descriptors()?;
-    let plugin_prompt_fragments = plugins.system_prompt_fragments()?;
-    let mut protocol_names = plugin_protocols
+    let protocol_names = plugin_protocols
         .iter()
         .map(|descriptor| descriptor.name.clone())
         .collect::<HashSet<_>>();
-    let mut prompt_protocols = plugin_protocols
+    let prompt_protocols = plugin_protocols
         .iter()
         .map(|descriptor| ProtocolPrompt {
             name: descriptor.name.clone(),
             description: descriptor.description.clone(),
         })
         .collect::<Vec<_>>();
-    let (discovered_skills, mut notices) = uri_agent::skill::discover(&config.cwd);
-    let mut skill_snapshots = Vec::new();
-    for skill in discovered_skills {
-        let snapshot = skill.snapshot();
-        let protocol = skill.protocol_name().to_string();
-        if !protocol_names.insert(protocol.clone()) {
-            notices.push(format!(
-                "skipped skill {} because protocol {}:// is already registered",
-                snapshot.path.display(),
-                protocol
-            ));
-            continue;
-        }
-        prompt_protocols.push(ProtocolPrompt {
-            name: protocol,
-            description: format!("Skill “{}”: {}", snapshot.name, snapshot.description),
-        });
-        skill_snapshots.push(snapshot);
-    }
-    prompt_protocols.sort_by(|left, right| left.name.cmp(&right.name));
-    let candidate_context = SessionContext {
-        system_prompt: uri_agent::prompts::system_prompt(
-            &prompt_protocols,
-            &plugin_prompt_fragments,
-        ),
-        skills: skill_snapshots,
-    };
     let requested = match &config.session {
         SessionChoice::New => None,
         SessionChoice::Latest => Some("latest"),
         SessionChoice::Existing(id) => Some(id.as_str()),
     };
-    let session = Session::open(
+    let session = Session::open_deferred(
         requested,
         &config.cwd,
         &initial.provider,
         &initial.model,
         initial.thinking,
-        candidate_context,
     )
     .await?;
     let session_settings = session.model_settings().await;
@@ -139,11 +212,6 @@ async fn run_session(
             session_settings.thinking,
         )
         .await?;
-    let frozen_context = session.context().await;
-    if !session.is_new() {
-        notices.clear();
-    }
-    notices.extend(plugin_notices);
     let tasks = TaskManager::new();
     let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
     wasm_plugins.bind_output(output.clone())?;
@@ -159,38 +227,7 @@ async fn run_session(
         )
         .with_credentials(config.manager.clone()),
     )?;
-    for snapshot in frozen_context.skills.clone() {
-        let description = format!("skill {} at {}", snapshot.name, snapshot.path.display());
-        let skill = match SkillProtocol::from_snapshot(snapshot) {
-            Ok(skill) => skill,
-            Err(error) => {
-                notices.push(format!("skipped {description}: {error:#}"));
-                continue;
-            }
-        };
-        let description = format!(
-            "{}:// for skill {}",
-            skill.protocol_name(),
-            skill.display_name()
-        );
-        if let Err(error) = protocols.register(skill) {
-            notices.push(format!("skipped {description}: {error}"));
-        }
-    }
-    wasm_plugins.set_reserved_protocols(
-        protocols
-            .descriptors()
-            .into_iter()
-            .map(|descriptor| descriptor.name),
-    )?;
-    let wasm_report = wasm_plugins.reload().await?;
-    if !wasm_report.diagnostics.is_empty() {
-        notices.push(format!(
-            "skipped {} WASM plugin(s); read wasm_plugin://help for diagnostics",
-            wasm_report.diagnostics.len()
-        ));
-    }
-    notices.extend(config.catalog.warnings().await);
+    startup_notices.extend(config.catalog.warnings().await);
 
     let configured = match configured_backend(
         &active,
@@ -202,7 +239,7 @@ async fn run_session(
     {
         Ok(configured) => configured,
         Err(error) => {
-            notices.push(format!("model configuration is not usable: {error:#}"));
+            startup_notices.push(format!("model configuration is not usable: {error:#}"));
             None
         }
     };
@@ -217,23 +254,37 @@ async fn run_session(
                 .map_or_else(ModelLimits::default, |model| model.limits()),
         ),
     };
+    let skill_source = SkillProtocolSource::default();
+    protocols.set_dynamic_source(Arc::new(skill_source.clone()))?;
     protocols.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
     let protocols = Arc::new(protocols);
     wasm_plugins.bind_host(Arc::downgrade(&protocols))?;
-    for notice in notices {
-        session.append(EventKind::Notice { text: notice }).await?;
-    }
     let context_window = limits.context_window;
-    let runtime = Arc::new(AgentRuntime::new(
+    let initializer = Arc::new(SessionInitializer {
+        session: session.clone(),
+        plugins: Arc::new(plugins),
+        cwd: config.cwd.clone(),
+        prompt_protocols,
+        reserved_protocols: protocol_names,
+        skill_source,
+        wasm_plugins,
+        startup_notices,
+    });
+    let runtime = Arc::new(AgentRuntime::new_deferred(
         backend,
         protocols.clone(),
         session.clone(),
-        frozen_context.system_prompt,
+        initializer,
         limits,
     ));
     forward_task_notices(session.clone(), tasks.clone(), Arc::downgrade(&runtime));
     runtime.set_compaction_settings(active.compaction).await;
-    runtime.refresh_context_estimate().await;
+    let startup_runtime = runtime.clone();
+    tokio::spawn(async move {
+        if startup_runtime.prepare_context().await.is_ok() {
+            startup_runtime.refresh_context_estimate().await;
+        }
+    });
     let commands = Arc::new(commands);
     let tui = Arc::new(tui);
     let session_runtime = SessionRuntime {

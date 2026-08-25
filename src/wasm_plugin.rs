@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, RwLock as AsyncRwLock};
+use tokio::sync::{Mutex, OnceCell as AsyncOnceCell, RwLock as AsyncRwLock};
 use uri_agent_plugin_sdk::{
     ABI_VERSION, HANDLE_EXPORT, HOST_CREDENTIALS, HOST_ENVIRONMENT, HOST_EXEC, HOST_READ,
     HandlerRequest, MANIFEST_EXPORT, Operation, PluginManifest,
@@ -374,6 +374,7 @@ pub struct WasmPluginManager {
     working_directory: PathBuf,
     current: Arc<RwLock<Arc<PluginSet>>>,
     last_report: Arc<AsyncRwLock<ReloadReport>>,
+    initial: Arc<AsyncOnceCell<Result<ReloadReport, String>>>,
     reload_lock: Arc<Mutex<()>>,
     reserved_protocols: Arc<RwLock<HashSet<String>>>,
     output: Arc<OnceLock<Arc<OutputStore>>>,
@@ -395,6 +396,7 @@ impl WasmPluginManager {
             working_directory: working_directory.to_path_buf(),
             current: Arc::new(RwLock::new(Arc::new(PluginSet::default()))),
             last_report: Arc::new(AsyncRwLock::new(ReloadReport::default())),
+            initial: Arc::new(AsyncOnceCell::new()),
             reload_lock: Arc::new(Mutex::new(())),
             reserved_protocols: Arc::new(RwLock::new(HashSet::new())),
             output: Arc::new(OnceLock::new()),
@@ -426,7 +428,22 @@ impl WasmPluginManager {
     }
 
     pub async fn reload(&self) -> Result<ReloadReport> {
+        if self.initial.get().is_none() {
+            return self.initialize().await;
+        }
         self.reload_from(&self.directory).await
+    }
+
+    pub async fn initialize(&self) -> Result<ReloadReport> {
+        self.initial
+            .get_or_init(|| async {
+                self.reload_from(&self.directory)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .clone()
+            .map_err(|error| anyhow!(error))
     }
 
     async fn reload_from(&self, directory: &Path) -> Result<ReloadReport> {
@@ -469,7 +486,12 @@ impl WasmPluginManager {
     }
 }
 
+#[async_trait]
 impl DynamicProtocolSource for WasmPluginManager {
+    async fn ready(&self) -> Result<()> {
+        self.initialize().await.map(|_| ())
+    }
+
     fn descriptors(&self) -> Vec<ProtocolDescriptor> {
         self.current()
             .protocols
@@ -513,6 +535,7 @@ impl Protocol for WasmPluginManager {
         if request.target != "help" {
             bail!("unknown wasm_plugin read target; use wasm_plugin://help");
         }
+        let _ = self.initialize().await;
         let active = self.current().protocols.keys().cloned().collect::<Vec<_>>();
         let mut report = self.last_report.write().await;
         let diagnostic_count = report.diagnostics.len();

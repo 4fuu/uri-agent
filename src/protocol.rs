@@ -47,14 +47,19 @@ pub trait Protocol: Send + Sync {
     }
 }
 
+#[async_trait]
 pub trait DynamicProtocolSource: Send + Sync {
+    async fn ready(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn descriptors(&self) -> Vec<ProtocolDescriptor>;
     fn protocol(&self, name: &str) -> Option<Arc<dyn Protocol>>;
 }
 
 pub struct ProtocolRegistry {
     protocols: BTreeMap<String, Arc<dyn Protocol>>,
-    dynamic: Option<Arc<dyn DynamicProtocolSource>>,
+    dynamic: Vec<Arc<dyn DynamicProtocolSource>>,
     output: Arc<OutputStore>,
     context: ProtocolContext,
 }
@@ -63,7 +68,7 @@ impl ProtocolRegistry {
     pub fn new(output: Arc<OutputStore>, tasks: TaskManager) -> Self {
         Self {
             protocols: BTreeMap::new(),
-            dynamic: None,
+            dynamic: Vec::new(),
             output,
             context: ProtocolContext { tasks },
         }
@@ -88,10 +93,12 @@ impl ProtocolRegistry {
     }
 
     pub fn set_dynamic_source(&mut self, source: Arc<dyn DynamicProtocolSource>) -> Result<()> {
-        if self.dynamic.is_some() {
-            bail!("dynamic protocol source is already registered");
-        }
-        let mut names = HashSet::new();
+        let mut names = self
+            .dynamic
+            .iter()
+            .flat_map(|source| source.descriptors())
+            .map(|descriptor| descriptor.name)
+            .collect::<HashSet<_>>();
         for descriptor in source.descriptors() {
             validate_descriptor(&descriptor)?;
             if self.protocols.contains_key(&descriptor.name)
@@ -103,7 +110,7 @@ impl ProtocolRegistry {
                 );
             }
         }
-        self.dynamic = Some(source);
+        self.dynamic.push(source);
         Ok(())
     }
 
@@ -113,7 +120,7 @@ impl ProtocolRegistry {
             .values()
             .map(|protocol| protocol.descriptor())
             .collect::<Vec<_>>();
-        if let Some(dynamic) = &self.dynamic {
+        for dynamic in &self.dynamic {
             descriptors.extend(dynamic.descriptors());
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
@@ -159,6 +166,7 @@ impl ProtocolRegistry {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
+            .await
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
         let descriptor = protocol.descriptor();
         if !descriptor.can_read {
@@ -179,6 +187,7 @@ impl ProtocolRegistry {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
+            .await
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
@@ -190,12 +199,23 @@ impl ProtocolRegistry {
         self.output.present(content, name).await
     }
 
-    fn find_protocol(&self, name: &str, include_dynamic: bool) -> Option<Arc<dyn Protocol>> {
-        self.protocols.get(name).cloned().or_else(|| {
-            include_dynamic
-                .then(|| self.dynamic.as_ref()?.protocol(name))
-                .flatten()
-        })
+    async fn find_protocol(&self, name: &str, include_dynamic: bool) -> Option<Arc<dyn Protocol>> {
+        if let Some(protocol) = self.protocols.get(name) {
+            return Some(protocol.clone());
+        }
+        if !include_dynamic {
+            return None;
+        }
+        for source in &self.dynamic {
+            if let Some(protocol) = source.protocol(name) {
+                return Some(protocol);
+            }
+            let _ = source.ready().await;
+            if let Some(protocol) = source.protocol(name) {
+                return Some(protocol);
+            }
+        }
+        None
     }
 }
 
@@ -220,6 +240,7 @@ pub fn split_address(uri: &str) -> Result<(&str, &str)> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug, PartialEq)]
     struct CapturedRequest {
@@ -230,6 +251,61 @@ mod tests {
 
     struct CaptureProtocol {
         capture: Arc<Mutex<Option<CapturedRequest>>>,
+    }
+
+    struct NamedProtocol(String);
+
+    #[async_trait]
+    impl Protocol for NamedProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: self.0.clone(),
+                description: "dynamic test".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+
+        async fn read(
+            &self,
+            _request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            Ok(self.0.as_bytes().to_vec())
+        }
+    }
+
+    struct DeferredSource {
+        name: String,
+        protocol: Mutex<Option<Arc<dyn Protocol>>>,
+        ready_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DynamicProtocolSource for DeferredSource {
+        async fn ready(&self) -> Result<()> {
+            self.ready_calls.fetch_add(1, Ordering::Relaxed);
+            *self.protocol.lock().unwrap() = Some(Arc::new(NamedProtocol(self.name.clone())));
+            Ok(())
+        }
+
+        fn descriptors(&self) -> Vec<ProtocolDescriptor> {
+            self.protocol
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|protocol| protocol.descriptor())
+                .collect()
+        }
+
+        fn protocol(&self, name: &str) -> Option<Arc<dyn Protocol>> {
+            self.protocol
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|protocol| protocol.descriptor().name == name)
+                .cloned()
+        }
     }
 
     #[async_trait]
@@ -364,5 +440,39 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("already registered"));
         let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn registry_supports_multiple_deferred_dynamic_sources() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let first = Arc::new(DeferredSource {
+            name: "first".to_string(),
+            protocol: Mutex::new(None),
+            ready_calls: AtomicUsize::new(0),
+        });
+        let second = Arc::new(DeferredSource {
+            name: "second".to_string(),
+            protocol: Mutex::new(None),
+            ready_calls: AtomicUsize::new(0),
+        });
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry.set_dynamic_source(first.clone()).unwrap();
+        registry.set_dynamic_source(second.clone()).unwrap();
+
+        assert_eq!(
+            registry.read("second://help", None).await.unwrap(),
+            "second"
+        );
+        assert_eq!(first.ready_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(second.ready_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            registry
+                .descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
     }
 }

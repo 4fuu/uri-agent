@@ -23,7 +23,10 @@ pub struct TuiTerminal {
 impl TuiTerminal {
     pub fn new() -> Result<Self> {
         let terminal = ratatui::try_init()?;
-        let keyboard_enhancement = matches!(supports_keyboard_enhancement(), Ok(true));
+        // A capability query blocks for two seconds when a terminal does not
+        // answer device-status requests. Unsupported Unix terminals safely
+        // ignore the keyboard enhancement push/pop control sequences.
+        let keyboard_enhancement = cfg!(unix);
         let setup = if keyboard_enhancement {
             execute!(
                 stdout(),
@@ -69,6 +72,7 @@ impl TuiTerminal {
         let mut pending_receiver = runtime.subscribe_pending_messages();
         let keymap = Keymap::load(Some(&info.cwd), info.key_display).await?;
         let show_splash = std::mem::take(&mut self.first_session);
+        let refresh_catalog_on_start = show_splash && catalog.networking_enabled();
         let mut app = App::new(
             protocols.descriptors(),
             commands,
@@ -105,6 +109,7 @@ impl TuiTerminal {
             services,
             &mut receiver,
             &mut pending_receiver,
+            refresh_catalog_on_start,
         )
         .await
     }
@@ -135,11 +140,15 @@ pub(super) async fn run_loop(
     services: LoopServices,
     receiver: &mut tokio::sync::broadcast::Receiver<SessionUpdate>,
     pending_receiver: &mut watch::Receiver<Vec<PendingMessage>>,
+    refresh_catalog_on_start: bool,
 ) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
     animation.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+    if refresh_catalog_on_start {
+        start_background_catalog_refresh(app, &services, background_tx.clone());
+    }
     loop {
         let context = services.runtime.context_usage();
         app.info.context_tokens = context.tokens;
@@ -259,7 +268,10 @@ pub(super) async fn persist_and_exit(
 }
 
 pub(super) enum BackgroundEvent {
-    CatalogRefreshed(Result<ActiveSettings>),
+    CatalogRefreshed {
+        result: Box<Result<ActiveSettings>>,
+        announced: bool,
+    },
     OauthFinished(Result<OauthToken>),
     ClipboardImageRead(Result<Vec<u8>>),
     ClipboardRead(Result<clipboard::ClipboardContent>),
@@ -2854,15 +2866,39 @@ pub(super) fn start_catalog_refresh(
     }
     app.catalog_refreshing = true;
     app.set_flash("Refreshing the Pi model catalog…");
+    spawn_catalog_refresh(services, sender, true, true);
+}
+
+fn start_background_catalog_refresh(
+    app: &mut App,
+    services: &LoopServices,
+    sender: mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    if app.catalog_refreshing {
+        return;
+    }
+    app.catalog_refreshing = true;
+    spawn_catalog_refresh(services, sender, false, false);
+}
+
+fn spawn_catalog_refresh(
+    services: &LoopServices,
+    sender: mpsc::UnboundedSender<BackgroundEvent>,
+    force: bool,
+    announced: bool,
+) {
     let catalog = services.catalog.clone();
     let manager = services.manager.clone();
     tokio::spawn(async move {
         let result = async {
-            catalog.refresh(true).await?;
+            catalog.refresh(force).await?;
             manager.reload().await
         }
         .await;
-        let _ = sender.send(BackgroundEvent::CatalogRefreshed(result));
+        let _ = sender.send(BackgroundEvent::CatalogRefreshed {
+            result: Box::new(result),
+            announced,
+        });
     });
 }
 
@@ -2873,10 +2909,10 @@ pub(super) async fn finish_background(
     event: BackgroundEvent,
 ) {
     match event {
-        BackgroundEvent::CatalogRefreshed(result) => {
+        BackgroundEvent::CatalogRefreshed { result, announced } => {
             app.catalog_refreshing = false;
             let result = async {
-                result?;
+                (*result)?;
                 let active = active_for_runtime(&services.manager, &services.runtime).await?;
                 apply_active(
                     app,
@@ -2908,10 +2944,11 @@ pub(super) async fn finish_background(
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            app.set_flash(match result {
-                Ok(()) => "Pi model catalog refreshed".to_string(),
-                Err(error) => format!("Catalog refresh failed: {error:#}"),
-            });
+            match result {
+                Ok(()) if announced => app.set_flash("Pi model catalog refreshed"),
+                Ok(()) => {}
+                Err(error) => app.set_flash(format!("Catalog refresh failed: {error:#}")),
+            }
         }
         BackgroundEvent::OauthFinished(result) => {
             let provider = app

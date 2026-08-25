@@ -1,11 +1,14 @@
 use crate::config::{display_path, path_is_within};
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 fn help(skill_md: &str, skill_directory: &Path, protocol: &str) -> String {
     format!(
@@ -25,6 +28,48 @@ pub struct SkillSnapshot {
 pub struct SkillProtocol {
     protocol: String,
     snapshot: SkillSnapshot,
+}
+
+#[derive(Clone, Default)]
+pub struct SkillProtocolSource {
+    protocols: Arc<RwLock<BTreeMap<String, Arc<dyn Protocol>>>>,
+}
+
+impl SkillProtocolSource {
+    pub fn replace(&self, skills: Vec<SkillProtocol>) {
+        *self
+            .protocols
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = skills
+            .into_iter()
+            .map(|skill| {
+                (
+                    skill.protocol_name().to_string(),
+                    Arc::new(skill) as Arc<dyn Protocol>,
+                )
+            })
+            .collect();
+    }
+}
+
+#[async_trait]
+impl DynamicProtocolSource for SkillProtocolSource {
+    fn descriptors(&self) -> Vec<ProtocolDescriptor> {
+        self.protocols
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|protocol| protocol.descriptor())
+            .collect()
+    }
+
+    fn protocol(&self, name: &str) -> Option<Arc<dyn Protocol>> {
+        self.protocols
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .cloned()
+    }
 }
 
 #[derive(Deserialize)]

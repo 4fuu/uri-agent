@@ -48,6 +48,10 @@ pub struct ModelResponse {
 
 #[async_trait]
 pub trait ModelBackend: Send + Sync {
+    async fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn complete(
         &self,
         request: ModelRequest,

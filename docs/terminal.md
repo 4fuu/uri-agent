@@ -30,6 +30,8 @@ Bindings belong to surfaces such as `global`, `main`, `composer`, `command`, `li
 
 Configurable actions must go through the keymap. Commands available from the panel or key bindings use `CommandRegistry`; they do not add a separate hard-coded command path.
 
+On Unix, URI Agent enables enhanced keyboard reporting without a blocking terminal capability query; terminals that do not support the control sequence safely ignore it. This avoids adding a fixed probe timeout before the first frame. Windows uses the console's normal keyboard reporting.
+
 ## Embedded terminal
 
 `:set-terminal` stores the command used by `:terminal`, such as `bash` or `pwsh -NoLogo`. `URI_AGENT_TERMINAL` can override it for one invocation.

@@ -358,15 +358,11 @@ impl ModelCatalog {
                 .build()?,
             offline,
         };
-        if !offline && let Err(error) = catalog.refresh(false).await {
-            catalog
-                .inner
-                .write()
-                .await
-                .warnings
-                .push(format!("Pi model catalog refresh failed: {error:#}"));
-        }
         Ok(catalog)
+    }
+
+    pub fn networking_enabled(&self) -> bool {
+        !self.offline
     }
 
     pub async fn refresh(&self, force: bool) -> Result<()> {

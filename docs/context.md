@@ -1,6 +1,6 @@
 # Startup context and Skills
 
-URI Agent builds startup context for each new session from its core prompt, prompt-only plugins, and discovered Skills. It freezes the resulting system prompt and Skill selection so later filesystem or environment changes do not reinterpret an existing session.
+URI Agent builds startup context for each new session from its core prompt, prompt-only plugins, and discovered Skills. Preparation begins in the background after the TUI opens; the first user message waits for the complete result. URI Agent then freezes the system prompt and Skill selection so later filesystem or environment changes do not reinterpret an existing session.
 
 ## Project instructions
 
@@ -14,7 +14,7 @@ The following content is from the project's AGENTS.md. Follow these instructions
 </project_rule_md>
 ```
 
-A missing file contributes nothing; other read failures stop session creation. Changes to `AGENTS.md` apply only to new sessions.
+A missing file contributes nothing; other read failures prevent the first message from starting. Changes to `AGENTS.md` apply only to new sessions.
 
 ## Installed binary hints
 
@@ -34,7 +34,7 @@ Neither startup plugin registers a protocol, command, panel, status provider, ke
 
 ### Discovery
 
-URI Agent scans these roots once at startup, from highest to lowest priority:
+For a new session, URI Agent scans these roots once while preparing its startup context, from highest to lowest priority:
 
 ```text
 <project>/.agents/skills
@@ -77,4 +77,4 @@ A new session stores:
 - each selected Skill's name and description;
 - each selected Skill's canonical `SKILL.md` path.
 
-Resume reuses this snapshot instead of rediscovering current context. Resources continue to load from the frozen location, so removing it produces an explicit error; a same-named Skill elsewhere cannot replace it. A stored session without frozen context is invalid rather than being reinterpreted with current startup state.
+Resume reuses this snapshot and does not scan current project instructions, `PATH`, or Skill roots. Resources continue to load from the frozen location, so removing it produces an explicit error; a same-named Skill elsewhere cannot replace it. A stored session without frozen context is invalid rather than being reinterpreted with current startup state.

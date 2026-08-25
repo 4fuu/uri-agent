@@ -14,7 +14,7 @@ If no platform data directory is available, URI Agent falls back to `<project>/.
 
 Earlier unversioned `sessions.db` files and their sidecars remain untouched beside the new database as an archive. URI Agent does not open, import, or modify them. Configuration and credentials use a separate directory and are unaffected.
 
-A new session remains in memory until its first user message is accepted. URI Agent then writes the frozen context, queued startup events, and message in one transaction, so opening and closing an empty session creates no session record.
+A new session remains in memory while its startup context prepares in the background. Its first user message waits for that context, then URI Agent writes the frozen context, queued startup events, and message in one transaction. Opening and closing an empty session creates no session record.
 
 The canonical startup directory is the project boundary recorded with every session:
 
@@ -31,7 +31,7 @@ URI Agent saves the composer draft when the TUI exits or switches sessions. Befo
 
 ## Frozen startup context
 
-A new session stores a `SessionContext` event containing the complete generated system prompt and selected Skill snapshots. Resume reuses it instead of regenerating the prompt or rebinding Skills from the current filesystem. See [Startup context and Skills](context.md) for the inputs and Skill rules.
+A new session freezes a `SessionContext` event containing the complete generated system prompt and selected Skill snapshots before accepting its first user message. Resume reuses it instead of regenerating the prompt or rebinding Skills from the current filesystem. See [Startup context and Skills](context.md) for the inputs and Skill rules.
 
 ## Append-only events
 

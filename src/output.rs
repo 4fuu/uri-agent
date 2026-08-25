@@ -3,11 +3,12 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
+use tokio::sync::OnceCell;
 
 pub struct OutputStore {
     directory: PathBuf,
     limit: AtomicUsize,
-    sequence: AtomicU64,
+    sequence: OnceCell<AtomicU64>,
 }
 
 impl OutputStore {
@@ -17,14 +18,10 @@ impl OutputStore {
             .join("uri-agent")
             .join("outputs")
             .join(session_id);
-        fs::create_dir_all(&base)
-            .await
-            .with_context(|| format!("failed to create output directory: {}", base.display()))?;
-        let sequence = next_sequence(&base).await?;
         Ok(Self {
             directory: base,
             limit: AtomicUsize::new(limit),
-            sequence: AtomicU64::new(sequence),
+            sequence: OnceCell::new(),
         })
     }
 
@@ -41,7 +38,19 @@ impl OutputStore {
     }
 
     pub(crate) async fn preserve(&self, content: &[u8], hint: &str) -> Result<PathBuf> {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self
+            .sequence
+            .get_or_try_init(|| async {
+                fs::create_dir_all(&self.directory).await.with_context(|| {
+                    format!(
+                        "failed to create output directory: {}",
+                        self.directory.display()
+                    )
+                })?;
+                Ok::<_, anyhow::Error>(AtomicU64::new(next_sequence(&self.directory).await?))
+            })
+            .await?
+            .fetch_add(1, Ordering::Relaxed);
         let filename = format!("{:06}-{}.txt", sequence, sanitize(hint));
         let path = self.directory.join(filename);
         fs::write(&path, content)
@@ -110,11 +119,35 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn output_directory_is_created_only_when_content_is_preserved() {
+        let session_id = format!("lazy{}", uuid::Uuid::now_v7().simple());
+        let store = OutputStore::new(&session_id, 16).await.unwrap();
+        let directory = store.directory().to_path_buf();
+        let _ = fs::remove_dir_all(&directory).await;
+
+        assert!(!directory.exists());
+        assert_eq!(
+            store.present(b"short".to_vec(), "test").await.unwrap(),
+            "short"
+        );
+        assert!(!directory.exists());
+        assert!(
+            store
+                .present(vec![b'x'; 100], "test")
+                .await
+                .unwrap()
+                .contains("[output truncated]")
+        );
+        assert!(directory.exists());
+        let _ = fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
     async fn oversized_output_is_preserved_and_linked() {
         let store = OutputStore {
             directory: tempfile::tempdir().unwrap().keep(),
             limit: AtomicUsize::new(16),
-            sequence: AtomicU64::new(0),
+            sequence: OnceCell::new(),
         };
         let rendered = store.present(vec![b'x'; 100], "test").await.unwrap();
         assert!(rendered.contains("[output truncated]"));

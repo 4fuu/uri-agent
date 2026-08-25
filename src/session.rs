@@ -1,7 +1,7 @@
 use crate::catalog::ThinkingLevel;
 use crate::skill::SkillSnapshot;
 use crate::task::TaskStatus;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rig::message::Message;
 use serde::{Deserialize, Serialize};
@@ -401,7 +401,26 @@ impl Session {
             provider,
             model,
             thinking,
-            context,
+            Some(context),
+        )
+        .await
+    }
+
+    pub async fn open_deferred(
+        requested: Option<&str>,
+        cwd: &Path,
+        provider: &str,
+        model: &str,
+        thinking: ThinkingLevel,
+    ) -> Result<Self> {
+        Self::open_at_with_thinking(
+            session_database_path(cwd),
+            requested,
+            cwd,
+            provider,
+            model,
+            thinking,
+            None,
         )
         .await
     }
@@ -422,7 +441,7 @@ impl Session {
             provider,
             model,
             ThinkingLevel::default(),
-            context,
+            Some(context),
         )
         .await
     }
@@ -434,7 +453,7 @@ impl Session {
         provider: &str,
         model: &str,
         thinking: ThinkingLevel,
-        context: SessionContext,
+        context: Option<SessionContext>,
     ) -> Result<Self> {
         let (directory, connection) = open_database(database_path.clone()).await?;
         let project_directory = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -536,23 +555,23 @@ impl Session {
                 model: model.to_string(),
                 thinking,
             };
-            let frozen = EventKind::SessionContext { context };
-            existing.extend([
-                SessionEvent {
-                    sequence: 0,
-                    at,
-                    kind: created,
-                },
-                SessionEvent {
+            existing.push(SessionEvent {
+                sequence: 0,
+                at,
+                kind: created,
+            });
+            if let Some(context) = context {
+                existing.push(SessionEvent {
                     sequence: 1,
                     at,
-                    kind: frozen,
-                },
-            ]);
+                    kind: EventKind::SessionContext { context },
+                });
+            }
         }
-        if !existing
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
+        if !created_session
+            && !existing
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
         {
             return Err(anyhow!(
                 "session {id} has no frozen context and cannot be resumed"
@@ -584,6 +603,32 @@ impl Session {
     }
     pub fn is_new(&self) -> bool {
         self.created
+    }
+
+    pub async fn initialize_context(&self, context: SessionContext) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
+        {
+            return Ok(());
+        }
+        if state.persisted {
+            bail!("cannot initialize missing context for a persisted session");
+        }
+        let event = SessionEvent {
+            sequence: state
+                .events
+                .last()
+                .map_or(0, |event| event.sequence.saturating_add(1)),
+            at: Utc::now(),
+            kind: EventKind::SessionContext { context },
+        };
+        state.events.push(event.clone());
+        drop(state);
+        self.publish_persisted(&[event]);
+        Ok(())
     }
     pub fn project_directory(&self) -> &Path {
         &self.project_directory
@@ -831,6 +876,14 @@ impl Session {
                 kind,
             })
             .collect::<Vec<_>>();
+        if events.iter().any(|event| starts_session(&event.kind))
+            && !state
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
+        {
+            bail!("cannot start a session before its startup context is ready");
+        }
         let mut next_settings = state.model_settings.clone();
         apply_model_settings(&mut next_settings, events.iter().map(|event| &event.kind));
 
@@ -1353,6 +1406,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_context_is_required_and_persisted_with_the_first_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = Session::open_at_with_thinking(
+            path.clone(),
+            Some("deferred-context"),
+            Path::new("/work"),
+            "test",
+            "model",
+            ThinkingLevel::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !opened
+                .snapshot()
+                .await
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
+        );
+        let error = opened
+            .append(EventKind::User {
+                text: "too early".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("startup context is ready"));
+
+        opened
+            .initialize_context(context("deferred"))
+            .await
+            .unwrap();
+        opened
+            .append(EventKind::User {
+                text: "persist atomically".into(),
+            })
+            .await
+            .unwrap();
+        let kinds = opened
+            .connection
+            .call(|database| {
+                let mut statement =
+                    database.prepare("SELECT kind FROM events ORDER BY sequence")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["session_created", "session_context", "user"]);
+        drop(opened);
+
+        let resumed = Session::open_at(
+            path,
+            Some("deferred-context"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("changed"),
+        )
+        .await
+        .unwrap();
+        let frozen = resumed.context().await;
+        assert_eq!(frozen.system_prompt, "system deferred");
+        assert_eq!(frozen.skills[0].description, "description deferred");
+    }
+
+    #[tokio::test]
     async fn session_without_a_frozen_context_is_not_reinterpreted() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
@@ -1661,7 +1784,7 @@ mod tests {
             "openai",
             "gpt-old",
             ThinkingLevel::High,
-            context("settings"),
+            Some(context("settings")),
         )
         .await
         .unwrap();
@@ -1691,7 +1814,7 @@ mod tests {
             "different-default",
             "different-model",
             ThinkingLevel::Off,
-            context("ignored"),
+            Some(context("ignored")),
         )
         .await
         .unwrap();

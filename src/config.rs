@@ -390,6 +390,7 @@ pub struct ConfigManager {
     invocation: InvocationOverrides,
     files: Mutex<ConfigFiles>,
     active: RwLock<ActiveSettings>,
+    oauth_refresh: Mutex<()>,
 }
 
 impl ConfigManager {
@@ -412,12 +413,11 @@ impl ConfigManager {
         if !auth_path.exists() {
             write_json(&auth_path, &auth, true).await?;
         }
-        let mut files = ConfigFiles {
+        let files = ConfigFiles {
             global,
             project,
             auth,
         };
-        refresh_stored_oauth(&mut files, &auth_path).await?;
         let active = calculate_active(&files, &catalog, &invocation).await?;
         Ok(Self {
             directory,
@@ -426,6 +426,7 @@ impl ConfigManager {
             invocation,
             files: Mutex::new(files),
             active: RwLock::new(active),
+            oauth_refresh: Mutex::new(()),
         })
     }
 
@@ -513,7 +514,6 @@ impl ConfigManager {
         files.global = read_json(&self.settings_path()).await?;
         files.project = read_json(&self.project_path).await?;
         files.auth = read_json(&self.auth_path()).await?;
-        refresh_stored_oauth(&mut files, &self.auth_path()).await?;
         self.recalculate(&files).await
     }
 
@@ -640,7 +640,34 @@ impl ConfigManager {
     /// network I/O. If another login or refresh wins the race, its newer
     /// credential is returned instead of being overwritten.
     pub async fn force_refresh_oauth(&self, provider: &str) -> Result<OauthToken> {
+        self.refresh_oauth(provider, true).await
+    }
+
+    pub(crate) async fn resolve_model_api_key(
+        &self,
+        settings: &ActiveSettings,
+    ) -> Result<Option<String>> {
+        let value = if settings.auth_kind == AuthKind::Oauth
+            && settings.api_key_source == ValueSource::Global
+        {
+            Some(self.refresh_oauth(&settings.provider, false).await?.access)
+        } else {
+            settings.api_key.clone()
+        };
+        match value {
+            Some(value) => Ok(Some(
+                resolve_config_value(&value, &settings.credential_environment).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn refresh_oauth(&self, provider: &str, force: bool) -> Result<OauthToken> {
+        let _refresh = self.oauth_refresh.lock().await;
         let before = self.oauth_token(provider).await?;
+        if !force && !before.expired() {
+            return Ok(before);
+        }
         let refreshed = oauth::refresh_token(provider, &before).await?;
         let mut files = self.files.lock().await;
         let current = files
@@ -692,9 +719,20 @@ impl ConfigManager {
     }
 
     pub async fn refresh_credentials(&self) -> Result<ActiveSettings> {
-        let mut files = self.files.lock().await;
-        refresh_stored_oauth(&mut files, &self.auth_path()).await?;
-        self.recalculate(&files).await
+        let providers = self
+            .files
+            .lock()
+            .await
+            .auth
+            .0
+            .iter()
+            .filter(|(_, entry)| entry.kind == "oauth")
+            .map(|(provider, _)| provider.clone())
+            .collect::<Vec<_>>();
+        for provider in providers {
+            let _ = self.refresh_oauth(&provider, false).await;
+        }
+        Ok(self.current().await)
     }
 
     async fn recalculate(&self, files: &ConfigFiles) -> Result<ActiveSettings> {
@@ -870,10 +908,6 @@ async fn calculate_active(
             auth_kind = AuthKind::ApiKey;
         }
     }
-    api_key = match api_key {
-        Some(value) => Some(resolve_config_value(&value, &credential_environment).await?),
-        None => None,
-    };
     if api_key.is_none() {
         auth_kind = AuthKind::None;
     }
@@ -936,42 +970,6 @@ fn configured_thinking(
         source = ValueSource::Project;
     }
     (thinking, source)
-}
-
-async fn refresh_stored_oauth(files: &mut ConfigFiles, auth_path: &Path) -> Result<()> {
-    let mut changed = false;
-    for (provider, entry) in files.auth.0.iter_mut() {
-        if entry.kind != "oauth" {
-            continue;
-        }
-        let Some(refresh) = entry.refresh.clone() else {
-            continue;
-        };
-        let expired = entry
-            .expires
-            .is_none_or(|expires| chrono::Utc::now().timestamp_millis() >= expires);
-        if !expired {
-            continue;
-        }
-        let token = oauth::OauthToken {
-            kind: "oauth".to_string(),
-            refresh,
-            access: entry.access.clone().unwrap_or_default(),
-            expires: entry.expires.unwrap_or(0),
-            extra: entry.extra.clone(),
-        };
-        if let Ok(token) = oauth::refresh_token(provider, &token).await {
-            entry.access = Some(token.access);
-            entry.refresh = Some(token.refresh);
-            entry.expires = Some(token.expires);
-            entry.extra = token.extra;
-            changed = true;
-        }
-    }
-    if changed {
-        write_json(auth_path, &files.auth, true).await?;
-    }
-    Ok(())
 }
 
 fn setting<T: Clone>(default: T, global: Option<T>, project: Option<T>) -> (T, ValueSource) {
@@ -1626,6 +1624,45 @@ mod tests {
         );
         // SAFETY: this process-unique variable is no longer used.
         unsafe { env::remove_var(environment) };
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn active_model_command_credential_is_resolved_only_when_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        let marker = root.path().join("credential-command-ran");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(&project).await.unwrap();
+        let command = format!("!touch '{}'; printf lazy-secret", marker.to_string_lossy());
+        let catalog = Arc::new(ModelCatalog::load(&directory, true).await.unwrap());
+        let manager = ConfigManager::load(
+            directory,
+            &project,
+            catalog,
+            InvocationOverrides {
+                provider: Some("example".to_string()),
+                model: Some("example-model".to_string()),
+                api_key: Some(command.clone()),
+                ..InvocationOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let active = manager.current().await;
+        assert_eq!(active.api_key.as_deref(), Some(command.as_str()));
+        assert!(!marker.exists());
+        assert_eq!(
+            manager
+                .resolve_model_api_key(&active)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("lazy-secret")
+        );
+        assert!(marker.exists());
     }
 
     #[test]

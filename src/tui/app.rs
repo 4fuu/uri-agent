@@ -40,7 +40,6 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::supports_keyboard_enhancement;
 use futures_util::StreamExt;
 use model_selector::{ModelSelector, context_label, model_label, reasoning};
 use portable_pty::CommandBuilder;

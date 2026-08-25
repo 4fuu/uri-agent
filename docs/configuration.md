@@ -41,7 +41,7 @@ The active backend applies catalog data relevant to requests and accounting, inc
 
 ### Refresh and offline mode
 
-Catalog entries are considered fresh for four hours. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to force a refresh from pi.dev and immediately apply the resulting model configurations.
+Startup loads the local catalog immediately, then refreshes pi.dev in the background after the TUI is available. Catalog entries are considered fresh for four hours. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to force a refresh from pi.dev and immediately apply the resulting model configurations.
 
 Use any of the following to disable pi.dev requests and rely on local catalog data:
 
@@ -70,7 +70,7 @@ Offline mode still loads `models-store.json` and `models.json`; it only disables
 | `parallel` | API key for built-in web search and page extraction |
 | `exa` | API key for built-in web search and page extraction |
 
-Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent attempts to refresh expired entries that include a refresh token. On Unix, URI Agent creates `auth.json` with mode `0600` and the configuration directory with mode `0700`.
+Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent refreshes an expired entry when its provider is first used rather than refreshing every stored provider during startup. On Unix, URI Agent creates `auth.json` with mode `0600` and the configuration directory with mode `0700`.
 
 Models using `openai-codex-responses` require the `openai-codex` OAuth entry created by the OpenAI browser or device-code login. An OpenAI Platform API key—including `OPENAI_API_KEY`, `URI_AGENT_API_KEY`, or `--api-key`—is not accepted for this subscription endpoint. Model availability is determined by the signed-in ChatGPT account and its subscription.
 
@@ -303,7 +303,7 @@ API keys and configured header values support pi-style environment expansion. Th
 }
 ```
 
-Command values time out after 10 seconds and are cached for the process. On Windows they run through PowerShell; on other platforms they run through `sh -c`.
+Command values run when the credential or header is first needed, not while URI Agent starts. They time out after 10 seconds and are cached for the process. On Windows they run through PowerShell; on other platforms they run through `sh -c`.
 
 > [!WARNING]
 > A leading `!` executes with the permissions of URI Agent. Do not load credential or header configuration from an untrusted project.

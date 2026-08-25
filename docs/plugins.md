@@ -24,7 +24,7 @@ There are no install, update, remove, or list operations, no `--wasm-plugin` fla
 
 Only non-hidden regular `.wasm` files directly inside the persistent directory are loaded. Nested files and temporary suffixes such as `.wasm.tmp` are ignored. Atomically replacing a file updates its plugin at the next reload; removing a file disables it at the next reload.
 
-The directory follows `URI_AGENT_CONFIG_DIR`; see [Configuration locations](configuration.md#configuration-locations).
+The directory follows `URI_AGENT_CONFIG_DIR`; see [Configuration locations](configuration.md#configuration-locations). Initial compilation and loading begin in the background after session context is ready. The first dynamic protocol lookup waits for that initial set when necessary, while the stable `wasm_plugin` manager remains available immediately.
 
 ## Reload lifecycle
 

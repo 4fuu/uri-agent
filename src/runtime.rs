@@ -9,6 +9,7 @@ use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use base64::Engine;
 use rig::completion::{FinishReason, Usage};
 use rig::message::{
@@ -21,7 +22,7 @@ use std::sync::RwLock as SyncRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, OnceCell, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
 const TOOL_CALL_LOOP_THRESHOLD: usize = 5;
@@ -179,7 +180,8 @@ pub struct AgentRuntime {
     protocols: Arc<ProtocolRegistry>,
     tasks: TaskManager,
     session: Session,
-    system_prompt: String,
+    system_prompt: OnceCell<String>,
+    initializer: Option<Arc<dyn RuntimeInitializer>>,
     limits: RwLock<ModelLimits>,
     context_usage: SyncRwLock<compaction::ContextUsage>,
     compaction_settings: RwLock<compaction::Settings>,
@@ -188,6 +190,11 @@ pub struct AgentRuntime {
     shutting_down: AtomicBool,
     pending: Mutex<PendingState>,
     pending_updates: watch::Sender<Vec<PendingMessage>>,
+}
+
+#[async_trait]
+pub trait RuntimeInitializer: Send + Sync {
+    async fn initialize(&self) -> Result<String>;
 }
 
 impl AgentRuntime {
@@ -200,12 +207,17 @@ impl AgentRuntime {
     ) -> Self {
         let (pending_updates, _) = watch::channel(Vec::new());
         let tasks = protocols.tasks();
+        let system_prompt_cell = OnceCell::new();
+        system_prompt_cell
+            .set(system_prompt)
+            .expect("a new runtime prompt cell is empty");
         Self {
             backend: RwLock::new(backend),
             protocols,
             tasks,
             session,
-            system_prompt,
+            system_prompt: system_prompt_cell,
+            initializer: None,
             limits: RwLock::new(limits),
             context_usage: SyncRwLock::new(compaction::ContextUsage {
                 tokens: 0,
@@ -218,6 +230,36 @@ impl AgentRuntime {
             pending: Mutex::new(PendingState::default()),
             pending_updates,
         }
+    }
+
+    pub fn new_deferred(
+        backend: Option<Arc<dyn ModelBackend>>,
+        protocols: Arc<ProtocolRegistry>,
+        session: Session,
+        initializer: Arc<dyn RuntimeInitializer>,
+        limits: ModelLimits,
+    ) -> Self {
+        let mut runtime = Self::new(backend, protocols, session, String::new(), limits);
+        runtime.system_prompt = OnceCell::new();
+        runtime.initializer = Some(initializer);
+        runtime
+    }
+
+    async fn system_prompt(&self) -> Result<&str> {
+        self.system_prompt
+            .get_or_try_init(|| async {
+                self.initializer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("runtime startup context is unavailable"))?
+                    .initialize()
+                    .await
+            })
+            .await
+            .map(String::as_str)
+    }
+
+    pub async fn prepare_context(&self) -> Result<()> {
+        self.system_prompt().await.map(|_| ())
     }
 
     pub fn session(&self) -> &Session {
@@ -238,13 +280,16 @@ impl AgentRuntime {
     }
 
     pub async fn refresh_context_estimate(&self) {
+        let Ok(system_prompt) = self.system_prompt().await else {
+            return;
+        };
         let model = self.session.model_settings().await;
         let context = self
             .session
             .model_context(&model.provider, &model.model)
             .await;
         let usage = compaction::context_usage(
-            &self.system_prompt,
+            system_prompt,
             &context.history,
             &tool_definitions(),
             context.latest_api_usage,
@@ -415,6 +460,14 @@ impl AgentRuntime {
             }
             let _ = previous.handle.await;
         }
+        self.prepare_context().await?;
+        let backend = self
+            .backend
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
+        backend.prepare().await?;
         {
             let mut pending = self.pending.lock().await;
             if !pending.messages.is_empty() {
@@ -600,6 +653,7 @@ impl AgentRuntime {
         if prompt.is_empty() {
             return Ok(());
         }
+        self.prepare_context().await?;
         let backend = match self.backend.read().await.clone() {
             Some(backend) => backend,
             None => {
@@ -612,6 +666,7 @@ impl AgentRuntime {
                 return Err(anyhow!(text));
             }
         };
+        backend.prepare().await?;
         let content = match prepared_content {
             Some(content) => {
                 if content
@@ -994,7 +1049,7 @@ impl AgentRuntime {
         // message boundary. URI Agent additionally preserves tool-call/result
         // pairing when selecting that boundary.
         let preparation = compaction::prepare_with_settings(
-            &self.system_prompt,
+            self.system_prompt().await?,
             &history,
             context_window,
             force,
@@ -1142,7 +1197,7 @@ impl AgentRuntime {
         self.refresh_context_estimate().await;
         let history = self.session.model_history().await;
         let request = ModelRequest {
-            system: self.system_prompt.clone(),
+            system: self.system_prompt().await?.to_string(),
             history,
             tools: true,
             estimated_context: self.context_usage().tokens,
