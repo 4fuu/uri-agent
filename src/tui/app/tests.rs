@@ -1436,6 +1436,66 @@ fn assistant_reply_supports_direct_mouse_drag_selection() {
 }
 
 #[test]
+fn transcript_copy_omits_visual_soft_wraps() {
+    for (kind, text, width, separator, expected) in [
+        (
+            BlockKind::Assistant,
+            "abc 中文内容",
+            10,
+            TextRowSeparator::None,
+            "abc 中文内容",
+        ),
+        (
+            BlockKind::User,
+            "abc defgh",
+            8,
+            TextRowSeparator::Space,
+            "abc defgh",
+        ),
+        (
+            BlockKind::Assistant,
+            "abc  \ndef",
+            10,
+            TextRowSeparator::Newline,
+            "abc\ndef",
+        ),
+    ] {
+        let mut app = test_app();
+        app.push(
+            kind,
+            if kind == BlockKind::User {
+                "YOU"
+            } else {
+                "AGENT"
+            },
+            text.to_string(),
+            None,
+            false,
+            kind == BlockKind::Assistant,
+        );
+        render_to_string(&mut app, width, 12);
+        let mut rows = app
+            .hit_regions
+            .iter()
+            .filter_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y));
+        let first = rows.next().expect("first wrapped transcript row");
+        let last = rows.next_back().unwrap_or(first);
+        assert_eq!(last, first + 1);
+        let surface = app.selectable.as_ref().unwrap();
+        let selection = TextSelection {
+            start: (surface.area.x + 1, first),
+            end: (surface.area.right().saturating_sub(1), last),
+        };
+
+        assert_eq!(
+            surface.row_separators[(first - surface.area.y) as usize],
+            separator
+        );
+        assert_eq!(selected_surface_text(surface, selection), expected);
+    }
+}
+
+#[test]
 fn virtual_transcript_tail_supports_direct_reverse_drag_selection() {
     let mut app = test_app();
     for index in 0..30 {
@@ -4446,6 +4506,8 @@ fn cell_selection_preserves_lines_and_trims_padding() {
                 .map(str::to_string)
                 .collect(),
         ],
+        row_separators: vec![TextRowSeparator::Newline; 2],
+        left_padding: 0,
     };
     let selection = TextSelection {
         start: (11, 5),
@@ -4453,6 +4515,36 @@ fn cell_selection_preserves_lines_and_trims_padding() {
     };
     assert_eq!(selected_surface_text(&surface, selection), "bc\ndef");
     assert_eq!(complete_surface_text(&surface), "abc\ndef");
+}
+
+#[test]
+fn cell_selection_omits_soft_wraps_but_preserves_source_separators() {
+    let surface = SelectableSurface {
+        area: Rect::new(0, 0, 5, 4),
+        cells: ["abc", "def", "ghi", "j"]
+            .into_iter()
+            .map(|line| {
+                line.chars()
+                    .map(|character| character.to_string())
+                    .chain(std::iter::repeat_n(" ".to_string(), 5 - line.len()))
+                    .collect()
+            })
+            .collect(),
+        row_separators: vec![
+            TextRowSeparator::None,
+            TextRowSeparator::Space,
+            TextRowSeparator::Newline,
+            TextRowSeparator::Newline,
+        ],
+        left_padding: 0,
+    };
+    let selection = TextSelection {
+        start: (0, 0),
+        end: (0, 3),
+    };
+
+    assert_eq!(selected_surface_text(&surface, selection), "abcdef ghi\nj");
+    assert_eq!(complete_surface_text(&surface), "abcdef ghi\nj");
 }
 
 #[test]
@@ -4464,7 +4556,7 @@ fn captured_wide_characters_do_not_include_their_hidden_cells() {
     terminal
         .draw(|frame| {
             frame.render_widget(Paragraph::new("复制内容"), area);
-            capture_surface(frame, &mut app, area);
+            capture_surface(frame, &mut app, area, None, 0);
         })
         .unwrap();
 

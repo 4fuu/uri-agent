@@ -260,6 +260,15 @@ struct HitRegion<T> {
 struct SelectableSurface {
     area: Rect,
     cells: Vec<Vec<String>>,
+    row_separators: Vec<TextRowSeparator>,
+    left_padding: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextRowSeparator {
+    None,
+    Space,
+    Newline,
 }
 
 #[derive(Clone, Copy)]

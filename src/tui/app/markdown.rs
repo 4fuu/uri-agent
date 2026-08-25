@@ -1,10 +1,16 @@
-use super::{ACCENT, MUTED, SURFACE, TEXT};
+use super::{ACCENT, MUTED, SURFACE, TEXT, TextRowSeparator};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use textwrap::WordSeparator;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub(super) fn render(source: &str, width: usize) -> Vec<Line<'static>> {
+pub(super) struct RenderedLine {
+    pub(super) line: Line<'static>,
+    pub(super) separator: TextRowSeparator,
+}
+
+pub(super) fn render(source: &str, width: usize) -> Vec<RenderedLine> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -32,11 +38,12 @@ struct TableState {
 
 struct Writer {
     width: usize,
-    lines: Vec<Line<'static>>,
+    lines: Vec<RenderedLine>,
     spans: Vec<Span<'static>>,
     line_open: bool,
     line_width: usize,
     prefix_width: usize,
+    pending_space: bool,
     line_style: Style,
     styles: Vec<Style>,
     links: Vec<String>,
@@ -58,6 +65,7 @@ impl Writer {
             line_open: false,
             line_width: 0,
             prefix_width: 0,
+            pending_space: false,
             line_style: Style::default(),
             styles: vec![Style::default().fg(TEXT)],
             links: Vec::new(),
@@ -71,13 +79,16 @@ impl Writer {
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> Vec<RenderedLine> {
         self.flush_line();
-        while self.lines.last().is_some_and(|line| line.width() == 0) {
+        while self.lines.last().is_some_and(|line| line.line.width() == 0) {
             self.lines.pop();
         }
         if self.lines.is_empty() {
-            self.lines.push(Line::default());
+            self.lines.push(RenderedLine {
+                line: Line::default(),
+                separator: TextRowSeparator::Newline,
+            });
         }
         self.lines
     }
@@ -398,8 +409,11 @@ impl Writer {
 
     fn blank_line(&mut self) {
         self.flush_line();
-        if self.lines.last().is_some_and(|line| line.width() > 0) {
-            self.lines.push(Line::default());
+        if self.lines.last().is_some_and(|line| line.line.width() > 0) {
+            self.lines.push(RenderedLine {
+                line: Line::default(),
+                separator: TextRowSeparator::Newline,
+            });
         }
     }
 
@@ -451,14 +465,21 @@ impl Writer {
     }
 
     fn flush_line(&mut self) {
+        self.flush_line_with(TextRowSeparator::Newline);
+    }
+
+    fn flush_line_with(&mut self, separator: TextRowSeparator) {
         if !self.line_open {
             return;
         }
-        self.lines
-            .push(Line::from(std::mem::take(&mut self.spans)).style(self.line_style));
+        self.lines.push(RenderedLine {
+            line: Line::from(std::mem::take(&mut self.spans)).style(self.line_style),
+            separator,
+        });
         self.line_open = false;
         self.line_width = 0;
         self.prefix_width = 0;
+        self.pending_space = false;
         self.line_style = Style::default();
     }
 
@@ -467,20 +488,9 @@ impl Writer {
             if line_index > 0 {
                 self.flush_line();
             }
-            let mut token = String::new();
-            let mut whitespace = None;
-            for character in logical.chars().chain(std::iter::once('\0')) {
-                let kind = character.is_whitespace();
-                if let Some(previous) = whitespace
-                    && (kind != previous || character == '\0')
-                {
-                    self.push_token(&token, previous, style);
-                    token.clear();
-                }
-                if character != '\0' {
-                    token.push(character);
-                    whitespace = Some(kind);
-                }
+            for word in WordSeparator::new().find_words(logical) {
+                self.push_token(word.word, false, style);
+                self.push_token(word.whitespace, true, style);
             }
         }
     }
@@ -494,18 +504,24 @@ impl Writer {
             if self.line_width > self.prefix_width && self.line_width < self.width {
                 self.push_span(" ", style);
             }
+            self.pending_space = self.line_width > self.prefix_width;
             return;
         }
         let token_width = token.width();
         if self.line_width > self.prefix_width && self.line_width + token_width > self.width {
-            self.flush_line();
+            self.flush_line_with(if self.pending_space {
+                TextRowSeparator::Space
+            } else {
+                TextRowSeparator::None
+            });
             self.start_line();
         }
+        self.pending_space = false;
         for character in token.chars() {
             let character_width = character.width().unwrap_or(0);
             if self.line_width > self.prefix_width && self.line_width + character_width > self.width
             {
-                self.flush_line();
+                self.flush_line_with(self.soft_wrap_separator());
                 self.start_line();
             }
             self.push_span(&character.to_string(), style);
@@ -523,6 +539,19 @@ impl Writer {
             last.content.to_mut().push_str(content);
         } else {
             self.spans.push(Span::styled(content.to_string(), style));
+        }
+    }
+
+    fn soft_wrap_separator(&self) -> TextRowSeparator {
+        if self
+            .spans
+            .last()
+            .and_then(|span| span.content.chars().last())
+            .is_some_and(char::is_whitespace)
+        {
+            TextRowSeparator::Space
+        } else {
+            TextRowSeparator::None
         }
     }
 
@@ -548,7 +577,7 @@ impl Writer {
                 if self.line_width > self.prefix_width
                     && self.line_width + character_width > self.width
                 {
-                    self.flush_line();
+                    self.flush_line_with(self.soft_wrap_separator());
                     self.start_line();
                 }
                 self.push_span(
@@ -576,7 +605,7 @@ mod tests {
         );
         let text = lines
             .iter()
-            .map(Line::to_string)
+            .map(|line| line.line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("# Heading"));
@@ -585,7 +614,7 @@ mod tests {
         assert!(text.contains("│ quoted"));
         assert!(text.contains("rust"));
         assert!(text.contains("fn main() {}"));
-        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+        assert!(lines.iter().flat_map(|line| &line.line.spans).any(|span| {
             span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
     }
@@ -600,9 +629,14 @@ mod tests {
         for heading in ["One", "Two", "Three", "Four", "Five", "Six"] {
             let line = lines
                 .iter()
-                .find(|line| line.to_string().contains(heading))
+                .find(|line| line.line.to_string().contains(heading))
                 .unwrap();
-            assert!(line.spans.iter().all(|span| span.style.fg == Some(ACCENT)));
+            assert!(
+                line.line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(ACCENT))
+            );
         }
     }
 
@@ -611,7 +645,7 @@ mod tests {
         let source = "| Name | Result |\n| --- | --- |\n| tests | passed |";
         let wide = render(source, 40)
             .iter()
-            .map(Line::to_string)
+            .map(|line| line.line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(wide.contains("Name"));
@@ -619,7 +653,7 @@ mod tests {
 
         let narrow = render(source, 10)
             .iter()
-            .map(Line::to_string)
+            .map(|line| line.line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(narrow.contains("Name:"));
@@ -631,14 +665,36 @@ mod tests {
     #[test]
     fn wraps_unicode_without_exceeding_the_requested_width() {
         let lines = render("你好世界 **abcdef**", 8);
-        assert!(lines.iter().all(|line| line.width() <= 8));
+        assert!(lines.iter().all(|line| line.line.width() <= 8));
+    }
+
+    #[test]
+    fn cjk_text_fills_the_current_line_before_wrapping() {
+        let lines = render("abc 中文内容", 8)
+            .iter()
+            .map(|line| line.line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, ["abc 中文", "内容"]);
+    }
+
+    #[test]
+    fn soft_wraps_record_how_copied_rows_rejoin() {
+        let cjk = render("abc 中文内容", 8);
+        assert_eq!(cjk[0].separator, TextRowSeparator::None);
+
+        let english = render("abc defgh", 6);
+        assert_eq!(english[0].separator, TextRowSeparator::Space);
+
+        let hard_break = render("abc  \ndef", 8);
+        assert_eq!(hard_break[0].separator, TextRowSeparator::Newline);
     }
 
     #[test]
     fn task_and_nested_list_markers_stay_compact() {
         let text = render("- [x] done\n- parent\n    1. child\n- next", 40)
             .iter()
-            .map(Line::to_string)
+            .map(|line| line.line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("☑ done"));
@@ -652,11 +708,16 @@ mod tests {
         let lines = render("before\n\n---\n\nafter", 40);
         let rule = lines
             .iter()
-            .find(|line| line.to_string().contains('─'))
+            .find(|line| line.line.to_string().contains('─'))
             .unwrap();
-        assert_eq!(rule.width(), 40);
-        assert_eq!(rule.to_string(), "─".repeat(40));
-        assert!(rule.spans.iter().all(|span| span.style.fg == Some(MUTED)));
+        assert_eq!(rule.line.width(), 40);
+        assert_eq!(rule.line.to_string(), "─".repeat(40));
+        assert!(
+            rule.line
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(MUTED))
+        );
     }
 
     #[test]
@@ -664,12 +725,13 @@ mod tests {
         let lines = render("> ---", 20);
         let rule = lines
             .iter()
-            .find(|line| line.to_string().contains('─'))
+            .find(|line| line.line.to_string().contains('─'))
             .unwrap();
-        assert_eq!(rule.width(), 20);
-        assert!(rule.to_string().starts_with("│ "));
+        assert_eq!(rule.line.width(), 20);
+        assert!(rule.line.to_string().starts_with("│ "));
         assert_eq!(
-            rule.to_string()
+            rule.line
+                .to_string()
                 .chars()
                 .filter(|character| character == &'─')
                 .count(),

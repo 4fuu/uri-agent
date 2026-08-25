@@ -543,7 +543,7 @@ mod tests {
         tokio::fs::write(directory.path().join("nested/no.txt"), "needle text\n")
             .await
             .unwrap();
-        tokio::fs::write(directory.path().join(".gitignore"), "nested/two.rs\n")
+        tokio::fs::write(directory.path().join(".ignore"), "nested/\n")
             .await
             .unwrap();
         let protocol =

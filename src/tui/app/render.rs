@@ -286,18 +286,18 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         Some(areas[1])
     };
     let notice_area = has_notices.then(|| areas[1]);
-    let content = if idle {
+    let (content, transcript_row_separators) = if idle {
         render_brand(frame, app, areas[0], false);
-        areas[0]
+        (areas[0], None)
     } else {
-        render_transcript(frame, app, areas[0]);
+        let row_separators = render_transcript(frame, app, areas[0]);
         render_footer(
             frame,
             app,
             footer_area.expect("conversation footer area"),
             live_activity.as_deref(),
         );
-        areas[0]
+        (areas[0], Some(row_separators))
     };
     if let Some(notice_area) = notice_area {
         frame.render_widget(
@@ -336,7 +336,13 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         Some(content)
     };
     if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
-        capture_surface(frame, app, selectable_area);
+        let row_separators = app
+            .overlay
+            .is_none()
+            .then_some(transcript_row_separators)
+            .flatten();
+        let left_padding = usize::from(row_separators.is_some());
+        capture_surface(frame, app, selectable_area, row_separators, left_padding);
         render_selection(frame, app);
     }
     if app.overlay.is_none()
@@ -677,7 +683,11 @@ pub(super) fn status_tone_style(tone: TuiStatusTone) -> Style {
     })
 }
 
-pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+pub(super) fn render_transcript(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+) -> Vec<TextRowSeparator> {
     if app.blocks.is_empty() {
         let unconfigured = app.info.provider.trim().is_empty() || app.info.model.trim().is_empty();
         let lines = if unconfigured {
@@ -701,12 +711,13 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect
             ]
         };
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
-        return;
+        return vec![TextRowSeparator::Newline; area.height as usize];
     }
     let message_width = area.width.saturating_sub(2).max(1) as usize;
     let process_width = message_width.saturating_sub(2).max(1);
     app.transcript_body_width = process_width;
     let mut items = Vec::new();
+    let mut row_separators = Vec::new();
     let mut block_for_row = Vec::new();
     let mut user_surface_for_row = Vec::new();
     let mut block_rows = vec![None; app.blocks.len()];
@@ -729,16 +740,18 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect
             )
         }) {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
+            row_separators.push(TextRowSeparator::Newline);
             block_for_row.push(None);
             user_surface_for_row.push(false);
         }
         if block.kind == BlockKind::User {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
+            row_separators.push(TextRowSeparator::Newline);
             block_for_row.push(None);
             user_surface_for_row.push(true);
         }
         let first = items.len();
-        for item in transcript_block_items(
+        for (item, separator) in transcript_block_items(
             block,
             index == app.selected_block,
             Some(index) == active_block,
@@ -747,12 +760,14 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect
             app,
         ) {
             items.push(item);
+            row_separators.push(separator);
             block_for_row.push(Some(index));
             user_surface_for_row.push(block.kind == BlockKind::User);
         }
         block_rows[index] = Some((first, items.len().saturating_sub(1)));
         if block.kind == BlockKind::User {
             items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
+            row_separators.push(TextRowSeparator::Newline);
             block_for_row.push(None);
             user_surface_for_row.push(true);
         }
@@ -782,6 +797,12 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect
         .skip(offset)
         .take(app.transcript_height)
         .collect::<Vec<_>>();
+    let mut visible_row_separators = row_separators
+        .into_iter()
+        .skip(offset)
+        .take(app.transcript_height)
+        .collect::<Vec<_>>();
+    visible_row_separators.resize(app.transcript_height, TextRowSeparator::Newline);
     frame.render_widget(
         List::new(visible).block(Block::new().padding(Padding::horizontal(1))),
         area,
@@ -817,6 +838,7 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect
             });
         }
     }
+    visible_row_separators
 }
 
 pub(super) fn transcript_needs_gap(
@@ -847,7 +869,7 @@ pub(super) fn transcript_block_items(
     mut message_width: usize,
     mut process_width: usize,
     app: &App,
-) -> Vec<ListItem<'static>> {
+) -> Vec<(ListItem<'static>, TextRowSeparator)> {
     if block.parent_process.is_some() {
         message_width = message_width.saturating_sub(2).max(1);
         process_width = process_width.saturating_sub(2).max(1);
@@ -868,23 +890,27 @@ pub(super) fn transcript_block_items(
     );
     let collapsed_hint = format!("  ▸ {expand_hint}");
     let mut rows = Vec::new();
+    let mut row_separators = Vec::new();
 
     match block.kind {
         BlockKind::User => {
-            for line in wrapped_block_lines(&block.text, message_width) {
+            for line in wrapped_block_lines_with_separators(&block.text, message_width) {
+                row_separators.push(line.separator);
                 rows.push(transcript_block_item(
                     block,
-                    vec![Span::styled(line, Style::default().fg(TEXT))],
+                    vec![Span::styled(line.text, Style::default().fg(TEXT))],
                     background,
                 ));
             }
         }
         BlockKind::Assistant => {
-            for mut line in markdown::render(&block.text, message_width) {
+            for rendered in markdown::render(&block.text, message_width) {
+                let mut line = rendered.line;
                 if block.parent_process.is_some() {
                     line.spans.insert(0, Span::raw("  "));
                 }
                 rows.push(ListItem::new(line).style(Style::default().bg(background)));
+                row_separators.push(rendered.separator);
             }
         }
         BlockKind::Process => {
@@ -1092,7 +1118,8 @@ pub(super) fn transcript_block_items(
         }
     }
 
-    rows
+    row_separators.resize(rows.len(), TextRowSeparator::Newline);
+    rows.into_iter().zip(row_separators).collect()
 }
 
 pub(super) fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'static> {
@@ -1151,21 +1178,64 @@ pub(super) fn visible_block_lines(
     (wrapped, extra)
 }
 
+struct WrappedBlockLine {
+    text: String,
+    separator: TextRowSeparator,
+}
+
 pub(super) fn wrapped_block_lines(text: &str, width: usize) -> Vec<String> {
+    wrapped_block_lines_with_separators(text, width)
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
+fn wrapped_block_lines_with_separators(text: &str, width: usize) -> Vec<WrappedBlockLine> {
     let mut wrapped = Vec::new();
     for logical in text.lines() {
         if logical.is_empty() {
-            wrapped.push(String::new());
+            wrapped.push(WrappedBlockLine {
+                text: String::new(),
+                separator: TextRowSeparator::Newline,
+            });
         } else {
-            wrapped.extend(
-                textwrap::wrap(logical, width.max(1))
-                    .into_iter()
-                    .map(|line| line.into_owned()),
-            );
+            let lines = textwrap::wrap(logical, width.max(1));
+            let mut search_from = 0;
+            let mut ranges = Vec::with_capacity(lines.len());
+            for line in &lines {
+                let content = line.as_ref();
+                let start = logical[search_from..]
+                    .find(content)
+                    .map_or(search_from, |offset| search_from + offset);
+                let end = start.saturating_add(content.len()).min(logical.len());
+                ranges.push((start, end));
+                search_from = end;
+            }
+            for (index, line) in lines.into_iter().enumerate() {
+                let separator = if let Some((next_start, _)) = ranges.get(index + 1) {
+                    if logical[ranges[index].1..*next_start]
+                        .chars()
+                        .any(char::is_whitespace)
+                    {
+                        TextRowSeparator::Space
+                    } else {
+                        TextRowSeparator::None
+                    }
+                } else {
+                    TextRowSeparator::Newline
+                };
+                wrapped.push(WrappedBlockLine {
+                    text: line.into_owned(),
+                    separator,
+                });
+            }
         }
     }
     if wrapped.is_empty() {
-        wrapped.push(String::new());
+        wrapped.push(WrappedBlockLine {
+            text: String::new(),
+            separator: TextRowSeparator::Newline,
+        });
     }
     wrapped
 }
@@ -2791,7 +2861,13 @@ pub(super) fn centered(area: Rect, width_percent: u16, height_percent: u16) -> R
         .split(vertical[1])[1]
 }
 
-pub(super) fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+pub(super) fn capture_surface(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    row_separators: Option<Vec<TextRowSeparator>>,
+    left_padding: usize,
+) {
     let cells = (area.y..area.bottom())
         .map(|row| {
             let mut hidden_cells = 0;
@@ -2809,8 +2885,17 @@ pub(super) fn capture_surface(frame: &mut Frame<'_>, app: &mut App, area: Rect) 
                 })
                 .collect()
         })
-        .collect();
-    app.selectable = Some(SelectableSurface { area, cells });
+        .collect::<Vec<_>>();
+    let mut row_separators =
+        row_separators.unwrap_or_else(|| vec![TextRowSeparator::Newline; cells.len()]);
+    row_separators.resize(cells.len(), TextRowSeparator::Newline);
+    row_separators.truncate(cells.len());
+    app.selectable = Some(SelectableSurface {
+        area,
+        cells,
+        row_separators,
+        left_padding,
+    });
 }
 
 pub(super) fn render_selection(frame: &mut Frame<'_>, app: &App) {
@@ -2977,6 +3062,9 @@ pub(super) fn selected_surface_text(
     surface: &SelectableSurface,
     selection: TextSelection,
 ) -> String {
+    if surface.cells.is_empty() {
+        return String::new();
+    }
     let relative = |point: (u16, u16)| {
         (
             point.0.saturating_sub(surface.area.x) as usize,
@@ -2990,37 +3078,63 @@ pub(super) fn selected_surface_text(
     } else {
         (second, first)
     };
-    surface
-        .cells
-        .iter()
-        .enumerate()
-        .skip(start_y)
-        .take(end_y.saturating_sub(start_y) + 1)
-        .map(|(row, cells)| {
-            let from = if row == start_y { start_x } else { 0 };
-            let to = if row == end_y {
-                end_x.saturating_add(1)
-            } else {
-                cells.len()
-            };
+    let mut text = String::new();
+    let last_row = end_y.min(surface.cells.len().saturating_sub(1));
+    for row in start_y..=last_row {
+        let cells = &surface.cells[row];
+        let from = if row == start_y {
+            start_x
+        } else if surface.row_separators[row - 1] != TextRowSeparator::Newline {
+            first_content_cell(cells)
+        } else {
+            surface.left_padding.min(cells.len())
+        };
+        let to = if row == end_y {
+            end_x.saturating_add(1)
+        } else {
+            cells.len()
+        };
+        text.push_str(
             cells[from.min(cells.len())..to.min(cells.len())]
                 .concat()
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+                .trim_end(),
+        );
+        if row < last_row {
+            push_row_separator(&mut text, surface.row_separators[row]);
+        }
+    }
+    text
 }
 
 pub(super) fn complete_surface_text(surface: &SelectableSurface) -> String {
-    surface
-        .cells
+    let mut text = String::new();
+    for (row, cells) in surface.cells.iter().enumerate() {
+        let from = if row > 0 && surface.row_separators[row - 1] != TextRowSeparator::Newline {
+            first_content_cell(cells)
+        } else {
+            surface.left_padding.min(cells.len())
+        };
+        text.push_str(cells[from..].concat().trim_end());
+        if row + 1 < surface.cells.len() {
+            push_row_separator(&mut text, surface.row_separators[row]);
+        }
+    }
+    text.trim().to_string()
+}
+
+fn first_content_cell(cells: &[String]) -> usize {
+    cells
         .iter()
-        .map(|cells| cells.concat().trim_end().to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+        .position(|cell| !cell.chars().all(char::is_whitespace))
+        .unwrap_or(cells.len())
+}
+
+fn push_row_separator(text: &mut String, separator: TextRowSeparator) {
+    match separator {
+        TextRowSeparator::None => {}
+        TextRowSeparator::Space => text.push(' '),
+        TextRowSeparator::Newline => text.push('\n'),
+    }
 }
 
 /// Pi's `formatCwdForFooter`: replace the home directory prefix with `~`.
