@@ -126,17 +126,21 @@ impl Protocol for SessionsPlugin {
             });
         if target == "help" {
             if !request.body.is_empty() {
-                bail!("sessions://help does not accept a body");
+                bail!(
+                    r#"sessions://help requires an empty body; retry read("sessions://help", "")"#
+                );
             }
             if query.is_some() {
-                bail!("sessions://help does not accept query parameters");
+                bail!(
+                    r#"sessions://help does not accept query parameters; use read("sessions://help", "")"#
+                );
             }
             return Ok(help(&self.cwd).into_bytes());
         }
         let options = SessionsOptions::parse(query)?;
         let output = match target {
             "recent" => {
-                require_empty_body(request.body, "sessions://recent")?;
+                require_empty_body(request.body, request.uri)?;
                 options.validate_discovery()?;
                 discover(&self.archive, options, None).await?
             }
@@ -145,9 +149,11 @@ impl Protocol for SessionsPlugin {
                 let query = search_text(request.body)?;
                 discover(&self.archive, options, Some(query)).await?
             }
-            "" => bail!("sessions target is required; read sessions://help"),
+            "" => bail!(
+                r#"sessions target is required; use read("sessions://help", "") for instructions"#
+            ),
             id => {
-                require_empty_body(request.body, "sessions session reads")?;
+                require_empty_body(request.body, request.uri)?;
                 options.validate_read()?;
                 read_session(&self.archive, id, options).await?
             }
@@ -159,9 +165,11 @@ impl Protocol for SessionsPlugin {
     }
 }
 
-fn require_empty_body(body: &str, operation: &str) -> Result<()> {
+fn require_empty_body(body: &str, uri: &str) -> Result<()> {
     if !body.is_empty() {
-        bail!("{operation} does not accept a body");
+        bail!(
+            r#"sessions reads require an empty body; retry read({uri:?}, ""); to search session history, use read("sessions://search", "<search text>")"#
+        );
     }
     Ok(())
 }
@@ -169,7 +177,9 @@ fn require_empty_body(body: &str, operation: &str) -> Result<()> {
 fn search_text(body: &str) -> Result<String> {
     let query = body.trim();
     if query.is_empty() {
-        bail!("sessions search requires nonempty text in the body");
+        bail!(
+            r#"sessions search requires nonempty text in the body; use read("sessions://search", "<search text>")"#
+        );
     }
     if query.chars().count() > 500 {
         bail!("sessions query is too long");
@@ -960,7 +970,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("does not accept a body"));
+        let error = error.to_string();
+        assert!(error.contains(r#"retry read("sessions://recent", "")"#));
+        assert!(error.contains(r#"read("sessions://search", "<search text>")"#));
     }
 
     #[test]

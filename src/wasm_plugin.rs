@@ -628,7 +628,10 @@ impl Protocol for WasmPluginManager {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if !request.body.is_empty() {
-            bail!("wasm_plugin help reads do not accept a body");
+            bail!(
+                "wasm_plugin help reads require an empty body; retry read({:?}, \"\")",
+                request.uri
+            );
         }
         match request.target {
             "help/load" => return Ok(load_help(&self.directory).into_bytes()),
@@ -636,7 +639,7 @@ impl Protocol for WasmPluginManager {
             "help" => {}
             _ => {
                 bail!(
-                    "unknown wasm_plugin read target; use wasm_plugin://help, wasm_plugin://help/load, or wasm_plugin://help/author"
+                    r#"unknown wasm_plugin read target; use read("wasm_plugin://help", ""), read("wasm_plugin://help/load", ""), or read("wasm_plugin://help/author", "")"#
                 )
             }
         }
@@ -679,10 +682,12 @@ impl Protocol for WasmPluginManager {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target != "reload" {
-            bail!("unknown wasm_plugin operation; use wasm_plugin://reload");
+            bail!(r#"unknown wasm_plugin operation; use exec("wasm_plugin://reload", "")"#);
         }
         if !request.body.is_empty() {
-            bail!("wasm_plugin://reload does not accept a body");
+            bail!(
+                r#"wasm_plugin://reload requires an empty body; retry exec("wasm_plugin://reload", "")"#
+            );
         }
         Ok(self.reload().await?.render().into_bytes())
     }
@@ -1070,15 +1075,6 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
     let mut names = HashSet::new();
     for descriptor in &manifest.protocols {
         validate_descriptor(&host_descriptor(descriptor))?;
-        if descriptor.description.trim().is_empty() {
-            bail!("protocol {} requires a description", descriptor.name);
-        }
-        if !descriptor.can_read {
-            bail!(
-                "protocol {} must support read so <protocol>://help is available",
-                descriptor.name
-            );
-        }
         if !names.insert(&descriptor.name) {
             bail!("protocol {} is declared more than once", descriptor.name);
         }

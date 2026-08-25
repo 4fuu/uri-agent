@@ -458,29 +458,29 @@ impl Protocol for HttpsProtocol {
     ) -> Result<Vec<u8>> {
         match request.target {
             "help" => {
-                require_empty_body(request.body, "https://help")?;
+                require_empty_body(request.body, request.uri)?;
                 self.help().await
             }
             target if target.starts_with("help/") => {
-                require_empty_body(request.body, target)?;
+                require_empty_body(request.body, request.uri)?;
                 self.provider_help(target)
             }
             target if target == "search" || target.starts_with("search?") => {
                 self.search(target, request.body).await
             }
             target => {
-                if !request.body.is_empty() {
-                    bail!("HTTPS page reads do not accept a body");
-                }
+                require_empty_body(request.body, request.uri)?;
                 self.read_page(target).await
             }
         }
     }
 }
 
-fn require_empty_body(body: &str, target: &str) -> Result<()> {
+fn require_empty_body(body: &str, uri: &str) -> Result<()> {
     if !body.is_empty() {
-        bail!("{target} does not accept a body");
+        bail!(
+            r#"this HTTPS read requires an empty body; retry read({uri:?}, ""); to search the web, use read("https://search", "<search query>")"#
+        );
     }
     Ok(())
 }
@@ -495,7 +495,9 @@ impl SearchInput {
     fn parse(target: &str, body: &str) -> Result<Self> {
         let query = body.trim();
         if query.is_empty() {
-            bail!("https://search requires a nonempty string body containing the search query");
+            bail!(
+                r#"https://search requires a nonempty string body; use read("https://search", "<search query>")"#
+            );
         }
         let query = query.to_string();
         let url = Url::parse(&format!("https://{target}"))
@@ -1333,6 +1335,18 @@ mod tests {
             error
                 .to_string()
                 .contains("requires a nonempty string body")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(r#"read("https://search", "<search query>")"#)
+        );
+
+        let error = require_empty_body("objective", "https://example.com/page").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(r#"retry read("https://example.com/page", "")"#)
         );
 
         manager

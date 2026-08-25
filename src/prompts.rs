@@ -29,7 +29,7 @@ pub fn system_prompt(
         "\nUse a direct tool when its typed arguments match the operation. Use read or exec for capabilities exposed as protocols.\n\n\
          The read and exec body is always a string. Pass \"\" when a protocol takes no body, pass plain text for textual input, and pass complete serialized JSON text when a protocol requires structured input.\n\n\
          Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values without including the angle brackets.\n\n\
-         Before using a protocol for the first time, call read(\"<protocol>://help\", \"\") and follow its contract.\n\n\
+         Before using any protocol in a session, you MUST first call read(\"<protocol>://help\", \"\") for that protocol and follow its contract. The help read is the only permitted first call to a protocol.\n\n\
          Verify relevant results before claiming work is complete.\n",
     );
 
@@ -95,7 +95,11 @@ mod tests {
             prompt.find("Available direct tools:").unwrap()
                 < prompt.find("Available protocols:").unwrap()
         );
-        assert!(prompt.contains(r#"call read("<protocol>://help", "")"#));
+        assert!(
+            prompt
+                .contains(r#"you MUST first call read("<protocol>://help", "") for that protocol"#)
+        );
+        assert!(prompt.contains("The help read is the only permitted first call to a protocol."));
         assert!(!prompt.contains("file://help"));
     }
 

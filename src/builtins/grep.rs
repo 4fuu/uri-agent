@@ -32,7 +32,9 @@ may be empty: `grep://` searches the current working directory.
 Optional query parameters:
 
 - `glob=<pattern>` filters searched paths with a glob pattern.
-- `literal=true` treats the body as literal text instead of a regular expression.
+- Search patterns are regular expressions by default. If a pattern is not valid
+  as a regular expression, the protocol retries it as literal text.
+- `literal=true` always treats the body as literal text.
 - `ignore_case=true` enables case-insensitive matching.
 - `context=<0..20>` includes surrounding lines.
 - `limit=<1..2000>` bounds the number of matches; the default is 200.
@@ -41,6 +43,7 @@ Examples:
 
 ```text
 read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
+read("grep://src/tui/app.rs", "fn push(")
 read("grep://?literal=true&ignore_case=true", "exact text")
 ```
 
@@ -107,12 +110,15 @@ impl Protocol for GrepProtocol {
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
             if !request.body.is_empty() {
-                bail!("grep://help does not accept a body");
+                bail!(r#"grep://help requires an empty body; retry read("grep://help", "")"#);
             }
             return Ok(help(&self.cwd).into_bytes());
         }
         if request.body.is_empty() {
-            bail!("grep requires a nonempty search pattern in the body");
+            bail!(
+                "grep requires a nonempty search pattern in the body; use read({:?}, \"<pattern>\")",
+                request.uri
+            );
         }
         let (root, query) = request
             .target
@@ -219,6 +225,68 @@ async fn run_grep(
     pattern: &str,
     options: &GrepOptions,
 ) -> Result<String> {
+    let mut fixed_strings = options.literal;
+    loop {
+        let result = run_grep_once(executable, cwd, root, pattern, options, fixed_strings)
+            .await
+            .context("grep failed")?;
+        if !fixed_strings && result.regex_parse_failed() {
+            fixed_strings = true;
+            continue;
+        }
+        return result.into_output(options.limit);
+    }
+}
+
+struct GrepRun {
+    output: String,
+    matches: usize,
+    truncated: bool,
+    status: std::process::ExitStatus,
+    stderr: Vec<u8>,
+}
+
+impl GrepRun {
+    fn regex_parse_failed(&self) -> bool {
+        self.matches == 0
+            && !self.truncated
+            && !matches!(self.status.code(), Some(0 | 1))
+            && String::from_utf8_lossy(&self.stderr).contains("regex parse error:")
+    }
+
+    fn into_output(mut self, limit: usize) -> Result<String> {
+        if !self.truncated && !matches!(self.status.code(), Some(0 | 1)) {
+            let message = String::from_utf8_lossy(&self.stderr);
+            let message = message.trim();
+            let message = message.strip_prefix("rg: ").unwrap_or(message);
+            bail!(
+                "grep failed{}",
+                if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {message}")
+                }
+            );
+        }
+        if self.matches == 0 {
+            return Ok("No matches.\n".to_string());
+        }
+        if self.truncated {
+            self.output
+                .push_str(&format!("\n[match limit reached: {limit}]\n"));
+        }
+        Ok(self.output)
+    }
+}
+
+async fn run_grep_once(
+    executable: &Path,
+    cwd: &Path,
+    root: &str,
+    pattern: &str,
+    options: &GrepOptions,
+    fixed_strings: bool,
+) -> Result<GrepRun> {
     let mut command = Command::new(executable);
     command
         .current_dir(cwd)
@@ -231,7 +299,7 @@ async fn run_grep(
     if let Some(glob) = &options.glob {
         command.arg("--glob").arg(glob);
     }
-    if options.literal {
+    if fixed_strings {
         command.arg("--fixed-strings");
     }
     if options.ignore_case {
@@ -241,9 +309,7 @@ async fn run_grep(
         command.arg("--context").arg(options.context.to_string());
     }
     command.arg("--").arg(pattern).arg(root);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start {}", executable.display()))?;
+    let mut child = command.spawn().context("cannot start search process")?;
     let stdout = child.stdout.take().expect("grep stdout is piped");
     let mut stderr = child.stderr.take().expect("grep stderr is piped");
     let stderr_task = tokio::spawn(async move {
@@ -256,7 +322,8 @@ async fn run_grep(
     let mut trailing_context = None;
     let mut truncated = false;
     while let Some(line) = lines.next_line().await? {
-        let event: Value = serde_json::from_str(&line).context("ripgrep returned invalid JSON")?;
+        let event: Value =
+            serde_json::from_str(&line).context("search process returned invalid JSON")?;
         let kind = event
             .get("type")
             .and_then(Value::as_str)
@@ -298,31 +365,20 @@ async fn run_grep(
     }
     let status = child.wait().await?;
     let stderr = stderr_task.await.context("grep stderr reader failed")??;
-    if !truncated && !matches!(status.code(), Some(0 | 1)) {
-        let message = String::from_utf8_lossy(&stderr).trim().to_string();
-        bail!(
-            "ripgrep failed{}",
-            if message.is_empty() {
-                String::new()
-            } else {
-                format!(": {message}")
-            }
-        );
-    }
-    if matches == 0 {
-        return Ok("No matches.\n".to_string());
-    }
-    if truncated {
-        output.push_str(&format!("\n[match limit reached: {}]\n", options.limit));
-    }
-    Ok(output)
+    Ok(GrepRun {
+        output,
+        matches,
+        truncated,
+        status,
+        stderr,
+    })
 }
 
 fn append_event(output: &mut String, event: &Value, is_match: bool) -> Result<()> {
     let data = event
         .get("data")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("ripgrep event has no data object"))?;
+        .ok_or_else(|| anyhow!("grep event has no data object"))?;
     let path = data
         .get("path")
         .and_then(|path| path.get("text"))
@@ -450,6 +506,8 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("MUST pass a nonempty search pattern"));
         assert!(help.contains("The root\nmay be empty"));
+        assert!(help.contains("retries it as literal text"));
+        assert!(help.contains(r#"read("grep://src/tui/app.rs", "fn push(")"#));
         assert!(help.contains("`grep://help` MUST use an empty string body"));
 
         let error = protocol
@@ -465,7 +523,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("nonempty search pattern"));
+        let error = error.to_string();
+        assert!(error.contains("nonempty search pattern"));
+        assert!(error.contains(r#"read("grep://", "<pattern>")"#));
     }
 
     #[tokio::test]
@@ -509,12 +569,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_reports_no_matches_honors_literal_mode_and_surfaces_invalid_regex() {
+    async fn grep_preserves_regex_and_literal_modes_and_retries_invalid_regex_as_literal() {
         let Some(rg) = rg_on_path() else {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
-        tokio::fs::write(directory.path().join("values.txt"), "a.b\naxb\n")
+        tokio::fs::write(directory.path().join("values.txt"), "a.b\naxb\nfn push(\n")
             .await
             .unwrap();
         let default_options = GrepOptions::parse(None).unwrap();
@@ -525,6 +585,12 @@ mod tests {
                 .unwrap(),
             "No matches.\n"
         );
+        let output = run_grep(&rg, directory.path(), ".", "a.b", &default_options)
+            .await
+            .unwrap();
+        assert!(output.contains("values.txt:1:a.b"));
+        assert!(output.contains("values.txt:2:axb"));
+
         let literal = GrepOptions {
             literal: true,
             ..GrepOptions::parse(None).unwrap()
@@ -535,9 +601,23 @@ mod tests {
         assert!(output.contains("values.txt:1:a.b"));
         assert!(!output.contains("values.txt:2:axb"));
 
-        let error = run_grep(&rg, directory.path(), ".", "(", &default_options)
+        let output = run_grep(&rg, directory.path(), ".", "fn push(", &default_options)
             .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("ripgrep failed"));
+            .unwrap();
+        assert!(output.contains("values.txt:3:fn push("));
+
+        let error = run_grep(
+            &rg,
+            directory.path(),
+            "missing-root",
+            "needle",
+            &default_options,
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("grep failed"));
+        assert!(!error.contains("ripgrep"));
+        assert!(!error.contains("rg:"));
     }
 }

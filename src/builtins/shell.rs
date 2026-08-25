@@ -2,7 +2,7 @@ use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, Plu
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use crate::task::{PromoteBackground, TaskManager, TaskRecord, TaskStatus};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::collections::BTreeMap;
@@ -28,7 +28,8 @@ Run Bash commands. Commands start in the foreground and normally return their
 final result in the same `exec` call.
 
 `read` supports only `bash://help` and MUST use an empty string body. To run a
-command, call `exec` with `bash://run`; the command body MUST be nonempty:
+command, call `exec` with `bash://run`; the command body MUST contain at least
+one non-whitespace character:
 
 ```text
 exec("bash://run", "cargo test")
@@ -73,7 +74,8 @@ PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
 `read` supports only `pwsh://help` and MUST use an empty string body. To run a
-command, call `exec` with `pwsh://run`; the command body MUST be nonempty:
+command, call `exec` with `pwsh://run`; the command body MUST contain at least
+one non-whitespace character:
 
 ```text
 exec("pwsh://run", "Get-ChildItem -Path . -Force")
@@ -311,19 +313,25 @@ impl Protocol for ShellProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        if request.target != "help" {
+            bail!(
+                r#"{0} read supports only help; use read("{0}://help", "") or run a command with exec("{0}://run", "<command>")"#,
+                self.name
+            );
+        }
         if !request.body.is_empty() {
-            bail!("{}://help does not accept a body", self.name);
+            bail!(
+                r#"{0}://help requires an empty body; retry read("{0}://help", "")"#,
+                self.name
+            );
         }
-        match request.target {
-            "help" => Ok(if self.name == "bash" {
-                BASH_HELP
-            } else {
-                PWSH_HELP
-            }
-            .as_bytes()
-            .to_vec()),
-            _ => bail!("expected {}://help", self.name),
+        Ok(if self.name == "bash" {
+            BASH_HELP
+        } else {
+            PWSH_HELP
         }
+        .as_bytes()
+        .to_vec())
     }
 
     async fn exec(
@@ -343,8 +351,13 @@ impl ShellProtocol {
         context: ProtocolContext,
         auto_background_after: Duration,
     ) -> Result<Vec<u8>> {
-        let options = parse_target(request.target)?;
-        let command = command_from_body(request.body)?.to_string();
+        let options = parse_target(request.target).with_context(|| {
+            format!(
+                r#"invalid {0} exec; use exec("{0}://run", "<command>")"#,
+                self.name
+            )
+        })?;
+        let command = command_from_body(request.body, self.name)?.to_string();
         let executable = self.executable.clone();
         let cwd = self.cwd.clone();
         let protocol = self.name.to_string();
@@ -493,9 +506,11 @@ fn parse_target(target: &str) -> Result<ShellOptions> {
     })
 }
 
-fn command_from_body(body: &str) -> Result<&str> {
-    if body.is_empty() {
-        bail!("shell body must be a nonempty command string");
+fn command_from_body<'a>(body: &'a str, protocol: &str) -> Result<&'a str> {
+    if body.trim().is_empty() {
+        bail!(
+            r#"{protocol} command body must contain a non-whitespace character; use exec("{protocol}://run", "<command>")"#
+        );
     }
     Ok(body)
 }
@@ -796,7 +811,7 @@ mod tests {
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
         assert!(PWSH_HELP.contains("`pwsh://help` and MUST use an empty string body"));
-        assert!(PWSH_HELP.contains("command body MUST be nonempty"));
+        assert!(PWSH_HELP.contains("command body MUST contain at least\none non-whitespace"));
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
@@ -804,7 +819,7 @@ mod tests {
         assert!(PWSH_HELP.contains("MUST NOT poll"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
         assert!(BASH_HELP.contains("`bash://help` and MUST use an empty string body"));
-        assert!(BASH_HELP.contains("command body MUST be nonempty"));
+        assert!(BASH_HELP.contains("command body MUST contain at least\none non-whitespace"));
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
@@ -846,8 +861,63 @@ mod tests {
 
     #[test]
     fn shell_body_only_accepts_a_command_string() {
-        assert_eq!(command_from_body("cargo test").unwrap(), "cargo test");
-        assert!(command_from_body("").is_err());
+        assert_eq!(
+            command_from_body("cargo test", "bash").unwrap(),
+            "cargo test"
+        );
+        assert!(command_from_body("", "bash").is_err());
+        assert!(command_from_body(" \n\t", "bash").is_err());
+    }
+
+    #[tokio::test]
+    async fn shell_route_errors_provide_copyable_read_and_exec_calls() {
+        let shell = ShellProtocol::new("bash", PathBuf::from("bash"), Path::new("."));
+        let context = ProtocolContext {
+            tasks: TaskManager::new(),
+        };
+
+        let read_error = shell
+            .read(
+                ProtocolRequest {
+                    uri: "bash://run",
+                    target: "run",
+                    body: "cargo test",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            read_error
+                .to_string()
+                .contains(r#"exec("bash://run", "<command>")"#)
+        );
+
+        let exec_error = shell
+            .exec(
+                ProtocolRequest {
+                    uri: "bash://help",
+                    target: "help",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{exec_error:#}").contains(r#"exec("bash://run", "<command>")"#));
+
+        let body_error = shell
+            .exec(
+                ProtocolRequest {
+                    uri: "bash://run",
+                    target: "run",
+                    body: " \n\t",
+                },
+                context,
+            )
+            .await
+            .unwrap_err();
+        assert!(body_error.to_string().contains("non-whitespace character"));
     }
 
     #[test]

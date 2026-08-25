@@ -177,7 +177,9 @@ impl ProtocolRegistry {
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
-            bail!("protocol does not support exec: {name}");
+            bail!(
+                r#"protocol {name} does not support exec; read("{name}://help", "") for its supported operations"#
+            );
         }
         let content = protocol
             .exec(ProtocolRequest { uri, target, body }, self.context.clone())
@@ -208,6 +210,15 @@ impl ProtocolRegistry {
 pub(crate) fn validate_descriptor(descriptor: &ProtocolDescriptor) -> Result<()> {
     if descriptor.name.is_empty() || descriptor.name.contains("://") {
         bail!("invalid protocol name: {:?}", descriptor.name);
+    }
+    if descriptor.description.trim().is_empty() {
+        bail!("protocol {} requires a description", descriptor.name);
+    }
+    if !descriptor.can_read {
+        bail!(
+            "protocol {} must support read so <protocol>://help is available",
+            descriptor.name
+        );
     }
     Ok(())
 }
@@ -344,6 +355,35 @@ mod tests {
     fn address_requires_an_unambiguous_separator() {
         assert!(split_address("file/path").is_err());
         assert!(split_address("://path").is_err());
+    }
+
+    #[test]
+    fn protocol_descriptors_require_help_reads_and_descriptions() {
+        let descriptor = ProtocolDescriptor {
+            name: "example".to_string(),
+            description: "Example protocol".to_string(),
+            can_read: true,
+            can_exec: false,
+        };
+        assert!(validate_descriptor(&descriptor).is_ok());
+        assert!(
+            validate_descriptor(&ProtocolDescriptor {
+                can_read: false,
+                ..descriptor.clone()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("must support read")
+        );
+        assert!(
+            validate_descriptor(&ProtocolDescriptor {
+                description: "  ".to_string(),
+                ..descriptor
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("requires a description")
+        );
     }
 
     #[tokio::test]

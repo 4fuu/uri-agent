@@ -140,7 +140,22 @@ impl Protocol for SkillProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if !request.body.is_empty() {
-            bail!("skill reads do not accept a body");
+            if request.target == "help" {
+                bail!(
+                    r#"skill help requires an empty body; retry read({:?}, "")"#,
+                    request.uri
+                );
+            }
+            if request.target.is_empty() {
+                bail!(
+                    r#"skill reads require an empty body; put the relative resource path in the URI, for example read("{}://<relative-path>", "")"#,
+                    self.protocol
+                );
+            }
+            bail!(
+                "skill reads require an empty body; retry read({:?}, \"\")",
+                request.uri
+            );
         }
         let root = self
             .snapshot
@@ -156,6 +171,12 @@ impl Protocol for SkillProtocol {
                 )
             })?;
             return Ok(help(&skill_md, root, &self.protocol).into_bytes());
+        }
+        if request.target.is_empty() {
+            bail!(
+                r#"skill resource target is required; use read("{}://help", "") for instructions"#,
+                self.protocol
+            );
         }
         let relative = Path::new(request.target);
         if relative.is_absolute() {
@@ -375,6 +396,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resource, b"echo ok");
+
+        let error = skill
+            .read(
+                ProtocolRequest {
+                    uri: "code-review-skill://",
+                    target: "",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(r#"read("code-review-skill://help", "")"#)
+        );
 
         let error = skill
             .read(

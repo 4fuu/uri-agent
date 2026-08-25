@@ -73,14 +73,26 @@ impl Protocol for TasksProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        require_no_body(request.body)?;
         match request.target {
-            "help" => Ok(HELP.as_bytes().to_vec()),
-            "summary" => Ok(render_summary(&context.tasks).await),
+            "help" => {
+                require_no_body(request.body, "read", request.uri)?;
+                Ok(HELP.as_bytes().to_vec())
+            }
+            "summary" => {
+                require_no_body(request.body, "read", request.uri)?;
+                Ok(render_summary(&context.tasks).await)
+            }
             id if !id.is_empty() && !id.contains('/') && !id.contains('?') => {
+                require_no_body(request.body, "read", request.uri)?;
                 render_task(&context.tasks, id).await
             }
-            _ => bail!("expected tasks://help, tasks://summary, or tasks://<id>"),
+            target if target.ends_with("/cancel") => bail!(
+                "task cancellation requires exec; use exec({:?}, \"\")",
+                request.uri
+            ),
+            _ => bail!(
+                r#"tasks read expects read("tasks://help", ""), read("tasks://summary", ""), or read("tasks://<id>", "")"#
+            ),
         }
     }
 
@@ -89,12 +101,24 @@ impl Protocol for TasksProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        require_no_body(request.body)?;
-        let id = request
+        let Some(id) = request
             .target
             .strip_suffix("/cancel")
             .filter(|id| !id.is_empty() && !id.contains('/'))
-            .ok_or_else(|| anyhow!("expected tasks://<id>/cancel"))?;
+        else {
+            if matches!(request.target, "help" | "summary")
+                || (!request.target.is_empty()
+                    && !request.target.contains('/')
+                    && !request.target.contains('?'))
+            {
+                bail!(
+                    "task inspection requires read; use read({:?}, \"\")",
+                    request.uri
+                );
+            }
+            bail!(r#"task cancellation expects exec("tasks://<id>/cancel", "")"#);
+        };
+        require_no_body(request.body, "exec", request.uri)?;
         let record = context
             .tasks
             .get(id)
@@ -111,9 +135,9 @@ impl Protocol for TasksProtocol {
     }
 }
 
-fn require_no_body(body: &str) -> Result<()> {
+fn require_no_body(body: &str, operation: &str, uri: &str) -> Result<()> {
     if !body.is_empty() {
-        bail!("tasks operations do not accept a body");
+        bail!("tasks operations require an empty body; retry {operation}({uri:?}, \"\")");
     }
     Ok(())
 }
@@ -307,6 +331,23 @@ mod tests {
         };
         let target = format!("{id}/cancel");
 
+        let error = TasksProtocol
+            .read(
+                ProtocolRequest {
+                    uri: "tasks://001/cancel",
+                    target: &target,
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(r#"exec("tasks://001/cancel", "")"#)
+        );
+
         let output = TasksProtocol
             .exec(
                 ProtocolRequest {
@@ -335,6 +376,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("do not accept a body"));
+        assert!(
+            error
+                .to_string()
+                .contains(r#"retry read("tasks://summary", "")"#)
+        );
     }
 }

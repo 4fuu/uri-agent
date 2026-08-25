@@ -93,7 +93,8 @@ and direct tools use the trusted [WASM plugin](plugins.md) path instead.
 - `read` and `exec` require a string `body`. Split protocol addresses only at
   the first `://`, then pass the opaque remainder and body, including `""`, to
   the selected protocol unchanged.
-- Protocol names are unique. A protocol may implement `read`, `exec`, or both.
+- Protocol names are unique. Every protocol implements `read` so its mandatory
+  `<protocol>://help` route is available; it may additionally implement `exec`.
 - Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
 - Keep protocol bodies semantically plain text when practical. Put operation
   selection and bounded options in the protocol-owned URI path or query. If a

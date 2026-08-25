@@ -72,7 +72,15 @@ impl Protocol for UriAgentDocsProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if !request.body.is_empty() {
-            bail!("{PROTOCOL_NAME} reads do not accept a body");
+            if request.target == "help" {
+                bail!(
+                    r#"uri-agent-docs://help requires an empty body; retry read("uri-agent-docs://help", "")"#
+                );
+            }
+            bail!(
+                "uri-agent-docs reads require an empty body; retry read({:?}, \"\")",
+                request.uri
+            );
         }
         if request.target == "help" {
             return Ok(help().into_bytes());
@@ -81,7 +89,7 @@ impl Protocol for UriAgentDocsProtocol {
             return Ok(content.as_bytes().to_vec());
         }
         bail!(
-            "unknown {PROTOCOL_NAME} read target: {}; use {PROTOCOL_NAME}://help",
+            r#"unknown {PROTOCOL_NAME} read target: {}; use read("{PROTOCOL_NAME}://help", "") for the exact filename list"#,
             request.target
         )
     }

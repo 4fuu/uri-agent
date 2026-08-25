@@ -38,6 +38,7 @@ Current working directory: `file://{}`
   recursively with standard ignore rules. Patterns are relative to that
   directory; for example, `file://src?glob=**/*.rs`. A glob scans at most
   50000 files; narrow the root for larger trees.
+- Unknown, duplicate, malformed, or invalid query parameters are rejected.
 - Reading a directory returns a bounded directory listing.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
@@ -231,7 +232,18 @@ impl Protocol for FileProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if !request.body.is_empty() {
-            bail!("file reads do not accept a body");
+            if request.target == "help" {
+                bail!(r#"file://help requires an empty body; retry read("file://help", "")"#);
+            }
+            if request.target.is_empty() {
+                bail!(
+                    r#"file reads require an empty body; put the path in the URI, for example read("file://<path>", "")"#
+                );
+            }
+            bail!(
+                "file reads require an empty body; retry read({:?}, \"\")",
+                request.uri
+            );
         }
         if request.target == "help" {
             return Ok(help(&self.cwd).into_bytes());
@@ -294,6 +306,7 @@ impl Range {
         let mut limit = DEFAULT_LIMIT;
         let mut line_numbers = false;
         let mut glob = None;
+        let mut seen = std::collections::HashSet::new();
         for pair in query
             .unwrap_or_default()
             .split('&')
@@ -302,6 +315,9 @@ impl Range {
             let (key, value) = pair
                 .split_once('=')
                 .ok_or_else(|| anyhow!("invalid query component: {pair}"))?;
+            if !seen.insert(key) {
+                bail!("duplicate file query parameter: {key}");
+            }
             match key {
                 "offset" => {
                     offset = value
@@ -323,9 +339,6 @@ impl Range {
                     }
                 }
                 "glob" => {
-                    if glob.is_some() {
-                        bail!("duplicate file query parameter: glob");
-                    }
                     if value.is_empty() {
                         bail!("file glob pattern cannot be empty");
                     }
@@ -493,6 +506,7 @@ mod tests {
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
         assert!(help.contains("`?glob=<pattern>`"));
+        assert!(help.contains("Unknown, duplicate, malformed, or invalid query parameters"));
         assert!(help.contains("Every `file` read"));
         assert!(help.contains("MUST pass an empty string body"));
         assert!(help.contains("does not support `exec`"));
@@ -504,12 +518,36 @@ mod tests {
         assert_eq!(resolve_path(cwd, "a%20b"), Path::new("/tmp/root/a%20b"));
     }
 
+    #[tokio::test]
+    async fn misplaced_file_body_reports_where_the_path_belongs() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = FileProtocol::new(directory.path())
+            .read(
+                ProtocolRequest {
+                    uri: "file://",
+                    target: "",
+                    body: "src/lib.rs",
+                },
+                ProtocolContext {
+                    tasks: crate::task::TaskManager::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains(r#"read("file://<path>", "")"#));
+    }
+
     #[test]
     fn ranges_are_one_based_and_bounded() {
         let range = Range::parse(Some("offset=0&limit=99999")).unwrap();
         assert_eq!(range.offset, 1);
         assert_eq!(range.limit, MAX_LIMIT);
         assert!(!range.line_numbers);
+        assert!(Range::parse(Some("offset=1&offset=2")).is_err());
+        assert!(Range::parse(Some("limit=1&limit=2")).is_err());
+        assert!(Range::parse(Some("line_numbers=true&line_numbers=false")).is_err());
+        assert!(Range::parse(Some("glob=*.rs&glob=*.md")).is_err());
     }
 
     #[test]

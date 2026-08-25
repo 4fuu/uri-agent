@@ -112,11 +112,15 @@ current working directory.
 
 `grep` puts the search pattern in the string body and searches a project-relative
 or absolute file or directory. An empty target searches the startup working
-directory. It invokes ripgrep directly without a shell and accepts `glob`,
-`literal`, `ignore_case`, `context`, and `limit` options:
+directory. Search patterns are regular expressions by default. If a pattern is
+not valid as a regular expression, the protocol retries it as literal text;
+`literal=true` always uses literal matching. It invokes ripgrep directly without
+a shell and accepts `glob`, `literal`, `ignore_case`, `context`, and `limit`
+options:
 
 ```text
 read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
+read("grep://src/tui/app.rs", "fn push(")
 read("grep://?literal=true&ignore_case=true", "exact text")
 ```
 
@@ -237,7 +241,8 @@ is included in its active tool schema.
 
 ### `bash` and `pwsh`
 
-Shell bodies must be command strings:
+Shell bodies must be command strings containing at least one non-whitespace
+character:
 
 ```text
 exec("bash://run", "cargo test")
