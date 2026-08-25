@@ -25,9 +25,9 @@ Search file contents and return bounded `path:line:text` matches.
 
 Current working directory: `grep://{}`
 
-Put the search pattern in the string body. Use `grep://<root>` for a project-
-relative or absolute file/directory root. An empty root searches the current
-working directory.
+Search reads MUST pass a nonempty search pattern in the string body. Use
+`grep://<root>` for a project-relative or absolute file/directory root. The root
+may be empty: `grep://` searches the current working directory.
 
 Optional query parameters:
 
@@ -44,7 +44,8 @@ read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
 read("grep://?literal=true&ignore_case=true", "exact text")
 ```
 
-This protocol is read-only and does not support `exec`.
+`grep://help` MUST use an empty string body. This protocol supports `read` only;
+it does not support `exec`.
 "#,
         display_path(cwd)
     )
@@ -427,6 +428,44 @@ mod tests {
         assert!(GrepOptions::parse(Some("context=21")).is_err());
         assert!(GrepOptions::parse(Some("limit=0")).is_err());
         assert!(GrepOptions::parse(Some("literal=true&literal=false")).is_err());
+    }
+
+    #[tokio::test]
+    async fn grep_help_distinguishes_empty_root_from_nonempty_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let protocol = GrepProtocol::new(directory.path());
+        let help = protocol
+            .read(
+                ProtocolRequest {
+                    uri: "grep://help",
+                    target: "help",
+                    body: "",
+                },
+                ProtocolContext {
+                    tasks: TaskManager::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("MUST pass a nonempty search pattern"));
+        assert!(help.contains("The root\nmay be empty"));
+        assert!(help.contains("`grep://help` MUST use an empty string body"));
+
+        let error = protocol
+            .read(
+                ProtocolRequest {
+                    uri: "grep://",
+                    target: "",
+                    body: "",
+                },
+                ProtocolContext {
+                    tasks: TaskManager::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("nonempty search pattern"));
     }
 
     #[tokio::test]

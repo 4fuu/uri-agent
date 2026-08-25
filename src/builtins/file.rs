@@ -41,7 +41,8 @@ Current working directory: `file://{}`
 - Reading a directory returns a bounded directory listing.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-This built-in protocol takes no protocol body; pass an empty string.
+Every `file` read, including `file://help`, MUST pass an empty string body.
+This protocol supports `read` only; it does not support `exec`.
 "#,
         display_path(cwd)
     )
@@ -492,6 +493,9 @@ mod tests {
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
         assert!(help.contains("`?glob=<pattern>`"));
+        assert!(help.contains("Every `file` read"));
+        assert!(help.contains("MUST pass an empty string body"));
+        assert!(help.contains("does not support `exec`"));
     }
 
     #[test]

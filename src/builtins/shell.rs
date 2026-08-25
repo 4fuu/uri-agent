@@ -27,7 +27,8 @@ const BASH_HELP: &str = r#"# bash
 Run Bash commands. Commands start in the foreground and normally return their
 final result in the same `exec` call.
 
-Call `exec` with `bash://run` and pass the command as the string body:
+`read` supports only `bash://help` and MUST use an empty string body. To run a
+command, call `exec` with `bash://run`; the command body MUST be nonempty:
 
 ```text
 exec("bash://run", "cargo test")
@@ -49,9 +50,9 @@ and `timeout=0` disables the timeout:
 exec("bash://run?timeout=120", "cargo test")
 ```
 
-Do not add another background layer inside the command. Background task status,
-output, and cancellation use the unified `tasks://` protocol. Completion is
-delivered automatically, so do not poll.
+You MUST NOT add another background layer inside the command. Background task
+status, output, and cancellation use the unified `tasks://` protocol.
+Completion is delivered automatically, so you MUST NOT poll.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -71,7 +72,8 @@ Prefer modern cross-platform tools such as `rg` and `fd` when available.
 PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
-Call `exec` with `pwsh://run` and pass the command as the string body:
+`read` supports only `pwsh://help` and MUST use an empty string body. To run a
+command, call `exec` with `pwsh://run`; the command body MUST be nonempty:
 
 ```text
 exec("pwsh://run", "Get-ChildItem -Path . -Force")
@@ -89,9 +91,9 @@ Foreground and background commands share one execution timeout. `timeout` is
 an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
 and `timeout=0` disables the timeout.
 
-Do not add another background layer inside the command. Background task status,
-output, and cancellation use the unified `tasks://` protocol. Completion is
-delivered automatically, so do not poll.
+You MUST NOT add another background layer inside the command. Background task
+status, output, and cancellation use the unified `tasks://` protocol.
+Completion is delivered automatically, so you MUST NOT poll.
 
 PowerShell source and plain-text output use UTF-8. Command success follows the
 final PowerShell or native command, and native exit codes are preserved.
@@ -793,15 +795,21 @@ mod tests {
         assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
-        assert!(PWSH_HELP.contains("Do not add another background layer"));
+        assert!(PWSH_HELP.contains("`pwsh://help` and MUST use an empty string body"));
+        assert!(PWSH_HELP.contains("command body MUST be nonempty"));
+        assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
-        assert!(PWSH_HELP.contains("do not poll"));
+        assert!(PWSH_HELP.contains("MUST NOT poll"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
+        assert!(BASH_HELP.contains("`bash://help` and MUST use an empty string body"));
+        assert!(BASH_HELP.contains("command body MUST be nonempty"));
+        assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
         assert!(BASH_HELP.contains("unified `tasks://` protocol"));
+        assert!(BASH_HELP.contains("MUST NOT poll"));
         assert!(!BASH_HELP.contains("?wait="));
         assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }

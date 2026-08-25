@@ -73,9 +73,9 @@ Last reload diagnostics: {diagnostics}
 - Read `wasm_plugin://help/load` for loading, updating, removing, and reloading plugins.
 - Read `wasm_plugin://help/author` for the SDK, ABI, protocols, direct tools, and permissions.
 - Call `exec("wasm_plugin://reload", "")` to reload the plugin directory.
-  Always read `wasm_plugin://help/load` before changing plugin files or calling reload.
+  You MUST read `wasm_plugin://help/load` before changing plugin files or calling reload.
 
-All reads require an empty string body.
+Every `wasm_plugin` read and exec call MUST pass an empty string body.
 "#,
         directory = display_path(directory),
     )
@@ -1575,7 +1575,8 @@ mod tests {
         assert!(help.contains("wasm_plugin://reload"));
         assert!(help.contains("wasm_plugin://help/load"));
         assert!(help.contains("wasm_plugin://help/author"));
-        assert!(help.contains("Always read `wasm_plugin://help/load`"));
+        assert!(help.contains("MUST read `wasm_plugin://help/load`"));
+        assert!(help.contains("read and exec call MUST pass an empty string body"));
         assert!(!help.contains("cargo build"));
         assert!(!help.contains("ModelToolDescriptor"));
 
