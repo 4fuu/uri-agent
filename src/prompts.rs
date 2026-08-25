@@ -20,8 +20,7 @@ pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> Stri
          Angle-bracketed values in protocol addresses, such as <protocol>, are placeholders.\n\
          The same placeholder convention applies throughout protocol help.\n\
          Replace placeholders with the required values without including the angle brackets.\n\
-         Before using a protocol for the first time, you must call read on \
-         <protocol>://help to learn its contract.\n\
+         Before using a protocol for the first time, call read(\"<protocol>://help\", {\"kind\":\"none\",\"value\":\"\"}) to learn its contract.\n\
          Verify relevant results before claiming work is complete.\n\n\
          Available protocols:\n",
     );
@@ -91,7 +90,7 @@ mod tests {
         assert!(prompt.contains("Every tool call requires a body envelope"));
         assert!(prompt.contains(r#"{"kind":"none","value":""}"#));
         assert!(prompt.contains("same placeholder convention applies throughout protocol help"));
-        assert!(prompt.contains("Before using a protocol for the first time"));
+        assert!(prompt.contains(r#"call read("<protocol>://help", {"kind":"none","value":""})"#));
         assert!(prompt.contains("- file: Read files."));
         assert!(!prompt.contains("file://help"));
     }
