@@ -54,7 +54,7 @@ URI Agent retries transient failures for normal model calls and context-summary 
 
 Fallback delays add up to 25% jitter. `Retry-After` or `retry-after-ms` takes precedence, capped at 60 seconds. When those headers are absent, a Google RPC `RetryInfo.retryDelay` in the response body supplies the same delay. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
 
-The experimental Antigravity transport performs bounded protocol-specific recovery before this generic policy sees a failure. An expired token or the first `401` refreshes the stored OAuth credential once. The first project-header `403` retries without that header. A Gemini `400` that specifically reports an invalid thought signature replaces persisted Gemini signatures with the private protocol's dummy marker and retries once. Within each generic attempt, network errors, `408`, `404`, and `5xx` responses fall through the sandbox, daily, and production endpoints in order. Once those endpoints are exhausted, the final failure retains its normal runtime classification and retry budget; `429` responses are never replayed internally.
+The experimental Antigravity transport performs bounded protocol-specific recovery before this generic policy sees a failure. An expired token or the first `401` refreshes the stored OAuth credential once. The first project-header `403` retries without that header. A Gemini `400` that specifically reports an invalid thought signature replaces signatures in that request copy with the private protocol's dummy marker and retries once; persisted replay remains unchanged. Within each generic attempt, network errors, `408`, `404`, and `5xx` responses fall through the sandbox, daily, and production endpoints in order. Once those endpoints are exhausted, the final failure retains its normal runtime classification and retry budget; `429` responses are never replayed internally.
 
 Because the counters are independent, alternating failure classes can consume up to 28 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time limit.
 
@@ -63,6 +63,8 @@ Each retry becomes a visible session event with its reason, delay, and count. Pr
 ## Model and tool loop
 
 A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
+
+If a turn is interrupted while tool calls from one model response are pending, URI Agent appends a failed result with the original correlation identity for every unfinished call before settling the turn. Later requests therefore never replay a tool call without its corresponding result.
 
 URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different call, no call, or multiple calls resets the sequence. Background task completion is delivered automatically, so repeated identical `tasks://` reads are polling and receive the same loop protection as other calls.
 

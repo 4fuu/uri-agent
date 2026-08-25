@@ -983,11 +983,16 @@ impl AgentRuntime {
                 })
                 .collect::<Vec<_>>();
             let mut sole_result = None;
+            let mut cancellation = None;
             for call in tool_calls.iter().cloned() {
-                let result = self.execute_tool(call, cancel).await?;
+                let (result, interrupted) = self.execute_tool(call, cancel).await?;
+                cancellation = cancellation.or(interrupted);
                 if tool_calls.len() == 1 {
                     sole_result = Some(result);
                 }
+            }
+            if let Some(cancellation) = cancellation.or(*cancel.borrow()) {
+                bail!(cancellation.message())
             }
             if let Some(redirect) = loop_guard.record_turn(&tool_calls, sole_result.as_deref()) {
                 self.session
@@ -1286,20 +1291,25 @@ impl AgentRuntime {
         &self,
         call: ToolCall,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<TurnCancellation>)> {
         let name = call.function.name.clone();
         let call_id = call.id.to_string();
-        let dispatch = self.dispatch(&name, &call.function.arguments);
-        tokio::pin!(dispatch);
-        let result = tokio::select! {
-            result = &mut dispatch => result,
-            changed = cancel.changed() => {
-                if changed.is_ok()
-                    && let Some(cancellation) = *cancel.borrow()
-                {
-                    bail!(cancellation.message())
+        let (result, cancellation) = if let Some(cancellation) = *cancel.borrow() {
+            (Err(anyhow!(cancellation.message())), Some(cancellation))
+        } else {
+            let dispatch = self.dispatch(&name, &call.function.arguments);
+            tokio::pin!(dispatch);
+            tokio::select! {
+                result = &mut dispatch => (result, None),
+                changed = cancel.changed() => {
+                    if changed.is_ok()
+                        && let Some(cancellation) = *cancel.borrow()
+                    {
+                        (Err(anyhow!(cancellation.message())), Some(cancellation))
+                    } else {
+                        (dispatch.await, None)
+                    }
                 }
-                dispatch.await
             }
         };
         let (output, failed) = match result {
@@ -1329,7 +1339,7 @@ impl AgentRuntime {
             .await
             .context("cannot persist tool result boundary")?;
         self.refresh_context_estimate().await;
-        Ok(output)
+        Ok((output, cancellation))
     }
 
     async fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
@@ -1799,10 +1809,12 @@ pub fn forward_task_notices(session: Session, tasks: TaskManager, runtime: Weak<
 mod tests {
     use super::*;
     use crate::model::ModelDelta;
+    use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
     use crate::session::SessionContext;
     use async_trait::async_trait;
     use rig::message::{ToolCallId, ToolFunction};
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn png_ihdr_dimensions_read_width_and_height() {
@@ -1830,6 +1842,11 @@ mod tests {
     struct BlockingBackend {
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
+    }
+
+    struct BlockingProtocol {
+        started: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
     }
 
     struct GatedBackend {
@@ -1904,6 +1921,28 @@ mod tests {
                 context_tokens: None,
                 finish_reason: Some(FinishReason::Stop),
             })
+        }
+    }
+
+    #[async_trait]
+    impl Protocol for BlockingProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "blocking".to_string(),
+                description: "block until the tool call is cancelled".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+
+        async fn read(
+            &self,
+            _request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.started.notify_one();
+            std::future::pending().await
         }
     }
 
@@ -4043,6 +4082,120 @@ mod tests {
             &event.kind,
             EventKind::Error { text } if text == TURN_INTERRUPTED_BY_USER
         )));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn tool_interrupt_persists_results_for_every_call_before_the_next_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut protocols = ProtocolRegistry::new(output, TaskManager::new());
+        protocols
+            .register(BlockingProtocol {
+                started: started.clone(),
+                calls: calls.clone(),
+            })
+            .unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                Ok(ModelResponse {
+                    content: vec![
+                        AssistantContent::ToolCall(read_call("call-1", "blocking://wait")),
+                        AssistantContent::ToolCall(read_call("call-2", "blocking://wait")),
+                    ],
+                    usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::ToolCalls),
+                }),
+                text_response("continued with complete tool history"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let runtime = Arc::new(AgentRuntime::new(
+            Some(backend.clone()),
+            Arc::new(protocols),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        ));
+
+        runtime.start_turn("run both tools".into()).await.unwrap();
+        started.notified().await;
+        assert!(runtime.interrupt_turn().await);
+        wait_for_turn(runtime.as_ref()).await;
+
+        let failed_results = session
+            .snapshot()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ToolResult {
+                    call_id,
+                    output,
+                    failed: true,
+                    ..
+                } => Some((call_id, output)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failed_results.len(), 2);
+        assert_eq!(failed_results[0].0, "call-1");
+        assert_eq!(failed_results[1].0, "call-2");
+        assert!(
+            failed_results
+                .iter()
+                .all(|(_, output)| output.contains(TURN_INTERRUPTED_BY_USER))
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        runtime.run_turn("continue".into()).await.unwrap();
+        let requests = backend.requests.lock().await;
+        let replayed_results = requests[1]
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|content| match content {
+                UserContent::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replayed_results.len(), 2);
+        assert_eq!(replayed_results[0].call.as_str(), "call-1");
+        assert_eq!(replayed_results[1].call.as_str(), "call-2");
+        assert!(replayed_results.iter().all(|result| {
+            matches!(
+                result.content.as_slice(),
+                [ToolResultContent::Text(text)] if text.text.contains(TURN_INTERRUPTED_BY_USER)
+            )
+        }));
+        drop(requests);
+
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
