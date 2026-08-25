@@ -1146,6 +1146,17 @@ impl App {
             .saturating_add(1);
     }
 
+    /// Remove the images a submitted message referenced without discarding
+    /// images pasted into the new draft while the turn was still starting.
+    fn discard_submitted_images(&mut self, submitted_image_ids: &[u64]) {
+        for id in submitted_image_ids {
+            self.composer_images.remove(id);
+        }
+        if self.composer_images.is_empty() {
+            self.next_composer_image_id = 1;
+        }
+    }
+
     fn insert_composer_text(&mut self, text: impl AsRef<str>) -> bool {
         expand_composer_selection_to_image_tokens(&mut self.input, &self.composer_images);
         let text = text.as_ref();

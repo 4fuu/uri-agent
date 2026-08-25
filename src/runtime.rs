@@ -468,20 +468,29 @@ impl AgentRuntime {
             }
             let _ = previous.handle.await;
         }
-        self.prepare_context().await?;
-        let backend = self
-            .backend
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
-        backend.prepare().await?;
         {
             let mut pending = self.pending.lock().await;
             if !pending.messages.is_empty() {
                 bail!("restore pending messages before starting a new turn")
             }
+            // Accept follow-up messages while deferred startup preparation
+            // runs; the spawned turn delivers them at its usual boundaries.
             pending.accepting = true;
+        }
+        let prepared = async {
+            self.prepare_context().await?;
+            let backend = self
+                .backend
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
+            backend.prepare().await
+        }
+        .await;
+        if let Err(error) = prepared {
+            self.stop_accepting_pending().await;
+            return Err(error);
         }
         let input = PendingMessageEntry {
             message: PendingMessage {
@@ -1974,6 +1983,151 @@ mod tests {
             limits,
         ));
         (runtime, session, output_directory)
+    }
+
+    struct GatedInitializer {
+        session: Session,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        failure: Option<String>,
+    }
+
+    #[async_trait]
+    impl RuntimeInitializer for GatedInitializer {
+        async fn initialize(&self) -> Result<String> {
+            self.entered.notify_one();
+            if let Some(failure) = &self.failure {
+                bail!("{failure}");
+            }
+            self.release.notified().await;
+            self.session
+                .initialize_context(SessionContext {
+                    system_prompt: "deferred system".to_string(),
+                    skills: Vec::new(),
+                })
+                .await?;
+            Ok("deferred system".to_string())
+        }
+    }
+
+    async fn deferred_test_runtime(
+        workspace: &Path,
+        backend: Arc<dyn ModelBackend>,
+        failure: Option<&str>,
+    ) -> (
+        Arc<AgentRuntime>,
+        Session,
+        PathBuf,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at_deferred(
+            workspace.join("sessions.db"),
+            Some(&session_id),
+            workspace,
+            "fake",
+            "fake-model",
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let initializer = Arc::new(GatedInitializer {
+            session: session.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            failure: failure.map(str::to_string),
+        });
+        let runtime = Arc::new(AgentRuntime::new_deferred(
+            Some(backend),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
+            session.clone(),
+            initializer,
+            ModelLimits::default(),
+        ));
+        (runtime, session, output_directory, entered, release)
+    }
+
+    #[tokio::test]
+    async fn start_turn_accepts_follow_ups_while_startup_context_prepares() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([
+                (vec![AssistantContent::text("first answer")], None),
+                (vec![AssistantContent::text("second answer")], None),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let (runtime, session, output_directory, entered, release) =
+            deferred_test_runtime(workspace.path(), backend, None).await;
+        let starting = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.start_turn("initial request".into()).await })
+        };
+        entered.notified().await;
+
+        let queued = runtime
+            .enqueue_message("queued follow-up".into(), PendingMessageKind::Queued)
+            .await
+            .unwrap();
+        assert_eq!(queued.text, "queued follow-up");
+        release.notify_one();
+
+        starting.await.unwrap().unwrap();
+        wait_for_turn(runtime.as_ref()).await;
+        let user_texts = session
+            .snapshot()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::User { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_texts, vec!["initial request", "queued follow-up"]);
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn failed_turn_start_stops_accepting_follow_ups() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("unreachable")],
+                None,
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let (runtime, _session, output_directory, _entered, _release) =
+            deferred_test_runtime(workspace.path(), backend, Some("startup context failed")).await;
+
+        let error = runtime
+            .start_turn("initial request".into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("startup context failed"));
+        let enqueue_error = runtime
+            .enqueue_message("queued follow-up".into(), PendingMessageKind::Queued)
+            .await
+            .unwrap_err();
+        assert!(
+            enqueue_error
+                .to_string()
+                .contains("the active turn has already finished")
+        );
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     fn tool_call_response(id: &str) -> Result<ModelResponse> {

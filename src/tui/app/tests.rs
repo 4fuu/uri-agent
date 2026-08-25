@@ -2177,6 +2177,27 @@ fn deleting_one_image_token_keeps_the_remaining_token_number_on_submit() {
 }
 
 #[test]
+fn submitted_image_cleanup_preserves_images_added_while_the_turn_starts() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Composer);
+    app.insert_composer_text("inspect ");
+    app.insert_clipboard_image(vec![1]);
+    let (prompt, _) = app.submit().unwrap();
+    assert_eq!(prompt, "inspect [Image #1]");
+    let submitted_image_ids = app.composer_images.keys().copied().collect::<Vec<_>>();
+
+    app.insert_composer_text("next ");
+    app.insert_clipboard_image(vec![2]);
+    app.discard_submitted_images(&submitted_image_ids);
+
+    assert_eq!(app.draft_text(), "next [Image #2]");
+    assert_eq!(app.composer_submission().1, [ImageAttachment::png(vec![2])]);
+    app.discard_submitted_images(&[2]);
+    assert!(app.composer_images.is_empty());
+    assert_eq!(app.next_composer_image_id, 1);
+}
+
+#[test]
 fn clipboard_images_wait_for_the_next_submit() {
     let mut app = test_app();
     let image = ImageAttachment::png(vec![1]);

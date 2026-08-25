@@ -448,6 +448,26 @@ impl Session {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn open_at_deferred(
+        database_path: PathBuf,
+        requested: Option<&str>,
+        cwd: &Path,
+        provider: &str,
+        model: &str,
+    ) -> Result<Self> {
+        Self::open_at_with_thinking(
+            database_path,
+            requested,
+            cwd,
+            provider,
+            model,
+            ThinkingLevel::default(),
+            None,
+        )
+        .await
+    }
+
     async fn open_at_with_thinking(
         database_path: PathBuf,
         requested: Option<&str>,

@@ -279,6 +279,11 @@ pub(super) enum BackgroundEvent {
         result: Box<Result<ActiveSettings>>,
         announced: bool,
     },
+    TurnStarted {
+        prompt: String,
+        submitted_image_ids: Vec<u64>,
+        result: Result<()>,
+    },
     OauthFinished(Result<OauthToken>),
     ClipboardImageRead(Result<Vec<u8>>),
     ClipboardRead(Result<clipboard::ClipboardContent>),
@@ -361,24 +366,19 @@ pub(super) async fn apply_action(
             }
         }
         Action::Submit { prompt, images } => {
-            match services
-                .runtime
-                .start_turn_with_images(prompt.clone(), images)
-                .await
-            {
-                Ok(()) => {
-                    app.composer_images.clear();
-                    app.next_composer_image_id = 1;
-                    let _ = services.runtime.session().save_draft("").await;
-                }
-                Err(error) => {
-                    app.busy = false;
-                    app.busy_since = None;
-                    app.activity = None;
-                    app.restore_to_draft(&prompt);
-                    app.set_flash(format!("Cannot start turn: {error:#}"));
-                }
-            }
+            // Deferred startup work (frozen context, backend preparation) can
+            // block on the first submit; run it off the event loop so the
+            // interface and its animation keep rendering meanwhile.
+            let submitted_image_ids = app.composer_images.keys().copied().collect();
+            let runtime = services.runtime.clone();
+            tokio::spawn(async move {
+                let result = runtime.start_turn_with_images(prompt.clone(), images).await;
+                let _ = background_tx.send(BackgroundEvent::TurnStarted {
+                    prompt,
+                    submitted_image_ids,
+                    result,
+                });
+            });
             Ok(None)
         }
         Action::Enqueue {
@@ -3041,6 +3041,23 @@ pub(super) async fn finish_background(
     event: BackgroundEvent,
 ) {
     match event {
+        BackgroundEvent::TurnStarted {
+            prompt,
+            submitted_image_ids,
+            result,
+        } => match result {
+            Ok(()) => {
+                app.discard_submitted_images(&submitted_image_ids);
+                let _ = services.runtime.session().save_draft("").await;
+            }
+            Err(error) => {
+                app.busy = false;
+                app.busy_since = None;
+                app.activity = None;
+                app.restore_to_draft(&prompt);
+                app.set_flash(format!("Cannot start turn: {error:#}"));
+            }
+        },
         BackgroundEvent::CatalogRefreshed { result, announced } => {
             app.catalog_refreshing = false;
             let result = async {
