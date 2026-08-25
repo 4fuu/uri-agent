@@ -157,4 +157,4 @@ rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1
 ```
 
-The buildable [`examples/wasm-plugin`](https://github.com/4fuu/uri-agent/tree/main/examples/wasm-plugin) project contains a complete guest. Read `wasm_plugin://help` in URI Agent for the active installation directory and exact model-facing workflow.
+The buildable [`examples/wasm-plugin`](https://github.com/4fuu/uri-agent/tree/main/examples/wasm-plugin) project contains a complete guest. Read `wasm_plugin://help/author` for model-facing authoring guidance and `wasm_plugin://help/load` before loading or reloading the completed plugin.

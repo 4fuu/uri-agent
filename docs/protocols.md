@@ -127,22 +127,28 @@ limits and output shape.
 
 ### `sessions`
 
-The read-only `sessions` protocol discovers and searches saved URI Agent sessions. Discovery is scoped to the current project by default; `scope: "all"` searches every project, and an optional `cwd` narrows that cross-project scope:
+The read-only `sessions` protocol discovers and searches saved URI Agent
+sessions. Discovery is scoped to the current project by default. Put discovery
+options in the URI query: `scope=all` searches every project, an optional
+percent-encoded `cwd` narrows that cross-project scope, and `limit` and `offset`
+bound the result page. The search body is only the plain search text:
 
 ```text
 read("sessions://recent", "")
-read("sessions://search", "{\"query\":\"refresh token\"}")
-read("sessions://search", "{\"query\":\"billing migration\",\"scope\":\"all\"}")
+read("sessions://search", "refresh token")
+read("sessions://search?scope=all&limit=20", "billing migration")
 ```
 
-Read an exact session ID to retrieve its newest visible records. Use the returned `before` cursor to page backward, and request `include_tools` only when tool evidence is needed:
+Read an exact session ID to retrieve its newest visible records. Put
+`include_tools`, `limit`, and the returned `before` pagination cursor in the URI
+query; session reads use an empty body:
 
 ```text
 read("sessions://<session-id>", "")
-read("sessions://<session-id>", "{\"include_tools\":true,\"limit\":20}")
+read("sessions://<session-id>?include_tools=true&limit=20", "")
 ```
 
-User, assistant, and terminal error text is returned by default. Thinking, usage, model replay payloads, compaction summaries, and TUI metadata are always excluded; tool calls and results are excluded unless requested. Results are bounded and marked as untrusted reference data. Archive access opens the SQLite database read-only and does not initialize, migrate, resume, append, rename, or delete sessions. Read `sessions://help` for the body fields and limits.
+User, assistant, and terminal error text is returned by default. Thinking, usage, model replay payloads, compaction summaries, and TUI metadata are always excluded; tool calls and results are excluded unless requested. Results are bounded and marked as untrusted reference data. Archive access opens the SQLite database read-only and does not initialize, migrate, resume, append, rename, or delete sessions. Read `sessions://help` for the exact query parameters and limits.
 
 ### `https`
 

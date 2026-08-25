@@ -4027,6 +4027,7 @@ mod tests {
         let runtime = Arc::new(AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(protocols),
+            protocol_model_tools(),
             session.clone(),
             "system".to_string(),
             ModelLimits::default(),

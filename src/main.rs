@@ -11,7 +11,7 @@ use uri_agent::output::OutputStore;
 use uri_agent::plugin::{
     CommandRegistry, ModelToolRegistry, PluginHost, PluginRegistry, TuiRegistry,
 };
-use uri_agent::prompts::ProtocolPrompt;
+use uri_agent::prompts::PromptEntry;
 use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, RuntimeInitializer, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice, SessionContext};
@@ -33,7 +33,8 @@ struct SessionInitializer {
     session: Session,
     plugins: Arc<PluginRegistry>,
     cwd: PathBuf,
-    prompt_protocols: Vec<ProtocolPrompt>,
+    prompt_tools: Vec<PromptEntry>,
+    prompt_protocols: Vec<PromptEntry>,
     reserved_protocols: HashSet<String>,
     skill_source: SkillProtocolSource,
     wasm_plugins: WasmPluginManager,
@@ -46,6 +47,7 @@ impl RuntimeInitializer for SessionInitializer {
         let (context, skills, mut notices) = if self.session.is_new() {
             let plugins = self.plugins.clone();
             let cwd = self.cwd.clone();
+            let prompt_tools = self.prompt_tools.clone();
             let mut prompt_protocols = self.prompt_protocols.clone();
             let mut protocol_names = self.reserved_protocols.clone();
             tokio::task::spawn_blocking(move || -> Result<_> {
@@ -64,7 +66,7 @@ impl RuntimeInitializer for SessionInitializer {
                         ));
                         continue;
                     }
-                    prompt_protocols.push(ProtocolPrompt {
+                    prompt_protocols.push(PromptEntry {
                         name: protocol,
                         description: format!("Skill “{}”: {}", snapshot.name, snapshot.description),
                     });
@@ -74,6 +76,7 @@ impl RuntimeInitializer for SessionInitializer {
                 prompt_protocols.sort_by(|left, right| left.name.cmp(&right.name));
                 let context = SessionContext {
                     system_prompt: uri_agent::prompts::system_prompt(
+                        &prompt_tools,
                         &prompt_protocols,
                         &prompt_fragments,
                     ),
@@ -181,13 +184,21 @@ async fn run_session(
     plugins.add(wasm_plugins.clone());
     let mut startup_notices = plugins.startup_notices();
     let plugin_protocols = plugins.protocol_descriptors()?;
+    let prompt_tools = plugins
+        .model_tool_descriptors()?
+        .into_iter()
+        .map(|descriptor| PromptEntry {
+            name: descriptor.name,
+            description: descriptor.description,
+        })
+        .collect::<Vec<_>>();
     let protocol_names = plugin_protocols
         .iter()
         .map(|descriptor| descriptor.name.clone())
         .collect::<HashSet<_>>();
     let prompt_protocols = plugin_protocols
         .iter()
-        .map(|descriptor| ProtocolPrompt {
+        .map(|descriptor| PromptEntry {
             name: descriptor.name.clone(),
             description: descriptor.description.clone(),
         })
@@ -276,6 +287,7 @@ async fn run_session(
         session: session.clone(),
         plugins: Arc::new(plugins),
         cwd: config.cwd.clone(),
+        prompt_tools,
         prompt_protocols,
         reserved_protocols: protocol_names,
         skill_source,

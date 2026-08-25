@@ -1,5 +1,5 @@
 use crate::output::OutputStore;
-use crate::prompts::ProtocolPrompt;
+use crate::prompts::PromptEntry;
 use crate::task::TaskManager;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -126,10 +126,10 @@ impl ProtocolRegistry {
         descriptors
     }
 
-    pub fn prompt_protocols(&self) -> Vec<ProtocolPrompt> {
+    pub fn prompt_protocols(&self) -> Vec<PromptEntry> {
         self.descriptors()
             .into_iter()
-            .map(|descriptor| ProtocolPrompt {
+            .map(|descriptor| PromptEntry {
                 name: descriptor.name,
                 description: descriptor.description,
             })
@@ -450,10 +450,7 @@ mod tests {
         registry.set_dynamic_source(first.clone()).unwrap();
         registry.set_dynamic_source(second.clone()).unwrap();
 
-        assert_eq!(
-            registry.read("second://help", None).await.unwrap(),
-            "second"
-        );
+        assert_eq!(registry.read("second://help", "").await.unwrap(), "second");
         assert_eq!(first.ready_calls.load(Ordering::Relaxed), 1);
         assert_eq!(second.ready_calls.load(Ordering::Relaxed), 1);
         assert_eq!(

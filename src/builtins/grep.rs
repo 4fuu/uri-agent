@@ -21,18 +21,17 @@ fn help(cwd: &Path) -> String {
     format!(
         r#"# grep
 
-Search file contents with ripgrep and return bounded `path:line:text` matches.
+Search file contents and return bounded `path:line:text` matches.
 
 Current working directory: `grep://{}`
 
 Put the search pattern in the string body. Use `grep://<root>` for a project-
 relative or absolute file/directory root. An empty root searches the current
-working directory. The protocol invokes ripgrep directly without a shell,
-prefers `rg` from PATH, and otherwise downloads a pinned verified binary.
+working directory.
 
 Optional query parameters:
 
-- `glob=<pattern>` filters searched paths with a ripgrep glob.
+- `glob=<pattern>` filters searched paths with a glob pattern.
 - `literal=true` treats the body as literal text instead of a regular expression.
 - `ignore_case=true` enables case-insensitive matching.
 - `context=<0..20>` includes surrounding lines.
@@ -93,9 +92,8 @@ impl Protocol for GrepProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: "grep".to_string(),
-            description:
-                "Search file contents with bounded ripgrep results and optional glob filtering."
-                    .to_string(),
+            description: "Search file contents with bounded results and optional glob filtering."
+                .to_string(),
             can_read: true,
             can_exec: false,
         }

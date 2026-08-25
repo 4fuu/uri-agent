@@ -61,17 +61,36 @@ fn help(
         serde_json::to_string(active_model_tools).expect("model tool names serialize as JSON")
     };
     format!(
-        r##"# wasm_plugin
+        r#"# wasm_plugin
 
-Build, install, and hot-reload trusted WASM plugins. There is no package
-manifest and URI Agent does not clone or build repositories itself.
+Inspect, author, and hot-reload trusted WASM plugins.
 
 Plugin directory: `{directory}`
 Active dynamic protocols: {active}
 Active dynamic model tools: {active_model_tools}
 Last reload diagnostics: {diagnostics}
 
-## Install workflow
+- Read `wasm_plugin://help/load` for loading, updating, removing, and reloading plugins.
+- Read `wasm_plugin://help/author` for the SDK, ABI, protocols, direct tools, and permissions.
+- Call `exec("wasm_plugin://reload", "")` to reload the plugin directory.
+  Always read `wasm_plugin://help/load` before changing plugin files or calling reload.
+
+All reads require an empty string body.
+"#,
+        directory = display_path(directory),
+    )
+}
+
+fn load_help(directory: &Path) -> String {
+    format!(
+        r#"# wasm_plugin loading
+
+Load, update, remove, and hot-reload trusted WASM plugins. There is no package
+manifest and URI Agent does not clone or build repositories itself.
+
+Plugin directory: `{directory}`
+
+## Load workflow
 
 1. Clone the requested repository into a temporary directory.
 2. Inspect its source and build instructions before running its build.
@@ -98,10 +117,25 @@ Last reload diagnostics: {diagnostics}
 To remove a plugin, delete its `.wasm` file and reload. To update one, atomically
 replace the file and reload.
 
-`wasm_plugin` exposes only
-`read("wasm_plugin://help", "")` and
-`exec("wasm_plugin://reload", "")`; reload accepts
-no protocol body.
+## Trust and runtime limits
+
+WASM is the stable distribution ABI, not a security boundary here. Only build
+and enable code you trust. Plugins run with WASI, unrestricted outbound HTTP,
+and writable host filesystem access on Unix. Through host `read`/`exec` they
+can also use URI Agent's built-in file and shell protocols with the same user
+permissions as URI Agent. Calls remain subject to memory, fuel, response-size,
+and 30-second reliability limits.
+"#,
+        directory = display_path(directory),
+    )
+}
+
+fn author_help() -> String {
+    format!(
+        r##"# wasm_plugin authoring
+
+Author WASM plugins that register protocols and typed direct model tools.
+The SDK targets ABI version 3; rebuild plugins that use an older ABI.
 
 ## Rust SDK
 
@@ -112,7 +146,7 @@ Add the SDK crate from crates.io:
 crate-type = ["cdylib"]
 
 [dependencies]
-uri-agent-plugin-sdk = "2026.825.0"
+uri-agent-plugin-sdk = "{version}"
 serde_json = "1"
 ```
 
@@ -190,16 +224,9 @@ process environment variables are available through
 `.request_credentials_access()` once. This grants dynamic read access to API
 keys for every provider and is likewise an explicit source-audit marker.
 
-## Trust and permissions
-
-WASM is the stable distribution ABI, not a security boundary here. Only build
-and enable code you trust. Plugins run with WASI, unrestricted outbound HTTP,
-and writable host filesystem access on Unix. Through host `read`/`exec` they
-can also use URI Agent's built-in file and shell protocols with the same user
-permissions as URI Agent. Calls remain subject to memory, fuel, response-size,
-and 30-second reliability limits.
+Read `wasm_plugin://help/load` before loading or reloading the completed plugin.
 "##,
-        directory = display_path(directory),
+        version = env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -601,10 +628,17 @@ impl Protocol for WasmPluginManager {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if !request.body.is_empty() {
-            bail!("wasm_plugin://help does not accept a body");
+            bail!("wasm_plugin help reads do not accept a body");
         }
-        if request.target != "help" {
-            bail!("unknown wasm_plugin read target; use wasm_plugin://help");
+        match request.target {
+            "help/load" => return Ok(load_help(&self.directory).into_bytes()),
+            "help/author" => return Ok(author_help().into_bytes()),
+            "help" => {}
+            _ => {
+                bail!(
+                    "unknown wasm_plugin read target; use wasm_plugin://help, wasm_plugin://help/load, or wasm_plugin://help/author"
+                )
+            }
         }
         let _ = self.initialize().await;
         let active = self.current().protocols.keys().cloned().collect::<Vec<_>>();
@@ -1532,15 +1566,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn help_exposes_only_help_and_reload() {
+    async fn help_routes_loading_and_authoring_separately() {
         let directory = tempfile::tempdir().unwrap();
         let (registry, _model_tools, _manager, output) =
             registry_with_manager(directory.path()).await;
 
         let help = registry.read("wasm_plugin://help", "").await.unwrap();
         assert!(help.contains("wasm_plugin://reload"));
-        assert!(help.contains("request_environment_access"));
+        assert!(help.contains("wasm_plugin://help/load"));
+        assert!(help.contains("wasm_plugin://help/author"));
+        assert!(help.contains("Always read `wasm_plugin://help/load`"));
+        assert!(!help.contains("cargo build"));
+        assert!(!help.contains("ModelToolDescriptor"));
+
+        let load = registry.read("wasm_plugin://help/load", "").await.unwrap();
+        assert!(load.contains("cargo build --release --target wasm32-wasip1"));
+        assert!(load.contains("atomic enable step"));
+        assert!(!load.contains("ModelToolDescriptor"));
+
+        let author = registry
+            .read("wasm_plugin://help/author", "")
+            .await
+            .unwrap();
+        assert!(author.contains("ModelToolDescriptor"));
+        assert!(author.contains("request_environment_access"));
+        assert!(!author.contains("atomic enable step"));
+
         assert!(registry.read("wasm_plugin://list", "").await.is_err());
+        assert!(
+            registry
+                .read("wasm_plugin://help/load", "unexpected")
+                .await
+                .is_err()
+        );
         assert!(registry.exec("wasm_plugin://install", "").await.is_err());
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }

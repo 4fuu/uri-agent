@@ -23,7 +23,7 @@ These documents explain stable concepts and cross-cutting behavior. More specifi
 - `uri-agent --help` defines the current command-line interface.
 - The active model-tool schemas define direct-tool arguments; `<protocol>://help` defines a registered protocol's accepted addresses, string body, execution behavior, result routes, and limits.
 - `uri-agent-docs://README.md` exposes this documentation embedded in the running binary, independent of its startup working directory.
-- `wasm_plugin://help` publishes the active WASM plugin directory and model-facing installation and reload contract.
+- `wasm_plugin://help` publishes active WASM plugin state and routes to separate loading and authoring help pages.
 - `F1` and `:help` show the active command and keymap reference after global and project overrides are applied.
 - The [pi model catalog](https://github.com/earendil-works/pi) plus local `models.json` defines the available providers and models.
 - [`AGENTS.md`](../AGENTS.md) is the concise entry point for coding agents; the [development guide](development.md) contains the detailed repository rules it references.

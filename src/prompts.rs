@@ -7,27 +7,31 @@ pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol. Use
 pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Exact behavior is protocol-specific; read `<protocol>://help` before use. Operations normally return their final result directly. Long-running operations may become managed background tasks whose completion is delivered automatically; use the tasks protocol to inspect or cancel them.";
 
 #[derive(Clone, Debug)]
-pub struct ProtocolPrompt {
+pub struct PromptEntry {
     pub name: String,
     pub description: String,
 }
 
-pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> String {
+pub fn system_prompt(
+    tools: &[PromptEntry],
+    protocols: &[PromptEntry],
+    fragments: &[String],
+) -> String {
     let mut prompt = String::from(
-        "You are a general-purpose agent running in URI Agent.\n\
-         Use read to retrieve information and exec to perform actions through registered protocols; use registered direct tools when their typed arguments fit the task.\n\
-         The read and exec body is always a string. Use an empty string when a protocol takes no body, plain text for textual input, or complete serialized JSON text when a protocol requires structured input.\n\
-         Angle-bracketed values in protocol addresses, such as <protocol>, are placeholders.\n\
-         The same placeholder convention applies throughout protocol help.\n\
-         Replace placeholders with the required values without including the angle brackets.\n\
-         Before using a protocol for the first time, call read(\"<protocol>://help\", \"\") to learn its contract.\n\
-         Verify relevant results before claiming work is complete.\n\n\
-         Available protocols:\n",
+        "You are a general-purpose agent running in URI Agent.\n\n\
+         Available direct tools:\n",
     );
 
-    for protocol in protocols {
-        let _ = writeln!(prompt, "- {}: {}", protocol.name, protocol.description);
-    }
+    write_entries(&mut prompt, tools);
+    prompt.push_str("\nAvailable protocols:\n");
+    write_entries(&mut prompt, protocols);
+    prompt.push_str(
+        "\nUse a direct tool when its typed arguments match the operation. Use read or exec for capabilities exposed as protocols.\n\n\
+         The read and exec body is always a string. Pass \"\" when a protocol takes no body, pass plain text for textual input, and pass complete serialized JSON text when a protocol requires structured input.\n\n\
+         Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values without including the angle brackets.\n\n\
+         Before using a protocol for the first time, call read(\"<protocol>://help\", \"\") and follow its contract.\n\n\
+         Verify relevant results before claiming work is complete.\n",
+    );
 
     for fragment in fragments {
         prompt.push('\n');
@@ -38,6 +42,17 @@ pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> Stri
     }
 
     prompt
+}
+
+fn write_entries(prompt: &mut String, entries: &[PromptEntry]) {
+    for entry in entries {
+        let description = entry
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(prompt, "- {}: {description}", entry.name);
+    }
 }
 
 pub fn task_accepted(id: &str) -> String {
@@ -58,9 +73,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_prompt_has_no_working_directory_or_repeated_help_addresses() {
+    fn system_prompt_separates_direct_tools_from_protocols() {
         let prompt = system_prompt(
-            &[ProtocolPrompt {
+            &[PromptEntry {
+                name: "read".to_string(),
+                description: "Read through a\nregistered protocol.".to_string(),
+            }],
+            &[PromptEntry {
                 name: "file".to_string(),
                 description: "Read files.".to_string(),
             }],
@@ -68,17 +87,26 @@ mod tests {
         );
         assert!(prompt.starts_with("You are a general-purpose agent running in URI Agent."));
         assert!(prompt.contains("body is always a string"));
-        assert!(prompt.contains("registered direct tools"));
-        assert!(prompt.contains("same placeholder convention applies throughout protocol help"));
-        assert!(prompt.contains(r#"call read("<protocol>://help", "")"#));
+        assert!(
+            prompt.contains("Available direct tools:\n- read: Read through a registered protocol.")
+        );
         assert!(prompt.contains("- file: Read files."));
+        assert!(
+            prompt.find("Available direct tools:").unwrap()
+                < prompt.find("Available protocols:").unwrap()
+        );
+        assert!(prompt.contains(r#"call read("<protocol>://help", "")"#));
         assert!(!prompt.contains("file://help"));
     }
 
     #[test]
     fn system_prompt_appends_plugin_fragments_after_protocols() {
         let prompt = system_prompt(
-            &[ProtocolPrompt {
+            &[PromptEntry {
+                name: "read".to_string(),
+                description: "Read resources.".to_string(),
+            }],
+            &[PromptEntry {
                 name: "file".to_string(),
                 description: "Read files.".to_string(),
             }],

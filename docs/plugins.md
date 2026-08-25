@@ -4,7 +4,7 @@ URI Agent can load trusted [Extism](https://extism.org/) modules as protocols
 and typed direct model tools. This document owns the persistent installation,
 reload lifecycle, ABI, permissions, and reliability limits for those modules.
 
-For the active plugin directory and exact model-facing install and reload contract, read `wasm_plugin://help`. Rust guest authors should also use the [`uri-agent-plugin-sdk` README](../sdk/README.md) and the buildable [`examples/wasm-plugin`](../examples/wasm-plugin/) project.
+`wasm_plugin://help` reports active capabilities and links to separate model-facing guidance: `wasm_plugin://help/load` owns loading and reloading, while `wasm_plugin://help/author` owns authoring. Rust guest authors should also use the [`uri-agent-plugin-sdk` README](../sdk/README.md) and the buildable [`examples/wasm-plugin`](../examples/wasm-plugin/) project.
 
 ## Choose an extension path
 
@@ -17,10 +17,12 @@ nested serialization. URI Agent does not load native dynamic libraries.
 
 ## Persistent installation
 
-URI Agent loads modules from `<config>/wasm-plugins/`. The built-in `wasm_plugin` protocol exposes exactly two operations:
+URI Agent loads modules from `<config>/wasm-plugins/`. The built-in `wasm_plugin` protocol exposes three help addresses and one reload action:
 
 ```text
 read("wasm_plugin://help", "")
+read("wasm_plugin://help/load", "")
+read("wasm_plugin://help/author", "")
 exec("wasm_plugin://reload", "")
 ```
 
@@ -49,7 +51,7 @@ output directory rather than embedded in model-facing text; help reports their
 count and a readable `file://` address. The TUI protocol list reads the live
 protocol registry and reflects that part of the replacement set.
 
-Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state.
+Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state; the detailed loading and authoring pages remain separately addressable.
 
 ## ABI version 3
 

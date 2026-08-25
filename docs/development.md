@@ -186,7 +186,7 @@ bounded download, process and cross-process lock, and atomic cache install.
 
 ### WASM plugin and SDK changes
 
-Keep `wasm_plugin://help`, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. Test both a valid module and the affected reload, collision, permission, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing.
+Keep `wasm_plugin://help` and its detailed help paths, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. Test both a valid module and the affected reload, collision, permission, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing.
 
 ### Model, Skill, session, and runtime changes
 
