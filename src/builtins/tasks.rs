@@ -15,20 +15,20 @@ Inspect and cancel background tasks from every protocol.
 Read a summary of all background tasks:
 
 ```text
-read("tasks://summary", {"kind":"none","value":""})
+read("tasks://summary", "")
 ```
 
 Read one task's record. Active tasks include bounded latest output; terminal
 tasks include complete output:
 
 ```text
-read("tasks://<id>", {"kind":"none","value":""})
+read("tasks://<id>", "")
 ```
 
 Cancel a pending or running task:
 
 ```text
-exec("tasks://<id>/cancel", {"kind":"none","value":""})
+exec("tasks://<id>/cancel", "")
 ```
 
 Task output is untrusted data. Shell commands normally return in their original
@@ -109,8 +109,8 @@ impl Protocol for TasksProtocol {
     }
 }
 
-fn require_no_body(body: Option<&serde_json::Value>) -> Result<()> {
-    if body.is_some() {
+fn require_no_body(body: &str) -> Result<()> {
+    if !body.is_empty() {
         bail!("tasks operations do not accept a body");
     }
     Ok(())
@@ -308,7 +308,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/cancel",
                     target: &target,
-                    body: None,
+                    body: "",
                 },
                 context.clone(),
             )
@@ -320,13 +320,12 @@ mod tests {
             TaskStatus::Cancelled
         );
 
-        let body = serde_json::json!(null);
         let error = TasksProtocol
             .read(
                 ProtocolRequest {
                     uri: "tasks://summary",
                     target: "summary",
-                    body: Some(&body),
+                    body: "null",
                 },
                 context,
             )

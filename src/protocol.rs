@@ -3,7 +3,6 @@ use crate::prompts::ProtocolPrompt;
 use crate::task::TaskManager;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -23,7 +22,7 @@ pub struct ProtocolDescriptor {
 pub struct ProtocolRequest<'a> {
     pub uri: &'a str,
     pub target: &'a str,
-    pub body: Option<&'a Value>,
+    pub body: &'a str,
 }
 
 #[async_trait]
@@ -141,28 +140,27 @@ impl ProtocolRegistry {
         self.context.tasks.clone()
     }
 
-    pub async fn read(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+    pub(crate) async fn present(&self, content: Vec<u8>, hint: &str) -> Result<String> {
+        self.output.present(content, hint).await
+    }
+
+    pub async fn read(&self, uri: &str, body: &str) -> Result<String> {
         self.dispatch_read(uri, body, true).await
     }
 
-    pub async fn exec(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+    pub async fn exec(&self, uri: &str, body: &str) -> Result<String> {
         self.dispatch_exec(uri, body, true).await
     }
 
-    pub(crate) async fn read_static(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+    pub(crate) async fn read_static(&self, uri: &str, body: &str) -> Result<String> {
         self.dispatch_read(uri, body, false).await
     }
 
-    pub(crate) async fn exec_static(&self, uri: &str, body: Option<&Value>) -> Result<String> {
+    pub(crate) async fn exec_static(&self, uri: &str, body: &str) -> Result<String> {
         self.dispatch_exec(uri, body, false).await
     }
 
-    async fn dispatch_read(
-        &self,
-        uri: &str,
-        body: Option<&Value>,
-        include_dynamic: bool,
-    ) -> Result<String> {
+    async fn dispatch_read(&self, uri: &str, body: &str, include_dynamic: bool) -> Result<String> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
@@ -178,12 +176,7 @@ impl ProtocolRegistry {
         self.output.present(content, name).await
     }
 
-    async fn dispatch_exec(
-        &self,
-        uri: &str,
-        body: Option<&Value>,
-        include_dynamic: bool,
-    ) -> Result<String> {
+    async fn dispatch_exec(&self, uri: &str, body: &str, include_dynamic: bool) -> Result<String> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
@@ -246,7 +239,7 @@ mod tests {
     struct CapturedRequest {
         uri: String,
         target: String,
-        body: Option<Value>,
+        body: String,
     }
 
     struct CaptureProtocol {
@@ -327,7 +320,7 @@ mod tests {
             *self.capture.lock().unwrap() = Some(CapturedRequest {
                 uri: request.uri.to_string(),
                 target: request.target.to_string(),
-                body: request.body.cloned(),
+                body: request.body.to_string(),
             });
             Ok(b"ok".to_vec())
         }
@@ -340,7 +333,7 @@ mod tests {
             *self.capture.lock().unwrap() = Some(CapturedRequest {
                 uri: request.uri.to_string(),
                 target: request.target.to_string(),
-                body: request.body.cloned(),
+                body: request.body.to_string(),
             });
             Ok(b"ok".to_vec())
         }
@@ -361,7 +354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_passes_opaque_uri_and_arbitrary_body_unchanged() {
+    async fn registry_passes_opaque_uri_and_string_body_unchanged() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -372,10 +365,10 @@ mod tests {
                 capture: capture.clone(),
             })
             .unwrap();
-        let body = serde_json::json!(["markdown is fine", {"nested": [1, null, true]}]);
+        let body = r#"["markdown is fine",{"nested":[1,null,true]}]"#;
 
         let result = registry
-            .read("capture://a://b?not=a url", Some(&body))
+            .read("capture://a://b?not=a url", body)
             .await
             .unwrap();
 
@@ -385,7 +378,7 @@ mod tests {
             &CapturedRequest {
                 uri: "capture://a://b?not=a url".to_string(),
                 target: "a://b?not=a url".to_string(),
-                body: Some(body),
+                body: body.to_string(),
             }
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -403,12 +396,9 @@ mod tests {
                 capture: capture.clone(),
             })
             .unwrap();
-        let body = serde_json::json!("unchanged");
+        let body = "unchanged";
 
-        let result = registry
-            .exec("capture://run?wait=30", Some(&body))
-            .await
-            .unwrap();
+        let result = registry.exec("capture://run?wait=30", body).await.unwrap();
 
         assert_eq!(result, "ok");
         assert_eq!(
@@ -416,7 +406,7 @@ mod tests {
             &CapturedRequest {
                 uri: "capture://run?wait=30".to_string(),
                 target: "run?wait=30".to_string(),
-                body: Some(body),
+                body: body.to_string(),
             }
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;

@@ -8,7 +8,9 @@ use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
 use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
-use uri_agent::plugin::{CommandRegistry, PluginHost, PluginRegistry, TuiRegistry};
+use uri_agent::plugin::{
+    CommandRegistry, ModelToolRegistry, PluginHost, PluginRegistry, TuiRegistry,
+};
 use uri_agent::prompts::ProtocolPrompt;
 use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, RuntimeInitializer, forward_task_notices};
@@ -216,17 +218,26 @@ async fn run_session(
     let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
     wasm_plugins.bind_output(output.clone())?;
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
+    let mut model_tools = ModelToolRegistry::new();
     let mut commands = CommandRegistry::with_core_commands();
     let mut tui = TuiRegistry::default();
     plugins.install(
         &mut PluginHost::new(
             &mut protocols,
+            &mut model_tools,
             &mut commands,
             &mut tui,
             config.environment.clone(),
         )
         .with_credentials(config.manager.clone()),
     )?;
+    wasm_plugins.set_reserved_model_tools(
+        model_tools
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name),
+    )?;
+    model_tools.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
     startup_notices.extend(config.catalog.warnings().await);
 
     let configured = match configured_backend(
@@ -258,6 +269,7 @@ async fn run_session(
     protocols.set_dynamic_source(Arc::new(skill_source.clone()))?;
     protocols.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
     let protocols = Arc::new(protocols);
+    let model_tools = Arc::new(model_tools);
     wasm_plugins.bind_host(Arc::downgrade(&protocols))?;
     let context_window = limits.context_window;
     let initializer = Arc::new(SessionInitializer {
@@ -273,6 +285,7 @@ async fn run_session(
     let runtime = Arc::new(AgentRuntime::new_deferred(
         backend,
         protocols.clone(),
+        model_tools,
         session.clone(),
         initializer,
         limits,

@@ -11,12 +11,10 @@ mod request_transform;
 mod rig_backend;
 
 use crate::catalog::{CatalogModel, ThinkingLevel};
-use crate::prompts;
 use anyhow::Result;
 use async_trait::async_trait;
 use rig::completion::{FinishReason, ToolDefinition};
 use rig::message::{AssistantContent, Message};
-use serde_json::json;
 use tokio::sync::mpsc;
 
 pub(crate) use failure::{
@@ -34,7 +32,7 @@ pub enum ModelDelta {
 pub struct ModelRequest {
     pub system: String,
     pub history: Vec<Message>,
-    pub tools: bool,
+    pub tools: Vec<ToolDefinition>,
     pub estimated_context: usize,
     pub max_output_tokens: Option<usize>,
 }
@@ -90,49 +88,6 @@ pub(crate) fn clamp_thinking_level(
                 .find(|level| model.supports_thinking_level(*level))
         })
         .unwrap_or(ThinkingLevel::Off)
-}
-
-pub fn tool_definitions() -> Vec<ToolDefinition> {
-    let parameters = json!({
-        "type": "object",
-        "properties": {
-            "uri": {
-                "type": "string",
-                "description": "Protocol address in the custom form <protocol>://<opaque-target>. It is not an RFC URL and is passed to the selected protocol unchanged."
-            },
-            "body": {
-                "type": "object",
-                "description": "Required envelope for the protocol-specific body. Use kind `none` with an empty value when the protocol takes no body, `text` for a literal string body, or `json` with the complete JSON serialization of any JSON body.",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["none", "text", "json"],
-                        "description": "How URI Agent decodes value before protocol dispatch."
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Empty for `none`, literal protocol text for `text`, or complete serialized JSON for `json`."
-                    }
-                },
-                "required": ["kind", "value"],
-                "additionalProperties": false
-            }
-        },
-        "required": ["uri", "body"],
-        "additionalProperties": false
-    });
-    vec![
-        ToolDefinition {
-            name: "read".to_string(),
-            description: prompts::READ_TOOL_DESCRIPTION.to_string(),
-            parameters: parameters.clone(),
-        },
-        ToolDefinition {
-            name: "exec".to_string(),
-            description: prompts::EXEC_TOOL_DESCRIPTION.to_string(),
-            parameters,
-        },
-    ]
 }
 
 #[cfg(test)]

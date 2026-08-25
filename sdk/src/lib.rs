@@ -13,7 +13,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -27,6 +27,7 @@ pub const HOST_CREDENTIALS: &str = "uri_agent_credentials";
 pub struct PluginManifest {
     pub abi_version: u32,
     pub protocols: Vec<ProtocolDescriptor>,
+    pub model_tools: Vec<ModelToolDescriptor>,
     pub permissions: PluginPermissions,
 }
 
@@ -35,8 +36,18 @@ impl PluginManifest {
         Self {
             abi_version: ABI_VERSION,
             protocols: protocols.into_iter().collect(),
+            model_tools: Vec::new(),
             permissions: PluginPermissions::default(),
         }
+    }
+
+    /// Register direct model tools with typed JSON arguments.
+    pub fn with_model_tools(
+        mut self,
+        tools: impl IntoIterator<Item = ModelToolDescriptor>,
+    ) -> Self {
+        self.model_tools = tools.into_iter().collect();
+        self
     }
 
     /// Request access to user-managed Agent environment variables.
@@ -75,6 +86,24 @@ pub struct ProtocolDescriptor {
     pub can_exec: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ModelToolDescriptor {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
 impl ProtocolDescriptor {
     pub fn new(
         name: impl Into<String>,
@@ -99,13 +128,19 @@ pub enum Operation {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HandlerRequest {
-    pub protocol: String,
-    pub operation: Operation,
-    pub uri: String,
-    pub target: String,
-    pub body: Option<Value>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HandlerRequest {
+    Protocol {
+        protocol: String,
+        operation: Operation,
+        uri: String,
+        target: String,
+        body: String,
+    },
+    ModelTool {
+        name: String,
+        arguments: Value,
+    },
 }
 
 /// Result returned by a plugin request handler.
@@ -115,7 +150,7 @@ pub type HandlerResult = Result<Vec<u8>, String>;
 #[derive(Serialize)]
 struct HostRequest<'a> {
     uri: &'a str,
-    body: Option<&'a Value>,
+    body: &'a str,
 }
 
 #[cfg(target_family = "wasm")]
@@ -133,13 +168,13 @@ mod host {
 
 /// Read through one of URI Agent's built-in protocols.
 #[cfg(target_family = "wasm")]
-pub fn read(uri: &str, body: Option<&Value>) -> Result<String, Error> {
+pub fn read(uri: &str, body: &str) -> Result<String, Error> {
     call_host(uri, body, host::uri_agent_read)
 }
 
 /// Execute through one of URI Agent's built-in protocols.
 #[cfg(target_family = "wasm")]
-pub fn exec(uri: &str, body: Option<&Value>) -> Result<String, Error> {
+pub fn exec(uri: &str, body: &str) -> Result<String, Error> {
     call_host(uri, body, host::uri_agent_exec)
 }
 
@@ -162,7 +197,7 @@ pub fn provider_api_key(provider: &str) -> Result<Option<String>, Error> {
 #[cfg(target_family = "wasm")]
 fn call_host(
     uri: &str,
-    body: Option<&Value>,
+    body: &str,
     call: unsafe fn(String) -> Result<String, Error>,
 ) -> Result<String, Error> {
     let input = serde_json::to_string(&HostRequest { uri, body })?;
@@ -217,6 +252,7 @@ mod tests {
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["abi_version"], ABI_VERSION);
         assert_eq!(value["protocols"][0]["name"], "example");
+        assert_eq!(value["model_tools"], serde_json::json!([]));
         assert_eq!(value["permissions"]["environment"], false);
         assert_eq!(value["permissions"]["credentials"], false);
 
@@ -235,14 +271,15 @@ mod tests {
         assert!(incomplete.is_err());
 
         let request: HandlerRequest = serde_json::from_value(serde_json::json!({
-            "protocol": "example",
-            "operation": "read",
-            "uri": "example://a://b",
-            "target": "a://b",
-            "body": {"answer": 42}
+            "kind": "model_tool",
+            "name": "example_tool",
+            "arguments": {"answer": 42}
         }))
         .unwrap();
-        assert_eq!(request.operation, Operation::Read);
-        assert_eq!(request.body.unwrap()["answer"], 42);
+        assert!(matches!(
+            request,
+            HandlerRequest::ModelTool { name, arguments }
+                if name == "example_tool" && arguments["answer"] == 42
+        ));
     }
 }

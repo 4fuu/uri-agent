@@ -1,23 +1,27 @@
 # WASM plugins
 
-URI Agent can load trusted [Extism](https://extism.org/) modules as protocols without changing the model-facing `read` and `exec` tool schemas. This document owns the persistent installation, reload lifecycle, ABI, permissions, and reliability limits for those modules.
+URI Agent can load trusted [Extism](https://extism.org/) modules as protocols
+and typed direct model tools. This document owns the persistent installation,
+reload lifecycle, ABI, permissions, and reliability limits for those modules.
 
 For the active plugin directory and exact model-facing install and reload contract, read `wasm_plugin://help`. Rust guest authors should also use the [`uri-agent-plugin-sdk` README](../sdk/README.md) and the buildable [`examples/wasm-plugin`](../examples/wasm-plugin/) project.
 
 ## Choose an extension path
 
-- Use a WASM plugin for a runtime-loaded third-party protocol with a portable ABI.
-- Use a linked Rust extension for a first-party capability compiled into URI Agent. Linked extensions can register protocols, commands, panels, status providers, composer completion providers, and startup prompt fragments; see [Linked Rust extensions](development.md#linked-rust-extensions).
+- Use a WASM plugin for a runtime-loaded third-party protocol or direct tool with a portable ABI.
+- Use a linked Rust extension for a first-party capability compiled into URI Agent. Linked extensions can register protocols, direct tools, commands, panels, status providers, composer completion providers, and startup prompt fragments; see [Linked Rust extensions](development.md#linked-rust-extensions).
 
-Both paths keep protocol operations behind `read` and `exec`. URI Agent does not load native dynamic libraries.
+Prefer a protocol for a capability with simple string input. Register a typed
+direct tool when structured or escape-heavy arguments would otherwise require
+nested serialization. URI Agent does not load native dynamic libraries.
 
 ## Persistent installation
 
 URI Agent loads modules from `<config>/wasm-plugins/`. The built-in `wasm_plugin` protocol exposes exactly two operations:
 
 ```text
-read("wasm_plugin://help", {"kind":"none","value":""})
-exec("wasm_plugin://reload", {"kind":"none","value":""})
+read("wasm_plugin://help", "")
+exec("wasm_plugin://reload", "")
 ```
 
 There are no install, update, remove, or list operations, no `--wasm-plugin` flag, no `wasmPlugins` setting, and no URI Agent package manifest or package manager. The agent uses normal file and shell protocols to discover source, review it, clone it, and build it in a temporary directory. Installation writes a temporary file beside the destination and atomically renames it to `<name>.wasm` before reloading.
@@ -32,31 +36,52 @@ Reload constructs a replacement set before changing the active registry:
 
 1. read the complete directory in stable path order;
 2. construct fresh Extism runtimes;
-3. validate manifests and protocol names;
+3. validate manifests, protocol names, direct-tool names, and tool schemas;
 4. skip invalid modules and collisions with built-ins, Skills, or earlier modules, while retaining diagnostics;
-5. atomically replace the complete dynamic protocol set.
+5. atomically replace the complete dynamic protocol and direct-tool set.
 
 A directory-level failure leaves the old set active. Calls that already captured an old protocol keep its runtime until they finish; new calls use the replacement set.
 
-The reload `exec` call returns only after the replacement set is active. Its result lists the active protocol names and tells the model to read each new `<protocol>://help`. Diagnostics are stored as JSON in the session output directory rather than embedded in model-facing text; help reports their count and a readable `file://` address. The TUI protocol list reads the live registry and reflects the replacement set.
+The reload `exec` call returns only after the replacement set is active. Its
+result lists active protocol and direct-tool names and tells the model to read
+each new `<protocol>://help`. Diagnostics are stored as JSON in the session
+output directory rather than embedded in model-facing text; help reports their
+count and a readable `file://` address. The TUI protocol list reads the live
+protocol registry and reflects that part of the replacement set.
 
 Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state.
 
-## ABI version 2
+## ABI version 3
 
-ABI version 2 lets a module contribute protocols. It does not contribute system prompt fragments, commands, panels, status providers, or composer completions. Exports use Extism's bytes-in/bytes-out functions and may be implemented with any compatible PDK.
+ABI version 3 lets a module contribute protocols and typed direct model tools.
+It does not contribute system prompt fragments, commands, panels, status
+providers, or composer completions. Exports use Extism's bytes-in/bytes-out
+functions and may be implemented with any compatible PDK. ABI version 2 is
+intentionally unsupported; rebuild old modules with the version 3 SDK.
 
 Every module exports `uri_agent_manifest`, which takes no input and returns:
 
 ```json
 {
-  "abi_version": 2,
+  "abi_version": 3,
   "protocols": [
     {
       "name": "example",
       "description": "Read and execute example resources",
       "can_read": true,
       "can_exec": true
+    }
+  ],
+  "model_tools": [
+    {
+      "name": "example_greeting",
+      "description": "Create a greeting from a typed name argument",
+      "parameters": {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+        "additionalProperties": false
+      }
     }
   ],
   "permissions": {
@@ -66,28 +91,50 @@ Every module exports `uri_agent_manifest`, which takes no input and returns:
 }
 ```
 
-Every manifest declares both permission fields. Set one to `true` to request the corresponding sensitive host capability.
+Every manifest declares `protocols`, `model_tools`, and both permission fields;
+use an empty array when it contributes no capability of one kind. Set a
+permission to `true` to request the corresponding sensitive host capability.
 
-Protocol names must be unique within the module and satisfy the normal registry rules. Descriptions must be nonempty. Every protocol must set `can_read` to `true` and implement `read("<protocol>://help", {"kind":"none","value":""})`; `can_exec` may be `true` or `false`.
+Protocol names must be unique within the module and satisfy the normal registry
+rules. Descriptions must be nonempty. Every protocol must set `can_read` to
+`true` and implement `read("<protocol>://help", "")`; `can_exec` may be `true`
+or `false`. Direct-tool names must also be unique and must not collide with a
+linked or earlier WASM tool. `parameters` is the JSON Schema object sent to the
+model. Its top level must declare `type: "object"`, provide a `properties` map,
+and set `additionalProperties: false`; every `required` entry must name one of
+those properties.
 
-A module declaring a protocol also exports `uri_agent_handle`. URI Agent calls it with the selected protocol, operation, original URI, opaque target, and optional body:
+A module declaring a protocol or direct tool also exports `uri_agent_handle`.
+Protocol calls use this tagged request:
 
 ```json
 {
+  "kind": "protocol",
   "protocol": "example",
   "operation": "read",
   "uri": "example://a://b?x=1",
   "target": "a://b?x=1",
-  "body": {"key": "value"}
+  "body": "{\"key\":\"value\"}"
 }
 ```
 
-`operation` is `read` or `exec`; `body` is `null` when the model-facing body
-envelope uses `kind: "none"`. URI Agent decodes `text` and `json` envelopes
-before this ABI boundary, so the plugin continues to receive the literal
-protocol body. Returned bytes become the protocol result, while an Extism error
-fails the call. A module remains instantiated until the next reload, so its
-in-memory state survives calls; calls into one module are serialized.
+`operation` is `read` or `exec`. `body` is always a string and is `""` when the
+protocol has no body. Direct tools receive the exact typed argument object:
+
+```json
+{
+  "kind": "model_tool",
+  "name": "example_greeting",
+  "arguments": {"name": "Ada"}
+}
+```
+
+To register a direct tool with the Rust SDK, construct a
+`ModelToolDescriptor`, pass it to `PluginManifest::with_model_tools`, and match
+`HandlerRequest::ModelTool` in the handler. Returned bytes become the tool or
+protocol result, while an Extism error fails the call. A module remains
+instantiated until the next reload, so its in-memory state survives calls;
+calls into one module are serialized.
 
 Each plugin implements its protocol help through the same handler. That help must describe every supported address and body shape.
 
@@ -129,7 +176,12 @@ marker for trusted code rather than an interactive grant or sandbox boundary.
 
 ## Trust and reliability
 
-WASM is a portable ABI in this feature, not a sandbox. Plugins are trusted code. They receive WASI and unrestricted outbound HTTP; on Unix they also receive writable host filesystem access. SDK `read` and `exec` host calls route to URI Agent's static built-in protocols, including file and available shell protocols, with URI Agent's user permissions.
+WASM is a portable ABI in this feature, not a sandbox. Plugins are trusted
+code. They receive WASI and unrestricted outbound HTTP; on Unix they also
+receive writable host filesystem access. SDK `read` and `exec` host calls take
+the same required string body as the model tools and route to URI Agent's
+static built-in protocols, including file and available shell protocols, with
+URI Agent's user permissions.
 
 Host calls reject dynamic WASM protocols and `wasm_plugin` itself, preventing recursive entry into a module runtime.
 
@@ -141,7 +193,8 @@ Each guest call has these limits:
 - 1 MiB Extism variable store;
 - 16 MiB module and response limit;
 - 256 KiB manifest limit;
-- 64 protocols per manifest.
+- 64 protocols per manifest;
+- 64 direct model tools per manifest.
 
 ## Rust guest SDK
 

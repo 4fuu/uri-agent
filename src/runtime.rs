@@ -3,8 +3,9 @@ use crate::compaction;
 use crate::config::{display_path, path_is_within};
 use crate::model::{
     ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelFailurePhase, ModelRequest,
-    ModelResponse, looks_like_context_overflow, tool_definitions,
+    ModelResponse, looks_like_context_overflow,
 };
+use crate::plugin::ModelToolRegistry;
 use crate::protocol::ProtocolRegistry;
 use crate::session::{EventKind, Session};
 use crate::task::{TaskManager, TaskRecord};
@@ -178,6 +179,7 @@ struct PendingState {
 pub struct AgentRuntime {
     backend: RwLock<Option<Arc<dyn ModelBackend>>>,
     protocols: Arc<ProtocolRegistry>,
+    model_tools: Arc<ModelToolRegistry>,
     tasks: TaskManager,
     session: Session,
     system_prompt: OnceCell<String>,
@@ -201,6 +203,7 @@ impl AgentRuntime {
     pub fn new(
         backend: Option<Arc<dyn ModelBackend>>,
         protocols: Arc<ProtocolRegistry>,
+        model_tools: Arc<ModelToolRegistry>,
         session: Session,
         system_prompt: String,
         limits: ModelLimits,
@@ -214,6 +217,7 @@ impl AgentRuntime {
         Self {
             backend: RwLock::new(backend),
             protocols,
+            model_tools,
             tasks,
             session,
             system_prompt: system_prompt_cell,
@@ -235,11 +239,19 @@ impl AgentRuntime {
     pub fn new_deferred(
         backend: Option<Arc<dyn ModelBackend>>,
         protocols: Arc<ProtocolRegistry>,
+        model_tools: Arc<ModelToolRegistry>,
         session: Session,
         initializer: Arc<dyn RuntimeInitializer>,
         limits: ModelLimits,
     ) -> Self {
-        let mut runtime = Self::new(backend, protocols, session, String::new(), limits);
+        let mut runtime = Self::new(
+            backend,
+            protocols,
+            model_tools,
+            session,
+            String::new(),
+            limits,
+        );
         runtime.system_prompt = OnceCell::new();
         runtime.initializer = Some(initializer);
         runtime
@@ -291,7 +303,7 @@ impl AgentRuntime {
         let usage = compaction::context_usage(
             system_prompt,
             &context.history,
-            &tool_definitions(),
+            &self.model_tools.definitions(),
             context.latest_api_usage,
             context.after_compaction,
         );
@@ -1083,7 +1095,7 @@ impl AgentRuntime {
                 &[],
             ),
             history: summary_history,
-            tools: false,
+            tools: Vec::new(),
             max_output_tokens: Some(summary_output_tokens),
         };
         let mut model_retries = HashMap::new();
@@ -1204,7 +1216,7 @@ impl AgentRuntime {
         let request = ModelRequest {
             system: self.system_prompt().await?.to_string(),
             history,
-            tools: true,
+            tools: self.model_tools.definitions(),
             estimated_context: self.context_usage().tokens,
             max_output_tokens: None,
         };
@@ -1343,19 +1355,9 @@ impl AgentRuntime {
     }
 
     async fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
-        let object = arguments
-            .as_object()
-            .ok_or_else(|| anyhow!("{name} arguments must be an object"))?;
-        let uri = object
-            .get("uri")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("{name} requires a uri string"))?;
-        let body = decode_tool_body(name, object.get("body"))?;
-        match name {
-            "read" => self.protocols.read(uri, body.as_ref()).await,
-            "exec" => self.protocols.exec(uri, body.as_ref()).await,
-            _ => bail!("unknown model tool: {name}"),
-        }
+        self.model_tools
+            .dispatch(name, arguments, &self.protocols)
+            .await
     }
 
     fn assistant_events(&self, content: &[AssistantContent]) -> Vec<EventKind> {
@@ -1380,32 +1382,6 @@ impl AgentRuntime {
     }
 }
 
-fn decode_tool_body(name: &str, body: Option<&Value>) -> Result<Option<Value>> {
-    let envelope = body
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("{name} requires a body envelope object"))?;
-    if envelope.len() != 2 || !envelope.contains_key("kind") || !envelope.contains_key("value") {
-        bail!("{name} body envelope must contain exactly `kind` and `value`");
-    }
-    let kind = envelope
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{name} body envelope requires a kind string"))?;
-    let value = envelope
-        .get("value")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{name} body envelope requires a value string"))?;
-    match kind {
-        "none" if value.is_empty() => Ok(None),
-        "none" => bail!("{name} body kind `none` requires an empty value"),
-        "text" => Ok(Some(Value::String(value.to_string()))),
-        "json" => Ok(Some(serde_json::from_str(value).with_context(|| {
-            format!("{name} body kind `json` requires valid JSON")
-        })?)),
-        kind => bail!("{name} body envelope has unknown kind `{kind}`"),
-    }
-}
-
 fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Object(fields) => {
@@ -1423,27 +1399,7 @@ fn canonical_json(value: &Value) -> Value {
 }
 
 fn canonical_tool_arguments(value: &Value) -> Value {
-    let mut canonical = canonical_json(value);
-    let Some(body) = canonical.get_mut("body").and_then(Value::as_object_mut) else {
-        return canonical;
-    };
-    if body.get("kind").and_then(Value::as_str) != Some("json") {
-        return canonical;
-    }
-    let Some(value) = body.get_mut("value") else {
-        return canonical;
-    };
-    let Some(decoded) = value
-        .as_str()
-        .and_then(|value| serde_json::from_str(value).ok())
-    else {
-        return canonical;
-    };
-    *value = Value::String(
-        serde_json::to_string(&canonical_json(&decoded))
-            .expect("canonical JSON values always serialize"),
-    );
-    canonical
+    canonical_json(value)
 }
 
 fn summarize_text(text: &str, limit: usize) -> String {
@@ -1762,7 +1718,7 @@ fn task_notification_message(records: &[TaskRecord]) -> String {
                 "output_truncated": output_truncated,
                 "read_complete_record": {
                     "uri": uri,
-                    "body": {"kind": "none", "value": ""}
+                    "body": ""
                 }
             })
         })
@@ -1815,6 +1771,12 @@ mod tests {
     use rig::message::{ToolCallId, ToolFunction};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
+
+    fn protocol_model_tools() -> Arc<ModelToolRegistry> {
+        let mut tools = ModelToolRegistry::new();
+        crate::builtins::model_tools::register_protocol_tools(&mut tools).unwrap();
+        Arc::new(tools)
+    }
 
     #[test]
     fn png_ihdr_dimensions_read_width_and_height() {
@@ -2003,6 +1965,7 @@ mod tests {
         let runtime = Arc::new(AgentRuntime::new(
             Some(backend),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
             session.clone(),
             "system".to_string(),
             limits,
@@ -2018,7 +1981,7 @@ mod tests {
                     "read".to_string(),
                     serde_json::json!({
                         "uri": "missing://help",
-                        "body": {"kind": "none", "value": ""}
+                        "body": ""
                     }),
                 ),
             ))],
@@ -2044,7 +2007,7 @@ mod tests {
                 "read".to_string(),
                 serde_json::json!({
                     "uri": uri,
-                    "body": {"kind": "none", "value": ""}
+                    "body": ""
                 }),
             ),
         )
@@ -2245,18 +2208,14 @@ mod tests {
         let mut guard = ToolCallLoopGuard::default();
         for index in 0..5 {
             let arguments = if index % 2 == 0 {
-                serde_json::from_str(
-                    r#"{"uri":"file://same","body":{"kind":"json","value":"{\"b\":2,\"a\":1}"}}"#,
-                )
+                serde_json::from_str(r#"{"input":{"b":2,"a":1}}"#)
             } else {
-                serde_json::from_str(
-                    r#"{"body":{"value":"{\"a\":1,\"b\":2}","kind":"json"},"uri":"file://same"}"#,
-                )
+                serde_json::from_str(r#"{"input":{"a":1,"b":2}}"#)
             }
             .unwrap();
             let call = ToolCall::new(
                 ToolCallId::new(format!("ordered-{index}")).unwrap(),
-                ToolFunction::new("read".to_string(), arguments),
+                ToolFunction::new("custom".to_string(), arguments),
             );
             let redirect = guard.record_turn(std::slice::from_ref(&call), Some("same result"));
             assert_eq!(redirect.is_some(), index == 4);
@@ -2466,7 +2425,7 @@ mod tests {
 
         runtime.start_turn("current task".into()).await.unwrap();
         requests_started.recv().await.unwrap();
-        assert!(!backend.requests.lock().await[0].tools);
+        assert!(backend.requests.lock().await[0].tools.is_empty());
         runtime
             .enqueue_message("new constraint".into(), PendingMessageKind::Guidance)
             .await
@@ -2476,7 +2435,7 @@ mod tests {
         requests_started.recv().await.unwrap();
         {
             let requests = backend.requests.lock().await;
-            assert!(requests[1].tools);
+            assert!(!requests[1].tools.is_empty());
             assert_eq!(
                 requests[1].history.last(),
                 Some(&Message::user("new constraint"))
@@ -2670,83 +2629,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_body_envelope_decodes_absent_text_and_arbitrary_json_bodies() {
-        assert_eq!(
-            decode_tool_body(
-                "read",
-                Some(&serde_json::json!({"kind": "none", "value": ""}))
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            decode_tool_body(
-                "exec",
-                Some(&serde_json::json!({"kind": "text", "value": "cargo test"}))
-            )
-            .unwrap(),
-            Some(Value::String("cargo test".to_string()))
-        );
-        assert_eq!(
-            decode_tool_body(
-                "read",
-                Some(&serde_json::json!({
-                    "kind": "json",
-                    "value": "[1,{\"raw\":true},null]"
-                }))
-            )
-            .unwrap(),
-            Some(serde_json::json!([1, {"raw": true}, null]))
-        );
-        assert_eq!(
-            decode_tool_body(
-                "read",
-                Some(&serde_json::json!({"kind": "json", "value": "42"}))
-            )
-            .unwrap(),
-            Some(serde_json::json!(42))
-        );
-        assert_eq!(
-            decode_tool_body(
-                "read",
-                Some(&serde_json::json!({"kind": "json", "value": "null"}))
-            )
-            .unwrap(),
-            Some(Value::Null)
-        );
-    }
-
-    #[test]
-    fn invalid_tool_body_envelopes_fail_before_protocol_dispatch() {
-        for (body, expected) in [
-            (None, "requires a body envelope object"),
-            (
-                Some(serde_json::json!({
-                    "kind": "none",
-                    "value": "",
-                    "extra": true
-                })),
-                "must contain exactly `kind` and `value`",
-            ),
-            (
-                Some(serde_json::json!({"kind": "none", "value": "not empty"})),
-                "kind `none` requires an empty value",
-            ),
-            (
-                Some(serde_json::json!({"kind": "json", "value": "{"})),
-                "kind `json` requires valid JSON",
-            ),
-            (
-                Some(serde_json::json!({"kind": "other", "value": ""})),
-                "unknown kind `other`",
-            ),
-        ] {
-            let error = decode_tool_body("read", body.as_ref()).unwrap_err();
-            assert!(error.to_string().contains(expected), "{error:#}");
-        }
-    }
-
-    #[test]
     fn fake_tool_call_can_retain_provider_correlation() {
         let call = ToolCall::new(
             ToolCallId::new("call-1").unwrap(),
@@ -2754,7 +2636,7 @@ mod tests {
                 "read".to_string(),
                 serde_json::json!({
                     "uri": "file://help",
-                    "body": {"kind": "none", "value": ""}
+                    "body": ""
                 }),
             ),
         );
@@ -2951,6 +2833,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
             session.clone(),
             "system".to_string(),
             ModelLimits::default(),
@@ -3002,6 +2885,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
             session.clone(),
             "system".to_string(),
             ModelLimits::default(),
@@ -3046,6 +2930,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             None,
             Arc::new(protocols),
+            protocol_model_tools(),
             session.clone(),
             "system".to_string(),
             ModelLimits::default(),
@@ -3091,6 +2976,7 @@ mod tests {
         let output_directory = output.directory().to_path_buf();
         let tasks = TaskManager::new();
         let mut protocols = ProtocolRegistry::new(output, tasks);
+        let mut model_tools = ModelToolRegistry::new();
         let mut commands = crate::plugin::CommandRegistry::with_core_commands();
         let mut tui = crate::plugin::TuiRegistry::default();
         let environment = Arc::new(
@@ -3108,6 +2994,7 @@ mod tests {
             .install(
                 &mut crate::plugin::PluginHost::new(
                     &mut protocols,
+                    &mut model_tools,
                     &mut commands,
                     &mut tui,
                     environment,
@@ -3121,7 +3008,7 @@ mod tests {
                 "read".to_string(),
                 serde_json::json!({
                     "uri": "file://help",
-                    "body": {"kind": "none", "value": ""}
+                    "body": ""
                 }),
             ),
         );
@@ -3136,6 +3023,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             Some(backend),
             Arc::new(protocols),
+            Arc::new(model_tools),
             session.clone(),
             "test system prompt".to_string(),
             ModelLimits {
@@ -3254,6 +3142,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
             session.clone(),
             "frozen system".to_string(),
             ModelLimits {
@@ -3287,7 +3176,7 @@ mod tests {
         let requests = backend.requests.lock().await;
         assert_eq!(requests[0].system, compaction::SUMMARY_SYSTEM_PROMPT);
         assert!(!requests[0].system.contains("frozen system"));
-        assert!(!requests[0].tools);
+        assert!(requests[0].tools.is_empty());
         assert_eq!(requests[0].max_output_tokens, Some(12));
         assert_eq!(requests[0].history.len(), 1);
         assert!(
@@ -3347,6 +3236,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
             session.clone(),
             "system".to_string(),
             ModelLimits {
@@ -3409,6 +3299,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             Some(backend.clone()),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
             session.clone(),
             "frozen system".to_string(),
             ModelLimits {
@@ -3422,9 +3313,9 @@ mod tests {
         let requests = backend.requests.lock().await;
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system, compaction::SUMMARY_SYSTEM_PROMPT);
-        assert!(!requests[0].tools);
+        assert!(requests[0].tools.is_empty());
         assert_eq!(requests[1].system, "frozen system");
-        assert!(requests[1].tools);
+        assert!(!requests[1].tools.is_empty());
         assert!(
             session
                 .snapshot()
@@ -3492,9 +3383,9 @@ mod tests {
 
         let requests = backend.requests.lock().await;
         assert_eq!(requests.len(), 3);
-        assert!(!requests[0].tools);
-        assert!(!requests[1].tools);
-        assert!(requests[2].tools);
+        assert!(requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
+        assert!(!requests[2].tools.is_empty());
         drop(requests);
         assert!(session.snapshot().await.iter().any(|event| matches!(
             &event.kind,
@@ -3655,8 +3546,8 @@ mod tests {
 
         let requests = backend.requests.lock().await;
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].tools);
-        assert!(!requests[1].tools);
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
         drop(requests);
         assert!(
             session
@@ -3972,9 +3863,9 @@ mod tests {
 
         let requests = backend.requests.lock().await;
         assert_eq!(requests.len(), 3);
-        assert!(requests[0].tools);
+        assert!(!requests[0].tools.is_empty());
         assert_eq!(requests[1].system, compaction::SUMMARY_SYSTEM_PROMPT);
-        assert!(requests[2].tools);
+        assert!(!requests[2].tools.is_empty());
         drop(requests);
         assert_eq!(
             session

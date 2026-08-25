@@ -7,7 +7,7 @@ use crate::plugin::{
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, WalkBuilder, overrides::OverrideBuilder};
 use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -31,12 +31,17 @@ Current working directory: `file://{}`
   from the current working directory.
 - Add `?offset=<line>&limit=<count>` to read a bounded range. `<line>` is the
   one-based starting line or directory-entry position, and `<count>` is the
-  maximum number of lines or entries to return.
+  maximum number of lines or entries to return. The default is 200 and the
+  maximum is 2000.
 - Add `?line_numbers=true` to prefix file content with one-based line numbers. Line numbers are disabled by default.
+- Add `?glob=<pattern>` to a directory address to list matching files
+  recursively with standard ignore rules. Patterns are relative to that
+  directory; for example, `file://src?glob=**/*.rs`. A glob scans at most
+  50000 files; narrow the root for larger trees.
 - Reading a directory returns a bounded directory listing.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-This built-in protocol takes no protocol body; use the `none` body envelope.
+This built-in protocol takes no protocol body; pass an empty string.
 "#,
         display_path(cwd)
     )
@@ -224,16 +229,28 @@ impl Protocol for FileProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        if !request.body.is_empty() {
+            bail!("file reads do not accept a body");
+        }
         if request.target == "help" {
             return Ok(help(&self.cwd).into_bytes());
         }
 
         let (target, query) = split_query(request.target);
         let path = resolve_path(&self.cwd, target);
+        let range = Range::parse(query)?;
         let metadata = fs::metadata(&path)
             .await
             .with_context(|| format!("cannot read {}", display_path(&path)))?;
-        let range = Range::parse(query)?;
+        if let Some(pattern) = range.glob.clone() {
+            if !metadata.is_dir() {
+                bail!("file glob root is not a directory: {}", display_path(&path));
+            }
+            if range.line_numbers {
+                bail!("line_numbers is not supported with file glob");
+            }
+            return read_glob(&self.cwd, &path, &pattern, request.uri, range).await;
+        }
         if metadata.is_dir() {
             read_directory(&path, range).await
         } else if metadata.is_file() {
@@ -262,11 +279,12 @@ fn split_query(target: &str) -> (&str, Option<&str>) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Range {
     offset: usize,
     limit: usize,
     line_numbers: bool,
+    glob: Option<String>,
 }
 
 impl Range {
@@ -274,6 +292,7 @@ impl Range {
         let mut offset = 1_usize;
         let mut limit = DEFAULT_LIMIT;
         let mut line_numbers = false;
+        let mut glob = None;
         for pair in query
             .unwrap_or_default()
             .split('&')
@@ -302,6 +321,15 @@ impl Range {
                         _ => bail!("invalid line_numbers: {value}; expected true or false"),
                     }
                 }
+                "glob" => {
+                    if glob.is_some() {
+                        bail!("duplicate file query parameter: glob");
+                    }
+                    if value.is_empty() {
+                        bail!("file glob pattern cannot be empty");
+                    }
+                    glob = Some(value.to_string());
+                }
                 _ => bail!("unknown file query parameter: {key}"),
             }
         }
@@ -309,8 +337,77 @@ impl Range {
             offset,
             limit,
             line_numbers,
+            glob,
         })
     }
+}
+
+async fn read_glob(
+    cwd: &Path,
+    root: &Path,
+    pattern: &str,
+    uri: &str,
+    range: Range,
+) -> Result<Vec<u8>> {
+    let cwd = cwd.to_path_buf();
+    let root = root.to_path_buf();
+    let pattern = pattern.to_string();
+    let worker_pattern = pattern.clone();
+    let entries = tokio::task::spawn_blocking(move || glob_entries(&cwd, &root, &worker_pattern))
+        .await
+        .context("file glob worker stopped unexpectedly")??;
+    let start = range.offset.saturating_sub(1).min(entries.len());
+    let end = start.saturating_add(range.limit).min(entries.len());
+    let mut output = entries[start..end].join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    if end < entries.len() {
+        let base = uri.split_once('?').map_or(uri, |(base, _)| base);
+        let _ = writeln!(
+            output,
+            "\n[{} more matches]\nNext: {}?glob={}&offset={}&limit={}",
+            entries.len() - end,
+            base,
+            pattern,
+            end + 1,
+            range.limit
+        );
+    }
+    Ok(output.into_bytes())
+}
+
+fn glob_entries(cwd: &Path, root: &Path, pattern: &str) -> Result<Vec<String>> {
+    let mut overrides = OverrideBuilder::new(root);
+    overrides
+        .add(pattern)
+        .with_context(|| format!("invalid file glob pattern: {pattern}"))?;
+    let overrides = overrides.build()?;
+    let mut walker = WalkBuilder::new(root);
+    walker.standard_filters(true);
+    let mut entries = Vec::new();
+    let mut scanned_files = 0usize;
+    for entry in walker.build() {
+        let entry = entry.with_context(|| format!("cannot scan files under {}", root.display()))?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        scanned_files += 1;
+        if scanned_files > MAX_SCANNED_FILES {
+            bail!("file glob scan exceeds {MAX_SCANNED_FILES} files; narrow the root directory");
+        }
+        if !overrides.matched(entry.path(), false).is_whitelist() {
+            continue;
+        }
+        entries.push(glob_output_path(cwd, entry.path()));
+    }
+    entries.sort_unstable();
+    Ok(entries)
+}
+
+fn glob_output_path(cwd: &Path, path: &Path) -> String {
+    path.strip_prefix(cwd)
+        .map_or_else(|_| display_path(path).replace('\\', "/"), completion_path)
 }
 
 async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
@@ -394,6 +491,7 @@ mod tests {
         assert!(help.contains("`?offset=<line>&limit=<count>`"));
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
+        assert!(help.contains("`?glob=<pattern>`"));
     }
 
     #[test]
@@ -525,5 +623,65 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Next: file://file.txt?offset=2&limit=1&line_numbers=true"));
+    }
+
+    #[test]
+    fn glob_entries_are_sorted_and_honor_standard_ignore_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("nested")).unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        std::fs::write(directory.path().join("z.rs"), "z").unwrap();
+        std::fs::write(directory.path().join("a.rs"), "a").unwrap();
+        std::fs::write(directory.path().join(".hidden.rs"), "hidden").unwrap();
+        std::fs::write(directory.path().join("nested/b.rs"), "b").unwrap();
+        std::fs::write(directory.path().join("nested/ignored.rs"), "ignored").unwrap();
+        std::fs::write(directory.path().join(".gitignore"), "nested/ignored.rs\n").unwrap();
+
+        assert_eq!(
+            glob_entries(directory.path(), directory.path(), "**/*.rs").unwrap(),
+            ["a.rs", "nested/b.rs", "z.rs"]
+        );
+        assert!(glob_entries(directory.path(), directory.path(), "[").is_err());
+    }
+
+    #[test]
+    fn glob_output_preserves_absolute_paths_outside_the_working_directory() {
+        let cwd = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.rs");
+        std::fs::write(&path, "outside").unwrap();
+
+        let entries = glob_entries(cwd.path(), outside.path(), "**/*.rs").unwrap();
+
+        assert_eq!(entries, [display_path(&path).replace('\\', "/")]);
+        #[cfg(unix)]
+        assert!(!entries[0].starts_with("//"));
+    }
+
+    #[tokio::test]
+    async fn glob_pagination_returns_a_complete_continuation_address() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("nested"))
+            .await
+            .unwrap();
+        fs::write(directory.path().join("a.rs"), "a").await.unwrap();
+        fs::write(directory.path().join("nested/b.rs"), "b")
+            .await
+            .unwrap();
+        let range = Range::parse(Some("glob=**/*.rs&offset=1&limit=1")).unwrap();
+
+        let output = read_glob(
+            directory.path(),
+            directory.path(),
+            "**/*.rs",
+            "file://?glob=**/*.rs&offset=1&limit=1",
+            range,
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.starts_with("a.rs\n"));
+        assert!(output.contains("Next: file://?glob=**/*.rs&offset=2&limit=1"));
     }
 }

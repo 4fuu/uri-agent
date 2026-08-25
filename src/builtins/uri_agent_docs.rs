@@ -31,7 +31,7 @@ The documents are available regardless of the startup working directory.
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
 - Targets are exact, case-sensitive filenames and do not accept paths or query parameters.
-- Use the `none` body envelope. This protocol does not support `exec`.
+- Pass an empty string body. This protocol does not support `exec`.
 
 Available documents:
 "#,
@@ -71,6 +71,9 @@ impl Protocol for UriAgentDocsProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        if !request.body.is_empty() {
+            bail!("{PROTOCOL_NAME} reads do not accept a body");
+        }
         if request.target == "help" {
             return Ok(help().into_bytes());
         }
@@ -95,7 +98,7 @@ mod tests {
                 ProtocolRequest {
                     uri: &format!("{PROTOCOL_NAME}://{target}"),
                     target,
-                    body: None,
+                    body: "",
                 },
                 ProtocolContext {
                     tasks: TaskManager::new(),

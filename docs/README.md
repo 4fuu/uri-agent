@@ -6,8 +6,8 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 
 | Goal | Document |
 | --- | --- |
-| Understand `read`, `exec`, protocol routing, built-ins, tasks, or output preservation | [Protocols, tasks, and output](protocols.md) |
-| Understand project instructions and binary hints, or create and troubleshoot a Skill | [Startup context and Skills](context.md) |
+| Understand `read`, `exec`, direct tools, protocol routing, built-ins, tasks, or output preservation | [Protocols, tasks, and output](protocols.md) |
+| Understand project instructions, or create and troubleshoot a Skill | [Startup context and Skills](context.md) |
 | Build, install, reload, or audit a trusted WASM plugin | [WASM plugins](plugins.md) |
 | Configure a model, credentials, Agent environment variables, reasoning effort, output limits, offline mode, or a custom endpoint | [Models and configuration](configuration.md) |
 | Use the conversation, composer, commands, and navigation | [Terminal interface](interface.md) |
@@ -21,7 +21,7 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 These documents explain stable concepts and cross-cutting behavior. More specific references remain authoritative:
 
 - `uri-agent --help` defines the current command-line interface.
-- `<protocol>://help` defines a registered protocol's accepted addresses, body shape, execution behavior, result routes, and limits.
+- The active model-tool schemas define direct-tool arguments; `<protocol>://help` defines a registered protocol's accepted addresses, string body, execution behavior, result routes, and limits.
 - `uri-agent-docs://README.md` exposes this documentation embedded in the running binary, independent of its startup working directory.
 - `wasm_plugin://help` publishes the active WASM plugin directory and model-facing installation and reload contract.
 - `F1` and `:help` show the active command and keymap reference after global and project overrides are applied.

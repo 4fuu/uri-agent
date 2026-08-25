@@ -1,6 +1,9 @@
 # URI Agent plugin SDK
 
-This crate provides Rust guest types, ABI version 2 exports, and host calls for trusted URI Agent Extism WebAssembly protocol plugins. Runtime installation, reload behavior, permissions, and limits are documented in [WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md).
+This crate provides Rust guest types, ABI version 3 exports, and host calls for
+trusted URI Agent Extism WebAssembly protocol and direct-tool plugins. Runtime
+installation, reload behavior, permissions, and limits are documented in
+[WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md).
 
 ## Use the SDK
 
@@ -18,7 +21,7 @@ Define a manifest and handler, then use `define_plugin!` to generate `uri_agent_
 
 ```rust
 use uri_agent_plugin_sdk::{
-    HandlerRequest, HandlerResult, PluginManifest, ProtocolDescriptor,
+    HandlerRequest, HandlerResult, Operation, PluginManifest, ProtocolDescriptor,
     define_plugin,
 };
 
@@ -32,16 +35,72 @@ fn manifest() -> PluginManifest {
 }
 
 fn handle(request: HandlerRequest) -> HandlerResult {
-    match request.target.as_str() {
-        "help" => Ok(b"# example\n\nDescribe every supported address here.\n".to_vec()),
-        _ => Err(format!("unsupported address: {}", request.uri)),
+    match request {
+        HandlerRequest::Protocol {
+            operation: Operation::Read,
+            target,
+            ..
+        } if target == "help" =>
+            Ok(b"# example\n\nDescribe every supported address here.\n".to_vec()),
+        _ => Err("unsupported plugin request".to_string()),
     }
 }
 
 define_plugin!(manifest(), handle);
 ```
 
-Every declared protocol must implement its `<protocol>://help` route. The SDK also exposes `uri_agent_plugin_sdk::read` and `uri_agent_plugin_sdk::exec` for calling URI Agent's static built-in protocols.
+Every declared protocol must implement its `<protocol>://help` route. Protocol
+bodies are always strings; use `""` for no body and serialize structured input
+as complete JSON text. The SDK also exposes `uri_agent_plugin_sdk::read` and
+`uri_agent_plugin_sdk::exec` with `(uri: &str, body: &str)` for calling URI
+Agent's static built-in protocols.
+
+## Register a typed direct tool
+
+Use a direct tool when complex arguments would otherwise require nested string
+escaping. Add a strict JSON Schema descriptor to the manifest, then handle the
+tagged model-tool request:
+
+```rust
+use uri_agent_plugin_sdk::{
+    HandlerRequest, HandlerResult, ModelToolDescriptor, PluginManifest,
+};
+
+fn manifest() -> PluginManifest {
+    PluginManifest::new([/* optional protocol descriptors */])
+        .with_model_tools([ModelToolDescriptor::new(
+            "example_greeting",
+            "Create a greeting from a typed name argument.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        )])
+}
+
+fn handle(request: HandlerRequest) -> HandlerResult {
+    match request {
+        HandlerRequest::ModelTool { name, arguments }
+            if name == "example_greeting" =>
+        {
+            let name = arguments["name"]
+                .as_str()
+                .ok_or_else(|| "name must be a string".to_string())?;
+            Ok(format!("Hello, {name}!\n").into_bytes())
+        }
+        _ => Err("unsupported plugin request".to_string()),
+    }
+}
+```
+
+Add `serde_json = "1"` to the guest dependencies when constructing schemas this
+way. The top-level schema must declare `type: "object"`, include a `properties`
+map, and set `additionalProperties: false`; every `required` name must be present
+in that map. URI Agent validates names and this strict schema shape, exposes the
+descriptor to the model, and sends typed arguments as
+`HandlerRequest::ModelTool` without protocol-body serialization.
 
 ## Request Agent environment access
 

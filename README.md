@@ -8,50 +8,62 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is a terminal coding agent where every model-facing capability for reading resources or performing actions is exposed as a URI protocol. Files, directories, edits, shells, web pages, session archives, documentation, Skills, and extensions share one address space behind exactly two tools:
+URI Agent is a terminal coding agent built around URI protocols with typed
+direct tools for operations whose arguments are complex or escape-heavy. The
+linked built-in plugins register four tools, and trusted WASM plugins may add
+more typed tools at runtime:
 
 ```text
-read(uri: string, body: BodyEnvelope)
-exec(uri: string, body: BodyEnvelope)
+read(uri: string, body: string)
+exec(uri: string, body: string)
+replace(path: string, old_text: string, new_text: string)
+apply_patch(patch: string)
 ```
 
-The required `BodyEnvelope` is `{"kind":"none|text|json","value":"..."}`.
-URI Agent decodes it into the optional protocol-specific JSON body before
-routing, keeping one concrete cross-provider schema without narrowing protocol
-payloads.
+The `read` and `exec` body is always required and always a string. Use `""`
+when a protocol takes no body, plain text for textual input, and complete
+serialized JSON text for structured protocol input.
 
-URI Agent extends to every capability the same loading pattern other agents use for Skills: expose a compact name and description first, then load full instructions and resources only when selected. A new session therefore preloads only routing rules and one-line protocol descriptors; detailed contracts remain at `<protocol>://help`, Skill bodies and documentation remain behind their protocols, and oversized results remain behind `file://` addresses. This preserves aggressive on-demand and progressive context loading while the fixed `read` / `exec` contract keeps tool calls reliable and registered protocols provide extreme flexibility. The fixed startup baseline remains around 3.7 KB instead of paying the context cost of every capability up front.
+URI Agent extends to most capabilities the same loading pattern other agents use
+for Skills: expose a compact name and description first, then load full
+instructions and resources only when selected. A new session therefore
+preloads routing rules, one-line protocol descriptors, and active tool schemas;
+detailed protocol contracts remain at `<protocol>://help`, Skill bodies and
+documentation remain behind their protocols, and oversized results remain
+behind `file://` addresses. This preserves aggressive on-demand and progressive
+context loading while direct edit tools avoid JSON-in-string escaping.
 
-Adding a capability adds a protocol entry rather than another model-facing tool schema or preloaded manual. Shell commands return directly when short, automatically become managed background tasks when long, and notify the model on completion without polling. Append-only session history is stored in SQLite.
+Simple string-input capabilities add a protocol entry rather than a preloaded
+manual. Typed or escape-heavy capabilities can register a direct tool through
+the same plugin system. Shell commands return directly when short,
+automatically become managed background tasks when long, and notify the model
+on completion without polling. Append-only session history is stored in
+SQLite.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 
 URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
 
-## A ~3.7 KB fixed startup baseline
-
-With the current source, the fixed startup baseline on Unix with Bash and nine built-in protocols is:
-
-| Component | Included content | UTF-8 size |
-| --- | --- | ---: |
-| System prompt | Routing rules and the built-in protocol index | 1,495 bytes (1.495 KB) |
-| `read` + `exec` definitions | Both compact internal tool schemas | 2,236 bytes (2.236 KB) |
-| **Total** | Fixed system prompt and tools | **3,731 bytes (3.731 KB)** |
+## Progressive startup context
 
 ```text
-~3.7 KB fixed baseline
-    → read("<protocol>://help", {"kind":"none","value":""})
+compact routing rules + protocol index + active tool schemas
+    → read("<protocol>://help", "")
     → that protocol's contract
     → task-specific reads and executions
 ```
 
-Skills follow the same path: startup adds only each discovered Skill's name and description; its `SKILL.md` and bundled resources load when the model selects that Skill. Actual startup context also adds the project's `AGENTS.md`, when present, and a short detected-binary hint. The table isolates URI Agent's fixed baseline, serializes its internal tool definitions as compact JSON, and excludes provider-specific request wrappers.
+Skills follow the same path: startup adds only each discovered Skill's name and
+description; its `SKILL.md` and bundled resources load when the model selects
+that Skill. Actual startup context also adds the project's `AGENTS.md` when
+present. Direct tools contribute their typed schemas but do not preload a
+separate manual.
 
 ## Why URI Agent
 
 - **URI-native progressive context:** one address space covers every resource and action, while Skills-style loading keeps contracts, instructions, resources, and complete output out of context until needed.
-- **Reliable and extensible:** the fixed `read` / `exec` contract stays stable while built-in, Skill, linked Rust, and trusted WASM protocols evolve independently.
+- **Reliable and extensible:** the stable string-based `read` / `exec` contract handles simple protocols, while typed direct tools avoid nested escaping and both paths remain plugin-registered.
 - **pi.dev models and sign-in:** URI Agent uses pi.dev's cloud model catalog and provider login methods, exposing every catalog model whose API family its backend supports through one selector.
 - **Durable, observable work:** managed tasks expose status and final output and automatically notify the model on completion; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
 - **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
@@ -135,7 +147,14 @@ See [Models and configuration](docs/configuration.md) for supported API families
 
 ## Extensions
 
-Trusted WASM modules can add runtime-loadable protocols. WASM is a portable ABI here, not a security boundary: enabled plugins receive filesystem, HTTP, WASI, and built-in protocol access with the same user authority as URI Agent. Direct access to saved Agent environment values or provider API keys requires an explicit capability request in plugin source; it is an audit marker, not an approval flow. See [WASM plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage, and reliability limits.
+Trusted WASM modules can add runtime-loadable protocols and typed direct tools.
+WASM is a portable ABI here, not a security boundary: enabled plugins receive
+filesystem, HTTP, WASI, and built-in protocol access with the same user
+authority as URI Agent. Direct access to saved Agent environment values or
+provider API keys requires an explicit capability request in plugin source; it
+is an audit marker, not an approval flow. See [WASM
+plugins](docs/plugins.md) for installation, reload behavior, the ABI, SDK usage,
+and reliability limits.
 
 ## Documentation
 

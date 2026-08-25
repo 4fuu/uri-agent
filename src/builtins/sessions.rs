@@ -8,7 +8,7 @@ use crate::session::{ArchivedSessionSummary, EventKind, SessionArchive, SessionE
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -43,10 +43,10 @@ Current project: `{}`
 Examples:
 
 ```text
-read("sessions://recent", {{"kind":"none","value":""}})
-read("sessions://search", {{"kind":"json","value":"{{\"query\":\"refresh token\"}}"}})
-read("sessions://<session-id>", {{"kind":"none","value":""}})
-read("sessions://<session-id>", {{"kind":"json","value":"{{\"include_tools\":true,\"limit\":20}}"}})
+read("sessions://recent", "")
+read("sessions://search", "{{\"query\":\"refresh token\"}}")
+read("sessions://<session-id>", "")
+read("sessions://<session-id>", "{{\"include_tools\":true,\"limit\":20}}")
 ```
 
 Results are bounded and include continuation values when more data exists.
@@ -117,6 +117,9 @@ impl Protocol for SessionsPlugin {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
+            if !request.body.is_empty() {
+                bail!("sessions://help does not accept a body");
+            }
             return Ok(help(&self.cwd).into_bytes());
         }
         if request.target.contains('?') {
@@ -169,9 +172,12 @@ struct SessionsOptions {
 }
 
 impl SessionsOptions {
-    fn parse(body: Option<&Value>) -> Result<Self> {
-        let options = serde_json::from_value(body.cloned().unwrap_or_else(|| json!({})))
-            .context("invalid sessions request body")?;
+    fn parse(body: &str) -> Result<Self> {
+        let options = if body.is_empty() {
+            Self::default()
+        } else {
+            serde_json::from_str(body).context("invalid sessions request body")?
+        };
         Ok(options)
     }
 
@@ -310,7 +316,7 @@ fn format_recent_sessions(
         let _ = writeln!(
             output,
             "\nMore sessions are available. Continue with: read(\"sessions://recent\", {})",
-            json!({"kind": "json", "value": body.to_string()})
+            json!(body.to_string())
         );
     }
     Ok(output)
@@ -358,7 +364,7 @@ fn format_search_results(
         let _ = writeln!(
             output,
             "\nMore matches are available. Continue with: read(\"sessions://search\", {})",
-            json!({"kind": "json", "value": body.to_string()})
+            json!(body.to_string())
         );
     }
     Ok(output)
@@ -491,7 +497,7 @@ async fn read_session(
             output,
             "\nEarlier records are available. Continue with: read(\"sessions://{}\", {})",
             session.summary.id,
-            json!({"kind": "json", "value": body.to_string()})
+            json!(body.to_string())
         );
     }
     Ok(output)
@@ -761,13 +767,13 @@ mod tests {
         let context = ProtocolContext {
             tasks: crate::task::TaskManager::new(),
         };
-        let search_body = json!({"query":"refresh"});
+        let search_body = json!({"query":"refresh"}).to_string();
         let search = plugin
             .read(
                 ProtocolRequest {
                     uri: "sessions://search",
                     target: "search",
-                    body: Some(&search_body),
+                    body: &search_body,
                 },
                 context.clone(),
             )
@@ -783,7 +789,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "sessions://session-one",
                     target: "session-one",
-                    body: None,
+                    body: "",
                 },
                 context.clone(),
             )
@@ -795,13 +801,13 @@ mod tests {
         assert!(!read.contains("private reasoning"));
         assert!(!read.contains("private tool output"));
 
-        let tool_body = json!({"include_tools":true});
+        let tool_body = json!({"include_tools":true}).to_string();
         let with_tools = plugin
             .read(
                 ProtocolRequest {
                     uri: "sessions://session-one",
                     target: "session-one",
-                    body: Some(&tool_body),
+                    body: &tool_body,
                 },
                 context,
             )

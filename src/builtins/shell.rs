@@ -5,7 +5,6 @@ use crate::task::{PromoteBackground, TaskManager, TaskRecord, TaskStatus};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -28,10 +27,10 @@ const BASH_HELP: &str = r#"# bash
 Run Bash commands. Commands start in the foreground and normally return their
 final result in the same `exec` call.
 
-Call `exec` with `bash://run` and encode the command as a text body:
+Call `exec` with `bash://run` and pass the command as the string body:
 
 ```text
-exec("bash://run", {"kind":"text","value":"cargo test"})
+exec("bash://run", "cargo test")
 ```
 
 If a foreground command is still running after about 60 seconds, URI Agent
@@ -39,7 +38,7 @@ automatically converts the same process into a background task without
 restarting it. Use `background=true` to return a task immediately:
 
 ```text
-exec("bash://run?background=true", {"kind":"text","value":"cargo test"})
+exec("bash://run?background=true", "cargo test")
 ```
 
 Foreground and background commands share one execution timeout. `timeout` is
@@ -47,7 +46,7 @@ an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
 and `timeout=0` disables the timeout:
 
 ```text
-exec("bash://run?timeout=120", {"kind":"text","value":"cargo test"})
+exec("bash://run?timeout=120", "cargo test")
 ```
 
 Do not add another background layer inside the command. Background task status,
@@ -72,10 +71,10 @@ Prefer modern cross-platform tools such as `rg` and `fd` when available.
 PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
-Call `exec` with `pwsh://run` and encode the command as a text body:
+Call `exec` with `pwsh://run` and pass the command as the string body:
 
 ```text
-exec("pwsh://run", {"kind":"text","value":"Get-ChildItem -Path . -Force"})
+exec("pwsh://run", "Get-ChildItem -Path . -Force")
 ```
 
 If a foreground command is still running after about 60 seconds, URI Agent
@@ -83,7 +82,7 @@ automatically converts the same process into a background task without
 restarting it. Use `background=true` to return a task immediately:
 
 ```text
-exec("pwsh://run?background=true", {"kind":"text","value":"cargo test"})
+exec("pwsh://run?background=true", "cargo test")
 ```
 
 Foreground and background commands share one execution timeout. `timeout` is
@@ -310,6 +309,9 @@ impl Protocol for ShellProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        if !request.body.is_empty() {
+            bail!("{}://help does not accept a body", self.name);
+        }
         match request.target {
             "help" => Ok(if self.name == "bash" {
                 BASH_HELP
@@ -489,11 +491,11 @@ fn parse_target(target: &str) -> Result<ShellOptions> {
     })
 }
 
-fn command_from_body(body: Option<&Value>) -> Result<&str> {
-    match body {
-        Some(Value::String(command)) => Ok(command),
-        _ => bail!("shell body must be a command string"),
+fn command_from_body(body: &str) -> Result<&str> {
+    if body.is_empty() {
+        bail!("shell body must be a nonempty command string");
     }
+    Ok(body)
 }
 
 fn command_label(command: &str) -> String {
@@ -836,11 +838,8 @@ mod tests {
 
     #[test]
     fn shell_body_only_accepts_a_command_string() {
-        let string = Value::String("cargo test".to_string());
-        let object = serde_json::json!({"command": "cargo test"});
-        assert_eq!(command_from_body(Some(&string)).unwrap(), "cargo test");
-        assert!(command_from_body(Some(&object)).is_err());
-        assert!(command_from_body(None).is_err());
+        assert_eq!(command_from_body("cargo test").unwrap(), "cargo test");
+        assert!(command_from_body("").is_err());
     }
 
     #[test]
@@ -1028,13 +1027,12 @@ mod tests {
             tasks: crate::task::TaskManager::new(),
         };
         let run_uri = format!("{protocol}://run");
-        let command = Value::String(short.to_string());
         let completed = shell
             .exec_with_auto_background(
                 ProtocolRequest {
                     uri: &run_uri,
                     target: "run",
-                    body: Some(&command),
+                    body: short,
                 },
                 context.clone(),
                 Duration::from_secs(10),
@@ -1046,14 +1044,13 @@ mod tests {
         assert!(completed.contains("foreground-ok"));
         assert!(context.tasks.list().await.is_empty());
 
-        let command = Value::String(delayed.to_string());
         let started = Instant::now();
         let accepted = shell
             .exec_with_auto_background(
                 ProtocolRequest {
                     uri: &run_uri,
                     target: "run",
-                    body: Some(&command),
+                    body: delayed,
                 },
                 context.clone(),
                 Duration::from_millis(20),
@@ -1066,14 +1063,13 @@ mod tests {
         assert!(accepted.contains("current status or output is explicitly needed"));
 
         let background_uri = format!("{protocol}://run?background=true");
-        let command = Value::String(explicit.to_string());
         let started = Instant::now();
         let accepted = shell
             .exec(
                 ProtocolRequest {
                     uri: &background_uri,
                     target: "run?background=true",
-                    body: Some(&command),
+                    body: explicit,
                 },
                 context.clone(),
             )
@@ -1213,11 +1209,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let started_path = directory.path().join("started");
         let leaked_path = directory.path().join("leaked");
-        let command = Value::String(format!(
+        let command = format!(
             "printf started > '{}'; (sleep 0.3; printf leaked > '{}') & wait",
             started_path.display(),
             leaked_path.display()
-        ));
+        );
         let executable = find_executable("bash").unwrap();
         let mut shell = ShellProtocol::new("bash", executable, directory.path());
         shell.environment = Some(PluginEnvironment::new(Arc::new(
@@ -1232,7 +1228,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "bash://run",
                     target: "run",
-                    body: Some(&command),
+                    body: &command,
                 },
                 context.clone(),
                 Duration::from_secs(60),

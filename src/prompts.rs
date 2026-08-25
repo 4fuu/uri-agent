@@ -14,13 +14,13 @@ pub struct ProtocolPrompt {
 
 pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> String {
     let mut prompt = String::from(
-        "You are a general-purpose agent running in URI Agent with exactly two tools: read and exec.\n\
-         Use read to retrieve information and exec to perform actions through registered protocols.\n\
-         Every tool call requires a body envelope. Use `{\"kind\":\"none\",\"value\":\"\"}` for no protocol body, `{\"kind\":\"text\",\"value\":\"...\"}` for a string body, or `{\"kind\":\"json\",\"value\":\"...\"}` with complete serialized JSON for any JSON body.\n\
+        "You are a general-purpose agent running in URI Agent.\n\
+         Use read to retrieve information and exec to perform actions through registered protocols; use registered direct tools when their typed arguments fit the task.\n\
+         The read and exec body is always a string. Use an empty string when a protocol takes no body, plain text for textual input, or complete serialized JSON text when a protocol requires structured input.\n\
          Angle-bracketed values in protocol addresses, such as <protocol>, are placeholders.\n\
          The same placeholder convention applies throughout protocol help.\n\
          Replace placeholders with the required values without including the angle brackets.\n\
-         Before using a protocol for the first time, call read(\"<protocol>://help\", {\"kind\":\"none\",\"value\":\"\"}) to learn its contract.\n\
+         Before using a protocol for the first time, call read(\"<protocol>://help\", \"\") to learn its contract.\n\
          Verify relevant results before claiming work is complete.\n\n\
          Available protocols:\n",
     );
@@ -66,13 +66,11 @@ mod tests {
             }],
             &[],
         );
-        assert!(prompt.starts_with(
-            "You are a general-purpose agent running in URI Agent with exactly two tools: read and exec."
-        ));
-        assert!(prompt.contains("Every tool call requires a body envelope"));
-        assert!(prompt.contains(r#"{"kind":"none","value":""}"#));
+        assert!(prompt.starts_with("You are a general-purpose agent running in URI Agent."));
+        assert!(prompt.contains("body is always a string"));
+        assert!(prompt.contains("registered direct tools"));
         assert!(prompt.contains("same placeholder convention applies throughout protocol help"));
-        assert!(prompt.contains(r#"call read("<protocol>://help", {"kind":"none","value":""})"#));
+        assert!(prompt.contains(r#"call read("<protocol>://help", "")"#));
         assert!(prompt.contains("- file: Read files."));
         assert!(!prompt.contains("file://help"));
     }

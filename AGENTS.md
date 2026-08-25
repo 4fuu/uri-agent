@@ -4,16 +4,23 @@ Guidance for coding agents working anywhere in this repository. This file is the
 
 ## Project contract
 
-URI Agent is a Rust terminal coding agent with a fixed model-facing interface:
+URI Agent is a Rust terminal coding agent with a plugin-registered model-facing
+interface. The linked built-ins provide:
 
 ```text
-read(uri, body: {kind, value})
-exec(uri, body: {kind, value})
+read(uri: string, body: string)
+exec(uri: string, body: string)
+replace(path: string, old_text: string, new_text: string)
+apply_patch(patch: string)
 ```
 
-The required body envelope uses `kind` `none`, `text`, or `json` and a string
-`value`; URI Agent decodes it to the protocol's optional arbitrary JSON body.
-Capabilities are registered as protocols and publish their operational instructions at `<protocol>://help`. Preserve this design: do not add another model-facing tool or place every capability in the initial system prompt.
+The `read` and `exec` body is always a string; use `""` when a protocol takes
+no body and complete serialized JSON text for structured protocol input.
+Capabilities with simple string input are registered as protocols and publish
+their operational instructions at `<protocol>://help`. Prefer a typed direct
+tool for complex or escape-heavy arguments. All model tools are registered by
+linked or WASM plugins; do not special-case tool names in the runtime or place
+every capability in the initial system prompt.
 
 ## Read before changing
 
@@ -22,7 +29,7 @@ Before changing code, read the applicable repository map, change rules, and veri
 | Area | Authoritative detail |
 | --- | --- |
 | Protocol routing, built-ins, tasks, output | [`docs/protocols.md`](docs/protocols.md) |
-| Project instructions, binary hints, Skills, frozen startup context | [`docs/context.md`](docs/context.md) |
+| Project instructions, Skills, frozen startup context | [`docs/context.md`](docs/context.md) |
 | WASM installation, reload, ABI, permissions, SDK | [`docs/plugins.md`](docs/plugins.md) |
 | Models, authentication, configuration, CLI overrides, custom providers | [`docs/configuration.md`](docs/configuration.md) |
 | Conversation UI, composer, commands, navigation | [`docs/interface.md`](docs/interface.md) |

@@ -1,7 +1,11 @@
 use crate::config::{AgentEnvironment, ConfigManager};
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
+use crate::tool_download::BinaryDownloader;
+pub use crate::tool_download::{BinaryDownload, DownloadArchive};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use rig::completion::ToolDefinition;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -493,6 +497,175 @@ impl TuiRegistry {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ModelToolDescriptor {
+    pub fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            parameters: self.parameters.clone(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait ModelTool: Send + Sync {
+    fn descriptor(&self) -> ModelToolDescriptor;
+
+    async fn execute(&self, arguments: &Value, protocols: &ProtocolRegistry) -> Result<String>;
+}
+
+pub trait DynamicModelToolSource: Send + Sync {
+    fn descriptors(&self) -> Vec<ModelToolDescriptor>;
+    fn tool(&self, name: &str) -> Option<Arc<dyn ModelTool>>;
+}
+
+#[derive(Default)]
+pub struct ModelToolRegistry {
+    tools: BTreeMap<String, Arc<dyn ModelTool>>,
+    dynamic: Option<Arc<dyn DynamicModelToolSource>>,
+}
+
+impl ModelToolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, tool: impl ModelTool + 'static) -> Result<()> {
+        self.register_arc(Arc::new(tool))
+    }
+
+    fn register_arc(&mut self, tool: Arc<dyn ModelTool>) -> Result<()> {
+        let descriptor = tool.descriptor();
+        validate_model_tool_descriptor(&descriptor)?;
+        if self.tools.contains_key(&descriptor.name) {
+            bail!("model tool name is already registered: {}", descriptor.name);
+        }
+        self.tools.insert(descriptor.name, tool);
+        Ok(())
+    }
+
+    pub fn set_dynamic_source(&mut self, source: Arc<dyn DynamicModelToolSource>) -> Result<()> {
+        if self.dynamic.is_some() {
+            bail!("dynamic model tool source is already registered");
+        }
+        let mut names = HashSet::new();
+        for descriptor in source.descriptors() {
+            validate_model_tool_descriptor(&descriptor)?;
+            if self.tools.contains_key(&descriptor.name) || !names.insert(descriptor.name.clone()) {
+                bail!(
+                    "dynamic model tool name is already registered: {}",
+                    descriptor.name
+                );
+            }
+        }
+        self.dynamic = Some(source);
+        Ok(())
+    }
+
+    pub fn descriptors(&self) -> Vec<ModelToolDescriptor> {
+        let mut descriptors = self
+            .tools
+            .values()
+            .map(|tool| tool.descriptor())
+            .collect::<Vec<_>>();
+        if let Some(dynamic) = &self.dynamic {
+            descriptors.extend(dynamic.descriptors());
+        }
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.definition())
+            .collect()
+    }
+
+    pub async fn dispatch(
+        &self,
+        name: &str,
+        arguments: &Value,
+        protocols: &ProtocolRegistry,
+    ) -> Result<String> {
+        let tool = self
+            .tools
+            .get(name)
+            .cloned()
+            .or_else(|| self.dynamic.as_ref().and_then(|source| source.tool(name)));
+        let tool = tool.ok_or_else(|| anyhow::anyhow!("unknown model tool: {name}"))?;
+        tool.execute(arguments, protocols).await
+    }
+}
+
+pub fn validate_model_tool_descriptor(descriptor: &ModelToolDescriptor) -> Result<()> {
+    validate_name(&descriptor.name)?;
+    if descriptor.description.trim().is_empty() {
+        bail!("model tool {} requires a description", descriptor.name);
+    }
+    let schema = descriptor.parameters.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "model tool {} parameters must be a JSON Schema object",
+            descriptor.name
+        )
+    })?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        bail!(
+            "model tool {} parameters must declare type object",
+            descriptor.name
+        );
+    }
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "model tool {} parameters must declare an object properties map",
+                descriptor.name
+            )
+        })?;
+    if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
+        bail!(
+            "model tool {} parameters must set additionalProperties to false",
+            descriptor.name
+        );
+    }
+    if let Some(required) = schema.get("required") {
+        let required = required.as_array().ok_or_else(|| {
+            anyhow::anyhow!("model tool {} required must be an array", descriptor.name)
+        })?;
+        let mut names = HashSet::new();
+        for name in required {
+            let name = name.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "model tool {} required names must be strings",
+                    descriptor.name
+                )
+            })?;
+            if !properties.contains_key(name) {
+                bail!(
+                    "model tool {} requires undeclared property {name}",
+                    descriptor.name
+                );
+            }
+            if !names.insert(name) {
+                bail!(
+                    "model tool {} requires property {name} more than once",
+                    descriptor.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PluginPermission {
     /// Read the user-managed Agent environment. This declaration is an audit
@@ -501,6 +674,9 @@ pub enum PluginPermission {
     /// Resolve saved or provider-environment API keys. This declaration is an
     /// audit marker for trusted plugin code, not an interactive approval boundary.
     Credentials,
+    /// Download and cache a pinned external executable. This declaration is an
+    /// audit marker for trusted plugin code, not an interactive approval boundary.
+    Downloads,
 }
 
 #[derive(Clone)]
@@ -537,28 +713,55 @@ impl PluginCredentials {
     }
 }
 
+#[derive(Clone)]
+pub struct PluginDownloads {
+    downloader: BinaryDownloader,
+}
+
+impl PluginDownloads {
+    fn new() -> Self {
+        Self {
+            downloader: BinaryDownloader::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new()
+    }
+
+    pub async fn ensure(&self, spec: &BinaryDownload) -> Result<PathBuf> {
+        self.downloader.ensure(spec).await
+    }
+}
+
 pub struct PluginHost<'a> {
     pub protocols: &'a mut ProtocolRegistry,
+    pub model_tools: &'a mut ModelToolRegistry,
     pub commands: &'a mut CommandRegistry,
     pub tui: &'a mut TuiRegistry,
     environment: Arc<AgentEnvironment>,
     credentials: Option<Arc<ConfigManager>>,
+    downloads: PluginDownloads,
     permissions: HashSet<PluginPermission>,
 }
 
 impl<'a> PluginHost<'a> {
     pub fn new(
         protocols: &'a mut ProtocolRegistry,
+        model_tools: &'a mut ModelToolRegistry,
         commands: &'a mut CommandRegistry,
         tui: &'a mut TuiRegistry,
         environment: Arc<AgentEnvironment>,
     ) -> Self {
         Self {
             protocols,
+            model_tools,
             commands,
             tui,
             environment,
             credentials: None,
+            downloads: PluginDownloads::new(),
             permissions: HashSet::new(),
         }
     }
@@ -585,12 +788,25 @@ impl<'a> PluginHost<'a> {
             .ok_or_else(|| anyhow::anyhow!("plugin credential access is not attached"))?;
         Ok(PluginCredentials::new(manager))
     }
+
+    pub fn downloads(&self) -> Result<PluginDownloads> {
+        if !self.permissions.contains(&PluginPermission::Downloads) {
+            bail!("plugin did not request binary download access");
+        }
+        Ok(self.downloads.clone())
+    }
 }
 
 pub trait Plugin: Send + Sync {
     /// Protocols contributed by this plugin. These declarations are used to
     /// freeze a new session's system prompt before the runtime registries exist.
     fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
+        Vec::new()
+    }
+
+    /// Direct model tools contributed by this plugin. Prefer a direct tool
+    /// when structured arguments would otherwise require nested serialization.
+    fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
         Vec::new()
     }
 
@@ -647,6 +863,25 @@ impl PluginRegistry {
         Ok(descriptors)
     }
 
+    pub fn model_tool_descriptors(&self) -> Result<Vec<ModelToolDescriptor>> {
+        let mut descriptors = Vec::new();
+        let mut names = HashSet::new();
+        for plugin in &self.plugins {
+            for descriptor in plugin.model_tool_descriptors() {
+                validate_model_tool_descriptor(&descriptor)?;
+                if !names.insert(descriptor.name.clone()) {
+                    bail!(
+                        "plugin model tool name is declared more than once: {}",
+                        descriptor.name
+                    );
+                }
+                descriptors.push(descriptor);
+            }
+        }
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(descriptors)
+    }
+
     pub fn startup_notices(&self) -> Vec<String> {
         self.plugins
             .iter()
@@ -665,7 +900,7 @@ impl PluginRegistry {
     }
 
     pub fn install(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        let expected = self
+        let expected_protocols = self
             .protocol_descriptors()?
             .into_iter()
             .map(|descriptor| (descriptor.name.clone(), descriptor))
@@ -676,8 +911,28 @@ impl PluginRegistry {
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<HashSet<_>>();
-        if let Some(name) = expected.keys().find(|name| before.contains(*name)) {
+        if let Some(name) = expected_protocols
+            .keys()
+            .find(|name| before.contains(*name))
+        {
             bail!("plugin protocol name is already registered: {name}");
+        }
+        let expected_tools = self
+            .model_tool_descriptors()?
+            .into_iter()
+            .map(|descriptor| (descriptor.name.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        let tools_before = host
+            .model_tools
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<HashSet<_>>();
+        if let Some(name) = expected_tools
+            .keys()
+            .find(|name| tools_before.contains(*name))
+        {
+            bail!("plugin model tool name is already registered: {name}");
         }
 
         for plugin in &self.plugins {
@@ -699,8 +954,18 @@ impl PluginRegistry {
             .filter(|descriptor| !before.contains(&descriptor.name))
             .map(|descriptor| (descriptor.name.clone(), descriptor))
             .collect::<BTreeMap<_, _>>();
-        if installed != expected {
+        if installed != expected_protocols {
             bail!("plugin protocol declarations do not match installed protocols");
+        }
+        let installed_tools = host
+            .model_tools
+            .descriptors()
+            .into_iter()
+            .filter(|descriptor| !tools_before.contains(&descriptor.name))
+            .map(|descriptor| (descriptor.name.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        if installed_tools != expected_tools {
+            bail!("plugin model tool declarations do not match installed model tools");
         }
         Ok(())
     }
@@ -892,6 +1157,39 @@ mod tests {
         credentials: Arc<std::sync::OnceLock<PluginCredentials>>,
     }
 
+    #[derive(Clone)]
+    struct DeclaredModelToolPlugin {
+        declares_tool: bool,
+    }
+
+    struct DownloadPlugin {
+        requests_downloads: bool,
+        downloads: Arc<std::sync::OnceLock<PluginDownloads>>,
+    }
+
+    #[async_trait]
+    impl ModelTool for DeclaredModelToolPlugin {
+        fn descriptor(&self) -> ModelToolDescriptor {
+            ModelToolDescriptor {
+                name: "declared_tool".to_string(),
+                description: "Declared test model tool".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _arguments: &Value,
+            _protocols: &ProtocolRegistry,
+        ) -> Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
     impl Plugin for PromptOnlyPlugin {
         fn startup_notices(&self) -> Vec<String> {
             vec!["plugin startup notice".to_string()]
@@ -936,6 +1234,34 @@ mod tests {
         }
     }
 
+    impl Plugin for DeclaredModelToolPlugin {
+        fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
+            self.declares_tool
+                .then(|| <Self as ModelTool>::descriptor(self))
+                .into_iter()
+                .collect()
+        }
+
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            host.model_tools.register(self.clone())
+        }
+    }
+
+    impl Plugin for DownloadPlugin {
+        fn permissions(&self) -> Vec<PluginPermission> {
+            self.requests_downloads
+                .then_some(PluginPermission::Downloads)
+                .into_iter()
+                .collect()
+        }
+
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            self.downloads
+                .set(host.downloads()?)
+                .map_err(|_| anyhow::anyhow!("download handle was already captured"))
+        }
+    }
+
     #[async_trait]
     impl Protocol for DeclaredProtocolPlugin {
         fn descriptor(&self) -> ProtocolDescriptor {
@@ -961,12 +1287,19 @@ mod tests {
         }
     }
 
-    async fn empty_host() -> (ProtocolRegistry, CommandRegistry, TuiRegistry, PathBuf) {
+    async fn empty_host() -> (
+        ProtocolRegistry,
+        ModelToolRegistry,
+        CommandRegistry,
+        TuiRegistry,
+        PathBuf,
+    ) {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let directory = output.directory().to_path_buf();
         (
             ProtocolRegistry::new(output, TaskManager::new()),
+            ModelToolRegistry::new(),
             CommandRegistry::with_core_commands(),
             TuiRegistry::default(),
             directory,
@@ -1004,12 +1337,13 @@ mod tests {
                 .descriptor()
             ]
         );
-        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
 
         plugins
             .install(&mut PluginHost::new(
                 &mut protocols,
+                &mut model_tools,
                 &mut commands,
                 &mut tui,
                 environment,
@@ -1029,12 +1363,13 @@ mod tests {
         plugins.add(DeclaredProtocolPlugin {
             declares_protocol: false,
         });
-        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
 
         let error = plugins
             .install(&mut PluginHost::new(
                 &mut protocols,
+                &mut model_tools,
                 &mut commands,
                 &mut tui,
                 environment,
@@ -1046,8 +1381,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugins_declare_and_install_the_same_model_tool_contract() {
+        let mut plugins = PluginRegistry::new();
+        let plugin = DeclaredModelToolPlugin {
+            declares_tool: true,
+        };
+        plugins.add(plugin.clone());
+        assert_eq!(
+            plugins.model_tool_descriptors().unwrap(),
+            vec![<DeclaredModelToolPlugin as ModelTool>::descriptor(&plugin)]
+        );
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+
+        plugins
+            .install(&mut PluginHost::new(
+                &mut protocols,
+                &mut model_tools,
+                &mut commands,
+                &mut tui,
+                environment,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            model_tools.descriptors(),
+            plugins.model_tool_descriptors().unwrap()
+        );
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[test]
+    fn model_tool_descriptors_require_a_strict_object_schema() {
+        let descriptor = |parameters| ModelToolDescriptor {
+            name: "strict_tool".to_string(),
+            description: "Strict test tool".to_string(),
+            parameters,
+        };
+
+        assert!(
+            validate_model_tool_descriptor(&descriptor(serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": false
+            })))
+            .is_ok()
+        );
+        assert!(
+            validate_model_tool_descriptor(&descriptor(serde_json::json!({
+                "type": "string",
+                "properties": {},
+                "additionalProperties": false
+            })))
+            .unwrap_err()
+            .to_string()
+            .contains("type object")
+        );
+        assert!(
+            validate_model_tool_descriptor(&descriptor(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": ["missing"],
+                "additionalProperties": false
+            })))
+            .unwrap_err()
+            .to_string()
+            .contains("undeclared property")
+        );
+        assert!(
+            validate_model_tool_descriptor(&descriptor(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })))
+            .unwrap_err()
+            .to_string()
+            .contains("additionalProperties")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_tool_declarations_reject_undeclared_installs_and_collisions() {
+        let mut undeclared = PluginRegistry::new();
+        undeclared.add(DeclaredModelToolPlugin {
+            declares_tool: false,
+        });
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        let error = undeclared
+            .install(&mut PluginHost::new(
+                &mut protocols,
+                &mut model_tools,
+                &mut commands,
+                &mut tui,
+                environment,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("declarations do not match"));
+
+        let mut duplicate = PluginRegistry::new();
+        duplicate.add(DeclaredModelToolPlugin {
+            declares_tool: true,
+        });
+        duplicate.add(DeclaredModelToolPlugin {
+            declares_tool: true,
+        });
+        let error = duplicate.model_tool_descriptors().unwrap_err();
+        assert!(error.to_string().contains("declared more than once"));
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_must_request_binary_download_access() {
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        let denied_capture = Arc::new(std::sync::OnceLock::new());
+        let mut denied = PluginRegistry::new();
+        denied.add(DownloadPlugin {
+            requests_downloads: false,
+            downloads: denied_capture,
+        });
+        let mut host = PluginHost::new(
+            &mut protocols,
+            &mut model_tools,
+            &mut commands,
+            &mut tui,
+            environment,
+        );
+
+        let error = denied.install(&mut host).unwrap_err();
+        assert!(format!("{error:#}").contains("did not request binary download access"));
+        assert!(host.downloads().is_err());
+
+        let allowed_capture = Arc::new(std::sync::OnceLock::new());
+        let mut allowed = PluginRegistry::new();
+        allowed.add(DownloadPlugin {
+            requests_downloads: true,
+            downloads: allowed_capture.clone(),
+        });
+        allowed.install(&mut host).unwrap();
+        assert!(allowed_capture.get().is_some());
+        assert!(host.downloads().is_err());
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
     async fn plugins_must_request_environment_access_once_for_dynamic_reads() {
-        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
         environment
             .set("NPM_TOKEN", "first".to_string())
@@ -1060,8 +1540,13 @@ mod tests {
             requests_environment: false,
             environment: denied_capture,
         });
-        let mut host =
-            PluginHost::new(&mut protocols, &mut commands, &mut tui, environment.clone());
+        let mut host = PluginHost::new(
+            &mut protocols,
+            &mut model_tools,
+            &mut commands,
+            &mut tui,
+            environment.clone(),
+        );
         let error = denied.install(&mut host).unwrap_err();
         assert!(format!("{error:#}").contains("did not request Agent environment access"));
         assert!(host.environment().is_err());
@@ -1093,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn plugins_must_request_credential_access_once_for_dynamic_reads() {
-        let (mut protocols, mut commands, mut tui, output) = empty_host().await;
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
         let manager = ConfigManager::load_for_test(&output, &output)
             .await
@@ -1109,8 +1594,14 @@ mod tests {
             requests_credentials: false,
             credentials: denied_capture,
         });
-        let mut host = PluginHost::new(&mut protocols, &mut commands, &mut tui, environment)
-            .with_credentials(manager.clone());
+        let mut host = PluginHost::new(
+            &mut protocols,
+            &mut model_tools,
+            &mut commands,
+            &mut tui,
+            environment,
+        )
+        .with_credentials(manager.clone());
         let error = denied.install(&mut host).unwrap_err();
         assert!(format!("{error:#}").contains("did not request credential access"));
         assert!(host.credentials().is_err());

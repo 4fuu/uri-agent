@@ -1,40 +1,44 @@
 # Protocols, tasks, and output
 
-URI Agent keeps the model-facing tool surface fixed while allowing the application to register new capabilities. This document describes routing, built-in protocols, execution semantics, managed tasks, and output preservation. Skill discovery and resources are documented in [Startup context and Skills](context.md).
+URI Agent keeps protocol routing small while allowing plugins to register both protocols and typed direct tools. This document describes routing, built-in protocols, direct editing tools, execution semantics, managed tasks, and output preservation. Skill discovery and resources are documented in [Startup context and Skills](context.md).
 
 For the exact runtime syntax of a protocol, read `<protocol>://help`. Those help routes are the canonical model-facing operation reference.
 
-## Fixed model interface
+## Model interface
 
-The model receives exactly two tool definitions:
+The linked built-in plugins register four tools:
 
 ```text
-read(uri: string, body: BodyEnvelope)
-exec(uri: string, body: BodyEnvelope)
+read(uri: string, body: string)
+exec(uri: string, body: string)
+replace(path: string, old_text: string, new_text: string)
+apply_patch(patch: string)
 ```
 
-`BodyEnvelope` is always present and has the concrete shape
-`{"kind":"none|text|json","value":"..."}`. Use `none` with an empty value when
-the protocol takes no body, `text` for a literal string body, and `json` with
-the complete JSON serialization of any JSON body. URI Agent decodes this
-model-facing envelope before protocol dispatch, so protocols and plugins still
-receive an optional arbitrary JSON value.
+`body` is always required and always a string. Pass `""` when a protocol takes
+no body, pass plain text for textual input, and pass the complete serialized
+JSON text when a protocol requires structured input. Protocols receive that
+string unchanged, including an empty string.
 
-`read` is used for resources, help, task snapshots, and completed output. `exec` starts work through protocols that support execution. A protocol may implement `read`, `exec`, or both.
+`read` is used for resources, help, task snapshots, and completed output. `exec`
+starts work through protocols that support execution. `replace` and
+`apply_patch` avoid nesting edit payloads inside a serialized protocol body.
+Runtime-loaded WASM plugins may add more typed direct tools, so the active tool
+set is not limited to these four. A protocol may implement `read`, `exec`, or
+both.
 
-Model dispatch and the [protocol registry](../src/protocol.rs) apply four routing rules:
+Model dispatch and the [protocol registry](../src/protocol.rs) apply three routing rules:
 
-1. Decode the required model-facing body envelope before entering the registry.
-2. Split an address only at the first `://` and use the part before that
+1. Split an address only at the first `://` and use the part before that
    delimiter as the registered protocol name.
-3. Pass the entire remainder to the protocol as an opaque target. The registry
+2. Pass the entire remainder to the protocol as an opaque target. The registry
    does not URL-decode, normalize, or parse options from it.
-4. Pass the decoded optional JSON body to the selected protocol unchanged.
+3. Pass the required string body to the selected protocol unchanged.
 
 For example, the target received by `capture` here is exactly `a://b?not=a url`:
 
 ```text
-read("capture://a://b?not=a url", {"kind":"none","value":""})
+read("capture://a://b?not=a url", "")
 ```
 
 Protocols own their target syntax. `file` interprets `?offset`, `?limit`, and
@@ -48,15 +52,14 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | Protocol | Operations | Responsibility |
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
-| `file` | `read` | Read files and bounded directory listings |
+| `file` | `read` | Read files, bounded directory listings, and recursive glob results |
+| `grep` | `read` | Search file contents with bounded ripgrep results and optional glob filtering |
 | `sessions` | `read` | Discover, search, and read bounded saved session history without changing it |
 | `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
-| `replace` | `read`, `exec` | Atomically replace one exact text match |
-| `apply_patch` | `read`, `exec` | Apply Codex-style add, delete, update, and move patches |
 | `tasks` | `read`, `exec` | Inspect and cancel background tasks from every protocol |
 | `bash` | `read`, `exec` | Run Bash commands in the foreground or as managed background tasks when Bash is enabled |
 | `pwsh` | `read`, `exec` | Run PowerShell 7 commands in the foreground or as managed background tasks when `pwsh` is enabled |
-| `wasm_plugin` | `read`, `exec` | Reload trusted WASM protocols and return the completed reload report |
+| `wasm_plugin` | `read`, `exec` | Reload trusted WASM protocols and direct tools and return the completed reload report |
 | `<name>-skill` | `read` | Load one [discovered Skill](context.md#skills) and its bundled files |
 
 Shell plugins detect their own executables at startup. On Windows, the `pwsh`
@@ -72,7 +75,7 @@ they remain readable from any startup working directory and match the running
 URI Agent version. Start with the embedded documentation index:
 
 ```text
-read("uri-agent-docs://README.md", {"kind":"none","value":""})
+read("uri-agent-docs://README.md", "")
 ```
 
 Other targets are the exact, case-sensitive filenames linked by that index,
@@ -85,32 +88,58 @@ supported.
 Relative paths resolve from the canonical startup working directory; absolute paths remain absolute. Reading a directory returns a sorted, bounded listing. Text reads accept a one-based line range:
 
 ```text
-read("file://src/main.rs?offset=1&limit=200", {"kind":"none","value":""})
+read("file://src/main.rs?offset=1&limit=200", "")
 ```
 
 File content is returned without line numbers by default. Add `line_numbers=true` when one-based line prefixes are useful:
 
 ```text
-read("file://src/main.rs?offset=1&limit=200&line_numbers=true", {"kind":"none","value":""})
+read("file://src/main.rs?offset=1&limit=200&line_numbers=true", "")
 ```
 
-`file://help` reports the accepted range options, active limits, and current working directory.
+Add `glob=<pattern>` to a directory target to list matching files recursively
+with standard ignore rules. Results are sorted and paginated with the same
+one-based `offset` and bounded `limit`:
+
+```text
+read("file://src?glob=**/*.rs&limit=200", "")
+```
+
+`file://help` reports the accepted range and glob options, active limits, and
+current working directory.
+
+### `grep`
+
+`grep` puts the search pattern in the string body and searches a project-relative
+or absolute file or directory. An empty target searches the startup working
+directory. It invokes ripgrep directly without a shell and accepts `glob`,
+`literal`, `ignore_case`, `context`, and `limit` options:
+
+```text
+read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
+read("grep://?literal=true&ignore_case=true", "exact text")
+```
+
+URI Agent uses a working `rg` from `PATH` when available. Otherwise the linked
+grep plugin silently installs its pinned platform archive after checking the
+release checksum and executable version. Read `grep://help` for the exact
+limits and output shape.
 
 ### `sessions`
 
 The read-only `sessions` protocol discovers and searches saved URI Agent sessions. Discovery is scoped to the current project by default; `scope: "all"` searches every project, and an optional `cwd` narrows that cross-project scope:
 
 ```text
-read("sessions://recent", {"kind":"none","value":""})
-read("sessions://search", {"kind":"json","value":"{\"query\":\"refresh token\"}"})
-read("sessions://search", {"kind":"json","value":"{\"query\":\"billing migration\",\"scope\":\"all\"}"})
+read("sessions://recent", "")
+read("sessions://search", "{\"query\":\"refresh token\"}")
+read("sessions://search", "{\"query\":\"billing migration\",\"scope\":\"all\"}")
 ```
 
 Read an exact session ID to retrieve its newest visible records. Use the returned `before` cursor to page backward, and request `include_tools` only when tool evidence is needed:
 
 ```text
-read("sessions://<session-id>", {"kind":"none","value":""})
-read("sessions://<session-id>", {"kind":"json","value":"{\"include_tools\":true,\"limit\":20}"})
+read("sessions://<session-id>", "")
+read("sessions://<session-id>", "{\"include_tools\":true,\"limit\":20}")
 ```
 
 User, assistant, and terminal error text is returned by default. Thinking, usage, model replay payloads, compaction summaries, and TUI metadata are always excluded; tool calls and results are excluded unless requested. Results are bounded and marked as untrusted reference data. Archive access opens the SQLite database read-only and does not initialize, migrate, resume, append, rename, or delete sessions. Read `sessions://help` for the body fields and limits.
@@ -123,7 +152,7 @@ provider in stable order (Parallel, then Exa) and try the next configured
 provider after an API failure:
 
 ```text
-read("https://www.rust-lang.org/", {"kind":"none","value":""})
+read("https://www.rust-lang.org/", "")
 ```
 
 Its reserved search route accepts the nonempty search query as a string body.
@@ -131,7 +160,7 @@ The URI accepts an optional result limit from 1 through 20, an optional
 provider (`parallel` or `exa`), and provider-specific options:
 
 ```text
-read("https://search?limit=10&provider=parallel", {"kind":"text","value":"stable Rust release notes"})
+read("https://search?limit=10&provider=parallel", "stable Rust release notes")
 ```
 
 Without `provider`, search tries configured providers in stable order:
@@ -152,34 +181,61 @@ requests time out after 30 seconds, and response bodies are limited to 5 MiB.
 
 ### `replace`
 
-`replace` performs an exact replacement and returns after the write succeeds:
+Prefer the typed `replace` tool. It performs an exact replacement and returns
+after the write succeeds without requiring JSON-in-string serialization:
 
 ```text
-exec(
-  "replace://src/config.rs",
-  {"kind":"json","value":"{\"old_text\":\"one unique match\",\"new_text\":\"replacement\"}"}
-)
+replace({"path":"src/config.rs","old_text":"one unique match","new_text":"replacement"})
 ```
 
-`old_text` must be nonempty and occur exactly once. Missing and ambiguous matches fail directly from `exec` without changing the file. A successful write atomically replaces the destination file.
+`old_text` must be nonempty and occur exactly once. Missing and ambiguous
+matches fail directly without changing the file. A successful write atomically
+replaces the destination file. `replace` is registered only as a direct tool;
+it has no protocol route. Its active tool schema is the exact model-facing
+argument contract.
 
 ### `apply_patch`
 
-`apply_patch` accepts a patch string and returns the final summary after applying it:
+The typed `apply_patch` tool accepts one complete patch string and returns the
+final summary after applying it:
 
 ```text
-exec("apply_patch://apply", {"kind":"text","value":"*** Begin Patch\n...\n*** End Patch"})
+apply_patch({"patch":"*** Begin Patch\n...\n*** End Patch"})
 ```
 
-It supports adding, deleting, updating, and moving files. Writes are atomic per file and operations run in patch order, but the whole patch is not transactional: failure in a later operation does not undo earlier successful operations. Read `apply_patch://help` for the complete file-operation and hunk grammar.
+The patch supports this grammar:
+
+```text
+*** Begin Patch
+*** Add File: <path>
++<new content>
+*** Update File: <path>
+*** Move to: <new path>
+@@ <optional landmark>
+-<old line>
++<new line>
+*** Delete File: <path>
+*** End Patch
+```
+
+`*** Move to` is optional and may appear only immediately after an Update File
+header. Update lines start with a space for context, `-` for removal, or `+` for
+addition. `*** End of File` may anchor a chunk at EOF. Every Add File content
+line starts with `+`. Relative paths resolve from the startup working directory;
+absolute paths are accepted.
+
+URI Agent parses and applies the complete patch to an in-memory plan before
+changing files. A commit failure rolls back every affected file. `apply_patch`
+is registered only as a direct tool; it has no protocol route. The same grammar
+is included in its active tool schema.
 
 ### `bash` and `pwsh`
 
 Shell bodies must be command strings:
 
 ```text
-exec("bash://run", {"kind":"text","value":"cargo test"})
-exec("pwsh://run", {"kind":"text","value":"cargo test"})
+exec("bash://run", "cargo test")
+exec("pwsh://run", "cargo test")
 ```
 
 Commands run from the startup working directory. Bash starts without profile or rc files; PowerShell starts without a profile and reads the script from standard input.
@@ -193,7 +249,7 @@ PowerShell source and plain-text output use UTF-8. Command status follows the fi
 Protocol execution returns its final result directly by default. Bash and PowerShell commands therefore start in the foreground. If a command is still running after about 60 seconds, URI Agent converts that same process into a managed background task without restarting it:
 
 ```text
-exec("bash://run", {"kind":"text","value":"cargo test"})
+exec("bash://run", "cargo test")
 → Exit: exit status: 0
   ...
 
@@ -204,13 +260,13 @@ exec("bash://run", {"kind":"text","value":"cargo test"})
 Use `background=true` when the command should become a task immediately:
 
 ```text
-exec("bash://run?background=true", {"kind":"text","value":"cargo test"})
+exec("bash://run?background=true", "cargo test")
 ```
 
 Foreground and background commands share one execution deadline. `timeout` is an integer number of seconds, omission defaults to 1,800 seconds (30 minutes), and `timeout=0` disables the deadline:
 
 ```text
-exec("bash://run?timeout=120", {"kind":"text","value":"cargo test"})
+exec("bash://run?timeout=120", "cargo test")
 ```
 
 The deadline is unchanged when an operation moves to the background. Timing out produces a failed task for background work or a direct `exec` error for foreground work, and terminates the process tree. Interrupting a shell tool call before automatic background conversion cancels its process rather than leaving detached work behind. Shell help tells the model not to create another background layer inside the command.
@@ -218,9 +274,9 @@ The deadline is unchanged when an operation moves to the background. Timing out 
 The shared `tasks` protocol covers work from every protocol:
 
 ```text
-read("tasks://summary", {"kind":"none","value":""})
-read("tasks://<id>", {"kind":"none","value":""})
-exec("tasks://<id>/cancel", {"kind":"none","value":""})
+read("tasks://summary", "")
+read("tasks://<id>", "")
+exec("tasks://<id>/cancel", "")
 ```
 
 Task acceptance is not success. A task record exposes `pending`, `running`, `completed`, `failed`, or `cancelled` state, its originating protocol, label, duration, bounded latest output while active, and complete terminal output. Task IDs increase within their in-process manager as lowercase hexadecimal values: they start at `001`, remain at least three digits wide, and expand after `fff`. Settled background records remain available for the lifetime of the session runtime. At most 16 background tasks may be pending or running at once; an explicit background request fails at capacity, while automatic conversion keeps waiting in the foreground.
@@ -239,6 +295,13 @@ When protocol output exceeds the active inline limit, URI Agent:
 
 This presentation behavior is shared by protocol reads and executions. Adjust the limit through `:settings`, configuration, `URI_AGENT_OUTPUT_LIMIT`, or `--output-limit`; see [Models and configuration](configuration.md).
 
-## Extension protocols
+## Extensions
 
-Capabilities may register protocols through linked Rust extensions, trusted runtime-loaded WASM modules, or discovered Skills. All remain behind `read` and `exec`. See [WASM plugins](plugins.md) for installation, reload, ABI, permissions, and SDK usage; [Startup context and Skills](context.md#skills) for Skill behavior; and the [development guide](development.md#linked-rust-extensions) for linked first-party internals.
+Capabilities may register protocols or typed direct tools through linked Rust
+extensions and trusted runtime-loaded WASM modules; discovered Skills register
+read-only protocols. Prefer a protocol for operations with a simple string
+input and a direct tool when typed or escape-heavy arguments would otherwise
+need nested serialization. See [WASM plugins](plugins.md) for installation,
+reload, ABI, permissions, and SDK usage; [Startup context and
+Skills](context.md#skills) for Skill behavior; and the [development
+guide](development.md#linked-rust-extensions) for linked first-party internals.

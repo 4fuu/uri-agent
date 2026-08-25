@@ -2,9 +2,7 @@ use super::antigravity::AntigravityTransport;
 use super::codex_websocket::CodexWebSocketTransport;
 use super::failure::{ModelFailure, ModelFailurePhase};
 use super::request_transform::ModelRequestTransform;
-use super::{
-    ModelBackend, ModelDelta, ModelRequest, ModelResponse, clamp_thinking_level, tool_definitions,
-};
+use super::{ModelBackend, ModelDelta, ModelRequest, ModelResponse, clamp_thinking_level};
 use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits, ThinkingLevel};
 use crate::config::{ActiveSettings, AuthKind, ConfigManager, resolve_config_value};
 use crate::oauth;
@@ -559,8 +557,8 @@ where
         .preamble(request.system)
         .messages(history)
         .max_tokens(max_tokens);
-    if request.tools {
-        completion = completion.tools(tool_definitions());
+    if !request.tools.is_empty() {
+        completion = completion.tools(request.tools);
     }
     let mut stream = completion
         .stream()

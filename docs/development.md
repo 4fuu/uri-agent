@@ -23,13 +23,13 @@ built-in plugins + discovered Skills
           |                         v
           |                 frozen SessionContext
           v                         |
-protocol / command / TUI registries <------------+
+protocol / model-tool / command / TUI registries <------------+
           |
           v
    runtime model loop <----> append-only SQLite session
           |
           v
- read/exec dispatch ----> direct result or managed task ----> bounded or preserved output
+generic tool dispatch ----> protocol or direct tool ----> bounded or preserved output
 ```
 
 For a resumed session, the stored `SessionContext` replaces newly generated prompt and Skill context. Current startup discovery must not reinterpret historical sessions.
@@ -41,13 +41,14 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/main.rs` | Application assembly, plugin installation, Skill registration, and runtime/TUI wiring |
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
-| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, Codex WebSocket and experimental Antigravity transports, multimodal support, and the two tool schemas |
+| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, Codex WebSocket and experimental Antigravity transports, and multimodal support |
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, binary-hint, embedded-documentation, file, session archive, HTTPS, exact replacement, Codex patch, unified tasks, Bash, and PowerShell plugins, including protocol help and provider-specific HTTPS internals |
-| `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, and protocol, command, generic panel, status, and composer completion registration |
-| `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol routing, trusted permissions, and atomic reload |
+| `src/builtins/` | Built-in project-instruction, embedded-documentation, file, grep, session archive, HTTPS, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific HTTPS internals |
+| `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, and model-tool, protocol, command, generic panel, status, and composer completion registration |
+| `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
+| `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol and model-tool routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
 | `examples/wasm-plugin/` | Buildable Rust guest plugin example |
 | `src/task.rs` | In-process task lifecycle, foreground-to-background promotion, capacity, progress, waiting, cancellation, records, and notices |
@@ -67,28 +68,36 @@ Put behavior in the module that owns the corresponding state and contract. Befor
 
 First-party capabilities use the plugin path exposed to linked Rust extensions:
 
-1. A [`Plugin`](../src/plugin.rs) may declare protocol descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen.
-2. `PluginRegistry` validates descriptor names, rejects duplicates, collects notices, and preserves registration order for prompt fragments.
-3. Plugins install protocols, commands, panel providers, status providers, and composer completion providers through `PluginHost`; prompt-only plugins need no runtime registration.
-4. Protocols remain behind `read` and `exec`, while commands join the searchable panel and key-bindable command registry.
+1. A [`Plugin`](../src/plugin.rs) may declare protocol and direct model-tool descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen.
+2. `PluginRegistry` validates descriptor names and tool schemas, rejects duplicates, requires declarations to match installed capabilities, collects notices, and preserves registration order for prompt fragments.
+3. Plugins install model tools, protocols, commands, panel providers, status providers, and composer completion providers through `PluginHost`; prompt-only plugins need no runtime registration.
+4. Simple string-input capabilities remain behind `read` and `exec`; typed or escape-heavy operations should register a direct model tool, while commands join the searchable panel and key-bindable command registry.
 
-Sensitive host access uses explicit plugin permissions. `PluginPermission::Environment` exposes `PluginEnvironment` for dynamic reads from the user-managed Agent environment. `PluginPermission::Credentials` exposes `PluginCredentials` for dynamic provider API-key resolution without coupling a plugin to configuration internals. Neither capability has a variable/provider allowlist or approval state: each declaration is an audit marker for trusted source, while an undeclared plugin is refused by the host interface.
+Sensitive host access uses explicit plugin permissions. `PluginPermission::Environment` exposes `PluginEnvironment` for dynamic reads from the user-managed Agent environment. `PluginPermission::Credentials` exposes `PluginCredentials` for dynamic provider API-key resolution without coupling a plugin to configuration internals. `PluginPermission::Downloads` exposes the pinned binary installer used by `grep`. These declarations are audit markers for trusted source, not approval state; an undeclared plugin is refused by the corresponding host interface.
 
 TUI extensions return generic documents, semantic status items, or text replacement candidates for the composer. Completion providers receive the current lines and character-based cursor position, then return a replacement range and labeled candidates; the TUI owns popup rendering, stale-result rejection, selection, and insertion. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, or panel providers; reserve prompt fragments for context required before the first tool call.
 
-URI Agent does not load native dynamic libraries. Third-party runtime protocols use the trusted [WASM plugin](plugins.md) path instead.
+URI Agent does not load native dynamic libraries. Third-party runtime protocols
+and direct tools use the trusted [WASM plugin](plugins.md) path instead.
 
 ## Architectural contracts
 
 ### Model-facing interface and protocols
 
-- The model sees exactly two tool definitions: `read` and `exec`.
-- Split protocol addresses only at the first `://`; decode the required
-  model-facing body envelope, then pass the opaque remainder and optional JSON
-  body to the selected protocol unchanged.
+- Linked plugins register `read`, `exec`, typed `replace`, and typed
+  `apply_patch`; runtime WASM plugins may register additional model tools.
+- Runtime dispatch is generic over the model-tool registry and must not
+  special-case tool names.
+- Every model tool, including `read` and `exec`, is declared and installed by a
+  plugin rather than coupled to the runtime.
+- `read` and `exec` require a string `body`. Split protocol addresses only at
+  the first `://`, then pass the opaque remainder and body, including `""`, to
+  the selected protocol unchanged.
 - Protocol names are unique. A protocol may implement `read`, `exec`, or both.
 - Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
-- Prefer extending `Protocol` over adding another model-facing concept or embedding every capability in the initial prompt.
+- Prefer a protocol for simple string inputs and a typed direct tool when
+  structured or escape-heavy arguments would otherwise require nested
+  serialization. Do not embed every capability in the initial prompt.
 - Reserve plugin system prompt fragments for context the model must receive before its first tool call. Prompt-only plugins do not need to register a protocol.
 
 The shared routing and execution lifecycle is in [Protocols, tasks, and output](protocols.md).
@@ -101,6 +110,8 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - URI syntax belongs to its protocol; the registry must not interpret protocol-specific options.
 - Shell cancellation terminates child processes, not only the parent future.
 - File writes remain atomic. Exact replacement rejects missing and ambiguous matches.
+- Patch application preflights the complete in-memory plan before writing and
+  rolls back every affected file after a commit failure.
 - Preserve oversized output in the session output directory and return a readable `file://` address.
 - Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
 - Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
@@ -153,6 +164,26 @@ When adding or changing a protocol:
 
 Do not add generic registry behavior for syntax that belongs to one protocol.
 
+### Direct model-tool changes
+
+When adding or changing a direct model tool:
+
+1. implement `ModelTool` in the plugin that owns the behavior;
+2. return the same descriptor from `Plugin::model_tool_descriptors` and install
+   the tool through `PluginHost::model_tools`;
+3. use a strict JSON Schema and reject unknown fields when decoding typed
+   arguments;
+4. keep runtime dispatch generic and add focused schema, dispatch, and failure
+   tests;
+5. update [protocol documentation](protocols.md) when the active public tool
+   surface changes.
+
+Use `PluginPermission::Downloads` before calling `PluginHost::downloads` for a
+linked plugin-managed executable. The request exists to make download behavior
+easy to find in source review; it does not show an approval prompt. Prefer a
+working executable from `PATH`, then use a pinned URL, checksum, version check,
+bounded download, process and cross-process lock, and atomic cache install.
+
 ### WASM plugin and SDK changes
 
 Keep `wasm_plugin://help`, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. Test both a valid module and the affected reload, collision, permission, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing.
@@ -191,7 +222,7 @@ For documentation-only changes, the full Rust suite is unnecessary unless code o
 
 - Root READMEs own project fit, critical warnings, the shortest successful setup, and navigation.
 - [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, and output detail.
-- [`docs/context.md`](context.md) owns project instructions, installed binary hints, Skill discovery and resources, and frozen startup context.
+- [`docs/context.md`](context.md) owns project instructions, Skill discovery and resources, and frozen startup context.
 - [`docs/plugins.md`](plugins.md) owns WASM installation, reload, ABI, trust boundaries, and runtime limits; [`sdk/README.md`](../sdk/README.md) owns Rust guest SDK usage.
 - [`docs/configuration.md`](configuration.md) owns models, authentication, files, precedence, CLI override semantics, and custom providers.
 - [`docs/interface.md`](interface.md) owns the conversation surface, composer, commands, and navigation.

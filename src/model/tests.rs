@@ -6,7 +6,7 @@ use crate::catalog::ModelLimits;
 use crate::config::AuthKind;
 use chrono::{DateTime, Utc};
 use http::{HeaderMap, HeaderValue};
-use rig::completion::CompletionError;
+use rig::completion::{CompletionError, ToolDefinition};
 use rig::message::Message;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -47,6 +47,25 @@ fn transformed(model: CatalogModel, thinking: ThinkingLevel, body: Value) -> Val
         .transform_bytes(bytes::Bytes::from(bytes)),
     )
     .unwrap()
+}
+
+fn test_tool_definitions() -> Vec<ToolDefinition> {
+    ["read", "exec"]
+        .into_iter()
+        .map(|name| ToolDefinition {
+            name: name.to_string(),
+            description: format!("Test {name} tool"),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "uri": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "required": ["uri", "body"],
+                "additionalProperties": false
+            }),
+        })
+        .collect()
 }
 
 fn codex_access_token() -> String {
@@ -229,7 +248,7 @@ async fn complete_codex_history(
             ModelRequest {
                 system: "system".to_string(),
                 history,
-                tools: false,
+                tools: Vec::new(),
                 estimated_context: 0,
                 max_output_tokens: None,
             },
@@ -389,7 +408,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
             ModelRequest {
                 system: "system".to_string(),
                 history: vec![Message::user("first question")],
-                tools: false,
+                tools: Vec::new(),
                 estimated_context: 0,
                 max_output_tokens: None,
             },
@@ -420,7 +439,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
                     },
                     Message::user("second question"),
                 ],
-                tools: false,
+                tools: Vec::new(),
                 estimated_context: 0,
                 max_output_tokens: None,
             },
@@ -689,7 +708,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
                 "id": "fc_1",
                 "call_id": "call_1",
                 "name": "read",
-                "arguments": "{\"uri\":\"file://README.md\",\"body\":{\"kind\":\"none\",\"value\":\"\"}}",
+                "arguments": "{\"uri\":\"file://README.md\",\"body\":\"\"}",
                 "status": "completed"
             }
         ],
@@ -739,7 +758,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
             "item_id": "fc_1",
             "output_index": 2,
             "sequence_number": 5,
-            "delta": "{\"uri\":\"file://README.md\",\"body\":{\"kind\":\"none\",\"value\":\"\"}}"
+            "delta": "{\"uri\":\"file://README.md\",\"body\":\"\"}"
         }),
         json!({
             "type": "response.output_item.done",
@@ -751,7 +770,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
                 "id": "fc_1",
                 "call_id": "call_1",
                 "name": "read",
-                "arguments": "{\"uri\":\"file://README.md\",\"body\":{\"kind\":\"none\",\"value\":\"\"}}",
+                "arguments": "{\"uri\":\"file://README.md\",\"body\":\"\"}",
                 "status": "completed"
             }
         }),
@@ -784,7 +803,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
             ModelRequest {
                 system: "System instructions".to_string(),
                 history: vec![Message::user("hello")],
-                tools: true,
+                tools: test_tool_definitions(),
                 estimated_context: 100,
                 max_output_tokens: Some(4096),
             },
@@ -846,7 +865,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
         if call.function.name == "read"
             && call.function.arguments == json!({
                 "uri": "file://README.md",
-                "body": {"kind": "none", "value": ""}
+                "body": ""
             }))
     }));
     let usage = response.usage.unwrap();
@@ -927,7 +946,7 @@ async fn codex_backend_requires_oauth_and_preserves_subscription_errors() {
                 ModelRequest {
                     system: "system".to_string(),
                     history: vec![Message::user("hello")],
-                    tools: false,
+                    tools: Vec::new(),
                     estimated_context: 0,
                     max_output_tokens: None,
                 },
@@ -1100,50 +1119,6 @@ fn retry_after_accepts_seconds_and_http_dates() {
         parse_retry_after_at(Some(&headers), now),
         Some(Duration::from_secs(30))
     );
-}
-
-#[test]
-fn model_only_sees_two_tools_with_a_required_typed_body_envelope() {
-    let tools = tool_definitions();
-    assert_eq!(
-        tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        ["read", "exec"]
-    );
-    assert!(
-        tools[1]
-            .description
-            .contains("Exact behavior is protocol-specific")
-    );
-    assert!(
-        tools[1]
-            .description
-            .contains("return their final result directly")
-    );
-    assert!(
-        tools[1]
-            .description
-            .contains("completion is delivered automatically")
-    );
-    assert!(
-        tools[1]
-            .description
-            .contains("use the tasks protocol to inspect or cancel them")
-    );
-    for tool in tools {
-        assert_eq!(tool.parameters["required"], json!(["uri", "body"]));
-        let body = &tool.parameters["properties"]["body"];
-        assert_eq!(body["type"], "object");
-        assert_eq!(body["required"], json!(["kind", "value"]));
-        assert_eq!(
-            body["properties"]["kind"]["enum"],
-            json!(["none", "text", "json"])
-        );
-        assert_eq!(body["properties"]["value"]["type"], "string");
-        assert_eq!(body["additionalProperties"], false);
-    }
 }
 
 #[test]

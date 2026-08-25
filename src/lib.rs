@@ -15,5 +15,6 @@ pub mod session;
 pub mod skill;
 pub mod task;
 pub mod terminal;
+mod tool_download;
 pub mod tui;
 pub mod wasm_plugin;

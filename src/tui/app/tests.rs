@@ -3991,7 +3991,7 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
             "exec",
             &serde_json::json!({
                 "uri": "bash://run",
-                "body": {"kind": "text", "value": "cargo test\necho done"}
+                "body": "cargo test\necho done"
             })
         ),
         "$ cargo test"
@@ -4005,13 +4005,9 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     );
     assert_eq!(
         tool_title(
-            "exec",
+            "apply_patch",
             &serde_json::json!({
-                "uri": "apply_patch://run",
-                "body": {
-                    "kind": "text",
-                    "value": "*** Begin Patch\n*** Update File: src/tui.rs\n*** Update File: Cargo.toml\n*** End Patch"
-                }
+                "patch": "*** Begin Patch\n*** Update File: src/tui.rs\n*** Update File: Cargo.toml\n*** End Patch"
             })
         ),
         "Patched src/tui.rs +1"
@@ -4020,10 +4016,7 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     let mut lines = Vec::new();
     tool_argument_details(
         &serde_json::json!({
-            "body": {
-                "kind": "json",
-                "value": "{\"path\":\"src/main.rs\",\"limit\":20}"
-            }
+            "body": "{\"path\":\"src/main.rs\",\"limit\":20}"
         }),
         &mut lines,
     );

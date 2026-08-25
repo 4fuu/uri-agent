@@ -1,9 +1,13 @@
 use super::file::resolve_path;
 use super::{EditableText, atomic_write};
-use crate::plugin::{Plugin, PluginHost};
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
+use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -14,52 +18,31 @@ const DELETE_FILE: &str = "*** Delete File: ";
 const UPDATE_FILE: &str = "*** Update File: ";
 const MOVE_TO: &str = "*** Move to: ";
 const END_OF_FILE: &str = "*** End of File";
-const HELP: &str = r#"# apply_patch
-
-Apply a Codex-style multi-file patch and return the final result.
-
-Call `exec` with `apply_patch://apply` and encode the complete patch as a text
-body. The body value must use this patch format:
-
-```text
-exec("apply_patch://apply", {"kind":"text","value":"<complete patch>"})
-```
-
-```text
-*** Begin Patch
-*** Add File: <path>
-+<new content>
-*** Update File: <path>
-@@ <optional landmark>
--<old line>
-+<new line>
-*** Delete File: <path>
-*** End Patch
-```
-
-Replace each `<path>` with the project-relative or absolute path for that
-operation. Replace the other placeholders with the patch context and content
-required by the project. Use `@@` without `<optional landmark>` when no landmark
-is needed. An Update File may put `*** Move to: <new path>` immediately after
-its header. Update lines begin with a space for context, `-` for removal, or `+`
-for addition. `*** End of File` anchors the preceding chunk at EOF. Add File
-content lines must all begin with `+`. Relative paths resolve from the startup
-working directory; absolute paths are accepted.
-
-Operations run in patch order and each write is atomic, but the complete patch
-is not transactional: a later failure does not undo earlier operations. `exec`
-returns the final summary after all operations succeed; errors are returned
-directly.
-
-`read` supports only `apply_patch://help`.
-"#;
+const PATCH_ARGUMENT_DESCRIPTION: &str = concat!(
+    "Complete Codex-style patch in this format:\n",
+    "*** Begin Patch\n",
+    "*** Add File: <path>\n",
+    "+<new content>\n",
+    "*** Update File: <path>\n",
+    "@@ <optional landmark>\n",
+    "-<old line>\n",
+    "+<new line>\n",
+    "*** Delete File: <path>\n",
+    "*** End Patch\n\n",
+    "Replace placeholders with actual values. Use @@ without a landmark when none is needed. ",
+    "An Update File may put *** Move to: <new path> immediately after its header. ",
+    "Update lines begin with a space for context, - for removal, or + for addition. ",
+    "*** End of File anchors the preceding chunk at EOF. Every Add File content line ",
+    "begins with +. Relative paths resolve from the startup working directory; absolute ",
+    "paths are accepted."
+);
 
 #[derive(Clone)]
-pub(super) struct ApplyPatchProtocol {
+pub(super) struct ApplyPatchTool {
     cwd: PathBuf,
 }
 
-impl ApplyPatchProtocol {
+impl ApplyPatchTool {
     pub(super) fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
@@ -67,51 +50,49 @@ impl ApplyPatchProtocol {
     }
 }
 
-impl Plugin for ApplyPatchProtocol {
-    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
-        vec![self.descriptor()]
+impl Plugin for ApplyPatchTool {
+    fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
+        vec![<Self as ModelTool>::descriptor(self)]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        host.protocols.register(self.clone())
+        host.model_tools.register(self.clone())
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyPatchArguments {
+    patch: String,
+}
+
 #[async_trait]
-impl Protocol for ApplyPatchProtocol {
-    fn descriptor(&self) -> ProtocolDescriptor {
-        ProtocolDescriptor {
+impl ModelTool for ApplyPatchTool {
+    fn descriptor(&self) -> ModelToolDescriptor {
+        ModelToolDescriptor {
             name: "apply_patch".to_string(),
-            description: "Apply a Codex-style multi-file patch.".to_string(),
-            can_read: true,
-            can_exec: true,
+            description: "Apply a transactional Codex-style multi-file patch. The complete patch is parsed and applied to an in-memory plan before files change; commit failures roll back every affected file.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": PATCH_ARGUMENT_DESCRIPTION
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
         }
     }
 
-    async fn read(
-        &self,
-        request: ProtocolRequest<'_>,
-        _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if request.target != "help" {
-            bail!("expected apply_patch://help");
+    async fn execute(&self, arguments: &Value, _protocols: &ProtocolRegistry) -> Result<String> {
+        let arguments: ApplyPatchArguments = serde_json::from_value(arguments.clone())
+            .context("invalid apply_patch tool arguments")?;
+        if arguments.patch.is_empty() {
+            bail!("apply_patch patch must be nonempty");
         }
-        Ok(HELP.as_bytes().to_vec())
-    }
-
-    async fn exec(
-        &self,
-        request: ProtocolRequest<'_>,
-        _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if !matches!(request.target, "" | "apply") {
-            bail!("expected apply_patch://apply");
-        }
-        let patch = request
-            .body
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow!("apply_patch body must be a patch string"))?;
-        Ok(apply_patch(&self.cwd, patch).await?.into_bytes())
+        apply_patch(&self.cwd, &arguments.patch).await
     }
 }
 
@@ -331,6 +312,7 @@ fn is_operation_or_end(line: &str) -> bool {
 
 async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     let hunks = parse_patch(patch)?;
+    let mut files = BTreeMap::<PathBuf, PlannedFile>::new();
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
@@ -338,27 +320,22 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     for hunk in hunks {
         match hunk {
             PatchHunk::Add { path, content } => {
-                atomic_write(
-                    &resolve_path(cwd, path.to_string_lossy().as_ref()),
-                    content.as_bytes(),
-                )
-                .await?;
+                let resolved = resolve_path(cwd, path.to_string_lossy().as_ref());
+                load_planned_file(&mut files, &resolved)
+                    .await?
+                    .final_content = Some(content.into_bytes());
                 added.push(path);
             }
             PatchHunk::Delete { path } => {
                 let resolved = resolve_path(cwd, path.to_string_lossy().as_ref());
-                let metadata = fs::symlink_metadata(&resolved)
-                    .await
-                    .with_context(|| format!("failed to delete file {}", resolved.display()))?;
-                if metadata.is_dir() {
+                let file = load_planned_file(&mut files, &resolved).await?;
+                if file.final_content.is_none() {
                     bail!(
-                        "failed to delete file {}: path is a directory",
+                        "failed to delete file {}: file not found",
                         resolved.display()
                     );
                 }
-                fs::remove_file(&resolved)
-                    .await
-                    .with_context(|| format!("failed to delete file {}", resolved.display()))?;
+                file.final_content = None;
                 deleted.push(path);
             }
             PatchHunk::Update {
@@ -367,24 +344,45 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 chunks,
             } => {
                 let source = resolve_path(cwd, path.to_string_lossy().as_ref());
-                let updated = derive_updated_content(&source, &chunks).await?;
+                let source_content = load_planned_file(&mut files, &source)
+                    .await?
+                    .final_content
+                    .clone()
+                    .ok_or_else(|| anyhow!("failed to read file to update {}", source.display()))?;
+                let source_text = String::from_utf8(source_content).with_context(|| {
+                    format!("file to update is not UTF-8: {}", source.display())
+                })?;
+                let updated = derive_updated_content(&source, &source_text, &chunks)?;
                 if let Some(destination) = move_to {
                     let resolved_destination =
                         resolve_path(cwd, destination.to_string_lossy().as_ref());
-                    atomic_write(&resolved_destination, updated.as_bytes()).await?;
                     if source != resolved_destination {
-                        fs::remove_file(&source).await.with_context(|| {
-                            format!("failed to remove original {}", source.display())
-                        })?;
+                        load_planned_file(&mut files, &resolved_destination)
+                            .await?
+                            .final_content = Some(updated.into_bytes());
+                        files
+                            .get_mut(&source)
+                            .expect("source was loaded")
+                            .final_content = None;
+                    } else {
+                        files
+                            .get_mut(&source)
+                            .expect("source was loaded")
+                            .final_content = Some(updated.into_bytes());
                     }
                     modified.push(destination);
                 } else {
-                    atomic_write(&source, updated.as_bytes()).await?;
+                    files
+                        .get_mut(&source)
+                        .expect("source was loaded")
+                        .final_content = Some(updated.into_bytes());
                     modified.push(path);
                 }
             }
         }
     }
+
+    commit_plan(&files).await?;
 
     let mut output = String::from("Success. Updated the following files:\n");
     for path in added {
@@ -399,11 +397,179 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     Ok(output)
 }
 
-async fn derive_updated_content(path: &Path, chunks: &[UpdateChunk]) -> Result<String> {
-    let original = fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read file to update {}", path.display()))?;
-    let original = EditableText::new(&original);
+#[derive(Clone)]
+struct OriginalFile {
+    content: Vec<u8>,
+    permissions: std::fs::Permissions,
+}
+
+struct PlannedFile {
+    original: Option<OriginalFile>,
+    final_content: Option<Vec<u8>>,
+}
+
+async fn load_planned_file<'a>(
+    files: &'a mut BTreeMap<PathBuf, PlannedFile>,
+    path: &Path,
+) -> Result<&'a mut PlannedFile> {
+    if !files.contains_key(path) {
+        let original = match fs::symlink_metadata(path).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("patch paths cannot be symbolic links: {}", path.display());
+                }
+                if !metadata.is_file() {
+                    bail!("patch path is not a regular file: {}", path.display());
+                }
+                Some(OriginalFile {
+                    content: fs::read(path)
+                        .await
+                        .with_context(|| format!("failed to read {}", path.display()))?,
+                    permissions: metadata.permissions(),
+                })
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        files.insert(
+            path.to_path_buf(),
+            PlannedFile {
+                final_content: original.as_ref().map(|file| file.content.clone()),
+                original,
+            },
+        );
+    }
+    Ok(files.get_mut(path).expect("planned file was inserted"))
+}
+
+async fn commit_plan(files: &BTreeMap<PathBuf, PlannedFile>) -> Result<()> {
+    let changed = files
+        .iter()
+        .filter(|(_, file)| {
+            file.original.as_ref().map(|file| &file.content) != file.final_content.as_ref()
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let mut created_directories = BTreeSet::new();
+    for path in &changed {
+        if files[path].final_content.is_some() {
+            collect_missing_parent_directories(path, &mut created_directories).await?;
+        }
+    }
+
+    let mut applied = Vec::new();
+    let result = async {
+        for path in changed
+            .iter()
+            .filter(|path| files[*path].final_content.is_some())
+        {
+            atomic_write(
+                path,
+                files[path]
+                    .final_content
+                    .as_deref()
+                    .expect("filtered planned write"),
+            )
+            .await?;
+            applied.push(path.clone());
+        }
+        for path in changed
+            .iter()
+            .filter(|path| files[*path].final_content.is_none())
+        {
+            fs::remove_file(path)
+                .await
+                .with_context(|| format!("failed to delete file {}", path.display()))?;
+            applied.push(path.clone());
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let Err(error) = result else {
+        return Ok(());
+    };
+
+    let rollback_errors = rollback_plan(files, &applied, &created_directories).await;
+    if rollback_errors.is_empty() {
+        return Err(error).context("patch commit failed; all file changes were rolled back");
+    }
+    bail!(
+        "patch commit failed: {error:#}; rollback also failed: {}",
+        rollback_errors.join("; ")
+    )
+}
+
+async fn collect_missing_parent_directories(
+    path: &Path,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        match fs::metadata(directory).await {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => bail!(
+                "cannot create patch file because parent is not a directory: {}",
+                directory.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                directories.insert(directory.to_path_buf());
+                parent = directory.parent();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", directory.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn rollback_plan(
+    files: &BTreeMap<PathBuf, PlannedFile>,
+    applied: &[PathBuf],
+    created_directories: &BTreeSet<PathBuf>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for path in applied.iter().rev() {
+        let result = match &files[path].original {
+            Some(original) => {
+                async {
+                    atomic_write(path, &original.content).await?;
+                    fs::set_permissions(path, original.permissions.clone()).await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await
+            }
+            None => match fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error:#}", path.display()));
+        }
+    }
+    let mut directories = created_directories.iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        match fs::remove_dir(directory).await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => errors.push(format!("{}: {error}", directory.display())),
+        }
+    }
+    errors
+}
+
+fn derive_updated_content(path: &Path, original: &str, chunks: &[UpdateChunk]) -> Result<String> {
+    let original = EditableText::new(original);
     let had_final_newline = original.normalized().ends_with('\n');
     let mut lines = if original.normalized().is_empty() {
         Vec::new()
@@ -535,69 +701,50 @@ fn normalize_for_match(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputStore;
     use crate::task::TaskManager;
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn protocol_exec_returns_the_completed_patch_directly() {
+    async fn direct_tool_returns_the_completed_patch() {
         let directory = tempfile::tempdir().unwrap();
-        let protocol = ApplyPatchProtocol::new(directory.path());
-        let tasks = TaskManager::new();
-        let context = ProtocolContext {
-            tasks: tasks.clone(),
-        };
-        let patch = serde_json::Value::String(
-            "*** Begin Patch\n*** Add File: added.txt\n+added\n*** End Patch".to_string(),
+        let output_store = Arc::new(
+            OutputStore::new(
+                &format!("apply-patch-{}", uuid::Uuid::now_v7().simple()),
+                1024,
+            )
+            .await
+            .unwrap(),
         );
-        let help = protocol
-            .read(
-                ProtocolRequest {
-                    uri: "apply_patch://help",
-                    target: "help",
-                    body: None,
-                },
-                context.clone(),
-            )
-            .await
-            .unwrap();
-        let help = String::from_utf8(help).unwrap();
-        assert!(help.contains("*** Add File: <path>"));
-        assert!(help.contains("returns the final summary"));
+        let protocols = ProtocolRegistry::new(output_store.clone(), TaskManager::new());
+        let tool = ApplyPatchTool::new(directory.path());
+        let patch = "*** Begin Patch\n*** Add File: added.txt\n+added\n*** End Patch";
 
-        let output = protocol
-            .exec(
-                ProtocolRequest {
-                    uri: "apply_patch://apply",
-                    target: "apply",
-                    body: Some(&patch),
-                },
-                context.clone(),
+        let output = tool
+            .execute(
+                &json!({
+                    "patch": patch
+                }),
+                &protocols,
             )
             .await
             .unwrap();
 
-        assert!(String::from_utf8(output).unwrap().contains("A added.txt"));
+        assert!(output.contains("A added.txt"));
         assert_eq!(
             fs::read_to_string(directory.path().join("added.txt"))
                 .await
                 .unwrap(),
             "added\n"
         );
-        assert!(tasks.list().await.is_empty());
+        let descriptor = tool.descriptor();
         assert!(
-            protocol
-                .read(
-                    ProtocolRequest {
-                        uri: "apply_patch://tasks",
-                        target: "tasks",
-                        body: None,
-                    },
-                    context,
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("apply_patch://help")
+            descriptor.parameters["properties"]["patch"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("*** Add File: <path>")
         );
+        let _ = fs::remove_dir_all(output_store.directory()).await;
     }
 
     #[tokio::test]
@@ -715,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_later_hunk_keeps_earlier_changes_but_not_the_failed_update() {
+    async fn failed_later_hunk_does_not_write_any_files() {
         let directory = tempfile::tempdir().unwrap();
         let existing = directory.path().join("existing.txt");
         fs::write(&existing, "unchanged\n").await.unwrap();
@@ -731,13 +878,46 @@ mod tests {
         let error = apply_patch(directory.path(), patch).await.unwrap_err();
 
         assert!(error.to_string().contains("failed to find expected lines"));
-        assert_eq!(
-            fs::read_to_string(directory.path().join("created.txt"))
-                .await
-                .unwrap(),
-            "created\n"
-        );
+        assert!(!directory.path().join("created.txt").exists());
         assert_eq!(fs::read_to_string(existing).await.unwrap(), "unchanged\n");
+    }
+
+    #[tokio::test]
+    async fn commit_failure_rolls_back_an_earlier_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.txt");
+        let failing = directory.path().join("z-directory");
+        fs::write(&first, "original\n").await.unwrap();
+        fs::create_dir(&failing).await.unwrap();
+        let metadata = fs::metadata(&first).await.unwrap();
+        let mut files = BTreeMap::new();
+        files.insert(
+            first.clone(),
+            PlannedFile {
+                original: Some(OriginalFile {
+                    content: b"original\n".to_vec(),
+                    permissions: metadata.permissions(),
+                }),
+                final_content: Some(b"changed\n".to_vec()),
+            },
+        );
+        files.insert(
+            failing.clone(),
+            PlannedFile {
+                original: None,
+                final_content: Some(b"cannot replace a directory\n".to_vec()),
+            },
+        );
+
+        let error = commit_plan(&files).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("all file changes were rolled back")
+        );
+        assert_eq!(fs::read_to_string(first).await.unwrap(), "original\n");
+        assert!(failing.is_dir());
     }
 
     #[test]

@@ -143,6 +143,9 @@ impl Protocol for SkillProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        if !request.body.is_empty() {
+            bail!("skill reads do not accept a body");
+        }
         let root = self
             .snapshot
             .path
@@ -351,7 +354,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://help",
                     target: "help",
-                    body: None,
+                    body: "",
                 },
                 context.clone(),
             )
@@ -366,7 +369,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://check.sh",
                     target: "check.sh",
-                    body: None,
+                    body: "",
                 },
                 context.clone(),
             )
@@ -379,7 +382,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://../outside",
                     target: "../outside",
-                    body: None,
+                    body: "",
                 },
                 context,
             )
@@ -400,7 +403,7 @@ mod tests {
                     ProtocolRequest {
                         uri: "code-review-skill://outside-link",
                         target: "outside-link",
-                        body: None,
+                        body: "",
                     },
                     ProtocolContext {
                         tasks: crate::task::TaskManager::new(),
@@ -441,7 +444,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "review-skill://help",
                     target: "help",
-                    body: None,
+                    body: "",
                 },
                 ProtocolContext {
                     tasks: crate::task::TaskManager::new(),
@@ -470,7 +473,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "review-skill://help",
                     target: "help",
-                    body: None,
+                    body: "",
                 },
                 ProtocolContext {
                     tasks: crate::task::TaskManager::new(),

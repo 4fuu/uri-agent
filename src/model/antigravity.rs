@@ -1294,15 +1294,7 @@ mod tests {
                     "$defs": {"Target": {"type": "integer", "minimum": 1}},
                     "properties": {
                         "uri": {"type": "string", "minLength": 1},
-                        "body": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {"type": "string", "enum": ["none", "text", "json"]},
-                                "value": {"type": "string"}
-                            },
-                            "required": ["kind", "value"],
-                            "additionalProperties": false
-                        },
+                        "body": {"type": "string"},
                         "target": {"$ref": "#/$defs/Target"},
                         "optional": {"type": ["string", "null"]},
                         "choice": {"anyOf": [
@@ -1318,14 +1310,7 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "body": {
-                            "type": "object",
-                            "properties": {
-                                "kind": {"type": "string", "enum": ["none", "text", "json"]},
-                                "value": {"type": "string"}
-                            },
-                            "required": ["kind", "value"]
-                        }
+                        "body": {"type": "string"}
                     },
                     "required": ["body"]
                 }
@@ -1357,15 +1342,7 @@ mod tests {
         assert!(parameters.get("additionalProperties").is_none());
         assert_eq!(parameters["required"], json!(["uri", "body", "target"]));
         assert!(parameters["properties"].get("invalid").is_none());
-        assert_eq!(parameters["properties"]["body"]["type"], "object");
-        assert_eq!(
-            parameters["properties"]["body"]["required"],
-            json!(["kind", "value"])
-        );
-        assert_eq!(
-            parameters["properties"]["body"]["properties"]["kind"]["enum"],
-            json!(["none", "text", "json"])
-        );
+        assert_eq!(parameters["properties"]["body"]["type"], "string");
         assert_eq!(parameters["properties"]["target"]["type"], "integer");
         assert_eq!(parameters["properties"]["choice"]["type"], "object");
         assert!(
@@ -1380,7 +1357,7 @@ mod tests {
         );
         assert_eq!(
             request["tools"][0]["functionDeclarations"][1]["parameters"]["properties"]["body"]["type"],
-            "object"
+            "string"
         );
         assert_eq!(
             request["tools"][0]["functionDeclarations"][1]["parameters"]["required"],

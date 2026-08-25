@@ -562,8 +562,15 @@ mod tests {
     fn request_estimate_includes_registered_tools() {
         let history = vec![Message::user("hello")];
         let without_tools = estimate_request_tokens("system", &history, &[]);
-        let with_tools =
-            estimate_request_tokens("system", &history, &crate::model::tool_definitions());
+        let with_tools = estimate_request_tokens(
+            "system",
+            &history,
+            &[ToolDefinition {
+                name: "read".to_string(),
+                description: "Read through a protocol".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        );
 
         assert!(with_tools > without_tools);
     }

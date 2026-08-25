@@ -8,49 +8,42 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent 是一个用 URI 协议统一模型能力的终端 coding agent。凡是模型用于读取资源或执行操作的能力，都以 URI 协议暴露：文件与目录、编辑、Shell、网页、会话归档、内置文档、Skills 和扩展共享同一个地址空间，而模型始终只看到两个工具：
+URI Agent 是一个以 URI 协议为核心的终端 coding agent；对于参数复杂或转义密集的操作，则提供有类型的直接工具。内置 Rust 插件会注册四个工具，可信 WASM 插件还可以在运行时添加更多有类型工具：
 
 ```text
-read(uri: string, body: BodyEnvelope)
-exec(uri: string, body: BodyEnvelope)
+read(uri: string, body: string)
+exec(uri: string, body: string)
+replace(path: string, old_text: string, new_text: string)
+apply_patch(patch: string)
 ```
 
-必填的 `BodyEnvelope` 形如 `{"kind":"none|text|json","value":"..."}`。
-URI Agent 会在路由前将它解码为协议可选的任意 JSON body，从而以一套具体、
-跨 Provider 的 schema 保留协议 payload 的完整表达能力。
+`read` 和 `exec` 的 body 始终必填且固定为字符串。协议不需要 body 时传
+`""`，文本输入直接传字符串，结构化协议输入则传完整序列化后的 JSON 文本。
 
-URI Agent 把其他 Agent 加载 Skills 的方式延伸到了所有能力：启动时只暴露简短的名称与描述，选中后才加载完整指令和资源。因此，新会话只预载路由规则和每个协议的一行描述；详细契约保留在 `<protocol>://help`，Skill 正文与文档保留在各自协议之后，超长结果则保留在 `file://` 地址之后。这既延续了极致的按需加载和上下文渐进理念，又通过固定的 `read` / `exec` 契约保持工具调用可靠，并通过可注册协议提供极强的灵活性。固定启动基线仍保持在约 3.7 KB，而不必预先承担全部能力的上下文成本。
+URI Agent 把其他 Agent 加载 Skills 的方式延伸到大多数能力：启动时只暴露简短的名称与描述，选中后才加载完整指令和资源。因此，新会话只预载路由规则、每个协议的一行描述和当前工具 schema；详细协议契约保留在 `<protocol>://help`，Skill 正文与文档保留在各自协议之后，超长结果则保留在 `file://` 地址之后。这既延续了极致的按需加载和上下文渐进理念，又让直接编辑工具避开 JSON 字符串内的二次转义。
 
-增加能力只会增加一条协议索引，而不是增加新的模型工具 schema 或预载整份说明书。Shell 命令较短时直接返回，运行较久时自动转为后台受管任务，并在完成后主动通知模型，无需轮询；会话历史以只追加方式保存在 SQLite 中。
+输入只是简单字符串的能力只需增加一条协议索引，不必预载整份说明书；有类型或转义密集的能力则可以通过同一插件系统注册直接工具。Shell 命令较短时直接返回，运行较久时自动转为后台受管任务，并在完成后主动通知模型，无需轮询；会话历史以只追加方式保存在 SQLite 中。
 
 > [!WARNING]
 > URI Agent 不提供沙箱。文件与 Shell 协议使用 `uri-agent` 进程本身的权限运行。请只使用可信的项目和配置。
 
 URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变化。模型请求及其所需上下文会发送给你选择的 Provider；除非启用离线模式，URI Agent 还会从 pi.dev 获取模型目录元数据。
 
-## 约 3.7 KB 的固定启动基线
-
-以当前源码为准，在 Unix、启用 Bash、包含 9 个内置协议且不计项目与环境附加内容时，固定启动基线为：
-
-| 组成 | 包含内容 | UTF-8 大小 |
-| --- | --- | ---: |
-| 系统提示词 | 路由规则与内置协议索引 | 1,495 bytes（1.495 KB） |
-| `read` + `exec` 定义 | 两个紧凑的内部工具 schema | 2,236 bytes（2.236 KB） |
-| **合计** | 固定系统提示词与工具 | **3,731 bytes（3.731 KB）** |
+## 渐进式启动上下文
 
 ```text
-约 3.7 KB 固定基线
-    → read("<protocol>://help", {"kind":"none","value":""})
+精简路由规则 + 协议索引 + 当前工具 schema
+    → read("<protocol>://help", "")
     → 只加载该协议的契约
     → 执行当前任务所需的读取与操作
 ```
 
-Skills 也遵循同一路径：启动时只加入每个已发现 Skill 的名称和描述；模型选择该 Skill 后，才会加载它的 `SKILL.md` 与配套资源。实际启动上下文还会按需加入项目的 `AGENTS.md`（如果存在）和一条简短的已检测命令行工具提示。上表只衡量 URI Agent 的固定基线；内部工具定义按紧凑 JSON 序列化，不包含不同 Provider 的请求包装。
+Skills 也遵循同一路径：启动时只加入每个已发现 Skill 的名称和描述；模型选择该 Skill 后，才会加载它的 `SKILL.md` 与配套资源。实际启动上下文还会按需加入项目的 `AGENTS.md`（如果存在）。直接工具会贡献有类型的 schema，但不会额外预载一整份手册。
 
 ## 为什么使用 URI Agent
 
 - **URI 原生的上下文渐进：**一个地址空间覆盖所有资源和操作，并像加载 Skills 一样，只在需要时载入契约、指令、资源和完整输出。
-- **调用可靠且易于扩展：**固定的 `read` / `exec` 契约保持稳定，内置、Skill、Rust 和可信 WASM 协议可以独立演进。
+- **调用可靠且易于扩展：**稳定的字符串 `read` / `exec` 契约处理简单协议，有类型的直接工具避免嵌套转义，而且两条路径都由插件注册。
 - **pi.dev 模型目录与登录方式：**复用 pi.dev 的云端模型配置和 Provider 登录方式，在同一选择器中使用其目录里属于 URI Agent 已支持 API 系列的模型与服务商。
 - **工作持久且可观察：**受管任务公开状态和最终输出，并会在完成时自动通知模型；只追加会话、草稿、固化上下文与压缩 checkpoint 都能跨重启保留。
 - **统一且可控的终端工作流：**内置网络访问、实时 Queue 与 Guidance、完整键盘操作以及 `@` 文件和 `@@` 会话引用都集中在同一界面。
@@ -134,7 +127,7 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 
 ## 扩展
 
-可信 WASM 模块可以添加运行时加载的协议。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。直接读取已保存的 Agent 环境变量或 Provider API key 时，插件源码必须显式申请相应能力；它只是审计标记，不是批准流程。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
+可信 WASM 模块可以添加运行时加载的协议和有类型的直接工具。这里的 WASM 是便携 ABI，不是安全边界；启用的插件拥有文件系统、HTTP、WASI 和内置协议访问能力，其用户权限与 URI Agent 相同。直接读取已保存的 Agent 环境变量或 Provider API key 时，插件源码必须显式申请相应能力；它只是审计标记，不是批准流程。安装、reload、ABI、SDK 用法和可靠性限制见英文文档 [WASM plugins](docs/plugins.md)。
 
 ## 文档
 

@@ -1,39 +1,20 @@
 use super::file::resolve_path;
 use super::{EditableText, atomic_write, normalize_line_endings};
-use crate::plugin::{Plugin, PluginHost};
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
+use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-const HELP: &str = r#"# replace
-
-Replace one exact text match and return the final result.
-
-Call `exec` with `replace://<path>` and encode the replacement object as JSON:
-
-```text
-exec("replace://<path>", {"kind":"json","value":"{\"old_text\":\"<old text>\",\"new_text\":\"<replacement>\"}"})
-```
-
-Replace `<path>` with the project-relative or absolute path of the file to edit,
-`<old text>` with the exact project text to find, and `<replacement>` with its
-new content. Relative paths resolve from the startup working directory.
-`old_text` must be nonempty and occur exactly once. The file is replaced
-atomically. `exec` returns after the replacement succeeds; validation and write
-errors are returned directly.
-
-`read` supports only `replace://help`.
-"#;
-
 #[derive(Clone)]
-pub(super) struct ReplaceProtocol {
+pub(super) struct ReplaceTool {
     cwd: PathBuf,
 }
 
-impl ReplaceProtocol {
+impl ReplaceTool {
     pub(super) fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
@@ -41,67 +22,56 @@ impl ReplaceProtocol {
     }
 }
 
-impl Plugin for ReplaceProtocol {
-    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
-        vec![self.descriptor()]
+impl Plugin for ReplaceTool {
+    fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
+        vec![<Self as ModelTool>::descriptor(self)]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        host.protocols.register(self.clone())
+        host.model_tools.register(self.clone())
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceArguments {
+    path: String,
+    old_text: String,
+    new_text: String,
 }
 
 #[async_trait]
-impl Protocol for ReplaceProtocol {
-    fn descriptor(&self) -> ProtocolDescriptor {
-        ProtocolDescriptor {
+impl ModelTool for ReplaceTool {
+    fn descriptor(&self) -> ModelToolDescriptor {
+        ModelToolDescriptor {
             name: "replace".to_string(),
-            description: "Atomically replace one exact text match in a file.".to_string(),
-            can_read: true,
-            can_exec: true,
+            description: "Replace one exact text match in a UTF-8 file atomically. Relative paths resolve from the startup working directory. The old text must be nonempty and occur exactly once; missing or ambiguous matches leave the file unchanged.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Project-relative or absolute file path."},
+                    "old_text": {"type": "string", "description": "Exact nonempty text to replace. Must occur once."},
+                    "new_text": {"type": "string", "description": "Replacement text."}
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": false
+            }),
         }
     }
 
-    async fn read(
-        &self,
-        request: ProtocolRequest<'_>,
-        _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if request.target != "help" {
-            bail!("expected replace://help");
+    async fn execute(&self, arguments: &Value, _protocols: &ProtocolRegistry) -> Result<String> {
+        let arguments: ReplaceArguments =
+            serde_json::from_value(arguments.clone()).context("invalid replace tool arguments")?;
+        if arguments.path.is_empty() {
+            bail!("replace path cannot be empty");
         }
-        Ok(HELP.as_bytes().to_vec())
-    }
-
-    async fn exec(
-        &self,
-        request: ProtocolRequest<'_>,
-        _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if request.target.is_empty() {
-            bail!("replace target path cannot be empty");
-        }
-        let body = request
-            .body
-            .ok_or_else(|| anyhow!("replace body is required"))?;
-        let path = resolve_path(&self.cwd, request.target);
-        replace_exact(&path, body).await?;
-        Ok(format!("Updated {}\n", path.display()).into_bytes())
+        let path = resolve_path(&self.cwd, &arguments.path);
+        replace_exact(&path, &arguments.old_text, &arguments.new_text).await?;
+        Ok(format!("Updated {}\n", path.display()))
     }
 }
 
-async fn replace_exact(path: &Path, body: &Value) -> Result<()> {
-    let object = body
-        .as_object()
-        .ok_or_else(|| anyhow!("replace body must be an object"))?;
-    let old_text = object
-        .get("old_text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("replace body requires an old_text string"))?;
-    let new_text = object
-        .get("new_text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("replace body requires a new_text string"))?;
+async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()> {
     if old_text.is_empty() {
         bail!("old_text cannot be empty");
     }
@@ -134,66 +104,38 @@ async fn replace_exact(path: &Path, body: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::OutputStore;
     use crate::task::TaskManager;
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn protocol_exec_returns_the_completed_replacement_directly() {
+    async fn direct_tool_returns_the_completed_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha beta\n").await.unwrap();
-        let protocol = ReplaceProtocol::new(directory.path());
-        let tasks = TaskManager::new();
-        let context = ProtocolContext {
-            tasks: tasks.clone(),
-        };
-        let body = serde_json::json!({"old_text": "beta", "new_text": "gamma"});
-        let help = protocol
-            .read(
-                ProtocolRequest {
-                    uri: "replace://help",
-                    target: "help",
-                    body: None,
-                },
-                context.clone(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            String::from_utf8(help)
-                .unwrap()
-                .contains("replace://<path>")
-        );
-
-        let output = protocol
-            .exec(
-                ProtocolRequest {
-                    uri: "replace://file.txt",
-                    target: "file.txt",
-                    body: Some(&body),
-                },
-                context.clone(),
-            )
-            .await
-            .unwrap();
-
-        assert!(String::from_utf8(output).unwrap().contains("Updated"));
-        assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha gamma\n");
-        assert!(tasks.list().await.is_empty());
-        assert!(
-            protocol
-                .read(
-                    ProtocolRequest {
-                        uri: "replace://tasks",
-                        target: "tasks",
-                        body: None,
-                    },
-                    context,
-                )
+        let output_store = Arc::new(
+            OutputStore::new(&format!("replace-{}", uuid::Uuid::now_v7().simple()), 1024)
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("replace://help")
+                .unwrap(),
         );
+        let protocols = ProtocolRegistry::new(output_store.clone(), TaskManager::new());
+        let tool = ReplaceTool::new(directory.path());
+
+        let output = tool
+            .execute(
+                &json!({
+                    "path": "file.txt",
+                    "old_text": "beta",
+                    "new_text": "gamma"
+                }),
+                &protocols,
+            )
+            .await
+            .unwrap();
+
+        assert!(output.contains("Updated"));
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha gamma\n");
+        let _ = fs::remove_dir_all(output_store.directory()).await;
     }
 
     #[tokio::test]
@@ -202,29 +144,14 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha beta").await.unwrap();
 
-        replace_exact(
-            &path,
-            &serde_json::json!({"old_text": "beta", "new_text": "gamma"}),
-        )
-        .await
-        .unwrap();
+        replace_exact(&path, "beta", "gamma").await.unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "alpha gamma");
 
-        let missing = replace_exact(
-            &path,
-            &serde_json::json!({"old_text": "missing", "new_text": "x"}),
-        )
-        .await
-        .unwrap_err();
+        let missing = replace_exact(&path, "missing", "x").await.unwrap_err();
         assert!(missing.to_string().contains("was not found"));
 
         fs::write(&path, "aaa").await.unwrap();
-        let ambiguous = replace_exact(
-            &path,
-            &serde_json::json!({"old_text": "aa", "new_text": "x"}),
-        )
-        .await
-        .unwrap_err();
+        let ambiguous = replace_exact(&path, "aa", "x").await.unwrap_err();
         assert!(ambiguous.to_string().contains("more than once"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), "aaa");
     }
@@ -237,15 +164,9 @@ mod tests {
             .await
             .unwrap();
 
-        replace_exact(
-            &path,
-            &serde_json::json!({
-                "old_text": "alpha\nbeta\n",
-                "new_text": "ALPHA\nBETA\n"
-            }),
-        )
-        .await
-        .unwrap();
+        replace_exact(&path, "alpha\nbeta\n", "ALPHA\nBETA\n")
+            .await
+            .unwrap();
 
         assert_eq!(
             fs::read_to_string(path).await.unwrap(),
@@ -263,10 +184,8 @@ mod tests {
 
         replace_exact(
             &with_newline,
-            &serde_json::json!({
-                "old_text": "\u{feff}alpha\nbeta\n",
-                "new_text": "\u{feff}ALPHA\nBETA"
-            }),
+            "\u{feff}alpha\nbeta\n",
+            "\u{feff}ALPHA\nBETA",
         )
         .await
         .unwrap();
@@ -277,12 +196,9 @@ mod tests {
 
         let without_newline = directory.path().join("without-newline.txt");
         fs::write(&without_newline, "alpha\nbeta").await.unwrap();
-        replace_exact(
-            &without_newline,
-            &serde_json::json!({"old_text": "alpha\nbeta", "new_text": "ALPHA\nBETA\n"}),
-        )
-        .await
-        .unwrap();
+        replace_exact(&without_newline, "alpha\nbeta", "ALPHA\nBETA\n")
+            .await
+            .unwrap();
         assert_eq!(
             fs::read_to_string(without_newline).await.unwrap(),
             "ALPHA\nBETA"
@@ -296,12 +212,9 @@ mod tests {
         let original = "hello\r\nworld\r\n---\nhello\nworld\n";
         fs::write(&path, original).await.unwrap();
 
-        let error = replace_exact(
-            &path,
-            &serde_json::json!({"old_text": "hello\nworld\n", "new_text": "replacement\n"}),
-        )
-        .await
-        .unwrap_err();
+        let error = replace_exact(&path, "hello\nworld\n", "replacement\n")
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("more than once"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), original);

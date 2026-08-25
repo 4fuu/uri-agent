@@ -16,19 +16,8 @@ The following content is from the project's AGENTS.md. Follow these instructions
 
 A missing file contributes nothing; other read failures prevent the first message from starting. Changes to `AGENTS.md` apply only to new sessions.
 
-## Installed binary hints
-
-Another prompt-only plugin scans `PATH` once for a fixed set of modern command-line tools:
-
-```text
-rg, fd, fdfind, sd, bat, batcat, eza, exa, lsd, delta,
-jq, yq, fzf, xh, hyperfine, dust, duf, procs, btm, zoxide,
-doggo, gping, hexyl, choose, sad, ast-grep, broot, tokei, watchexec, glow
-```
-
-When it finds any, the generated prompt names the available programs and asks the model to prefer them over classical Unix equivalents. Detection is case-insensitive, preserves the display order above, removes duplicate names, and never invokes a detected program. Changes to installed binaries or `PATH` apply only to new sessions.
-
-Neither startup plugin registers a protocol, command, panel, status provider, key binding, or setting.
+The project-instruction plugin does not register a protocol, command, panel,
+status provider, key binding, or setting.
 
 ## Skills
 

@@ -25,36 +25,51 @@ pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
 }
 
 fn tool_body_text(arguments: &serde_json::Value) -> Option<&str> {
-    let body = arguments.get("body")?;
-    if let Some(value) = body.as_str() {
-        return Some(value);
-    }
-    let envelope = body.as_object()?;
-    (envelope.get("kind").and_then(serde_json::Value::as_str) == Some("text"))
-        .then(|| envelope.get("value").and_then(serde_json::Value::as_str))?
+    arguments.get("body")?.as_str()
 }
 
 fn tool_body(arguments: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
     let body = arguments.get("body")?;
-    let Some(envelope) = body.as_object() else {
+    let Some(value) = body.as_str() else {
         return Some(Cow::Borrowed(body));
     };
-    let kind = envelope.get("kind").and_then(serde_json::Value::as_str);
-    let value = envelope.get("value").and_then(serde_json::Value::as_str);
-    match (kind, value) {
-        (Some("none"), Some("")) => None,
-        (Some("text"), Some(value)) => {
-            Some(Cow::Owned(serde_json::Value::String(value.to_string())))
-        }
-        (Some("json"), Some(value)) => serde_json::from_str(value)
-            .ok()
-            .map(Cow::Owned)
-            .or(Some(Cow::Borrowed(body))),
-        _ => Some(Cow::Borrowed(body)),
+    if value.is_empty() {
+        return None;
     }
+    serde_json::from_str(value)
+        .ok()
+        .map(Cow::Owned)
+        .or(Some(Cow::Borrowed(body)))
 }
 
 pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
+    if name == "apply_patch" {
+        let files = arguments
+            .get("patch")
+            .and_then(serde_json::Value::as_str)
+            .map(patch_targets)
+            .unwrap_or_default();
+        if let Some(first) = files.first() {
+            let more = files.len().saturating_sub(1);
+            return format!(
+                "Patched {}{}",
+                single_line_preview(first, 64),
+                if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        return "Applied patch".to_string();
+    }
+    if name == "replace" {
+        let path = arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        return format!("Edited {}", single_line_preview(path, 72));
+    }
     let action = match name {
         "read" => "Read",
         "exec" => "Ran",
@@ -72,27 +87,6 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             "$ {}",
             single_line_preview(command.lines().next().unwrap_or_default(), 76)
         );
-    }
-    if name == "exec" && protocol == "apply_patch" {
-        let files = tool_body_text(arguments)
-            .map(patch_targets)
-            .unwrap_or_default();
-        if let Some(first) = files.first() {
-            let more = files.len().saturating_sub(1);
-            return format!(
-                "Patched {}{}",
-                single_line_preview(first, 64),
-                if more > 0 {
-                    format!(" +{more}")
-                } else {
-                    String::new()
-                }
-            );
-        }
-        return "Applied patch".to_string();
-    }
-    if name == "exec" && protocol == "replace" {
-        return format!("Edited {}", single_line_preview(target, 72));
     }
     if name == "read" && protocol == "file" {
         return format!("Read {}", single_line_preview(target, 76));
@@ -176,6 +170,16 @@ pub(super) fn tool_argument_details(
     if let Some(fields) = arguments.as_object() {
         for (key, value) in fields {
             if matches!(key.as_str(), "uri" | "body") {
+                continue;
+            }
+            if key == "patch"
+                && let Some(patch) = value.as_str()
+            {
+                lines.extend(
+                    patch_targets(patch)
+                        .into_iter()
+                        .map(|file| (format!("  {file}"), MUTED)),
+                );
                 continue;
             }
             lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));

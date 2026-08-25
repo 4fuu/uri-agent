@@ -1,8 +1,9 @@
 mod agents;
 mod apply_patch;
-mod bin_hints;
 mod file;
+mod grep;
 mod https;
+pub(crate) mod model_tools;
 mod replace;
 mod sessions;
 mod shell;
@@ -84,13 +85,14 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
 
 pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
+    plugins.add(model_tools::ProtocolToolsPlugin);
     plugins.add(agents::AgentsPlugin::new(cwd));
-    plugins.add(bin_hints::BinHintsPlugin);
     plugins.add(uri_agent_docs::UriAgentDocsProtocol);
     plugins.add(file::FileProtocol::new(cwd));
+    plugins.add(grep::GrepProtocol::new(cwd));
     plugins.add(https::HttpsProtocol::new());
-    plugins.add(replace::ReplaceProtocol::new(cwd));
-    plugins.add(apply_patch::ApplyPatchProtocol::new(cwd));
+    plugins.add(replace::ReplaceTool::new(cwd));
+    plugins.add(apply_patch::ApplyPatchTool::new(cwd));
     plugins.add(sessions::SessionsPlugin::new(cwd));
     plugins.add(tasks::TasksProtocol);
     shell::add_plugins(&mut plugins, cwd);
@@ -149,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_distribution_declares_document_file_web_and_edit_plugins() {
+    fn built_in_distribution_separates_protocols_from_direct_edit_tools() {
         let directory = tempfile::tempdir().unwrap();
         let plugins = plugins(directory.path());
         let names = plugins
@@ -161,10 +163,18 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "uri-agent-docs"));
         assert!(names.iter().any(|name| name == "file"));
+        assert!(names.iter().any(|name| name == "grep"));
         assert!(names.iter().any(|name| name == "https"));
-        assert!(names.iter().any(|name| name == "replace"));
-        assert!(names.iter().any(|name| name == "apply_patch"));
         assert!(names.iter().any(|name| name == "tasks"));
-        assert!(!names.iter().any(|name| name == "edit"));
+        assert!(!names.iter().any(|name| name == "replace"));
+        assert!(!names.iter().any(|name| name == "apply_patch"));
+
+        let model_tools = plugins
+            .model_tool_descriptors()
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        assert_eq!(model_tools, ["apply_patch", "exec", "read", "replace"]);
     }
 }
