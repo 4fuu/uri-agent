@@ -41,7 +41,7 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 
 Click to place the caret, or drag across the draft to select editable text. `Ctrl+C`, `Ctrl+Shift+C`, `Cmd+C`, or right-click copies the selected draft through OSC52.
 The terminal cursor is placed at the text caret so IME candidate windows can follow the active insertion point. Opening the composer pauses interface animation unless its completion popup is open.
-Long logical lines soft-wrap at the visible composer edge; only the newline shortcuts above insert a newline into the submitted text.
+Long logical lines soft-wrap at the visible composer edge. `Enter` sends; the newline shortcuts above insert a newline. A multi-line paste, including one that a terminal reports as ordinary key presses, is inserted as draft text and does not send.
 
 Type `@` at the start of a token to list project files and insert an `@file://<path>` reference. Type `@@` to list saved sessions from the current project and insert a stable `@@<session-id>` reference. `Up` and `Down` select an open candidate, `Tab` or `Enter` inserts it, `Esc` closes the candidates without closing the composer, and mouse selection is supported. File and session matching run through linked completion providers; the composer only handles generic replacement ranges and candidates.
 

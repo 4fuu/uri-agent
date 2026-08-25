@@ -44,7 +44,7 @@ User prompts, assistant responses, blank conversation space (including the virtu
 
 ## Image attachments
 
-Normal paste inserts text and opens the composer when used from the conversation. When the terminal forwards `Ctrl+V`, URI Agent reads the clipboard, preferring an image and falling back to text. Because some terminals consume `Ctrl+V`, `Alt+V` is the reliable image shortcut. Submission waits for the background clipboard read to finish.
+Normal paste inserts text and opens the composer when used from the conversation. Multi-line paste stays in the draft and does not send, even when the terminal cannot report a paste event and delivers the text as ordinary key presses. When the terminal forwards `Ctrl+V`, URI Agent reads the clipboard, preferring an image and falling back to text. Because some terminals consume `Ctrl+V`, `Alt+V` is the reliable image shortcut. Submission waits for the background clipboard read to finish.
 
 Each image appears in the composer as an atomic `[Image #N WxH]` chip, using pixel dimensions from the PNG header when they are available. Cursor movement crosses the whole chip; adjacent `Backspace` or `Delete`, or a selection touching it, removes both chip and attachment. On submission, active chips keep the same numbers and dimensions in the sent message. Unsent image bytes are process-local and are discarded on exit or session switch; stale chips and markers are removed from restored drafts.
 

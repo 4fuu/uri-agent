@@ -1961,6 +1961,143 @@ fn smart_clipboard_result_inserts_text_or_an_image_into_the_composer() {
 }
 
 #[test]
+fn multiline_paste_inserts_newlines_without_sending() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Composer);
+    handle_paste(&mut app, "first\r\nsecond\rthird".to_string());
+    assert!(app.overlay == Some(Overlay::Composer));
+    assert_eq!(app.draft_text(), "first\nsecond\nthird");
+    assert!(!app.busy);
+
+    let mut from_main = test_app();
+    handle_paste(&mut from_main, "alpha\nbeta\n".to_string());
+    assert!(from_main.overlay == Some(Overlay::Composer));
+    assert_eq!(from_main.draft_text(), "alpha\nbeta\n");
+    assert!(from_main.submit().is_some());
+
+    let mut clipboard = test_app();
+    clipboard.overlay = Some(Overlay::Composer);
+    clipboard.clipboard_image_loading = true;
+    assert!(
+        clipboard.finish_clipboard_read(Ok(clipboard::ClipboardContent::Text(
+            "one\r\ntwo".to_string()
+        )))
+    );
+    assert_eq!(clipboard.draft_text(), "one\ntwo");
+    assert!(clipboard.overlay == Some(Overlay::Composer));
+}
+
+#[test]
+fn unbracketed_paste_keys_are_not_treated_as_submit() {
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let typed = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+    assert_eq!(
+        pasted_text_from_keys(&[typed('h'), typed('i'), enter]),
+        None
+    );
+    assert_eq!(
+        pasted_text_from_keys(&[typed('y'), typed('e'), typed('s'), enter]),
+        None
+    );
+    assert_eq!(pasted_text_from_keys(&[enter]), None);
+    assert_eq!(pasted_text_from_keys(&[enter, enter]), None);
+    assert_eq!(
+        pasted_text_from_keys(&[typed('h'), typed('e'), typed('l'), typed('l'), typed('o')]),
+        None
+    );
+    assert_eq!(
+        pasted_text_from_keys(&[
+            typed('h'),
+            typed('e'),
+            typed('l'),
+            typed('l'),
+            typed('o'),
+            enter,
+            typed('w'),
+            typed('o'),
+            typed('r'),
+            typed('l'),
+            typed('d'),
+        ]),
+        Some("hello\nworld".to_string())
+    );
+    assert_eq!(
+        pasted_text_from_keys(&[
+            typed('l'),
+            typed('i'),
+            typed('n'),
+            typed('e'),
+            typed(' '),
+            typed('o'),
+            typed('n'),
+            typed('e'),
+            enter,
+        ]),
+        Some("line one\n".to_string())
+    );
+    assert_eq!(
+        pasted_text_from_keys(&[
+            typed('a'),
+            KeyEvent::new(KeyCode::Char('\r'), KeyModifiers::NONE),
+            typed('b')
+        ]),
+        Some("a\nb".to_string())
+    );
+}
+
+#[test]
+fn paste_burst_skips_windows_key_releases_and_keeps_following_events() {
+    let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let release = |code| KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release);
+
+    // Windows consoles deliver a release for every pasted key; the burst must
+    // survive them so the multi-line text is still recognized as a paste.
+    let (keys, rest) = split_paste_burst(
+        press(KeyCode::Char('a')),
+        vec![
+            Event::Key(release(KeyCode::Char('a'))),
+            Event::Key(press(KeyCode::Enter)),
+            Event::Key(release(KeyCode::Enter)),
+            Event::Key(press(KeyCode::Char('b'))),
+        ],
+    );
+    assert_eq!(
+        keys.iter().map(|key| key.code).collect::<Vec<_>>(),
+        vec![KeyCode::Char('a'), KeyCode::Enter, KeyCode::Char('b')]
+    );
+    assert!(rest.is_empty());
+    assert_eq!(pasted_text_from_keys(&keys), Some("a\nb".to_string()));
+
+    // A lone key followed by its release stays ordinary typing, not a paste.
+    let (keys, rest) = split_paste_burst(
+        press(KeyCode::Char('a')),
+        vec![Event::Key(release(KeyCode::Char('a')))],
+    );
+    assert_eq!(keys.len(), 1);
+    assert!(rest.is_empty());
+    assert_eq!(pasted_text_from_keys(&keys), None);
+
+    // The first non-textual event ends the burst and keeps its order.
+    let (keys, rest) = split_paste_burst(
+        press(KeyCode::Char('a')),
+        vec![
+            Event::Key(press(KeyCode::Esc)),
+            Event::Key(press(KeyCode::Char('b'))),
+        ],
+    );
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        rest.iter()
+            .filter_map(|event| match event {
+                Event::Key(key) => Some(key.code),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![KeyCode::Esc, KeyCode::Char('b')]
+    );
+}
+
+#[test]
 fn clipboard_image_token_is_inserted_at_the_caret() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);

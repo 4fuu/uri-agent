@@ -40,7 +40,6 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use futures_util::StreamExt;
 use model_selector::{ModelSelector, context_label, model_label, reasoning};
 use portable_pty::CommandBuilder;
 use ratatui::buffer::CellWidth;
@@ -1149,7 +1148,13 @@ impl App {
 
     fn insert_composer_text(&mut self, text: impl AsRef<str>) -> bool {
         expand_composer_selection_to_image_tokens(&mut self.input, &self.composer_images);
-        let inserted = self.input.insert_str(text);
+        let text = text.as_ref();
+        let inserted = if text.contains('\r') {
+            self.input
+                .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"))
+        } else {
+            self.input.insert_str(text)
+        };
         self.sync_composer_chrome();
         inserted
     }

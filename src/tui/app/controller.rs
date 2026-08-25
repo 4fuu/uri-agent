@@ -1,4 +1,7 @@
 use super::*;
+use futures_util::{Stream, StreamExt};
+use std::pin::Pin;
+use std::task::Poll;
 
 pub struct TuiServices {
     pub runtime: Arc<AgentRuntime>,
@@ -160,7 +163,14 @@ pub(super) async fn run_loop(
             },
             event = terminal_events.next() => {
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
-                match event? {
+                let (events, paste) =
+                    collect_possible_paste(&mut terminal_events, event?, app.pty.is_none())
+                        .await?;
+                if let Some(text) = paste {
+                    apply_surface_paste(app, text, &background_tx);
+                }
+                for event in events {
+                match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let selection_active = app.selection.is_some()
                             || (app.overlay == Some(Overlay::Composer)
@@ -194,11 +204,7 @@ pub(super) async fn run_loop(
                                 app.set_flash(format!("Terminal paste failed: {error:#}"));
                             }
                         } else {
-                            app.skip_splash();
-                            handle_paste(app, text);
-                            if app.overlay == Some(Overlay::Composer) {
-                                start_completion_query(app, background_tx.clone());
-                            }
+                            apply_surface_paste(app, text, &background_tx);
                         }
                     }
                     Event::Mouse(mouse) => {
@@ -221,6 +227,7 @@ pub(super) async fn run_loop(
                         }
                     }
                     Event::FocusGained | Event::FocusLost | Event::Resize(_, _) | Event::Key(_) => {}
+                }
                 }
             }
             event = receiver.recv() => match event {
@@ -527,6 +534,131 @@ pub(super) async fn apply_action(
             Ok(None)
         }
     }
+}
+
+fn apply_surface_paste(
+    app: &mut App,
+    text: String,
+    background_tx: &mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    app.skip_splash();
+    handle_paste(app, text);
+    if app.overlay == Some(Overlay::Composer) {
+        start_completion_query(app, background_tx.clone());
+    }
+}
+
+async fn collect_possible_paste(
+    stream: &mut EventStream,
+    first: Event,
+    allow_burst: bool,
+) -> Result<(Vec<Event>, Option<String>)> {
+    let Event::Key(key) = first else {
+        return Ok((vec![first], None));
+    };
+    if !allow_burst || key.kind == KeyEventKind::Release || !is_textual_paste_key(key) {
+        return Ok((vec![Event::Key(key)], None));
+    }
+    let (keys, rest) = split_paste_burst(key, take_ready_events(stream).await?);
+    let paste = pasted_text_from_keys(&keys);
+    let mut events = if paste.is_some() {
+        Vec::new()
+    } else {
+        keys.into_iter().map(Event::Key).collect()
+    };
+    events.extend(rest);
+    Ok((events, paste))
+}
+
+/// Collects the events the terminal has already delivered without waiting for
+/// more to arrive.
+///
+/// The poll runs under the caller's waker. `EventStream` parks a single waker
+/// in its background reader thread, so polling it with a detached waker (such
+/// as `now_or_never`) leaves that thread waking a waker that can never resume
+/// this loop; the next key press then freezes the interface whenever no other
+/// select branch fires.
+async fn take_ready_events(stream: &mut EventStream) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    // Poll once and surface `Pending` as a value instead of awaiting it: the
+    // stream sees the loop's real waker, but an empty queue stops the drain
+    // immediately instead of suspending until the next key arrives.
+    while let Poll::Ready(event) =
+        std::future::poll_fn(|context| Poll::Ready(Pin::new(&mut *stream).poll_next(context))).await
+    {
+        match event {
+            Some(Ok(event)) => events.push(event),
+            Some(Err(error)) => return Err(error.into()),
+            None => break,
+        }
+    }
+    Ok(events)
+}
+
+/// Splits already-delivered events into the burst of textual keys following
+/// `first` and the events that no longer belong to the burst. Windows reports
+/// a release for every pasted key, so textual releases are skipped without
+/// ending the burst.
+pub(super) fn split_paste_burst(
+    first: KeyEvent,
+    events: Vec<Event>,
+) -> (Vec<KeyEvent>, Vec<Event>) {
+    let mut keys = vec![first];
+    let mut rest = Vec::new();
+    for event in events {
+        if rest.is_empty()
+            && let Event::Key(key) = event
+            && is_textual_paste_key(key)
+        {
+            if key.kind != KeyEventKind::Release {
+                keys.push(key);
+            }
+            continue;
+        }
+        rest.push(event);
+    }
+    (keys, rest)
+}
+
+fn is_textual_paste_key(key: KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+}
+
+pub(super) fn pasted_text_from_keys(keys: &[KeyEvent]) -> Option<String> {
+    if keys.len() < 2 {
+        return None;
+    }
+    let mut text = String::new();
+    let mut newlines = 0usize;
+    let mut has_non_enter = false;
+    for key in keys {
+        match key.code {
+            KeyCode::Char('\n' | '\r') | KeyCode::Enter => {
+                text.push('\n');
+                newlines += 1;
+            }
+            KeyCode::Char(character) => {
+                text.push(character);
+                has_non_enter = true;
+            }
+            KeyCode::Tab => {
+                text.push('\t');
+                has_non_enter = true;
+            }
+            _ => return None,
+        }
+    }
+    if newlines == 0 || !has_non_enter {
+        return None;
+    }
+    // A short typed reply plus Enter can sit in the same input burst while a
+    // frame is drawn. Keep that as a send; longer or mid-text newlines are paste.
+    if newlines == 1 && text.ends_with('\n') && text.chars().count() <= 4 {
+        return None;
+    }
+    Some(text)
 }
 
 pub(super) fn handle_paste(app: &mut App, text: String) {
