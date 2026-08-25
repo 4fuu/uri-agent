@@ -66,7 +66,7 @@ impl ToolCallLoopGuard {
             return None;
         }
 
-        let arguments = serde_json::to_string(&canonical_json(&call.function.arguments))
+        let arguments = serde_json::to_string(&canonical_tool_arguments(&call.function.arguments))
             .unwrap_or_else(|_| call.function.arguments.to_string());
         let signature = format!("{}:{arguments}", call.function.name);
         if self.last_signature.as_deref() == Some(&signature) {
@@ -1154,10 +1154,10 @@ impl AgentRuntime {
             .get("uri")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("{name} requires a uri string"))?;
-        let body = object.get("body");
+        let body = decode_tool_body(name, object.get("body"))?;
         match name {
-            "read" => self.protocols.read(uri, body).await,
-            "exec" => self.protocols.exec(uri, body).await,
+            "read" => self.protocols.read(uri, body.as_ref()).await,
+            "exec" => self.protocols.exec(uri, body.as_ref()).await,
             _ => bail!("unknown model tool: {name}"),
         }
     }
@@ -1184,6 +1184,32 @@ impl AgentRuntime {
     }
 }
 
+fn decode_tool_body(name: &str, body: Option<&Value>) -> Result<Option<Value>> {
+    let envelope = body
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("{name} requires a body envelope object"))?;
+    if envelope.len() != 2 || !envelope.contains_key("kind") || !envelope.contains_key("value") {
+        bail!("{name} body envelope must contain exactly `kind` and `value`");
+    }
+    let kind = envelope
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{name} body envelope requires a kind string"))?;
+    let value = envelope
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{name} body envelope requires a value string"))?;
+    match kind {
+        "none" if value.is_empty() => Ok(None),
+        "none" => bail!("{name} body kind `none` requires an empty value"),
+        "text" => Ok(Some(Value::String(value.to_string()))),
+        "json" => Ok(Some(serde_json::from_str(value).with_context(|| {
+            format!("{name} body kind `json` requires valid JSON")
+        })?)),
+        kind => bail!("{name} body envelope has unknown kind `{kind}`"),
+    }
+}
+
 fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Object(fields) => {
@@ -1198,6 +1224,30 @@ fn canonical_json(value: &Value) -> Value {
         Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
         _ => value.clone(),
     }
+}
+
+fn canonical_tool_arguments(value: &Value) -> Value {
+    let mut canonical = canonical_json(value);
+    let Some(body) = canonical.get_mut("body").and_then(Value::as_object_mut) else {
+        return canonical;
+    };
+    if body.get("kind").and_then(Value::as_str) != Some("json") {
+        return canonical;
+    }
+    let Some(value) = body.get_mut("value") else {
+        return canonical;
+    };
+    let Some(decoded) = value
+        .as_str()
+        .and_then(|value| serde_json::from_str(value).ok())
+    else {
+        return canonical;
+    };
+    *value = Value::String(
+        serde_json::to_string(&canonical_json(&decoded))
+            .expect("canonical JSON values always serialize"),
+    );
+    canonical
 }
 
 fn is_loop_guard_exempt(call: &ToolCall) -> bool {
@@ -1666,7 +1716,10 @@ mod tests {
                 ToolCallId::new(id).unwrap(),
                 ToolFunction::new(
                     "read".to_string(),
-                    serde_json::json!({"uri": "missing://help"}),
+                    serde_json::json!({
+                        "uri": "missing://help",
+                        "body": {"kind": "none", "value": ""}
+                    }),
                 ),
             ))],
             usage: None,
@@ -1687,7 +1740,13 @@ mod tests {
     fn read_call(id: &str, uri: &str) -> ToolCall {
         ToolCall::new(
             ToolCallId::new(id).unwrap(),
-            ToolFunction::new("read".to_string(), serde_json::json!({"uri": uri})),
+            ToolFunction::new(
+                "read".to_string(),
+                serde_json::json!({
+                    "uri": uri,
+                    "body": {"kind": "none", "value": ""}
+                }),
+            ),
         )
     }
 
@@ -1750,9 +1809,13 @@ mod tests {
         let mut guard = ToolCallLoopGuard::default();
         for index in 0..5 {
             let arguments = if index % 2 == 0 {
-                serde_json::from_str(r#"{"uri":"file://same","body":{"b":2,"a":1}}"#)
+                serde_json::from_str(
+                    r#"{"uri":"file://same","body":{"kind":"json","value":"{\"b\":2,\"a\":1}"}}"#,
+                )
             } else {
-                serde_json::from_str(r#"{"body":{"a":1,"b":2},"uri":"file://same"}"#)
+                serde_json::from_str(
+                    r#"{"body":{"value":"{\"a\":1,\"b\":2}","kind":"json"},"uri":"file://same"}"#,
+                )
             }
             .unwrap();
             let call = ToolCall::new(
@@ -2171,10 +2234,80 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_body_values_are_not_reencoded_by_argument_parsing() {
-        let value = serde_json::json!({"uri": "mock://target", "body": [1, {"raw": true}, null]});
-        let body = value.as_object().unwrap().get("body").unwrap();
-        assert_eq!(body, &serde_json::json!([1, {"raw": true}, null]));
+    fn tool_body_envelope_decodes_absent_text_and_arbitrary_json_bodies() {
+        assert_eq!(
+            decode_tool_body(
+                "read",
+                Some(&serde_json::json!({"kind": "none", "value": ""}))
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            decode_tool_body(
+                "exec",
+                Some(&serde_json::json!({"kind": "text", "value": "cargo test"}))
+            )
+            .unwrap(),
+            Some(Value::String("cargo test".to_string()))
+        );
+        assert_eq!(
+            decode_tool_body(
+                "read",
+                Some(&serde_json::json!({
+                    "kind": "json",
+                    "value": "[1,{\"raw\":true},null]"
+                }))
+            )
+            .unwrap(),
+            Some(serde_json::json!([1, {"raw": true}, null]))
+        );
+        assert_eq!(
+            decode_tool_body(
+                "read",
+                Some(&serde_json::json!({"kind": "json", "value": "42"}))
+            )
+            .unwrap(),
+            Some(serde_json::json!(42))
+        );
+        assert_eq!(
+            decode_tool_body(
+                "read",
+                Some(&serde_json::json!({"kind": "json", "value": "null"}))
+            )
+            .unwrap(),
+            Some(Value::Null)
+        );
+    }
+
+    #[test]
+    fn invalid_tool_body_envelopes_fail_before_protocol_dispatch() {
+        for (body, expected) in [
+            (None, "requires a body envelope object"),
+            (
+                Some(serde_json::json!({
+                    "kind": "none",
+                    "value": "",
+                    "extra": true
+                })),
+                "must contain exactly `kind` and `value`",
+            ),
+            (
+                Some(serde_json::json!({"kind": "none", "value": "not empty"})),
+                "kind `none` requires an empty value",
+            ),
+            (
+                Some(serde_json::json!({"kind": "json", "value": "{"})),
+                "kind `json` requires valid JSON",
+            ),
+            (
+                Some(serde_json::json!({"kind": "other", "value": ""})),
+                "unknown kind `other`",
+            ),
+        ] {
+            let error = decode_tool_body("read", body.as_ref()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]
@@ -2183,7 +2316,10 @@ mod tests {
             ToolCallId::new("call-1").unwrap(),
             ToolFunction::new(
                 "read".to_string(),
-                serde_json::json!({"uri": "file://help"}),
+                serde_json::json!({
+                    "uri": "file://help",
+                    "body": {"kind": "none", "value": ""}
+                }),
             ),
         );
         assert_eq!(call.id.as_str(), "call-1");
@@ -2547,7 +2683,10 @@ mod tests {
             ToolCallId::new("read-help").unwrap(),
             ToolFunction::new(
                 "read".to_string(),
-                serde_json::json!({"uri": "file://help"}),
+                serde_json::json!({
+                    "uri": "file://help",
+                    "body": {"kind": "none", "value": ""}
+                }),
             ),
         );
         let backend = Arc::new(FakeBackend {

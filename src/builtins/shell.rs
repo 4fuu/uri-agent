@@ -24,10 +24,10 @@ const BASH_HELP: &str = r#"# bash
 
 Run Bash commands as managed asynchronous tasks.
 
-Call `exec` with `bash://run` and pass the command string directly as the body:
+Call `exec` with `bash://run` and encode the command as a text body:
 
 ```text
-exec("bash://run", "cargo test")
+exec("bash://run", {"kind":"text","value":"cargo test"})
 ```
 
 Add `?wait=<seconds>` to wait for an integer number of seconds from 0 through
@@ -35,8 +35,14 @@ Add `?wait=<seconds>` to wait for an integer number of seconds from 0 through
 keeps running and the result contains its task URI.
 
 Read `bash://tasks/<id>` for status and bounded output, using the task ID
-returned by `exec`. If that output exceeds the system limit, the result includes
-a `file://` address containing the full output.
+returned by `exec`:
+
+```text
+read("bash://tasks/<id>", {"kind":"none","value":""})
+```
+
+If that output exceeds the system limit, the result includes a `file://`
+address containing the full output.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -55,10 +61,10 @@ Prefer modern cross-platform tools such as `rg` and `fd` when available.
 PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
-Call `exec` with `pwsh://run` and pass the command string directly as the body:
+Call `exec` with `pwsh://run` and encode the command as a text body:
 
 ```text
-exec("pwsh://run", "Get-ChildItem -Path . -Force")
+exec("pwsh://run", {"kind":"text","value":"Get-ChildItem -Path . -Force"})
 ```
 
 Commands already run as managed tasks. Do not create another background layer
@@ -72,8 +78,14 @@ PowerShell source and plain-text output use UTF-8. Task success follows the
 final PowerShell or native command, and native exit codes are preserved.
 
 Read `pwsh://tasks/<id>` for status and bounded output, using the task ID
-returned by `exec`. If that output exceeds the system limit, the result includes
-a `file://` address containing the full output.
+returned by `exec`:
+
+```text
+read("pwsh://tasks/<id>", {"kind":"none","value":""})
+```
+
+If that output exceeds the system limit, the result includes a `file://`
+address containing the full output.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.

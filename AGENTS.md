@@ -7,10 +7,12 @@ Guidance for coding agents working anywhere in this repository. This file is the
 URI Agent is a Rust terminal coding agent with a fixed model-facing interface:
 
 ```text
-read(uri, body?)
-exec(uri, body?)
+read(uri, body: {kind, value})
+exec(uri, body: {kind, value})
 ```
 
+The required body envelope uses `kind` `none`, `text`, or `json` and a string
+`value`; URI Agent decodes it to the protocol's optional arbitrary JSON body.
 Capabilities are registered as protocols and publish their operational instructions at `<protocol>://help`. Preserve this design: do not add another model-facing tool or place every capability in the initial system prompt.
 
 ## Read before changing

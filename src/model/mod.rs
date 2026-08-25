@@ -97,10 +97,24 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "description": "Protocol address in the custom form <protocol>://<opaque-target>. It is not an RFC URL and is passed to the selected protocol unchanged."
             },
             "body": {
-                "description": "Optional protocol-specific payload. It may be any JSON value and is passed to the selected protocol unchanged."
+                "type": "object",
+                "description": "Required envelope for the protocol-specific body. Use kind `none` with an empty value when the protocol takes no body, `text` for a literal string body, or `json` with the complete JSON serialization of any JSON body.",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["none", "text", "json"],
+                        "description": "How URI Agent decodes value before protocol dispatch."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Empty for `none`, literal protocol text for `text`, or complete serialized JSON for `json`."
+                    }
+                },
+                "required": ["kind", "value"],
+                "additionalProperties": false
             }
         },
-        "required": ["uri"],
+        "required": ["uri", "body"],
         "additionalProperties": false
     });
     vec![

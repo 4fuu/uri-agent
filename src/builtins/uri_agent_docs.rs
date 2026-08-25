@@ -31,7 +31,7 @@ The documents are available regardless of the startup working directory.
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
 - Targets are exact, case-sensitive filenames and do not accept paths or query parameters.
-- The optional body is ignored. This protocol does not support `exec`.
+- Use the `none` body envelope. This protocol does not support `exec`.
 
 Available documents:
 "#,

@@ -9,23 +9,32 @@ For the exact runtime syntax of a protocol, read `<protocol>://help`. Those help
 The model receives exactly two tool definitions:
 
 ```text
-read(uri: string, body?: any)
-exec(uri: string, body?: any)
+read(uri: string, body: BodyEnvelope)
+exec(uri: string, body: BodyEnvelope)
 ```
+
+`BodyEnvelope` is always present and has the concrete shape
+`{"kind":"none|text|json","value":"..."}`. Use `none` with an empty value when
+the protocol takes no body, `text` for a literal string body, and `json` with
+the complete JSON serialization of any JSON body. URI Agent decodes this
+model-facing envelope before protocol dispatch, so protocols and plugins still
+receive an optional arbitrary JSON value.
 
 `read` is used for resources, help, task snapshots, and completed output. `exec` starts work through protocols that support execution. A protocol may implement `read`, `exec`, or both.
 
-The [protocol registry](../src/protocol.rs) applies four routing rules:
+Model dispatch and the [protocol registry](../src/protocol.rs) apply four routing rules:
 
-1. Split an address only at the first `://`.
-2. Use the part before that delimiter as the registered protocol name.
-3. Pass the entire remainder to the protocol as an opaque target. The registry does not URL-decode, normalize, or parse options from it.
-4. Accept any JSON value as the optional `body` and pass it to the selected protocol unchanged.
+1. Decode the required model-facing body envelope before entering the registry.
+2. Split an address only at the first `://` and use the part before that
+   delimiter as the registered protocol name.
+3. Pass the entire remainder to the protocol as an opaque target. The registry
+   does not URL-decode, normalize, or parse options from it.
+4. Pass the decoded optional JSON body to the selected protocol unchanged.
 
 For example, the target received by `capture` here is exactly `a://b?not=a url`:
 
 ```text
-read("capture://a://b?not=a url")
+read("capture://a://b?not=a url", {"kind":"none","value":""})
 ```
 
 Protocols own their target syntax. `file` interprets `?offset`, `?limit`, and
@@ -62,7 +71,7 @@ they remain readable from any startup working directory and match the running
 URI Agent version. Start with the embedded documentation index:
 
 ```text
-read("uri-agent-docs://README.md")
+read("uri-agent-docs://README.md", {"kind":"none","value":""})
 ```
 
 Other targets are the exact, case-sensitive filenames linked by that index,
@@ -75,13 +84,13 @@ supported.
 Relative paths resolve from the canonical startup working directory; absolute paths remain absolute. Reading a directory returns a sorted, bounded listing. Text reads accept a one-based line range:
 
 ```text
-read("file://src/main.rs?offset=1&limit=200")
+read("file://src/main.rs?offset=1&limit=200", {"kind":"none","value":""})
 ```
 
 File content is returned without line numbers by default. Add `line_numbers=true` when one-based line prefixes are useful:
 
 ```text
-read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
+read("file://src/main.rs?offset=1&limit=200&line_numbers=true", {"kind":"none","value":""})
 ```
 
 `file://help` reports the accepted range options, active limits, and current working directory.
@@ -91,16 +100,16 @@ read("file://src/main.rs?offset=1&limit=200&line_numbers=true")
 The read-only `sessions` protocol discovers and searches saved URI Agent sessions. Discovery is scoped to the current project by default; `scope: "all"` searches every project, and an optional `cwd` narrows that cross-project scope:
 
 ```text
-read("sessions://recent")
-read("sessions://search", {"query":"refresh token"})
-read("sessions://search", {"query":"billing migration","scope":"all"})
+read("sessions://recent", {"kind":"none","value":""})
+read("sessions://search", {"kind":"json","value":"{\"query\":\"refresh token\"}"})
+read("sessions://search", {"kind":"json","value":"{\"query\":\"billing migration\",\"scope\":\"all\"}"})
 ```
 
 Read an exact session ID to retrieve its newest visible records. Use the returned `before` cursor to page backward, and request `include_tools` only when tool evidence is needed:
 
 ```text
-read("sessions://<session-id>")
-read("sessions://<session-id>", {"include_tools":true,"limit":20})
+read("sessions://<session-id>", {"kind":"none","value":""})
+read("sessions://<session-id>", {"kind":"json","value":"{\"include_tools\":true,\"limit\":20}"})
 ```
 
 User, assistant, and terminal error text is returned by default. Thinking, usage, model replay payloads, compaction summaries, and TUI metadata are always excluded; tool calls and results are excluded unless requested. Results are bounded and marked as untrusted reference data. Archive access opens the SQLite database read-only and does not initialize, migrate, resume, append, rename, or delete sessions. Read `sessions://help` for the body fields and limits.
@@ -113,7 +122,7 @@ provider in stable order (Parallel, then Exa) and try the next configured
 provider after an API failure:
 
 ```text
-read("https://www.rust-lang.org/")
+read("https://www.rust-lang.org/", {"kind":"none","value":""})
 ```
 
 Its reserved search route accepts the nonempty search query as a string body.
@@ -121,7 +130,7 @@ The URI accepts an optional result limit from 1 through 20, an optional
 provider (`parallel` or `exa`), and provider-specific options:
 
 ```text
-read("https://search?limit=10&provider=parallel", "stable Rust release notes")
+read("https://search?limit=10&provider=parallel", {"kind":"text","value":"stable Rust release notes"})
 ```
 
 Without `provider`, search tries configured providers in stable order:
@@ -147,7 +156,7 @@ requests time out after 30 seconds, and response bodies are limited to 5 MiB.
 ```text
 exec(
   "replace://src/config.rs",
-  {"old_text":"one unique match","new_text":"replacement"}
+  {"kind":"json","value":"{\"old_text\":\"one unique match\",\"new_text\":\"replacement\"}"}
 )
 ```
 
@@ -158,7 +167,7 @@ exec(
 `apply_patch` accepts a patch string and returns the final summary after applying it:
 
 ```text
-exec("apply_patch://apply", "*** Begin Patch\n...\n*** End Patch")
+exec("apply_patch://apply", {"kind":"text","value":"*** Begin Patch\n...\n*** End Patch"})
 ```
 
 It supports adding, deleting, updating, and moving files. Writes are atomic per file and operations run in patch order, but the whole patch is not transactional: failure in a later operation does not undo earlier successful operations. Read `apply_patch://help` for the complete file-operation and hunk grammar.
@@ -168,8 +177,8 @@ It supports adding, deleting, updating, and moving files. Writes are atomic per 
 Shell bodies must be command strings:
 
 ```text
-exec("bash://run", "cargo test")
-exec("pwsh://run", "cargo test")
+exec("bash://run", {"kind":"text","value":"cargo test"})
+exec("pwsh://run", {"kind":"text","value":"cargo test"})
 ```
 
 Commands run from the startup working directory. Bash starts without profile or rc files; PowerShell starts without a profile and reads the script from standard input.
@@ -183,9 +192,9 @@ PowerShell source and plain-text output use UTF-8. Its task status follows the f
 Protocol execution returns its final result directly by default. Necessary long-running operations may instead become managed tasks. The built-in shell protocols use managed tasks because command duration is unbounded:
 
 ```text
-exec("bash://run", "cargo test")
+exec("bash://run", {"kind":"text","value":"cargo test"})
 → Task accepted: <id>
-→ Read status: bash://tasks/<id>
+→ Read status: read("bash://tasks/<id>", {"kind":"none","value":""})
 ```
 
 Acceptance is not success. Read the returned route to observe `pending`, `running`, `completed`, `failed`, or `cancelled` status and the eventual content. Task IDs increase within their in-process manager as lowercase hexadecimal values: they start at `001`, remain at least three digits wide, and expand after `fff`. Protocols expose task lists and individual tasks through their own read routes; the shared task manager does not create a generic model-facing task protocol.
@@ -193,7 +202,7 @@ Acceptance is not success. Read the returned route to observe `pending`, `runnin
 Shell protocols offer a bounded wait when the immediate result is useful:
 
 ```text
-exec("bash://?wait=30", "cargo test")
+exec("bash://?wait=30", {"kind":"text","value":"cargo test"})
 ```
 
 If the wait window expires, the task keeps running and the response still includes its task URI. `?wait=N` belongs to `bash` and `pwsh`; it is not a registry option. Read the active shell protocol's help for the accepted range.

@@ -689,7 +689,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
                 "id": "fc_1",
                 "call_id": "call_1",
                 "name": "read",
-                "arguments": "{\"uri\":\"file://README.md\"}",
+                "arguments": "{\"uri\":\"file://README.md\",\"body\":{\"kind\":\"none\",\"value\":\"\"}}",
                 "status": "completed"
             }
         ],
@@ -739,7 +739,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
             "item_id": "fc_1",
             "output_index": 2,
             "sequence_number": 5,
-            "delta": "{\"uri\":\"file://README.md\"}"
+            "delta": "{\"uri\":\"file://README.md\",\"body\":{\"kind\":\"none\",\"value\":\"\"}}"
         }),
         json!({
             "type": "response.output_item.done",
@@ -751,7 +751,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
                 "id": "fc_1",
                 "call_id": "call_1",
                 "name": "read",
-                "arguments": "{\"uri\":\"file://README.md\"}",
+                "arguments": "{\"uri\":\"file://README.md\",\"body\":{\"kind\":\"none\",\"value\":\"\"}}",
                 "status": "completed"
             }
         }),
@@ -843,8 +843,11 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
     );
     assert!(response.content.iter().any(|content| {
         matches!(content, AssistantContent::ToolCall(call)
-                if call.function.name == "read"
-                    && call.function.arguments == json!({"uri": "file://README.md"}))
+        if call.function.name == "read"
+            && call.function.arguments == json!({
+                "uri": "file://README.md",
+                "body": {"kind": "none", "value": ""}
+            }))
     }));
     let usage = response.usage.unwrap();
     assert_eq!(usage.input_tokens, 8);
@@ -1100,7 +1103,7 @@ fn retry_after_accepts_seconds_and_http_dates() {
 }
 
 #[test]
-fn model_only_sees_two_tools_and_body_is_unconstrained() {
+fn model_only_sees_two_tools_with_a_required_typed_body_envelope() {
     let tools = tool_definitions();
     assert_eq!(
         tools
@@ -1119,11 +1122,18 @@ fn model_only_sees_two_tools_and_body_is_unconstrained() {
             .description
             .contains("return their final result directly")
     );
-    assert!(
-        tools[0].parameters["properties"]["body"]
-            .get("type")
-            .is_none()
-    );
+    for tool in tools {
+        assert_eq!(tool.parameters["required"], json!(["uri", "body"]));
+        let body = &tool.parameters["properties"]["body"];
+        assert_eq!(body["type"], "object");
+        assert_eq!(body["required"], json!(["kind", "value"]));
+        assert_eq!(
+            body["properties"]["kind"]["enum"],
+            json!(["none", "text", "json"])
+        );
+        assert_eq!(body["properties"]["value"]["type"], "string");
+        assert_eq!(body["additionalProperties"], false);
+    }
 }
 
 #[test]

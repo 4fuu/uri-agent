@@ -43,10 +43,10 @@ Current project: `{}`
 Examples:
 
 ```text
-read("sessions://recent")
-read("sessions://search", {{"query":"refresh token"}})
-read("sessions://<session-id>")
-read("sessions://<session-id>", {{"include_tools":true,"limit":20}})
+read("sessions://recent", {{"kind":"none","value":""}})
+read("sessions://search", {{"kind":"json","value":"{{\"query\":\"refresh token\"}}"}})
+read("sessions://<session-id>", {{"kind":"none","value":""}})
+read("sessions://<session-id>", {{"kind":"json","value":"{{\"include_tools\":true,\"limit\":20}}"}})
 ```
 
 Results are bounded and include continuation values when more data exists.
@@ -309,7 +309,8 @@ fn format_recent_sessions(
         }
         let _ = writeln!(
             output,
-            "\nMore sessions are available. Continue with: read(\"sessions://recent\", {body})"
+            "\nMore sessions are available. Continue with: read(\"sessions://recent\", {})",
+            json!({"kind": "json", "value": body.to_string()})
         );
     }
     Ok(output)
@@ -356,7 +357,8 @@ fn format_search_results(
         }
         let _ = writeln!(
             output,
-            "\nMore matches are available. Continue with: read(\"sessions://search\", {body})"
+            "\nMore matches are available. Continue with: read(\"sessions://search\", {})",
+            json!({"kind": "json", "value": body.to_string()})
         );
     }
     Ok(output)
@@ -487,8 +489,9 @@ async fn read_session(
         });
         let _ = writeln!(
             output,
-            "\nEarlier records are available. Continue with: read(\"sessions://{}\", {body})",
-            session.summary.id
+            "\nEarlier records are available. Continue with: read(\"sessions://{}\", {})",
+            session.summary.id,
+            json!({"kind": "json", "value": body.to_string()})
         );
     }
     Ok(output)

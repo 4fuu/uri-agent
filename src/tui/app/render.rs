@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 pub(super) fn block_document(block: &DisplayBlock) -> String {
     block_document_with_level(block, 1)
@@ -23,6 +24,36 @@ pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
     (separator > 0).then(|| uri[..separator].to_string())
 }
 
+fn tool_body_text(arguments: &serde_json::Value) -> Option<&str> {
+    let body = arguments.get("body")?;
+    if let Some(value) = body.as_str() {
+        return Some(value);
+    }
+    let envelope = body.as_object()?;
+    (envelope.get("kind").and_then(serde_json::Value::as_str) == Some("text"))
+        .then(|| envelope.get("value").and_then(serde_json::Value::as_str))?
+}
+
+fn tool_body(arguments: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
+    let body = arguments.get("body")?;
+    let Some(envelope) = body.as_object() else {
+        return Some(Cow::Borrowed(body));
+    };
+    let kind = envelope.get("kind").and_then(serde_json::Value::as_str);
+    let value = envelope.get("value").and_then(serde_json::Value::as_str);
+    match (kind, value) {
+        (Some("none"), Some("")) => None,
+        (Some("text"), Some(value)) => {
+            Some(Cow::Owned(serde_json::Value::String(value.to_string())))
+        }
+        (Some("json"), Some(value)) => serde_json::from_str(value)
+            .ok()
+            .map(Cow::Owned)
+            .or(Some(Cow::Borrowed(body))),
+        _ => Some(Cow::Borrowed(body)),
+    }
+}
+
 pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     let action = match name {
         "read" => "Read",
@@ -35,7 +66,7 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
     if name == "exec"
         && matches!(protocol, "bash" | "pwsh")
-        && let Some(command) = arguments.get("body").and_then(serde_json::Value::as_str)
+        && let Some(command) = tool_body_text(arguments)
     {
         return format!(
             "$ {}",
@@ -43,9 +74,7 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
         );
     }
     if name == "exec" && protocol == "apply_patch" {
-        let files = arguments
-            .get("body")
-            .and_then(serde_json::Value::as_str)
+        let files = tool_body_text(arguments)
             .map(patch_targets)
             .unwrap_or_default();
         if let Some(first) = files.first() {
@@ -152,10 +181,10 @@ pub(super) fn tool_argument_details(
             lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
         }
     }
-    let Some(body) = arguments.get("body") else {
+    let Some(body) = tool_body(arguments) else {
         return;
     };
-    match body {
+    match body.as_ref() {
         serde_json::Value::String(value) => {
             let files = patch_targets(value);
             if !files.is_empty() {

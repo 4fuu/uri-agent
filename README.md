@@ -11,11 +11,16 @@
 URI Agent is a terminal coding agent where every model-facing capability for reading resources or performing actions is exposed as a URI protocol. Files, directories, edits, shells, web pages, session archives, documentation, Skills, and extensions share one address space behind exactly two tools:
 
 ```text
-read(uri: string, body?: any)
-exec(uri: string, body?: any)
+read(uri: string, body: BodyEnvelope)
+exec(uri: string, body: BodyEnvelope)
 ```
 
-URI Agent extends to every capability the same loading pattern other agents use for Skills: expose a compact name and description first, then load full instructions and resources only when selected. A new session therefore preloads only routing rules and one-line protocol descriptors; detailed contracts remain at `<protocol>://help`, Skill bodies and documentation remain behind their protocols, and oversized results remain behind `file://` addresses. This preserves aggressive on-demand and progressive context loading while the fixed `read` / `exec` contract keeps tool calls reliable and registered protocols provide extreme flexibility. The fixed startup baseline remains around 2.5 KB instead of paying the context cost of every capability up front.
+The required `BodyEnvelope` is `{"kind":"none|text|json","value":"..."}`.
+URI Agent decodes it into the optional protocol-specific JSON body before
+routing, keeping one concrete cross-provider schema without narrowing protocol
+payloads.
+
+URI Agent extends to every capability the same loading pattern other agents use for Skills: expose a compact name and description first, then load full instructions and resources only when selected. A new session therefore preloads only routing rules and one-line protocol descriptors; detailed contracts remain at `<protocol>://help`, Skill bodies and documentation remain behind their protocols, and oversized results remain behind `file://` addresses. This preserves aggressive on-demand and progressive context loading while the fixed `read` / `exec` contract keeps tool calls reliable and registered protocols provide extreme flexibility. The fixed startup baseline remains around 3.6 KB instead of paying the context cost of every capability up front.
 
 Adding a capability adds a protocol entry rather than another model-facing tool schema or preloaded manual. Long-running operations become managed tasks, and append-only session history is stored in SQLite.
 
@@ -24,19 +29,19 @@ Adding a capability adds a protocol entry rather than another model-facing tool 
 
 URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
 
-## A ~2.5 KB fixed startup baseline
+## A ~3.6 KB fixed startup baseline
 
 With the current source, the fixed startup baseline on Unix with Bash and eight built-in protocols is:
 
 | Component | Included content | UTF-8 size |
 | --- | --- | ---: |
-| System prompt | Routing rules and the built-in protocol index | 1,159 bytes (1.159 KB) |
-| `read` + `exec` definitions | Both compact internal tool schemas | 1,326 bytes (1.326 KB) |
-| **Total** | Fixed system prompt and tools | **2,485 bytes (2.485 KB)** |
+| System prompt | Routing rules and the built-in protocol index | 1,391 bytes (1.391 KB) |
+| `read` + `exec` definitions | Both compact internal tool schemas | 2,248 bytes (2.248 KB) |
+| **Total** | Fixed system prompt and tools | **3,639 bytes (3.639 KB)** |
 
 ```text
-~2.5 KB fixed baseline
-    → read("<protocol>://help")
+~3.6 KB fixed baseline
+    → read("<protocol>://help", {"kind":"none","value":""})
     → that protocol's contract
     → task-specific reads and executions
 ```

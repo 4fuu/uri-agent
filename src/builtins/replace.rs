@@ -12,10 +12,10 @@ const HELP: &str = r#"# replace
 
 Replace one exact text match and return the final result.
 
-Call `exec` with `replace://<path>` and this body:
+Call `exec` with `replace://<path>` and encode the replacement object as JSON:
 
-```json
-{"old_text":"<old text>","new_text":"<replacement>"}
+```text
+exec("replace://<path>", {"kind":"json","value":"{\"old_text\":\"<old text>\",\"new_text\":\"<replacement>\"}"})
 ```
 
 Replace `<path>` with the project-relative or absolute path of the file to edit,

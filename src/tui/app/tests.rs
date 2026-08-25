@@ -3926,16 +3926,29 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     assert_eq!(
         tool_title(
             "exec",
-            &serde_json::json!({"uri": "bash://run", "body": "cargo test\necho done"})
+            &serde_json::json!({
+                "uri": "bash://run",
+                "body": {"kind": "text", "value": "cargo test\necho done"}
+            })
         ),
         "$ cargo test"
     );
     assert_eq!(
         tool_title(
             "exec",
+            &serde_json::json!({"uri": "bash://run", "body": "legacy command"})
+        ),
+        "$ legacy command"
+    );
+    assert_eq!(
+        tool_title(
+            "exec",
             &serde_json::json!({
                 "uri": "apply_patch://run",
-                "body": "*** Begin Patch\n*** Update File: src/tui.rs\n*** Update File: Cargo.toml\n*** End Patch"
+                "body": {
+                    "kind": "text",
+                    "value": "*** Begin Patch\n*** Update File: src/tui.rs\n*** Update File: Cargo.toml\n*** End Patch"
+                }
             })
         ),
         "Patched src/tui.rs +1"
@@ -3943,7 +3956,12 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
 
     let mut lines = Vec::new();
     tool_argument_details(
-        &serde_json::json!({"body": {"path": "src/main.rs", "limit": 20}}),
+        &serde_json::json!({
+            "body": {
+                "kind": "json",
+                "value": "{\"path\":\"src/main.rs\",\"limit\":20}"
+            }
+        }),
         &mut lines,
     );
     let text = lines
@@ -3953,6 +3971,8 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
         .join("\n");
     assert!(text.contains("path: src/main.rs"));
     assert!(text.contains("limit: 20"));
+    assert!(!text.contains("kind:"));
+    assert!(!text.contains("value:"));
     assert!(!text.contains(['{', '}', '"']));
 }
 

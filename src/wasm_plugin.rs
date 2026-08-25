@@ -78,7 +78,7 @@ Last reload diagnostics: {diagnostics}
    then rename it to `<name>.wasm` in the same directory. The rename is the
    atomic enable step. Hidden files, nested files, and files that do not end in
    `.wasm` are ignored.
-5. Call `exec("wasm_plugin://reload")`. The call returns after reload builds a
+5. Call `exec("wasm_plugin://reload", {{"kind":"none","value":""}})`. The call returns after reload builds a
    complete replacement protocol set and swaps it into the running agent.
    Existing calls keep their old runtime until they finish. Invalid or
    conflicting modules are skipped and reported.
@@ -87,8 +87,10 @@ Last reload diagnostics: {diagnostics}
 To remove a plugin, delete its `.wasm` file and reload. To update one, atomically
 replace the file and reload.
 
-`wasm_plugin` exposes only `read("wasm_plugin://help")` and
-`exec("wasm_plugin://reload")`; reload accepts no body.
+`wasm_plugin` exposes only
+`read("wasm_plugin://help", {{"kind":"none","value":""}})` and
+`exec("wasm_plugin://reload", {{"kind":"none","value":""}})`; reload accepts
+no protocol body.
 
 ## Rust SDK
 
@@ -130,7 +132,8 @@ define_plugin!(manifest(), handle);
 ```
 
 Every declared protocol must set `can_read` to `true` and handle
-`read("<protocol>://help")`, documenting every supported address and body shape.
+`read("<protocol>://help", {{"kind":"none","value":""}})`, documenting every
+supported address and body shape.
 The SDK exports `uri_agent_manifest` and `uri_agent_handle`; plugin authors do
 not need to write ABI glue. `uri_agent_plugin_sdk::{{read, exec}}`
 let a plugin call URI Agent's built-in protocols using JSON bodies. Calls into

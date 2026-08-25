@@ -16,6 +16,7 @@ pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> Stri
     let mut prompt = String::from(
         "You are a general-purpose agent running in URI Agent with exactly two tools: read and exec.\n\
          Use read to retrieve information and exec to perform actions through registered protocols.\n\
+         Every tool call requires a body envelope. Use `{\"kind\":\"none\",\"value\":\"\"}` for no protocol body, `{\"kind\":\"text\",\"value\":\"...\"}` for a string body, or `{\"kind\":\"json\",\"value\":\"...\"}` with complete serialized JSON for any JSON body.\n\
          Angle-bracketed values in protocol addresses, such as <protocol>, are placeholders.\n\
          The same placeholder convention applies throughout protocol help.\n\
          Replace placeholders with the required values without including the angle brackets.\n\
@@ -41,7 +42,9 @@ pub fn system_prompt(protocols: &[ProtocolPrompt], fragments: &[String]) -> Stri
 }
 
 pub fn task_accepted(protocol: &str, id: &str) -> String {
-    format!("Task accepted: {id}\nRead status: {protocol}://tasks/{id}")
+    format!(
+        "Task accepted: {id}\nRead status: read(\"{protocol}://tasks/{id}\", {{\"kind\":\"none\",\"value\":\"\"}})"
+    )
 }
 
 pub fn task_snapshot(
@@ -85,6 +88,8 @@ mod tests {
         assert!(prompt.starts_with(
             "You are a general-purpose agent running in URI Agent with exactly two tools: read and exec."
         ));
+        assert!(prompt.contains("Every tool call requires a body envelope"));
+        assert!(prompt.contains(r#"{"kind":"none","value":""}"#));
         assert!(prompt.contains("same placeholder convention applies throughout protocol help"));
         assert!(prompt.contains("Before using a protocol for the first time"));
         assert!(prompt.contains("- file: Read files."));
@@ -104,6 +109,14 @@ mod tests {
         assert!(prompt.ends_with("\n<project_rule_md>rules</project_rule_md>\n"));
         assert!(
             prompt.find("- file: Read files.").unwrap() < prompt.find("<project_rule_md>").unwrap()
+        );
+    }
+
+    #[test]
+    fn task_acceptance_emits_a_complete_status_read() {
+        assert_eq!(
+            task_accepted("bash", "001"),
+            "Task accepted: 001\nRead status: read(\"bash://tasks/001\", {\"kind\":\"none\",\"value\":\"\"})"
         );
     }
 }

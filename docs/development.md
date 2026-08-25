@@ -83,7 +83,9 @@ URI Agent does not load native dynamic libraries. Third-party runtime protocols 
 ### Model-facing interface and protocols
 
 - The model sees exactly two tool definitions: `read` and `exec`.
-- Split protocol addresses only at the first `://`; pass the opaque remainder and optional JSON body to the selected protocol unchanged.
+- Split protocol addresses only at the first `://`; decode the required
+  model-facing body envelope, then pass the opaque remainder and optional JSON
+  body to the selected protocol unchanged.
 - Protocol names are unique. A protocol may implement `read`, `exec`, or both.
 - Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
 - Prefer extending `Protocol` over adding another model-facing concept or embedding every capability in the initial prompt.

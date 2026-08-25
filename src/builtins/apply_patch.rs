@@ -18,7 +18,12 @@ const HELP: &str = r#"# apply_patch
 
 Apply a Codex-style multi-file patch and return the final result.
 
-Call `exec` with `apply_patch://apply`. The body must be the patch string itself:
+Call `exec` with `apply_patch://apply` and encode the complete patch as a text
+body. The body value must use this patch format:
+
+```text
+exec("apply_patch://apply", {"kind":"text","value":"<complete patch>"})
+```
 
 ```text
 *** Begin Patch

@@ -36,7 +36,7 @@ Current working directory: `file://{}`
 - Reading a directory returns a bounded directory listing.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-The body is passed through but is not required by this built-in protocol.
+This built-in protocol takes no protocol body; use the `none` body envelope.
 "#,
         display_path(cwd)
     )

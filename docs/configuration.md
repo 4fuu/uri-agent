@@ -129,7 +129,7 @@ Older physical IDs remain runnable for saved sessions but are hidden from the se
 
 `compat.antigravityModel` remains a fallback for custom and legacy records that do not define `antigravityRoutes`.
 
-Requests use the private `v1internal:streamGenerateContent` SSE operation. URI Agent sends numeric `thinkingBudget` values, preserves and mirrors Gemini thought signatures across tool rounds, normalizes tool schemas and `toolConfig`, and adds stable missing Claude tool IDs. A 401 refreshes the OAuth token once; a project-header 403 retries once without that header. After these transport-specific repairs and endpoint fallbacks are exhausted, failures retain URI Agent's normal model retry classification and budget.
+Requests use the private `v1internal:streamGenerateContent` SSE operation. URI Agent sends numeric `thinkingBudget` values, preserves and mirrors Gemini thought signatures across tool rounds, normalizes tool schemas and `toolConfig`, and adds stable missing Claude tool IDs. The fixed model-facing body envelope uses only concrete object, enum, and string schema types, so normalization preserves it without changing protocol-body semantics. A 401 refreshes the OAuth token once; a project-header 403 retries once without that header. After these transport-specific repairs and endpoint fallbacks are exhausted, failures retain URI Agent's normal model retry classification and budget.
 
 URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 

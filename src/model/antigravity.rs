@@ -1312,7 +1312,15 @@ mod tests {
                     "$defs": {"Target": {"type": "integer", "minimum": 1}},
                     "properties": {
                         "uri": {"type": "string", "minLength": 1},
-                        "body": {"type": "", "description": "Any JSON value"},
+                        "body": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["none", "text", "json"]},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["kind", "value"],
+                            "additionalProperties": false
+                        },
                         "target": {"$ref": "#/$defs/Target"},
                         "optional": {"type": ["string", "null"]},
                         "choice": {"anyOf": [
@@ -1321,15 +1329,23 @@ mod tests {
                         ]},
                         "invalid": false
                     },
-                    "required": ["uri", "target", "optional", "invalid", "missing"]
+                    "required": ["uri", "body", "target", "optional", "invalid", "missing"]
                 }
             }, {
                 "name": "exec",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "body": {"type": "", "description": "Any JSON value"}
-                    }
+                        "body": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["none", "text", "json"]},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["kind", "value"]
+                        }
+                    },
+                    "required": ["body"]
                 }
             }]}],
             "toolConfig": null
@@ -1357,9 +1373,17 @@ mod tests {
         );
         let parameters = &request["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(parameters.get("additionalProperties").is_none());
-        assert_eq!(parameters["required"], json!(["uri", "target"]));
+        assert_eq!(parameters["required"], json!(["uri", "body", "target"]));
         assert!(parameters["properties"].get("invalid").is_none());
-        assert_eq!(parameters["properties"]["body"]["type"], "string");
+        assert_eq!(parameters["properties"]["body"]["type"], "object");
+        assert_eq!(
+            parameters["properties"]["body"]["required"],
+            json!(["kind", "value"])
+        );
+        assert_eq!(
+            parameters["properties"]["body"]["properties"]["kind"]["enum"],
+            json!(["none", "text", "json"])
+        );
         assert_eq!(parameters["properties"]["target"]["type"], "integer");
         assert_eq!(parameters["properties"]["choice"]["type"], "object");
         assert!(
@@ -1374,7 +1398,11 @@ mod tests {
         );
         assert_eq!(
             request["tools"][0]["functionDeclarations"][1]["parameters"]["properties"]["body"]["type"],
-            "string"
+            "object"
+        );
+        assert_eq!(
+            request["tools"][0]["functionDeclarations"][1]["parameters"]["required"],
+            json!(["body"])
         );
     }
 

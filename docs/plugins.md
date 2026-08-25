@@ -16,8 +16,8 @@ Both paths keep protocol operations behind `read` and `exec`. URI Agent does not
 URI Agent loads modules from `<config>/wasm-plugins/`. The built-in `wasm_plugin` protocol exposes exactly two operations:
 
 ```text
-read("wasm_plugin://help")
-exec("wasm_plugin://reload")
+read("wasm_plugin://help", {"kind":"none","value":""})
+exec("wasm_plugin://reload", {"kind":"none","value":""})
 ```
 
 There are no install, update, remove, or list operations, no `--wasm-plugin` flag, no `wasmPlugins` setting, and no URI Agent package manifest or package manager. The agent uses normal file and shell protocols to discover source, review it, clone it, and build it in a temporary directory. Installation writes a temporary file beside the destination and atomically renames it to `<name>.wasm` before reloading.
@@ -64,7 +64,7 @@ Every module exports `uri_agent_manifest`, which takes no input and returns:
 
 An optional `permissions` object can request sensitive host capabilities. Existing ABI version 1 manifests without it continue to load with no Agent environment or credential access.
 
-Protocol names must be unique within the module and satisfy the normal registry rules. Descriptions must be nonempty. Every protocol must set `can_read` to `true` and implement `read("<protocol>://help")`; `can_exec` may be `true` or `false`.
+Protocol names must be unique within the module and satisfy the normal registry rules. Descriptions must be nonempty. Every protocol must set `can_read` to `true` and implement `read("<protocol>://help", {"kind":"none","value":""})`; `can_exec` may be `true` or `false`.
 
 A module declaring a protocol also exports `uri_agent_handle`. URI Agent calls it with the selected protocol, operation, original URI, opaque target, and optional body:
 
@@ -78,7 +78,12 @@ A module declaring a protocol also exports `uri_agent_handle`. URI Agent calls i
 }
 ```
 
-`operation` is `read` or `exec`; `body` is `null` when omitted from the tool call. Returned bytes become the protocol result, while an Extism error fails the call. A module remains instantiated until the next reload, so its in-memory state survives calls; calls into one module are serialized.
+`operation` is `read` or `exec`; `body` is `null` when the model-facing body
+envelope uses `kind: "none"`. URI Agent decodes `text` and `json` envelopes
+before this ABI boundary, so the plugin continues to receive the literal
+protocol body. Returned bytes become the protocol result, while an Extism error
+fails the call. A module remains instantiated until the next reload, so its
+in-memory state survives calls; calls into one module are serialized.
 
 Each plugin implements its protocol help through the same handler. That help must describe every supported address and body shape.
 
