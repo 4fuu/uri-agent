@@ -975,6 +975,13 @@ pub(super) fn transcript_block_items(
             }
         }
         BlockKind::Tool => {
+            let header_color = if block.protocol_help_required {
+                PURPLE
+            } else if block.failed {
+                ERROR
+            } else {
+                WARM
+            };
             let status = if live {
                 animation::spinner(app.frame).to_string()
             } else if block.failed {
@@ -993,14 +1000,11 @@ pub(super) fn transcript_block_items(
             rows.push(transcript_block_item(
                 block,
                 vec![
-                    Span::styled(
-                        format!("{status} "),
-                        Style::default().fg(if block.failed { ERROR } else { WARM }),
-                    ),
+                    Span::styled(format!("{status} "), Style::default().fg(header_color)),
                     Span::styled(
                         block.title.clone(),
                         Style::default()
-                            .fg(if block.failed { ERROR } else { WARM })
+                            .fg(header_color)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(

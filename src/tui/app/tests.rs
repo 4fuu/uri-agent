@@ -299,6 +299,7 @@ fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
             name: "read".into(),
             output: "source".into(),
             failed: false,
+            protocol_help_required: false,
         },
     );
     apply_event(
@@ -3965,6 +3966,7 @@ fn tool_call_and_result_share_one_block() {
             name: "read".to_string(),
             output: "complete tool output".to_string(),
             failed: false,
+            protocol_help_required: false,
         },
     });
     assert_eq!(app.blocks.len(), 1);
@@ -3982,6 +3984,59 @@ fn tool_call_and_result_share_one_block() {
     assert!(expanded.contains("↳ file://src/main.rs"));
     assert!(expanded.contains("└ complete tool output"));
     assert!(!expanded.contains("{\"uri\""));
+}
+
+#[test]
+fn protocol_help_gate_colors_only_the_tool_header_purple() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "blocked".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({
+                "uri": "file://src/main.rs",
+                "body": ""
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "blocked".to_string(),
+            name: "read".to_string(),
+            output: "The first call to a protocol must read its help.".to_string(),
+            failed: true,
+            protocol_help_required: true,
+        },
+    );
+    app.blocks[0].expanded = true;
+    app.skip_splash();
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let cells = terminal.backend().buffer().content();
+    let symbols = cells.iter().map(|cell| cell.symbol()).collect::<Vec<_>>();
+    let find = |needle: &str| {
+        let needle = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+        symbols
+            .windows(needle.len())
+            .position(|window| window.iter().zip(&needle).all(|(cell, ch)| *cell == ch))
+            .expect("expected text should be rendered")
+    };
+
+    let header = "× Read src/main.rs";
+    let header_start = find(header);
+    for cell in &cells[header_start..header_start + header.chars().count()] {
+        assert_eq!(cell.fg, PURPLE);
+    }
+    let detail = "The first call to a protocol must read its help.";
+    let detail_start = find(detail);
+    for cell in &cells[detail_start..detail_start + detail.chars().count()] {
+        assert_eq!(cell.fg, ERROR);
+    }
 }
 
 #[test]
@@ -4101,6 +4156,7 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
             name: "read".into(),
             output: "done".into(),
             failed: false,
+            protocol_help_required: false,
         },
     });
     app.apply(SessionEvent {

@@ -12,6 +12,9 @@ User prompts use a teal band; assistant responses render as Markdown on the term
 
 Select a process, reasoning, or tool row with the keyboard or mouse and press `Enter` or click to fold or expand it. Tool summaries describe the routed URI, command, patch targets, and result instead of raw argument JSON. Press `o` or right-click to open the full document, including during streaming. In that document, press `c` to copy the complete contents. Search and reasoning/tool jump actions reveal a folded parent automatically.
 
+If the model calls a protocol before reading that protocol's help, the blocked
+tool row uses a purple header. Its error detail keeps the normal error color.
+
 A click outside dismisses read-only and navigational floats, including the composer, command panel, selectors, status, help, protocols, tasks, and documents. The composer preserves its draft. Settings, text prompts, OAuth, and the embedded terminal require an explicit close so an outside click cannot discard edits or stop work.
 
 ## Composer and commands

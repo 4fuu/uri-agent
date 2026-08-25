@@ -279,6 +279,9 @@ async fn run_session(
     let skill_source = SkillProtocolSource::default();
     protocols.set_dynamic_source(Arc::new(skill_source.clone()))?;
     protocols.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
+    protocols
+        .restore_help_reads(&session.snapshot().await)
+        .await;
     let protocols = Arc::new(protocols);
     let model_tools = Arc::new(model_tools);
     wasm_plugins.bind_host(Arc::downgrade(&protocols))?;

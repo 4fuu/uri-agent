@@ -6,7 +6,7 @@ use crate::model::{
     ModelResponse, looks_like_context_overflow,
 };
 use crate::plugin::ModelToolRegistry;
-use crate::protocol::ProtocolRegistry;
+use crate::protocol::{PROTOCOL_HELP_REQUIRED_MESSAGE, ProtocolHelpRequired, ProtocolRegistry};
 use crate::session::{EventKind, Session};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Context, Result, anyhow, bail};
@@ -1320,9 +1320,12 @@ impl AgentRuntime {
                 }
             }
         };
-        let (output, failed) = match result {
-            Ok(output) => (output, false),
-            Err(error) => (format!("Error: {error:#}"), true),
+        let (output, failed, protocol_help_required) = match result {
+            Ok(output) => (output, false, false),
+            Err(error) if error.downcast_ref::<ProtocolHelpRequired>().is_some() => {
+                (PROTOCOL_HELP_REQUIRED_MESSAGE.to_string(), true, true)
+            }
+            Err(error) => (format!("Error: {error:#}"), true, false),
         };
         let result = UserContent::tool_result_for(
             call.id,
@@ -1337,6 +1340,7 @@ impl AgentRuntime {
                     name: name.clone(),
                     output: output.clone(),
                     failed,
+                    protocol_help_required,
                 },
                 EventKind::ModelMessage {
                     message: Message::User {
@@ -1895,9 +1899,12 @@ mod tests {
 
         async fn read(
             &self,
-            _request: ProtocolRequest<'_>,
+            request: ProtocolRequest<'_>,
             _context: ProtocolContext,
         ) -> Result<Vec<u8>> {
+            if request.target == "help" {
+                return Ok(b"blocking help".to_vec());
+            }
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.started.notify_one();
             std::future::pending().await
@@ -3092,6 +3099,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_help_gate_returns_exact_model_message_and_marks_result() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let mut protocols = ProtocolRegistry::new(output, TaskManager::new());
+        protocols
+            .register(BlockingProtocol {
+                started: Arc::new(tokio::sync::Notify::new()),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .unwrap();
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(VecDeque::from([
+                Ok(ModelResponse {
+                    content: vec![AssistantContent::ToolCall(read_call(
+                        "blocked-call",
+                        "blocking://wait",
+                    ))],
+                    usage: None,
+                    context_tokens: None,
+                    finish_reason: Some(FinishReason::ToolCalls),
+                }),
+                text_response("read help next"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let runtime = AgentRuntime::new(
+            Some(backend.clone()),
+            Arc::new(protocols),
+            protocol_model_tools(),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        );
+
+        runtime.run_turn("skip help".into()).await.unwrap();
+
+        let events = session.snapshot().await;
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ToolResult {
+                output,
+                failed: true,
+                protocol_help_required: true,
+                ..
+            } if output == PROTOCOL_HELP_REQUIRED_MESSAGE
+        )));
+        let requests = backend.requests.lock().await;
+        let result = requests[1]
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|content| match content {
+                UserContent::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("blocked result should be replayed to the model");
+        assert!(matches!(
+            result.content.as_slice(),
+            [ToolResultContent::Text(text)] if text.text == PROTOCOL_HELP_REQUIRED_MESSAGE
+        ));
+        drop(requests);
+
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
     async fn manual_compaction_persists_a_checkpoint_and_keeps_raw_history() {
         let workspace = tempfile::tempdir().unwrap();
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
@@ -4009,6 +4106,7 @@ mod tests {
             responses: Mutex::new(VecDeque::from([
                 Ok(ModelResponse {
                     content: vec![
+                        AssistantContent::ToolCall(read_call("help", "blocking://help")),
                         AssistantContent::ToolCall(read_call("call-1", "blocking://wait")),
                         AssistantContent::ToolCall(read_call("call-2", "blocking://wait")),
                     ],
@@ -4073,10 +4171,11 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(replayed_results.len(), 2);
-        assert_eq!(replayed_results[0].call.as_str(), "call-1");
-        assert_eq!(replayed_results[1].call.as_str(), "call-2");
-        assert!(replayed_results.iter().all(|result| {
+        assert_eq!(replayed_results.len(), 3);
+        assert_eq!(replayed_results[0].call.as_str(), "help");
+        assert_eq!(replayed_results[1].call.as_str(), "call-1");
+        assert_eq!(replayed_results[2].call.as_str(), "call-2");
+        assert!(replayed_results[1..].iter().all(|result| {
             matches!(
                 result.content.as_slice(),
                 [ToolResultContent::Text(text)] if text.text.contains(TURN_INTERRUPTED_BY_USER)

@@ -1,10 +1,27 @@
 use crate::output::OutputStore;
 use crate::prompts::PromptEntry;
+use crate::session::{EventKind, SessionEvent};
 use crate::task::TaskManager;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+
+pub(crate) const PROTOCOL_HELP_REQUIRED_MESSAGE: &str =
+    "The first call to a protocol must read its help.";
+
+#[derive(Debug)]
+pub(crate) struct ProtocolHelpRequired;
+
+impl fmt::Display for ProtocolHelpRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(PROTOCOL_HELP_REQUIRED_MESSAGE)
+    }
+}
+
+impl std::error::Error for ProtocolHelpRequired {}
 
 #[derive(Clone)]
 pub struct ProtocolContext {
@@ -61,6 +78,7 @@ pub struct ProtocolRegistry {
     dynamic: Vec<Arc<dyn DynamicProtocolSource>>,
     output: Arc<OutputStore>,
     context: ProtocolContext,
+    help_read: AsyncMutex<HashSet<String>>,
 }
 
 impl ProtocolRegistry {
@@ -70,6 +88,7 @@ impl ProtocolRegistry {
             dynamic: Vec::new(),
             output,
             context: ProtocolContext { tasks },
+            help_read: AsyncMutex::new(HashSet::new()),
         }
     }
 
@@ -138,22 +157,68 @@ impl ProtocolRegistry {
     }
 
     pub async fn read(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_read(uri, body, true).await
+        self.dispatch_read(uri, body, true, true).await
     }
 
     pub async fn exec(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_exec(uri, body, true).await
+        self.dispatch_exec(uri, body, true, true).await
     }
 
     pub(crate) async fn read_static(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_read(uri, body, false).await
+        self.dispatch_read(uri, body, false, false).await
     }
 
     pub(crate) async fn exec_static(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_exec(uri, body, false).await
+        self.dispatch_exec(uri, body, false, false).await
     }
 
-    async fn dispatch_read(&self, uri: &str, body: &str, include_dynamic: bool) -> Result<String> {
+    pub async fn restore_help_reads(&self, events: &[SessionEvent]) {
+        let mut pending = HashMap::new();
+        let mut restored = HashSet::new();
+        for event in events {
+            match &event.kind {
+                EventKind::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    pending.remove(call_id);
+                    if name == "read"
+                        && let (Some(uri), Some("")) = (
+                            arguments.get("uri").and_then(|value| value.as_str()),
+                            arguments.get("body").and_then(|value| value.as_str()),
+                        )
+                        && let Ok((protocol, "help")) = split_address(uri)
+                    {
+                        pending.insert(call_id.clone(), protocol.to_string());
+                    }
+                }
+                EventKind::ToolResult {
+                    call_id,
+                    name,
+                    failed,
+                    ..
+                } => {
+                    if let Some(protocol) = pending.remove(call_id)
+                        && name == "read"
+                        && !failed
+                    {
+                        restored.insert(protocol);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.help_read.lock().await.extend(restored);
+    }
+
+    async fn dispatch_read(
+        &self,
+        uri: &str,
+        body: &str,
+        include_dynamic: bool,
+        require_help: bool,
+    ) -> Result<String> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
@@ -163,18 +228,34 @@ impl ProtocolRegistry {
         if !descriptor.can_read {
             bail!("protocol does not support read: {name}");
         }
+        if require_help && target != "help" && !self.help_read.lock().await.contains(name) {
+            return Err(ProtocolHelpRequired.into());
+        }
         let content = protocol
             .read(ProtocolRequest { uri, target, body }, self.context.clone())
             .await?;
-        self.output.present(content, name).await
+        let output = self.output.present(content, name).await?;
+        if require_help && target == "help" && body.is_empty() {
+            self.help_read.lock().await.insert(name.to_string());
+        }
+        Ok(output)
     }
 
-    async fn dispatch_exec(&self, uri: &str, body: &str, include_dynamic: bool) -> Result<String> {
+    async fn dispatch_exec(
+        &self,
+        uri: &str,
+        body: &str,
+        include_dynamic: bool,
+        require_help: bool,
+    ) -> Result<String> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
             .await
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
+        if require_help && !self.help_read.lock().await.contains(name) {
+            return Err(ProtocolHelpRequired.into());
+        }
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
             bail!(
@@ -399,6 +480,7 @@ mod tests {
             })
             .unwrap();
         let body = r#"["markdown is fine",{"nested":[1,null,true]}]"#;
+        registry.read("capture://help", "").await.unwrap();
 
         let result = registry
             .read("capture://a://b?not=a url", body)
@@ -430,6 +512,7 @@ mod tests {
             })
             .unwrap();
         let body = "unchanged";
+        registry.read("capture://help", "").await.unwrap();
 
         let result = registry.exec("capture://run?wait=30", body).await.unwrap();
 
@@ -462,6 +545,111 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("already registered"));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn first_model_call_must_read_protocol_help() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let capture = Arc::new(Mutex::new(None));
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(CaptureProtocol {
+                capture: capture.clone(),
+            })
+            .unwrap();
+
+        for error in [
+            registry.read("capture://value", "").await.unwrap_err(),
+            registry.exec("capture://run", "").await.unwrap_err(),
+        ] {
+            assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
+            assert_eq!(error.to_string(), PROTOCOL_HELP_REQUIRED_MESSAGE);
+        }
+        assert!(capture.lock().unwrap().is_none());
+
+        registry.read("capture://help", "").await.unwrap();
+        assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
+        assert_eq!(registry.exec("capture://run", "").await.unwrap(), "ok");
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_help_and_static_calls_do_not_unlock_model_calls() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(CaptureProtocol {
+                capture: Arc::new(Mutex::new(None)),
+            })
+            .unwrap();
+
+        registry.read("capture://help", "unexpected").await.unwrap();
+        assert!(
+            registry
+                .read("capture://value", "")
+                .await
+                .unwrap_err()
+                .downcast_ref::<ProtocolHelpRequired>()
+                .is_some()
+        );
+        registry.read_static("capture://value", "").await.unwrap();
+        registry.exec_static("capture://run", "").await.unwrap();
+        assert!(
+            registry
+                .read("capture://value", "")
+                .await
+                .unwrap_err()
+                .downcast_ref::<ProtocolHelpRequired>()
+                .is_some()
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn restored_successful_help_read_unlocks_protocol() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(CaptureProtocol {
+                capture: Arc::new(Mutex::new(None)),
+            })
+            .unwrap();
+        let events = vec![
+            SessionEvent {
+                sequence: 1,
+                at: chrono::Utc::now(),
+                kind: EventKind::ToolCall {
+                    call_id: "help-call".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({
+                        "uri": "capture://help",
+                        "body": ""
+                    }),
+                },
+            },
+            SessionEvent {
+                sequence: 2,
+                at: chrono::Utc::now(),
+                kind: EventKind::ToolResult {
+                    call_id: "help-call".to_string(),
+                    name: "read".to_string(),
+                    output: "help".to_string(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+            },
+        ];
+
+        registry.restore_help_reads(&events).await;
+
+        assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 

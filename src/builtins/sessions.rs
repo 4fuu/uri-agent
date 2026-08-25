@@ -895,6 +895,7 @@ mod tests {
                     name: "file".to_string(),
                     output: "private tool output".to_string(),
                     failed: false,
+                    protocol_help_required: false,
                 },
                 EventKind::TurnFinished,
             ])

@@ -20,6 +20,10 @@ no body, pass plain text for textual input, and pass the complete serialized
 JSON text when a protocol requires structured input. Protocols receive that
 string unchanged, including an empty string.
 
+Before any other call to a protocol in a session, the model must successfully
+call `read("<protocol>://help", "")`. The runtime blocks calls that skip this
+first help read. Each protocol is tracked independently.
+
 `read` is used for resources, help, task snapshots, and completed output. `exec`
 starts work through protocols that support execution. `replace` and
 `apply_patch` avoid nesting edit payloads inside a serialized protocol body.

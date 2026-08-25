@@ -307,6 +307,8 @@ pub enum EventKind {
         name: String,
         output: String,
         failed: bool,
+        #[serde(default)]
+        protocol_help_required: bool,
     },
     ModelMessage {
         message: Message,

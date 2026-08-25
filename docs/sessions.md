@@ -64,6 +64,11 @@ Each retry becomes a visible session event with its reason, delay, and count. Pr
 
 A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
 
+The first model-facing call to each protocol must successfully read its exact
+`<protocol>://help` route with an empty body. This state belongs to the session;
+resuming reconstructs it from successful persisted tool results. Internal
+protocol calls made by a WASM plugin are not model-facing and bypass this gate.
+
 If a turn is interrupted while tool calls from one model response are pending, URI Agent appends a failed result with the original correlation identity for every unfinished call before settling the turn. Later requests therefore never replay a tool call without its corresponding result.
 
 URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different call, no call, or multiple calls resets the sequence. Background task completion is delivered automatically, so repeated identical `tasks://` reads are polling and receive the same loop protection as other calls.

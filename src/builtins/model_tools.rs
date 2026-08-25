@@ -158,6 +158,10 @@ mod tests {
     #[tokio::test]
     async fn protocol_tools_dispatch_string_bodies_without_transforming_empty_input() {
         let (protocols, output) = protocols().await;
+        ProtocolTool::new(ProtocolOperation::Read)
+            .execute(&json!({"uri": "capture://help", "body": ""}), &protocols)
+            .await
+            .unwrap();
         let read = ProtocolTool::new(ProtocolOperation::Read)
             .execute(&json!({"uri": "capture://value", "body": ""}), &protocols)
             .await

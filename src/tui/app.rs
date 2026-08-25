@@ -73,6 +73,7 @@ const MUTED: Color = Color::Rgb(116, 124, 135);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
 const WARM: Color = Color::Rgb(239, 173, 104);
 const ERROR: Color = Color::Rgb(239, 108, 120);
+const PURPLE: Color = Color::Rgb(190, 130, 255);
 const FLASH_MIN_DURATION: Duration = Duration::from_secs(3);
 const FLASH_MAX_DURATION: Duration = Duration::from_secs(15);
 const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
@@ -128,6 +129,7 @@ struct DisplayBlock {
     text: String,
     call_id: Option<String>,
     failed: bool,
+    protocol_help_required: bool,
     expanded: bool,
     tool: Option<ToolDisplay>,
     transient: bool,
@@ -811,6 +813,7 @@ impl App {
                 name,
                 output,
                 failed,
+                protocol_help_required,
             } => {
                 if let Some(block) = self
                     .blocks
@@ -819,6 +822,7 @@ impl App {
                     .find(|block| block.call_id.as_deref() == Some(&call_id))
                 {
                     block.failed = failed;
+                    block.protocol_help_required = protocol_help_required;
                     if let Some(tool) = block.tool.as_mut() {
                         tool.output = Some(output.clone());
                     }
@@ -831,7 +835,9 @@ impl App {
                 } else {
                     let tool_output = output.clone();
                     self.push(
-                        if failed {
+                        if protocol_help_required {
+                            BlockKind::Tool
+                        } else if failed {
                             BlockKind::Error
                         } else {
                             BlockKind::Tool
@@ -842,7 +848,9 @@ impl App {
                         failed,
                         true,
                     );
-                    self.blocks.last_mut().unwrap().tool = Some(ToolDisplay {
+                    let block = self.blocks.last_mut().unwrap();
+                    block.protocol_help_required = protocol_help_required;
+                    block.tool = Some(ToolDisplay {
                         name,
                         arguments: serde_json::Value::Null,
                         output: Some(tool_output),
@@ -1017,6 +1025,7 @@ impl App {
                 text: String::new(),
                 call_id: None,
                 failed: false,
+                protocol_help_required: false,
                 expanded: false,
                 tool: None,
                 transient: false,
@@ -1068,6 +1077,7 @@ impl App {
             text,
             call_id,
             failed,
+            protocol_help_required: false,
             expanded,
             tool: None,
             transient: self.applying_transient,

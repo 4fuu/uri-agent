@@ -1129,6 +1129,7 @@ mod tests {
     use crate::output::OutputStore;
     use crate::plugin::{CommandRegistry, ModelToolRegistry, PluginRegistry, TuiRegistry};
     use crate::protocol::{Protocol, ProtocolContext, ProtocolRegistry, ProtocolRequest};
+    use crate::session::{EventKind, SessionEvent};
     use crate::task::TaskManager;
 
     struct CaptureProtocol;
@@ -1378,6 +1379,37 @@ mod tests {
         (registry, model_tools, manager, output)
     }
 
+    async fn restore_help_read(registry: &ProtocolRegistry, protocol: &str) {
+        let call_id = format!("{protocol}-help");
+        registry
+            .restore_help_reads(&[
+                SessionEvent {
+                    sequence: 1,
+                    at: chrono::Utc::now(),
+                    kind: EventKind::ToolCall {
+                        call_id: call_id.clone(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({
+                            "uri": format!("{protocol}://help"),
+                            "body": ""
+                        }),
+                    },
+                },
+                SessionEvent {
+                    sequence: 2,
+                    at: chrono::Utc::now(),
+                    kind: EventKind::ToolResult {
+                        call_id,
+                        name: "read".to_string(),
+                        output: "help".to_string(),
+                        failed: false,
+                        protocol_help_required: false,
+                    },
+                },
+            ])
+            .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn reload_exec_returns_after_replacing_the_complete_dynamic_protocol_set() {
         let directory = tempfile::tempdir().unwrap();
@@ -1391,8 +1423,10 @@ mod tests {
         .await
         .unwrap();
 
+        restore_help_read(&registry, "wasm_plugin").await;
         let reloaded = registry.exec("wasm_plugin://reload", "").await.unwrap();
         assert!(reloaded.contains(r#"Active protocols: ["first"]"#));
+        restore_help_read(&registry, "first").await;
         assert!(registry.read("first://value", "").await.is_ok());
         let help = registry.read("wasm_plugin://help", "").await.unwrap();
         assert!(help.contains(r#"Active dynamic protocols: ["first"]"#));
@@ -1410,6 +1444,7 @@ mod tests {
         registry.exec("wasm_plugin://reload", "").await.unwrap();
 
         assert!(registry.read("first://value", "").await.is_err());
+        restore_help_read(&registry, "second").await;
         assert!(registry.read("second://value", "").await.is_ok());
         let old_result = old_protocol
             .read(
@@ -1557,6 +1592,7 @@ mod tests {
             .join("missing-wasm-plugins");
 
         assert!(manager.reload_from(&missing).await.is_err());
+        restore_help_read(&registry, "stable").await;
         assert!(registry.read("stable://value", "").await.is_ok());
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
@@ -1609,6 +1645,7 @@ mod tests {
             .await
             .unwrap();
 
+        restore_help_read(&registry, "wasm_plugin").await;
         let reloaded = registry.exec("wasm_plugin://reload", "").await.unwrap();
         assert!(reloaded.contains("Skipped plugins: 1"));
         assert!(!reloaded.contains("bad.wasm"));
@@ -1649,6 +1686,7 @@ mod tests {
         .unwrap();
         manager.reload().await.unwrap();
 
+        restore_help_read(&registry, "host_call").await;
         let result = registry.read("host_call://run", "").await.unwrap();
         assert_eq!(result, "host received from-plugin");
 
@@ -1697,6 +1735,8 @@ mod tests {
         .unwrap();
         manager.reload().await.unwrap();
 
+        restore_help_read(&registry, "allowed_environment").await;
+        restore_help_read(&registry, "denied_environment").await;
         assert_eq!(
             registry
                 .read("allowed_environment://read", "")
@@ -1745,6 +1785,8 @@ mod tests {
         .unwrap();
         manager.reload().await.unwrap();
 
+        restore_help_read(&registry, "allowed_credentials").await;
+        restore_help_read(&registry, "denied_credentials").await;
         assert_eq!(
             registry
                 .read("allowed_credentials://read", "")
