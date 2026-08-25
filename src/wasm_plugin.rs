@@ -1024,19 +1024,19 @@ mod tests {
 
     fn valid_manifest(name: &str) -> String {
         format!(
-            r#"{{"abi_version":1,"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}]}}"#
+            r#"{{"abi_version":{ABI_VERSION},"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"environment":false,"credentials":false}}}}"#
         )
     }
 
     fn environment_manifest(name: &str) -> String {
         format!(
-            r#"{{"abi_version":1,"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"environment":true}}}}"#
+            r#"{{"abi_version":{ABI_VERSION},"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"environment":true,"credentials":false}}}}"#
         )
     }
 
     fn credentials_manifest(name: &str) -> String {
         format!(
-            r#"{{"abi_version":1,"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"credentials":true}}}}"#
+            r#"{{"abi_version":{ABI_VERSION},"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"permissions":{{"environment":false,"credentials":true}}}}"#
         )
     }
 
@@ -1209,10 +1209,12 @@ mod tests {
     async fn protocols_without_readable_help_are_skipped() {
         let directory = tempfile::tempdir().unwrap();
         let (_registry, manager, output) = registry_with_manager(directory.path()).await;
-        let manifest = r#"{"abi_version":1,"protocols":[{"name":"exec_only","description":"Exec only","can_read":false,"can_exec":true}]}"#;
+        let manifest = format!(
+            r#"{{"abi_version":{ABI_VERSION},"protocols":[{{"name":"exec_only","description":"Exec only","can_read":false,"can_exec":true}}],"permissions":{{"environment":false,"credentials":false}}}}"#
+        );
         tokio::fs::write(
             manager.directory().join("exec-only.wasm"),
-            module(manifest, true),
+            module(&manifest, true),
         )
         .await
         .unwrap();

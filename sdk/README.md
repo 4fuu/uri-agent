@@ -1,6 +1,6 @@
 # URI Agent plugin SDK
 
-This crate provides Rust guest types, ABI exports, and host calls for trusted URI Agent Extism WebAssembly protocol plugins. Runtime installation, reload behavior, permissions, and limits are documented in [WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md).
+This crate provides Rust guest types, ABI version 2 exports, and host calls for trusted URI Agent Extism WebAssembly protocol plugins. Runtime installation, reload behavior, permissions, and limits are documented in [WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md).
 
 ## Use the SDK
 

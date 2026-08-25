@@ -7,10 +7,12 @@ URI Agent stores conversations as append-only sessions and preserves the exact s
 Sessions are stored in SQLite at:
 
 ```text
-<platform-data-dir>/uri-agent/sessions.db
+<platform-data-dir>/uri-agent/sessions-v2.db
 ```
 
-If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions.db`.
+If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions-v2.db`.
+
+Earlier unversioned `sessions.db` files and their sidecars remain untouched beside the new database as an archive. URI Agent does not open, import, or modify them. Configuration and credentials use a separate directory and are unaffected.
 
 A new session remains in memory until its first user message is accepted. URI Agent then writes the frozen context, queued startup events, and message in one transaction, so opening and closing an empty session creates no session record.
 

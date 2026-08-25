@@ -44,7 +44,7 @@ User prompts, assistant responses, blank conversation space (including the virtu
 
 Normal paste inserts text and opens the composer when used from the conversation. When the terminal forwards `Ctrl+V`, URI Agent reads the clipboard, preferring an image and falling back to text. Because some terminals consume `Ctrl+V`, `Alt+V` is the reliable image shortcut. Submission waits for the background clipboard read to finish.
 
-Each image appears in the composer as an atomic `🖼 #N` chip. Cursor movement crosses the whole chip; adjacent `Backspace` or `Delete`, or a selection touching it, removes both chip and attachment. On submission, active chips become `[Image #N]` markers in message order. Unsent image bytes are process-local and are discarded on exit or session switch; stale chips and markers are removed from restored drafts.
+Each image appears in the composer as an atomic `[Image #N]` chip. Cursor movement crosses the whole chip; adjacent `Backspace` or `Delete`, or a selection touching it, removes both chip and attachment. On submission, active chips remain `[Image #N]` markers in message order. Unsent image bytes are process-local and are discarded on exit or session switch; stale chips and markers are removed from restored drafts.
 
 For a model whose catalog `input` includes `image`, a standalone `@file://<path>` attaches a project image:
 

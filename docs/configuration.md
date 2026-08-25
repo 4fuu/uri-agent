@@ -103,7 +103,7 @@ The selector exposes canonical models rather than the private low/medium/high ro
 | `claude-sonnet-4-6` | `off`; `low` 8,192; `medium` 16,384; `high` 24,576; `max` 32,768 |
 | `claude-opus-4-6` | `low` 8,192; `medium` 16,384; `high` 24,576; `max` 32,768 |
 
-Older physical IDs remain runnable for saved sessions but are hidden from the selector. Gemini 3.6 aliases use the Gemini 3.7 Flash routes, and Gemini 2.5 Flash aliases use the non-thinking Gemini 3.1 Flash Lite route. A local `models.json` can overlay individual effort routes when the private service changes:
+A local `models.json` can overlay individual effort routes when the private service changes:
 
 ```json
 {
@@ -126,8 +126,6 @@ Older physical IDs remain runnable for saved sessions but are hidden from the se
   }
 }
 ```
-
-`compat.antigravityModel` remains a fallback for custom and legacy records that do not define `antigravityRoutes`.
 
 Requests use the private `v1internal:streamGenerateContent` SSE operation. URI Agent sends numeric `thinkingBudget` values, preserves and mirrors Gemini thought signatures across tool rounds, normalizes tool schemas and `toolConfig`, and adds stable missing Claude tool IDs. The fixed model-facing body envelope uses only concrete object, enum, and string schema types, so normalization preserves it without changing protocol-body semantics. A 401 refreshes the OAuth token once; a project-header 403 retries once without that header. After these transport-specific repairs and endpoint fallbacks are exhausted, failures retain URI Agent's normal model retry classification and budget.
 

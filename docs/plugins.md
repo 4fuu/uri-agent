@@ -42,15 +42,15 @@ The reload `exec` call returns only after the replacement set is active. Its res
 
 Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state.
 
-## ABI version 1
+## ABI version 2
 
-ABI version 1 lets a module contribute protocols. It does not contribute system prompt fragments, commands, panels, status providers, or composer completions. Exports use Extism's bytes-in/bytes-out functions and may be implemented with any compatible PDK.
+ABI version 2 lets a module contribute protocols. It does not contribute system prompt fragments, commands, panels, status providers, or composer completions. Exports use Extism's bytes-in/bytes-out functions and may be implemented with any compatible PDK.
 
 Every module exports `uri_agent_manifest`, which takes no input and returns:
 
 ```json
 {
-  "abi_version": 1,
+  "abi_version": 2,
   "protocols": [
     {
       "name": "example",
@@ -58,11 +58,15 @@ Every module exports `uri_agent_manifest`, which takes no input and returns:
       "can_read": true,
       "can_exec": true
     }
-  ]
+  ],
+  "permissions": {
+    "environment": false,
+    "credentials": false
+  }
 }
 ```
 
-An optional `permissions` object can request sensitive host capabilities. Existing ABI version 1 manifests without it continue to load with no Agent environment or credential access.
+Every manifest declares both permission fields. Set one to `true` to request the corresponding sensitive host capability.
 
 Protocol names must be unique within the module and satisfy the normal registry rules. Descriptions must be nonempty. Every protocol must set `can_read` to `true` and implement `read("<protocol>://help", {"kind":"none","value":""})`; `can_exec` may be `true` or `false`.
 

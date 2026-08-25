@@ -40,48 +40,30 @@ pub(super) fn resolve_route(
         .thinking_level(thinking)
         .and_then(Value::as_str)
         .unwrap_or_else(|| thinking.as_str());
-    if let Some(route) = model
+    let route = model
         .compat("antigravityRoutes")
         .and_then(|routes| routes.get(mapped_level))
-        .and_then(Value::as_object)
-    {
-        let upstream = route
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.trim().is_empty())?;
-        let thinking_budget = route
-            .get("thinkingBudget")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| thinking.budget());
-        return Some(AntigravityRoute {
-            model: upstream.to_string(),
-            thinking_budget,
-            max_output_tokens: route
-                .get("maxOutputTokens")
-                .and_then(Value::as_u64)
-                .filter(|limit| *limit > 0)
-                .unwrap_or_else(|| model.max_tokens()),
-            include_thoughts: route
-                .get("includeThoughts")
-                .and_then(Value::as_bool)
-                .unwrap_or(thinking_budget > 0),
-        });
-    }
-
-    let upstream = model
-        .compat("antigravityModel")
+        .and_then(Value::as_object)?;
+    let upstream = route
+        .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.trim().is_empty())?;
-    let thinking_budget = if model.reasoning() && thinking.enabled() {
-        thinking.budget()
-    } else {
-        0
-    };
+    let thinking_budget = route
+        .get("thinkingBudget")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| thinking.budget());
     Some(AntigravityRoute {
         model: upstream.to_string(),
         thinking_budget,
-        max_output_tokens: model.max_tokens(),
-        include_thoughts: thinking_budget > 0,
+        max_output_tokens: route
+            .get("maxOutputTokens")
+            .and_then(Value::as_u64)
+            .filter(|limit| *limit > 0)
+            .unwrap_or_else(|| model.max_tokens()),
+        include_thoughts: route
+            .get("includeThoughts")
+            .and_then(Value::as_bool)
+            .unwrap_or(thinking_budget > 0),
     })
 }
 

@@ -13,7 +13,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -26,9 +26,7 @@ pub const HOST_CREDENTIALS: &str = "uri_agent_credentials";
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
     pub abi_version: u32,
-    #[serde(default)]
     pub protocols: Vec<ProtocolDescriptor>,
-    #[serde(default, skip_serializing_if = "PluginPermissions::is_empty")]
     pub permissions: PluginPermissions,
 }
 
@@ -63,20 +61,8 @@ impl PluginManifest {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginPermissions {
-    #[serde(default, skip_serializing_if = "is_false")]
     pub environment: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub credentials: bool,
-}
-
-impl PluginPermissions {
-    fn is_empty(&self) -> bool {
-        !self.environment && !self.credentials
-    }
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -231,21 +217,22 @@ mod tests {
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["abi_version"], ABI_VERSION);
         assert_eq!(value["protocols"][0]["name"], "example");
-        assert!(value.get("permissions").is_none());
+        assert_eq!(value["permissions"]["environment"], false);
+        assert_eq!(value["permissions"]["credentials"], false);
 
         let manifest = PluginManifest::new([]).request_environment_access();
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["permissions"]["environment"], true);
+        assert_eq!(value["permissions"]["credentials"], false);
         let manifest = PluginManifest::new([]).request_credentials_access();
         let value = serde_json::to_value(manifest).unwrap();
+        assert_eq!(value["permissions"]["environment"], false);
         assert_eq!(value["permissions"]["credentials"], true);
-        let legacy: PluginManifest = serde_json::from_value(serde_json::json!({
+        let incomplete = serde_json::from_value::<PluginManifest>(serde_json::json!({
             "abi_version": ABI_VERSION,
             "protocols": []
-        }))
-        .unwrap();
-        assert!(!legacy.permissions.environment);
-        assert!(!legacy.permissions.credentials);
+        }));
+        assert!(incomplete.is_err());
 
         let request: HandlerRequest = serde_json::from_value(serde_json::json!({
             "protocol": "example",

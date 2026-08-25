@@ -16,6 +16,8 @@ use tokio_rusqlite::{
 };
 use uuid::Uuid;
 
+const SESSION_DATABASE_FILE: &str = "sessions-v2.db";
+
 #[derive(Clone, Debug)]
 pub enum SessionChoice {
     New,
@@ -281,7 +283,6 @@ pub enum EventKind {
         cwd: PathBuf,
         provider: String,
         model: String,
-        #[serde(default)]
         thinking: ThinkingLevel,
     },
     SessionContext {
@@ -339,15 +340,11 @@ pub enum EventKind {
         cost: f64,
         /// Provider-reported total tokens for the completed request, before
         /// any API-specific normalization used for price accounting.
-        #[serde(default)]
         total: u64,
         /// Whether this usage belongs to a successful ordinary assistant
         /// message and is therefore valid as a context-meter baseline.
-        #[serde(default = "default_true")]
         context: bool,
-        #[serde(default)]
         provider: String,
-        #[serde(default)]
         model: String,
     },
     Error {
@@ -366,10 +363,6 @@ struct State {
     events: Vec<SessionEvent>,
     persisted: bool,
     model_settings: SessionModelSettings,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Clone, Debug)]
@@ -565,40 +558,8 @@ impl Session {
                 "session {id} has no frozen context and cannot be resumed"
             ));
         }
-
-        let stored_settings = if created_session {
-            None
-        } else {
-            let settings_id = id.clone();
-            connection
-                .call(move |db| {
-                    db.query_row(
-                        "SELECT provider, model, thinking FROM sessions WHERE id = ?1",
-                        [settings_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                })
-                .await
-                .context("cannot restore session model settings")?
-                .map(|(provider, model, thinking)| SessionModelSettings {
-                    provider,
-                    model,
-                    thinking: thinking.parse().unwrap_or_default(),
-                })
-        };
-        let fallback_settings = stored_settings.unwrap_or_else(|| SessionModelSettings {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            thinking,
-        });
-        let model_settings = model_settings_from_events(&existing, fallback_settings);
+        let model_settings = model_settings_from_events(&existing)
+            .ok_or_else(|| anyhow!("session {id} has no creation event and cannot be resumed"))?;
         let (events, _) = broadcast::channel(512);
         let session = Self {
             id,
@@ -1072,8 +1033,8 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
 
 fn session_database_path(fallback: &Path) -> PathBuf {
     dirs::data_dir()
-        .map(|path| path.join("uri-agent/sessions.db"))
-        .unwrap_or_else(|| fallback.join(".uri-agent/sessions.db"))
+        .map(|path| path.join("uri-agent").join(SESSION_DATABASE_FILE))
+        .unwrap_or_else(|| fallback.join(".uri-agent").join(SESSION_DATABASE_FILE))
 }
 
 async fn open_archive_database(path: &Path) -> Result<Option<Connection>> {
@@ -1121,9 +1082,9 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                  CREATE TABLE IF NOT EXISTS sessions (
                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                    cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
-                   thinking TEXT NOT NULL DEFAULT 'off',
+                   thinking TEXT NOT NULL,
                    head_sequence INTEGER NOT NULL,
-                   draft TEXT NOT NULL DEFAULT ''
+                   draft TEXT NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS events (
                    session_id TEXT NOT NULL, sequence INTEGER NOT NULL, at TEXT NOT NULL,
@@ -1135,62 +1096,6 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                    cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
                  );",
             )?;
-            let has_draft = {
-                let mut statement = db.prepare("PRAGMA table_info(sessions)")?;
-                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-                names.filter_map(Result::ok).any(|name| name == "draft")
-            };
-            if !has_draft {
-                db.execute(
-                    "ALTER TABLE sessions ADD COLUMN draft TEXT NOT NULL DEFAULT ''",
-                    [],
-                )?;
-            }
-            let has_thinking = {
-                let mut statement = db.prepare("PRAGMA table_info(sessions)")?;
-                let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-                names.filter_map(Result::ok).any(|name| name == "thinking")
-            };
-            if !has_thinking {
-                db.execute(
-                    "ALTER TABLE sessions ADD COLUMN thinking TEXT NOT NULL DEFAULT 'off'",
-                    [],
-                )?;
-            }
-
-            // TODO: Remove this compatibility cleanup after legacy empty sessions have aged out.
-            let transaction = db.transaction()?;
-            transaction.execute(
-                "INSERT INTO pending_drafts (cwd, draft)
-                 SELECT legacy.cwd, legacy.draft
-                 FROM sessions AS legacy
-                 WHERE legacy.draft <> ''
-                   AND NOT EXISTS (
-                     SELECT 1 FROM events
-                     WHERE events.session_id = legacy.id AND events.kind = 'user'
-                   )
-                   AND NOT EXISTS (
-                     SELECT 1 FROM sessions AS newer
-                     WHERE newer.cwd = legacy.cwd
-                       AND NOT EXISTS (
-                         SELECT 1 FROM events
-                         WHERE events.session_id = newer.id AND events.kind = 'user'
-                       )
-                       AND (newer.updated_at > legacy.updated_at
-                            OR (newer.updated_at = legacy.updated_at AND newer.id > legacy.id))
-                   )
-                 ON CONFLICT(cwd) DO UPDATE SET draft = excluded.draft",
-                [],
-            )?;
-            transaction.execute(
-                "DELETE FROM sessions
-                 WHERE NOT EXISTS (
-                   SELECT 1 FROM events
-                   WHERE events.session_id = sessions.id AND events.kind = 'user'
-                 )",
-                [],
-            )?;
-            transaction.commit()?;
             Ok::<_, tokio_rusqlite::rusqlite::Error>(())
         })
         .await
@@ -1249,21 +1154,22 @@ fn apply_model_settings<'a>(
     }
 }
 
-fn model_settings_from_events(
-    events: &[SessionEvent],
-    mut fallback: SessionModelSettings,
-) -> SessionModelSettings {
-    // Older URI Agent versions updated only the materialized session row. If
-    // no append-only change exists, that row remains the compatibility truth
-    // rather than the original values in SessionCreated.
-    if !events
-        .iter()
-        .any(|event| matches!(&event.kind, EventKind::ModelSettingsChanged { .. }))
-    {
-        return fallback;
-    }
-    apply_model_settings(&mut fallback, events.iter().map(|event| &event.kind));
-    fallback
+fn model_settings_from_events(events: &[SessionEvent]) -> Option<SessionModelSettings> {
+    let mut settings = events.iter().find_map(|event| match &event.kind {
+        EventKind::SessionCreated {
+            provider,
+            model,
+            thinking,
+            ..
+        } => Some(SessionModelSettings {
+            provider: provider.clone(),
+            model: model.clone(),
+            thinking: *thinking,
+        }),
+        _ => None,
+    })?;
+    apply_model_settings(&mut settings, events.iter().map(|event| &event.kind));
+    Some(settings)
 }
 
 fn validate_session_id(id: &str) -> Result<()> {
@@ -1450,10 +1356,10 @@ mod tests {
     async fn session_without_a_frozen_context_is_not_reinterpreted() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
-        let original = session(&path, Some("legacy")).await;
+        let original = session(&path, Some("missing-context")).await;
         original
             .append(EventKind::User {
-                text: "persist legacy session".into(),
+                text: "persist session".into(),
             })
             .await
             .unwrap();
@@ -1461,7 +1367,8 @@ mod tests {
             .connection
             .call(|database| {
                 database.execute(
-                    "DELETE FROM events WHERE session_id = 'legacy' AND kind = 'session_context'",
+                    "DELETE FROM events
+                     WHERE session_id = 'missing-context' AND kind = 'session_context'",
                     [],
                 )?;
                 Ok::<_, tokio_rusqlite::rusqlite::Error>(())
@@ -1472,7 +1379,7 @@ mod tests {
 
         let error = match Session::open_at(
             path,
-            Some("legacy"),
+            Some("missing-context"),
             Path::new("/work"),
             "test",
             "model",
@@ -1573,6 +1480,15 @@ mod tests {
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','events')",
             [], |row| row.get(0))).await.unwrap();
         assert_eq!(tables, 2);
+    }
+
+    #[test]
+    fn default_session_database_uses_a_new_generation_file() {
+        assert_eq!(
+            session_database_path(Path::new("/work")).file_name(),
+            Some(std::ffi::OsStr::new(SESSION_DATABASE_FILE))
+        );
+        assert_ne!(SESSION_DATABASE_FILE, "sessions.db");
     }
 
     #[tokio::test]
@@ -1689,48 +1605,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_empty_sessions_are_removed_without_losing_their_draft() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("sessions.db");
-        let opened = session(&path, Some("setup")).await;
-        opened
-            .connection
-            .call(|db| {
-                db.execute(
-                    "INSERT INTO sessions
-                     (id, created_at, updated_at, cwd, provider, model, head_sequence, draft)
-                     VALUES ('legacy-empty', '2026-01-01T00:00:00Z',
-                             '2026-01-01T00:00:00Z', '/work', 'test', 'model', 1, 'legacy draft')",
-                    [],
-                )?;
-                db.execute(
-                    "INSERT INTO events (session_id, sequence, at, kind, payload_json)
-                     VALUES ('legacy-empty', 0, '2026-01-01T00:00:00Z', 'notice',
-                             '{\"kind\":\"notice\",\"text\":\"startup\"}')",
-                    [],
-                )?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
-        drop(opened);
-
-        let reopened = session(&path, Some("fresh")).await;
-        assert_eq!(reopened.draft().await, "legacy draft");
-        let counts: (i64, i64) = reopened
-            .connection
-            .call(|db| {
-                Ok::<_, tokio_rusqlite::rusqlite::Error>((
-                    db.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?,
-                    db.query_row("SELECT count(*) FROM events", [], |row| row.get(0))?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(counts, (0, 0));
-    }
-
-    #[tokio::test]
     async fn project_session_list_stays_inside_the_launch_directory() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
@@ -1836,28 +1710,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_created_event_defaults_thinking_to_off() {
-        let kind: EventKind = serde_json::from_value(serde_json::json!({
+    fn session_created_event_requires_thinking() {
+        let result = serde_json::from_value::<EventKind>(serde_json::json!({
             "kind": "session_created",
             "cwd": "/work",
             "provider": "openai",
-            "model": "gpt-old"
-        }))
-        .unwrap();
-        assert!(matches!(
-            kind,
-            EventKind::SessionCreated {
-                thinking: ThinkingLevel::Off,
-                ..
-            }
-        ));
+            "model": "gpt"
+        }));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn legacy_row_only_model_change_remains_resumable() {
+    async fn session_without_a_creation_event_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
-        let original = session(&path, Some("legacy-model")).await;
+        let original = session(&path, Some("missing-created")).await;
         original
             .append(EventKind::User {
                 text: "persist".into(),
@@ -1868,8 +1735,8 @@ mod tests {
             .connection
             .call(|db| {
                 db.execute(
-                    "UPDATE sessions SET provider = 'legacy-provider', model = 'legacy-current'
-                     WHERE id = 'legacy-model'",
+                    "DELETE FROM events
+                     WHERE session_id = 'missing-created' AND kind = 'session_created'",
                     [],
                 )?;
                 Ok::<_, tokio_rusqlite::rusqlite::Error>(())
@@ -1878,9 +1745,20 @@ mod tests {
             .unwrap();
         drop(original);
 
-        let resumed = session(&path, Some("legacy-model")).await;
-        assert_eq!(resumed.model_settings().await.provider, "legacy-provider");
-        assert_eq!(resumed.model_settings().await.model, "legacy-current");
+        let error = match Session::open_at(
+            path,
+            Some("missing-created"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("ignored"),
+        )
+        .await
+        {
+            Ok(_) => panic!("session without a creation event was resumed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("has no creation event"));
     }
 
     #[tokio::test]

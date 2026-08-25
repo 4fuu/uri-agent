@@ -3936,9 +3936,9 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     assert_eq!(
         tool_title(
             "exec",
-            &serde_json::json!({"uri": "bash://run", "body": "legacy command"})
+            &serde_json::json!({"uri": "bash://run", "body": "test command"})
         ),
-        "$ legacy command"
+        "$ test command"
     );
     assert_eq!(
         tool_title(

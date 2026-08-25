@@ -726,7 +726,7 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
         "max": {"model": "claude-opus-4-6-thinking", "thinkingBudget": 32768, "maxOutputTokens": 64000}
     });
 
-    let mut models = BTreeMap::from([
+    let models = BTreeMap::from([
         (
             "gemini-3.7-flash".to_string(),
             tiered(
@@ -802,199 +802,6 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
             ),
         ),
     ]);
-
-    let legacy = [
-        ("claude-fable-5", "Claude Fable 5", "claude-fable-5"),
-        ("claude-opus-4-8", "Claude Opus 4.8", "claude-opus-4-8"),
-        ("claude-opus-4-7", "Claude Opus 4.7", "claude-opus-4-7"),
-        (
-            "claude-sonnet-4-5",
-            "Claude Sonnet 4.5",
-            "claude-sonnet-4-5",
-        ),
-        ("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-2.5-pro"),
-        ("gemini-3-pro-low", "Gemini 3 Pro Low", "gemini-3-pro-low"),
-        (
-            "gemini-3-pro-high",
-            "Gemini 3 Pro High",
-            "gemini-3-pro-high",
-        ),
-    ];
-    for (id, name, upstream) in legacy {
-        models.insert(id.to_string(), legacy_antigravity_model(id, name, upstream));
-    }
-    for (id, name, context_window, max_tokens, routes) in [
-        (
-            "gemini-3-flash",
-            "Gemini 3 Flash",
-            1_000_000,
-            65_536,
-            gemini_35_routes.clone(),
-        ),
-        (
-            "gemini-3.5-flash-high",
-            "Gemini 3.5 Flash High",
-            1_000_000,
-            65_536,
-            gemini_35_routes.clone(),
-        ),
-        (
-            "gemini-3.1-pro-high",
-            "Gemini 3.1 Pro High",
-            1_048_576,
-            65_535,
-            gemini_31_routes.clone(),
-        ),
-        (
-            "gemini-pro",
-            "Gemini Pro",
-            1_048_576,
-            65_535,
-            gemini_31_routes.clone(),
-        ),
-        (
-            "gemini-3.7-flash-high",
-            "Gemini 3.7 Flash High",
-            1_000_000,
-            65_536,
-            gemini_37_routes.clone(),
-        ),
-        (
-            "gemini-3.7-flash-tiered",
-            "Gemini 3.7 Flash Tiered",
-            1_000_000,
-            65_536,
-            gemini_37_routes.clone(),
-        ),
-        (
-            "gemini-3.6-flash",
-            "Gemini 3.6 Flash",
-            1_000_000,
-            65_536,
-            gemini_37_routes.clone(),
-        ),
-        (
-            "gemini-3.6-flash-high",
-            "Gemini 3.6 Flash High",
-            1_000_000,
-            65_536,
-            gemini_37_routes.clone(),
-        ),
-        (
-            "gemini-3.6-flash-tiered",
-            "Gemini 3.6 Flash Tiered",
-            1_000_000,
-            65_536,
-            gemini_37_routes.clone(),
-        ),
-    ] {
-        models.insert(
-            id.to_string(),
-            tiered(id, name, context_window, max_tokens, routes),
-        );
-        models
-            .get_mut(id)
-            .and_then(Value::as_object_mut)
-            .expect("built-in Antigravity model")
-            .insert("hidden".to_string(), Value::Bool(true));
-    }
-    for (id, name, level, route) in [
-        (
-            "gemini-3.1-pro-low",
-            "Gemini 3.1 Pro Low",
-            "low",
-            gemini_31_routes["low"].clone(),
-        ),
-        (
-            "gemini-3.6-flash-low",
-            "Gemini 3.6 Flash Low",
-            "low",
-            gemini_37_routes["low"].clone(),
-        ),
-        (
-            "gemini-3.6-flash-medium",
-            "Gemini 3.6 Flash Medium",
-            "medium",
-            gemini_37_routes["medium"].clone(),
-        ),
-        (
-            "gemini-3.7-flash-low",
-            "Gemini 3.7 Flash Low",
-            "low",
-            gemini_37_routes["low"].clone(),
-        ),
-        (
-            "gemini-3.7-flash-medium",
-            "Gemini 3.7 Flash Medium",
-            "medium",
-            gemini_37_routes["medium"].clone(),
-        ),
-        (
-            "gemini-3.5-flash-low",
-            "Gemini 3.5 Flash Low",
-            "low",
-            gemini_35_routes["low"].clone(),
-        ),
-        (
-            "gemini-3.5-flash-medium",
-            "Gemini 3.5 Flash Medium",
-            "medium",
-            gemini_35_routes["medium"].clone(),
-        ),
-    ] {
-        models.insert(
-            id.to_string(),
-            fixed_legacy_antigravity_model(id, name, level, route),
-        );
-    }
-    for (id, name, routes) in [
-        (
-            "claude-sonnet-4-6-thinking",
-            "Claude Sonnet 4.6 Thinking",
-            claude_sonnet_routes,
-        ),
-        (
-            "claude-opus-4-6-thinking",
-            "Claude Opus 4.6 Thinking",
-            claude_opus_routes,
-        ),
-    ] {
-        models.insert(
-            id.to_string(),
-            antigravity_model(
-                id,
-                name,
-                true,
-                (200_000, 64_000),
-                true,
-                serde_json::json!({
-                    "off": null, "minimal": null, "low": "low", "medium": "medium",
-                    "high": "high", "xhigh": null, "max": "max"
-                }),
-                routes,
-            ),
-        );
-    }
-    for (id, name) in [
-        ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-        ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
-        ("gemini-2.5-flash-thinking", "Gemini 2.5 Flash Thinking"),
-    ] {
-        models.insert(
-            id.to_string(),
-            antigravity_model(
-                id,
-                name,
-                false,
-                (1_048_576, 16_384),
-                true,
-                serde_json::json!({}),
-                serde_json::json!({
-                    "off": {"model": "gemini-3.1-flash-lite", "thinkingBudget": 0, "maxOutputTokens": 16384, "includeThoughts": false}
-                }),
-            ),
-        );
-    }
     BTreeMap::from([("antigravity".to_string(), models)])
 }
 
@@ -1008,12 +815,6 @@ fn antigravity_model(
     routes: Value,
 ) -> Value {
     let (context_window, max_tokens) = limits;
-    let upstream = routes
-        .get("high")
-        .or_else(|| routes.get("off"))
-        .and_then(|route| route.get("model"))
-        .and_then(Value::as_str)
-        .unwrap_or(id);
     serde_json::json!({
         "id": id,
         "name": name,
@@ -1028,53 +829,9 @@ fn antigravity_model(
         "maxTokens": max_tokens,
         "thinkingLevelMap": thinking_level_map,
         "compat": {
-            "antigravityModel": upstream,
             "antigravityRoutes": routes
         }
     })
-}
-
-fn legacy_antigravity_model(id: &str, name: &str, upstream: &str) -> Value {
-    antigravity_model(
-        id,
-        name,
-        true,
-        (1_048_576, 64_000),
-        true,
-        serde_json::json!({}),
-        serde_json::json!({
-            "off": {"model": upstream, "thinkingBudget": 0, "maxOutputTokens": 64000, "includeThoughts": false},
-            "minimal": {"model": upstream, "thinkingBudget": 1024, "maxOutputTokens": 64000},
-            "low": {"model": upstream, "thinkingBudget": 2048, "maxOutputTokens": 64000},
-            "medium": {"model": upstream, "thinkingBudget": 8192, "maxOutputTokens": 64000},
-            "high": {"model": upstream, "thinkingBudget": 16384, "maxOutputTokens": 64000}
-        }),
-    )
-}
-
-fn fixed_legacy_antigravity_model(id: &str, name: &str, level: &str, route: Value) -> Value {
-    let mut thinking_level_map = Map::new();
-    for candidate in ThinkingLevel::ALL {
-        thinking_level_map.insert(candidate.as_str().to_string(), Value::Null);
-    }
-    thinking_level_map.insert(level.to_string(), Value::String(level.to_string()));
-    let mut routes = Map::new();
-    routes.insert(level.to_string(), route.clone());
-    antigravity_model(
-        id,
-        name,
-        true,
-        (
-            1_048_576,
-            route
-                .get("maxOutputTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(64_000),
-        ),
-        true,
-        Value::Object(thinking_level_map),
-        Value::Object(routes),
-    )
 }
 
 fn apply_provider_defaults(model: &mut Value, provider: &UserProvider) {
@@ -1245,10 +1002,6 @@ mod tests {
             .unwrap();
         assert_eq!(gemini.name, "Private Flash");
         assert_eq!(gemini.api, "antigravity");
-        assert_eq!(
-            gemini.compat("antigravityModel").and_then(Value::as_str),
-            Some("gemini-3.7-flash-high")
-        );
         assert_eq!(gemini.limits().context_window, 1_000_000);
         assert_eq!(gemini.limits().max_tokens, 65_536);
         assert_eq!(
@@ -1259,21 +1012,21 @@ mod tests {
                 .and_then(Value::as_str),
             Some("gemini-3.7-flash-medium")
         );
-        assert!(
-            models
-                .iter()
-                .find(|model| model.id == "gemini-3.6-flash-low")
-                .is_some_and(CatalogModel::hidden)
-        );
-        assert!(!gemini.hidden());
         assert_eq!(
             models
                 .iter()
-                .find(|model| model.id == "claude-opus-4-6")
-                .and_then(|model| model.compat("antigravityModel"))
-                .and_then(Value::as_str),
-            Some("claude-opus-4-6-thinking")
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "claude-opus-4-6",
+                "claude-sonnet-4-6",
+                "gemini-3.1-flash-lite",
+                "gemini-3.1-pro",
+                "gemini-3.5-flash",
+                "gemini-3.7-flash",
+            ]
         );
+        assert!(models.iter().all(|model| !model.hidden()));
     }
 
     #[test]

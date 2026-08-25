@@ -77,4 +77,4 @@ A new session stores:
 - each selected Skill's name and description;
 - each selected Skill's canonical `SKILL.md` path.
 
-Resume reuses this snapshot instead of rediscovering current context. Resources continue to load from the frozen location, so removing it produces an explicit error; a same-named Skill elsewhere cannot replace it. A historical session without frozen context is invalid rather than being reinterpreted with current startup state.
+Resume reuses this snapshot instead of rediscovering current context. Resources continue to load from the frozen location, so removing it produces an explicit error; a same-named Skill elsewhere cannot replace it. A stored session without frozen context is invalid rather than being reinterpreted with current startup state.

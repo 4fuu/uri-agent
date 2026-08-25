@@ -220,7 +220,7 @@ struct SettingsFile {
     default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_limit: Option<usize>,
-    #[serde(alias = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     default_thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
@@ -1326,11 +1326,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_file_uses_pi_thinking_fields_and_migrates_the_legacy_name() {
+    fn settings_file_uses_pi_thinking_fields() {
         let settings: SettingsFile = serde_json::from_value(serde_json::json!({
             "defaultProvider": "openai",
             "defaultModel": "gpt-5.2",
-            "thinkingLevel": "high",
+            "defaultThinkingLevel": "high",
             "modelThinkingLevels": {
                 "openai/gpt-5.2": "medium"
             }
@@ -1339,7 +1339,6 @@ mod tests {
         let value = serde_json::to_value(settings).unwrap();
         assert_eq!(value["defaultThinkingLevel"], "high");
         assert_eq!(value["modelThinkingLevels"]["openai/gpt-5.2"], "medium");
-        assert!(value.get("thinkingLevel").is_none());
     }
 
     #[tokio::test]

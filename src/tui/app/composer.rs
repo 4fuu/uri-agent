@@ -98,17 +98,10 @@ pub(super) fn strip_image_references_with(
         .join("\n")
 }
 
-pub(super) fn legacy_image_token_spans(line: &str) -> Vec<ImageTokenSpan> {
-    numbered_image_spans(line, LEGACY_IMAGE_TOKEN_PREFIX, None)
-}
-
 pub(super) fn strip_image_references(text: &str) -> String {
     strip_image_references_with(
-        &strip_image_references_with(
-            &strip_image_references_with(text, image_token_spans),
-            image_marker_spans,
-        ),
-        legacy_image_token_spans,
+        &strip_image_references_with(text, image_token_spans),
+        image_marker_spans,
     )
 }
 
