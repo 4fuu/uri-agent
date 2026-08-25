@@ -1,7 +1,10 @@
 use super::*;
 
-pub(super) fn image_token_label(id: u64) -> String {
-    format!("{IMAGE_TOKEN_PREFIX}{id}]")
+pub(super) fn image_token_label(id: u64, dimensions: Option<(u32, u32)>) -> String {
+    match dimensions {
+        Some((width, height)) => format!("{IMAGE_TOKEN_PREFIX}{id} {width}x{height}]"),
+        None => format!("{IMAGE_TOKEN_PREFIX}{id}]"),
+    }
 }
 
 pub(super) fn numbered_image_spans(
@@ -19,7 +22,20 @@ pub(super) fn numbered_image_spans(
             if digits == 0 {
                 return None;
             }
-            let mut end_byte = digits_start + digits;
+            let id_end_byte = digits_start + digits;
+            let mut end_byte = id_end_byte;
+            if let Some(rest) = line.get(end_byte..).and_then(|rest| rest.strip_prefix(' ')) {
+                let width = rest.bytes().take_while(u8::is_ascii_digit).count();
+                if width > 0 && rest.as_bytes().get(width) == Some(&b'x') {
+                    let height = rest[width + 1..]
+                        .bytes()
+                        .take_while(u8::is_ascii_digit)
+                        .count();
+                    if height > 0 {
+                        end_byte += 1 + width + 1 + height;
+                    }
+                }
+            }
             if let Some(closing) = closing {
                 if line.as_bytes().get(end_byte) != Some(&closing) {
                     return None;
@@ -31,6 +47,7 @@ pub(super) fn numbered_image_spans(
                 id,
                 start_byte,
                 end_byte,
+                id_end_byte,
                 start_col: line[..start_byte].chars().count(),
                 end_col: line[..end_byte].chars().count(),
             })
@@ -50,7 +67,6 @@ pub(super) fn rewrite_image_references(
     text: &str,
     ids: &BTreeMap<u64, u64>,
     spans: fn(&str) -> Vec<ImageTokenSpan>,
-    marker: bool,
 ) -> String {
     text.split('\n')
         .map(|line| {
@@ -61,11 +77,8 @@ pub(super) fn rewrite_image_references(
                     continue;
                 };
                 rewritten.push_str(&line[cursor..token.start_byte]);
-                if marker {
-                    rewritten.push_str(&format!("[Image #{id}]"));
-                } else {
-                    rewritten.push_str(&image_token_label(*id));
-                }
+                rewritten.push_str(&format!("{IMAGE_TOKEN_PREFIX}{id}"));
+                rewritten.push_str(&line[token.id_end_byte..token.end_byte]);
                 cursor = token.end_byte;
             }
             rewritten.push_str(&line[cursor..]);
@@ -76,7 +89,7 @@ pub(super) fn rewrite_image_references(
 }
 
 pub(super) fn rewrite_image_token_ids(text: &str, ids: &BTreeMap<u64, u64>) -> String {
-    rewrite_image_references(text, ids, image_token_spans, false)
+    rewrite_image_references(text, ids, image_token_spans)
 }
 
 pub(super) fn strip_image_references_with(
@@ -109,19 +122,19 @@ pub(super) fn collapse_image_markers(text: &str, image_count: usize) -> String {
     let ids = (1..=image_count as u64)
         .map(|id| (id, id))
         .collect::<BTreeMap<_, _>>();
-    rewrite_image_references(text, &ids, image_marker_spans, false)
+    rewrite_image_references(text, &ids, image_marker_spans)
 }
 
-pub(super) fn ensure_image_markers(text: &str, image_count: usize) -> String {
+pub(super) fn ensure_image_markers(text: &str, images: &BTreeMap<u64, ImageAttachment>) -> String {
     let present = text
         .split('\n')
         .flat_map(image_marker_spans)
-        .filter_map(|token| usize::try_from(token.id).ok())
-        .filter(|id| *id <= image_count)
+        .map(|token| token.id)
         .collect::<HashSet<_>>();
-    let missing = (1..=image_count)
+    let missing = images
+        .keys()
         .filter(|id| !present.contains(id))
-        .map(|id| format!("[Image #{id}]"))
+        .map(|id| image_token_label(*id, images.get(id).and_then(ImageAttachment::dimensions)))
         .collect::<Vec<_>>()
         .join(" ");
     match (text.trim().is_empty(), missing.is_empty()) {
@@ -153,6 +166,42 @@ pub(super) fn prepare_image_references(
     (ids, images)
 }
 
+pub(super) fn image_store_from_references(
+    text: &str,
+    images: &[ImageAttachment],
+    spans: fn(&str) -> Vec<ImageTokenSpan>,
+) -> BTreeMap<u64, ImageAttachment> {
+    let mut store = BTreeMap::new();
+    let mut index = 0usize;
+    let mut seen = HashSet::new();
+    for line in text.split('\n') {
+        for token in spans(line) {
+            if !seen.insert(token.id) {
+                continue;
+            }
+            let Some(image) = images.get(index) else {
+                continue;
+            };
+            store.insert(token.id, image.clone());
+            index += 1;
+        }
+    }
+    let mut next_id = store
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
+    for image in images.iter().skip(index).cloned() {
+        while store.contains_key(&next_id) {
+            next_id = next_id.saturating_add(1);
+        }
+        store.insert(next_id, image);
+        next_id = next_id.saturating_add(1);
+    }
+    store
+}
+
 pub(super) fn prepare_composer_images(
     text: &str,
     image_store: &BTreeMap<u64, ImageAttachment>,
@@ -166,8 +215,9 @@ pub(super) fn prepare_image_submission(
     image_store: &BTreeMap<u64, ImageAttachment>,
 ) -> (String, Vec<ImageAttachment>) {
     let (ids, images) = prepare_image_references(text, image_store);
+    let ids = ids.into_keys().map(|id| (id, id)).collect();
     (
-        rewrite_image_references(text, &ids, image_token_spans, true),
+        rewrite_image_references(text, &ids, image_token_spans),
         images,
     )
 }

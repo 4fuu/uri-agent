@@ -2015,7 +2015,7 @@ fn deleting_a_selection_that_touches_a_token_removes_the_whole_image() {
 }
 
 #[test]
-fn deleting_one_image_token_keeps_and_renumbers_the_other_on_submit() {
+fn deleting_one_image_token_keeps_the_remaining_token_number_on_submit() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);
     app.insert_clipboard_image(vec![1]);
@@ -2026,8 +2026,16 @@ fn deleting_one_image_token_keeps_and_renumbers_the_other_on_submit() {
 
     assert_eq!(app.draft_text(), " [Image #2]");
     let (prompt, images) = app.composer_submission();
-    assert_eq!(prompt, " [Image #1]");
+    assert_eq!(prompt, " [Image #2]");
     assert_eq!(images, [ImageAttachment::png(vec![2])]);
+
+    let (prompt, images) = app.submit().unwrap();
+    assert_eq!(prompt, " [Image #2]");
+    assert_eq!(images, [ImageAttachment::png(vec![2])]);
+    app.busy = false;
+    app.restore_to_draft(&prompt);
+    assert_eq!(app.draft_text(), " [Image #2]");
+    assert_eq!(app.composer_submission(), (prompt, images));
 }
 
 #[test]
@@ -2170,11 +2178,66 @@ fn restoring_pending_images_merges_and_renumbers_composer_tokens() {
 }
 
 #[test]
+fn restoring_pending_images_with_gapped_markers_rebases_the_draft() {
+    let mut app = test_app();
+    app.insert_clipboard_image(vec![9]);
+
+    app.restore_pending_to_draft("queued [Image #3]", vec![ImageAttachment::png(vec![3])]);
+
+    assert_eq!(app.draft_text(), "queued [Image #1]\n\n[Image #2]");
+    let (prompt, images) = app.composer_submission();
+    assert_eq!(prompt, "queued [Image #1]\n\n[Image #2]");
+    assert_eq!(
+        images,
+        [ImageAttachment::png(vec![3]), ImageAttachment::png(vec![9])]
+    );
+}
+
+#[test]
 fn persisted_drafts_drop_image_tokens_without_binary_attachments() {
     assert_eq!(
         strip_image_references("before [Image #1]\nafter [Image #20]"),
         "before \nafter "
     );
+    assert_eq!(
+        strip_image_references("keep [Image #2 1280x720] text"),
+        "keep  text"
+    );
+}
+
+#[test]
+fn clipboard_image_tokens_include_png_dimensions() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Composer);
+    let png = crate::clipboard::encode_png(12, 8, vec![0; 12 * 8 * 4]).unwrap();
+    app.insert_clipboard_image(png.clone());
+
+    assert_eq!(app.draft_text(), "[Image #1 12x8]");
+    let (prompt, images) = app.composer_submission();
+    assert_eq!(prompt, "[Image #1 12x8]");
+    assert_eq!(images, [ImageAttachment::png(png.clone())]);
+
+    let mut restored = test_app();
+    restored.restore_pending_to_draft("queued [Image #3 12x8]", vec![ImageAttachment::png(png)]);
+    assert_eq!(restored.draft_text(), "queued [Image #1 12x8]");
+
+    app.input.move_cursor(CursorMove::End);
+    app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
+    assert!(app.draft_text().is_empty());
+    assert!(app.composer_submission().1.is_empty());
+}
+
+#[test]
+fn image_token_spans_accept_optional_dimensions() {
+    let spans = image_token_spans("see [Image #2 1920x1080] and [Image #3]");
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].id, 2);
+    assert_eq!(
+        spans[0].end_col - spans[0].start_col,
+        "[Image #2 1920x1080]".chars().count()
+    );
+    assert_eq!(spans[1].id, 3);
+    assert!(image_token_spans("[Image #1 extra]").is_empty());
 }
 
 #[test]

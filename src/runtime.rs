@@ -44,6 +44,21 @@ impl ImageAttachment {
     pub(crate) fn png(bytes: Vec<u8>) -> Self {
         Self { bytes }
     }
+
+    pub(crate) fn dimensions(&self) -> Option<(u32, u32)> {
+        png_ihdr_dimensions(&self.bytes)
+    }
+}
+
+fn png_ihdr_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    const IHDR: &[u8] = b"IHDR";
+    if bytes.len() < 24 || !bytes.starts_with(SIGNATURE) || &bytes[12..16] != IHDR {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 #[derive(Clone, Copy)]
@@ -1733,6 +1748,17 @@ mod tests {
     use async_trait::async_trait;
     use rig::message::{ToolCallId, ToolFunction};
     use std::collections::VecDeque;
+
+    #[test]
+    fn png_ihdr_dimensions_read_width_and_height() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&1920u32.to_be_bytes());
+        bytes.extend_from_slice(&1080u32.to_be_bytes());
+        assert_eq!(png_ihdr_dimensions(&bytes), Some((1920, 1080)));
+        assert_eq!(ImageAttachment::png(vec![1, 2, 3]).dimensions(), None);
+    }
 
     #[derive(Default)]
     struct FakeBackend {

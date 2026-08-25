@@ -287,6 +287,7 @@ struct ImageTokenSpan {
     id: u64,
     start_byte: usize,
     end_byte: usize,
+    id_end_byte: usize,
     start_col: usize,
     end_col: usize,
 }
@@ -1110,7 +1111,7 @@ impl App {
         if text.trim().is_empty() {
             return None;
         }
-        self.reset_composer_images(&images);
+        self.reset_composer_images(&text, &images);
         self.input = TextArea::default();
         self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
@@ -1126,14 +1127,15 @@ impl App {
         prepare_image_submission(&self.draft_text(), &self.composer_images)
     }
 
-    fn reset_composer_images(&mut self, images: &[ImageAttachment]) {
-        self.composer_images = images
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, image)| (index as u64 + 1, image))
-            .collect();
-        self.next_composer_image_id = images.len() as u64 + 1;
+    fn reset_composer_images(&mut self, text: &str, images: &[ImageAttachment]) {
+        self.composer_images = image_store_from_references(text, images, image_token_spans);
+        self.next_composer_image_id = self
+            .composer_images
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
     }
 
     fn insert_composer_text(&mut self, text: impl AsRef<str>) -> bool {
@@ -1152,8 +1154,10 @@ impl App {
     fn insert_clipboard_image(&mut self, bytes: Vec<u8>) {
         let id = self.next_composer_image_id;
         self.next_composer_image_id = self.next_composer_image_id.saturating_add(1);
-        self.composer_images.insert(id, ImageAttachment::png(bytes));
-        self.insert_composer_text(image_token_label(id));
+        let image = ImageAttachment::png(bytes);
+        let label = image_token_label(id, image.dimensions());
+        self.composer_images.insert(id, image);
+        self.insert_composer_text(label);
     }
 
     fn finish_clipboard_image_read(&mut self, result: Result<Vec<u8>>) {
@@ -1236,12 +1240,8 @@ impl App {
     }
 
     fn restore_pending_to_draft(&mut self, text: &str, images: Vec<ImageAttachment>) {
-        let queued_store = images
-            .into_iter()
-            .enumerate()
-            .map(|(index, image)| (index as u64 + 1, image))
-            .collect::<BTreeMap<_, _>>();
-        let queued = ensure_image_markers(text, queued_store.len());
+        let queued_store = image_store_from_references(text, &images, image_marker_spans);
+        let queued = ensure_image_markers(text, &queued_store);
         let queued = collapse_image_markers(&queued, queued_store.len());
         let (queued, mut queued_images) = prepare_composer_images(&queued, &queued_store);
         let (current, current_images) =
@@ -1259,7 +1259,7 @@ impl App {
             .collect::<Vec<_>>()
             .join("\n\n");
         queued_images.extend(current_images);
-        self.reset_composer_images(&queued_images);
+        self.reset_composer_images(&restored, &queued_images);
         self.input = TextArea::default();
         self.input.insert_str(restored);
         self.sync_composer_chrome();

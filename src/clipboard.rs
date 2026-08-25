@@ -51,7 +51,7 @@ fn read_arboard_image_png() -> Result<Vec<u8>> {
     encode_png(image.width, image.height, image.bytes.into_owned())
 }
 
-fn encode_png(width: usize, height: usize, bytes: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn encode_png(width: usize, height: usize, bytes: Vec<u8>) -> Result<Vec<u8>> {
     let width = u32::try_from(width).context("clipboard image width is too large")?;
     let height = u32::try_from(height).context("clipboard image height is too large")?;
     let image = RgbaImage::from_raw(width, height, bytes)
