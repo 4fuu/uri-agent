@@ -1290,7 +1290,7 @@ mod tests {
             "bash",
             &executable,
             directory.path(),
-            "(for value in 1 2 3 4; do sleep 0.05; printf 'tail%s\\n' \"$value\"; done) &",
+            "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do :; done; printf 'tail1\\ntail2\\ntail3\\ntail4\\n') &",
             &BTreeMap::new(),
             None,
             None,
