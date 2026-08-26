@@ -53,19 +53,21 @@ protocol registry and reflects that part of the replacement set.
 
 Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state; the detailed loading and authoring pages remain separately addressable.
 
-## ABI version 3
+## ABI version 4
 
-ABI version 3 lets a module contribute protocols and typed direct model tools.
-It does not contribute system prompt fragments, commands, panels, status
-providers, or composer completions. Exports use Extism's bytes-in/bytes-out
-functions and may be implemented with any compatible PDK. ABI version 2 is
-intentionally unsupported; rebuild old modules with the version 3 SDK.
+ABI version 4 lets a module contribute protocols and typed direct model tools
+and resolve configured model roles through a read-only host call. It does not
+contribute system prompt fragments, commands, panels, status providers, or
+composer completions. Exports use Extism's bytes-in/bytes-out functions and may
+be implemented with any compatible PDK. ABI version 3 modules remain supported;
+rebuild them with the version 4 SDK to use model-role lookup. ABI version 2 is
+intentionally unsupported.
 
 Every module exports `uri_agent_manifest`, which takes no input and returns:
 
 ```json
 {
-  "abi_version": 3,
+  "abi_version": 4,
   "protocols": [
     {
       "name": "example",
@@ -139,6 +141,24 @@ instantiated until the next reload, so its in-memory state survives calls;
 calls into one module are serialized.
 
 Each plugin implements its protocol help through the same handler. That help must describe every supported address and body shape.
+
+## Model-role lookup
+
+Model roles are named model routes configured in global or project
+`settings.json`; see [Model roles for plugins](configuration.md#model-roles-for-plugins).
+An ABI version 4 Rust guest resolves one dynamically without declaring a
+manifest permission:
+
+```rust
+let role = uri_agent_plugin_sdk::model_role("review")?
+    .ok_or("model role review is not configured")?;
+```
+
+The result contains `provider`, `model`, and the resolved `thinking` value.
+Lookup returns `None` for an unconfigured role and fails when the role name or
+configured model is invalid. It returns no API key, does not perform inference,
+and does not change the conversation model. A settings reload or project
+override is reflected without reloading the plugin.
 
 ## Agent environment access
 

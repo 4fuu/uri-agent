@@ -12,7 +12,12 @@ URI Agent does not choose a default provider or model. After starting it in a pr
 2. Run `:model` to select a runnable model.
 3. Use `:settings` to inspect the effective values.
 
-`:logout` removes a stored credential. Model and credential changes apply to the current session without restarting the application.
+`:model` lists only providers with a currently configured credential source.
+`:logout` removes a stored credential. If it removes the current provider's
+last credential source, URI Agent also clears that provider's saved default and
+the current session's model instead of switching providers automatically.
+Per-model thinking preferences are retained. Model and credential changes apply
+to the current session without restarting the application.
 
 ## Model catalog
 
@@ -26,7 +31,7 @@ URI Agent downloads provider and model records from pi.dev and merges them with 
 
 URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol). It is not part of the pi.dev coverage count.
 
-The model selector shows only models using a supported API family. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
+The model selector shows only models using a supported API family whose provider has a configured credential from `models.json`, `auth.json`, or a recognized provider environment variable. The generic `URI_AGENT_API_KEY` and `--api-key` overrides expose only the current provider rather than every catalog provider. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
 
 `openai-codex-responses` targets the ChatGPT Codex subscription endpoint and uses WebSocket streaming by default. URI Agent supplies the account ID from the OAuth access token, stable session headers and prompt cache key, and the Codex Responses request fields required for reasoning and tool calls. Within a session it reuses an idle connection, retains it for up to five idle minutes or 55 minutes total, and—when request options and history still match—continues from `previous_response_id` while sending only newly appended input. A busy connection is never shared between concurrent requests.
 
@@ -162,7 +167,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 
 | Path | Purpose |
 | --- | --- |
-| `<config>/settings.json` | Global provider, model, thinking, output, and terminal settings |
+| `<config>/settings.json` | Global provider, model, model-role, thinking, output, and terminal settings |
 | `<config>/auth.json` | Global provider credentials |
 | `<config>/environment.json` | Global environment variables for Agent shell commands and trusted plugins |
 | `<config>/models.json` | Custom providers, models, headers, and model overrides |
@@ -197,6 +202,7 @@ The dedicated linked Rust and WASM host interface requires an explicitly request
 | `outputLimit` | Maximum bytes returned inline before preserving full output | `32768` |
 | `defaultThinkingLevel` | Fallback reasoning effort | `off` |
 | `modelThinkingLevels` | Per-model effort keyed by `provider/model` | `{}` |
+| `modelRoles` | Named model routes available to linked and WASM plugins | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
 | `keyDisplay` | Key-hint style: `auto`, `macos`, or `text` | `auto` |
 | `compaction.enabled` | Run threshold and overflow compaction automatically | `true` |
@@ -252,6 +258,35 @@ off, minimal, low, medium, high, xhigh, max
 The active model determines which levels are available. Run `:effort` to open a selector containing only supported levels; the current effective level is selected when the panel opens.
 
 `:effort` and the Thinking row in Settings persist the selection in `modelThinkingLevels` under `provider/model`. Switching models restores that model's saved value. `defaultThinkingLevel` is the file-level fallback; `URI_AGENT_THINKING` and `--thinking` override it for the current invocation.
+
+## Model roles for plugins
+
+`modelRoles` lets plugins resolve a named provider, model, and thinking effort
+without changing the active conversation model:
+
+```json
+{
+  "modelRoles": {
+    "review": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "thinking": "high"
+    },
+    "commit": {
+      "provider": "openai",
+      "model": "gpt-5.2"
+    }
+  }
+}
+```
+
+Role names contain only ASCII letters, digits, `-`, and `_`. A same-named
+project role replaces the complete global role. `provider` and `model` are
+required and must identify a runnable catalog model. When `thinking` is
+omitted, resolution uses that model's `modelThinkingLevels` entry and then
+`defaultThinkingLevel`. Lookup is dynamic, returns no credential, and does not
+alter the current session. URI Agent exposes this interface for plugins but
+does not otherwise use model roles yet; see [WASM model-role lookup](plugins.md#model-role-lookup).
 
 ## Command-line options
 

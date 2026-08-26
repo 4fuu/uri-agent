@@ -2,7 +2,8 @@ use crate::config::display_path;
 use crate::output::OutputStore;
 use crate::plugin::{
     DynamicModelToolSource, ModelTool, ModelToolDescriptor, Plugin, PluginCredentials,
-    PluginEnvironment, PluginHost, PluginPermission, validate_model_tool_descriptor,
+    PluginEnvironment, PluginHost, PluginModelRoles, PluginPermission,
+    validate_model_tool_descriptor,
 };
 use crate::protocol::{
     DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRegistry,
@@ -20,11 +21,12 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell as AsyncOnceCell, RwLock as AsyncRwLock};
 use uri_agent_plugin_sdk::{
-    ABI_VERSION, HANDLE_EXPORT, HOST_CREDENTIALS, HOST_ENVIRONMENT, HOST_EXEC, HOST_READ,
-    HandlerRequest, MANIFEST_EXPORT, Operation, PluginManifest,
+    ABI_VERSION, HANDLE_EXPORT, HOST_CREDENTIALS, HOST_ENVIRONMENT, HOST_EXEC, HOST_MODEL_ROLE,
+    HOST_READ, HandlerRequest, MANIFEST_EXPORT, Operation, PluginManifest,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
+const MIN_SUPPORTED_ABI_VERSION: u32 = 3;
 const MAX_MODULE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -135,7 +137,8 @@ fn author_help() -> String {
         r##"# wasm_plugin authoring
 
 Author WASM plugins that register protocols and typed direct model tools.
-The SDK targets ABI version 3; rebuild plugins that use an older ABI.
+The SDK targets ABI version 4. Existing ABI version 3 plugins remain supported;
+rebuild them to use model-role lookup.
 
 ## Rust SDK
 
@@ -224,6 +227,13 @@ process environment variables are available through
 `.request_credentials_access()` once. This grants dynamic read access to API
 keys for every provider and is likewise an explicit source-audit marker.
 
+User-configured model routes are available through
+`uri_agent_plugin_sdk::model_role(name)`. The returned role contains provider,
+model, and resolved thinking values, but no credential. Lookup requires no
+manifest permission, performs no inference, and does not change the active
+conversation model. Role names use only ASCII letters, digits, `-`, and `_`;
+see the model-role settings documentation for global/project precedence.
+
 Read `wasm_plugin://help/load` before loading or reloading the completed plugin.
 "##,
         version = env!("CARGO_PKG_VERSION"),
@@ -246,6 +256,7 @@ struct HostBridge {
     environment_allowed: Arc<OnceLock<bool>>,
     credentials: Arc<OnceLock<PluginCredentials>>,
     credentials_allowed: Arc<OnceLock<bool>>,
+    model_roles: Arc<OnceLock<PluginModelRoles>>,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +280,7 @@ impl HostBridge {
             environment_allowed: Arc::new(OnceLock::new()),
             credentials: Arc::new(OnceLock::new()),
             credentials_allowed: Arc::new(OnceLock::new()),
+            model_roles: Arc::new(OnceLock::new()),
         }
     }
 
@@ -280,6 +292,7 @@ impl HostBridge {
             environment_allowed: Arc::new(OnceLock::new()),
             credentials: self.credentials.clone(),
             credentials_allowed: Arc::new(OnceLock::new()),
+            model_roles: self.model_roles.clone(),
         }
     }
 
@@ -311,6 +324,12 @@ impl HostBridge {
         self.credentials_allowed
             .set(allowed)
             .map_err(|_| anyhow!("WASM plugin credential permission is already bound"))
+    }
+
+    fn bind_model_roles(&self, model_roles: PluginModelRoles) -> Result<()> {
+        self.model_roles
+            .set(model_roles)
+            .map_err(|_| anyhow!("WASM plugin model roles are already bound"))
     }
 
     fn dispatch(&self, operation: Operation, input: &str) -> Result<String> {
@@ -355,6 +374,15 @@ impl HostBridge {
         let value = self.runtime.block_on(credentials.api_key(provider))?;
         serde_json::to_string(&value).context("cannot encode provider API key result")
     }
+
+    fn model_role(&self, name: &str) -> Result<String> {
+        let model_roles = self
+            .model_roles
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin model roles are not attached"))?;
+        let value = self.runtime.block_on(model_roles.resolve(name))?;
+        serde_json::to_string(&value).context("cannot encode model role result")
+    }
 }
 
 extism::host_fn!(uri_agent_read_host(user_data: HostBridge; input: String) -> String {
@@ -391,6 +419,15 @@ extism::host_fn!(uri_agent_credentials_host(user_data: HostBridge; input: String
         .map_err(|_| anyhow!("WASM plugin credentials host bridge lock is poisoned"))?
         .clone();
     bridge.provider_api_key(&input)
+});
+
+extism::host_fn!(uri_agent_model_role_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin model role host bridge lock is poisoned"))?
+        .clone();
+    bridge.model_role(&input)
 });
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -611,6 +648,7 @@ impl Plugin for WasmPluginManager {
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         self.bridge.bind_environment(host.environment()?)?;
         self.bridge.bind_credentials(host.credentials()?)?;
+        self.bridge.bind_model_roles(host.model_roles()?)?;
         host.protocols.register(self.clone())
     }
 }
@@ -1035,8 +1073,16 @@ fn build_runtime(
             HOST_CREDENTIALS,
             [ValType::I64],
             [ValType::I64],
-            user_data,
+            user_data.clone(),
             uri_agent_credentials_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_MODEL_ROLE,
+            [ValType::I64],
+            [ValType::I64],
+            user_data,
+            uri_agent_model_role_host,
         )
         .build()
 }
@@ -1059,10 +1105,10 @@ fn read_manifest(plugin: &mut extism::Plugin, display: &str) -> Result<PluginMan
 }
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
-    if manifest.abi_version != ABI_VERSION {
+    if !(MIN_SUPPORTED_ABI_VERSION..=ABI_VERSION).contains(&manifest.abi_version) {
         bail!(
-            "unsupported ABI version {}; expected {ABI_VERSION}",
-            manifest.abi_version
+            "unsupported ABI version {}; expected {MIN_SUPPORTED_ABI_VERSION} through {ABI_VERSION}",
+            manifest.abi_version,
         );
     }
     if manifest.protocols.len() > MAX_PROTOCOLS_PER_PLUGIN {
@@ -1313,6 +1359,28 @@ mod tests {
             host_function,
             br#"{"uri":"capture://from-plugin","body":"{\"answer\":42}"}"#,
         )
+    }
+
+    #[test]
+    fn current_and_previous_abi_versions_are_supported() {
+        let mut manifest = PluginManifest::new([]);
+        manifest.abi_version = MIN_SUPPORTED_ABI_VERSION;
+        validate_manifest(&manifest).unwrap();
+
+        manifest.abi_version = MIN_SUPPORTED_ABI_VERSION - 1;
+        assert!(
+            validate_manifest(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported ABI version")
+        );
+        manifest.abi_version = ABI_VERSION + 1;
+        assert!(
+            validate_manifest(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported ABI version")
+        );
     }
 
     async fn registry_with_manager(
@@ -1749,6 +1817,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("did not request environment access"));
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_model_role_lookup_requires_no_manifest_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            directory.path().join("models.json"),
+            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"review-model","name":"Review"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            directory.path().join("settings.json"),
+            br#"{"modelRoles":{"review":{"provider":"example","model":"review-model","thinking":"low"}}}"#,
+        )
+        .await
+        .unwrap();
+        let (registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        tokio::fs::write(
+            manager.directory().join("model-role.wasm"),
+            host_call_module_with_input(&valid_manifest("model_role"), HOST_MODEL_ROLE, b"review"),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        restore_help_read(&registry, "model_role").await;
+        assert_eq!(
+            registry.read("model_role://read", "").await.unwrap(),
+            r#"{"provider":"example","model":"review-model","thinking":"low"}"#
+        );
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 

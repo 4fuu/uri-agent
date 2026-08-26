@@ -1,4 +1,4 @@
-use crate::config::{AgentEnvironment, ConfigManager};
+use crate::config::{AgentEnvironment, ConfigManager, ModelRole};
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
 use crate::tool_download::BinaryDownloader;
 pub use crate::tool_download::{BinaryDownload, DownloadArchive};
@@ -714,6 +714,21 @@ impl PluginCredentials {
 }
 
 #[derive(Clone)]
+pub struct PluginModelRoles {
+    manager: Arc<ConfigManager>,
+}
+
+impl PluginModelRoles {
+    pub(crate) fn new(manager: Arc<ConfigManager>) -> Self {
+        Self { manager }
+    }
+
+    pub async fn resolve(&self, name: &str) -> Result<Option<ModelRole>> {
+        self.manager.model_role(name).await
+    }
+}
+
+#[derive(Clone)]
 pub struct PluginDownloads {
     downloader: BinaryDownloader,
 }
@@ -787,6 +802,14 @@ impl<'a> PluginHost<'a> {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("plugin credential access is not attached"))?;
         Ok(PluginCredentials::new(manager))
+    }
+
+    pub fn model_roles(&self) -> Result<PluginModelRoles> {
+        let manager = self
+            .credentials
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("plugin model roles are not attached"))?;
+        Ok(PluginModelRoles::new(manager))
     }
 
     pub fn downloads(&self) -> Result<PluginDownloads> {
@@ -974,6 +997,7 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::ThinkingLevel;
     use crate::output::OutputStore;
     use crate::protocol::{Protocol, ProtocolDescriptor};
     use crate::task::TaskManager;
@@ -1157,6 +1181,10 @@ mod tests {
         credentials: Arc<std::sync::OnceLock<PluginCredentials>>,
     }
 
+    struct ModelRolePlugin {
+        model_roles: Arc<std::sync::OnceLock<PluginModelRoles>>,
+    }
+
     #[derive(Clone)]
     struct DeclaredModelToolPlugin {
         declares_tool: bool,
@@ -1231,6 +1259,14 @@ mod tests {
             self.credentials
                 .set(host.credentials()?)
                 .map_err(|_| anyhow::anyhow!("credentials were already captured"))
+        }
+    }
+
+    impl Plugin for ModelRolePlugin {
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            self.model_roles
+                .set(host.model_roles()?)
+                .map_err(|_| anyhow::anyhow!("model roles were already captured"))
         }
     }
 
@@ -1626,6 +1662,68 @@ mod tests {
         assert_eq!(
             reader.api_key("exa").await.unwrap().as_deref(),
             Some("added later")
+        );
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_resolve_model_roles_dynamically_without_a_permission() {
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
+        tokio::fs::create_dir_all(&output).await.unwrap();
+        tokio::fs::write(
+            output.join("models.json"),
+            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"first","name":"First"},{"id":"second","name":"Second"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            output.join("settings.json"),
+            br#"{"modelRoles":{"review":{"provider":"example","model":"first","thinking":"low"}}}"#,
+        )
+        .await
+        .unwrap();
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        let manager = ConfigManager::load_for_test(&output, &output)
+            .await
+            .unwrap();
+        let capture = Arc::new(std::sync::OnceLock::new());
+        let mut plugins = PluginRegistry::new();
+        plugins.add(ModelRolePlugin {
+            model_roles: capture.clone(),
+        });
+        let mut host = PluginHost::new(
+            &mut protocols,
+            &mut model_tools,
+            &mut commands,
+            &mut tui,
+            environment,
+        )
+        .with_credentials(manager.clone());
+        plugins.install(&mut host).unwrap();
+        let roles = capture.get().unwrap();
+        assert_eq!(
+            roles.resolve("review").await.unwrap(),
+            Some(ModelRole {
+                provider: "example".to_string(),
+                model: "first".to_string(),
+                thinking: ThinkingLevel::Low,
+            })
+        );
+
+        tokio::fs::write(
+            output.join("settings.json"),
+            br#"{"modelRoles":{"review":{"provider":"example","model":"second","thinking":"high"}}}"#,
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+        assert_eq!(
+            roles.resolve("review").await.unwrap(),
+            Some(ModelRole {
+                provider: "example".to_string(),
+                model: "second".to_string(),
+                thinking: ThinkingLevel::High,
+            })
         );
         let _ = tokio::fs::remove_dir_all(output).await;
     }

@@ -1,8 +1,10 @@
 # URI Agent plugin SDK
 
-This crate provides Rust guest types, ABI version 3 exports, and host calls for
-trusted URI Agent Extism WebAssembly protocol and direct-tool plugins. Runtime
-installation, reload behavior, permissions, and limits are documented in
+This crate provides Rust guest types, ABI version 4 exports, and host calls for
+trusted URI Agent Extism WebAssembly protocol and direct-tool plugins. URI Agent
+continues to load ABI version 3 modules, but model-role lookup requires
+rebuilding with this SDK. Runtime installation, reload behavior, permissions,
+and limits are documented in
 [WASM plugins](https://github.com/4fuu/uri-agent/blob/main/docs/plugins.md).
 
 ## Use the SDK
@@ -101,6 +103,25 @@ map, and set `additionalProperties: false`; every `required` name must be presen
 in that map. URI Agent validates names and this strict schema shape, exposes the
 descriptor to the model, and sends typed arguments as
 `HandlerRequest::ModelTool` without protocol-body serialization.
+
+## Resolve a configured model role
+
+Model roles let the user choose model routes for plugin-owned work without the
+plugin hard-coding a provider or changing the conversation model:
+
+```rust
+#[cfg(target_family = "wasm")]
+fn review_model() -> Result<uri_agent_plugin_sdk::ModelRole, String> {
+    uri_agent_plugin_sdk::model_role("review")
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "model role review is not configured".to_string())
+}
+```
+
+The result contains `provider`, `model`, and `thinking`. Lookup is dynamic,
+returns no credential, performs no model request, and requires no manifest
+permission. Role configuration and precedence are documented under
+[Model roles for plugins](https://github.com/4fuu/uri-agent/blob/main/docs/configuration.md#model-roles-for-plugins).
 
 ## Request Agent environment access
 

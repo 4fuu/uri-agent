@@ -13,7 +13,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -21,6 +21,15 @@ pub const HOST_READ: &str = "uri_agent_read";
 pub const HOST_EXEC: &str = "uri_agent_exec";
 pub const HOST_ENVIRONMENT: &str = "uri_agent_environment";
 pub const HOST_CREDENTIALS: &str = "uri_agent_credentials";
+pub const HOST_MODEL_ROLE: &str = "uri_agent_model_role";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRole {
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +172,7 @@ mod host {
         pub fn uri_agent_exec(input: String) -> String;
         pub fn uri_agent_environment(input: String) -> String;
         pub fn uri_agent_credentials(input: String) -> String;
+        pub fn uri_agent_model_role(input: String) -> String;
     }
 }
 
@@ -191,6 +201,14 @@ pub fn environment_variable(name: &str) -> Result<Option<String>, Error> {
 #[cfg(target_family = "wasm")]
 pub fn provider_api_key(provider: &str) -> Result<Option<String>, Error> {
     let output = unsafe { host::uri_agent_credentials(provider.to_string())? };
+    Ok(serde_json::from_str(&output)?)
+}
+
+/// Resolve a configured model role. Model-role access does not expose a
+/// credential and requires no manifest permission.
+#[cfg(target_family = "wasm")]
+pub fn model_role(name: &str) -> Result<Option<ModelRole>, Error> {
+    let output = unsafe { host::uri_agent_model_role(name.to_string())? };
     Ok(serde_json::from_str(&output)?)
 }
 
@@ -281,5 +299,19 @@ mod tests {
             HandlerRequest::ModelTool { name, arguments }
                 if name == "example_tool" && arguments["answer"] == 42
         ));
+
+        let role = ModelRole {
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            thinking: "low".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(role).unwrap(),
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5",
+                "thinking": "low"
+            })
+        );
     }
 }

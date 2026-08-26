@@ -8,7 +8,7 @@ use clap::Parser;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -26,6 +26,14 @@ pub enum AuthKind {
     None,
     ApiKey,
     Oauth,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRole {
+    pub provider: String,
+    pub model: String,
+    pub thinking: ThinkingLevel,
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -213,7 +221,7 @@ struct InvocationOverrides {
     thinking: Option<ThinkingLevel>,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 struct SettingsFile {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +234,8 @@ struct SettingsFile {
     default_thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_roles: BTreeMap<String, ModelRoleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,7 +246,16 @@ struct SettingsFile {
     extra: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelRoleConfig {
+    provider: String,
+    model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingLevel>,
+}
+
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 struct CompactionFile {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -385,6 +404,13 @@ struct ConfigFiles {
     auth: AuthFile,
 }
 
+struct ResolvedModelCredential {
+    api_key: Option<String>,
+    source: ValueSource,
+    kind: AuthKind,
+    environment: BTreeMap<String, String>,
+}
+
 pub struct ConfigManager {
     directory: PathBuf,
     project_path: PathBuf,
@@ -436,6 +462,77 @@ impl ConfigManager {
 
     pub async fn current(&self) -> ActiveSettings {
         self.active.read().await.clone()
+    }
+
+    /// Resolve a configured model role for a linked or WASM plugin. Project
+    /// settings override a same-named global role. Role lookup is dynamic and
+    /// does not change the active conversation model.
+    pub async fn model_role(&self, name: &str) -> Result<Option<ModelRole>> {
+        validate_model_role_name(name)?;
+        let configured = {
+            let files = self.files.lock().await;
+            let Some(configured) = files
+                .project
+                .model_roles
+                .get(name)
+                .or_else(|| files.global.model_roles.get(name))
+            else {
+                return Ok(None);
+            };
+            if configured.provider.trim().is_empty() || configured.model.trim().is_empty() {
+                bail!("model role {name:?} requires nonempty provider and model values");
+            }
+            let thinking = configured.thinking.unwrap_or_else(|| {
+                configured_thinking(&files, &configured.provider, &configured.model).0
+            });
+            ModelRole {
+                provider: configured.provider.clone(),
+                model: configured.model.clone(),
+                thinking,
+            }
+        };
+        if self
+            .catalog
+            .model(&configured.provider, &configured.model)
+            .await
+            .is_none()
+        {
+            bail!(
+                "model role {name:?} selects unavailable model {}/{}",
+                configured.provider,
+                configured.model
+            );
+        }
+        Ok(Some(configured))
+    }
+
+    /// Return catalog providers that currently have a configured model
+    /// credential source. Values are not expanded and OAuth is not refreshed
+    /// while building a model-selection list.
+    pub async fn model_providers_with_credentials(
+        &self,
+        current_provider: &str,
+    ) -> BTreeSet<String> {
+        let providers = self.catalog.providers().await;
+        let files = self.files.lock().await;
+        let mut configured = BTreeSet::new();
+        for provider in providers {
+            let include_generic_overrides = provider == current_provider;
+            if resolve_model_credential(
+                &files,
+                &self.catalog,
+                &self.invocation,
+                &provider,
+                include_generic_overrides,
+            )
+            .await
+            .api_key
+            .is_some()
+            {
+                configured.insert(provider);
+            }
+        }
+        configured
     }
 
     /// Resolve a provider API key outside the active model selection.
@@ -535,6 +632,58 @@ impl ConfigManager {
         settings.default_model = Some(model.to_string());
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
+    }
+
+    /// Remove persisted default model selections that resolve through
+    /// `provider`. Per-model thinking preferences are retained for a future
+    /// login. The caller owns any current session selection.
+    pub async fn clear_model_selection_for_provider(&self, provider: &str) -> Result<bool> {
+        let mut files = self.files.lock().await;
+        let mut global = files.global.clone();
+        let mut project = files.project.clone();
+        let global_selected = global.default_provider.as_deref() == Some(provider);
+        let project_selected = project.default_provider.as_deref() == Some(provider);
+        let project_model_inherits_provider = project.default_provider.is_none()
+            && global_selected
+            && project.default_model.is_some();
+
+        if global_selected {
+            global.default_provider = None;
+            global.default_model = None;
+        }
+        if project_selected {
+            project.default_provider = None;
+            project.default_model = None;
+        } else if project_model_inherits_provider {
+            project.default_model = None;
+        }
+
+        let global_changed = global != files.global;
+        let project_changed = project != files.project;
+        if !global_changed && !project_changed {
+            return Ok(false);
+        }
+
+        let write_result = async {
+            if global_changed {
+                write_json(&self.settings_path(), &global, false).await?;
+            }
+            if project_changed {
+                write_json(&self.project_path, &project, false).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            files.global = read_json(&self.settings_path()).await?;
+            files.project = read_json(&self.project_path).await?;
+            self.recalculate(&files).await?;
+            return Err(error);
+        }
+        files.global = global;
+        files.project = project;
+        self.recalculate(&files).await?;
+        Ok(true)
     }
 
     pub async fn set_output_limit(&self, output_limit: usize) -> Result<ActiveSettings> {
@@ -881,17 +1030,46 @@ async fn calculate_active(
 
     let compaction = compaction_settings(&files.global, &files.project)?;
 
-    let configured_entry = files.auth.0.get(&provider);
-    let credential_environment = configured_entry
+    let credential = resolve_model_credential(files, catalog, invocation, &provider, true).await;
+
+    Ok(ActiveSettings {
+        provider,
+        model,
+        api_key: credential.api_key,
+        auth_kind: credential.kind,
+        output_limit,
+        thinking,
+        terminal,
+        key_display,
+        compaction,
+        provider_source,
+        model_source,
+        api_key_source: credential.source,
+        output_limit_source,
+        thinking_source,
+        terminal_source,
+        credential_environment: credential.environment,
+    })
+}
+
+async fn resolve_model_credential(
+    files: &ConfigFiles,
+    catalog: &ModelCatalog,
+    invocation: &InvocationOverrides,
+    provider: &str,
+    include_generic_overrides: bool,
+) -> ResolvedModelCredential {
+    let configured_entry = files.auth.0.get(provider);
+    let environment = configured_entry
         .map(|entry| entry.env.clone())
         .unwrap_or_default();
     let private_oauth = provider == "antigravity";
     let models_key = if private_oauth {
         None
     } else {
-        catalog.configured_api_key(&provider).await
+        catalog.configured_api_key(provider).await
     };
-    let (mut api_key, mut api_key_source, mut auth_kind) = match configured_entry {
+    let (mut api_key, mut source, mut kind) = match configured_entry {
         Some(entry) if entry.kind == "oauth" => {
             (entry.access.clone(), ValueSource::Global, AuthKind::Oauth)
         }
@@ -900,60 +1078,52 @@ async fn calculate_active(
         }
         _ => (models_key, ValueSource::ModelsFile, AuthKind::None),
     };
-    if auth_kind == AuthKind::None && api_key.is_some() {
-        auth_kind = AuthKind::ApiKey;
+    if kind == AuthKind::None && api_key.is_some() {
+        kind = AuthKind::ApiKey;
     }
     if !private_oauth {
-        let provider_environment = api_key_environment(&provider);
-        let mut environments = vec![
-            provider_environment.clone(),
-            "URI_AGENT_API_KEY".to_string(),
-        ];
+        let mut environments = vec![api_key_environment(provider)];
         if provider == "anthropic" {
             environments.insert(0, "ANTHROPIC_OAUTH_TOKEN".to_string());
             environments.insert(1, "ANTHROPIC_AUTH_TOKEN".to_string());
         }
-        for environment in environments {
-            if let Ok(value) = env::var(&environment)
+        for name in environments {
+            if let Ok(value) = env::var(&name)
                 && !value.trim().is_empty()
             {
                 api_key = Some(value);
-                api_key_source = ValueSource::Environment(environment.clone());
-                auth_kind = if environment.contains("OAUTH") {
+                source = ValueSource::Environment(name.clone());
+                kind = if name.contains("OAUTH") {
                     AuthKind::Oauth
                 } else {
                     AuthKind::ApiKey
                 };
             }
         }
-        if let Some(value) = &invocation.api_key {
-            api_key = Some(value.clone());
-            api_key_source = ValueSource::CommandLine;
-            auth_kind = AuthKind::ApiKey;
+        if include_generic_overrides {
+            if let Ok(value) = env::var("URI_AGENT_API_KEY")
+                && !value.trim().is_empty()
+            {
+                api_key = Some(value);
+                source = ValueSource::Environment("URI_AGENT_API_KEY".to_string());
+                kind = AuthKind::ApiKey;
+            }
+            if let Some(value) = &invocation.api_key {
+                api_key = Some(value.clone());
+                source = ValueSource::CommandLine;
+                kind = AuthKind::ApiKey;
+            }
         }
     }
     if api_key.is_none() {
-        auth_kind = AuthKind::None;
+        kind = AuthKind::None;
     }
-
-    Ok(ActiveSettings {
-        provider,
-        model,
+    ResolvedModelCredential {
         api_key,
-        auth_kind,
-        output_limit,
-        thinking,
-        terminal,
-        key_display,
-        compaction,
-        provider_source,
-        model_source,
-        api_key_source,
-        output_limit_source,
-        thinking_source,
-        terminal_source,
-        credential_environment,
-    })
+        source,
+        kind,
+        environment,
+    }
 }
 
 fn oauth_token_from_entry(provider: &str, entry: &AuthEntry) -> Result<OauthToken> {
@@ -1034,6 +1204,17 @@ fn compaction_settings(
 
 fn model_setting_key(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
+}
+
+fn validate_model_role_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        bail!("invalid model role name {name:?}; use ASCII letters, digits, '-' or '_'");
+    }
+    Ok(())
 }
 
 static COMMAND_VALUE_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
@@ -1597,6 +1778,151 @@ mod tests {
         let value = serde_json::to_value(settings).unwrap();
         assert_eq!(value["defaultThinkingLevel"], "high");
         assert_eq!(value["modelThinkingLevels"]["openai/gpt-5.2"], "medium");
+    }
+
+    #[tokio::test]
+    async fn model_roles_are_project_overridable_and_resolve_model_thinking() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(project.join(".uri-agent"))
+            .await
+            .unwrap();
+        fs::write(
+            directory.join("models.json"),
+            br#"{"providers":{"global-provider":{"baseUrl":"https://global.invalid/v1","api":"openai-responses","models":[{"id":"global-model","name":"Global"}]},"project-provider":{"baseUrl":"https://project.invalid/v1","api":"openai-responses","models":[{"id":"project-model","name":"Project"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            br#"{"modelRoles":{"commit":{"provider":"global-provider","model":"global-model","thinking":"high"}}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            project.join(".uri-agent/settings.json"),
+            br#"{"modelRoles":{"commit":{"provider":"project-provider","model":"project-model"}},"modelThinkingLevels":{"project-provider/project-model":"medium"}}"#,
+        )
+        .await
+        .unwrap();
+
+        let manager = ConfigManager::load_for_test(&directory, &project)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.model_role("commit").await.unwrap(),
+            Some(ModelRole {
+                provider: "project-provider".to_string(),
+                model: "project-model".to_string(),
+                thinking: ThinkingLevel::Medium,
+            })
+        );
+        assert_eq!(manager.model_role("missing").await.unwrap(), None);
+        assert!(manager.model_role("invalid role").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn model_provider_filter_scopes_generic_keys_to_the_current_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(&project).await.unwrap();
+        fs::write(
+            directory.join("models.json"),
+            br#"{"providers":{"saved-provider":{"baseUrl":"https://saved.invalid/v1","api":"openai-responses","models":[{"id":"saved-model","name":"Saved"}]},"file-provider":{"baseUrl":"https://file.invalid/v1","api":"openai-responses","apiKey":"file-key","models":[{"id":"file-model","name":"File"}]},"generic-provider":{"baseUrl":"https://generic.invalid/v1","api":"openai-responses","models":[{"id":"generic-model","name":"Generic"}]},"missing-provider":{"baseUrl":"https://missing.invalid/v1","api":"openai-responses","models":[{"id":"missing-model","name":"Missing"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        let catalog = Arc::new(ModelCatalog::load(&directory, true).await.unwrap());
+        let manager = ConfigManager::load(
+            directory.clone(),
+            &project,
+            catalog,
+            InvocationOverrides {
+                provider: Some("generic-provider".to_string()),
+                api_key: Some("generic-key".to_string()),
+                ..InvocationOverrides::default()
+            },
+        )
+        .await
+        .unwrap();
+        manager
+            .set_api_key("saved-provider", "saved-key".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .model_providers_with_credentials("generic-provider")
+                .await,
+            BTreeSet::from([
+                "file-provider".to_string(),
+                "generic-provider".to_string(),
+                "saved-provider".to_string()
+            ])
+        );
+        assert_eq!(
+            manager.model_providers_with_credentials("").await,
+            BTreeSet::from(["file-provider".to_string(), "saved-provider".to_string()])
+        );
+        manager.clear_api_key("saved-provider").await.unwrap();
+        assert_eq!(
+            manager.model_providers_with_credentials("").await,
+            BTreeSet::from(["file-provider".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_provider_selection_removes_inherited_model_but_keeps_preferences() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(project.join(".uri-agent"))
+            .await
+            .unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            br#"{"defaultProvider":"openai","defaultModel":"global-model","modelThinkingLevels":{"openai/project-model":"high"}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            project.join(".uri-agent/settings.json"),
+            br#"{"defaultModel":"project-model"}"#,
+        )
+        .await
+        .unwrap();
+        let manager = ConfigManager::load_for_test(&directory, &project)
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .clear_model_selection_for_provider("openai")
+                .await
+                .unwrap()
+        );
+        let global: Value =
+            serde_json::from_slice(&fs::read(directory.join("settings.json")).await.unwrap())
+                .unwrap();
+        let project: Value = serde_json::from_slice(
+            &fs::read(project.join(".uri-agent/settings.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(global.get("defaultProvider").is_none());
+        assert!(global.get("defaultModel").is_none());
+        assert!(project.get("defaultModel").is_none());
+        assert_eq!(
+            global["modelThinkingLevels"]["openai/project-model"],
+            "high"
+        );
+        assert!(!manager.current().await.model_configured());
     }
 
     #[tokio::test]

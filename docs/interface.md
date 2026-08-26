@@ -89,6 +89,12 @@ Core commands are registered through `CommandRegistry`:
 
 `:login` includes model providers plus the Parallel and Exa web providers. Selecting Parallel or Exa opens a masked API-key prompt with that provider's key-management URL. Saved credentials take effect immediately for search and page extraction in the built-in `https` protocol and appear in `:logout` like other stored credentials.
 
+`:model`, `F3`, and the Settings model action list models only for providers
+with a configured model credential source. Logging out the current provider
+clears the current session model and that provider's saved default only when no
+other credential source remains; URI Agent does not automatically switch to a
+different provider.
+
 Conversation search includes user, assistant, reasoning, tool, notice, compaction, and error text currently loaded in the transcript. Type to filter the results, use the arrow keys to choose one and press `Enter`, or click a result to return to that block. It is unavailable before the conversation has any text and while the `:resume` session selector is open.
 
 Extensions register commands through the same registry, so they appear in the panel, help, and key-bindable action set without TUI-specific routing.

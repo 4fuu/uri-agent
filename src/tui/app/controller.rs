@@ -2780,9 +2780,40 @@ pub(super) async fn store_api_key(
 }
 
 pub(super) async fn logout_provider(app: &mut App, services: &LoopServices, provider: &str) {
+    let current = services.runtime.session().model_settings().await;
     let result = async {
         services.manager.clear_api_key(provider).await?;
-        let active = active_for_runtime(&services.manager, &services.runtime).await?;
+        let affects_current = current.provider == provider;
+        if affects_current {
+            // Do not leave a backend holding the removed stored credential if
+            // any later settings or session write fails.
+            services.runtime.set_backend(None, None).await;
+            app.info.model_ready = false;
+        }
+        let credential_remains = services
+            .manager
+            .model_providers_with_credentials(&current.provider)
+            .await
+            .contains(provider);
+        let clear_current = affects_current && !credential_remains;
+        let defaults_warning = if clear_current {
+            services
+                .manager
+                .clear_model_selection_for_provider(provider)
+                .await
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            None
+        };
+        let active = if clear_current {
+            services
+                .manager
+                .for_session("", "", ThinkingLevel::Off)
+                .await?
+        } else {
+            active_for_runtime(&services.manager, &services.runtime).await?
+        };
         apply_active(
             app,
             &services.runtime,
@@ -2792,11 +2823,20 @@ pub(super) async fn logout_provider(app: &mut App, services: &LoopServices, prov
             &active,
         )
         .await?;
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>((credential_remains, clear_current, defaults_warning))
     }
     .await;
     app.set_flash(match result {
-        Ok(()) => format!("Removed stored credential for {provider}"),
+        Ok((_, true, Some(warning))) => format!(
+            "Removed stored credential and cleared the current model; saved defaults could not be cleared: {warning}"
+        ),
+        Ok((_, true, None)) => {
+            format!("Removed stored credential for {provider} and cleared the current model")
+        }
+        Ok((true, false, _)) => format!(
+            "Removed stored credential for {provider}; another credential source remains active"
+        ),
+        Ok((false, false, _)) => format!("Removed stored credential for {provider}"),
         Err(error) => format!("Could not log out {provider}: {error:#}"),
     });
 }
@@ -2815,9 +2855,12 @@ pub(super) async fn open_models(
             return;
         }
     };
-    let selector = ModelSelector::load(catalog, &active, query).await;
+    let providers = manager
+        .model_providers_with_credentials(&active.provider)
+        .await;
+    let selector = ModelSelector::load(catalog, &active, &providers, query).await;
     if selector.model_count() == 0 {
-        app.set_flash("No runnable models cached · :settings then refresh, or add models.json");
+        app.set_flash("No authenticated model providers · use :login");
     }
     app.model_selector = Some(selector);
     app.overlay = Some(Overlay::Models);
@@ -3199,8 +3242,13 @@ pub(super) async fn finish_background(
                     .as_ref()
                     .map(|selector| selector.query().to_string())
                 {
-                    app.model_selector =
-                        Some(ModelSelector::load(&services.catalog, &active, query).await);
+                    let providers = services
+                        .manager
+                        .model_providers_with_credentials(&active.provider)
+                        .await;
+                    app.model_selector = Some(
+                        ModelSelector::load(&services.catalog, &active, &providers, query).await,
+                    );
                 }
                 Ok::<_, anyhow::Error>(())
             }

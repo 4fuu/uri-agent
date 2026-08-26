@@ -1,6 +1,7 @@
 use super::{fuzzy_score, wrapped_index};
 use crate::catalog::{CatalogModel, ModelCatalog};
 use crate::config::ActiveSettings;
+use std::collections::BTreeSet;
 
 #[derive(Clone)]
 pub(super) struct ModelSelector {
@@ -16,11 +17,12 @@ impl ModelSelector {
     pub(super) async fn load(
         catalog: &ModelCatalog,
         active: &ActiveSettings,
+        providers_with_credentials: &BTreeSet<String>,
         query: impl Into<String>,
     ) -> Self {
         let mut models = Vec::new();
-        for provider in catalog.providers().await {
-            models.extend(catalog.models(&provider).await);
+        for provider in providers_with_credentials {
+            models.extend(catalog.models(provider).await);
         }
         models.sort_by(|left, right| {
             left.provider
