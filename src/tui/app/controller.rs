@@ -276,7 +276,7 @@ pub(super) async fn persist_and_exit(
 
 pub(super) enum BackgroundEvent {
     CatalogRefreshed {
-        result: Box<Result<ActiveSettings>>,
+        result: Box<Result<CatalogRefreshReport>>,
         announced: bool,
     },
     TurnStarted {
@@ -3148,11 +3148,11 @@ pub(super) fn start_catalog_refresh(
     sender: mpsc::UnboundedSender<BackgroundEvent>,
 ) {
     if app.catalog_refreshing {
-        app.set_flash("The Pi model catalog is already refreshing");
+        app.set_flash("The model catalogs are already refreshing");
         return;
     }
     app.catalog_refreshing = true;
-    app.set_flash("Refreshing the Pi model catalog…");
+    app.set_flash("Refreshing model catalogs…");
     spawn_catalog_refresh(services, sender, true, true);
 }
 
@@ -3174,14 +3174,9 @@ fn spawn_catalog_refresh(
     force: bool,
     announced: bool,
 ) {
-    let catalog = services.catalog.clone();
     let manager = services.manager.clone();
     tokio::spawn(async move {
-        let result = async {
-            catalog.refresh(force).await?;
-            manager.reload().await
-        }
-        .await;
+        let result = manager.refresh_catalog(force).await;
         let _ = sender.send(BackgroundEvent::CatalogRefreshed {
             result: Box::new(result),
             announced,
@@ -3216,7 +3211,7 @@ pub(super) async fn finish_background(
         BackgroundEvent::CatalogRefreshed { result, announced } => {
             app.catalog_refreshing = false;
             let result = async {
-                (*result)?;
+                let report = (*result)?;
                 let active = active_for_runtime(&services.manager, &services.runtime).await?;
                 apply_active(
                     app,
@@ -3250,12 +3245,31 @@ pub(super) async fn finish_background(
                         ModelSelector::load(&services.catalog, &active, &providers, query).await,
                     );
                 }
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(report)
             }
             .await;
             match result {
-                Ok(()) if announced => app.set_flash("Pi model catalog refreshed"),
-                Ok(()) => {}
+                Ok(report) if announced => {
+                    let failures = report.pi_failures + report.discovery_failures;
+                    if failures > 0 {
+                        app.set_flash(format!(
+                            "Model catalogs refreshed with {failures} warning(s); cached data was retained"
+                        ));
+                    } else if report.discovered_models > 0 {
+                        app.set_flash(format!(
+                            "Model catalogs refreshed; {} provider model(s) discovered",
+                            report.discovered_models
+                        ));
+                    } else {
+                        app.set_flash("Model catalogs refreshed");
+                    }
+                }
+                Ok(report) if report.pi_failures + report.discovery_failures > 0 => {
+                    app.set_flash(
+                        "Some model catalogs could not refresh; cached data was retained",
+                    );
+                }
+                Ok(_) => {}
                 Err(error) => app.set_flash(format!("Catalog refresh failed: {error:#}")),
             }
         }

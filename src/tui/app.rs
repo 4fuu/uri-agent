@@ -7,7 +7,7 @@ mod render;
 #[cfg(test)]
 mod tests;
 
-use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
+use crate::catalog::{CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel};
 use crate::clipboard;
 use crate::compaction::ContextAccuracy;
 use crate::config::{

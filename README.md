@@ -43,7 +43,7 @@ SQLite.
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 
-URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev.
+URI Agent is an early release and may change between dated versions. Model requests and the context they need are sent to the provider you select. Unless offline mode is enabled, URI Agent also fetches model catalog metadata from pi.dev and, when credentials are configured, supported providers' model-list APIs.
 
 ## Progressive startup context
 
@@ -64,21 +64,22 @@ separate manual.
 
 - **URI-native progressive context:** one address space covers every resource and action, while Skills-style loading keeps contracts, instructions, resources, and complete output out of context until needed.
 - **Reliable and extensible:** the stable string-based `read` / `exec` contract handles simple protocols, while typed direct tools avoid nested escaping and both paths remain plugin-registered.
-- **pi.dev models and sign-in:** URI Agent uses pi.dev's cloud model catalog and provider login methods, exposing every catalog model whose API family its backend supports through one selector.
+- **Current models and sign-in:** URI Agent combines pi.dev's cloud catalog and provider login methods with credential-scoped live discovery, exposing runnable new provider models before the shared catalog catches up.
 - **Durable, observable work:** managed tasks expose status and final output and automatically notify the model on completion; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
 - **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
 
 ## pi.dev model coverage
 
-URI Agent is compatible with the model configurations distributed through pi.dev. As of 2026-08-24, its implemented API families cover:
+URI Agent is compatible with the model configurations distributed through pi.dev. As of 2026-08-26, its implemented API families and provider discovery cover:
 
 | Catalog measure | Supported |
 | --- | ---: |
 | API families | 5 of 9 |
 | Model entries | 1,107 of 1,307 (84.7%) |
 | Provider IDs | 35 of 39 |
+| Provider IDs with live discovery | 28 of 35 runnable |
 
-Catalog contents and account entitlements change; a listed model still requires the matching credential, region, and subscription. See [Models and configuration](docs/configuration.md#model-catalog) for the exact API families and authentication requirements.
+Live provider results are cached per credential and supplement rather than replace pi.dev metadata. Catalog contents and account entitlements change; a listed model still requires the matching credential, region, and subscription. See [Models and configuration](docs/configuration.md#model-catalog) for the exact discovery coverage, API families, and authentication requirements.
 
 ## Quick start
 

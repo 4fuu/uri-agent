@@ -2630,7 +2630,10 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
         return;
     };
     let summary = if app.catalog_refreshing {
-        format!("{} refreshing pi.dev", animation::spinner(app.frame))
+        format!(
+            "{} refreshing model catalogs",
+            animation::spinner(app.frame)
+        )
     } else {
         format!(
             "{} matches · {} models · {} providers",

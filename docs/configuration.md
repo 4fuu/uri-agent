@@ -1,6 +1,6 @@
 # Models and configuration
 
-URI Agent combines the [pi model catalog](https://github.com/earendil-works/pi), local provider definitions, layered settings, and process-specific overrides. This document describes model support, authentication, file locations, precedence, and command-line configuration.
+URI Agent combines the [pi model catalog](https://github.com/earendil-works/pi), live provider model discovery, local provider definitions, layered settings, and process-specific overrides. This document describes model support, authentication, file locations, precedence, and command-line configuration.
 
 Run `uri-agent --help` for the current CLI syntax. In the TUI, `:settings` shows the active provider and model, credential status and source, thinking level, output limit, and Agent environment manager.
 
@@ -21,7 +21,7 @@ to the current session without restarting the application.
 
 ## Model catalog
 
-URI Agent downloads provider and model records from pi.dev and merges them with the local `models.json`. The Rust/Rig backend currently runs these API families:
+URI Agent downloads provider and model records from pi.dev, supplements them from supported providers' model-list APIs, and merges them with the local `models.json`. The Rust/Rig backend currently runs these API families:
 
 - `openai-responses`
 - `openai-codex-responses`
@@ -32,6 +32,21 @@ URI Agent downloads provider and model records from pi.dev and merges them with 
 URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol). It is not part of the pi.dev coverage count.
 
 The model selector shows only models using a supported API family whose provider has a configured credential from `models.json`, `auth.json`, or a recognized provider environment variable. The generic `URI_AGENT_API_KEY` and `--api-key` overrides expose only the current provider rather than every catalog provider. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
+
+Live discovery is enabled for 28 of the 35 runnable pi provider IDs:
+
+```text
+ant-ling, anthropic, baseten, cerebras, deepseek, google, groq,
+huggingface, minimax, minimax-cn, moonshotai, moonshotai-cn, nvidia,
+openai, opencode, opencode-go, openrouter, qwen-token-plan,
+qwen-token-plan-cn, qwen-token-plan-individual, together, xai, xiaomi,
+xiaomi-token-plan-ams, xiaomi-token-plan-cn, xiaomi-token-plan-sgp, zai,
+zai-coding-cn
+```
+
+URI Agent does not attempt live discovery for `cloudflare-ai-gateway`, `cloudflare-workers-ai`, `fireworks`, `github-copilot`, `kimi-coding`, `openai-codex`, or `vercel-ai-gateway`: those supported backends do not expose a portable model-list route from which URI Agent can safely construct runnable unknown model IDs.
+
+Provider results are additive. A pi model with the same provider and ID always wins once the cloud catalog catches up. For a model known only to the provider, URI Agent conservatively inherits runtime metadata from the nearest compatible pi model and omits price metadata rather than reporting an unverified cost. These provisional records are marked as discovered in the cache.
 
 `openai-codex-responses` targets the ChatGPT Codex subscription endpoint and uses WebSocket streaming by default. URI Agent supplies the account ID from the OAuth access token, stable session headers and prompt cache key, and the Codex Responses request fields required for reasoning and tool calls. Within a session it reuses an idle connection, retains it for up to five idle minutes or 55 minutes total, and—when request options and history still match—continues from `previous_response_id` while sending only newly appended input. A busy connection is never shared between concurrent requests.
 
@@ -46,9 +61,11 @@ The active backend applies catalog data relevant to requests and accounting, inc
 
 ### Refresh and offline mode
 
-Startup loads the local catalog immediately, then refreshes pi.dev in the background after the TUI is available. Catalog entries are considered fresh for four hours. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to force a refresh from pi.dev and immediately apply the resulting model configurations.
+Startup loads the local catalog immediately, then refreshes pi.dev and eligible configured providers in the background after the TUI is available. Pi entries are considered fresh for four hours; provider listings are considered fresh for five minutes. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to bypass both freshness windows and immediately apply the resulting model configurations. Refreshes are serialized and provider requests run concurrently, so one slow or failing provider does not block cached results from the others.
 
-Use any of the following to disable pi.dev requests and rely on local catalog data:
+Live discovery uses each provider's resolved API key or OAuth access token. The cache is scoped to a one-way credential fingerprint: raw credentials are never stored in `models-store.json`, and cached models from one account are not exposed after switching credentials. A provider failure retains the matching account's previous cache. Background startup refresh does not execute credentials configured with a leading `!`; an explicit force refresh may execute them through the normal trusted configuration-command path.
+
+Use any of the following to disable all catalog requests and rely on local catalog data:
 
 ```text
 uri-agent --offline
@@ -56,7 +73,7 @@ URI_AGENT_OFFLINE=1 uri-agent
 PI_OFFLINE=1 uri-agent
 ```
 
-Offline mode still loads `models-store.json` and `models.json`; it only disables catalog networking.
+Offline mode still loads `models-store.json` and `models.json`, including discovered models cached for the currently resolved credential; it only disables catalog networking.
 
 ## Authentication
 
@@ -171,7 +188,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 | `<config>/auth.json` | Global provider credentials |
 | `<config>/environment.json` | Global environment variables for Agent shell commands and trusted plugins |
 | `<config>/models.json` | Custom providers, models, headers, and model overrides |
-| `<config>/models-store.json` | Generated pi catalog cache |
+| `<config>/models-store.json` | Generated pi and credential-scoped provider catalog cache |
 | `<config>/keymap.rhai` | Global keymap overrides |
 | `<config>/wasm-plugins/` | Trusted WASM modules loaded at startup and on reload |
 | `<project>/.uri-agent/settings.json` | Optional project settings |

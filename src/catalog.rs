@@ -1,3 +1,5 @@
+mod discovery;
+
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
@@ -15,6 +17,23 @@ use uuid::Uuid;
 const PROVIDERS_URL: &str = "https://pi.dev/api/models/providers";
 const REFRESH_INTERVAL_MS: i64 = 4 * 60 * 60 * 1000;
 const REQUEST_CONCURRENCY: usize = 8;
+
+#[derive(Clone)]
+pub(crate) struct CatalogCredential {
+    pub secret: String,
+    pub oauth: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogRefreshReport {
+    pub pi_failures: usize,
+    pub discovery_failures: usize,
+    pub discovered_models: usize,
+}
+
+pub(crate) fn supports_live_discovery(provider: &str) -> bool {
+    discovery::supports_provider(provider)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -298,6 +317,15 @@ struct StoreEntry {
     checked_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    discoveries: BTreeMap<String, DiscoveryStoreEntry>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryStoreEntry {
+    models: Vec<CatalogModel>,
+    checked_at: i64,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -323,6 +351,7 @@ struct UserProvider {
 struct CatalogState {
     store: BTreeMap<String, StoreEntry>,
     user: ModelsFile,
+    discovery_scopes: BTreeMap<String, String>,
     models: BTreeMap<String, Vec<CatalogModel>>,
     warnings: Vec<String>,
 }
@@ -334,6 +363,7 @@ pub struct ModelCatalog {
     user_path: PathBuf,
     client: reqwest::Client,
     offline: bool,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ModelCatalog {
@@ -342,11 +372,13 @@ impl ModelCatalog {
         let user_path = directory.join("models.json");
         let store = read_json(&store_path).await?;
         let user = read_json(&user_path).await?;
-        let (models, warnings) = merge_catalog(&store, &user);
+        let discovery_scopes = BTreeMap::new();
+        let (models, warnings) = merge_catalog(&store, &user, &discovery_scopes);
         let catalog = Self {
             inner: Arc::new(RwLock::new(CatalogState {
                 store,
                 user,
+                discovery_scopes,
                 models,
                 warnings,
             })),
@@ -357,6 +389,7 @@ impl ModelCatalog {
                 .user_agent(concat!("uri-agent/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             offline,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         Ok(catalog)
     }
@@ -365,19 +398,68 @@ impl ModelCatalog {
         !self.offline
     }
 
-    pub async fn refresh(&self, force: bool) -> Result<()> {
+    pub(crate) async fn activate_discovery(
+        &self,
+        credentials: &BTreeMap<String, CatalogCredential>,
+    ) {
+        let scopes = credentials
+            .iter()
+            .filter(|(provider, _)| discovery::supports_provider(provider))
+            .map(|(provider, credential)| {
+                (
+                    provider.clone(),
+                    discovery::credential_fingerprint(provider, credential),
+                )
+            })
+            .collect();
+        let mut state = self.inner.write().await;
+        state.discovery_scopes = scopes;
+        let (models, warnings) = merge_catalog(&state.store, &state.user, &state.discovery_scopes);
+        state.models = models;
+        state.warnings.extend(warnings);
+    }
+
+    pub(crate) async fn refresh(
+        &self,
+        force: bool,
+        credentials: &BTreeMap<String, CatalogCredential>,
+    ) -> Result<CatalogRefreshReport> {
         if self.offline {
             bail!("model catalog networking is disabled");
         }
-        let providers = self
+        let _refresh = self.refresh_lock.lock().await;
+        self.activate_discovery(credentials).await;
+        let mut report = CatalogRefreshReport::default();
+        let providers = match self
             .client
             .get(PROVIDERS_URL)
             .header("Accept", "application/json")
             .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<String>>()
-            .await?;
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => match response.json::<Vec<String>>().await {
+                Ok(providers) => providers,
+                Err(error) => {
+                    report.pi_failures += 1;
+                    self.inner
+                        .write()
+                        .await
+                        .warnings
+                        .push(format!("catalog pi.dev: {error:#}"));
+                    Vec::new()
+                }
+            },
+            Err(error) => {
+                report.pi_failures += 1;
+                self.inner
+                    .write()
+                    .await
+                    .warnings
+                    .push(format!("catalog pi.dev: {error:#}"));
+                Vec::new()
+            }
+        };
         let current = self.inner.read().await.store.clone();
         let now = Utc::now().timestamp_millis();
         let client = self.client.clone();
@@ -409,6 +491,7 @@ impl ModelCatalog {
                     state.store.insert(provider, entry);
                 }
                 Err(error) => {
+                    report.pi_failures += 1;
                     fallback.checked_at = Some(now);
                     state.store.insert(provider.clone(), fallback);
                     state
@@ -417,18 +500,99 @@ impl ModelCatalog {
                 }
             }
         }
-        write_json(&self.store_path, &state.store).await?;
         state.user = read_json(&self.user_path).await?;
-        let (models, warnings) = merge_catalog(&state.store, &state.user);
+        let (base_models, warnings) = merge_catalog(&state.store, &state.user, &BTreeMap::new());
+        state.warnings.extend(warnings);
+        drop(state);
+
+        let discovery_requests = credentials
+            .iter()
+            .filter_map(|(provider, credential)| {
+                if !discovery::supports_provider(provider) || !base_models.contains_key(provider) {
+                    return None;
+                }
+                let fingerprint = discovery::credential_fingerprint(provider, credential);
+                let cached = current
+                    .get(provider)
+                    .and_then(|entry| entry.discoveries.get(&fingerprint))
+                    .cloned();
+                if !force
+                    && cached.as_ref().is_some_and(|entry| {
+                        now - entry.checked_at < discovery::REFRESH_INTERVAL_MS
+                    })
+                {
+                    return None;
+                }
+                Some((provider.clone(), credential.clone(), fingerprint, cached))
+            })
+            .collect::<Vec<_>>();
+        let discovery_results = stream::iter(discovery_requests)
+            .map(|(provider, credential, fingerprint, cached)| {
+                let client = self.client.clone();
+                let catalog = base_models.clone();
+                async move {
+                    let result =
+                        discovery::discover(&client, &provider, &credential, &catalog).await;
+                    (provider, fingerprint, cached, result)
+                }
+            })
+            .buffer_unordered(REQUEST_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut state = self.inner.write().await;
+        for (provider, fingerprint, cached, result) in discovery_results {
+            let entry = state.store.entry(provider.clone()).or_default();
+            entry
+                .discoveries
+                .retain(|existing, _| existing == &fingerprint);
+            match result {
+                Ok(models) => {
+                    entry.discoveries.insert(
+                        fingerprint,
+                        DiscoveryStoreEntry {
+                            models,
+                            checked_at: now,
+                        },
+                    );
+                }
+                Err(error) => {
+                    report.discovery_failures += 1;
+                    entry.discoveries.insert(
+                        fingerprint,
+                        DiscoveryStoreEntry {
+                            models: cached.map_or_else(Vec::new, |entry| entry.models),
+                            checked_at: now,
+                        },
+                    );
+                    state
+                        .warnings
+                        .push(format!("catalog {provider} discovery: {error:#}"));
+                }
+            }
+        }
+        write_json(&self.store_path, &state.store).await?;
+        let (models, warnings) = merge_catalog(&state.store, &state.user, &state.discovery_scopes);
+        report.discovered_models = models
+            .values()
+            .flatten()
+            .filter(|model| {
+                model
+                    .metadata
+                    .get("discovered")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
         state.models = models;
         state.warnings.extend(warnings);
-        Ok(())
+        Ok(report)
     }
 
     pub async fn reload_user_overrides(&self) -> Result<()> {
         let user = read_json(&self.user_path).await?;
         let mut state = self.inner.write().await;
-        let (models, warnings) = merge_catalog(&state.store, &user);
+        let (models, warnings) = merge_catalog(&state.store, &user, &state.discovery_scopes);
         state.user = user;
         state.models = models;
         state.warnings.extend(warnings);
@@ -484,6 +648,10 @@ impl ModelCatalog {
 
     pub async fn warnings(&self) -> Vec<String> {
         self.inner.read().await.warnings.clone()
+    }
+
+    pub(crate) async fn add_warning(&self, warning: String) {
+        self.inner.write().await.warnings.push(warning);
     }
 
     pub fn store_path(&self) -> &Path {
@@ -545,6 +713,7 @@ async fn fetch_provider(
         checked_at: Some(now),
         last_modified: Some(last_modified),
         etag,
+        discoveries: cached.discoveries,
     })
 }
 
@@ -573,6 +742,7 @@ fn parse_provider_payload(provider: &str, value: Value) -> Result<Vec<CatalogMod
 fn merge_catalog(
     store: &BTreeMap<String, StoreEntry>,
     user: &ModelsFile,
+    discovery_scopes: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, Vec<CatalogModel>>, Vec<String>) {
     let mut raw = built_in_catalog();
     for (provider, entry) in store {
@@ -587,6 +757,21 @@ fn merge_catalog(
                     Some((id, model))
                 }),
         );
+    }
+    for (provider, fingerprint) in discovery_scopes {
+        let Some(discovered) = store
+            .get(provider)
+            .and_then(|entry| entry.discoveries.get(fingerprint))
+        else {
+            continue;
+        };
+        let models = raw.entry(provider.clone()).or_default();
+        for model in &discovered.models {
+            let Ok(value) = serde_json::to_value(model) else {
+                continue;
+            };
+            models.entry(model.id.clone()).or_insert(value);
+        }
     }
     let mut warnings = Vec::new();
 
@@ -989,7 +1174,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let (merged, warnings) = merge_catalog(&BTreeMap::new(), &user);
+        let (merged, warnings) = merge_catalog(&BTreeMap::new(), &user, &BTreeMap::new());
         assert!(warnings.is_empty());
         let models = &merged["antigravity"];
         let gemini = models
@@ -1054,7 +1239,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let (merged, warnings) = merge_catalog(&store, &user);
+        let (merged, warnings) = merge_catalog(&store, &user, &BTreeMap::new());
         assert!(warnings.is_empty());
         assert_eq!(merged["openai"].len(), 2);
         assert_eq!(merged["openai"][0].name, "Overridden");
@@ -1085,9 +1270,64 @@ mod tests {
                 ..StoreEntry::default()
             },
         )]);
-        let (merged, warnings) = merge_catalog(&store, &ModelsFile::default());
+        let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &BTreeMap::new());
         assert!(warnings.is_empty());
         assert_eq!(merged["azure-openai-responses"].len(), 1);
+    }
+
+    #[test]
+    fn provider_discovery_cache_is_credential_scoped_and_never_overrides_pi_metadata() {
+        let pi: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "shared", "name": "Pi Shared", "api": "openai-completions",
+            "provider": "zai", "baseUrl": "https://api.example/v1"
+        }))
+        .unwrap();
+        let discovered = |id: &str, name: &str| {
+            serde_json::from_value::<CatalogModel>(serde_json::json!({
+                "id": id, "name": name, "api": "openai-completions",
+                "provider": "zai", "baseUrl": "https://api.example/v1",
+                "discovered": true
+            }))
+            .unwrap()
+        };
+        let store = BTreeMap::from([(
+            "zai".to_string(),
+            StoreEntry {
+                models: vec![pi],
+                discoveries: BTreeMap::from([
+                    (
+                        "account-a".to_string(),
+                        DiscoveryStoreEntry {
+                            models: vec![
+                                discovered("shared", "Stale Shared"),
+                                discovered("only-a", "Only A"),
+                            ],
+                            checked_at: 1,
+                        },
+                    ),
+                    (
+                        "account-b".to_string(),
+                        DiscoveryStoreEntry {
+                            models: vec![discovered("only-b", "Only B")],
+                            checked_at: 1,
+                        },
+                    ),
+                ]),
+                ..StoreEntry::default()
+            },
+        )]);
+        let scopes = BTreeMap::from([("zai".to_string(), "account-a".to_string())]);
+
+        let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &scopes);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            merged["zai"]
+                .iter()
+                .map(|model| (model.id.as_str(), model.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("only-a", "Only A"), ("shared", "Pi Shared")]
+        );
     }
 
     #[test]

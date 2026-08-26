@@ -75,7 +75,7 @@ Core commands are registered through `CommandRegistry`:
 | `:protocols` | List registered read and exec routes |
 | `:status` | Show project, model, usage, and extension status |
 | `:model` | Search runnable models |
-| `:refresh-catalog` | Force-refresh and apply cloud model configurations |
+| `:refresh-catalog` | Force-refresh and apply pi and provider model catalogs |
 | `:effort` | Select thinking effort supported by the active model |
 | `:settings` | Inspect and edit active settings |
 | `:login`, `:logout` | Manage provider credentials |

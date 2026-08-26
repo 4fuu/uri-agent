@@ -1,4 +1,7 @@
-use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel, api_key_environment};
+use crate::catalog::{
+    CatalogCredential, CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel,
+    api_key_environment, supports_live_discovery,
+};
 use crate::compaction;
 use crate::keymap::KeyDisplayStyle;
 use crate::oauth::{self, OauthToken};
@@ -59,7 +62,7 @@ pub struct Cli {
     #[arg(long, value_name = "LEVEL")]
     pub thinking: Option<ThinkingLevel>,
 
-    /// Disable pi.dev model-catalog network requests and use the local cache only.
+    /// Disable cloud and provider model-catalog requests and use the local cache only.
     #[arg(long)]
     pub offline: bool,
 
@@ -411,6 +414,13 @@ struct ResolvedModelCredential {
     environment: BTreeMap<String, String>,
 }
 
+struct DiscoveryCredentialCandidate {
+    provider: String,
+    value: String,
+    oauth: bool,
+    environment: BTreeMap<String, String>,
+}
+
 pub struct ConfigManager {
     directory: PathBuf,
     project_path: PathBuf,
@@ -448,6 +458,9 @@ impl ConfigManager {
             project,
             auth,
         };
+        let candidates = discovery_credential_candidates(&files, &catalog, &invocation).await;
+        let (credentials, _) = resolve_discovery_credentials(candidates, false).await;
+        catalog.activate_discovery(&credentials).await;
         let active = calculate_active(&files, &catalog, &invocation).await?;
         Ok(Self {
             directory,
@@ -616,6 +629,22 @@ impl ConfigManager {
         files.project = read_json(&self.project_path).await?;
         files.auth = read_json(&self.auth_path()).await?;
         self.recalculate(&files).await
+    }
+
+    pub async fn refresh_catalog(&self, force: bool) -> Result<CatalogRefreshReport> {
+        let candidates = {
+            let files = self.files.lock().await;
+            discovery_credential_candidates(&files, &self.catalog, &self.invocation).await
+        };
+        let (credentials, credential_warnings) =
+            resolve_discovery_credentials(candidates, force).await;
+        let mut report = self.catalog.refresh(force, &credentials).await?;
+        report.discovery_failures += credential_warnings.len();
+        for warning in credential_warnings {
+            self.catalog.add_warning(warning).await;
+        }
+        self.reload().await?;
+        Ok(report)
     }
 
     pub async fn set_model(&self, provider: &str, model: &str) -> Result<ActiveSettings> {
@@ -891,6 +920,10 @@ impl ConfigManager {
     }
 
     async fn recalculate(&self, files: &ConfigFiles) -> Result<ActiveSettings> {
+        let candidates =
+            discovery_credential_candidates(files, &self.catalog, &self.invocation).await;
+        let (credentials, _) = resolve_discovery_credentials(candidates, false).await;
+        self.catalog.activate_discovery(&credentials).await;
         let active = calculate_active(files, &self.catalog, &self.invocation).await?;
         *self.active.write().await = active.clone();
         Ok(active)
@@ -931,12 +964,91 @@ impl ConfigManager {
     }
 }
 
-async fn calculate_active(
+async fn discovery_credential_candidates(
     files: &ConfigFiles,
     catalog: &ModelCatalog,
     invocation: &InvocationOverrides,
-) -> Result<ActiveSettings> {
-    let (mut provider, mut provider_source) = setting(
+) -> Vec<DiscoveryCredentialCandidate> {
+    let current_provider = selected_provider(files, invocation).0;
+    let providers = catalog.providers().await;
+    let mut candidates = Vec::new();
+    for provider in providers {
+        if !supports_live_discovery(&provider) {
+            continue;
+        }
+        let credential = resolve_model_credential(
+            files,
+            catalog,
+            invocation,
+            &provider,
+            provider == current_provider,
+        )
+        .await;
+        let Some(value) = credential.api_key else {
+            continue;
+        };
+        candidates.push(DiscoveryCredentialCandidate {
+            provider,
+            value,
+            oauth: credential.kind == AuthKind::Oauth,
+            environment: credential.environment,
+        });
+    }
+    candidates
+}
+
+async fn resolve_discovery_credentials(
+    candidates: Vec<DiscoveryCredentialCandidate>,
+    allow_commands: bool,
+) -> (BTreeMap<String, CatalogCredential>, Vec<String>) {
+    let mut credentials = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for candidate in candidates {
+        let resolution = if !allow_commands {
+            let value = candidate.value.trim_start();
+            if let Some(command) = value.strip_prefix('!') {
+                let command = command.trim();
+                let Some(cache) = COMMAND_VALUE_CACHE.get() else {
+                    continue;
+                };
+                let Some(secret) = cache.lock().await.get(command).cloned() else {
+                    continue;
+                };
+                Ok(secret)
+            } else {
+                resolve_config_value(&candidate.value, &candidate.environment).await
+            }
+        } else {
+            resolve_config_value(&candidate.value, &candidate.environment).await
+        };
+        match resolution {
+            Ok(secret) if !secret.trim().is_empty() => {
+                credentials.insert(
+                    candidate.provider,
+                    CatalogCredential {
+                        secret,
+                        oauth: candidate.oauth,
+                    },
+                );
+            }
+            Ok(_) => warnings.push(format!(
+                "catalog {} discovery: configured credential is empty",
+                candidate.provider
+            )),
+            Err(error) => warnings.push(format!(
+                "catalog {} discovery credential: {error:#}",
+                candidate.provider
+            )),
+        }
+    }
+    (credentials, warnings)
+}
+
+fn selected_provider(
+    files: &ConfigFiles,
+    invocation: &InvocationOverrides,
+) -> (String, ValueSource, String) {
+    let (mut provider, mut source) = setting(
         String::new(),
         files.global.default_provider.clone(),
         files.project.default_provider.clone(),
@@ -946,12 +1058,21 @@ async fn calculate_active(
         && !value.trim().is_empty()
     {
         provider = value;
-        provider_source = ValueSource::Environment("URI_AGENT_PROVIDER".to_string());
+        source = ValueSource::Environment("URI_AGENT_PROVIDER".to_string());
     }
     if let Some(value) = &invocation.provider {
         provider.clone_from(value);
-        provider_source = ValueSource::CommandLine;
+        source = ValueSource::CommandLine;
     }
+    (provider, source, settings_provider)
+}
+
+async fn calculate_active(
+    files: &ConfigFiles,
+    catalog: &ModelCatalog,
+    invocation: &InvocationOverrides,
+) -> Result<ActiveSettings> {
+    let (provider, provider_source, settings_provider) = selected_provider(files, invocation);
 
     let (mut model, mut model_source) = if provider == settings_provider {
         setting(
@@ -2345,6 +2466,66 @@ mod tests {
             Some("lazy-secret")
         );
         assert!(marker.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn background_discovery_skips_credential_commands_until_forced() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("discovery-command-ran");
+        let command = format!("!touch '{}'; printf live-secret", marker.to_string_lossy());
+        let candidate = || DiscoveryCredentialCandidate {
+            provider: "opencode-go".to_string(),
+            value: command.clone(),
+            oauth: false,
+            environment: BTreeMap::new(),
+        };
+
+        let (credentials, warnings) = resolve_discovery_credentials(vec![candidate()], false).await;
+        assert!(credentials.is_empty());
+        assert!(warnings.is_empty());
+        assert!(!marker.exists());
+
+        let (credentials, warnings) = resolve_discovery_credentials(vec![candidate()], true).await;
+        assert!(warnings.is_empty());
+        assert_eq!(credentials["opencode-go"].secret, "live-secret");
+        assert!(marker.exists());
+
+        fs::remove_file(&marker).await.unwrap();
+        let (credentials, warnings) = resolve_discovery_credentials(vec![candidate()], false).await;
+        assert!(warnings.is_empty());
+        assert_eq!(credentials["opencode-go"].secret, "live-secret");
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn invocation_api_key_is_scoped_to_the_selected_discovery_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = ModelCatalog::load(root.path(), true).await.unwrap();
+        let files = ConfigFiles {
+            global: SettingsFile::default(),
+            project: SettingsFile::default(),
+            auth: AuthFile::default(),
+        };
+        let invocation = InvocationOverrides {
+            provider: Some("opencode-go".to_string()),
+            api_key: Some("invocation-key".to_string()),
+            ..InvocationOverrides::default()
+        };
+
+        let selected =
+            resolve_model_credential(&files, &catalog, &invocation, "opencode-go", true).await;
+        let unrelated = resolve_model_credential(
+            &files,
+            &catalog,
+            &invocation,
+            "uri-agent-discovery-unselected",
+            false,
+        )
+        .await;
+
+        assert_eq!(selected.api_key.as_deref(), Some("invocation-key"));
+        assert_eq!(unrelated.api_key, None);
     }
 
     #[test]
