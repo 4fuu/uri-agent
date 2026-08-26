@@ -1305,9 +1305,11 @@ mod tests {
     #[tokio::test]
     async fn shell_timeout_preserves_observed_output_and_terminates_the_process_tree() {
         let directory = tempfile::tempdir().unwrap();
+        let release_path = directory.path().join("release");
         let leaked_path = directory.path().join("leaked");
         let command = format!(
-            "printf partial; (sleep 0.3; printf leaked > '{}') & wait",
+            "printf partial; (while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & wait",
+            release_path.display(),
             leaked_path.display()
         );
         let executable = find_executable("bash").unwrap();
@@ -1324,6 +1326,7 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
+        tokio::fs::write(&release_path, b"release").await.unwrap();
         time::sleep(Duration::from_millis(500)).await;
 
         assert!(error.contains("Command timed out"));
@@ -1336,10 +1339,12 @@ mod tests {
     async fn dropping_a_foreground_shell_call_cancels_its_managed_process() {
         let directory = tempfile::tempdir().unwrap();
         let started_path = directory.path().join("started");
+        let release_path = directory.path().join("release");
         let leaked_path = directory.path().join("leaked");
         let command = format!(
-            "printf started > '{}'; (sleep 0.3; printf leaked > '{}') & wait",
+            "printf started > '{}'; (while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & wait",
             started_path.display(),
+            release_path.display(),
             leaked_path.display()
         );
         let executable = find_executable("bash").unwrap();
@@ -1379,6 +1384,7 @@ mod tests {
             }
             time::sleep(Duration::from_millis(10)).await;
         }
+        tokio::fs::write(&release_path, b"release").await.unwrap();
         time::sleep(Duration::from_millis(500)).await;
 
         assert!(context.tasks.get("001").await.is_none());
@@ -1390,10 +1396,12 @@ mod tests {
     async fn dropping_shell_execution_terminates_its_process_tree() {
         let directory = tempfile::tempdir().unwrap();
         let started_path = directory.path().join("started");
+        let release_path = directory.path().join("release");
         let leaked_path = directory.path().join("leaked");
         let command = format!(
-            "printf started > '{}'; (sleep 0.3; printf leaked > '{}') & wait",
+            "printf started > '{}'; (while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & wait",
             started_path.display(),
+            release_path.display(),
             leaked_path.display()
         );
         let executable = find_executable("bash").unwrap();
@@ -1420,6 +1428,7 @@ mod tests {
         assert!(started_path.exists());
         execution.abort();
         let _ = execution.await;
+        tokio::fs::write(&release_path, b"release").await.unwrap();
         time::sleep(Duration::from_millis(500)).await;
 
         assert!(!leaked_path.exists());
