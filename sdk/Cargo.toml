@@ -1,6 +1,6 @@
 [package]
 name = "uri-agent-plugin-sdk"
-version = "2026.826.2"
+version = "2026.827.0"
 edition = "2021"
 license = "MIT"
 description = "Rust guest SDK for URI Agent Extism WebAssembly protocol plugins"
