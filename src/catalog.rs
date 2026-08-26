@@ -650,10 +650,6 @@ impl ModelCatalog {
         self.inner.read().await.warnings.clone()
     }
 
-    pub(crate) async fn add_warning(&self, warning: String) {
-        self.inner.write().await.warnings.push(warning);
-    }
-
     pub fn store_path(&self) -> &Path {
         &self.store_path
     }

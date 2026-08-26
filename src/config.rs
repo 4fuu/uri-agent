@@ -459,7 +459,7 @@ impl ConfigManager {
             auth,
         };
         let candidates = discovery_credential_candidates(&files, &catalog, &invocation).await;
-        let (credentials, _) = resolve_discovery_credentials(candidates, false).await;
+        let credentials = resolve_discovery_credentials(candidates, false).await;
         catalog.activate_discovery(&credentials).await;
         let active = calculate_active(&files, &catalog, &invocation).await?;
         Ok(Self {
@@ -636,13 +636,8 @@ impl ConfigManager {
             let files = self.files.lock().await;
             discovery_credential_candidates(&files, &self.catalog, &self.invocation).await
         };
-        let (credentials, credential_warnings) =
-            resolve_discovery_credentials(candidates, force).await;
-        let mut report = self.catalog.refresh(force, &credentials).await?;
-        report.discovery_failures += credential_warnings.len();
-        for warning in credential_warnings {
-            self.catalog.add_warning(warning).await;
-        }
+        let credentials = resolve_discovery_credentials(candidates, force).await;
+        let report = self.catalog.refresh(force, &credentials).await?;
         self.reload().await?;
         Ok(report)
     }
@@ -922,7 +917,7 @@ impl ConfigManager {
     async fn recalculate(&self, files: &ConfigFiles) -> Result<ActiveSettings> {
         let candidates =
             discovery_credential_candidates(files, &self.catalog, &self.invocation).await;
-        let (credentials, _) = resolve_discovery_credentials(candidates, false).await;
+        let credentials = resolve_discovery_credentials(candidates, false).await;
         self.catalog.activate_discovery(&credentials).await;
         let active = calculate_active(files, &self.catalog, &self.invocation).await?;
         *self.active.write().await = active.clone();
@@ -1000,9 +995,8 @@ async fn discovery_credential_candidates(
 async fn resolve_discovery_credentials(
     candidates: Vec<DiscoveryCredentialCandidate>,
     allow_commands: bool,
-) -> (BTreeMap<String, CatalogCredential>, Vec<String>) {
+) -> BTreeMap<String, CatalogCredential> {
     let mut credentials = BTreeMap::new();
-    let mut warnings = Vec::new();
     for candidate in candidates {
         let resolution = if !allow_commands {
             let value = candidate.value.trim_start();
@@ -1021,27 +1015,19 @@ async fn resolve_discovery_credentials(
         } else {
             resolve_config_value(&candidate.value, &candidate.environment).await
         };
-        match resolution {
-            Ok(secret) if !secret.trim().is_empty() => {
-                credentials.insert(
-                    candidate.provider,
-                    CatalogCredential {
-                        secret,
-                        oauth: candidate.oauth,
-                    },
-                );
-            }
-            Ok(_) => warnings.push(format!(
-                "catalog {} discovery: configured credential is empty",
-                candidate.provider
-            )),
-            Err(error) => warnings.push(format!(
-                "catalog {} discovery credential: {error:#}",
-                candidate.provider
-            )),
+        if let Ok(secret) = resolution
+            && !secret.trim().is_empty()
+        {
+            credentials.insert(
+                candidate.provider,
+                CatalogCredential {
+                    secret,
+                    oauth: candidate.oauth,
+                },
+            );
         }
     }
-    (credentials, warnings)
+    credentials
 }
 
 fn selected_provider(
@@ -2481,21 +2467,41 @@ mod tests {
             environment: BTreeMap::new(),
         };
 
-        let (credentials, warnings) = resolve_discovery_credentials(vec![candidate()], false).await;
+        let credentials = resolve_discovery_credentials(vec![candidate()], false).await;
         assert!(credentials.is_empty());
-        assert!(warnings.is_empty());
         assert!(!marker.exists());
 
-        let (credentials, warnings) = resolve_discovery_credentials(vec![candidate()], true).await;
-        assert!(warnings.is_empty());
+        let credentials = resolve_discovery_credentials(vec![candidate()], true).await;
         assert_eq!(credentials["opencode-go"].secret, "live-secret");
         assert!(marker.exists());
 
         fs::remove_file(&marker).await.unwrap();
-        let (credentials, warnings) = resolve_discovery_credentials(vec![candidate()], false).await;
-        assert!(warnings.is_empty());
+        let credentials = resolve_discovery_credentials(vec![candidate()], false).await;
         assert_eq!(credentials["opencode-go"].secret, "live-secret");
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn discovery_silently_skips_credentials_that_are_not_currently_usable() {
+        let unavailable_variable =
+            format!("URI_AGENT_DISCOVERY_MISSING_{}", Uuid::new_v4().simple());
+        let candidate = |value: String| DiscoveryCredentialCandidate {
+            provider: "zai".to_string(),
+            value,
+            oauth: false,
+            environment: BTreeMap::new(),
+        };
+
+        let credentials = resolve_discovery_credentials(
+            vec![
+                candidate(String::new()),
+                candidate(format!("${{{unavailable_variable}}}")),
+            ],
+            true,
+        )
+        .await;
+
+        assert!(credentials.is_empty());
     }
 
     #[tokio::test]
