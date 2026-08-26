@@ -3399,6 +3399,11 @@ fn overflowing_transcript_renders_an_inset_scrollbar_outside_copied_cells() {
     assert!(content_rows.iter().any(|row| row.ends_with('│')));
     assert!(content_rows.iter().any(|row| row.ends_with('┃')));
     assert!(content_rows.last().unwrap().ends_with('┃'));
+    let scrollbar_area = app.transcript_scrollbar_area.unwrap();
+    assert_eq!(
+        app.selectable.as_ref().unwrap().area.right(),
+        scrollbar_area.x
+    );
     assert!(
         app.selectable
             .as_ref()
@@ -3432,6 +3437,124 @@ fn overflowing_transcript_renders_an_inset_scrollbar_outside_copied_cells() {
             .take(short.transcript_height)
             .all(|row| !row.ends_with(['│', '┃']))
     );
+}
+
+#[test]
+fn transcript_scrollbar_handles_track_clicks_and_thumb_drags() {
+    let mut app = test_app();
+    for index in 0..50 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 40, 12);
+    let area = app.transcript_scrollbar_area.unwrap();
+    let metrics = transcript_scrollbar_metrics(&app).unwrap();
+    let live_tail = metrics.live_tail;
+    assert_eq!(app.transcript_offset, live_tail);
+    app.selection = Some(TextSelection {
+        start: (1, area.y),
+        end: (2, area.y),
+    });
+
+    let thumb_row = area.y + metrics.thumb_start as u16;
+    assert!(handle_transcript_scrollbar_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: thumb_row,
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+    assert!(app.selection.is_none());
+    assert!(app.transcript_scrollbar_drag.is_some());
+    assert_eq!(app.transcript_offset, live_tail);
+
+    assert!(handle_transcript_scrollbar_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x.saturating_sub(5),
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+    assert_eq!(app.transcript_offset, 0);
+    assert!(!app.transcript_follow_tail);
+    assert!(handle_transcript_scrollbar_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+    assert!(app.transcript_scrollbar_drag.is_none());
+
+    assert!(handle_transcript_scrollbar_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.bottom().saturating_sub(1),
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+    assert_eq!(app.transcript_offset, live_tail);
+    assert!(app.transcript_follow_tail);
+}
+
+#[test]
+fn transcript_text_selection_stops_before_the_scrollbar_column() {
+    let mut app = test_app();
+    for index in 0..50 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 40, 12);
+    let area = app.transcript_scrollbar_area.unwrap();
+    let selectable = app.selectable.as_ref().unwrap().area;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: selectable.x + 1,
+        row: selectable.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x,
+        row: selectable.bottom().saturating_sub(1),
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, drag, false));
+    assert_eq!(
+        app.selection.unwrap().end.0,
+        selectable.right().saturating_sub(1)
+    );
+
+    let backend = TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let area = app.transcript_scrollbar_area.unwrap();
+    assert!((area.y..area.bottom()).all(|row| {
+        !terminal.backend().buffer()[(area.x, row)]
+            .modifier
+            .contains(Modifier::REVERSED)
+    }));
 }
 
 #[test]

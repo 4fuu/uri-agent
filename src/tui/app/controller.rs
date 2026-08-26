@@ -1740,6 +1740,9 @@ pub(super) async fn handle_mouse(
     if close_float_on_outside_click(app, mouse) {
         return Action::Continue;
     }
+    if handle_transcript_scrollbar_mouse(app, mouse) {
+        return Action::Continue;
+    }
     if begin_direct_transcript_selection(app, mouse) {
         return Action::Continue;
     }
@@ -2016,6 +2019,84 @@ pub(super) fn activate_transcript_mouse(app: &mut App, mouse: MouseEvent) -> boo
     app.last_click = None;
     app.click_transcript_block(index, open_document);
     true
+}
+
+pub(super) fn handle_transcript_scrollbar_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    let starting = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
+    let continuing = app.transcript_scrollbar_drag.is_some()
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        );
+    if !starting && !continuing {
+        return false;
+    }
+    if starting {
+        let Some(area) = app.transcript_scrollbar_area.filter(|area| {
+            app.overlay.is_none() && area.contains((mouse.column, mouse.row).into())
+        }) else {
+            app.transcript_scrollbar_drag = None;
+            return false;
+        };
+        let Some(metrics) = transcript_scrollbar_metrics(app) else {
+            app.transcript_scrollbar_drag = None;
+            return false;
+        };
+        let row = mouse.row.clamp(area.y, area.bottom().saturating_sub(1));
+        let relative_row = row.saturating_sub(area.y) as usize;
+        let thumb_end = metrics.thumb_start.saturating_add(metrics.thumb_length);
+        if !(metrics.thumb_start..thumb_end).contains(&relative_row) {
+            let target_thumb_start = relative_row
+                .saturating_sub(metrics.thumb_length / 2)
+                .min(metrics.max_thumb_start);
+            let offset = proportional_scrollbar_offset(
+                target_thumb_start,
+                metrics.max_thumb_start,
+                metrics.live_tail,
+            );
+            app.set_transcript_scrollbar_offset(offset);
+        }
+        app.selection = None;
+        app.last_click = None;
+        app.transcript_scrollbar_drag = Some(TranscriptScrollbarDrag {
+            row,
+            offset: app.transcript_offset,
+        });
+        return true;
+    }
+
+    let drag = app
+        .transcript_scrollbar_drag
+        .expect("continuing scrollbar drag has state");
+    if let (Some(area), Some(metrics)) = (
+        app.transcript_scrollbar_area,
+        transcript_scrollbar_metrics(app),
+    ) {
+        let row = mouse.row.clamp(area.y, area.bottom().saturating_sub(1));
+        let distance = row.abs_diff(drag.row) as usize;
+        let offset_distance =
+            proportional_scrollbar_offset(distance, metrics.max_thumb_start, metrics.live_tail);
+        let offset = if row < drag.row {
+            drag.offset.saturating_sub(offset_distance)
+        } else {
+            drag.offset.saturating_add(offset_distance)
+        };
+        app.set_transcript_scrollbar_offset(offset);
+    }
+    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+        app.transcript_scrollbar_drag = None;
+    }
+    true
+}
+
+fn proportional_scrollbar_offset(position: usize, maximum: usize, live_tail: usize) -> usize {
+    if maximum == 0 {
+        return 0;
+    }
+    position
+        .saturating_mul(live_tail)
+        .saturating_add(maximum / 2)
+        / maximum
 }
 
 pub(super) fn is_selection_copy_click(app: &App, mouse: MouseEvent) -> bool {

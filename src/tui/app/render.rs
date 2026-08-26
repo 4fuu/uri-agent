@@ -232,6 +232,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_regions.clear();
     app.overlay_bounds = None;
     app.overlay_viewport_rows = 0;
+    app.transcript_scrollbar_area = None;
     app.selectable = None;
     app.composer_view = None;
     if app.overlay != Some(Overlay::Composer) {
@@ -324,6 +325,11 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             flash_area,
         );
     }
+    app.transcript_scrollbar_area = if app.overlay.is_none() && !idle {
+        transcript_scrollbar_area(app, content)
+    } else {
+        None
+    };
     let selectable_area = if let Some(overlay) = app.overlay {
         app.hit_regions.clear();
         let area = overlay_area(frame.area(), app, overlay);
@@ -334,7 +340,12 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             vertical: 2,
         }))
     } else {
-        Some(content)
+        Some(Rect {
+            width: content
+                .width
+                .saturating_sub(u16::from(app.transcript_scrollbar_area.is_some())),
+            ..content
+        })
     };
     if let Some(selectable_area) = selectable_area.filter(|area| !area.is_empty()) {
         let row_separators = app
@@ -347,7 +358,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_selection(frame, app);
     }
     if app.overlay.is_none() && !idle {
-        render_transcript_scrollbar(frame, app, content);
+        render_transcript_scrollbar(frame, app);
     }
     if app.overlay.is_none()
         && let Some(footer_area) = footer_area.filter(|area| area.height == 1)
@@ -845,10 +856,55 @@ pub(super) fn render_transcript(
     visible_row_separators
 }
 
-pub(super) fn render_transcript_scrollbar(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if app.transcript_rows <= app.transcript_height || area.is_empty() {
-        return;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TranscriptScrollbarMetrics {
+    pub(super) live_tail: usize,
+    pub(super) thumb_start: usize,
+    pub(super) thumb_length: usize,
+    pub(super) max_thumb_start: usize,
+}
+
+fn transcript_scrollbar_area(app: &App, area: Rect) -> Option<Rect> {
+    (app.transcript_rows > app.transcript_height && !area.is_empty())
+        .then(|| Rect::new(area.right().saturating_sub(1), area.y, 1, area.height))
+}
+
+pub(super) fn transcript_scrollbar_metrics(app: &App) -> Option<TranscriptScrollbarMetrics> {
+    let area = app.transcript_scrollbar_area?;
+    let track_length = area.height as usize;
+    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
+    let content_span = live_tail.saturating_add(app.transcript_height);
+    if track_length == 0 || content_span == 0 {
+        return None;
     }
+    let rounding_divide = |numerator: usize, denominator: usize| {
+        numerator.saturating_add(denominator / 2) / denominator
+    };
+    let thumb_length = rounding_divide(
+        app.transcript_height.saturating_mul(track_length),
+        content_span,
+    )
+    .clamp(1, track_length);
+    let max_thumb_start = track_length.saturating_sub(thumb_length);
+    let thumb_start = rounding_divide(
+        app.transcript_offset
+            .min(live_tail)
+            .saturating_mul(track_length),
+        content_span,
+    )
+    .min(max_thumb_start);
+    Some(TranscriptScrollbarMetrics {
+        live_tail,
+        thumb_start,
+        thumb_length,
+        max_thumb_start,
+    })
+}
+
+pub(super) fn render_transcript_scrollbar(frame: &mut Frame<'_>, app: &App) {
+    let Some(area) = app.transcript_scrollbar_area else {
+        return;
+    };
     let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
     let mut state = ScrollbarState::new(live_tail.saturating_add(1))
         .position(app.transcript_offset.min(live_tail))
@@ -859,7 +915,7 @@ pub(super) fn render_transcript_scrollbar(frame: &mut Frame<'_>, app: &App, area
         .track_symbol(Some("│"))
         .track_style(Style::default().fg(MUTED))
         .thumb_symbol("┃")
-        .thumb_style(Style::default().fg(ACCENT));
+        .thumb_style(Style::default().fg(MUTED));
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
@@ -2928,8 +2984,18 @@ pub(super) fn render_selection(frame: &mut Frame<'_>, app: &App) {
     let (Some(surface), Some(selection)) = (&app.selectable, app.selection) else {
         return;
     };
-    let first = selection.start;
-    let second = selection.end;
+    let clamp = |point: (u16, u16)| {
+        (
+            point
+                .0
+                .clamp(surface.area.x, surface.area.right().saturating_sub(1)),
+            point
+                .1
+                .clamp(surface.area.y, surface.area.bottom().saturating_sub(1)),
+        )
+    };
+    let first = clamp(selection.start);
+    let second = clamp(selection.end);
     let (start, end) = if (first.1, first.0) <= (second.1, second.0) {
         (first, second)
     } else {

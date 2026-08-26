@@ -278,6 +278,12 @@ struct TextSelection {
     end: (u16, u16),
 }
 
+#[derive(Clone, Copy)]
+struct TranscriptScrollbarDrag {
+    row: u16,
+    offset: usize,
+}
+
 #[derive(Clone)]
 struct ComposerView {
     inner: Rect,
@@ -550,6 +556,8 @@ struct App {
     transcript_height: usize,
     transcript_follow_tail: bool,
     transcript_center_selected: bool,
+    transcript_scrollbar_area: Option<Rect>,
+    transcript_scrollbar_drag: Option<TranscriptScrollbarDrag>,
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
@@ -633,6 +641,8 @@ impl App {
             transcript_height: 0,
             transcript_follow_tail: true,
             transcript_center_selected: false,
+            transcript_scrollbar_area: None,
+            transcript_scrollbar_drag: None,
             started: Instant::now(),
             splash_skipped: !show_splash,
             last_sequence: None,
@@ -1754,6 +1764,13 @@ impl App {
         } else {
             offset
         };
+        self.transcript_follow_tail = self.transcript_offset == live_tail;
+        self.transcript_center_selected = false;
+    }
+
+    fn set_transcript_scrollbar_offset(&mut self, offset: usize) {
+        let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
+        self.transcript_offset = offset.min(live_tail);
         self.transcript_follow_tail = self.transcript_offset == live_tail;
         self.transcript_center_selected = false;
     }
