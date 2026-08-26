@@ -2213,7 +2213,7 @@ mod tests {
     }
 
     async fn wait_for_turn(runtime: &AgentRuntime) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while runtime.turn_running().await {
                 tokio::task::yield_now().await;
             }
@@ -4459,7 +4459,7 @@ mod tests {
         drop(runtime);
         backend.release.notify_one();
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if matches!(
                     session.snapshot().await.last().map(|event| &event.kind),

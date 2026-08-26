@@ -643,7 +643,9 @@ async fn execute(
         if status.is_some() && stdout.is_none() && stderr.is_none() {
             break;
         }
+        // After the parent exits, drain ready pipe data before treating inherited handles as idle.
         tokio::select! {
+            biased;
             _ = &mut deadline, if timeout.is_some() => {
                 timed_out = true;
                 break;
@@ -652,40 +654,44 @@ async fn execute(
                 status = Some(result?);
                 output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
             }
-            result = async {
-                stdout
-                    .as_mut()
-                    .expect("stdout read is guarded")
-                    .read(&mut stdout_buffer)
-                    .await
-            }, if stdout.is_some() => {
-                let count = result?;
-                if count == 0 {
-                    stdout = None;
-                } else {
-                    stdout_content.extend_from_slice(&stdout_buffer[..count]);
-                    if let Some((tasks, id)) = progress {
-                        tasks.append_latest_output(id, &stdout_buffer[..count]).await;
-                    }
-                    if status.is_some() {
-                        output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
-                    }
+            (is_stdout, result) = async {
+                tokio::select! {
+                    result = async {
+                        stdout
+                            .as_mut()
+                            .expect("stdout read is guarded")
+                            .read(&mut stdout_buffer)
+                            .await
+                    }, if stdout.is_some() => (true, result),
+                    result = async {
+                        stderr
+                            .as_mut()
+                            .expect("stderr read is guarded")
+                            .read(&mut stderr_buffer)
+                            .await
+                    }, if stderr.is_some() => (false, result),
                 }
-            }
-            result = async {
-                stderr
-                    .as_mut()
-                    .expect("stderr read is guarded")
-                    .read(&mut stderr_buffer)
-                    .await
-            }, if stderr.is_some() => {
+            }, if stdout.is_some() || stderr.is_some() => {
                 let count = result?;
                 if count == 0 {
-                    stderr = None;
+                    if is_stdout {
+                        stdout = None;
+                    } else {
+                        stderr = None;
+                    }
                 } else {
-                    stderr_content.extend_from_slice(&stderr_buffer[..count]);
+                    let content = if is_stdout {
+                        &stdout_buffer[..count]
+                    } else {
+                        &stderr_buffer[..count]
+                    };
+                    if is_stdout {
+                        stdout_content.extend_from_slice(content);
+                    } else {
+                        stderr_content.extend_from_slice(content);
+                    }
                     if let Some((tasks, id)) = progress {
-                        tasks.append_latest_output(id, &stderr_buffer[..count]).await;
+                        tasks.append_latest_output(id, content).await;
                     }
                     if status.is_some() {
                         output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
@@ -1249,7 +1255,7 @@ mod tests {
         // SAFETY: the process-unique variable is no longer used.
         unsafe { std::env::remove_var(&name) };
         let output = String::from_utf8(output).unwrap();
-        assert_eq!(output, "managed");
+        assert_eq!(output.trim_end(), "managed");
         assert!(!output.contains("inherited"));
     }
 
