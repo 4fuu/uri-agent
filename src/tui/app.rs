@@ -70,6 +70,7 @@ const ROW_ACTIVE: Color = Color::Rgb(25, 30, 35);
 const USER_SURFACE: Color = Color::Rgb(23, 48, 45);
 const TEXT: Color = Color::Rgb(218, 223, 229);
 const MUTED: Color = Color::Rgb(116, 124, 135);
+const SCROLLBAR: Color = Color::Rgb(142, 150, 160);
 const ACCENT: Color = Color::Rgb(104, 210, 194);
 const WARM: Color = Color::Rgb(239, 173, 104);
 const ERROR: Color = Color::Rgb(239, 108, 120);
@@ -1770,7 +1771,8 @@ impl App {
 
     fn set_transcript_scrollbar_offset(&mut self, offset: usize) {
         let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
-        self.transcript_offset = offset.min(live_tail);
+        let reading_end = transcript_reading_end(self.transcript_rows, self.transcript_height);
+        self.transcript_offset = offset.min(reading_end);
         self.transcript_follow_tail = self.transcript_offset == live_tail;
         self.transcript_center_selected = false;
     }

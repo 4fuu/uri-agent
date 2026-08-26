@@ -858,22 +858,22 @@ pub(super) fn render_transcript(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TranscriptScrollbarMetrics {
-    pub(super) live_tail: usize,
+    pub(super) reading_end: usize,
     pub(super) thumb_start: usize,
     pub(super) thumb_length: usize,
     pub(super) max_thumb_start: usize,
 }
 
 fn transcript_scrollbar_area(app: &App, area: Rect) -> Option<Rect> {
-    (app.transcript_rows > app.transcript_height && !area.is_empty())
+    (transcript_reading_end(app.transcript_rows, app.transcript_height) > 0 && !area.is_empty())
         .then(|| Rect::new(area.right().saturating_sub(1), area.y, 1, area.height))
 }
 
 pub(super) fn transcript_scrollbar_metrics(app: &App) -> Option<TranscriptScrollbarMetrics> {
     let area = app.transcript_scrollbar_area?;
     let track_length = area.height as usize;
-    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
-    let content_span = live_tail.saturating_add(app.transcript_height);
+    let reading_end = transcript_reading_end(app.transcript_rows, app.transcript_height);
+    let content_span = reading_end.saturating_add(app.transcript_height);
     if track_length == 0 || content_span == 0 {
         return None;
     }
@@ -888,13 +888,13 @@ pub(super) fn transcript_scrollbar_metrics(app: &App) -> Option<TranscriptScroll
     let max_thumb_start = track_length.saturating_sub(thumb_length);
     let thumb_start = rounding_divide(
         app.transcript_offset
-            .min(live_tail)
+            .min(reading_end)
             .saturating_mul(track_length),
         content_span,
     )
     .min(max_thumb_start);
     Some(TranscriptScrollbarMetrics {
-        live_tail,
+        reading_end,
         thumb_start,
         thumb_length,
         max_thumb_start,
@@ -905,9 +905,9 @@ pub(super) fn render_transcript_scrollbar(frame: &mut Frame<'_>, app: &App) {
     let Some(area) = app.transcript_scrollbar_area else {
         return;
     };
-    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
-    let mut state = ScrollbarState::new(live_tail.saturating_add(1))
-        .position(app.transcript_offset.min(live_tail))
+    let reading_end = transcript_reading_end(app.transcript_rows, app.transcript_height);
+    let mut state = ScrollbarState::new(reading_end.saturating_add(1))
+        .position(app.transcript_offset.min(reading_end))
         .viewport_content_length(app.transcript_height);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
@@ -915,7 +915,7 @@ pub(super) fn render_transcript_scrollbar(frame: &mut Frame<'_>, app: &App) {
         .track_symbol(Some("│"))
         .track_style(Style::default().fg(MUTED))
         .thumb_symbol("┃")
-        .thumb_style(Style::default().fg(MUTED));
+        .thumb_style(Style::default().fg(SCROLLBAR));
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 

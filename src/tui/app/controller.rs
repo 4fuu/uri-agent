@@ -2052,7 +2052,7 @@ pub(super) fn handle_transcript_scrollbar_mouse(app: &mut App, mouse: MouseEvent
             let offset = proportional_scrollbar_offset(
                 target_thumb_start,
                 metrics.max_thumb_start,
-                metrics.live_tail,
+                metrics.reading_end,
             );
             app.set_transcript_scrollbar_offset(offset);
         }
@@ -2075,7 +2075,7 @@ pub(super) fn handle_transcript_scrollbar_mouse(app: &mut App, mouse: MouseEvent
         let row = mouse.row.clamp(area.y, area.bottom().saturating_sub(1));
         let distance = row.abs_diff(drag.row) as usize;
         let offset_distance =
-            proportional_scrollbar_offset(distance, metrics.max_thumb_start, metrics.live_tail);
+            proportional_scrollbar_offset(distance, metrics.max_thumb_start, metrics.reading_end);
         let offset = if row < drag.row {
             drag.offset.saturating_sub(offset_distance)
         } else {

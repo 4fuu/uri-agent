@@ -3398,7 +3398,7 @@ fn overflowing_transcript_renders_an_inset_scrollbar_outside_copied_cells() {
         .collect::<Vec<_>>();
     assert!(content_rows.iter().any(|row| row.ends_with('│')));
     assert!(content_rows.iter().any(|row| row.ends_with('┃')));
-    assert!(content_rows.last().unwrap().ends_with('┃'));
+    assert!(content_rows.last().unwrap().ends_with('│'));
     let scrollbar_area = app.transcript_scrollbar_area.unwrap();
     assert_eq!(
         app.selectable.as_ref().unwrap().area.right(),
@@ -3412,6 +3412,18 @@ fn overflowing_transcript_renders_an_inset_scrollbar_outside_copied_cells() {
             .iter()
             .all(|row| row.last().is_some_and(|cell| cell == " "))
     );
+
+    app.scroll_transcript(isize::MAX);
+    let rendered = render_to_string(&mut app, 40, 12);
+    let content_rows = rendered
+        .lines()
+        .take(app.transcript_height)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        app.transcript_offset,
+        transcript_reading_end(app.transcript_rows, app.transcript_height)
+    );
+    assert!(content_rows.last().unwrap().ends_with('┃'));
 
     app.page_transcript(-1);
     let rendered = render_to_string(&mut app, 40, 12);
@@ -3455,7 +3467,9 @@ fn transcript_scrollbar_handles_track_clicks_and_thumb_drags() {
     render_to_string(&mut app, 40, 12);
     let area = app.transcript_scrollbar_area.unwrap();
     let metrics = transcript_scrollbar_metrics(&app).unwrap();
-    let live_tail = metrics.live_tail;
+    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
+    let reading_end = metrics.reading_end;
+    assert!(reading_end > live_tail);
     assert_eq!(app.transcript_offset, live_tail);
     app.selection = Some(TextSelection {
         start: (1, area.y),
@@ -3507,8 +3521,32 @@ fn transcript_scrollbar_handles_track_clicks_and_thumb_drags() {
             modifiers: KeyModifiers::NONE,
         }
     ));
-    assert_eq!(app.transcript_offset, live_tail);
-    assert!(app.transcript_follow_tail);
+    assert_eq!(app.transcript_offset, reading_end);
+    assert!(!app.transcript_follow_tail);
+    assert!(handle_transcript_scrollbar_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: area.x,
+            row: area.bottom().saturating_sub(1),
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+
+    render_to_string(&mut app, 40, 12);
+    let area = app.transcript_scrollbar_area.unwrap();
+    let metrics = transcript_scrollbar_metrics(&app).unwrap();
+    assert_eq!(metrics.thumb_start, metrics.max_thumb_start);
+    assert!(handle_transcript_scrollbar_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y + metrics.thumb_start as u16,
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+    assert_eq!(app.transcript_offset, reading_end);
 }
 
 #[test]
