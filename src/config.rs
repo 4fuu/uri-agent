@@ -80,6 +80,7 @@ impl Config {
     pub async fn load(cli: Cli) -> Result<Self> {
         let cwd = cli.cwd.unwrap_or(env::current_dir()?).canonicalize()?;
         let directory = config_directory()?;
+        migrate_legacy_macos_config(&directory).await?;
         fs::create_dir_all(&directory).await?;
         #[cfg(unix)]
         {
@@ -1143,15 +1144,179 @@ fn environment_truthy(name: &str) -> bool {
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
+const CONFIG_DIRECTORY_NAME: &str = "uri-agent";
+
 pub fn config_directory() -> Result<PathBuf> {
-    if let Ok(directory) = env::var("URI_AGENT_CONFIG_DIR")
-        && !directory.trim().is_empty()
-    {
-        return Ok(PathBuf::from(directory));
+    if let Some(directory) = overridden_config_directory() {
+        return Ok(directory);
     }
-    dirs::config_dir()
-        .map(|directory| directory.join("uri-agent"))
+    default_config_directory_from(
+        dirs::home_dir().as_deref(),
+        dirs::config_dir().as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+fn overridden_config_directory() -> Option<PathBuf> {
+    env::var("URI_AGENT_CONFIG_DIR")
+        .ok()
+        .filter(|directory| !directory.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn default_config_directory_from(
+    home_dir: Option<&Path>,
+    platform_config_dir: Option<&Path>,
+    use_home_config: bool,
+) -> Result<PathBuf> {
+    let base = if use_home_config {
+        home_dir.map(|home| home.join(".config"))
+    } else {
+        platform_config_dir.map(Path::to_path_buf)
+    };
+    base.map(|directory| directory.join(CONFIG_DIRECTORY_NAME))
         .ok_or_else(|| anyhow!("cannot determine the platform config directory"))
+}
+
+async fn migrate_legacy_macos_config(new_directory: &Path) -> Result<()> {
+    if !cfg!(target_os = "macos") || overridden_config_directory().is_some() {
+        return Ok(());
+    }
+    let Some(old_directory) =
+        dirs::config_dir().map(|directory| directory.join(CONFIG_DIRECTORY_NAME))
+    else {
+        return Ok(());
+    };
+    migrate_legacy_directory(&old_directory, new_directory)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot migrate macOS data from {} to {}",
+                old_directory.display(),
+                new_directory.display()
+            )
+        })
+}
+
+async fn migrate_legacy_directory(old_directory: &Path, new_directory: &Path) -> Result<()> {
+    let old_directory = old_directory.to_path_buf();
+    let new_directory = new_directory.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        migrate_legacy_directory_sync(&old_directory, &new_directory)
+    })
+    .await
+    .context("configuration migration worker failed")?
+}
+
+fn migrate_legacy_directory_sync(old_directory: &Path, new_directory: &Path) -> Result<()> {
+    if !old_directory.is_dir() || config_directories_match(old_directory, new_directory) {
+        return Ok(());
+    }
+
+    if !new_directory.exists() {
+        if let Some(parent) = new_directory.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "cannot create configuration directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        if std::fs::rename(old_directory, new_directory).is_ok() {
+            return Ok(());
+        }
+    }
+
+    std::fs::create_dir_all(new_directory).with_context(|| {
+        format!(
+            "cannot create configuration directory: {}",
+            new_directory.display()
+        )
+    })?;
+    merge_directory(old_directory, new_directory)?;
+    remove_config_entry(old_directory)
+}
+
+fn merge_directory(from: &Path, to: &Path) -> Result<()> {
+    for entry in
+        std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
+    {
+        let entry = entry.with_context(|| format!("cannot read {}", from.display()))?;
+        let name = entry.file_name();
+        let source = from.join(&name);
+        let dest = to.join(name);
+        if source.is_dir() && dest.is_dir() {
+            merge_directory(&source, &dest)?;
+            continue;
+        }
+        if dest.exists() {
+            continue;
+        }
+        move_config_entry(&source, &dest)?;
+    }
+    Ok(())
+}
+
+fn config_directories_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn move_config_entry(from: &Path, to: &Path) -> Result<()> {
+    if to.exists() {
+        return Ok(());
+    }
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if !from.exists() || to.exists() {
+        return Ok(());
+    }
+    copy_config_entry(from, to)?;
+    remove_config_entry(from)
+}
+
+fn copy_config_entry(from: &Path, to: &Path) -> Result<()> {
+    let metadata =
+        std::fs::metadata(from).with_context(|| format!("cannot inspect {}", from.display()))?;
+    if metadata.is_dir() {
+        std::fs::create_dir_all(to).with_context(|| format!("cannot create {}", to.display()))?;
+        for entry in
+            std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
+        {
+            let entry = entry.with_context(|| format!("cannot read {}", from.display()))?;
+            let name = entry.file_name();
+            copy_config_entry(&from.join(&name), &to.join(name))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::copy(from, to)
+        .map(|_| ())
+        .with_context(|| format!("cannot copy {} to {}", from.display(), to.display()))
+}
+
+fn remove_config_entry(path: &Path) -> Result<()> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    };
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("cannot remove {}", path.display()))
 }
 
 async fn lock_auth_file(directory: &Path) -> Result<std::fs::File> {
@@ -1881,5 +2046,139 @@ mod tests {
         );
         // SAFETY: this process-unique variable is no longer used.
         unsafe { env::remove_var("URI_AGENT_CONFIG_TEST_VALUE") };
+    }
+
+    #[test]
+    fn macos_default_config_directory_uses_home_config() {
+        let home = PathBuf::from("/Users/ada");
+        let directory = default_config_directory_from(
+            Some(&home),
+            Some(Path::new("/Users/ada/Library/Application Support")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(directory, home.join(".config").join("uri-agent"));
+    }
+
+    #[test]
+    fn platform_default_config_directory_uses_the_platform_config_root() {
+        let directory = default_config_directory_from(
+            Some(Path::new("/home/ada")),
+            Some(Path::new("/home/ada/.config")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            directory,
+            PathBuf::from("/home/ada/.config").join("uri-agent")
+        );
+    }
+
+    #[test]
+    fn missing_home_directory_is_an_error_when_home_config_is_required() {
+        let error = default_config_directory_from(None, Some(Path::new("/platform/config")), true)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot determine the platform config directory"));
+    }
+
+    #[tokio::test]
+    async fn macos_legacy_directory_moves_all_files_and_removes_the_source() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("Application Support").join("uri-agent");
+        let new = root.path().join(".config").join("uri-agent");
+        fs::create_dir_all(old.join("wasm-plugins")).await.unwrap();
+        fs::write(old.join("settings.json"), "{}\n").await.unwrap();
+        fs::write(old.join("auth.json"), "{\"providers\":{}}\n")
+            .await
+            .unwrap();
+        fs::write(old.join("sessions-v2.db"), b"db").await.unwrap();
+        fs::write(old.join("sessions-v2.db-wal"), b"wal")
+            .await
+            .unwrap();
+        fs::write(old.join("wasm-plugins").join("demo.wasm"), b"wasm")
+            .await
+            .unwrap();
+
+        migrate_legacy_directory(&old, &new).await.unwrap();
+
+        assert_eq!(fs::read(new.join("settings.json")).await.unwrap(), b"{}\n");
+        assert_eq!(
+            fs::read(new.join("auth.json")).await.unwrap(),
+            b"{\"providers\":{}}\n"
+        );
+        assert_eq!(fs::read(new.join("sessions-v2.db")).await.unwrap(), b"db");
+        assert_eq!(
+            fs::read(new.join("sessions-v2.db-wal")).await.unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            fs::read(new.join("wasm-plugins").join("demo.wasm"))
+                .await
+                .unwrap(),
+            b"wasm"
+        );
+        assert!(!old.exists());
+    }
+
+    #[tokio::test]
+    async fn macos_legacy_directory_does_not_overwrite_existing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let new = root.path().join("new");
+        fs::create_dir_all(&old).await.unwrap();
+        fs::create_dir_all(&new).await.unwrap();
+        fs::write(old.join("settings.json"), "old").await.unwrap();
+        fs::write(old.join("auth.json"), "old-auth").await.unwrap();
+        fs::write(old.join("sessions-v2.db"), "old-db")
+            .await
+            .unwrap();
+        fs::write(new.join("settings.json"), "new").await.unwrap();
+
+        migrate_legacy_directory(&old, &new).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(new.join("settings.json")).await.unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(new.join("auth.json")).await.unwrap(),
+            "old-auth"
+        );
+        assert_eq!(
+            fs::read_to_string(new.join("sessions-v2.db"))
+                .await
+                .unwrap(),
+            "old-db"
+        );
+        assert!(!old.exists());
+    }
+
+    #[tokio::test]
+    async fn macos_legacy_directory_is_a_noop_when_legacy_directory_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        migrate_legacy_directory(&root.path().join("missing"), &root.path().join("new"))
+            .await
+            .unwrap();
+        assert!(!root.path().join("new").exists());
+    }
+
+    #[tokio::test]
+    async fn macos_legacy_directory_is_a_noop_when_directories_match() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("uri-agent");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::write(directory.join("settings.json"), "keep")
+            .await
+            .unwrap();
+        migrate_legacy_directory(&directory, &directory)
+            .await
+            .unwrap();
+        assert!(directory.exists());
+        assert_eq!(
+            fs::read_to_string(directory.join("settings.json"))
+                .await
+                .unwrap(),
+            "keep"
+        );
     }
 }

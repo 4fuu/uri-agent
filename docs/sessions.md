@@ -10,9 +10,9 @@ Sessions are stored in SQLite at:
 <platform-data-dir>/uri-agent/sessions-v2.db
 ```
 
-If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions-v2.db`.
+On macOS this path is `~/.config/uri-agent/sessions-v2.db`, colocated with configuration. If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions-v2.db`.
 
-Earlier unversioned `sessions.db` files and their sidecars remain untouched beside the new database as an archive. URI Agent does not open, import, or modify them. Configuration and credentials use a separate directory and are unaffected.
+Earlier unversioned `sessions.db` files and their sidecars remain untouched beside the new database as an archive. URI Agent does not open, import, or modify them.
 
 A new session remains in memory while its startup context prepares in the background. Its first user message waits for that context, then URI Agent writes the frozen context, queued startup events, and message in one transaction. Opening and closing an empty session creates no session record.
 

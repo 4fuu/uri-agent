@@ -1107,7 +1107,30 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
 }
 
 fn session_database_path(fallback: &Path) -> PathBuf {
-    dirs::data_dir()
+    session_database_path_from(
+        macos_session_config_directory(),
+        dirs::data_dir().as_deref(),
+        fallback,
+    )
+}
+
+fn macos_session_config_directory() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        crate::config::config_directory().ok()
+    } else {
+        None
+    }
+}
+
+fn session_database_path_from(
+    config_directory: Option<PathBuf>,
+    platform_data_dir: Option<&Path>,
+    fallback: &Path,
+) -> PathBuf {
+    if let Some(directory) = config_directory {
+        return directory.join(SESSION_DATABASE_FILE);
+    }
+    platform_data_dir
         .map(|path| path.join("uri-agent").join(SESSION_DATABASE_FILE))
         .unwrap_or_else(|| fallback.join(".uri-agent").join(SESSION_DATABASE_FILE))
 }
@@ -1634,6 +1657,34 @@ mod tests {
             Some(std::ffi::OsStr::new(SESSION_DATABASE_FILE))
         );
         assert_ne!(SESSION_DATABASE_FILE, "sessions.db");
+    }
+
+    #[test]
+    fn macos_session_database_uses_the_config_directory() {
+        let path = session_database_path_from(
+            Some(PathBuf::from("/Users/ada/.config/uri-agent")),
+            Some(Path::new("/Users/ada/Library/Application Support")),
+            Path::new("/work"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/ada/.config/uri-agent").join(SESSION_DATABASE_FILE)
+        );
+    }
+
+    #[test]
+    fn platform_session_database_uses_the_data_directory() {
+        let path = session_database_path_from(
+            None,
+            Some(Path::new("/home/ada/.local/share")),
+            Path::new("/work"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/home/ada/.local/share")
+                .join("uri-agent")
+                .join(SESSION_DATABASE_FILE)
+        );
     }
 
     #[tokio::test]

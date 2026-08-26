@@ -154,13 +154,11 @@ environment variable. `models.json apiKey`, `URI_AGENT_API_KEY`, and
 
 ## Configuration locations
 
-URI Agent uses the platform configuration directory followed by `uri-agent`. On Linux this is normally:
+URI Agent stores global configuration in `~/.config/uri-agent` on macOS and Linux. On Windows this is normally `%AppData%\uri-agent`.
 
-```text
-~/.config/uri-agent
-```
+On macOS, earlier releases used `~/Library/Application Support/uri-agent`. If that directory still exists, URI Agent moves its complete contents — including session databases — into `~/.config/uri-agent` before loading settings, then deletes the old directory. Existing files in the new location are kept.
 
-Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
+Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path. An explicit override is used as-is and does not migrate files from the previous macOS location.
 
 | Path | Purpose |
 | --- | --- |
@@ -174,7 +172,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 | `<project>/.uri-agent/settings.json` | Optional project settings |
 | `<project>/.uri-agent/keymap.rhai` | Optional project keymap overrides |
 
-Sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Session storage and project boundaries](sessions.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
+Sessions live in this configuration directory on macOS after the Application Support cutover. On other platforms, sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Session storage and project boundaries](sessions.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
 
 The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings field. See [WASM plugins](plugins.md) for loading, installation, and reload behavior.
 
