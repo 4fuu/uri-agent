@@ -6,11 +6,19 @@ URI Agent presents one conversation surface with floating controls for compositi
 
 Startup may show a short splash. An empty conversation then shows the project, active model and thinking effort, and compose, command, and help hints; if no model is configured, it prompts for `:login`. `:new` returns directly to this welcome view.
 
-After the first record, a compact footer shows the active model, effort, and context usage. The context meter animates during live activity, stays static when idle, and uses provider-reported usage when available. `≈` appears only when an idle conversation remains on an estimate or an API baseline plus estimated trailing messages; live estimates omit it. `?` means compaction invalidated the previous baseline and no new provider usage has arrived. Activity and fixed statuses appear above the footer, while transient notifications overlay the current view and expire independently. Click the footer, press `F4`, or run `:status` for project, session, usage, and extension details.
+After the first record, a compact footer shows the active model, effort, and context usage. The context meter animates during live activity, stays static when idle, and uses provider-reported usage when available. `≈` appears only when an idle conversation remains on an estimate or an API baseline plus estimated trailing messages; live estimates omit it. `?` means compaction invalidated the previous baseline and no new provider usage has arrived. Activity and fixed statuses appear above the footer, while transient notifications overlay the current view and expire independently. Click the footer, press `F4`, or run `:status` for project, session, usage, the per-session diagnostic log path, and extension details.
 
 User prompts use a teal band; assistant responses render as Markdown on the terminal background. Both occupy the transcript width without decorative prefixes, so copied text contains only message content. Visual soft wraps do not add line breaks to copied transcript text; intentional rendered line breaks remain. During a turn, intermediate text, reasoning, and tools remain visible in event order. At completion they fold into one `Process` row, while the final response or terminal error stays visible. Restored sessions reconstruct the same collapsed form.
 
-Select a process, reasoning, or tool row with the keyboard or mouse and press `Enter` or click to fold or expand it. Tool summaries describe the routed URI, command, patch targets, and result instead of raw argument JSON. Press `o` or right-click to open the full document, including during streaming. In that document, press `c` to copy the complete contents. Search and reasoning/tool jump actions reveal a folded parent automatically.
+Select a process, reasoning, or tool row with the keyboard or mouse and press
+`Enter` or click to fold or expand it. Tool summaries describe the routed URI,
+command, patch targets, and result instead of raw argument JSON. Press `o` or
+right-click to open a Markdown-rendered full document, including during
+streaming. Tool documents show status, target, meaningful input, and result or
+error; commands, patches, edits, and dynamic output use fenced blocks without
+changing their indentation. Internal call IDs and raw `CALL`/`RESULT` markers
+are omitted. In that document, press `c` to copy the complete contents. Search
+and reasoning/tool jump actions reveal a folded parent automatically.
 
 If the model calls a protocol before reading that protocol's help, the blocked
 tool row uses a purple header. Its error detail keeps the normal error color.

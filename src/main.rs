@@ -436,6 +436,7 @@ async fn show_session(
                 context_tokens: runtime.estimated_context(),
                 context_accuracy: runtime.context_usage().accuracy,
                 compaction_enabled: active.compaction.enabled,
+                diagnostics_path: session_runtime.output.diagnostics_path(),
                 terminal: active.terminal,
                 key_display: active.key_display,
             },

@@ -2655,11 +2655,14 @@ pub(super) fn open_search(app: &mut App) {
         .iter()
         .enumerate()
         .filter(|(_, block)| block.kind != BlockKind::Process)
-        .map(|(index, block)| SelectorItem {
-            id: index.to_string(),
-            title: block.title.clone(),
-            description: search_line_preview(&block.text, "", 180),
-            search_text: Some(block.text.clone()),
+        .map(|(index, block)| {
+            let search_text = block_search_text(block);
+            SelectorItem {
+                id: index.to_string(),
+                title: block.title.clone(),
+                description: search_line_preview(&search_text, "", 180),
+                search_text: Some(search_text),
+            }
         })
         .collect::<Vec<_>>();
     if items.is_empty() {

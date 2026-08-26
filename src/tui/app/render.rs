@@ -6,16 +6,208 @@ pub(super) fn block_document(block: &DisplayBlock) -> String {
 }
 
 pub(super) fn block_document_with_level(block: &DisplayBlock, level: usize) -> String {
-    let mut document = format!("{} {}\n", "#".repeat(level), block.title);
-    if let Some(call_id) = &block.call_id {
-        document.push_str(&format!("\nCall ID: `{call_id}`\n"));
+    if let Some(tool) = &block.tool {
+        return tool_document(block, tool, level);
     }
+    let mut document = format!("{} {}\n", "#".repeat(level), block.title);
     document.push('\n');
     document.push_str(&block.text);
     if !document.ends_with('\n') {
         document.push('\n');
     }
     document
+}
+
+fn tool_document(block: &DisplayBlock, tool: &ToolDisplay, level: usize) -> String {
+    let section_level = level.saturating_add(1);
+    let mut document = format!("{} {}\n\n", "#".repeat(level), block.title);
+    document.push_str(match (&tool.output, block.failed) {
+        (None, _) => "**• Running**\n",
+        (Some(_), true) => "**× Failed**\n",
+        (Some(_), false) => "**✓ Succeeded**\n",
+    });
+
+    if let Some(target) = tool_target(tool) {
+        document.push_str(&format!("\n**Target:** {}\n", inline_code(target)));
+    }
+    append_tool_input(&mut document, tool, section_level);
+
+    if let Some(output) = &tool.output {
+        let heading = if block.failed { "Error" } else { "Result" };
+        document.push_str(&format!("\n{} {heading}\n\n", "#".repeat(section_level)));
+        let output = if block.failed {
+            output.strip_prefix("Error: ").unwrap_or(output)
+        } else {
+            output
+        };
+        if output.is_empty() {
+            document.push_str("_(no output)_\n");
+        } else {
+            document.push_str(&fenced_block(output, "text"));
+        }
+    }
+    document
+}
+
+fn tool_target(tool: &ToolDisplay) -> Option<&str> {
+    tool.arguments
+        .get("uri")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            (tool.name == "replace")
+                .then(|| tool.arguments.get("path")?.as_str())
+                .flatten()
+        })
+}
+
+fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
+    let heading = "#".repeat(level);
+    if tool.name == "apply_patch"
+        && let Some(patch) = tool
+            .arguments
+            .get("patch")
+            .and_then(serde_json::Value::as_str)
+    {
+        document.push_str(&format!("\n{heading} Patch\n\n"));
+        document.push_str(&fenced_block(patch, "diff"));
+        return;
+    }
+    if tool.name == "replace" {
+        for (key, label) in [("old_text", "Before"), ("new_text", "After")] {
+            if let Some(value) = tool.arguments.get(key).and_then(serde_json::Value::as_str) {
+                document.push_str(&format!("\n{heading} {label}\n\n"));
+                document.push_str(&fenced_block(value, "text"));
+            }
+        }
+        return;
+    }
+    if let Some(body) = tool_body_text(&tool.arguments)
+        && !body.is_empty()
+    {
+        let protocol = tool_protocol(&tool.arguments);
+        let (label, language) = if tool.name == "exec" {
+            match protocol.as_deref() {
+                Some("bash") => ("Command", "bash"),
+                Some("pwsh") => ("Command", "powershell"),
+                _ => ("Input", "text"),
+            }
+        } else {
+            ("Input", "text")
+        };
+        let parsed = (label != "Command")
+            .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
+            .flatten();
+        let rendered = parsed.as_ref().and_then(|value| {
+            serde_json::to_string_pretty(&redact_sensitive_arguments(value)).ok()
+        });
+        document.push_str(&format!("\n{heading} {label}\n\n"));
+        document.push_str(&fenced_block(
+            rendered.as_deref().unwrap_or(body),
+            if rendered.is_some() { "json" } else { language },
+        ));
+    }
+
+    let Some(arguments) = tool.arguments.as_object() else {
+        return;
+    };
+    let remaining = arguments
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "uri" | "body"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if remaining.is_empty() {
+        return;
+    }
+    let remaining = redact_sensitive_arguments(&serde_json::Value::Object(remaining));
+    let input = serde_json::to_string_pretty(&remaining).unwrap_or_else(|_| remaining.to_string());
+    document.push_str(&format!("\n{heading} Input\n\n"));
+    document.push_str(&fenced_block(&input, "json"));
+}
+
+pub(super) fn redact_sensitive_arguments(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    let value = if sensitive_argument_name(name) {
+                        serde_json::Value::String("[redacted]".to_string())
+                    } else {
+                        redact_sensitive_arguments(value)
+                    };
+                    (name.clone(), value)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(redact_sensitive_arguments).collect())
+        }
+        value => value.clone(),
+    }
+}
+
+fn sensitive_argument_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        name.as_str(),
+        "api_key"
+            | "apikey"
+            | "access_token"
+            | "accesstoken"
+            | "refresh_token"
+            | "refreshtoken"
+            | "auth_token"
+            | "authtoken"
+            | "authorization"
+            | "password"
+            | "passwords"
+            | "passphrase"
+            | "secret"
+            | "secrets"
+            | "client_secret"
+            | "clientsecret"
+            | "credential"
+            | "credentials"
+            | "cookie"
+            | "cookies"
+            | "private_key"
+            | "privatekey"
+            | "environment"
+            | "environment_variables"
+            | "environmentvariables"
+            | "env"
+            | "env_vars"
+            | "envvars"
+            | "token"
+    ) || ["_api_key", "_token", "_password", "_secret", "_credential"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn inline_code(value: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(value).saturating_add(1).max(1));
+    let padding = value.starts_with(['`', ' ']) || value.ends_with(['`', ' ']);
+    if padding {
+        format!("{fence} {value} {fence}")
+    } else {
+        format!("{fence}{value}{fence}")
+    }
+}
+
+pub(super) fn fenced_block(value: &str, language: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(value).saturating_add(1).max(3));
+    format!(
+        "{fence}{language}\n{value}{}{fence}\n",
+        if value.ends_with('\n') { "" } else { "\n" }
+    )
+}
+
+fn longest_backtick_run(value: &str) -> usize {
+    value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default()
 }
 
 pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
@@ -182,7 +374,7 @@ pub(super) fn tool_argument_details(
                 );
                 continue;
             }
-            lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
+            lines.push((format!("  {key}: {}", argument_summary(key, value)), MUTED));
         }
     }
     let Some(body) = tool_body(arguments) else {
@@ -205,7 +397,7 @@ pub(super) fn tool_argument_details(
         }
         serde_json::Value::Object(fields) => {
             for (key, value) in fields {
-                lines.push((format!("  {key}: {}", json_value_summary(value)), MUTED));
+                lines.push((format!("  {key}: {}", argument_summary(key, value)), MUTED));
             }
         }
         serde_json::Value::Array(values) => {
@@ -214,6 +406,14 @@ pub(super) fn tool_argument_details(
         serde_json::Value::Number(value) => lines.push((format!("  body: {value}"), MUTED)),
         serde_json::Value::Bool(value) => lines.push((format!("  body: {value}"), MUTED)),
         serde_json::Value::Null => {}
+    }
+}
+
+fn argument_summary(name: &str, value: &serde_json::Value) -> String {
+    if sensitive_argument_name(name) {
+        "[redacted]".to_string()
+    } else {
+        json_value_summary(value)
     }
 }
 
@@ -1086,17 +1286,15 @@ pub(super) fn transcript_block_items(
             } else {
                 WARM
             };
+            let has_result = block.tool.as_ref().map_or_else(
+                || block.text.contains("\n\nRESULT\n"),
+                |tool| tool.output.is_some(),
+            );
             let status = if live {
                 animation::spinner(app.frame).to_string()
             } else if block.failed {
                 "×".to_string()
-            } else if block
-                .tool
-                .as_ref()
-                .and_then(|tool| tool.output.as_ref())
-                .is_some()
-                || block.text.contains("\n\nRESULT\n")
-            {
+            } else if has_result {
                 "✓".to_string()
             } else {
                 "·".to_string()
@@ -1730,10 +1928,14 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 .map(|(title, body)| (title.as_str(), body.as_str()))
                 .unwrap_or(("DOCUMENT", "Nothing to show."));
             let title = panel_title(name, hints);
+            let inner_width = block.inner(area).width as usize;
+            let lines = markdown::render(body, inner_width)
+                .into_iter()
+                .map(|rendered| rendered.line)
+                .collect::<Vec<_>>();
             frame.render_widget(
-                Paragraph::new(body)
+                Paragraph::new(lines)
                     .block(block.title(fit_panel_title(&title, area.width)))
-                    .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,
             );
@@ -1872,6 +2074,11 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             "SESSION",
             app.info.session_id.clone(),
             Style::default().fg(TEXT),
+        ),
+        status_row(
+            "LOG",
+            display_path(&app.info.diagnostics_path),
+            Style::default().fg(MUTED),
         ),
         status_row(
             "MODEL",

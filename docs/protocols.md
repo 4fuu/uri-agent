@@ -22,7 +22,8 @@ string unchanged, including an empty string.
 
 Before any other call to a protocol in a session, the model must successfully
 call `read("<protocol>://help", "")`. The runtime blocks calls that skip this
-first help read. Each protocol is tracked independently.
+first help read and returns the exact help address required. Each protocol is
+tracked independently.
 
 `read` is used for resources, help, task snapshots, and completed output. `exec`
 starts work through protocols that support execution. `replace` and
@@ -103,14 +104,18 @@ read("file://src/main.rs?offset=1&limit=200&line_numbers=true", "")
 
 Add `glob=<pattern>` to a directory target to list matching files recursively
 with standard ignore rules. Results are sorted and paginated with the same
-one-based `offset` and bounded `limit`:
+one-based `offset` and bounded `limit`. Query values use standard
+percent-encoding:
 
 ```text
 read("file://src?glob=**/*.rs&limit=200", "")
 ```
 
 `file://help` reports the accepted range and glob options, active limits, and
-current working directory.
+current working directory. Paginated file, directory, and glob results omit a
+redundant remaining-count field and return the exact next address. Empty
+directories return `No entries.` and empty globs return `No matches.`; an empty
+file remains empty content.
 
 ### `grep`
 
@@ -156,7 +161,16 @@ read("sessions://<session-id>", "")
 read("sessions://<session-id>?include_tools=true&limit=20", "")
 ```
 
-User, assistant, and terminal error text is returned by default. Thinking, usage, model replay payloads, compaction summaries, and TUI metadata are always excluded; tool calls and results are excluded unless requested. Results are bounded and marked as untrusted reference data. Archive access opens the SQLite database read-only and does not initialize, migrate, resume, append, rename, or delete sessions. Read `sessions://help` for the exact query parameters and limits.
+User, assistant, and terminal error text is returned by default. Thinking,
+usage, model replay payloads, compaction summaries, TUI metadata, model and
+provider names, message counts, and per-record timestamps are excluded; tool
+calls and results are excluded unless requested. Discovery returns the session
+ID, title, and working directory only when needed to distinguish cross-project
+results. Records retain role, sequence cursor, failure state, and text. Results
+are bounded and marked as untrusted reference data. Archive access opens the
+SQLite database read-only and does not initialize, migrate, resume, append,
+rename, or delete sessions. Read `sessions://help` for the exact query
+parameters and limits.
 
 ### `https`
 
@@ -192,6 +206,9 @@ HTTPS fetching: HTML is cleaned and converted to Markdown, JSON is
 pretty-printed, and other textual resources are returned as text. Local reads
 do not execute JavaScript or extract PDFs. Redirects must remain on HTTPS,
 requests time out after 30 seconds, and response bodies are limited to 5 MiB.
+Search and page results are explicitly framed as untrusted web content. Search
+output omits the echoed query, provider, and provider request ID; the request ID
+and selected provider remain available in the per-session diagnostic log.
 
 ### `replace`
 
@@ -259,14 +276,19 @@ URI Agent injects the latest values from its global Agent environment manager in
 
 PowerShell source and plain-text output use UTF-8. Command status follows the final PowerShell or native command, including the native command's exact exit code.
 
+Successful stdout-only output is returned directly. A stderr-only result is
+prefixed by `stderr:`, and both labels are retained when both streams exist.
+Silent success returns `(no output)`. Nonzero exits and timeouts retain their
+terminal state and any observed output; the generic `Error:` marker remains so
+all model providers distinguish failures from successful text.
+
 ## Managed tasks
 
 Protocol execution returns its final result directly by default. Bash and PowerShell commands therefore start in the foreground. If a command is still running after about 60 seconds, URI Agent converts that same process into a managed background task without restarting it:
 
 ```text
 exec("bash://run", "cargo test")
-→ Exit: exit status: 0
-  ...
+→ <stdout>
 
 # If it remains active past the foreground window:
 → Background task accepted: tasks://<id>
@@ -294,21 +316,49 @@ read("tasks://<id>", "")
 exec("tasks://<id>/cancel", "")
 ```
 
-Task acceptance is not success. A task record exposes `pending`, `running`, `completed`, `failed`, or `cancelled` state, its originating protocol, label, duration, bounded latest output while active, and complete terminal output. Task IDs increase within their in-process manager as lowercase hexadecimal values: they start at `001`, remain at least three digits wide, and expand after `fff`. Settled background records remain available for the lifetime of the session runtime. At most 16 background tasks may be pending or running at once; an explicit background request fails at capacity, while automatic conversion keeps waiting in the foreground.
+Task acceptance is not success. A model-facing task record exposes `pending`,
+`running`, `completed`, `failed`, or `cancelled` state, its originating
+protocol, label, bounded latest output while active, and complete terminal
+output. Internal timestamps and duration do not enter the model result. Task
+IDs increase within their in-process manager as lowercase hexadecimal values:
+they start at `001`, remain at least three digits wide, and expand after `fff`.
+Settled background records remain available for the lifetime of the session
+runtime. At most 16 background tasks may be pending or running at once; an
+explicit background request fails at capacity, while automatic conversion
+keeps waiting in the foreground.
 
-When a background task reaches `completed`, `failed`, or `cancelled`, URI Agent sends the model an automatic hidden notification containing the `tasks://` URI, status, and at most the latest 20 lines and 4,000 characters of output. The notification continues the active turn at its next model boundary or starts a model turn when idle, so the model must not poll. Task output is identified as untrusted data. Reading an individual terminal task or a summary that already presents it suppresses the duplicate notification. Notifications are delivered in batches of at most 10 and approximately 16,000 output characters.
+When a background task reaches `completed`, `failed`, or `cancelled`, URI Agent
+sends the model an automatic hidden plain-text notification containing the
+`tasks://` URI, status, and at most the latest 20 lines and 4,000 characters of
+output. A complete-record read instruction appears only when that output was
+truncated. The notification continues the active turn at its next model
+boundary or starts a model turn when idle, so the model must not poll. Task
+output is identified as untrusted data. Reading an individual terminal task or
+a summary that already presents it suppresses the duplicate notification.
+Notifications are delivered in batches of at most 10 and approximately 16,000
+output characters.
 
 Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree, not only the Rust future that waits for it.
 
 ## Complete output preservation
 
-When protocol output exceeds the active inline limit, URI Agent:
+When a successful tool result or formatted failure exceeds the active inline
+limit, URI Agent:
 
 1. stores the complete bytes under the platform cache directory at `uri-agent/outputs/<session-id>/`;
 2. returns a head-and-tail preview;
 3. includes a readable `file://` address for the complete output.
 
-This presentation behavior is shared by protocol reads and executions. Adjust the limit through `:settings`, configuration, `URI_AGENT_OUTPUT_LIMIT`, or `--output-limit`; see [Models and configuration](configuration.md).
+This presentation behavior is shared by protocol reads, executions, dynamic
+WASM tools, and failures. Adjust the limit through `:settings`, configuration,
+`URI_AGENT_OUTPUT_LIMIT`, or `--output-limit`; see [Models and
+configuration](configuration.md).
+
+Each session also has `diagnostics.jsonl` in this output directory. The log
+contains tool lifecycle timing, call IDs, tool names, argument field names and
+sizes, result sizes and state, plus selected internal provider identifiers. It
+does not copy raw arguments, credentials, environment values, or successful
+tool output. The `:status` panel shows its path.
 
 ## Extensions
 

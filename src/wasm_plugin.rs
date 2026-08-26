@@ -410,8 +410,7 @@ impl ReloadReport {
             serde_json::to_string(&self.protocols).expect("protocol names serialize as JSON")
         };
         let mut result = format!(
-            "WASM plugins reloaded.\nLoaded plugins: {}\nActive protocols: {protocols}\nActive model tools: {}",
-            self.loaded_files.len(),
+            "WASM plugins reloaded.\nProtocols: {protocols}\nModel tools: {}",
             if self.model_tools.is_empty() {
                 "none".to_string()
             } else {
@@ -421,12 +420,12 @@ impl ReloadReport {
         );
         if !self.diagnostics.is_empty() {
             result.push_str(&format!(
-                "\nSkipped plugins: {}\nRead wasm_plugin://help for the diagnostics file.",
+                "\nSkipped: {}; read(\"wasm_plugin://help\", \"\") for untrusted diagnostics.",
                 self.diagnostics.len()
             ));
         }
         if !self.protocols.is_empty() {
-            result.push_str("\nRead each active protocol's <protocol>://help before using it.");
+            result.push_str("\nRead each listed protocol's <protocol>://help before use.");
         }
         result
     }
@@ -1425,7 +1424,8 @@ mod tests {
 
         restore_help_read(&registry, "wasm_plugin").await;
         let reloaded = registry.exec("wasm_plugin://reload", "").await.unwrap();
-        assert!(reloaded.contains(r#"Active protocols: ["first"]"#));
+        assert!(reloaded.contains(r#"Protocols: ["first"]"#));
+        assert!(!reloaded.contains("Loaded plugins:"));
         restore_help_read(&registry, "first").await;
         assert!(registry.read("first://value", "").await.is_ok());
         let help = registry.read("wasm_plugin://help", "").await.unwrap();
@@ -1647,7 +1647,7 @@ mod tests {
 
         restore_help_read(&registry, "wasm_plugin").await;
         let reloaded = registry.exec("wasm_plugin://reload", "").await.unwrap();
-        assert!(reloaded.contains("Skipped plugins: 1"));
+        assert!(reloaded.contains("Skipped: 1"));
         assert!(!reloaded.contains("bad.wasm"));
 
         let help = registry.read("wasm_plugin://help", "").await.unwrap();

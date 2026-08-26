@@ -57,6 +57,11 @@ Completion is delivered automatically, so you MUST NOT poll.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
+
+On success, stdout-only output is returned directly, stderr-only output is
+identified by `stderr:`, and both streams are labeled when both exist. A
+successful command with no output returns `(no output)`. Failures retain the
+exit code or timeout and any output observed before termination.
 "#;
 const PWSH_HELP: &str = r#"# pwsh
 
@@ -102,6 +107,11 @@ final PowerShell or native command, and native exit codes are preserved.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
+
+On success, stdout-only output is returned directly, stderr-only output is
+identified by `stderr:`, and both streams are labeled when both exist. A
+successful command with no output returns `(no output)`. Failures retain the
+exit code or timeout and any output observed before termination.
 "#;
 
 struct ProcessTreeGuard {
@@ -592,7 +602,7 @@ async fn execute(
             Ok(result) => result?,
             Err(_) => {
                 bail!(
-                    "Command timed out after {} seconds.",
+                    "Command timed out after {}s.",
                     timeout
                         .expect("a deadline is only present when a timeout is configured")
                         .as_secs()
@@ -688,34 +698,57 @@ async fn execute(
 
     if timed_out {
         let mut result = format!(
-            "Command timed out after {} seconds.\n",
+            "Command timed out after {}s.",
             timeout
                 .expect("the timeout branch is only enabled when configured")
                 .as_secs()
         )
         .into_bytes();
-        append_stream_output(&mut result, &stdout_content, &stderr_content);
+        append_process_output(&mut result, &stdout_content, &stderr_content, false);
         return Err(anyhow!(String::from_utf8_lossy(&result).into_owned()));
     }
     let status = status.ok_or_else(|| anyhow!("shell process exited without a status"))?;
     process_tree.disarm();
-    let mut result = format!("Exit: {status}\n").into_bytes();
-    append_stream_output(&mut result, &stdout_content, &stderr_content);
     if status.success() {
+        let mut result = Vec::new();
+        append_process_output(&mut result, &stdout_content, &stderr_content, true);
         Ok(result)
     } else {
+        let mut result = status.code().map_or_else(
+            || format!("Command terminated: {status}.").into_bytes(),
+            |code| format!("Command exited with code {code}.").into_bytes(),
+        );
+        append_process_output(&mut result, &stdout_content, &stderr_content, false);
         Err(anyhow!(String::from_utf8_lossy(&result).into_owned()))
     }
 }
 
-fn append_stream_output(result: &mut Vec<u8>, stdout: &[u8], stderr: &[u8]) {
-    if !stdout.is_empty() {
-        result.extend_from_slice(b"\nstdout:\n");
-        result.extend_from_slice(stdout);
+fn append_process_output(result: &mut Vec<u8>, stdout: &[u8], stderr: &[u8], empty_marker: bool) {
+    if stdout.is_empty() && stderr.is_empty() {
+        if empty_marker {
+            result.extend_from_slice(b"(no output)");
+        }
+        return;
     }
-    if !stderr.is_empty() {
-        result.extend_from_slice(b"\nstderr:\n");
-        result.extend_from_slice(stderr);
+    if !result.is_empty() {
+        result.extend_from_slice(b"\n\n");
+    }
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, true) => result.extend_from_slice(stdout),
+        (true, false) => {
+            result.extend_from_slice(b"stderr:\n");
+            result.extend_from_slice(stderr);
+        }
+        (false, false) => {
+            result.extend_from_slice(b"stdout:\n");
+            result.extend_from_slice(stdout);
+            if !stdout.ends_with(b"\n") {
+                result.push(b'\n');
+            }
+            result.extend_from_slice(b"\nstderr:\n");
+            result.extend_from_slice(stderr);
+        }
+        (true, true) => unreachable!("empty streams returned above"),
     }
 }
 
@@ -804,6 +837,21 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn process_output_uses_only_the_stream_labels_the_model_needs() {
+        let render = |stdout: &[u8], stderr: &[u8], empty_marker| {
+            let mut output = Vec::new();
+            append_process_output(&mut output, stdout, stderr, empty_marker);
+            String::from_utf8(output).unwrap()
+        };
+
+        assert_eq!(render(b"out", b"", true), "out");
+        assert_eq!(render(b"", b"err", true), "stderr:\nerr");
+        assert_eq!(render(b"out", b"err", true), "stdout:\nout\n\nstderr:\nerr");
+        assert_eq!(render(b"", b"", true), "(no output)");
+        assert_eq!(render(b"", b"", false), "");
+    }
 
     #[test]
     fn pwsh_help_uses_powershell_syntax_and_bounds_shell_work() {
@@ -1064,11 +1112,7 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("Exit:"));
-        #[cfg(unix)]
-        assert!(error.contains("Exit: exit status: 7"));
-        #[cfg(windows)]
-        assert!(error.contains("Exit: exit code: 7"));
+        assert_eq!(error, "Command exited with code 7.");
     }
 
     #[tokio::test]
@@ -1118,8 +1162,8 @@ mod tests {
             .await
             .unwrap();
         let completed = String::from_utf8(completed).unwrap();
-        assert!(completed.contains("Exit:"));
         assert!(completed.contains("foreground-ok"));
+        assert!(!completed.contains("Exit:"));
         assert!(context.tasks.list().await.is_empty());
 
         let started = Instant::now();
@@ -1205,7 +1249,7 @@ mod tests {
         // SAFETY: the process-unique variable is no longer used.
         unsafe { std::env::remove_var(&name) };
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("stdout:\nmanaged"));
+        assert_eq!(output, "managed");
         assert!(!output.contains("inherited"));
     }
 
@@ -1277,7 +1321,7 @@ mod tests {
         time::sleep(Duration::from_millis(500)).await;
 
         assert!(error.contains("Command timed out"));
-        assert!(error.contains("stdout:\npartial"));
+        assert!(error.ends_with("\n\npartial"));
         assert!(!leaked_path.exists());
     }
 

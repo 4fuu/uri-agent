@@ -5,7 +5,7 @@ use crate::plugin::{
     TuiCompletions, TuiTextPosition, TuiTextRange,
 };
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use ignore::{DirEntry, WalkBuilder, overrides::OverrideBuilder};
 use std::cmp::Reverse;
@@ -38,8 +38,10 @@ Current working directory: `file://{}`
   recursively with standard ignore rules. Patterns are relative to that
   directory; for example, `file://src?glob=**/*.rs`. A glob scans at most
   50000 files; narrow the root for larger trees.
+- Query values use standard percent-encoding.
 - Unknown, duplicate, malformed, or invalid query parameters are rejected.
-- Reading a directory returns a bounded directory listing.
+- Paginated file, directory, and glob reads return an exact `Next:` address.
+  Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
 Every `file` read, including `file://help`, MUST pass an empty string body.
@@ -265,7 +267,7 @@ impl Protocol for FileProtocol {
             return read_glob(&self.cwd, &path, &pattern, request.uri, range).await;
         }
         if metadata.is_dir() {
-            read_directory(&path, range).await
+            read_directory(&path, request.uri, range).await
         } else if metadata.is_file() {
             read_file(&path, request.uri, range).await
         } else {
@@ -307,18 +309,11 @@ impl Range {
         let mut line_numbers = false;
         let mut glob = None;
         let mut seen = std::collections::HashSet::new();
-        for pair in query
-            .unwrap_or_default()
-            .split('&')
-            .filter(|pair| !pair.is_empty())
-        {
-            let (key, value) = pair
-                .split_once('=')
-                .ok_or_else(|| anyhow!("invalid query component: {pair}"))?;
-            if !seen.insert(key) {
+        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            if !seen.insert(key.to_string()) {
                 bail!("duplicate file query parameter: {key}");
             }
-            match key {
+            match key.as_ref() {
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -332,7 +327,7 @@ impl Range {
                         .clamp(1, MAX_LIMIT)
                 }
                 "line_numbers" => {
-                    line_numbers = match value {
+                    line_numbers = match value.as_ref() {
                         "true" => true,
                         "false" => false,
                         _ => bail!("invalid line_numbers: {value}; expected true or false"),
@@ -342,7 +337,7 @@ impl Range {
                     if value.is_empty() {
                         bail!("file glob pattern cannot be empty");
                     }
-                    glob = Some(value.to_string());
+                    glob = Some(value.into_owned());
                 }
                 _ => bail!("unknown file query parameter: {key}"),
             }
@@ -370,6 +365,9 @@ async fn read_glob(
     let entries = tokio::task::spawn_blocking(move || glob_entries(&cwd, &root, &worker_pattern))
         .await
         .context("file glob worker stopped unexpectedly")??;
+    if entries.is_empty() {
+        return Ok(b"No matches.".to_vec());
+    }
     let start = range.offset.saturating_sub(1).min(entries.len());
     let end = start.saturating_add(range.limit).min(entries.len());
     let mut output = entries[start..end].join("\n");
@@ -378,15 +376,11 @@ async fn read_glob(
     }
     if end < entries.len() {
         let base = uri.split_once('?').map_or(uri, |(base, _)| base);
-        let _ = writeln!(
-            output,
-            "\n[{} more matches]\nNext: {}?glob={}&offset={}&limit={}",
-            entries.len() - end,
-            base,
-            pattern,
-            end + 1,
-            range.limit
-        );
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.append_pair("glob", &pattern);
+        query.append_pair("offset", &(end + 1).to_string());
+        query.append_pair("limit", &range.limit.to_string());
+        let _ = writeln!(output, "\nNext: {}?{}", base, query.finish());
     }
     Ok(output.into_bytes())
 }
@@ -453,8 +447,7 @@ async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
         };
         let _ = writeln!(
             output,
-            "\n[{} more lines]\nNext: {}?offset={}&limit={}{}",
-            lines.len() - end,
+            "\nNext: {}?offset={}&limit={}{}",
             base,
             end + 1,
             range.limit,
@@ -464,7 +457,7 @@ async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
     Ok(output.into_bytes())
 }
 
-async fn read_directory(path: &Path, range: Range) -> Result<Vec<u8>> {
+async fn read_directory(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
     let mut directory = fs::read_dir(path)
         .await
         .with_context(|| format!("cannot list {}", display_path(path)))?;
@@ -481,6 +474,9 @@ async fn read_directory(path: &Path, range: Range) -> Result<Vec<u8>> {
         entries.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
     }
     entries.sort_unstable();
+    if entries.is_empty() {
+        return Ok(b"No entries.".to_vec());
+    }
     let start = range.offset.saturating_sub(1).min(entries.len());
     let end = start.saturating_add(range.limit).min(entries.len());
     let mut output = entries[start..end].join("\n");
@@ -488,7 +484,14 @@ async fn read_directory(path: &Path, range: Range) -> Result<Vec<u8>> {
         output.push('\n');
     }
     if end < entries.len() {
-        let _ = writeln!(output, "\n[{} more entries]", entries.len() - end);
+        let base = uri.split_once('?').map_or(uri, |(base, _)| base);
+        let _ = writeln!(
+            output,
+            "\nNext: {}?offset={}&limit={}",
+            base,
+            end + 1,
+            range.limit
+        );
     }
     Ok(output.into_bytes())
 }
@@ -506,6 +509,7 @@ mod tests {
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
         assert!(help.contains("`?glob=<pattern>`"));
+        assert!(help.contains("standard percent-encoding"));
         assert!(help.contains("Unknown, duplicate, malformed, or invalid query parameters"));
         assert!(help.contains("Every `file` read"));
         assert!(help.contains("MUST pass an empty string body"));
@@ -548,6 +552,13 @@ mod tests {
         assert!(Range::parse(Some("limit=1&limit=2")).is_err());
         assert!(Range::parse(Some("line_numbers=true&line_numbers=false")).is_err());
         assert!(Range::parse(Some("glob=*.rs&glob=*.md")).is_err());
+    }
+
+    #[test]
+    fn glob_query_values_are_percent_decoded() {
+        let range = Range::parse(Some("glob=reports%2F%3F%26%23%25*.md")).unwrap();
+
+        assert_eq!(range.glob.as_deref(), Some("reports/?&#%*.md"));
     }
 
     #[test]
@@ -724,6 +735,83 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.starts_with("a.rs\n"));
-        assert!(output.contains("Next: file://?glob=**/*.rs&offset=2&limit=1"));
+        assert!(output.contains("Next: file://?glob=**%2F*.rs&offset=2&limit=1"));
+        assert!(!output.contains("more matches"));
+    }
+
+    #[tokio::test]
+    async fn glob_pagination_encodes_delimiters_in_the_continuation_address() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a&b.rs"), "a")
+            .await
+            .unwrap();
+        fs::write(directory.path().join("c&b.rs"), "c")
+            .await
+            .unwrap();
+        let pattern = "*&b.rs";
+
+        let output = read_glob(
+            directory.path(),
+            directory.path(),
+            pattern,
+            "file://?glob=*%26b.rs&offset=1&limit=1",
+            Range::parse(Some("glob=*%26b.rs&offset=1&limit=1")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Next: file://?glob=*%26b.rs&offset=2&limit=1"));
+        let next = output.trim().lines().last().unwrap();
+        let uri = next.strip_prefix("Next: ").unwrap();
+        let (_, query) = uri.split_once('?').unwrap();
+        assert_eq!(
+            Range::parse(Some(query)).unwrap().glob.as_deref(),
+            Some(pattern)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_globs_and_directories_are_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let glob = read_glob(
+            directory.path(),
+            directory.path(),
+            "**/*.rs",
+            "file://?glob=**/*.rs",
+            Range::parse(Some("glob=**/*.rs")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let listing = read_directory(directory.path(), "file://", Range::parse(None).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(glob, b"No matches.");
+        assert_eq!(listing, b"No entries.");
+    }
+
+    #[tokio::test]
+    async fn directory_pagination_returns_only_the_continuation_address() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a")
+            .await
+            .unwrap();
+        fs::write(directory.path().join("b.txt"), "b")
+            .await
+            .unwrap();
+
+        let output = read_directory(
+            directory.path(),
+            "file://?offset=1&limit=1",
+            Range::parse(Some("offset=1&limit=1")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(output, "a.txt\n\nNext: file://?offset=2&limit=1\n");
+        assert!(!output.contains("more entries"));
     }
 }

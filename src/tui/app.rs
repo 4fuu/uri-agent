@@ -101,6 +101,7 @@ pub struct TuiInfo {
     pub context_tokens: usize,
     pub context_accuracy: ContextAccuracy,
     pub compaction_enabled: bool,
+    pub diagnostics_path: PathBuf,
     pub terminal: Option<String>,
     pub key_display: KeyDisplayStyle,
 }
@@ -817,13 +818,11 @@ impl App {
             } => {
                 let protocol = tool_protocol(&arguments).unwrap_or_else(|| name.clone());
                 self.activity = Some(Activity::Tool(protocol));
-                let text = serde_json::to_string_pretty(&arguments)
-                    .unwrap_or_else(|_| arguments.to_string());
                 let title = tool_title(&name, &arguments);
                 self.push(
                     BlockKind::Tool,
                     &title,
-                    format!("CALL\n{text}"),
+                    String::new(),
                     Some(call_id),
                     false,
                     false,
@@ -852,12 +851,6 @@ impl App {
                     if let Some(tool) = block.tool.as_mut() {
                         tool.output = Some(output.clone());
                     }
-                    block.text.push_str(if failed {
-                        "\n\nERROR\n"
-                    } else {
-                        "\n\nRESULT\n"
-                    });
-                    block.text.push_str(&output);
                 } else {
                     let tool_output = output.clone();
                     self.push(
@@ -1906,6 +1899,27 @@ impl App {
         self.overlay = None;
         self.overlay_scroll = 0;
     }
+}
+
+fn block_search_text(block: &DisplayBlock) -> String {
+    let Some(tool) = &block.tool else {
+        return block.text.clone();
+    };
+    let mut arguments = redact_sensitive_arguments(&tool.arguments);
+    if let Some(body) = arguments.get_mut("body")
+        && let Some(body_text) = body.as_str()
+        && let Ok(parsed) = serde_json::from_str(body_text)
+    {
+        *body = redact_sensitive_arguments(&parsed);
+    }
+    let mut text = serde_json::to_string(&arguments).unwrap_or_else(|_| arguments.to_string());
+    if let Some(output) = &tool.output {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(output);
+    }
+    text
 }
 
 fn hit_target<T: Copy>(regions: &[HitRegion<T>], mouse: MouseEvent) -> Option<T> {

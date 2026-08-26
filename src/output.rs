@@ -1,14 +1,17 @@
 use crate::prompts;
 use anyhow::{Context, Result};
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
-use tokio::sync::OnceCell;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, OnceCell};
 
 pub struct OutputStore {
     directory: PathBuf,
     limit: AtomicUsize,
     sequence: OnceCell<AtomicU64>,
+    diagnostic_write: Mutex<()>,
 }
 
 impl OutputStore {
@@ -22,11 +25,16 @@ impl OutputStore {
             directory: base,
             limit: AtomicUsize::new(limit),
             sequence: OnceCell::new(),
+            diagnostic_write: Mutex::new(()),
         })
     }
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    pub fn diagnostics_path(&self) -> PathBuf {
+        self.directory.join("diagnostics.jsonl")
     }
 
     pub fn set_limit(&self, limit: usize) {
@@ -65,6 +73,7 @@ impl OutputStore {
             return Ok(String::from_utf8_lossy(&content).into_owned());
         }
 
+        let content_bytes = content.len();
         let path = self.preserve(&content, hint).await?;
 
         let head = limit.saturating_mul(3) / 4;
@@ -74,7 +83,60 @@ impl OutputStore {
             preview.push_str("\n…\n");
             preview.push_str(&String::from_utf8_lossy(&content[content.len() - tail..]));
         }
+        let _ = self
+            .record_diagnostic(
+                "output_preserved",
+                serde_json::json!({
+                    "hint": hint,
+                    "content_bytes": content_bytes,
+                    "inline_limit": limit,
+                }),
+            )
+            .await;
         Ok(prompts::truncated_output(&preview, &path))
+    }
+
+    pub(crate) async fn record_diagnostic(&self, event: &str, fields: Value) -> Result<()> {
+        let _guard = self.diagnostic_write.lock().await;
+        fs::create_dir_all(&self.directory).await.with_context(|| {
+            format!(
+                "failed to create diagnostic directory: {}",
+                self.directory.display()
+            )
+        })?;
+        let mut record = Map::new();
+        record.insert(
+            "timestamp".to_string(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        record.insert("event".to_string(), Value::String(event.to_string()));
+        if let Value::Object(fields) = fields {
+            for (name, value) in fields {
+                if !record.contains_key(&name) {
+                    record.insert(name, value);
+                }
+            }
+        }
+        let mut line =
+            serde_json::to_vec(&record).context("failed to serialize diagnostic event")?;
+        line.push(b'\n');
+        let path = self.diagnostics_path();
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .await
+            .with_context(|| format!("failed to open diagnostic log: {}", path.display()))?;
+        file.write_all(&line)
+            .await
+            .with_context(|| format!("failed to write diagnostic log: {}", path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("failed to flush diagnostic log: {}", path.display()))
     }
 }
 
@@ -148,6 +210,7 @@ mod tests {
             directory: tempfile::tempdir().unwrap().keep(),
             limit: AtomicUsize::new(16),
             sequence: OnceCell::new(),
+            diagnostic_write: Mutex::new(()),
         };
         let rendered = store.present(vec![b'x'; 100], "test").await.unwrap();
         assert!(rendered.contains("[output truncated]"));
@@ -163,5 +226,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_sequence(directory.path()).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_json_lines_without_raw_tool_content() {
+        let store = OutputStore {
+            directory: tempfile::tempdir().unwrap().keep(),
+            limit: AtomicUsize::new(16),
+            sequence: OnceCell::new(),
+            diagnostic_write: Mutex::new(()),
+        };
+
+        store
+            .record_diagnostic(
+                "tool_call_finished",
+                serde_json::json!({
+                    "call_id": "call-1",
+                    "tool": "exec",
+                    "argument_keys": ["body", "uri"],
+                    "failed": false,
+                    "output_bytes": 12
+                }),
+            )
+            .await
+            .unwrap();
+
+        let log = fs::read_to_string(store.diagnostics_path()).await.unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let event: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event["event"], "tool_call_finished");
+        assert_eq!(event["call_id"], "call-1");
+        assert_eq!(event["argument_keys"], serde_json::json!(["body", "uri"]));
+        assert!(event.get("arguments").is_none());
+        assert!(event.get("output").is_none());
+        assert!(event["timestamp"].as_str().is_some());
     }
 }

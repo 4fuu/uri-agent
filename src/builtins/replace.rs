@@ -67,7 +67,7 @@ impl ModelTool for ReplaceTool {
         }
         let path = resolve_path(&self.cwd, &arguments.path);
         replace_exact(&path, &arguments.old_text, &arguments.new_text).await?;
-        Ok(format!("Updated {}\n", path.display()))
+        Ok(format!("Updated {}", path.display()))
     }
 }
 

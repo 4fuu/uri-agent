@@ -9,15 +9,26 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
-pub(crate) const PROTOCOL_HELP_REQUIRED_MESSAGE: &str =
-    "The first call to a protocol must read its help.";
-
 #[derive(Debug)]
-pub(crate) struct ProtocolHelpRequired;
+pub(crate) struct ProtocolHelpRequired {
+    protocol: String,
+}
+
+impl ProtocolHelpRequired {
+    fn new(protocol: &str) -> Self {
+        Self {
+            protocol: protocol.to_string(),
+        }
+    }
+}
 
 impl fmt::Display for ProtocolHelpRequired {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(PROTOCOL_HELP_REQUIRED_MESSAGE)
+        write!(
+            formatter,
+            "Read \"{}://help\" with an empty body before using this protocol.",
+            self.protocol
+        )
     }
 }
 
@@ -152,6 +163,14 @@ impl ProtocolRegistry {
         self.context.tasks.clone()
     }
 
+    pub(crate) fn output_store(&self) -> Arc<OutputStore> {
+        self.output.clone()
+    }
+
+    pub(crate) async fn record_diagnostic(&self, event: &str, fields: serde_json::Value) {
+        let _ = self.output.record_diagnostic(event, fields).await;
+    }
+
     pub(crate) async fn present(&self, content: Vec<u8>, hint: &str) -> Result<String> {
         self.output.present(content, hint).await
     }
@@ -229,7 +248,7 @@ impl ProtocolRegistry {
             bail!("protocol does not support read: {name}");
         }
         if require_help && target != "help" && !self.help_read.lock().await.contains(name) {
-            return Err(ProtocolHelpRequired.into());
+            return Err(ProtocolHelpRequired::new(name).into());
         }
         let content = protocol
             .read(ProtocolRequest { uri, target, body }, self.context.clone())
@@ -254,7 +273,7 @@ impl ProtocolRegistry {
             .await
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
         if require_help && !self.help_read.lock().await.contains(name) {
-            return Err(ProtocolHelpRequired.into());
+            return Err(ProtocolHelpRequired::new(name).into());
         }
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
@@ -566,7 +585,10 @@ mod tests {
             registry.exec("capture://run", "").await.unwrap_err(),
         ] {
             assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
-            assert_eq!(error.to_string(), PROTOCOL_HELP_REQUIRED_MESSAGE);
+            assert_eq!(
+                error.to_string(),
+                "Read \"capture://help\" with an empty body before using this protocol."
+            );
         }
         assert!(capture.lock().unwrap().is_none());
 

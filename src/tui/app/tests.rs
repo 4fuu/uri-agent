@@ -44,6 +44,7 @@ fn test_app_with_splash(show_splash: bool) -> App {
             context_tokens: 0,
             context_accuracy: ContextAccuracy::Api,
             compaction_enabled: true,
+            diagnostics_path: PathBuf::from("/tmp/uri-agent/diagnostics.jsonl"),
             terminal: None,
             key_display: KeyDisplayStyle::Text,
         },
@@ -909,6 +910,7 @@ fn compact_footer_stays_minimal_while_expanded_status_keeps_usage_details() {
     assert!(!rendered.contains("toggle"));
     assert!(!rendered.contains("Esc close"));
     assert!(rendered.contains("test / model · effort off"));
+    assert!(rendered.contains("/tmp/uri-agent/diagnostics.jsonl"));
     assert!(rendered.contains("26k / 262k · 10.0%"));
     assert!(rendered.contains("read 500 · write 0 · last hit 25.0%"));
     assert!(rendered.contains("$0.0123"));
@@ -4510,9 +4512,15 @@ fn tool_call_and_result_share_one_block() {
     });
     assert_eq!(app.blocks.len(), 1);
     assert_eq!(app.blocks[0].title, "Read src/main.rs");
-    assert!(app.blocks[0].text.contains("CALL"));
-    assert!(app.blocks[0].text.contains("RESULT"));
-    assert!(block_document(&app.blocks[0]).contains("complete tool output"));
+    assert!(app.blocks[0].text.is_empty());
+    let document = block_document(&app.blocks[0]);
+    assert!(document.contains("**✓ Succeeded**"));
+    assert!(document.contains("**Target:** `file://src/main.rs`"));
+    assert!(document.contains("## Result"));
+    assert!(document.contains("complete tool output"));
+    assert!(!document.contains("Call ID:"));
+    assert!(!document.contains("\nCALL\n"));
+    assert!(!document.contains("\nRESULT\n"));
 
     let collapsed = render_to_string(&mut app, 100, 24);
     assert!(collapsed.contains("✓ Read src/main.rs"));
@@ -4523,6 +4531,195 @@ fn tool_call_and_result_share_one_block() {
     assert!(expanded.contains("↳ file://src/main.rs"));
     assert!(expanded.contains("└ complete tool output"));
     assert!(!expanded.contains("{\"uri\""));
+}
+
+#[test]
+fn full_tool_documents_render_status_input_and_output_as_markdown() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "shell-call".to_string(),
+            name: "exec".to_string(),
+            arguments: serde_json::json!({
+                "uri": "bash://run",
+                "body": "printf done"
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "shell-call".to_string(),
+            name: "exec".to_string(),
+            output: "done".to_string(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+
+    app.open_selected_document();
+    let body = &app.document.as_ref().unwrap().1;
+    assert!(body.contains("## Command"));
+    assert!(body.contains("```bash\nprintf done\n```"));
+    assert!(body.contains("## Result"));
+    assert!(!body.contains("shell-call"));
+
+    app.skip_splash();
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    let cells = terminal.backend().buffer().content();
+    let symbols = cells.iter().map(|cell| cell.symbol()).collect::<Vec<_>>();
+    let needle = "printf done"
+        .chars()
+        .map(|character| character.to_string())
+        .collect::<Vec<_>>();
+    let commands = symbols
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(index, window)| {
+            window
+                .iter()
+                .zip(&needle)
+                .all(|(cell, char)| *cell == char)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(!commands.is_empty(), "rendered command should be visible");
+    assert!(commands.iter().any(|start| {
+        cells[*start..*start + needle.len()]
+            .iter()
+            .all(|cell| cell.bg == SURFACE)
+    }));
+    let language = ["b", "a", "s", "h"];
+    assert!(
+        symbols
+            .windows(language.len())
+            .enumerate()
+            .any(|(start, window)| {
+                window == language
+                    && cells[start..start + language.len()]
+                        .iter()
+                        .all(|cell| cell.fg == MUTED && cell.modifier.contains(Modifier::ITALIC))
+            })
+    );
+}
+
+#[test]
+fn tool_details_redact_sensitive_dynamic_arguments() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "custom-call".to_string(),
+            name: "custom".to_string(),
+            arguments: serde_json::json!({
+                "api_key": "argument-secret",
+                "body": r#"{"authorization":"body-secret","query":"visible body"}"#,
+                "environment_variables": {"DATABASE_URL": "env-secret"},
+                "message": "visible argument",
+                "settings": {"password": "nested-secret"}
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "custom-call".to_string(),
+            name: "custom".to_string(),
+            output: "done".to_string(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+
+    let document = block_document(&app.blocks[0]);
+    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20);
+    let details = details
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let search = block_search_text(&app.blocks[0]);
+
+    for rendered in [&document, &details, &search] {
+        assert!(rendered.contains("[redacted]"));
+        assert!(rendered.contains("visible argument"));
+        assert!(!rendered.contains("argument-secret"));
+        assert!(!rendered.contains("body-secret"));
+        assert!(!rendered.contains("env-secret"));
+        assert!(!rendered.contains("nested-secret"));
+    }
+    assert!(document.contains("visible body"));
+}
+
+#[test]
+fn tool_documents_distinguish_running_failed_and_empty_results() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "failed-call".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"uri": "file://missing", "body": ""}),
+        },
+    );
+    assert!(block_document(&app.blocks[0]).contains("**• Running**"));
+
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "failed-call".to_string(),
+            name: "read".to_string(),
+            output: "Error: file not found".to_string(),
+            failed: true,
+            protocol_help_required: false,
+        },
+    );
+    let failed = block_document(&app.blocks[0]);
+    assert!(failed.contains("**× Failed**"));
+    assert!(failed.contains("## Error"));
+    assert!(failed.contains("```text\nfile not found\n```"));
+    assert!(!failed.contains("Error: file not found"));
+
+    apply_event(
+        &mut app,
+        3,
+        EventKind::ToolCall {
+            call_id: "empty-call".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"uri": "file://empty", "body": ""}),
+        },
+    );
+    apply_event(
+        &mut app,
+        4,
+        EventKind::ToolResult {
+            call_id: "empty-call".to_string(),
+            name: "read".to_string(),
+            output: String::new(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+    let empty = block_document(&app.blocks[1]);
+    assert!(empty.contains("**✓ Succeeded**"));
+    assert!(empty.contains("## Result\n\n_(no output)_"));
+}
+
+#[test]
+fn tool_document_fences_do_not_conflict_with_dynamic_backticks() {
+    assert_eq!(
+        fenced_block("before\n```\nafter", "text"),
+        "````text\nbefore\n```\nafter\n````\n"
+    );
 }
 
 #[test]
@@ -4546,7 +4743,8 @@ fn protocol_help_gate_colors_only_the_tool_header_purple() {
         EventKind::ToolResult {
             call_id: "blocked".to_string(),
             name: "read".to_string(),
-            output: "The first call to a protocol must read its help.".to_string(),
+            output: "Read \"file://help\" with an empty body before using this protocol."
+                .to_string(),
             failed: true,
             protocol_help_required: true,
         },
@@ -4571,7 +4769,7 @@ fn protocol_help_gate_colors_only_the_tool_header_purple() {
     for cell in &cells[header_start..header_start + header.chars().count()] {
         assert_eq!(cell.fg, PURPLE);
     }
-    let detail = "The first call to a protocol must read its help.";
+    let detail = "Read \"file://help\" with an empty body before using this protocol.";
     let detail_start = find(detail);
     for cell in &cells[detail_start..detail_start + detail.chars().count()] {
         assert_eq!(cell.fg, ERROR);

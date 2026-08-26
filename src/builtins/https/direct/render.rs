@@ -6,7 +6,8 @@ pub(super) async fn render_page(
     body: Vec<u8>,
 ) -> Result<Vec<u8>> {
     let text = String::from_utf8(body).context("HTTPS response is not valid UTF-8 text")?;
-    let content = if is_html(content_type, &text) {
+    let html = is_html(content_type, &text);
+    let content = if html {
         html_to_markdown(text).await?
     } else if content_type.contains("json") {
         serde_json::from_str::<Value>(&text)
@@ -17,16 +18,14 @@ pub(super) async fn render_page(
     } else {
         bail!("unsupported HTTPS response content type: {content_type}");
     };
-    let content_type = if content_type.is_empty() {
-        "unknown"
-    } else {
-        content_type
-    };
-    Ok(format!(
-        "Source: {final_url}\nContent-Type: {content_type}\n\n{}\n",
-        content.trim()
-    )
-    .into_bytes())
+    let mut output = format!("{UNTRUSTED_WEB_CONTENT}\nSource: {final_url}\n");
+    if !html && !content_type.is_empty() {
+        output.push_str(&format!("Content-Type: {content_type}\n"));
+    }
+    output.push('\n');
+    output.push_str(content.trim());
+    output.push('\n');
+    Ok(output.into_bytes())
 }
 
 async fn html_to_markdown(html: String) -> Result<String> {

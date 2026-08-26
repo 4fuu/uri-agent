@@ -384,7 +384,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
 
     commit_plan(&files).await?;
 
-    let mut output = String::from("Success. Updated the following files:\n");
+    let mut output = String::from("Applied patch:\n");
     for path in added {
         output.push_str(&format!("A {}\n", path.display()));
     }
@@ -779,7 +779,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "Success. Updated the following files:\nA nested/add.txt\nM update.txt\nM nested/moved.txt\nD delete.txt\n"
+            "Applied patch:\nA nested/add.txt\nM update.txt\nM nested/moved.txt\nD delete.txt\n"
         );
         assert_eq!(
             fs::read_to_string(directory.path().join("nested/add.txt"))

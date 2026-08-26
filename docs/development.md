@@ -52,7 +52,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
 | `examples/wasm-plugin/` | Buildable Rust guest plugin example |
 | `src/task.rs` | In-process task lifecycle, foreground-to-background promotion, capacity, progress, waiting, cancellation, records, and notices |
-| `src/output.rs` | Inline output limits, previews, and complete-output persistence |
+| `src/output.rs` | Inline output limits, previews, complete-output persistence, and per-session JSONL diagnostics |
 | `src/skill.rs` | Skill discovery, frontmatter, protocol naming and help, snapshots, and resource containment |
 | `src/session.rs` | SQLite schema, session boundaries, frozen context, events, drafts, checkpoints, and replay |
 | `src/compaction.rs` | Context estimation, complete-turn compaction boundaries, summaries, and retained history |
@@ -117,6 +117,10 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - Patch application preflights the complete in-memory plan before writing and
   rolls back every affected file after a commit failure.
 - Preserve oversized output in the session output directory and return a readable `file://` address.
+- Keep model-facing tool results separate from user-facing detail and diagnostic
+  metadata. Diagnostics may record identifiers, field names, sizes, timing, and
+  state, but not raw arguments, credentials, environment values, or successful
+  tool output.
 - Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
 - Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
 - Resume from the frozen snapshot rather than regenerating current prompt or Skill state.
