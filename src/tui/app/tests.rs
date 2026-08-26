@@ -3268,6 +3268,10 @@ fn list_selection_wraps_in_both_directions() {
     assert_eq!(wrapped_index(2, 1, 3), 0);
     assert_eq!(wrapped_index(2, 4, 3), 0);
     assert_eq!(wrapped_index(8, 1, 0), 0);
+    assert_eq!(bounded_index(0, -3, 5), 0);
+    assert_eq!(bounded_index(0, 3, 5), 3);
+    assert_eq!(bounded_index(3, 3, 5), 4);
+    assert_eq!(bounded_index(8, 1, 0), 0);
 
     let mut app = test_app();
     app.push(BlockKind::User, "YOU", "one".into(), None, false, false);
@@ -3334,6 +3338,118 @@ fn transcript_scroll_is_independent_from_selection_and_follows_the_tail_again() 
 
     render_to_string(&mut app, 80, 40);
     assert_eq!(app.transcript_offset, 0);
+}
+
+#[test]
+fn transcript_pages_by_the_rendered_viewport_without_moving_selection() {
+    let mut app = test_app();
+    for index in 0..50 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    app.selected_block = 49;
+    render_to_string(&mut app, 80, 12);
+    let live_tail = app.transcript_offset;
+    let page_rows = app.transcript_height;
+
+    app.page_transcript(-1);
+    assert_eq!(app.transcript_offset, live_tail - page_rows);
+    assert_eq!(app.selected_block, 49);
+    assert!(!app.transcript_follow_tail);
+
+    app.page_transcript(1);
+    assert_eq!(app.transcript_offset, live_tail);
+    assert_eq!(app.selected_block, 49);
+    assert!(app.transcript_follow_tail);
+
+    render_to_string(&mut app, 80, 20);
+    assert_eq!(app.transcript_height, 19);
+    app.page_transcript(-1);
+    assert_eq!(
+        app.transcript_offset,
+        transcript_live_tail(app.transcript_rows, app.transcript_height) - 19
+    );
+}
+
+#[test]
+fn overflowing_transcript_renders_an_inset_scrollbar_outside_copied_cells() {
+    let mut app = test_app();
+    for index in 0..50 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+
+    let rendered = render_to_string(&mut app, 40, 12);
+    let content_rows = rendered
+        .lines()
+        .take(app.transcript_height)
+        .collect::<Vec<_>>();
+    assert!(content_rows.iter().any(|row| row.ends_with('│')));
+    assert!(content_rows.iter().any(|row| row.ends_with('┃')));
+    assert!(content_rows.last().unwrap().ends_with('┃'));
+    assert!(
+        app.selectable
+            .as_ref()
+            .unwrap()
+            .cells
+            .iter()
+            .all(|row| row.last().is_some_and(|cell| cell == " "))
+    );
+
+    app.page_transcript(-1);
+    let rendered = render_to_string(&mut app, 40, 12);
+    let content_rows = rendered
+        .lines()
+        .take(app.transcript_height)
+        .collect::<Vec<_>>();
+    assert!(!content_rows.last().unwrap().ends_with('┃'));
+
+    let mut short = test_app();
+    short.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "short".to_string(),
+        None,
+        false,
+        true,
+    );
+    let rendered = render_to_string(&mut short, 40, 12);
+    assert!(
+        rendered
+            .lines()
+            .take(short.transcript_height)
+            .all(|row| !row.ends_with(['│', '┃']))
+    );
+}
+
+#[test]
+fn overlays_page_by_their_rendered_content_height() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Document);
+    app.document = Some((
+        "LONG".to_string(),
+        (0..100).map(|i| format!("line {i}\n")).collect(),
+    ));
+    render_to_string(&mut app, 100, 24);
+    let page_rows = app.overlay_viewport_rows;
+    assert!(page_rows > 8);
+
+    app.page_overlay(1);
+    assert_eq!(app.overlay_scroll, page_rows as u16);
+    app.page_overlay(-1);
+    assert_eq!(app.overlay_scroll, 0);
 }
 
 #[test]
@@ -3593,6 +3709,50 @@ fn command_panel_input_filters_the_selection() {
     assert!(rendered.contains("⌕ effort█"));
     assert!(rendered.contains(":effort"));
     assert!(!rendered.contains(":terminal"));
+}
+
+#[test]
+fn command_and_selector_panels_page_by_their_visible_rows() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Command);
+    render_to_string(&mut app, 80, 24);
+    let command_count = app.matching_commands().len();
+    let command_page = app.overlay_viewport_rows;
+    assert!(command_count > command_page);
+    assert!(matches!(
+        apply_command_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            "pagedown"
+        ),
+        CommandKey::Continue
+    ));
+    assert_eq!(
+        app.command_selected,
+        bounded_index(0, command_page as isize, command_count)
+    );
+
+    let items = (0..30)
+        .map(|index| SelectorItem {
+            id: index.to_string(),
+            title: format!("Item {index}"),
+            description: String::new(),
+            search_text: None,
+        })
+        .collect();
+    app.selector = Some(SelectorState::new(SelectorKind::Logout, "SELECT", items));
+    app.overlay = Some(Overlay::Selector);
+    render_to_string(&mut app, 80, 24);
+    let selector_page = app.overlay_viewport_rows;
+    assert!(matches!(
+        apply_selector_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            "pagedown"
+        ),
+        SelectorKey::Continue
+    ));
+    assert_eq!(app.selector.as_ref().unwrap().selected, selector_page);
 }
 
 #[test]

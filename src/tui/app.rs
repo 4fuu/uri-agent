@@ -47,7 +47,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use render::*;
@@ -459,6 +460,10 @@ impl SelectorState {
         self.selected = wrapped_index(self.selected, distance, self.visible.len());
     }
 
+    fn page_selection(&mut self, distance: isize) {
+        self.selected = bounded_index(self.selected, distance, self.visible.len());
+    }
+
     fn select_from_click(&mut self, position: usize, double_click: bool) -> bool {
         self.selected = position;
         double_click || matches!(&self.kind, SelectorKind::Search)
@@ -532,6 +537,7 @@ struct App {
     overlay: Option<Overlay>,
     delivery: Option<DeliveryState>,
     overlay_scroll: u16,
+    overlay_viewport_rows: usize,
     jump: JumpKind,
     busy: bool,
     activity: Option<Activity>,
@@ -614,6 +620,7 @@ impl App {
             overlay: None,
             delivery: None,
             overlay_scroll: 0,
+            overlay_viewport_rows: 0,
             jump: JumpKind::All,
             busy: false,
             activity: None,
@@ -1751,6 +1758,27 @@ impl App {
         self.transcript_center_selected = false;
     }
 
+    fn page_transcript(&mut self, direction: isize) {
+        self.scroll_transcript(direction * self.transcript_height.max(1) as isize);
+    }
+
+    fn overlay_page_distance(&self, direction: isize) -> isize {
+        direction * self.overlay_viewport_rows.max(1) as isize
+    }
+
+    fn page_overlay(&mut self, direction: isize) {
+        let distance = self.overlay_page_distance(direction);
+        if distance < 0 {
+            self.overlay_scroll = self
+                .overlay_scroll
+                .saturating_sub(distance.unsigned_abs().min(u16::MAX as usize) as u16);
+        } else {
+            self.overlay_scroll = self
+                .overlay_scroll
+                .saturating_add((distance as usize).min(u16::MAX as usize) as u16);
+        }
+    }
+
     fn reset_command_search(&mut self) {
         self.command_query.clear();
         self.command_selected = 0;
@@ -1838,6 +1866,11 @@ impl App {
         self.command_selected = wrapped_index(self.command_selected, distance, count);
     }
 
+    fn page_command_selection(&mut self, distance: isize) {
+        let count = self.matching_commands().len();
+        self.command_selected = bounded_index(self.command_selected, distance, count);
+    }
+
     fn close_floats(&mut self) {
         if let Some(oauth) = self.oauth.take() {
             oauth.login.cancel();
@@ -1877,6 +1910,18 @@ fn wrapped_index(current: usize, distance: isize, count: usize) -> usize {
         (current + count - distance.unsigned_abs() % count) % count
     } else {
         (current + distance as usize % count) % count
+    }
+}
+
+fn bounded_index(current: usize, distance: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let current = current.min(count - 1);
+    if distance < 0 {
+        current.saturating_sub(distance.unsigned_abs())
+    } else {
+        current.saturating_add(distance as usize).min(count - 1)
     }
 }
 

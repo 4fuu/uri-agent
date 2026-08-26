@@ -940,11 +940,11 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServ
             Action::Continue
         }
         Some("page_down") => {
-            app.move_selection(8);
+            app.page_transcript(1);
             Action::Continue
         }
         Some("page_up") => {
-            app.move_selection(-8);
+            app.page_transcript(-1);
             Action::Continue
         }
         Some("scroll_down") => {
@@ -1148,16 +1148,26 @@ pub(super) async fn handle_overlay_key(
                 Action::Continue
             }
             Some("page_up") => {
-                app.overlay_scroll = app.overlay_scroll.saturating_sub(8);
+                app.selected_task = bounded_index(
+                    app.selected_task,
+                    app.overlay_page_distance(-1),
+                    app.task_records.len(),
+                );
                 Action::Continue
             }
             Some("page_down") => {
-                app.overlay_scroll = app.overlay_scroll.saturating_add(8);
+                app.selected_task = bounded_index(
+                    app.selected_task,
+                    app.overlay_page_distance(1),
+                    app.task_records.len(),
+                );
                 Action::Continue
             }
             _ => Action::Continue,
         },
         Overlay::Models => {
+            let page_up = app.overlay_page_distance(-1);
+            let page_down = app.overlay_page_distance(1);
             let Some(selector) = app.model_selector.as_mut() else {
                 app.overlay = None;
                 return Action::Continue;
@@ -1177,11 +1187,11 @@ pub(super) async fn handle_overlay_key(
                     Action::Continue
                 }
                 Some("page_up") => {
-                    selector.move_selection(-10);
+                    selector.page_selection(page_up);
                     Action::Continue
                 }
                 Some("page_down") => {
-                    selector.move_selection(10);
+                    selector.page_selection(page_down);
                     Action::Continue
                 }
                 Some("first") => {
@@ -1231,11 +1241,11 @@ pub(super) async fn handle_overlay_key(
                 Action::Continue
             }
             Some("page_up") => {
-                app.overlay_scroll = app.overlay_scroll.saturating_sub(8);
+                app.page_overlay(-1);
                 Action::Continue
             }
             Some("page_down") => {
-                app.overlay_scroll = app.overlay_scroll.saturating_add(8);
+                app.page_overlay(1);
                 Action::Continue
             }
             _ => Action::Continue,
@@ -1257,11 +1267,11 @@ pub(super) async fn handle_overlay_key(
                     Action::Continue
                 }
                 Some("page_up") => {
-                    app.overlay_scroll = app.overlay_scroll.saturating_sub(8);
+                    app.page_overlay(-1);
                     Action::Continue
                 }
                 Some("page_down") => {
-                    app.overlay_scroll = app.overlay_scroll.saturating_add(8);
+                    app.page_overlay(1);
                     Action::Continue
                 }
                 _ => Action::Continue,
@@ -1325,6 +1335,14 @@ pub(super) fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) ->
         }
         Some("next") => {
             app.move_command_selection(1);
+            CommandKey::Continue
+        }
+        Some("page_up") => {
+            app.page_command_selection(app.overlay_page_distance(-1));
+            CommandKey::Continue
+        }
+        Some("page_down") => {
+            app.page_command_selection(app.overlay_page_distance(1));
             CommandKey::Continue
         }
         Some("confirm") => CommandKey::Confirm,
@@ -1402,6 +1420,8 @@ pub(super) async fn handle_selector_key(
 }
 
 pub(super) fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -> SelectorKey {
+    let page_up = app.overlay_page_distance(-1);
+    let page_down = app.overlay_page_distance(1);
     let Some(selector) = app.selector.as_mut() else {
         app.overlay = None;
         return SelectorKey::Continue;
@@ -1425,6 +1445,14 @@ pub(super) fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -
         }
         Some("next") => {
             selector.move_selection(1);
+            SelectorKey::Continue
+        }
+        Some("page_up") => {
+            selector.page_selection(page_up);
+            SelectorKey::Continue
+        }
+        Some("page_down") => {
+            selector.page_selection(page_down);
             SelectorKey::Continue
         }
         Some("confirm") => SelectorKey::Confirm,

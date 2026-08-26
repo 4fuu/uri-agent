@@ -83,6 +83,10 @@ impl ModelSelector {
         self.selected = wrapped_index(self.selected, distance, self.visible.len());
     }
 
+    pub(super) fn page_selection(&mut self, distance: isize) {
+        self.selected = super::bounded_index(self.selected, distance, self.visible.len());
+    }
+
     pub(super) fn first(&mut self) {
         self.selected = 0;
     }
@@ -258,6 +262,27 @@ mod tests {
         selector.move_selection(-1);
         assert_eq!(selector.selected_position(), 1);
         selector.move_selection(1);
+        assert_eq!(selector.selected_position(), 0);
+    }
+
+    #[test]
+    fn paging_selection_stops_at_the_list_boundaries() {
+        let mut selector = ModelSelector::from_models(
+            vec![
+                model("openai", "a", "A"),
+                model("openai", "b", "B"),
+                model("openai", "c", "C"),
+                model("openai", "d", "D"),
+                model("openai", "e", "E"),
+            ],
+            "openai",
+            "a",
+        );
+        selector.page_selection(3);
+        assert_eq!(selector.selected_position(), 3);
+        selector.page_selection(3);
+        assert_eq!(selector.selected_position(), 4);
+        selector.page_selection(-10);
         assert_eq!(selector.selected_position(), 0);
     }
 

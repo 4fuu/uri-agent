@@ -231,6 +231,7 @@ pub(super) fn json_value_summary(value: &serde_json::Value) -> String {
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.hit_regions.clear();
     app.overlay_bounds = None;
+    app.overlay_viewport_rows = 0;
     app.selectable = None;
     app.composer_view = None;
     if app.overlay != Some(Overlay::Composer) {
@@ -344,6 +345,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         let left_padding = usize::from(row_separators.is_some());
         capture_surface(frame, app, selectable_area, row_separators, left_padding);
         render_selection(frame, app);
+    }
+    if app.overlay.is_none() && !idle {
+        render_transcript_scrollbar(frame, app, content);
     }
     if app.overlay.is_none()
         && let Some(footer_area) = footer_area.filter(|area| area.height == 1)
@@ -839,6 +843,24 @@ pub(super) fn render_transcript(
         }
     }
     visible_row_separators
+}
+
+pub(super) fn render_transcript_scrollbar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.transcript_rows <= app.transcript_height || area.is_empty() {
+        return;
+    }
+    let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
+    let mut state = ScrollbarState::new(live_tail.saturating_add(1))
+        .position(app.transcript_offset.min(live_tail))
+        .viewport_content_length(app.transcript_height);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .track_style(Style::default().fg(MUTED))
+        .thumb_symbol("┃")
+        .thumb_style(Style::default().fg(ACCENT));
+    frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
 pub(super) fn transcript_needs_gap(
@@ -1542,6 +1564,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(SURFACE).fg(TEXT))
         .padding(Padding::uniform(1));
+    app.overlay_viewport_rows = block.inner(area).height as usize;
     match overlay {
         Overlay::Composer => {
             let pending_height = pending_preview_height(app);
@@ -1897,6 +1920,7 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
         .split(inner);
+    app.overlay_viewport_rows = sections[1].height as usize;
     let query_width = sections[0].width.saturating_sub(3) as usize;
     frame.render_widget(
         Paragraph::new(format!(
@@ -2248,6 +2272,7 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
         .split(inner);
+    app.overlay_viewport_rows = sections[1].height as usize;
     let query_width = sections[0].width.saturating_sub(3) as usize;
     frame.render_widget(
         Paragraph::new(format!(
@@ -2325,6 +2350,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             Constraint::Length(3),
         ])
         .split(inner);
+    app.overlay_viewport_rows = sections[1].height as usize;
     let selected_key = app.model_selector.as_ref().and_then(|selector| {
         selector
             .selected()

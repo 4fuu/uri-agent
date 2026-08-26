@@ -84,6 +84,8 @@ map("list", "esc", "close");
 
 map("selector", "down", "next");
 map("selector", "up", "previous");
+map("selector", "pagedown", "page_down");
+map("selector", "pageup", "page_up");
 map("selector", "enter", "confirm");
 map("selector", "esc", "close");
 map("selector", "backspace", "backspace");
@@ -98,6 +100,8 @@ map("command", "esc", "cancel");
 map("command", "backspace", "backspace");
 map("command", "up", "previous");
 map("command", "down", "next");
+map("command", "pageup", "page_up");
+map("command", "pagedown", "page_down");
 map("command", "tab", "complete");
 map("command", "backtab", "complete_previous");
 map("command", "shift+tab", "complete_previous");
@@ -748,6 +752,14 @@ mod tests {
         assert_eq!(keymap.action("main", "o").as_deref(), Some("open"));
         assert_eq!(keymap.action("document", "c").as_deref(), Some("copy"));
         assert_eq!(keymap.action("document", "esc").as_deref(), Some("close"));
+        assert_eq!(
+            keymap.action("command", "pagedown").as_deref(),
+            Some("page_down")
+        );
+        assert_eq!(
+            keymap.action("selector", "pageup").as_deref(),
+            Some("page_up")
+        );
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);
         assert_eq!(keymap.action("composer", "ctrl+c").as_deref(), Some("copy"));
