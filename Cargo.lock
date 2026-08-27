@@ -5117,6 +5117,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5243,6 +5249,7 @@ dependencies = [
  "tokio-util",
  "tui-term",
  "tui-textarea-2",
+ "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",
  "uri-agent-plugin-sdk",

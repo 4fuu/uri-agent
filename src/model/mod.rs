@@ -26,6 +26,7 @@ pub use rig_backend::configured_backend;
 pub enum ModelDelta {
     Text(String),
     Reasoning(String),
+    ToolCall(String),
 }
 
 #[derive(Clone)]

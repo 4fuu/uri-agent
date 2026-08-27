@@ -15,7 +15,7 @@ use rig::completion::CompletionModel as RigCompletionModel;
 use rig::http_client::HttpClientExt;
 use rig::message::AssistantContent;
 use rig::providers::{anthropic, chatgpt, gemini, openai};
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
@@ -569,6 +569,8 @@ where
         .await
         .map_err(|error| ModelFailure::from_completion_error(error, ModelFailurePhase::Request))?;
     let mut reasoning_deltas = HashSet::new();
+    let mut tool_call_names = HashSet::new();
+    let mut tool_call_arguments = HashSet::new();
     while let Some(event) = stream.next().await {
         match event.map_err(|error| {
             ModelFailure::from_completion_error(error, ModelFailurePhase::Stream)
@@ -588,9 +590,34 @@ where
                     let _ = deltas.send(ModelDelta::Reasoning(text));
                 }
             }
-            StreamedAssistantContent::ToolCall { .. }
-            | StreamedAssistantContent::ToolCallDelta { .. }
-            | StreamedAssistantContent::Reasoning { .. }
+            StreamedAssistantContent::ToolCallDelta {
+                internal_call_id,
+                content,
+            } => match content {
+                ToolCallDeltaContent::Name(name) => {
+                    if tool_call_names.insert(internal_call_id) {
+                        let _ = deltas.send(ModelDelta::ToolCall(name));
+                    }
+                }
+                ToolCallDeltaContent::Delta(arguments) => {
+                    tool_call_arguments.insert(internal_call_id);
+                    let _ = deltas.send(ModelDelta::ToolCall(arguments));
+                }
+            },
+            StreamedAssistantContent::ToolCall {
+                tool_call,
+                internal_call_id,
+            } => {
+                if !tool_call_names.contains(&internal_call_id) {
+                    let _ = deltas.send(ModelDelta::ToolCall(tool_call.function.name));
+                }
+                if !tool_call_arguments.contains(&internal_call_id) {
+                    let _ = deltas.send(ModelDelta::ToolCall(
+                        tool_call.function.arguments.to_string(),
+                    ));
+                }
+            }
+            StreamedAssistantContent::Reasoning { .. }
             | StreamedAssistantContent::Final(_)
             | StreamedAssistantContent::Unknown(_) => {}
         }

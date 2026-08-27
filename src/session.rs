@@ -298,6 +298,11 @@ pub enum EventKind {
     AssistantReasoning {
         text: String,
     },
+    /// Provisional tool-call name or argument text used for live output-rate
+    /// accounting. The completed `ToolCall` remains the durable transcript.
+    AssistantToolCallDelta {
+        text: String,
+    },
     ToolCall {
         call_id: String,
         name: String,
@@ -340,6 +345,10 @@ pub enum EventKind {
     Usage {
         input: u64,
         output: u64,
+        /// Output tokens spent on reasoning, when reported separately. This
+        /// is a subset of `output` after provider normalization.
+        #[serde(default)]
+        reasoning: u64,
         cache_read: u64,
         cache_write: u64,
         cost: f64,
@@ -1216,6 +1225,7 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::User { .. } => "user",
         EventKind::AssistantText { .. } => "assistant_text",
         EventKind::AssistantReasoning { .. } => "assistant_reasoning",
+        EventKind::AssistantToolCallDelta { .. } => "assistant_tool_call_delta",
         EventKind::ToolCall { .. } => "tool_call",
         EventKind::ToolResult { .. } => "tool_result",
         EventKind::ModelMessage { .. } => "model_message",
@@ -1508,6 +1518,7 @@ mod tests {
                 EventKind::Usage {
                     input: 1_000,
                     output: 200,
+                    reasoning: 0,
                     cache_read: 34,
                     cache_write: 0,
                     cost: 0.0,

@@ -855,11 +855,23 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
             .iter()
             .filter_map(|delta| match delta {
                 ModelDelta::Text(text) => Some(text.as_str()),
-                ModelDelta::Reasoning(_) => None,
+                ModelDelta::Reasoning(_) | ModelDelta::ToolCall(_) => None,
             })
             .collect::<String>(),
         "你好"
     );
+    let tool_deltas = deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            ModelDelta::ToolCall(text) => Some(text.as_str()),
+            ModelDelta::Text(_) | ModelDelta::Reasoning(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_deltas.iter().filter(|delta| **delta == "read").count(),
+        1
+    );
+    assert!(tool_deltas.concat().contains("file://README.md"));
     assert!(response.content.iter().any(|content| {
         matches!(content, AssistantContent::ToolCall(call)
         if call.function.name == "read"

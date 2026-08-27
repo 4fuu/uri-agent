@@ -3,6 +3,7 @@ mod composer;
 mod controller;
 mod markdown;
 mod model_selector;
+mod rate;
 mod render;
 #[cfg(test)]
 mod tests;
@@ -51,6 +52,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
+use rate::*;
 use render::*;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Write, stdout};
@@ -605,6 +607,7 @@ struct App {
     next_composer_image_id: u64,
     clipboard_image_loading: bool,
     usage: UsageTotals,
+    token_rate: TokenRateState,
     last_cache_hit: Option<f64>,
     branch: Option<(Instant, Option<String>)>,
     last_interrupt_press: Option<(String, Instant)>,
@@ -691,6 +694,7 @@ impl App {
             next_composer_image_id: 1,
             clipboard_image_loading: false,
             usage: UsageTotals::default(),
+            token_rate: TokenRateState::default(),
             last_cache_hit: None,
             branch: None,
             last_interrupt_press: None,
@@ -799,10 +803,15 @@ impl App {
         match event.kind {
             EventKind::SessionCreated { .. }
             | EventKind::SessionContext { .. }
-            | EventKind::ModelSettingsChanged { .. }
             | EventKind::Task { .. } => {}
-            EventKind::ModelMessage { .. } => {}
+            EventKind::ModelSettingsChanged { .. } => self.token_rate.clear_final(),
+            EventKind::ModelMessage { message } => {
+                if matches!(message, rig::message::Message::Assistant { .. }) {
+                    self.token_rate.finish_response(Instant::now());
+                }
+            }
             EventKind::User { text } => {
+                self.token_rate.ensure_turn();
                 self.reasoning_folded_during_stream = false;
                 self.busy = true;
                 self.busy_since.get_or_insert_with(Instant::now);
@@ -810,10 +819,22 @@ impl App {
                 self.push(BlockKind::User, "YOU", text, None, false, false);
             }
             EventKind::AssistantText { text } => {
+                if self.applying_transient {
+                    self.token_rate
+                        .observe_stream_text(&text, false, Instant::now());
+                } else {
+                    self.token_rate.observe_response_text(&text, false);
+                }
                 self.activity = Some(Activity::Writing);
                 self.append_or_push(BlockKind::Assistant, "AGENT", text, true);
             }
             EventKind::AssistantReasoning { text } => {
+                if self.applying_transient {
+                    self.token_rate
+                        .observe_stream_text(&text, true, Instant::now());
+                } else {
+                    self.token_rate.observe_response_text(&text, true);
+                }
                 self.activity = Some(Activity::Reasoning);
                 self.append_or_push(
                     BlockKind::Reasoning,
@@ -822,11 +843,20 @@ impl App {
                     !self.reasoning_folded_during_stream,
                 );
             }
+            EventKind::AssistantToolCallDelta { text } => {
+                if self.applying_transient {
+                    self.token_rate
+                        .observe_stream_text(&text, false, Instant::now());
+                }
+            }
             EventKind::ToolCall {
                 call_id,
                 name,
                 arguments,
             } => {
+                self.token_rate.observe_response_text(&name, false);
+                self.token_rate
+                    .observe_response_text(&arguments.to_string(), false);
                 let protocol = tool_protocol(&arguments).unwrap_or_else(|| name.clone());
                 self.activity = Some(Activity::Tool(protocol));
                 let title = tool_title(&name, &arguments);
@@ -897,6 +927,7 @@ impl App {
                 delay_ms,
                 reason,
             } => {
+                self.token_rate.retry_response();
                 self.activity = Some(Activity::Retrying {
                     attempt,
                     max_retries,
@@ -917,9 +948,11 @@ impl App {
             EventKind::Usage {
                 input,
                 output,
+                reasoning,
                 cache_read,
                 cache_write,
                 cost,
+                context,
                 ..
             } => {
                 self.usage.input += input;
@@ -930,8 +963,13 @@ impl App {
                 let prompt_tokens = input + cache_read + cache_write;
                 self.last_cache_hit =
                     (prompt_tokens > 0).then(|| cache_read as f64 / prompt_tokens as f64 * 100.0);
+                if context {
+                    self.token_rate
+                        .observe_usage(output, reasoning, Instant::now());
+                }
             }
             EventKind::Error { text } => {
+                self.token_rate.fail_turn();
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
@@ -943,6 +981,7 @@ impl App {
                 replacement_history: _,
                 manual,
             } => {
+                self.token_rate.retry_response();
                 if manual {
                     self.busy = false;
                     self.activity = None;
@@ -961,6 +1000,7 @@ impl App {
                 );
             }
             EventKind::TurnFinished => {
+                self.token_rate.finish_turn();
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
@@ -1080,6 +1120,7 @@ impl App {
     }
 
     fn finish_hydration(&mut self) {
+        self.token_rate.finish_hydration();
         self.busy = false;
         self.activity = None;
         self.busy_since = None;
@@ -1155,6 +1196,7 @@ impl App {
         self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
         self.dismiss_completions();
+        self.token_rate.start_turn();
         self.busy = true;
         self.busy_since = Some(Instant::now());
         self.activity = Some(Activity::Thinking);

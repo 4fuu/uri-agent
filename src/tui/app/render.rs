@@ -797,7 +797,7 @@ pub(super) fn transcript_before_live_tail(app: &App) -> bool {
     app.transcript_offset < transcript_live_tail(app.transcript_rows, app.transcript_height)
 }
 
-pub(super) fn footer_activity(app: &App) -> Option<String> {
+pub(super) fn footer_activity(app: &mut App) -> Option<String> {
     if !app.busy {
         return None;
     }
@@ -810,8 +810,13 @@ pub(super) fn footer_activity(app: &App) -> Option<String> {
         .busy_since
         .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
         .unwrap_or_default();
+    let token_rate = app
+        .token_rate
+        .display_rate(Instant::now())
+        .map(|rate| format!(" · {}", format_token_rate(rate)))
+        .unwrap_or_default();
     Some(format!(
-        "{} {activity}{elapsed}  {}",
+        "{} {activity}{elapsed}  {}{token_rate}",
         animation::spinner(app.frame),
         animation::activity(app.frame, 8)
     ))
@@ -826,7 +831,12 @@ pub(super) fn compact_model(app: &App) -> String {
     } else {
         app.info.model.clone()
     };
-    format!("{model} · effort {}", app.info.thinking)
+    let token_rate = (!app.busy && app.activity.is_none())
+        .then(|| app.token_rate.final_average())
+        .flatten()
+        .map(|rate| format!(" · {}", format_token_rate(rate)))
+        .unwrap_or_default();
+    format!("{model} · effort {}{token_rate}", app.info.thinking)
 }
 
 pub(super) fn context_percent(app: &App) -> f64 {

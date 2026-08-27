@@ -1199,6 +1199,7 @@ impl AgentRuntime {
         Some(EventKind::Usage {
             input: usage.input_tokens,
             output: usage.output_tokens,
+            reasoning: usage.reasoning_tokens,
             cache_read: usage.cached_input_tokens,
             cache_write: usage.cache_creation_input_tokens,
             cost,
@@ -1301,6 +1302,7 @@ impl AgentRuntime {
         self.session.publish_transient(match delta {
             ModelDelta::Text(text) => EventKind::AssistantText { text },
             ModelDelta::Reasoning(text) => EventKind::AssistantReasoning { text },
+            ModelDelta::ToolCall(text) => EventKind::AssistantToolCallDelta { text },
         });
     }
 

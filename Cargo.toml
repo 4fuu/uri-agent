@@ -53,6 +53,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-rusqlite = { version = "0.7", features = ["bundled"] }
 tui-term = "0.3"
 tui-textarea = { package = "tui-textarea-2", version = "0.9" }
+unicode-general-category = "1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 uri-agent-plugin-sdk = { version = "=2026.827.2", path = "sdk" }

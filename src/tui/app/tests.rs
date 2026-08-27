@@ -886,6 +886,7 @@ fn compact_footer_stays_minimal_while_expanded_status_keeps_usage_details() {
         kind: EventKind::Usage {
             input: 1_500,
             output: 600,
+            reasoning: 0,
             cache_read: 500,
             cache_write: 0,
             cost: 0.0123,
@@ -4937,6 +4938,125 @@ fn activity_status_follows_stream_events() {
             .filter(|block| block.kind == BlockKind::Tool)
             .all(|block| !block.expanded)
     );
+}
+
+#[test]
+fn token_rate_follows_the_activity_animation_and_moves_to_the_ready_footer() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        true,
+    );
+    let now = Instant::now();
+
+    // Calibrate the visible-unit/token ratio with one completed response.
+    app.token_rate.start_turn();
+    app.token_rate
+        .observe_stream_text("hello world", false, now - Duration::from_secs(2));
+    app.token_rate.observe_usage(10, 0, now);
+    app.token_rate.observe_response_text("hello world", false);
+    app.token_rate.finish_response(now);
+    app.token_rate.finish_turn();
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    let footer = rendered.lines().last().unwrap();
+    assert!(footer.starts_with("model · effort off · 5.00 tok/s"));
+    assert!(!rendered.lines().any(|line| line.contains("thinking")));
+
+    app.token_rate.start_turn();
+    app.token_rate
+        .observe_stream_text("one", false, now - Duration::from_secs(1));
+    app.token_rate
+        .observe_stream_text(" two", false, now - Duration::from_millis(500));
+    app.busy = true;
+    app.activity = Some(Activity::Thinking);
+    app.busy_since = Some(now - Duration::from_secs(1));
+    let animation = animation::activity(app.frame, 8);
+    let rendered = render_to_string(&mut app, 100, 24);
+    let activity = rendered
+        .lines()
+        .find(|line| line.contains("thinking"))
+        .unwrap();
+    assert!(activity.contains(&format!("{animation} · ")));
+    assert!(activity.contains("tok/s"));
+    assert!(!rendered.lines().last().unwrap().contains("tok/s"));
+}
+
+#[test]
+fn completed_rate_is_hidden_unless_the_state_is_ready() {
+    let mut app = test_app();
+    let start = Instant::now() - Duration::from_secs(2);
+    app.token_rate.start_turn();
+    app.token_rate.observe_stream_text("answer", false, start);
+    app.token_rate
+        .observe_usage(20, 0, start + Duration::from_secs(2));
+    app.token_rate.observe_response_text("answer", false);
+    app.token_rate
+        .finish_response(start + Duration::from_secs(2));
+    app.token_rate.finish_turn();
+
+    app.busy = true;
+    app.activity = Some(Activity::Thinking);
+    assert_eq!(compact_model(&app), "model · effort off");
+    app.busy = false;
+    assert_eq!(compact_model(&app), "model · effort off");
+    app.activity = None;
+    assert_eq!(compact_model(&app), "model · effort off · 10.0 tok/s");
+}
+
+#[test]
+fn hydration_restores_rate_calibration_without_inventing_a_final_average() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "question".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::Usage {
+            input: 20,
+            output: 10,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost: 0.0,
+            total: 30,
+            context: true,
+            provider: "test".into(),
+            model: "model".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::AssistantText {
+            text: "hello world".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        3,
+        EventKind::ModelMessage {
+            message: rig::message::Message::assistant("hello world"),
+        },
+    );
+    apply_event(&mut app, 4, EventKind::TurnFinished);
+    app.finish_hydration();
+    assert_eq!(app.token_rate.final_average(), None);
+
+    let now = Instant::now();
+    app.token_rate.start_turn();
+    app.token_rate
+        .observe_stream_text("one two", false, now - Duration::from_secs(1));
+    assert_eq!(app.token_rate.display_rate(now), Some(10.0));
 }
 
 #[test]
