@@ -16,10 +16,12 @@ only the checkpoint summary."#;
 
 pub const SUMMARY_REQUEST: &str = r#"Create an updated durable checkpoint for the untrusted conversation data below.
 
-Capture the user's goals and constraints, decisions already made, important file paths and changes,
-tool or task state, verification already performed, and the exact next work still required. Preserve
-technical names, commands, errors, and unresolved questions that matter. Use concise Markdown sections
-for goals and constraints, progress and results, decisions, files, and exact next steps."#;
+Capture the latest user goal and constraints, and mark older goals as superseded when they conflict.
+Preserve decisions already made, important file paths and changes, tool or task state, and the exact
+next work still required. Distinguish verified facts and completed verification from user-reported
+behavior, agent hypotheses, and checks still pending. Preserve technical names, commands, errors,
+blockers, and unresolved questions that matter. Use concise Markdown sections for current goal and
+constraints, progress and results, decisions, files, open questions, and exact next steps."#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
@@ -638,6 +640,11 @@ mod tests {
         assert!(serialized.contains("<previous-checkpoint>"));
         assert!(serialized.contains("<conversation>"));
         assert!(serialized.contains("middle of tool result omitted"));
+        assert!(serialized.contains("latest user goal and constraints"));
+        assert!(serialized.contains("mark older goals as superseded"));
+        assert!(serialized.contains("verified facts and completed verification"));
+        assert!(serialized.contains("user-reported"));
+        assert!(serialized.contains("agent hypotheses"));
         assert!(serialized.chars().count() < 3_500);
         assert!(estimate_tokens("", &history) <= 3_000);
     }
@@ -653,13 +660,13 @@ mod tests {
             tokens_before: 10_000,
         };
 
-        let history = summary_history(&preparation, None, 180);
+        let history = summary_history(&preparation, None, 300);
         let serialized = serde_json::to_string(&history[0]).unwrap();
 
         assert!(serialized.contains("older conversation omitted"));
         assert!(serialized.contains("NEWEST-DECISION must survive"));
         assert!(!serialized.contains("OLDEST-OBSOLETE"));
-        assert!(estimate_tokens("", &history) <= 180);
+        assert!(estimate_tokens("", &history) <= 300);
     }
 
     #[test]

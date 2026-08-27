@@ -30,7 +30,13 @@ pub fn system_prompt(
          The read and exec body is always a string. Pass \"\" when a protocol takes no body, pass plain text for textual input, and pass complete serialized JSON text when a protocol requires structured input.\n\n\
          Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values without including the angle brackets.\n\n\
          Before using any protocol in a session, you MUST first call read(\"<protocol>://help\", \"\") for that protocol and follow its contract. The help read is the only permitted first call to a protocol.\n\n\
-         Verify relevant results before claiming work is complete.\n",
+         Operating rules:\n\
+         - For clear requests, inspect relevant sources, carry the work through, and verify the result.\n\
+         - Treat user reports and proposed causes as claims to check, not established facts.\n\
+         - Make the smallest complete change. Preserve unrelated existing work and remove temporary artifacts you create.\n\
+         - If an action fails, diagnose the failure before retrying it or changing approach.\n\
+         - Ask before modifying shared or external state or taking irreversible actions unless the user explicitly requested that specific action. Routine local reads, requested workspace edits, builds, and tests need no separate approval.\n\
+         - Report verification honestly. Never claim a check passed unless it ran successfully; state why relevant verification could not be completed.\n",
     );
 
     for fragment in fragments {
@@ -100,6 +106,12 @@ mod tests {
                 .contains(r#"you MUST first call read("<protocol>://help", "") for that protocol"#)
         );
         assert!(prompt.contains("The help read is the only permitted first call to a protocol."));
+        assert!(prompt.contains("Operating rules:\n- For clear requests"));
+        assert!(prompt.contains("Treat user reports and proposed causes as claims to check"));
+        assert!(prompt.contains("Make the smallest complete change"));
+        assert!(prompt.contains("diagnose the failure before retrying"));
+        assert!(prompt.contains("Ask before modifying shared or external state"));
+        assert!(prompt.contains("Never claim a check passed unless it ran successfully"));
         assert!(!prompt.contains("file://help"));
     }
 
