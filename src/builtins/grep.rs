@@ -27,7 +27,9 @@ Current working directory: `grep://{}`
 
 Search reads MUST pass a nonempty search pattern in the string body. Use
 `grep://<root>` for a project-relative or absolute file/directory root. The root
-may be empty: `grep://` searches the current working directory.
+may be empty: `grep://` searches the current working directory. On Unix, `~`
+and paths beginning with `~/` resolve from the current user's home directory;
+`~user` is not expanded.
 
 Optional query parameters:
 
@@ -125,7 +127,7 @@ impl Protocol for GrepProtocol {
             .split_once('?')
             .map_or((request.target, None), |(root, query)| (root, Some(query)));
         let options = GrepOptions::parse(query)?;
-        let resolved = resolve_path(&self.cwd, root);
+        let resolved = resolve_path(&self.cwd, root)?;
         let metadata = tokio::fs::metadata(&resolved)
             .await
             .with_context(|| format!("cannot search {}", display_path(&resolved)))?;
@@ -143,7 +145,7 @@ impl Protocol for GrepProtocol {
         run_grep(
             &rg,
             &self.cwd,
-            if root.is_empty() { "." } else { root },
+            &grep_root_argument(&self.cwd, root, &resolved),
             request.body,
             &options,
         )
@@ -218,10 +220,22 @@ fn parse_bool(name: &str, value: &str) -> Result<bool> {
     }
 }
 
+fn grep_root_argument(cwd: &Path, root: &str, resolved: &Path) -> PathBuf {
+    if root.is_empty() {
+        return PathBuf::from(".");
+    }
+    let original = Path::new(root);
+    if cwd.join(original) == resolved {
+        original.to_path_buf()
+    } else {
+        resolved.to_path_buf()
+    }
+}
+
 async fn run_grep(
     executable: &Path,
     cwd: &Path,
-    root: &str,
+    root: &Path,
     pattern: &str,
     options: &GrepOptions,
 ) -> Result<String> {
@@ -282,7 +296,7 @@ impl GrepRun {
 async fn run_grep_once(
     executable: &Path,
     cwd: &Path,
-    root: &str,
+    root: &Path,
     pattern: &str,
     options: &GrepOptions,
     fixed_strings: bool,
@@ -486,6 +500,24 @@ mod tests {
         assert!(GrepOptions::parse(Some("literal=true&literal=false")).is_err());
     }
 
+    #[test]
+    fn grep_uses_resolved_home_paths_but_preserves_ordinary_relative_roots() {
+        let cwd = Path::new("/project");
+
+        assert_eq!(
+            grep_root_argument(cwd, "src", Path::new("/project/src")),
+            Path::new("src")
+        );
+        assert_eq!(
+            grep_root_argument(cwd, "~/notes", Path::new("/home/ada/notes")),
+            Path::new("/home/ada/notes")
+        );
+        assert_eq!(
+            grep_root_argument(cwd, "", Path::new("/project")),
+            Path::new(".")
+        );
+    }
+
     #[tokio::test]
     async fn grep_help_distinguishes_empty_root_from_nonempty_body() {
         let directory = tempfile::tempdir().unwrap();
@@ -506,6 +538,8 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("MUST pass a nonempty search pattern"));
         assert!(help.contains("The root\nmay be empty"));
+        assert!(help.contains("paths beginning with `~/` resolve"));
+        assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("retries it as literal text"));
         assert!(help.contains(r#"read("grep://src/tui/app.rs", "fn push(")"#));
         assert!(help.contains("`grep://help` MUST use an empty string body"));
@@ -580,14 +614,26 @@ mod tests {
         let default_options = GrepOptions::parse(None).unwrap();
 
         assert_eq!(
-            run_grep(&rg, directory.path(), ".", "missing", &default_options)
-                .await
-                .unwrap(),
+            run_grep(
+                &rg,
+                directory.path(),
+                Path::new("."),
+                "missing",
+                &default_options,
+            )
+            .await
+            .unwrap(),
             "No matches.\n"
         );
-        let output = run_grep(&rg, directory.path(), ".", "a.b", &default_options)
-            .await
-            .unwrap();
+        let output = run_grep(
+            &rg,
+            directory.path(),
+            Path::new("."),
+            "a.b",
+            &default_options,
+        )
+        .await
+        .unwrap();
         assert!(output.contains("values.txt:1:a.b"));
         assert!(output.contains("values.txt:2:axb"));
 
@@ -595,21 +641,27 @@ mod tests {
             literal: true,
             ..GrepOptions::parse(None).unwrap()
         };
-        let output = run_grep(&rg, directory.path(), ".", "a.b", &literal)
+        let output = run_grep(&rg, directory.path(), Path::new("."), "a.b", &literal)
             .await
             .unwrap();
         assert!(output.contains("values.txt:1:a.b"));
         assert!(!output.contains("values.txt:2:axb"));
 
-        let output = run_grep(&rg, directory.path(), ".", "fn push(", &default_options)
-            .await
-            .unwrap();
+        let output = run_grep(
+            &rg,
+            directory.path(),
+            Path::new("."),
+            "fn push(",
+            &default_options,
+        )
+        .await
+        .unwrap();
         assert!(output.contains("values.txt:3:fn push("));
 
         let error = run_grep(
             &rg,
             directory.path(),
-            "missing-root",
+            Path::new("missing-root"),
             "needle",
             &default_options,
         )

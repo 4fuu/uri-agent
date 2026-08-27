@@ -90,7 +90,11 @@ supported.
 
 ### `file`
 
-Relative paths resolve from the canonical startup working directory; absolute paths remain absolute. Reading a directory returns a sorted, bounded listing. Text reads accept a one-based line range:
+Relative paths resolve from the canonical startup working directory; absolute
+paths remain absolute. On Unix, `~` and paths beginning with `~/` resolve from
+the current user's home directory; `~user` remains an ordinary relative path.
+Reading a directory returns a sorted, bounded listing. Text reads accept a
+one-based line range:
 
 ```text
 read("file://src/main.rs?offset=1&limit=200", "")
@@ -121,11 +125,12 @@ file remains empty content.
 
 `grep` puts the search pattern in the string body and searches a project-relative
 or absolute file or directory. An empty target searches the startup working
-directory. Search patterns are regular expressions by default. If a pattern is
+directory. On Unix, the root accepts the same `~` and `~/` home-relative paths
+as `file`. Search patterns are regular expressions by default. If a pattern is
 not valid as a regular expression, the protocol retries it as literal text;
-`literal=true` always uses literal matching. It invokes ripgrep directly without
-a shell and accepts `glob`, `literal`, `ignore_case`, `context`, and `limit`
-options:
+`literal=true` always uses literal matching. It invokes ripgrep directly
+without a shell and accepts `glob`, `literal`, `ignore_case`, `context`, and
+`limit` options:
 
 ```text
 read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
@@ -222,8 +227,9 @@ replace({"path":"src/config.rs","old_text":"one unique match","new_text":"replac
 `old_text` must be nonempty and occur exactly once. Missing and ambiguous
 matches fail directly without changing the file. A successful write atomically
 replaces the destination file. `replace` is registered only as a direct tool;
-it has no protocol route. Its active tool schema is the exact model-facing
-argument contract.
+it has no protocol route. Relative and absolute paths follow `file` semantics,
+including `~` and `~/` home expansion on Unix. Its active tool schema is the
+exact model-facing argument contract.
 
 ### `apply_patch`
 
@@ -253,7 +259,8 @@ The patch supports this grammar:
 header. Update lines start with a space for context, `-` for removal, or `+` for
 addition. `*** End of File` may anchor a chunk at EOF. Every Add File content
 line starts with `+`. Relative paths resolve from the startup working directory;
-absolute paths are accepted.
+absolute paths are accepted. On Unix, `~` and paths beginning with `~/` resolve
+from the current user's home directory, while `~user` is not expanded.
 
 URI Agent parses and applies the complete patch to an in-memory plan before
 changing files. A commit failure rolls back every affected file. `apply_patch`

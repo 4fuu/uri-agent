@@ -45,11 +45,11 @@ impl ModelTool for ReplaceTool {
     fn descriptor(&self) -> ModelToolDescriptor {
         ModelToolDescriptor {
             name: "replace".to_string(),
-            description: "Replace one exact text match in a UTF-8 file atomically. Relative paths resolve from the startup working directory. The old text must be nonempty and occur exactly once; missing or ambiguous matches leave the file unchanged.".to_string(),
+            description: "Replace one exact text match in a UTF-8 file atomically. Relative paths resolve from the startup working directory. On Unix, `~` and paths beginning with `~/` resolve from the current user's home directory; `~user` is not expanded. The old text must be nonempty and occur exactly once; missing or ambiguous matches leave the file unchanged.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Project-relative or absolute file path."},
+                    "path": {"type": "string", "description": "Project-relative or absolute file path; on Unix, ~ and paths beginning with ~/ resolve from the current user's home directory."},
                     "old_text": {"type": "string", "description": "Exact nonempty text to replace. Must occur once."},
                     "new_text": {"type": "string", "description": "Replacement text."}
                 },
@@ -65,7 +65,7 @@ impl ModelTool for ReplaceTool {
         if arguments.path.is_empty() {
             bail!("replace path cannot be empty");
         }
-        let path = resolve_path(&self.cwd, &arguments.path);
+        let path = resolve_path(&self.cwd, &arguments.path)?;
         replace_exact(&path, &arguments.old_text, &arguments.new_text).await?;
         Ok(format!("Updated {}", path.display()))
     }
@@ -135,6 +135,12 @@ mod tests {
 
         assert!(output.contains("Updated"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha gamma\n");
+        assert!(
+            tool.descriptor().parameters["properties"]["path"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("paths beginning with ~/")
+        );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }
 

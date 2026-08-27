@@ -28,7 +28,8 @@ Current working directory: `file://{}`
 
 - Use `file://<path>` to read a file or directory. Replace `<path>` with a
   project-relative path or an absolute filesystem path; relative paths resolve
-  from the current working directory.
+  from the current working directory. On Unix, `~` and paths beginning with
+  `~/` resolve from the current user's home directory; `~user` is not expanded.
 - Add `?offset=<line>&limit=<count>` to read a bounded range. `<line>` is the
   one-based starting line or directory-entry position, and `<count>` is the
   maximum number of lines or entries to return. The default is 200 and the
@@ -252,7 +253,7 @@ impl Protocol for FileProtocol {
         }
 
         let (target, query) = split_query(request.target);
-        let path = resolve_path(&self.cwd, target);
+        let path = resolve_path(&self.cwd, target)?;
         let range = Range::parse(query)?;
         let metadata = fs::metadata(&path)
             .await
@@ -276,14 +277,23 @@ impl Protocol for FileProtocol {
     }
 }
 
-pub(crate) fn resolve_path(cwd: &Path, target: &str) -> PathBuf {
+pub(crate) fn resolve_path(cwd: &Path, target: &str) -> Result<PathBuf> {
+    #[cfg(unix)]
+    if target == "~" || target.starts_with("~/") {
+        let home = dirs::home_dir().context("cannot determine the home directory")?;
+        let relative = Path::new(target)
+            .strip_prefix("~")
+            .expect("home-relative path starts with a tilde component");
+        return Ok(home.join(relative));
+    }
+
     let path = Path::new(target);
     if path.is_absolute() {
-        path.to_path_buf()
+        Ok(path.to_path_buf())
     } else if target.is_empty() {
-        cwd.to_path_buf()
+        Ok(cwd.to_path_buf())
     } else {
-        cwd.join(path)
+        Ok(cwd.join(path))
     }
 }
 
@@ -511,6 +521,8 @@ mod tests {
         assert!(help.contains("`?glob=<pattern>`"));
         assert!(help.contains("standard percent-encoding"));
         assert!(help.contains("Unknown, duplicate, malformed, or invalid query parameters"));
+        assert!(help.contains("paths beginning with\n  `~/` resolve"));
+        assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("Every `file` read"));
         assert!(help.contains("MUST pass an empty string body"));
         assert!(help.contains("does not support `exec`"));
@@ -519,7 +531,43 @@ mod tests {
     #[test]
     fn custom_targets_are_not_percent_decoded() {
         let cwd = Path::new("/tmp/root");
-        assert_eq!(resolve_path(cwd, "a%20b"), Path::new("/tmp/root/a%20b"));
+        assert_eq!(
+            resolve_path(cwd, "a%20b").unwrap(),
+            Path::new("/tmp/root/a%20b")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_home_relative_paths_expand_without_interpreting_usernames() {
+        let cwd = Path::new("/tmp/root");
+        let home = dirs::home_dir().unwrap();
+
+        assert_eq!(resolve_path(cwd, "~").unwrap(), home);
+        assert_eq!(
+            resolve_path(cwd, "~/notes/file.txt").unwrap(),
+            home.join("notes/file.txt")
+        );
+        assert_eq!(
+            resolve_path(cwd, "~someone/file.txt").unwrap(),
+            cwd.join("~someone/file.txt")
+        );
+        assert_eq!(
+            resolve_path(cwd, "notes/~/file.txt").unwrap(),
+            cwd.join("notes/~/file.txt")
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn tilde_paths_remain_relative_on_non_unix_platforms() {
+        let cwd = Path::new("root");
+
+        assert_eq!(resolve_path(cwd, "~").unwrap(), cwd.join("~"));
+        assert_eq!(
+            resolve_path(cwd, "~/notes/file.txt").unwrap(),
+            cwd.join("~/notes/file.txt")
+        );
     }
 
     #[tokio::test]

@@ -34,7 +34,8 @@ const PATCH_ARGUMENT_DESCRIPTION: &str = concat!(
     "Update lines begin with a space for context, - for removal, or + for addition. ",
     "*** End of File anchors the preceding chunk at EOF. Every Add File content line ",
     "begins with +. Relative paths resolve from the startup working directory; absolute ",
-    "paths are accepted."
+    "paths are accepted. On Unix, ~ and paths beginning with ~/ resolve from the current ",
+    "user's home directory; ~user is not expanded."
 );
 
 #[derive(Clone)]
@@ -320,14 +321,14 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     for hunk in hunks {
         match hunk {
             PatchHunk::Add { path, content } => {
-                let resolved = resolve_path(cwd, path.to_string_lossy().as_ref());
+                let resolved = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 load_planned_file(&mut files, &resolved)
                     .await?
                     .final_content = Some(content.into_bytes());
                 added.push(path);
             }
             PatchHunk::Delete { path } => {
-                let resolved = resolve_path(cwd, path.to_string_lossy().as_ref());
+                let resolved = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 let file = load_planned_file(&mut files, &resolved).await?;
                 if file.final_content.is_none() {
                     bail!(
@@ -343,7 +344,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 move_to,
                 chunks,
             } => {
-                let source = resolve_path(cwd, path.to_string_lossy().as_ref());
+                let source = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 let source_content = load_planned_file(&mut files, &source)
                     .await?
                     .final_content
@@ -355,7 +356,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 let updated = derive_updated_content(&source, &source_text, &chunks)?;
                 if let Some(destination) = move_to {
                     let resolved_destination =
-                        resolve_path(cwd, destination.to_string_lossy().as_ref());
+                        resolve_path(cwd, destination.to_string_lossy().as_ref())?;
                     if source != resolved_destination {
                         load_planned_file(&mut files, &resolved_destination)
                             .await?
@@ -743,6 +744,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("*** Add File: <path>")
+        );
+        assert!(
+            descriptor.parameters["properties"]["patch"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("paths beginning with ~/")
         );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }
