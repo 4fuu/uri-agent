@@ -81,6 +81,9 @@ const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const SMOOTH_SCROLL_FRAME_DURATION: Duration = Duration::from_millis(16);
+const MOUSE_SCROLL_ROWS: isize = 3;
+const MAX_PENDING_SCROLL_ROWS: usize = 12;
 const EXPANDED_PREVIEW_LINES: usize = 24;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
@@ -284,6 +287,12 @@ struct TextSelection {
 struct TranscriptScrollbarDrag {
     row: u16,
     offset: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MouseScrollAnimation {
+    Transcript { target: usize, direction: isize },
+    Overlay { target: u16, direction: isize },
 }
 
 #[derive(Clone)]
@@ -560,6 +569,7 @@ struct App {
     transcript_center_selected: bool,
     transcript_scrollbar_area: Option<Rect>,
     transcript_scrollbar_drag: Option<TranscriptScrollbarDrag>,
+    mouse_scroll_animation: Option<MouseScrollAnimation>,
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
@@ -645,6 +655,7 @@ impl App {
             transcript_center_selected: false,
             transcript_scrollbar_area: None,
             transcript_scrollbar_drag: None,
+            mouse_scroll_animation: None,
             started: Instant::now(),
             splash_skipped: !show_splash,
             last_sequence: None,
@@ -1741,28 +1752,128 @@ impl App {
     }
 
     fn scroll_transcript(&mut self, distance: isize) {
+        self.cancel_mouse_scroll_animation();
+        self.transcript_offset =
+            self.transcript_scroll_destination(self.transcript_offset, distance);
         let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
-        let reading_end = transcript_reading_end(self.transcript_rows, self.transcript_height);
-        let offset = if distance < 0 {
-            self.transcript_offset
-                .saturating_sub(distance.unsigned_abs())
-        } else {
-            self.transcript_offset
-                .saturating_add(distance as usize)
-                .min(reading_end)
-        };
-        self.transcript_offset = if (self.transcript_offset < live_tail && offset > live_tail)
-            || (self.transcript_offset > live_tail && offset < live_tail)
-        {
-            live_tail
-        } else {
-            offset
-        };
         self.transcript_follow_tail = self.transcript_offset == live_tail;
         self.transcript_center_selected = false;
     }
 
+    fn transcript_scroll_destination(&self, start: usize, distance: isize) -> usize {
+        let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
+        let reading_end = transcript_reading_end(self.transcript_rows, self.transcript_height);
+        let offset = if distance < 0 {
+            start.saturating_sub(distance.unsigned_abs())
+        } else {
+            start.saturating_add(distance as usize).min(reading_end)
+        };
+        if (start < live_tail && offset > live_tail) || (start > live_tail && offset < live_tail) {
+            live_tail
+        } else {
+            offset
+        }
+    }
+
+    fn smooth_scroll_transcript(&mut self, direction: isize) {
+        let start = match self.mouse_scroll_animation {
+            Some(MouseScrollAnimation::Transcript {
+                target,
+                direction: previous_direction,
+            }) if previous_direction == direction => target,
+            _ => self.transcript_offset,
+        };
+        let target = self.transcript_scroll_destination(start, direction * MOUSE_SCROLL_ROWS);
+        let target = if direction < 0 {
+            target.max(
+                self.transcript_offset
+                    .saturating_sub(MAX_PENDING_SCROLL_ROWS),
+            )
+        } else {
+            target.min(
+                self.transcript_offset
+                    .saturating_add(MAX_PENDING_SCROLL_ROWS),
+            )
+        };
+        self.mouse_scroll_animation = (target != self.transcript_offset)
+            .then_some(MouseScrollAnimation::Transcript { target, direction });
+        if self.mouse_scroll_animation.is_some() {
+            self.transcript_follow_tail = false;
+            self.transcript_center_selected = false;
+        }
+    }
+
+    fn smooth_scroll_overlay(&mut self, direction: isize) {
+        let start = match self.mouse_scroll_animation {
+            Some(MouseScrollAnimation::Overlay {
+                target,
+                direction: previous_direction,
+            }) if previous_direction == direction => target,
+            _ => self.overlay_scroll,
+        };
+        let distance = direction * MOUSE_SCROLL_ROWS;
+        let target = if distance < 0 {
+            start.saturating_sub(distance.unsigned_abs().min(u16::MAX as usize) as u16)
+        } else {
+            start.saturating_add((distance as usize).min(u16::MAX as usize) as u16)
+        };
+        let maximum_pending = MAX_PENDING_SCROLL_ROWS.min(u16::MAX as usize) as u16;
+        let target = if direction < 0 {
+            target.max(self.overlay_scroll.saturating_sub(maximum_pending))
+        } else {
+            target.min(self.overlay_scroll.saturating_add(maximum_pending))
+        };
+        self.mouse_scroll_animation = (target != self.overlay_scroll)
+            .then_some(MouseScrollAnimation::Overlay { target, direction });
+    }
+
+    fn mouse_scroll_animating(&self) -> bool {
+        self.mouse_scroll_animation.is_some()
+    }
+
+    fn advance_mouse_scroll_animation(&mut self) {
+        let Some(animation) = self.mouse_scroll_animation.take() else {
+            return;
+        };
+        match animation {
+            MouseScrollAnimation::Transcript { target, direction } => {
+                let reading_end =
+                    transcript_reading_end(self.transcript_rows, self.transcript_height);
+                let target = target.min(reading_end);
+                self.transcript_offset = match self.transcript_offset.cmp(&target) {
+                    std::cmp::Ordering::Less => self.transcript_offset.saturating_add(1),
+                    std::cmp::Ordering::Greater => self.transcript_offset.saturating_sub(1),
+                    std::cmp::Ordering::Equal => self.transcript_offset,
+                };
+                let finished = self.transcript_offset == target;
+                let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
+                self.transcript_follow_tail = finished && self.transcript_offset == live_tail;
+                self.transcript_center_selected = false;
+                if !finished {
+                    self.mouse_scroll_animation =
+                        Some(MouseScrollAnimation::Transcript { target, direction });
+                }
+            }
+            MouseScrollAnimation::Overlay { target, direction } => {
+                self.overlay_scroll = match self.overlay_scroll.cmp(&target) {
+                    std::cmp::Ordering::Less => self.overlay_scroll.saturating_add(1),
+                    std::cmp::Ordering::Greater => self.overlay_scroll.saturating_sub(1),
+                    std::cmp::Ordering::Equal => self.overlay_scroll,
+                };
+                if self.overlay_scroll != target {
+                    self.mouse_scroll_animation =
+                        Some(MouseScrollAnimation::Overlay { target, direction });
+                }
+            }
+        }
+    }
+
+    fn cancel_mouse_scroll_animation(&mut self) {
+        self.mouse_scroll_animation = None;
+    }
+
     fn set_transcript_scrollbar_offset(&mut self, offset: usize) {
+        self.cancel_mouse_scroll_animation();
         let live_tail = transcript_live_tail(self.transcript_rows, self.transcript_height);
         let reading_end = transcript_reading_end(self.transcript_rows, self.transcript_height);
         self.transcript_offset = offset.min(reading_end);

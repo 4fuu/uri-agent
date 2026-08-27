@@ -148,6 +148,8 @@ pub(super) async fn run_loop(
     let mut terminal_events = EventStream::new();
     let mut animation = time::interval(Duration::from_millis(90));
     animation.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut smooth_scroll = time::interval(SMOOTH_SCROLL_FRAME_DURATION);
+    smooth_scroll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
     if refresh_catalog_on_start {
         start_background_catalog_refresh(app, &services, background_tx.clone());
@@ -160,6 +162,9 @@ pub(super) async fn run_loop(
         tokio::select! {
             _ = animation.tick(), if !app.animations_paused() => {
                 app.frame = app.frame.wrapping_add(1);
+            },
+            _ = smooth_scroll.tick(), if app.mouse_scroll_animating() => {
+                app.advance_mouse_scroll_animation();
             },
             event = terminal_events.next() => {
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
@@ -852,6 +857,7 @@ pub(super) fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
 }
 
 pub(super) async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServices) -> Action {
+    app.cancel_mouse_scroll_animation();
     let key_name = key_name(key);
     if app.interrupt_on_double_press(key, &key_name) {
         return Action::InterruptTurn;
@@ -1723,6 +1729,12 @@ pub(super) async fn handle_mouse(
     mouse: MouseEvent,
     services: &LoopServices,
 ) -> Action {
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        app.cancel_mouse_scroll_animation();
+    }
     if consume_copy_click_release(app, mouse) {
         return Action::Continue;
     }
@@ -1753,70 +1765,8 @@ pub(super) async fn handle_mouse(
         return Action::Continue;
     }
     match mouse.kind {
-        MouseEventKind::ScrollUp => match app.overlay {
-            Some(Overlay::Command) => {
-                app.move_command_selection(-1);
-            }
-            Some(Overlay::Delivery) => {
-                if let Some(delivery) = app.delivery.as_mut() {
-                    delivery.selected = wrapped_index(delivery.selected, -1, 2);
-                }
-            }
-            Some(Overlay::Selector) => {
-                if let Some(selector) = app.selector.as_mut() {
-                    selector.move_selection(-1);
-                }
-            }
-            Some(Overlay::Tasks) => {
-                app.selected_task = wrapped_index(app.selected_task, -1, app.task_records.len());
-            }
-            Some(Overlay::Models) => {
-                if let Some(selector) = app.model_selector.as_mut() {
-                    selector.move_selection(-3);
-                }
-            }
-            Some(Overlay::Settings) => {
-                if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = wrapped_index(settings.selected, -1, 5);
-                }
-            }
-            Some(Overlay::Composer) => app.move_completion(-1),
-            Some(Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
-            Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_sub(3),
-            None => app.scroll_transcript(-3),
-        },
-        MouseEventKind::ScrollDown => match app.overlay {
-            Some(Overlay::Command) => {
-                app.move_command_selection(1);
-            }
-            Some(Overlay::Delivery) => {
-                if let Some(delivery) = app.delivery.as_mut() {
-                    delivery.selected = wrapped_index(delivery.selected, 1, 2);
-                }
-            }
-            Some(Overlay::Selector) => {
-                if let Some(selector) = app.selector.as_mut() {
-                    selector.move_selection(1);
-                }
-            }
-            Some(Overlay::Tasks) => {
-                app.selected_task = wrapped_index(app.selected_task, 1, app.task_records.len());
-            }
-            Some(Overlay::Models) => {
-                if let Some(selector) = app.model_selector.as_mut() {
-                    selector.move_selection(3);
-                }
-            }
-            Some(Overlay::Settings) => {
-                if let Some(settings) = app.settings.as_mut() {
-                    settings.selected = wrapped_index(settings.selected, 1, 5);
-                }
-            }
-            Some(Overlay::Composer) => app.move_completion(1),
-            Some(Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {}
-            Some(_) => app.overlay_scroll = app.overlay_scroll.saturating_add(3),
-            None => app.scroll_transcript(3),
-        },
+        MouseEventKind::ScrollUp => handle_mouse_scroll(app, -1),
+        MouseEventKind::ScrollDown => handle_mouse_scroll(app, 1),
         MouseEventKind::Down(MouseButton::Left) => {
             let Some(target) = hit_target(&app.hit_regions, mouse) else {
                 return Action::Continue;
@@ -1890,6 +1840,52 @@ pub(super) async fn handle_mouse(
         _ => {}
     }
     Action::Continue
+}
+
+pub(super) fn handle_mouse_scroll(app: &mut App, direction: isize) {
+    match app.overlay {
+        Some(Overlay::Command) => {
+            app.cancel_mouse_scroll_animation();
+            app.move_command_selection(direction);
+        }
+        Some(Overlay::Delivery) => {
+            app.cancel_mouse_scroll_animation();
+            if let Some(delivery) = app.delivery.as_mut() {
+                delivery.selected = wrapped_index(delivery.selected, direction, 2);
+            }
+        }
+        Some(Overlay::Selector) => {
+            app.cancel_mouse_scroll_animation();
+            if let Some(selector) = app.selector.as_mut() {
+                selector.move_selection(direction);
+            }
+        }
+        Some(Overlay::Tasks) => {
+            app.cancel_mouse_scroll_animation();
+            app.selected_task = wrapped_index(app.selected_task, direction, app.task_records.len());
+        }
+        Some(Overlay::Models) => {
+            app.cancel_mouse_scroll_animation();
+            if let Some(selector) = app.model_selector.as_mut() {
+                selector.move_selection(direction * MOUSE_SCROLL_ROWS);
+            }
+        }
+        Some(Overlay::Settings) => {
+            app.cancel_mouse_scroll_animation();
+            if let Some(settings) = app.settings.as_mut() {
+                settings.selected = wrapped_index(settings.selected, direction, 5);
+            }
+        }
+        Some(Overlay::Composer) => {
+            app.cancel_mouse_scroll_animation();
+            app.move_completion(direction);
+        }
+        Some(Overlay::Text | Overlay::Oauth | Overlay::Terminal) => {
+            app.cancel_mouse_scroll_animation();
+        }
+        Some(_) => app.smooth_scroll_overlay(direction),
+        None => app.smooth_scroll_transcript(direction),
+    }
 }
 
 pub(super) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {

@@ -3343,6 +3343,79 @@ fn transcript_scroll_is_independent_from_selection_and_follows_the_tail_again() 
 }
 
 #[test]
+fn mouse_wheel_smooths_each_three_row_step_without_reducing_distance() {
+    let mut app = test_app();
+    for index in 0..30 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let tail_offset = app.transcript_offset;
+
+    handle_mouse_scroll(&mut app, -1);
+    assert_eq!(app.transcript_offset, tail_offset);
+    assert!(app.mouse_scroll_animating());
+    app.advance_mouse_scroll_animation();
+    assert_eq!(app.transcript_offset, tail_offset - 1);
+    app.advance_mouse_scroll_animation();
+    assert_eq!(app.transcript_offset, tail_offset - 2);
+    app.advance_mouse_scroll_animation();
+    assert_eq!(app.transcript_offset, tail_offset - 3);
+    assert!(!app.mouse_scroll_animating());
+
+    handle_mouse_scroll(&mut app, 1);
+    for _ in 0..3 {
+        app.advance_mouse_scroll_animation();
+    }
+    assert_eq!(app.transcript_offset, tail_offset);
+
+    app.overlay = Some(Overlay::Document);
+    app.overlay_scroll = 3;
+    handle_mouse_scroll(&mut app, -1);
+    assert_eq!(app.overlay_scroll, 3);
+    app.advance_mouse_scroll_animation();
+    assert_eq!(app.overlay_scroll, 2);
+    app.advance_mouse_scroll_animation();
+    assert_eq!(app.overlay_scroll, 1);
+    app.advance_mouse_scroll_animation();
+    assert_eq!(app.overlay_scroll, 0);
+    assert!(!app.mouse_scroll_animating());
+}
+
+#[test]
+fn smooth_mouse_scroll_coalesces_bursts_without_a_long_backlog() {
+    let mut app = test_app();
+    for index in 0..50 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let tail_offset = app.transcript_offset;
+
+    for _ in 0..10 {
+        handle_mouse_scroll(&mut app, -1);
+    }
+    for _ in 0..MAX_PENDING_SCROLL_ROWS {
+        app.advance_mouse_scroll_animation();
+    }
+
+    assert_eq!(app.transcript_offset, tail_offset - MAX_PENDING_SCROLL_ROWS);
+    assert!(!app.mouse_scroll_animating());
+}
+
+#[test]
 fn transcript_pages_by_the_rendered_viewport_without_moving_selection() {
     let mut app = test_app();
     for index in 0..50 {
