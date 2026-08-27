@@ -320,12 +320,14 @@ Task acceptance is not success. A model-facing task record exposes `pending`,
 `running`, `completed`, `failed`, or `cancelled` state, its originating
 protocol, label, bounded latest output while active, and complete terminal
 output. Internal timestamps and duration do not enter the model result. Task
-IDs increase within their in-process manager as lowercase hexadecimal values:
-they start at `001`, remain at least three digits wide, and expand after `fff`.
-Settled background records remain available for the lifetime of the session
-runtime. At most 16 background tasks may be pending or running at once; an
-explicit background request fails at capacity, while automatic conversion
-keeps waiting in the foreground.
+IDs increase within their session as lowercase hexadecimal values: they start
+at `001`, remain at least three digits wide, expand after `fff`, and continue
+after the highest restored ID. Completed, failed, and cancelled reports remain
+available when their session is resumed, including after an application
+restart. A task process itself never resumes; work interrupted by process exit
+is restored as cancelled. At most 16 background tasks may be pending or
+running at once; an explicit background request fails at capacity, while
+automatic conversion keeps waiting in the foreground.
 
 When a background task reaches `completed`, `failed`, or `cancelled`, URI Agent
 sends the model an automatic hidden plain-text notification containing the

@@ -1,11 +1,12 @@
 use crate::catalog::ThinkingLevel;
 use crate::skill::SkillSnapshot;
-use crate::task::TaskStatus;
+use crate::task::{TaskReport, TaskStatus};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rig::message::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -323,6 +324,8 @@ pub enum EventKind {
         protocol: String,
         label: String,
         status: TaskStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     Notice {
         text: String,
@@ -729,6 +732,10 @@ impl Session {
 
     pub async fn snapshot(&self) -> Vec<SessionEvent> {
         self.state.lock().await.events.clone()
+    }
+
+    pub async fn task_reports(&self) -> Vec<TaskReport> {
+        task_reports_from_events(&self.state.lock().await.events)
     }
 
     pub async fn model_settings(&self) -> SessionModelSettings {
@@ -1226,6 +1233,63 @@ fn starts_session(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { .. })
 }
 
+fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
+    struct ReportState {
+        protocol: String,
+        label: String,
+        status: TaskStatus,
+        started_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        output: String,
+    }
+
+    let mut reports = HashMap::<String, ReportState>::new();
+    for event in events {
+        let EventKind::Task {
+            id,
+            protocol,
+            label,
+            status,
+            output,
+        } = &event.kind
+        else {
+            continue;
+        };
+        let report = reports.entry(id.clone()).or_insert_with(|| ReportState {
+            protocol: protocol.clone(),
+            label: label.clone(),
+            status: *status,
+            started_at: event.at,
+            updated_at: event.at,
+            output: String::new(),
+        });
+        report.protocol.clone_from(protocol);
+        report.label.clone_from(label);
+        report.status = *status;
+        report.updated_at = event.at;
+        if let Some(output) = output {
+            report.output.clone_from(output);
+        }
+    }
+
+    reports
+        .into_iter()
+        .map(|(id, report)| TaskReport {
+            id,
+            protocol: report.protocol,
+            label: report.label,
+            status: if report.status.terminal() {
+                report.status
+            } else {
+                TaskStatus::Cancelled
+            },
+            started_at: report.started_at,
+            finished_at: report.updated_at,
+            content: report.output.into_bytes(),
+        })
+        .collect()
+}
+
 fn apply_model_settings<'a>(
     settings: &mut SessionModelSettings,
     kinds: impl IntoIterator<Item = &'a EventKind>,
@@ -1336,6 +1400,68 @@ mod tests {
             vec![0, 1, 2, 3]
         );
         assert!(matches!(events[3].kind, EventKind::TurnFinished));
+    }
+
+    #[tokio::test]
+    async fn terminal_task_reports_are_restored_and_interrupted_tasks_settle_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first = session(&path, Some("task-reports")).await;
+        first
+            .append(EventKind::User {
+                text: "run background work".into(),
+            })
+            .await
+            .unwrap();
+        first
+            .append_batch(vec![
+                EventKind::Task {
+                    id: "00a".into(),
+                    protocol: "bash".into(),
+                    label: "completed command".into(),
+                    status: TaskStatus::Running,
+                    output: None,
+                },
+                EventKind::Task {
+                    id: "00a".into(),
+                    protocol: "bash".into(),
+                    label: "completed command".into(),
+                    status: TaskStatus::Completed,
+                    output: Some("complete output".into()),
+                },
+                EventKind::Task {
+                    id: "00b".into(),
+                    protocol: "bash".into(),
+                    label: "interrupted command".into(),
+                    status: TaskStatus::Running,
+                    output: None,
+                },
+            ])
+            .await
+            .unwrap();
+        drop(first);
+
+        let reopened = session(&path, Some("task-reports")).await;
+        let reports = reopened.task_reports().await;
+        let completed = reports.iter().find(|report| report.id == "00a").unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.content, b"complete output");
+        let interrupted = reports.iter().find(|report| report.id == "00b").unwrap();
+        assert_eq!(interrupted.status, TaskStatus::Cancelled);
+        assert!(interrupted.content.is_empty());
+    }
+
+    #[test]
+    fn historical_task_events_without_output_remain_readable() {
+        let event = serde_json::from_value::<EventKind>(serde_json::json!({
+            "kind": "task",
+            "id": "001",
+            "protocol": "bash",
+            "label": "historical",
+            "status": "completed"
+        }))
+        .unwrap();
+        assert!(matches!(event, EventKind::Task { output: None, .. }));
     }
 
     #[tokio::test]

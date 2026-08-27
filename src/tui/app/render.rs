@@ -2859,7 +2859,7 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
 pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     if app.task_records.is_empty() {
         frame.render_widget(
-            Paragraph::new("No managed tasks in this process.")
+            Paragraph::new("No managed tasks in this session.")
                 .block(block.title(" TASKS "))
                 .style(Style::default().fg(MUTED)),
             area,

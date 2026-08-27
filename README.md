@@ -65,7 +65,7 @@ separate manual.
 - **URI-native progressive context:** one address space covers every resource and action, while Skills-style loading keeps contracts, instructions, resources, and complete output out of context until needed.
 - **Reliable and extensible:** the stable string-based `read` / `exec` contract handles simple protocols, while typed direct tools avoid nested escaping and both paths remain plugin-registered.
 - **Current models and sign-in:** URI Agent combines pi.dev's cloud catalog and provider login methods with credential-scoped live discovery, exposing runnable new provider models before the shared catalog catches up.
-- **Durable, observable work:** managed tasks expose status and final output and automatically notify the model on completion; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
+- **Durable, observable work:** managed tasks expose status and final output, automatically notify the model on completion, and restore settled reports with their session; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
 - **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
 
 ## pi.dev model coverage

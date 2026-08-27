@@ -1791,12 +1791,21 @@ pub fn forward_task_notices(session: Session, tasks: TaskManager, runtime: Weak<
                         continue;
                     }
                     let terminal = notice.status.terminal();
+                    let output = if terminal {
+                        tasks
+                            .get(&notice.id)
+                            .await
+                            .map(|record| String::from_utf8_lossy(&record.content).into_owned())
+                    } else {
+                        None
+                    };
                     let _ = session
                         .append(EventKind::Task {
                             id: notice.id,
                             protocol: notice.protocol,
                             label: notice.label,
                             status: notice.status,
+                            output,
                         })
                         .await;
                     if terminal && let Some(runtime) = runtime.upgrade() {
@@ -2283,6 +2292,15 @@ mod tests {
         tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
 
         requests_started.recv().await.unwrap();
+        assert!(session.snapshot().await.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Task {
+                id,
+                status: crate::task::TaskStatus::Completed,
+                output: Some(output),
+                ..
+            } if id == "001" && output == "background result"
+        )));
         let requests = backend.requests.lock().await;
         let history = serde_json::to_string(&requests[0].history).unwrap();
         assert!(history.contains("Terminal background task results"));

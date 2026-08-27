@@ -35,7 +35,12 @@ A new session freezes a `SessionContext` event containing the complete generated
 
 ## Append-only events
 
-User and model messages, model settings, tool calls and results, usage, notices, errors, task notices, turn boundaries, and compaction checkpoints are appended as events. Normal operation and compaction do not rewrite or delete earlier events.
+User and model messages, model settings, tool calls and results, usage, notices,
+errors, task lifecycle notices and terminal reports, turn boundaries, and
+compaction checkpoints are appended as events. Resuming a session reconstructs
+its settled task reports; a task left pending or running when its process ended
+is restored as cancelled rather than restarted. Normal operation and compaction
+do not rewrite or delete earlier events.
 
 The transcript and model-replay forms of one message commit in the same SQLite transaction. Streaming text and reasoning are provisional TUI updates; only the completed response enters durable replay. Provider tool-call identity is preserved so resumed tool conversations remain valid for the selected backend.
 

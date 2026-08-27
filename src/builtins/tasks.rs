@@ -40,8 +40,10 @@ current status or output is explicitly needed. Reading a terminal result before
 automatic delivery suppresses the duplicate notification.
 
 At most 16 background tasks may be pending or running at once. Completed,
-failed, and cancelled records remain available for the lifetime of the session
-runtime. Oversized reads include a `file://` address containing full output.
+failed, and cancelled reports remain available when their session is resumed,
+including after an application restart. A task process itself never resumes;
+work interrupted by process exit is restored as cancelled. Oversized reads
+include a `file://` address containing full output.
 "#;
 
 #[derive(Clone, Copy)]

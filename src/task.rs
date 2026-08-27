@@ -55,6 +55,17 @@ pub struct TaskRecord {
     terminal_notification: TerminalNotification,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskReport {
+    pub id: String,
+    pub protocol: String,
+    pub label: String,
+    pub status: TaskStatus,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub content: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TaskNotice {
     pub id: String,
@@ -101,6 +112,44 @@ impl TaskManager {
             workers: Arc::new(SyncMutex::new(HashMap::new())),
             notices,
             next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn from_reports(reports: impl IntoIterator<Item = TaskReport>) -> Self {
+        let mut records = HashMap::new();
+        let mut next_id = 1;
+        for report in reports {
+            if !report.status.terminal() {
+                continue;
+            }
+            if let Ok(sequence) = u64::from_str_radix(&report.id, 16) {
+                next_id = next_id.max(sequence.saturating_add(1));
+            }
+            let mut latest_output = Vec::new();
+            append_bounded(&mut latest_output, &report.content);
+            records.insert(
+                report.id.clone(),
+                TaskRecord {
+                    id: report.id,
+                    protocol: report.protocol,
+                    label: report.label,
+                    status: report.status,
+                    background: true,
+                    started_at: report.started_at,
+                    finished_at: Some(report.finished_at),
+                    content: report.content,
+                    latest_output,
+                    cancellation: CancellationToken::new(),
+                    terminal_notification: TerminalNotification::Delivered,
+                },
+            );
+        }
+        let (notices, _) = broadcast::channel(128);
+        Self {
+            inner: Arc::new(RwLock::new(records)),
+            workers: Arc::new(SyncMutex::new(HashMap::new())),
+            notices,
+            next_id: Arc::new(AtomicU64::new(next_id)),
         }
     }
 
@@ -463,6 +512,31 @@ mod tests {
         let tasks = TaskManager::new();
         assert_eq!(tasks.allocate("test", "first").await.id, "001");
         assert_eq!(tasks.allocate("test", "second").await.id, "002");
+    }
+
+    #[tokio::test]
+    async fn restored_reports_remain_readable_and_advance_task_ids() {
+        let started_at = Utc::now();
+        let finished_at = started_at + chrono::Duration::seconds(1);
+        let tasks = TaskManager::from_reports([TaskReport {
+            id: "00f".to_string(),
+            protocol: "bash".to_string(),
+            label: "restored".to_string(),
+            status: TaskStatus::Completed,
+            started_at,
+            finished_at,
+            content: b"complete output".to_vec(),
+        }]);
+
+        let restored = tasks.get("00f").await.unwrap();
+        assert_eq!(restored.status, TaskStatus::Completed);
+        assert_eq!(restored.content, b"complete output");
+        assert_eq!(restored.finished_at, Some(finished_at));
+        assert!(tasks.pending_terminal_notifications().await.is_empty());
+        assert_eq!(
+            tasks.allocate_background("bash", "next").await.unwrap().id,
+            "010"
+        );
     }
 
     #[tokio::test]
