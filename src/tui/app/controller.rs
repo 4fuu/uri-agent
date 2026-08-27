@@ -3250,12 +3250,7 @@ pub(super) async fn finish_background(
             .await;
             match result {
                 Ok(report) if announced => {
-                    let failures = report.pi_failures + report.discovery_failures;
-                    if failures > 0 {
-                        app.set_flash(format!(
-                            "Model catalogs refreshed with {failures} warning(s); cached data was retained"
-                        ));
-                    } else if report.discovered_models > 0 {
+                    if report.discovered_models > 0 {
                         app.set_flash(format!(
                             "Model catalogs refreshed; {} provider model(s) discovered",
                             report.discovered_models
@@ -3263,11 +3258,6 @@ pub(super) async fn finish_background(
                     } else {
                         app.set_flash("Model catalogs refreshed");
                     }
-                }
-                Ok(report) if report.pi_failures + report.discovery_failures > 0 => {
-                    app.set_flash(
-                        "Some model catalogs could not refresh; cached data was retained",
-                    );
                 }
                 Ok(_) => {}
                 Err(error) => app.set_flash(format!("Catalog refresh failed: {error:#}")),

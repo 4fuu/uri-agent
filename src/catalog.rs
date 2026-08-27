@@ -362,6 +362,7 @@ pub struct ModelCatalog {
     store_path: PathBuf,
     user_path: PathBuf,
     client: reqwest::Client,
+    providers_url: String,
     offline: bool,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -388,6 +389,7 @@ impl ModelCatalog {
                 .timeout(Duration::from_secs(4))
                 .user_agent(concat!("uri-agent/", env!("CARGO_PKG_VERSION")))
                 .build()?,
+            providers_url: PROVIDERS_URL.to_string(),
             offline,
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -432,7 +434,7 @@ impl ModelCatalog {
         let mut report = CatalogRefreshReport::default();
         let providers = match self
             .client
-            .get(PROVIDERS_URL)
+            .get(&self.providers_url)
             .header("Accept", "application/json")
             .send()
             .await
@@ -440,31 +442,23 @@ impl ModelCatalog {
         {
             Ok(response) => match response.json::<Vec<String>>().await {
                 Ok(providers) => providers,
-                Err(error) => {
+                Err(_) => {
                     report.pi_failures += 1;
-                    self.inner
-                        .write()
-                        .await
-                        .warnings
-                        .push(format!("catalog pi.dev: {error:#}"));
                     Vec::new()
                 }
             },
-            Err(error) => {
+            Err(_) => {
                 report.pi_failures += 1;
-                self.inner
-                    .write()
-                    .await
-                    .warnings
-                    .push(format!("catalog pi.dev: {error:#}"));
                 Vec::new()
             }
         };
         let current = self.inner.read().await.store.clone();
         let now = Utc::now().timestamp_millis();
         let client = self.client.clone();
+        let providers_url = self.providers_url.clone();
         let refreshed = stream::iter(providers.into_iter().map(|provider| {
             let client = client.clone();
+            let providers_url = providers_url.clone();
             let cached = current.get(&provider).cloned().unwrap_or_default();
             async move {
                 if !force
@@ -476,7 +470,7 @@ impl ModelCatalog {
                     return (provider, cached.clone(), Ok(cached));
                 }
                 let fallback = cached.clone();
-                let result = fetch_provider(&client, &provider, cached, now).await;
+                let result = fetch_provider(&client, &providers_url, &provider, cached, now).await;
                 (provider, fallback, result)
             }
         }))
@@ -490,13 +484,10 @@ impl ModelCatalog {
                 Ok(entry) => {
                     state.store.insert(provider, entry);
                 }
-                Err(error) => {
+                Err(_) => {
                     report.pi_failures += 1;
                     fallback.checked_at = Some(now);
-                    state.store.insert(provider.clone(), fallback);
-                    state
-                        .warnings
-                        .push(format!("catalog {provider}: {error:#}"));
+                    state.store.insert(provider, fallback);
                 }
             }
         }
@@ -556,7 +547,7 @@ impl ModelCatalog {
                         },
                     );
                 }
-                Err(error) => {
+                Err(_) => {
                     report.discovery_failures += 1;
                     entry.discoveries.insert(
                         fingerprint,
@@ -565,9 +556,6 @@ impl ModelCatalog {
                             checked_at: now,
                         },
                     );
-                    state
-                        .warnings
-                        .push(format!("catalog {provider} discovery: {error:#}"));
                 }
             }
         }
@@ -661,11 +649,12 @@ impl ModelCatalog {
 
 async fn fetch_provider(
     client: &reqwest::Client,
+    providers_url: &str,
     provider: &str,
     cached: StoreEntry,
     now: i64,
 ) -> Result<StoreEntry> {
-    let url = format!("{PROVIDERS_URL}/{provider}");
+    let url = format!("{providers_url}/{provider}");
     let mut request = client.get(url).header("Accept", "application/json");
     if !cached.models.is_empty()
         && let Some(etag) = &cached.etag
@@ -1157,6 +1146,81 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn catalog_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "client closed before sending HTTP headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let reason = if status == 200 { "OK" } else { "Forbidden" };
+                let body = body.replace("$BASE_URL", &base_url);
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn provider_probe_failures_retain_catalog_data_without_user_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let responses = vec![
+            (200, serde_json::json!(["xai"]).to_string()),
+            (
+                200,
+                serde_json::json!([{
+                    "id": "grok-4",
+                    "name": "Grok 4",
+                    "api": "openai-responses",
+                    "baseUrl": "$BASE_URL/v1"
+                }])
+                .to_string(),
+            ),
+            (403, "{}".to_string()),
+        ];
+        let (providers_url, server) = catalog_server(responses).await;
+        let mut catalog = ModelCatalog::load(root.path(), false).await.unwrap();
+        catalog.providers_url = providers_url;
+        let credentials = BTreeMap::from([(
+            "xai".to_string(),
+            CatalogCredential {
+                secret: "configured-key".to_string(),
+                oauth: false,
+            },
+        )]);
+
+        let report = catalog.refresh(true, &credentials).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET /v1/models "));
+        assert_eq!(report.discovery_failures, 1);
+        assert_eq!(report.discovered_models, 0);
+        assert!(catalog.warnings().await.is_empty());
+        assert!(catalog.model("xai", "grok-4").await.is_some());
+    }
 
     #[test]
     fn antigravity_models_are_built_in_and_user_overrides_remain_effective() {
