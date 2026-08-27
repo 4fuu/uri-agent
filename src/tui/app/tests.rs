@@ -4970,16 +4970,16 @@ fn macos_key_display_formats_composer_panel_and_help_hints() {
     app.overlay = Some(Overlay::Composer);
     app.sync_composer_chrome();
     let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("↩ send · ⇧↩ newline · ⌥V image"));
+    assert!(rendered.contains("↩ send · ⇧ ↩ newline · ⌥ V image"));
 
     app.overlay = Some(Overlay::Models);
     let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("MODELS · ⌃R refresh"));
+    assert!(rendered.contains("MODELS · ⌃ R refresh"));
 
     let help = keymap_help(&app.keymap);
-    assert!(help.contains("⌘C"));
-    assert!(help.contains("⌘V"));
-    assert!(help.contains("⌘Z"));
+    assert!(help.contains("⌘ C"));
+    assert!(help.contains("⌘ V"));
+    assert!(help.contains("⌘ Z"));
 }
 
 #[test]

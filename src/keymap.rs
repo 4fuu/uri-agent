@@ -305,20 +305,20 @@ impl KeyStroke {
     fn display_modifiers(&self, style: KeyDisplayStyle) -> String {
         match style {
             KeyDisplayStyle::Macos => {
-                let mut output = String::new();
+                let mut parts = Vec::new();
                 if self.modifiers & CONTROL != 0 {
-                    output.push('⌃');
+                    parts.push("⌃");
                 }
                 if self.modifiers & ALT != 0 {
-                    output.push('⌥');
+                    parts.push("⌥");
                 }
                 if self.modifiers & SHIFT != 0 {
-                    output.push('⇧');
+                    parts.push("⇧");
                 }
                 if self.modifiers & SUPER != 0 {
-                    output.push('⌘');
+                    parts.push("⌘");
                 }
-                output
+                parts.join(" ")
             }
             KeyDisplayStyle::Text | KeyDisplayStyle::Auto => {
                 let mut parts = Vec::new();
@@ -350,9 +350,13 @@ impl KeyStroke {
     }
 
     fn display_macos(&self) -> String {
-        let mut output = self.display_modifiers(KeyDisplayStyle::Macos);
-        output.push_str(&display_code(&self.code, true));
-        output
+        let modifiers = self.display_modifiers(KeyDisplayStyle::Macos);
+        let code = display_code(&self.code, true);
+        if modifiers.is_empty() {
+            code
+        } else {
+            format!("{modifiers} {code}")
+        }
     }
 }
 
@@ -913,13 +917,22 @@ mod tests {
 
         let macos = Keymap::with_display_style(KeyDisplayStyle::Macos).unwrap();
         assert_eq!(macos.key_hint("main", "previous").as_deref(), Some("↑"));
-        assert_eq!(macos.key_hint("composer", "newline").as_deref(), Some("⇧↩"));
+        assert_eq!(
+            macos.key_hint("composer", "newline").as_deref(),
+            Some("⇧ ↩")
+        );
         assert_eq!(
             macos.key_hint("composer", "paste_image").as_deref(),
-            Some("⌥V")
+            Some("⌥ V")
         );
-        assert_eq!(macos.key_hint("global", "copy").as_deref(), Some("⌘C"));
-        assert_eq!(macos.key_hint("main", "paste").as_deref(), Some("⌘V"));
+        assert_eq!(
+            KeyStroke::parse("Command+Shift+Z")
+                .unwrap()
+                .display(KeyDisplayStyle::Macos),
+            "⇧ ⌘ Z"
+        );
+        assert_eq!(macos.key_hint("global", "copy").as_deref(), Some("⌘ C"));
+        assert_eq!(macos.key_hint("main", "paste").as_deref(), Some("⌘ V"));
         assert_eq!(macos.modifier_hint("shift").as_deref(), Some("⇧"));
         assert_eq!(macos.action("composer", "cmd+z").as_deref(), Some("undo"));
     }
@@ -940,7 +953,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             keymap.key_hint("composer", "newline").as_deref(),
-            Some("⌘K")
+            Some("⌘ K")
         );
         assert_eq!(
             keymap.action("composer", "super+k").as_deref(),
