@@ -279,17 +279,16 @@ The active model determines which levels are available. Run `:effort` to open a 
 
 ## Model roles for plugins
 
-URI Agent provides the built-in roles `default`, `small`, and `large`. Each is
-a semantic route rather than a hard-coded catalog model. An explicitly
-configured role wins; an unconfigured `small` or `large` role inherits an
-explicit `default` role, and an otherwise unconfigured built-in role uses the
-currently configured default conversation model.
+URI Agent provides one built-in role, `small`, as a semantic route rather than
+a hard-coded catalog model. It starts without a model assignment: selecting the
+conversation model does not change it. Other roles are custom and exist only
+after they are explicitly added.
 
-Use `:model-roles` to inspect and assign these roles. `Ctrl+N` adds a custom
+Use `:model-roles` to inspect and assign roles. `Ctrl+N` adds a custom
 role. `Enter` first selects a runnable model and then selects one of that
 model's supported thinking levels; both choices are stored on the role.
-`Delete` removes its explicit assignment. Resetting a built-in role restores
-its fallback; removing a custom role removes it from the list.
+`Delete` removes its explicit assignment. Unassigning `small` leaves it in the
+list; removing a custom role removes it from the list.
 
 `modelRoles` stores explicit role assignments:
 
@@ -326,7 +325,7 @@ selection like this:
 {
   "pluginSettings": {
     "terminal-title": {
-      "role": "large"
+      "role": "review"
     }
   }
 }

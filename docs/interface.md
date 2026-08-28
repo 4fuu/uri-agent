@@ -97,11 +97,11 @@ clears the current session model and that provider's saved default only when no
 other credential source remains; URI Agent does not automatically switch to a
 different provider.
 
-`:model-roles` lists `default`, `small`, and `large` first, followed by custom
-roles. Fallback routes are labeled in the list. Press `Enter` to assign a
-runnable model and then its thinking effort, `Ctrl+N` to name and assign a
-custom role, or `Delete` to reset the selected built-in role or remove a custom
-role. Plugin commands can open a second generic selector that stores any
+`:model-roles` lists the built-in `small` role first, followed by custom roles.
+`small` starts unassigned and does not follow the conversation model. Press
+`Enter` to assign a runnable model and then its thinking effort, `Ctrl+N` to
+name and assign a custom role, or `Delete` to unassign `small` or remove a
+custom role. Plugin commands can open a second generic selector that stores any
 available role in that plugin's settings, separately from role-to-model
 assignments.
 

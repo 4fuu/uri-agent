@@ -130,11 +130,11 @@ manifest permission:
 
 ```rust
 #[cfg(target_family = "wasm")]
-fn select_large_role() -> Result<(), String> {
+fn select_review_role() -> Result<(), String> {
     let current = uri_agent_plugin_sdk::plugin_setting("role")
         .map_err(|error| error.to_string())?;
-    if current.as_ref().and_then(|value| value.as_str()) != Some("large") {
-        uri_agent_plugin_sdk::set_plugin_setting("role", serde_json::json!("large"))
+    if current.as_ref().and_then(|value| value.as_str()) != Some("review") {
+        uri_agent_plugin_sdk::set_plugin_setting("role", serde_json::json!("review"))
             .map_err(|error| error.to_string())?;
     }
     Ok(())

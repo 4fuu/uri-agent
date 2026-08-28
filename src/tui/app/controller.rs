@@ -519,10 +519,10 @@ pub(super) async fn apply_action(
         }
         Action::RemoveModelRole(role) => {
             match services.manager.remove_model_role(&role).await {
-                Ok(true) => app.set_flash(format!("Model role {role} reset")),
-                Ok(false) => app.set_flash(format!("Model role {role} already uses its fallback")),
+                Ok(true) => app.set_flash(format!("Model role {role} assignment removed")),
+                Ok(false) => app.set_flash(format!("Model role {role} has no assignment")),
                 Err(error) => {
-                    app.set_flash(format!("Could not reset model role {role}: {error:#}"))
+                    app.set_flash(format!("Could not remove model role {role}: {error:#}"))
                 }
             }
             open_model_roles(app, &services.manager).await;
@@ -3142,7 +3142,7 @@ pub(super) fn model_role_selector(
     selected: Option<&str>,
 ) -> SelectorState {
     let title = if matches!(&kind, SelectorKind::ModelRoles) {
-        "MODEL ROLES · Ctrl+N add · Delete reset"
+        "MODEL ROLES · Ctrl+N add · Delete remove"
     } else {
         "SELECT MODEL ROLE"
     };
@@ -3153,16 +3153,8 @@ pub(super) fn model_role_selector(
         .map(|info| {
             let description = info.error.unwrap_or_else(|| {
                 info.role.map_or_else(
-                    || "no default model selected".to_string(),
-                    |role| {
-                        format!(
-                            "{}/{} · {}{}",
-                            role.provider,
-                            role.model,
-                            role.thinking,
-                            if info.configured { "" } else { " · fallback" }
-                        )
-                    },
+                    || "no model assigned".to_string(),
+                    |role| format!("{}/{} · {}", role.provider, role.model, role.thinking,),
                 )
             });
             SelectorItem {

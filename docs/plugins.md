@@ -154,7 +154,7 @@ permission:
 let role = uri_agent_plugin_sdk::plugin_setting("role")?
     .and_then(|value| value.as_str().map(str::to_owned))
     .unwrap_or_else(|| "small".to_string());
-uri_agent_plugin_sdk::set_plugin_setting("role", serde_json::json!("large"))?;
+uri_agent_plugin_sdk::set_plugin_setting("role", serde_json::json!("review"))?;
 ```
 
 Values live under `pluginSettings` in global or project `settings.json`. A

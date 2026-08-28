@@ -4935,16 +4935,11 @@ fn environment_prompts_hide_values_and_return_to_the_manager() {
 }
 
 #[test]
-fn model_role_selector_labels_fallbacks_and_custom_role_names_open_model_selection() {
+fn model_role_selector_labels_assignments_and_custom_role_names_open_model_selection() {
     let roles = vec![
         crate::config::ModelRoleInfo {
-            name: "default".to_string(),
-            role: Some(crate::config::ModelRole {
-                provider: "example".to_string(),
-                model: "main-model".to_string(),
-                thinking: ThinkingLevel::Medium,
-            }),
-            configured: false,
+            name: "small".to_string(),
+            role: None,
             error: None,
         },
         crate::config::ModelRoleInfo {
@@ -4954,7 +4949,6 @@ fn model_role_selector_labels_fallbacks_and_custom_role_names_open_model_selecti
                 model: "small-model".to_string(),
                 thinking: ThinkingLevel::Low,
             }),
-            configured: true,
             error: None,
         },
     ];
@@ -4964,8 +4958,8 @@ fn model_role_selector_labels_fallbacks_and_custom_role_names_open_model_selecti
 
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("MODEL ROLES"));
-    assert!(rendered.contains("default"));
-    assert!(rendered.contains("example/main-model · medium · fallback"));
+    assert!(rendered.contains("small"));
+    assert!(rendered.contains("no model assigned"));
     assert!(rendered.contains("title"));
     assert!(rendered.contains("example/small-model · low"));
 

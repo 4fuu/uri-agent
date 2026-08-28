@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BUILTIN_MODEL_ROLES: [&str; 3] = ["default", "small", "large"];
+pub const BUILTIN_MODEL_ROLES: [&str; 1] = ["small"];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
@@ -52,7 +52,6 @@ pub struct ModelRole {
 pub struct ModelRoleInfo {
     pub name: String,
     pub role: Option<ModelRole>,
-    pub configured: bool,
     pub error: Option<String>,
 }
 
@@ -501,54 +500,31 @@ impl ConfigManager {
     /// does not change the active conversation model.
     pub async fn model_role(&self, name: &str) -> Result<Option<ModelRole>> {
         validate_model_role_name(name)?;
-        let (configured, fallback) = {
+        let configured = {
             let files = self.files.lock().await;
-            let configured = files
+            files
                 .project
                 .model_roles
                 .get(name)
                 .or_else(|| files.global.model_roles.get(name))
-                .cloned();
-            let fallback = (BUILTIN_MODEL_ROLES.contains(&name) && configured.is_none())
-                .then(|| {
-                    files
-                        .project
-                        .model_roles
-                        .get("default")
-                        .or_else(|| files.global.model_roles.get("default"))
-                        .cloned()
-                })
-                .flatten();
-            (configured, fallback)
+                .cloned()
         };
-        let configured = configured.or(fallback);
-        let role = if let Some(configured) = configured {
-            if configured.provider.trim().is_empty() || configured.model.trim().is_empty() {
-                bail!("model role {name:?} requires nonempty provider and model values");
-            }
-            let thinking = if let Some(thinking) = configured.thinking {
-                thinking
-            } else {
-                let files = self.files.lock().await;
-                configured_thinking(&files, &configured.provider, &configured.model).0
-            };
-            ModelRole {
-                provider: configured.provider,
-                model: configured.model,
-                thinking,
-            }
-        } else if BUILTIN_MODEL_ROLES.contains(&name) {
-            let active = self.current().await;
-            if !active.model_configured() {
-                return Ok(None);
-            }
-            ModelRole {
-                provider: active.provider,
-                model: active.model,
-                thinking: active.thinking,
-            }
-        } else {
+        let Some(configured) = configured else {
             return Ok(None);
+        };
+        if configured.provider.trim().is_empty() || configured.model.trim().is_empty() {
+            bail!("model role {name:?} requires nonempty provider and model values");
+        }
+        let thinking = if let Some(thinking) = configured.thinking {
+            thinking
+        } else {
+            let files = self.files.lock().await;
+            configured_thinking(&files, &configured.provider, &configured.model).0
+        };
+        let role = ModelRole {
+            provider: configured.provider,
+            model: configured.model,
+            thinking,
         };
         if self
             .catalog
@@ -566,16 +542,15 @@ impl ConfigManager {
     }
 
     pub async fn model_roles(&self) -> Result<Vec<ModelRoleInfo>> {
-        let (custom, configured) = {
+        let custom = {
             let files = self.files.lock().await;
             let mut custom = BTreeSet::new();
             custom.extend(files.global.model_roles.keys().cloned());
             custom.extend(files.project.model_roles.keys().cloned());
-            let configured = custom.clone();
             for builtin in BUILTIN_MODEL_ROLES {
                 custom.remove(builtin);
             }
-            (custom, configured)
+            custom
         };
         let mut names = BUILTIN_MODEL_ROLES
             .into_iter()
@@ -588,12 +563,7 @@ impl ConfigManager {
                 Ok(role) => (role, None),
                 Err(error) => (None, Some(error.to_string())),
             };
-            roles.push(ModelRoleInfo {
-                role,
-                configured: configured.contains(&name),
-                error,
-                name,
-            });
+            roles.push(ModelRoleInfo { role, error, name });
         }
         Ok(roles)
     }
@@ -2269,7 +2239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn built_in_roles_fall_back_to_default_then_the_active_model() {
+    async fn the_small_role_requires_an_independent_model_assignment() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("config");
         let project = root.path().join("project");
@@ -2283,7 +2253,7 @@ mod tests {
         .unwrap();
         fs::write(
             directory.join("settings.json"),
-            br#"{"defaultProvider":"example","defaultModel":"active-model","modelRoles":{"default":{"provider":"example","model":"role-model","thinking":"high"}}}"#,
+            br#"{"defaultProvider":"example","defaultModel":"active-model"}"#,
         )
         .await
         .unwrap();
@@ -2291,24 +2261,25 @@ mod tests {
         let manager = ConfigManager::load_for_test(&directory, &project)
             .await
             .unwrap();
-        for name in BUILTIN_MODEL_ROLES {
-            assert_eq!(
-                manager.model_role(name).await.unwrap(),
-                Some(ModelRole {
-                    provider: "example".to_string(),
-                    model: "role-model".to_string(),
-                    thinking: ThinkingLevel::High,
-                })
-            );
-        }
+        assert_eq!(manager.model_role("small").await.unwrap(), None);
+        assert_eq!(manager.model_role("default").await.unwrap(), None);
+        assert_eq!(manager.model_role("large").await.unwrap(), None);
 
-        assert!(manager.remove_model_role("default").await.unwrap());
-        for name in BUILTIN_MODEL_ROLES {
-            assert_eq!(
-                manager.model_role(name).await.unwrap().unwrap().model,
-                "active-model"
-            );
-        }
+        manager
+            .set_model_role("small", "example", "role-model", ThinkingLevel::Off)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.model_role("small").await.unwrap(),
+            Some(ModelRole {
+                provider: "example".to_string(),
+                model: "role-model".to_string(),
+                thinking: ThinkingLevel::Off,
+            })
+        );
+
+        assert!(manager.remove_model_role("small").await.unwrap());
+        assert_eq!(manager.model_role("small").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -2369,7 +2340,7 @@ mod tests {
                 .into_iter()
                 .map(|role| role.name)
                 .collect::<Vec<_>>(),
-            ["default", "small", "large", "title"]
+            ["small", "title"]
         );
         manager
             .set_plugin_setting("terminal-title", "role", Value::String("title".to_string()))

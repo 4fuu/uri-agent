@@ -214,7 +214,7 @@ fn core_commands() -> Vec<CommandSpec> {
         CommandSpec::new(
             "model-roles",
             "Model roles",
-            "assign models to default, small, large, and custom plugin roles",
+            "assign models to the small and custom plugin roles",
             ["roles"],
             CommandTarget::Core(ModelRoles),
         ),
