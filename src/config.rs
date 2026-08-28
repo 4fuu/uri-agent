@@ -2718,6 +2718,66 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(windows)]
+    fn windows_config_tests_require_pwsh() -> bool {
+        std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn config_command_timeout_terminates_windows_processes_before_returning() {
+        if !windows_config_tests_require_pwsh() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("leaked");
+        let command = format!(
+            "Start-Sleep -Seconds 3; Set-Content -Path '{}' -Value leaked",
+            marker.display()
+        );
+
+        let output = execute_config_command(&command, Duration::from_millis(200))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        assert!(output.is_none());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn successful_config_command_terminates_lingering_windows_descendants() {
+        if !windows_config_tests_require_pwsh() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("leaked");
+        let leak_script = BASE64.encode(format!(
+            "Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked",
+            marker.display()
+        ));
+        let command = format!(
+            "[Console]::Out.Write('secret'); Start-Process -WindowStyle Hidden pwsh -ArgumentList '-NoProfile', '-EncodedCommand', '{leak_script}' | Out-Null"
+        );
+
+        let output = execute_config_command(&command, Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"secret");
+        assert!(!marker.exists());
+    }
+
     #[test]
     fn macos_default_config_directory_uses_home_config() {
         let home = PathBuf::from("/Users/ada");

@@ -1303,6 +1303,40 @@ mod tests {
         assert!(!leaked_path.exists());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_completion_terminates_quiet_windows_descendants_after_parent_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let leaked_path = directory.path().join("leaked");
+        let Some(executable) = find_executable("pwsh") else {
+            return;
+        };
+        let started = Instant::now();
+        let leak_script = BASE64.encode(format!(
+            "Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value leaked",
+            leaked_path.display()
+        ));
+        let command = format!(
+            "Write-Output finished; Start-Process -WindowStyle Hidden pwsh -ArgumentList '-NoProfile', '-EncodedCommand', '{leak_script}' | Out-Null"
+        );
+        let output = execute(
+            "pwsh",
+            &executable,
+            directory.path(),
+            &command,
+            &BTreeMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        time::sleep(Duration::from_secs(4)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(String::from_utf8(output).unwrap().contains("finished"));
+        assert!(!leaked_path.exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_completion_keeps_tail_output_active_after_parent_exit() {
