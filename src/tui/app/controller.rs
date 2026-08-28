@@ -4495,6 +4495,7 @@ pub(super) async fn finish_background(
                 app.busy = false;
                 app.busy_since = None;
                 app.activity = None;
+                app.clear_transient_blocks();
                 app.restore_to_draft(&prompt);
                 app.set_flash(format!("Cannot start turn: {error:#}"));
             }

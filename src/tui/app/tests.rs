@@ -2140,6 +2140,38 @@ fn composer_enter_sends_shift_enter_breaks_and_esc_keeps_draft() {
 }
 
 #[test]
+fn first_submission_replaces_the_welcome_with_a_provisional_user_message() {
+    let mut app = test_app();
+    app.skip_splash();
+    app.overlay = Some(Overlay::Composer);
+    app.input.insert_str("first request");
+
+    let (prompt, images) = app.submit().unwrap();
+
+    assert_eq!(prompt, "first request");
+    assert!(images.is_empty());
+    assert_eq!(app.blocks.len(), 1);
+    assert_eq!(app.blocks[0].kind, BlockKind::User);
+    assert_eq!(app.blocks[0].text, "first request");
+    assert!(app.blocks[0].transient);
+    let rendered = render_to_string(&mut app, 80, 24);
+    assert!(rendered.contains("first request"));
+    assert!(!rendered.contains("Space compose · : commands · ? help"));
+
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "first request".into(),
+        },
+    );
+    assert_eq!(app.blocks.len(), 1);
+    assert_eq!(app.blocks[0].kind, BlockKind::User);
+    assert_eq!(app.blocks[0].text, "first request");
+    assert!(!app.blocks[0].transient);
+}
+
+#[test]
 fn composer_applies_generic_completion_ranges_and_rejects_stale_results() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);
@@ -6130,6 +6162,22 @@ fn double_escape_gesture_requires_two_press_events_during_a_running_turn() {
     assert!(!app.interrupt_on_double_press(escape, "esc"));
     app.last_interrupt_press = Some(("esc".to_string(), Instant::now() - DOUBLE_CLICK_INTERVAL));
     assert!(!app.interrupt_on_double_press(escape, "esc"));
+}
+
+#[test]
+fn escape_consumed_by_a_float_does_not_prime_turn_interruption() {
+    let mut app = test_app();
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    app.busy = true;
+    app.overlay = Some(Overlay::Composer);
+
+    assert!(!app.interrupt_on_double_press(escape, "esc"));
+    assert!(app.last_interrupt_press.is_none());
+
+    app.overlay = None;
+    assert!(!app.interrupt_on_double_press(escape, "esc"));
+    assert!(app.last_interrupt_press.is_some());
+    assert!(app.interrupt_on_double_press(escape, "esc"));
 }
 
 #[test]

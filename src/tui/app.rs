@@ -1010,6 +1010,7 @@ impl App {
             return false;
         }
         if !self.busy
+            || self.overlay.is_some()
             || matches!(self.activity, Some(Activity::Compacting))
             || self.keymap.action("global", key_name).as_deref()
                 != Some("interrupt_on_double_press")
@@ -1039,7 +1040,8 @@ impl App {
         if !self.applying_transient
             && matches!(
                 &event.kind,
-                EventKind::AssistantText { .. }
+                EventKind::User { .. }
+                    | EventKind::AssistantText { .. }
                     | EventKind::AssistantReasoning { .. }
                     | EventKind::ToolCall { .. }
                     | EventKind::ModelMessage { .. }
@@ -1638,6 +1640,9 @@ impl App {
         self.busy_since = Some(Instant::now());
         self.activity = Some(Activity::Thinking);
         self.overlay = None;
+        if self.blocks.is_empty() {
+            self.apply_transient(EventKind::User { text: text.clone() });
+        }
         Some((text, images))
     }
 
