@@ -838,6 +838,7 @@ impl App {
         self.mouse_scroll_animating()
             || (!self.animations_paused()
                 && (self.showing_splash()
+                    || self.blocks.is_empty()
                     || self.busy
                     || self.marquee.is_some()
                     || (self.catalog_refreshing && self.overlay == Some(Overlay::Models))))

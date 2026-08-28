@@ -61,9 +61,20 @@ fn test_app() -> App {
 }
 
 #[test]
-fn continuous_render_demand_stops_when_the_ui_is_idle() {
+fn continuous_render_demand_keeps_the_welcome_wordmark_live_but_stops_when_idle() {
     let mut app = test_app();
     app.skip_splash();
+    assert!(app.blocks.is_empty());
+    assert!(app.continuous_render_demand());
+
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "settled".to_string(),
+        None,
+        false,
+        true,
+    );
     assert!(!app.continuous_render_demand());
 
     app.busy = true;
