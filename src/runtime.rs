@@ -4365,6 +4365,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_model_request_is_identical_after_checkpointed_reopen() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend_before = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("unused")],
+                Some(fake_usage()),
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let (runtime_before, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend_before.clone(),
+            ModelLimits::default(),
+        )
+        .await;
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: "question".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("question"),
+                },
+                EventKind::Usage {
+                    input: 20,
+                    output: 5,
+                    reasoning: 1,
+                    cache_read: 2,
+                    cache_write: 0,
+                    cost: 0.0,
+                    total: 27,
+                    context: true,
+                    provider: "fake".into(),
+                    model: "fake-model".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("answer"),
+                },
+            ])
+            .await
+            .unwrap();
+        session
+            .append_compaction(
+                "summary".into(),
+                27,
+                vec![Message::user("summary"), Message::assistant("answer")],
+                false,
+            )
+            .await
+            .unwrap();
+        session
+            .append(EventKind::ModelMessage {
+                message: Message::user("tail"),
+            })
+            .await
+            .unwrap();
+
+        let (_cancel_tx, mut cancel) = watch::channel(None);
+        runtime_before
+            .complete_once(backend_before.as_ref(), &mut cancel)
+            .await
+            .unwrap();
+        let request_before = backend_before.requests.lock().await[0].clone();
+        let session_id = session.id().to_string();
+        drop(runtime_before);
+        drop(session);
+
+        let reopened = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "different-default",
+            "different-model",
+            SessionContext {
+                system_prompt: "changed system".into(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let backend_after = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("unused")],
+                Some(fake_usage()),
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let frozen_system = reopened.context().await.system_prompt;
+        let runtime_after = AgentRuntime::new(
+            Some(backend_after.clone()),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
+            reopened,
+            frozen_system,
+            ModelLimits::default(),
+        );
+        let (_cancel_tx, mut cancel) = watch::channel(None);
+        runtime_after
+            .complete_once(backend_after.as_ref(), &mut cancel)
+            .await
+            .unwrap();
+        let request_after = backend_after.requests.lock().await[0].clone();
+
+        assert_eq!(request_after.system, request_before.system);
+        assert_eq!(request_after.history, request_before.history);
+        assert_eq!(
+            serde_json::to_value(&request_after.tools).unwrap(),
+            serde_json::to_value(&request_before.tools).unwrap()
+        );
+        assert_eq!(
+            request_after.estimated_context,
+            request_before.estimated_context
+        );
+        assert_eq!(
+            request_after.max_output_tokens,
+            request_before.max_output_tokens
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
     async fn detached_turn_survives_its_conversation_surface_switching_away() {
         let workspace = tempfile::tempdir().unwrap();
         let backend = Arc::new(BlockingBackend {

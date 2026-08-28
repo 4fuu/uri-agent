@@ -303,7 +303,7 @@ pub(super) fn format_token_rate(rate: f64) -> String {
     }
 }
 
-fn visible_units(text: &str) -> usize {
+pub(crate) fn visible_units(text: &str) -> usize {
     count_visible_units(text, false).0
 }
 

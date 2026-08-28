@@ -5,4 +5,5 @@
 
 mod app;
 
+pub(crate) use app::rate::visible_units;
 pub use app::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};

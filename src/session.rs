@@ -6,18 +6,35 @@ use chrono::{DateTime, Utc};
 use rig::message::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
     Connection,
-    rusqlite::{OpenFlags, OptionalExtension, params},
+    rusqlite::{Connection as SqliteConnection, OpenFlags, OptionalExtension, params},
 };
 use uuid::Uuid;
 
 const SESSION_DATABASE_FILE: &str = "sessions-v2.db";
+const RESUME_INDEX_VERSION: u32 = 1;
+const MAX_EVENT_PAGE: usize = 512;
+const RESUME_EVENT_KINDS: &[&str] = &[
+    "session_created",
+    "model_settings_changed",
+    "user",
+    "assistant_text",
+    "assistant_reasoning",
+    "tool_call",
+    "tool_result",
+    "model_message",
+    "task",
+    "model_retry",
+    "usage",
+    "error",
+    "compaction",
+];
 
 #[derive(Clone, Debug)]
 pub enum SessionChoice {
@@ -250,14 +267,14 @@ impl SessionArchive {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct SessionModelSettings {
     pub provider: String,
     pub model: String,
     pub thinking: ThinkingLevel,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SessionEvent {
     pub sequence: u64,
     pub at: DateTime<Utc>,
@@ -265,7 +282,7 @@ pub struct SessionEvent {
     pub kind: EventKind,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SessionContext {
     pub system_prompt: String,
     pub skills: Vec<SkillSnapshot>,
@@ -277,7 +294,7 @@ pub enum SessionUpdate {
     Transient(EventKind),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
     SessionCreated {
@@ -376,7 +393,276 @@ pub enum EventKind {
 struct State {
     events: Vec<SessionEvent>,
     persisted: bool,
+    head_sequence: Option<u64>,
     model_settings: SessionModelSettings,
+    context: Option<SessionContext>,
+    derived: ResumeState,
+    replay: ReplayState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+struct ResumeState {
+    through_sequence: Option<u64>,
+    context_sequence: Option<u64>,
+    model_settings: Option<SessionModelSettings>,
+    has_user: bool,
+    successful_help_reads: HashSet<String>,
+    pending_help_reads: HashMap<String, String>,
+    tasks: HashMap<String, TaskPointers>,
+    usage: UsageTotals,
+    token_calibration: TokenCalibration,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+struct TaskPointers {
+    first_sequence: u64,
+    latest_sequence: u64,
+    output_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+struct UsageTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
+    last_cache_hit: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+struct TokenCalibration {
+    visible_units: u64,
+    output_tokens: u64,
+    pending_visible_units: u64,
+    pending_reasoning_visible: bool,
+    pending_usage: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplayState {
+    history: Vec<Message>,
+    usage_before_assistant: Vec<Option<UsageBaseline>>,
+    pending_usage: Option<UsageBaseline>,
+    after_compaction: bool,
+    latest_compaction_summary: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct UsageBaseline {
+    total: usize,
+    context: bool,
+    provider: String,
+    model: String,
+}
+
+struct RestoredState {
+    context: Option<SessionContext>,
+    derived: ResumeState,
+    replay: ReplayState,
+    tail: Vec<SessionEvent>,
+}
+
+enum EventPage {
+    All,
+    After(u64, usize),
+    Before(u64, usize),
+    Tail(usize),
+}
+
+fn restore_persisted_state(
+    db: &mut SqliteConnection,
+    id: &str,
+    authoritative_head: u64,
+) -> tokio_rusqlite::rusqlite::Result<RestoredState> {
+    let context_event = db
+        .query_row(
+            "SELECT sequence, payload_json FROM events
+             WHERE session_id = ?1 AND kind = 'session_context'
+             ORDER BY sequence LIMIT 1",
+            [id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let context_sequence = context_event
+        .as_ref()
+        .and_then(|(sequence, _)| u64::try_from(*sequence).ok());
+    let context = context_event
+        .and_then(|(_, payload)| serde_json::from_str::<EventKind>(&payload).ok())
+        .and_then(|kind| match kind {
+            EventKind::SessionContext { context } => Some(context),
+            _ => None,
+        });
+    let has_creation = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events
+         WHERE session_id = ?1 AND kind = 'session_created')",
+        [id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_creation {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+
+    let latest_compaction = db
+        .query_row(
+            "SELECT sequence, at, payload_json FROM events
+             WHERE session_id = ?1 AND kind = 'compaction'
+             ORDER BY sequence DESC LIMIT 1",
+            [id],
+            stored_event_from_row,
+        )
+        .optional()?;
+    let checkpoint = db
+        .query_row(
+            "SELECT version, through_sequence, payload_json
+             FROM session_resume_index WHERE session_id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .and_then(|(version, through, payload)| {
+            let through = u64::try_from(through).ok()?;
+            if version != i64::from(RESUME_INDEX_VERSION) || through > authoritative_head {
+                return None;
+            }
+            let mut state = serde_json::from_str::<ResumeState>(&payload).ok()?;
+            if state.through_sequence != Some(through) {
+                return None;
+            }
+            let is_compaction = db
+                .query_row(
+                    "SELECT kind = 'compaction' FROM events
+                     WHERE session_id = ?1 AND sequence = ?2",
+                    params![id, through as i64],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            is_compaction.then_some((through, std::mem::take(&mut state)))
+        });
+
+    let (mut derived, cursor) = if let Some((through, state)) = checkpoint {
+        (state, Some(through))
+    } else if let Some(compaction) = &latest_compaction {
+        let mut state = ResumeState::default();
+        for event in query_events(
+            db,
+            id,
+            None,
+            Some(compaction.sequence),
+            Some(RESUME_EVENT_KINDS),
+        )? {
+            apply_resume_event(&mut state, &event);
+        }
+        state.context_sequence = context_sequence;
+        if let Ok(payload) = serde_json::to_string(&state) {
+            let _ = db.execute(
+                "INSERT INTO session_resume_index
+                 (session_id, version, through_sequence, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   version = excluded.version,
+                   through_sequence = excluded.through_sequence,
+                   payload_json = excluded.payload_json",
+                params![
+                    id,
+                    i64::from(RESUME_INDEX_VERSION),
+                    compaction.sequence as i64,
+                    payload
+                ],
+            );
+        }
+        (state, Some(compaction.sequence))
+    } else {
+        (ResumeState::default(), None)
+    };
+
+    let tail = query_events(db, id, cursor, None, Some(RESUME_EVENT_KINDS))?;
+    for event in &tail {
+        apply_resume_event(&mut derived, event);
+    }
+    derived.context_sequence = derived.context_sequence.or(context_sequence);
+    derived.through_sequence = Some(authoritative_head);
+
+    let mut replay = ReplayState::default();
+    let replay_cursor = latest_compaction.as_ref().map(|event| event.sequence);
+    if let Some(compaction) = latest_compaction {
+        apply_replay_event(&mut replay, &compaction.kind);
+    }
+    for event in query_events(
+        db,
+        id,
+        replay_cursor,
+        None,
+        Some(&["usage", "model_message"]),
+    )? {
+        apply_replay_event(&mut replay, &event.kind);
+    }
+
+    Ok(RestoredState {
+        context,
+        derived,
+        replay,
+        tail,
+    })
+}
+
+fn query_events(
+    db: &SqliteConnection,
+    id: &str,
+    after: Option<u64>,
+    through: Option<u64>,
+    kinds: Option<&[&str]>,
+) -> tokio_rusqlite::rusqlite::Result<Vec<SessionEvent>> {
+    let after = after.map_or(-1, |sequence| sequence as i64);
+    let through = through.map_or(i64::MAX, |sequence| sequence as i64);
+    let mut statement = db.prepare(
+        "SELECT sequence, at, payload_json FROM events
+         WHERE session_id = ?1 AND sequence > ?2 AND sequence <= ?3
+           AND (?4 = '' OR instr(',' || ?4 || ',', ',' || kind || ',') > 0)
+         ORDER BY sequence",
+    )?;
+    let kinds = kinds.map_or_else(String::new, |kinds| kinds.join(","));
+    statement
+        .query_map(params![id, after, through, kinds], stored_event_from_row)?
+        .collect()
+}
+
+fn stored_event_from_row(
+    row: &tokio_rusqlite::rusqlite::Row<'_>,
+) -> tokio_rusqlite::rusqlite::Result<SessionEvent> {
+    let sequence = row.get::<_, i64>(0)?;
+    let at = row.get::<_, String>(1)?;
+    let payload = row.get::<_, String>(2)?;
+    let at = DateTime::parse_from_rfc3339(&at)
+        .map_err(|error| {
+            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                1,
+                tokio_rusqlite::rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?
+        .with_timezone(&Utc);
+    let kind = serde_json::from_str(&payload).map_err(|error| {
+        tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+            2,
+            tokio_rusqlite::rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    Ok(SessionEvent {
+        sequence: sequence as u64,
+        at,
+        kind,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -522,65 +808,42 @@ impl Session {
 
         let project_for_lookup = project.clone();
         let id_for_lookup = id.clone();
-        let belongs_to_project = connection
+        let stored_session = connection
             .call(move |db| {
                 db.query_row(
-                    "SELECT cwd = ?2 FROM sessions WHERE id = ?1",
+                    "SELECT cwd = ?2, head_sequence,
+                       EXISTS(SELECT 1 FROM events
+                         WHERE events.session_id = sessions.id AND kind = 'session_created')
+                     FROM sessions WHERE id = ?1",
                     params![id_for_lookup, project_for_lookup],
-                    |row| row.get::<_, bool>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, bool>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
                 )
                 .optional()
             })
             .await
             .context("cannot validate session project")?;
-        if belongs_to_project == Some(false) {
+        if stored_session.as_ref().is_some_and(|stored| !stored.0) {
             return Err(anyhow!("session {id} belongs to a different project"));
         }
+        if stored_session.as_ref().is_some_and(|stored| !stored.2) {
+            return Err(anyhow!(
+                "session {id} has no creation event and cannot be resumed"
+            ));
+        }
+        let created_session = stored_session.is_none();
+        let mut existing = Vec::new();
+        let mut derived = ResumeState::default();
+        let mut replay = ReplayState::default();
+        let mut frozen_context = None;
+        let mut head_sequence = None;
+        let mut restored_settings = None;
 
-        let lookup_id = id.clone();
-        let existing = connection
-            .call(move |db| {
-                let mut statement = db.prepare(
-                    "SELECT sequence, at, payload_json FROM events
-                 WHERE session_id = ?1 ORDER BY sequence",
-                )?;
-                let rows = statement.query_map([lookup_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                let mut events = Vec::new();
-                for row in rows {
-                    let (sequence, at, payload): (i64, String, String) = row?;
-                    events.push(SessionEvent {
-                        sequence: sequence as u64,
-                        at: DateTime::parse_from_rfc3339(&at)
-                            .map_err(|e| {
-                                tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                    2,
-                                    tokio_rusqlite::rusqlite::types::Type::Text,
-                                    Box::new(e),
-                                )
-                            })?
-                            .with_timezone(&Utc),
-                        kind: serde_json::from_str(&payload).map_err(|e| {
-                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                tokio_rusqlite::rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })?,
-                    });
-                }
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(events)
-            })
-            .await
-            .context("cannot restore session events")?;
-
-        let mut existing = existing;
-        let created_session = existing.is_empty();
         if created_session {
             let at = Utc::now();
             let created = EventKind::SessionCreated {
@@ -601,18 +864,37 @@ impl Session {
                     kind: EventKind::SessionContext { context },
                 });
             }
+            for event in &existing {
+                apply_resume_event(&mut derived, event);
+                apply_replay_event(&mut replay, &event.kind);
+                if let EventKind::SessionContext { context } = &event.kind {
+                    frozen_context = Some(context.clone());
+                }
+            }
+            restored_settings = model_settings_from_events(&existing);
+            head_sequence = existing.last().map(|event| event.sequence);
+        } else if let Some((_, stored_head, _)) = stored_session {
+            let authoritative_head = u64::try_from(stored_head)
+                .map_err(|_| anyhow!("session {id} has an invalid event head"))?;
+            head_sequence = Some(authoritative_head);
+            let lookup_id = id.clone();
+            let restored = connection
+                .call(move |db| restore_persisted_state(db, &lookup_id, authoritative_head))
+                .await
+                .context("cannot restore session state")?;
+            frozen_context = restored.context;
+            restored_settings = restored.derived.model_settings.clone();
+            derived = restored.derived;
+            replay = restored.replay;
+            existing = restored.tail;
         }
-        if !created_session
-            && !existing
-                .iter()
-                .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
-        {
+        let model_settings = restored_settings
+            .ok_or_else(|| anyhow!("session {id} has no creation event and cannot be resumed"))?;
+        if !created_session && frozen_context.is_none() {
             return Err(anyhow!(
                 "session {id} has no frozen context and cannot be resumed"
             ));
         }
-        let model_settings = model_settings_from_events(&existing)
-            .ok_or_else(|| anyhow!("session {id} has no creation event and cannot be resumed"))?;
         let (events, _) = broadcast::channel(512);
         let session = Self {
             id,
@@ -625,7 +907,11 @@ impl Session {
             state: Arc::new(Mutex::new(State {
                 events: existing,
                 persisted: !created_session,
+                head_sequence,
                 model_settings,
+                context: frozen_context,
+                derived,
+                replay,
             })),
             events,
         };
@@ -641,11 +927,7 @@ impl Session {
 
     pub async fn initialize_context(&self, context: SessionContext) -> Result<()> {
         let mut state = self.state.lock().await;
-        if state
-            .events
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
-        {
+        if state.context.is_some() {
             return Ok(());
         }
         if state.persisted {
@@ -653,12 +935,17 @@ impl Session {
         }
         let event = SessionEvent {
             sequence: state
-                .events
-                .last()
-                .map_or(0, |event| event.sequence.saturating_add(1)),
+                .head_sequence
+                .map_or(0, |sequence| sequence.saturating_add(1)),
             at: Utc::now(),
             kind: EventKind::SessionContext { context },
         };
+        if let EventKind::SessionContext { context } = &event.kind {
+            state.context = Some(context.clone());
+        }
+        state.head_sequence = Some(event.sequence);
+        apply_resume_event(&mut state.derived, &event);
+        apply_replay_event(&mut state.replay, &event.kind);
         state.events.push(event.clone());
         drop(state);
         self.publish_persisted(&[event]);
@@ -740,11 +1027,55 @@ impl Session {
     }
 
     pub async fn snapshot(&self) -> Vec<SessionEvent> {
-        self.state.lock().await.events.clone()
+        let state = self.state.lock().await;
+        if !state.persisted {
+            return state.events.clone();
+        }
+        drop(state);
+        self.query_event_page(EventPage::All)
+            .await
+            .expect("persisted session snapshot must remain readable")
     }
 
     pub async fn task_reports(&self) -> Vec<TaskReport> {
-        task_reports_from_events(&self.state.lock().await.events)
+        let (persisted, pointers, in_memory) = {
+            let state = self.state.lock().await;
+            (
+                state.persisted,
+                state.derived.tasks.values().cloned().collect::<Vec<_>>(),
+                state.events.clone(),
+            )
+        };
+        if !persisted {
+            return task_reports_from_events(&in_memory);
+        }
+        let id = self.id.clone();
+        self.connection
+            .call(move |db| {
+                let mut sequences = HashSet::new();
+                for pointers in pointers {
+                    sequences.insert(pointers.first_sequence);
+                    sequences.insert(pointers.latest_sequence);
+                    sequences.extend(pointers.output_sequence);
+                }
+                let mut events = Vec::with_capacity(sequences.len());
+                let mut statement = db.prepare(
+                    "SELECT sequence, at, payload_json FROM events
+                     WHERE session_id = ?1 AND sequence = ?2 AND kind = 'task'",
+                )?;
+                for sequence in sequences {
+                    if let Some(event) = statement
+                        .query_row(params![id, sequence as i64], stored_event_from_row)
+                        .optional()?
+                    {
+                        events.push(event);
+                    }
+                }
+                events.sort_by_key(|event| event.sequence);
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(task_reports_from_events(&events))
+            })
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn model_settings(&self) -> SessionModelSettings {
@@ -755,13 +1086,43 @@ impl Session {
         self.state
             .lock()
             .await
-            .events
-            .iter()
-            .find_map(|event| match &event.kind {
-                EventKind::SessionContext { context } => Some(context.clone()),
-                _ => None,
-            })
+            .context
+            .clone()
             .expect("session context is validated when the session opens")
+    }
+
+    pub async fn has_user_message(&self) -> bool {
+        self.state.lock().await.derived.has_user
+    }
+
+    pub async fn successful_protocol_help_reads(&self) -> HashSet<String> {
+        self.state
+            .lock()
+            .await
+            .derived
+            .successful_help_reads
+            .clone()
+    }
+
+    pub async fn events_after(&self, sequence: u64, limit: usize) -> Result<Vec<SessionEvent>> {
+        if sequence > i64::MAX as u64 {
+            return Ok(Vec::new());
+        }
+        self.query_event_page(EventPage::After(sequence, limit.min(MAX_EVENT_PAGE)))
+            .await
+    }
+
+    pub async fn events_before(&self, sequence: u64, limit: usize) -> Result<Vec<SessionEvent>> {
+        if sequence > i64::MAX as u64 {
+            return self.tail_events(limit).await;
+        }
+        self.query_event_page(EventPage::Before(sequence, limit.min(MAX_EVENT_PAGE)))
+            .await
+    }
+
+    pub async fn tail_events(&self, limit: usize) -> Result<Vec<SessionEvent>> {
+        self.query_event_page(EventPage::Tail(limit.min(MAX_EVENT_PAGE)))
+            .await
     }
 
     pub async fn model_history(&self) -> Vec<Message> {
@@ -770,57 +1131,26 @@ impl Session {
 
     pub(crate) async fn model_context(&self, provider: &str, model: &str) -> ModelContext {
         let state = self.state.lock().await;
-        let latest_compaction = state
-            .events
+        let latest_api_usage = state
+            .replay
+            .usage_before_assistant
             .iter()
-            .rposition(|event| matches!(event.kind, EventKind::Compaction { .. }));
-        let mut history = latest_compaction
-            .and_then(|index| match &state.events[index].kind {
-                EventKind::Compaction {
-                    replacement_history,
-                    ..
-                } => Some(replacement_history.clone()),
-                _ => None,
+            .enumerate()
+            .filter_map(|(index, usage)| {
+                let usage = usage.as_ref()?;
+                (usage.context
+                    && usage.total > 0
+                    && (provider.is_empty()
+                        || usage.provider.is_empty()
+                        || usage.provider == provider)
+                    && (model.is_empty() || usage.model.is_empty() || usage.model == model))
+                    .then_some((index, usage.total))
             })
-            .unwrap_or_default();
-        let mut latest_api_usage = None;
-        let mut pending_usage = None;
-        for event in state
-            .events
-            .iter()
-            .skip(latest_compaction.map_or(0, |index| index + 1))
-        {
-            match &event.kind {
-                EventKind::Usage {
-                    total,
-                    context,
-                    provider: usage_provider,
-                    model: usage_model,
-                    ..
-                } => {
-                    pending_usage = (*context
-                        && *total > 0
-                        && (provider.is_empty()
-                            || usage_provider.is_empty()
-                            || usage_provider == provider)
-                        && (model.is_empty() || usage_model.is_empty() || usage_model == model))
-                        .then_some(*total as usize);
-                }
-                EventKind::ModelMessage { message } => {
-                    history.push(message.clone());
-                    if matches!(message, Message::Assistant { .. })
-                        && let Some(tokens) = pending_usage.take()
-                    {
-                        latest_api_usage = Some((history.len() - 1, tokens));
-                    }
-                }
-                _ => {}
-            }
-        }
+            .next_back();
         ModelContext {
-            history,
+            history: state.replay.history.clone(),
             latest_api_usage,
-            after_compaction: latest_compaction.is_some(),
+            after_compaction: state.replay.after_compaction,
         }
     }
 
@@ -828,13 +1158,9 @@ impl Session {
         self.state
             .lock()
             .await
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| match &event.kind {
-                EventKind::Compaction { summary, .. } => Some(summary.clone()),
-                _ => None,
-            })
+            .replay
+            .latest_compaction_summary
+            .clone()
     }
 
     pub async fn append_compaction(
@@ -902,9 +1228,8 @@ impl Session {
         let at = Utc::now();
         let at_text = at.to_rfc3339();
         let first_sequence = state
-            .events
-            .last()
-            .map_or(0, |event| event.sequence.saturating_add(1));
+            .head_sequence
+            .map_or(0, |sequence| sequence.saturating_add(1));
         let events = kinds
             .into_iter()
             .enumerate()
@@ -914,12 +1239,7 @@ impl Session {
                 kind,
             })
             .collect::<Vec<_>>();
-        if events.iter().any(|event| starts_session(&event.kind))
-            && !state
-                .events
-                .iter()
-                .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
-        {
+        if events.iter().any(|event| starts_session(&event.kind)) && state.context.is_none() {
             bail!("cannot start a session before its startup context is ready");
         }
         let mut next_settings = state.model_settings.clone();
@@ -927,8 +1247,8 @@ impl Session {
 
         if !state.persisted {
             if !events.iter().any(|event| starts_session(&event.kind)) {
-                state.events.extend(events.iter().cloned());
                 state.model_settings = next_settings;
+                apply_committed_events(&mut state, &events, false);
                 drop(state);
                 self.publish_persisted(&events);
                 return Ok(events);
@@ -994,9 +1314,12 @@ impl Session {
                 .await
                 .context("cannot create session")?;
             state.persisted = true;
-            state.events.extend(events.iter().cloned());
             state.model_settings = next_settings;
+            let checkpoint = apply_committed_events(&mut state, &events, true);
             drop(state);
+            if let Some((through, payload)) = checkpoint {
+                self.persist_resume_index(through, payload).await;
+            }
             self.publish_persisted(&events);
             return Ok(events);
         }
@@ -1015,10 +1338,7 @@ impl Session {
         let provider = next_settings.provider.clone();
         let model = next_settings.model.clone();
         let thinking = next_settings.thinking.to_string();
-        let expected_head = state
-            .events
-            .last()
-            .map_or(-1, |event| event.sequence as i64);
+        let expected_head = state.head_sequence.map_or(-1, |sequence| sequence as i64);
         let head_sequence = events
             .last()
             .expect("nonempty batch has a final event")
@@ -1053,9 +1373,12 @@ impl Session {
             })
             .await
             .context("cannot append session event batch")?;
-        state.events.extend(events.iter().cloned());
         state.model_settings = next_settings;
+        let checkpoint = apply_committed_events(&mut state, &events, true);
         drop(state);
+        if let Some((through, payload)) = checkpoint {
+            self.persist_resume_index(through, payload).await;
+        }
         self.publish_persisted(&events);
         Ok(events)
     }
@@ -1064,6 +1387,105 @@ impl Session {
         for event in events {
             let _ = self.events.send(SessionUpdate::Persisted(event.clone()));
         }
+    }
+
+    async fn persist_resume_index(&self, through: u64, payload: String) {
+        let id = self.id.clone();
+        let _ = self
+            .connection
+            .call(move |db| {
+                db.execute(
+                    "INSERT INTO session_resume_index
+                     (session_id, version, through_sequence, payload_json)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       version = excluded.version,
+                       through_sequence = excluded.through_sequence,
+                       payload_json = excluded.payload_json",
+                    params![id, i64::from(RESUME_INDEX_VERSION), through as i64, payload],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await;
+    }
+
+    async fn query_event_page(&self, page: EventPage) -> Result<Vec<SessionEvent>> {
+        let state = self.state.lock().await;
+        if !state.persisted {
+            let events = match page {
+                EventPage::All => state.events.clone(),
+                EventPage::After(sequence, limit) => state
+                    .events
+                    .iter()
+                    .filter(|event| event.sequence > sequence)
+                    .take(limit)
+                    .cloned()
+                    .collect(),
+                EventPage::Before(sequence, limit) => {
+                    let mut events = state
+                        .events
+                        .iter()
+                        .rev()
+                        .filter(|event| event.sequence < sequence)
+                        .take(limit)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    events.reverse();
+                    events
+                }
+                EventPage::Tail(limit) => {
+                    let start = state.events.len().saturating_sub(limit);
+                    state.events[start..].to_vec()
+                }
+            };
+            return Ok(events);
+        }
+        drop(state);
+
+        let id = self.id.clone();
+        self.connection
+            .call(move |db| {
+                let (sql, cursor, limit) = match page {
+                    EventPage::All => (
+                        "SELECT sequence, at, payload_json FROM events
+                         WHERE session_id = ?1 ORDER BY sequence",
+                        0_i64,
+                        i64::MAX,
+                    ),
+                    EventPage::After(sequence, limit) => (
+                        "SELECT sequence, at, payload_json FROM events
+                         WHERE session_id = ?1 AND sequence > ?2
+                         ORDER BY sequence LIMIT ?3",
+                        sequence as i64,
+                        limit as i64,
+                    ),
+                    EventPage::Before(sequence, limit) => (
+                        "SELECT sequence, at, payload_json FROM (
+                           SELECT sequence, at, payload_json FROM events
+                           WHERE session_id = ?1 AND sequence < ?2
+                           ORDER BY sequence DESC LIMIT ?3
+                         ) ORDER BY sequence",
+                        sequence as i64,
+                        limit as i64,
+                    ),
+                    EventPage::Tail(limit) => (
+                        "SELECT sequence, at, payload_json FROM (
+                           SELECT sequence, at, payload_json FROM events
+                           WHERE session_id = ?1 ORDER BY sequence DESC LIMIT ?3
+                         ) ORDER BY sequence",
+                        0_i64,
+                        limit as i64,
+                    ),
+                };
+                let mut statement = db.prepare(sql)?;
+                let rows = match page {
+                    EventPage::All => statement.query_map([&id], stored_event_from_row)?,
+                    _ => statement.query_map(params![id, cursor, limit], stored_event_from_row)?,
+                };
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .context("cannot read session event page")
     }
 }
 
@@ -1206,6 +1628,15 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                    PRIMARY KEY(session_id, sequence),
                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                  );
+                 CREATE INDEX IF NOT EXISTS events_session_kind_sequence
+                   ON events(session_id, kind, sequence);
+                 CREATE TABLE IF NOT EXISTS session_resume_index (
+                   session_id TEXT PRIMARY KEY,
+                   version INTEGER NOT NULL,
+                   through_sequence INTEGER NOT NULL,
+                   payload_json TEXT NOT NULL,
+                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                 );
                  CREATE TABLE IF NOT EXISTS pending_drafts (
                    cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
                  );",
@@ -1241,6 +1672,206 @@ fn payload_kind(kind: &EventKind) -> &'static str {
 
 fn starts_session(kind: &EventKind) -> bool {
     matches!(kind, EventKind::User { .. })
+}
+
+fn apply_committed_events(
+    state: &mut State,
+    events: &[SessionEvent],
+    compact_memory: bool,
+) -> Option<(u64, String)> {
+    let mut checkpoint = None;
+    for event in events {
+        apply_resume_event(&mut state.derived, event);
+        apply_replay_event(&mut state.replay, &event.kind);
+        if let EventKind::SessionContext { context } = &event.kind {
+            state.context = Some(context.clone());
+        }
+        state.head_sequence = Some(event.sequence);
+        state.events.push(event.clone());
+        if matches!(event.kind, EventKind::Compaction { .. }) {
+            checkpoint = serde_json::to_string(&state.derived)
+                .ok()
+                .map(|payload| (event.sequence, payload));
+            if compact_memory {
+                state.events.clear();
+            }
+        }
+    }
+    checkpoint
+}
+
+fn apply_replay_event(replay: &mut ReplayState, kind: &EventKind) {
+    match kind {
+        EventKind::Compaction {
+            summary,
+            replacement_history,
+            ..
+        } => {
+            replay.history.clone_from(replacement_history);
+            replay.usage_before_assistant = vec![None; replacement_history.len()];
+            replay.pending_usage = None;
+            replay.after_compaction = true;
+            replay.latest_compaction_summary = Some(summary.clone());
+        }
+        EventKind::Usage {
+            total,
+            context,
+            provider,
+            model,
+            ..
+        } => {
+            replay.pending_usage = Some(UsageBaseline {
+                total: *total as usize,
+                context: *context,
+                provider: provider.clone(),
+                model: model.clone(),
+            });
+        }
+        EventKind::ModelMessage { message } => {
+            let usage = matches!(message, Message::Assistant { .. })
+                .then(|| replay.pending_usage.take())
+                .flatten();
+            replay.history.push(message.clone());
+            replay.usage_before_assistant.push(usage);
+        }
+        _ => {}
+    }
+}
+
+fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
+    state.through_sequence = Some(event.sequence);
+    match &event.kind {
+        EventKind::SessionCreated {
+            provider,
+            model,
+            thinking,
+            ..
+        }
+        | EventKind::ModelSettingsChanged {
+            provider,
+            model,
+            thinking,
+        } => {
+            state.model_settings = Some(SessionModelSettings {
+                provider: provider.clone(),
+                model: model.clone(),
+                thinking: *thinking,
+            });
+        }
+        EventKind::SessionContext { .. } => state.context_sequence = Some(event.sequence),
+        EventKind::User { .. } => state.has_user = true,
+        EventKind::ToolCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            state.pending_help_reads.remove(call_id);
+            if name == "read"
+                && let (Some(uri), Some("")) = (
+                    arguments.get("uri").and_then(Value::as_str),
+                    arguments.get("body").and_then(Value::as_str),
+                )
+                && let Ok((protocol, "help")) = crate::protocol::split_address(uri)
+            {
+                state
+                    .pending_help_reads
+                    .insert(call_id.clone(), protocol.to_string());
+            }
+            state.token_calibration.pending_visible_units = state
+                .token_calibration
+                .pending_visible_units
+                .saturating_add(crate::tui::visible_units(name) as u64)
+                .saturating_add(crate::tui::visible_units(&arguments.to_string()) as u64);
+        }
+        EventKind::ToolResult {
+            call_id,
+            name,
+            failed,
+            ..
+        } => {
+            if let Some(protocol) = state.pending_help_reads.remove(call_id)
+                && name == "read"
+                && !failed
+            {
+                state.successful_help_reads.insert(protocol);
+            }
+        }
+        EventKind::Task { id, output, .. } => {
+            let pointers = state.tasks.entry(id.clone()).or_insert(TaskPointers {
+                first_sequence: event.sequence,
+                latest_sequence: event.sequence,
+                output_sequence: None,
+            });
+            pointers.latest_sequence = event.sequence;
+            if output.is_some() {
+                pointers.output_sequence = Some(event.sequence);
+            }
+        }
+        EventKind::Usage {
+            input,
+            output,
+            reasoning,
+            cache_read,
+            cache_write,
+            cost,
+            context,
+            ..
+        } => {
+            state.usage.input = state.usage.input.saturating_add(*input);
+            state.usage.output = state.usage.output.saturating_add(*output);
+            state.usage.cache_read = state.usage.cache_read.saturating_add(*cache_read);
+            state.usage.cache_write = state.usage.cache_write.saturating_add(*cache_write);
+            state.usage.cost += cost;
+            let prompt_tokens = input
+                .saturating_add(*cache_read)
+                .saturating_add(*cache_write);
+            state.usage.last_cache_hit =
+                (prompt_tokens > 0).then(|| *cache_read as f64 / prompt_tokens as f64 * 100.0);
+            if *context {
+                state.token_calibration.pending_usage = Some((*output, *reasoning));
+            }
+        }
+        EventKind::AssistantText { text } => {
+            state.token_calibration.pending_visible_units = state
+                .token_calibration
+                .pending_visible_units
+                .saturating_add(crate::tui::visible_units(text) as u64);
+        }
+        EventKind::AssistantReasoning { text } => {
+            state.token_calibration.pending_reasoning_visible |= !text.is_empty();
+            state.token_calibration.pending_visible_units = state
+                .token_calibration
+                .pending_visible_units
+                .saturating_add(crate::tui::visible_units(text) as u64);
+        }
+        EventKind::ModelMessage {
+            message: Message::Assistant { .. },
+        } => {
+            if let Some((output, reasoning)) = state.token_calibration.pending_usage.take() {
+                let output = if state.token_calibration.pending_reasoning_visible {
+                    output
+                } else {
+                    output.saturating_sub(reasoning)
+                };
+                if output > 0 && state.token_calibration.pending_visible_units > 0 {
+                    state.token_calibration.visible_units = state
+                        .token_calibration
+                        .visible_units
+                        .saturating_add(state.token_calibration.pending_visible_units);
+                    state.token_calibration.output_tokens =
+                        state.token_calibration.output_tokens.saturating_add(output);
+                }
+            }
+            state.token_calibration.pending_visible_units = 0;
+            state.token_calibration.pending_reasoning_visible = false;
+        }
+        EventKind::ModelRetry { .. } | EventKind::Compaction { .. } | EventKind::Error { .. } => {
+            state.token_calibration.pending_visible_units = 0;
+            state.token_calibration.pending_reasoning_visible = false;
+            state.token_calibration.pending_usage = None;
+        }
+        _ => {}
+    }
 }
 
 fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
@@ -1385,6 +2016,59 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn eager_model_context(events: &[SessionEvent], provider: &str, model: &str) -> ModelContext {
+        let latest_compaction = events
+            .iter()
+            .rposition(|event| matches!(event.kind, EventKind::Compaction { .. }));
+        let mut history = latest_compaction
+            .and_then(|index| match &events[index].kind {
+                EventKind::Compaction {
+                    replacement_history,
+                    ..
+                } => Some(replacement_history.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut latest_api_usage = None;
+        let mut pending_usage = None;
+        for event in events
+            .iter()
+            .skip(latest_compaction.map_or(0, |index| index + 1))
+        {
+            match &event.kind {
+                EventKind::Usage {
+                    total,
+                    context,
+                    provider: usage_provider,
+                    model: usage_model,
+                    ..
+                } => {
+                    pending_usage = (*context
+                        && *total > 0
+                        && (provider.is_empty()
+                            || usage_provider.is_empty()
+                            || usage_provider == provider)
+                        && (model.is_empty() || usage_model.is_empty() || usage_model == model))
+                        .then_some(*total as usize);
+                }
+                EventKind::ModelMessage { message } => {
+                    history.push(message.clone());
+                    if matches!(message, Message::Assistant { .. })
+                        && let Some(tokens) = pending_usage.take()
+                    {
+                        latest_api_usage = Some((history.len() - 1, tokens));
+                    }
+                }
+                _ => {}
+            }
+        }
+        ModelContext {
+            history,
+            latest_api_usage,
+            after_compaction: latest_compaction.is_some(),
+        }
     }
 
     #[tokio::test]
@@ -1743,6 +2427,613 @@ mod tests {
         let context = reopened.model_context("test", "model").await;
         assert!(context.latest_api_usage.is_none());
         assert!(context.after_compaction);
+    }
+
+    #[tokio::test]
+    async fn lazy_replay_matches_the_eager_reference_across_compactions_and_usage_pairing() {
+        use rig::message::{
+            AssistantContent, ToolCall, ToolCallId, ToolFunction, ToolResult, ToolResultContent,
+            UserContent,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("differential-replay")).await;
+        let call_id = ToolCallId::new("call-17").unwrap();
+        let tool_call = Message::Assistant {
+            id: Some("assistant-provider-id".into()),
+            content: vec![AssistantContent::ToolCall(ToolCall::new(
+                call_id.clone(),
+                ToolFunction::new("read".into(), serde_json::json!({"uri": "file://help"})),
+            ))],
+        };
+        let tool_result = Message::User {
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: call_id,
+                provider: None,
+                name: "read".into(),
+                content: vec![ToolResultContent::text("help output")],
+            })],
+        };
+        opened
+            .append_batch(vec![
+                EventKind::User { text: "old".into() },
+                EventKind::ModelMessage {
+                    message: Message::user("old"),
+                },
+                EventKind::Usage {
+                    input: 10,
+                    output: 2,
+                    reasoning: 0,
+                    cache_read: 1,
+                    cache_write: 0,
+                    cost: 0.1,
+                    total: 13,
+                    context: true,
+                    provider: "provider-a".into(),
+                    model: "model-a".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("discarded by compaction"),
+                },
+            ])
+            .await
+            .unwrap();
+        opened
+            .append_compaction(
+                "first".into(),
+                100,
+                vec![Message::user("summary one")],
+                false,
+            )
+            .await
+            .unwrap();
+        opened
+            .append_batch(vec![
+                EventKind::ModelSettingsChanged {
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                    thinking: ThinkingLevel::High,
+                },
+                EventKind::ModelMessage {
+                    message: tool_call.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+        opened
+            .append_compaction(
+                "mid-turn".into(),
+                80,
+                vec![Message::user("summary two"), tool_call],
+                false,
+            )
+            .await
+            .unwrap();
+        opened
+            .append_batch(vec![
+                EventKind::ModelMessage {
+                    message: tool_result,
+                },
+                EventKind::Usage {
+                    input: 20,
+                    output: 4,
+                    reasoning: 1,
+                    cache_read: 2,
+                    cache_write: 3,
+                    cost: 0.2,
+                    total: 29,
+                    context: true,
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                },
+                EventKind::Usage {
+                    input: 0,
+                    output: 0,
+                    reasoning: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost: 0.0,
+                    total: 0,
+                    context: false,
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("invalid usage replaced the baseline"),
+                },
+                EventKind::Usage {
+                    input: 30,
+                    output: 5,
+                    reasoning: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost: 0.3,
+                    total: 35,
+                    context: true,
+                    provider: "provider-b".into(),
+                    model: "model-b".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("usage remains pending across a user message"),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("tail answer"),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let events = opened.snapshot().await;
+        for (provider, model) in [
+            ("provider-b", "model-b"),
+            ("provider-a", "model-a"),
+            ("", ""),
+        ] {
+            let expected = eager_model_context(&events, provider, model);
+            let actual = opened.model_context(provider, model).await;
+            assert_eq!(actual.history, expected.history);
+            assert_eq!(
+                serde_json::to_value(&actual.history).unwrap(),
+                serde_json::to_value(&expected.history).unwrap()
+            );
+            assert_eq!(actual.latest_api_usage, expected.latest_api_usage);
+            assert_eq!(actual.after_compaction, expected.after_compaction);
+        }
+        drop(opened);
+        let reopened = session(&path, Some("differential-replay")).await;
+        let expected = eager_model_context(&events, "provider-b", "model-b");
+        let actual = reopened.model_context("provider-b", "model-b").await;
+        assert_eq!(actual.history, expected.history);
+        assert_eq!(actual.latest_api_usage, expected.latest_api_usage);
+        assert_eq!(actual.after_compaction, expected.after_compaction);
+        assert_eq!(actual.latest_api_usage, Some((5, 35)));
+    }
+
+    #[tokio::test]
+    async fn resume_index_fallbacks_rebuild_without_changing_authoritative_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("index-fallbacks")).await;
+        opened
+            .append(EventKind::User {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        let first_compaction = opened
+            .append_compaction("one".into(), 10, vec![Message::user("one")], false)
+            .await
+            .unwrap();
+        let old_index = opened
+            .connection
+            .call(|db| {
+                db.query_row(
+                    "SELECT version, through_sequence, payload_json
+                     FROM session_resume_index WHERE session_id = 'index-fallbacks'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        opened
+            .append_batch(vec![
+                EventKind::ToolCall {
+                    call_id: "help".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"uri":"file://help","body":""}),
+                },
+                EventKind::ToolResult {
+                    call_id: "help".into(),
+                    name: "read".into(),
+                    output: "ok".into(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+                EventKind::Task {
+                    id: "task".into(),
+                    protocol: "bash".into(),
+                    label: "work".into(),
+                    status: TaskStatus::Completed,
+                    output: Some("result".into()),
+                },
+                EventKind::Task {
+                    id: "interrupted".into(),
+                    protocol: "bash".into(),
+                    label: "partial".into(),
+                    status: TaskStatus::Running,
+                    output: Some("partial output".into()),
+                },
+                EventKind::Task {
+                    id: "interrupted".into(),
+                    protocol: "bash".into(),
+                    label: "partial".into(),
+                    status: TaskStatus::Running,
+                    output: None,
+                },
+                EventKind::ToolCall {
+                    call_id: "failed-help".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"uri":"grep://help","body":""}),
+                },
+                EventKind::ToolResult {
+                    call_id: "failed-help".into(),
+                    name: "read".into(),
+                    output: "failed".into(),
+                    failed: true,
+                    protocol_help_required: false,
+                },
+                EventKind::ToolCall {
+                    call_id: "reused".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"uri":"tasks://help","body":""}),
+                },
+            ])
+            .await
+            .unwrap();
+        opened
+            .append_compaction("two".into(), 20, vec![Message::user("two")], false)
+            .await
+            .unwrap();
+        let index_payload = opened
+            .connection
+            .call(|db| {
+                db.query_row(
+                    "SELECT payload_json FROM session_resume_index
+                     WHERE session_id = 'index-fallbacks'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(!index_payload.contains("result"));
+        opened
+            .append(EventKind::ModelMessage {
+                message: Message::assistant("tail"),
+            })
+            .await
+            .unwrap();
+        opened
+            .append(EventKind::ToolCall {
+                call_id: "reused".into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        opened
+            .update_model_settings("tail-provider", "tail-model", ThinkingLevel::High)
+            .await
+            .unwrap();
+        opened
+            .connection
+            .call(|db| {
+                db.execute(
+                    "UPDATE sessions SET provider = 'stale', model = 'stale', thinking = 'off'
+                     WHERE id = 'index-fallbacks'",
+                    [],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        let authoritative_events = opened
+            .connection
+            .call(|db| {
+                let mut statement = db.prepare(
+                    "SELECT sequence, payload_json FROM events
+                     WHERE session_id = 'index-fallbacks' ORDER BY sequence",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+        let expected_events = opened.snapshot().await;
+        let mut expected_derived = ResumeState::default();
+        for event in &expected_events {
+            apply_resume_event(&mut expected_derived, event);
+        }
+        let expected_context = eager_model_context(&expected_events, "test", "model");
+        drop(opened);
+
+        enum Corruption {
+            Absent,
+            UnknownVersion,
+            Malformed,
+            ImpossibleHead,
+            Stale,
+        }
+        for corruption in [
+            Corruption::Absent,
+            Corruption::UnknownVersion,
+            Corruption::Malformed,
+            Corruption::ImpossibleHead,
+            Corruption::Stale,
+        ] {
+            let database_path = path.clone();
+            let old_index = old_index.clone();
+            let mutator = Connection::open(&database_path).await.unwrap();
+            mutator
+                .call(move |db| {
+                    match corruption {
+                        Corruption::Absent => {
+                            db.execute("DELETE FROM session_resume_index WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::UnknownVersion => {
+                            db.execute("UPDATE session_resume_index SET version = 999 WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::Malformed => {
+                            db.execute("UPDATE session_resume_index SET payload_json = '{bad' WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::ImpossibleHead => {
+                            db.execute("UPDATE session_resume_index SET through_sequence = 999999 WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::Stale => {
+                            db.execute(
+                                "INSERT INTO session_resume_index (session_id, version, through_sequence, payload_json)
+                                 VALUES ('index-fallbacks', ?1, ?2, ?3)
+                                 ON CONFLICT(session_id) DO UPDATE SET version=excluded.version,
+                                   through_sequence=excluded.through_sequence, payload_json=excluded.payload_json",
+                                params![old_index.0, old_index.1, old_index.2],
+                            )?;
+                        }
+                    }
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                })
+                .await
+                .unwrap();
+            drop(mutator);
+
+            let resumed = session(&path, Some("index-fallbacks")).await;
+            assert_eq!(resumed.state.lock().await.derived, expected_derived);
+            let actual = resumed.model_context("test", "model").await;
+            assert_eq!(actual.history, expected_context.history);
+            assert_eq!(actual.latest_api_usage, expected_context.latest_api_usage);
+            let reports = resumed.task_reports().await;
+            assert_eq!(
+                reports
+                    .iter()
+                    .find(|report| report.id == "task")
+                    .unwrap()
+                    .content,
+                b"result"
+            );
+            let interrupted = reports
+                .iter()
+                .find(|report| report.id == "interrupted")
+                .unwrap();
+            assert_eq!(interrupted.status, TaskStatus::Cancelled);
+            assert_eq!(interrupted.content, b"partial output");
+            let help_reads = resumed.successful_protocol_help_reads().await;
+            assert!(help_reads.contains("file"));
+            assert!(!help_reads.contains("grep"));
+            assert!(!help_reads.contains("tasks"));
+            assert!(
+                !resumed
+                    .state
+                    .lock()
+                    .await
+                    .derived
+                    .pending_help_reads
+                    .contains_key("reused")
+            );
+            assert!(resumed.has_user_message().await);
+            assert_eq!(
+                resumed.model_settings().await,
+                SessionModelSettings {
+                    provider: "tail-provider".into(),
+                    model: "tail-model".into(),
+                    thinking: ThinkingLevel::High,
+                }
+            );
+            let after = resumed
+                .connection
+                .call(|db| {
+                    let mut statement = db.prepare(
+                        "SELECT sequence, payload_json FROM events
+                         WHERE session_id = 'index-fallbacks' ORDER BY sequence",
+                    )?;
+                    statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .await
+                .unwrap();
+            assert_eq!(after, authoritative_events);
+            drop(resumed);
+        }
+        assert!(first_compaction.sequence < expected_events.last().unwrap().sequence);
+    }
+
+    #[tokio::test]
+    async fn paging_cursors_concatenate_without_gaps_and_include_later_appends_only_after_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("paging")).await;
+        opened
+            .append_batch(vec![
+                EventKind::User {
+                    text: "turn".into(),
+                },
+                EventKind::ToolCall {
+                    call_id: "a".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+                EventKind::Compaction {
+                    summary: "mid".into(),
+                    tokens_before: 1,
+                    replacement_history: vec![],
+                    manual: false,
+                },
+                EventKind::ToolResult {
+                    call_id: "a".into(),
+                    name: "read".into(),
+                    output: "done".into(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+                EventKind::TurnFinished,
+            ])
+            .await
+            .unwrap();
+        let initial = opened.snapshot().await;
+        let first = opened.events_after(0, 2).await.unwrap();
+        opened
+            .append(EventKind::Notice {
+                text: "later".into(),
+            })
+            .await
+            .unwrap();
+        let mut forward = first;
+        loop {
+            let cursor = forward.last().unwrap().sequence;
+            let page = opened.events_after(cursor, 2).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            forward.extend(page);
+        }
+        let all = opened.snapshot().await;
+        assert_eq!(forward, all.into_iter().skip(1).collect::<Vec<_>>());
+
+        let boundary = initial.last().unwrap().sequence.saturating_add(1);
+        let mut backward = Vec::new();
+        let mut cursor = boundary;
+        loop {
+            let page = opened.events_before(cursor, 2).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page[0].sequence;
+            backward.splice(0..0, page);
+        }
+        assert_eq!(backward, initial);
+        let snapshot = opened.snapshot().await;
+        assert_eq!(
+            opened.tail_events(3).await.unwrap(),
+            snapshot[snapshot.len() - 3..]
+        );
+        assert!(opened.events_after(0, 10_000).await.unwrap().len() <= MAX_EVENT_PAGE);
+    }
+
+    #[tokio::test]
+    async fn cache_failure_does_not_block_or_publish_ahead_of_authoritative_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("cache-failure")).await;
+        opened
+            .append(EventKind::User {
+                text: "start".into(),
+            })
+            .await
+            .unwrap();
+        opened
+            .connection
+            .call(|db| {
+                db.execute_batch(
+                    "CREATE TRIGGER reject_resume_index
+                     BEFORE INSERT ON session_resume_index
+                     BEGIN SELECT RAISE(ABORT, 'cache unavailable'); END;",
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        let mut updates = opened.subscribe();
+        let event = opened
+            .append_compaction("safe".into(), 1, vec![Message::user("safe")], false)
+            .await
+            .unwrap();
+        let published = updates.recv().await.unwrap();
+        assert!(
+            matches!(published, SessionUpdate::Persisted(ref saved) if saved.sequence == event.sequence)
+        );
+        let stored_head = opened
+            .connection
+            .call(|db| {
+                db.query_row(
+                    "SELECT head_sequence FROM sessions WHERE id = 'cache-failure'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored_head as u64, event.sequence);
+        assert!(matches!(
+            opened.snapshot().await.last().map(|event| &event.kind),
+            Some(EventKind::Compaction { .. })
+        ));
+        drop(opened);
+        let reopened = session(&path, Some("cache-failure")).await;
+        assert_eq!(reopened.model_history().await, vec![Message::user("safe")]);
+    }
+
+    #[tokio::test]
+    async fn compacted_resume_keeps_only_tail_events_and_repeated_context_is_in_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("bounded-resume")).await;
+        let large = "x".repeat(100_000);
+        opened
+            .append_batch(vec![
+                EventKind::User {
+                    text: "start".into(),
+                },
+                EventKind::AssistantText { text: large },
+                EventKind::ModelMessage {
+                    message: Message::user("old"),
+                },
+            ])
+            .await
+            .unwrap();
+        let checkpoint = opened
+            .append_compaction(
+                "bounded".into(),
+                25_000,
+                vec![Message::user("summary")],
+                false,
+            )
+            .await
+            .unwrap();
+        opened
+            .append(EventKind::ModelMessage {
+                message: Message::assistant("tail"),
+            })
+            .await
+            .unwrap();
+        drop(opened);
+
+        let resumed = session(&path, Some("bounded-resume")).await;
+        let in_memory = resumed.state.lock().await.events.clone();
+        assert_eq!(in_memory.len(), 1);
+        assert!(
+            in_memory
+                .iter()
+                .all(|event| event.sequence > checkpoint.sequence)
+        );
+        let first = resumed.model_context("test", "model").await;
+        let second = resumed.model_context("test", "model").await;
+        assert_eq!(first.history, second.history);
+        assert_eq!(
+            first.history,
+            vec![Message::user("summary"), Message::assistant("tail")]
+        );
     }
 
     #[tokio::test]

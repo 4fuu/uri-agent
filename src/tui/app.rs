@@ -3,7 +3,7 @@ mod composer;
 mod controller;
 mod markdown;
 mod model_selector;
-mod rate;
+pub(super) mod rate;
 mod render;
 #[cfg(test)]
 mod tests;

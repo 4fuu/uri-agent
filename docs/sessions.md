@@ -42,6 +42,31 @@ its settled task reports; a task left pending or running when its process ended
 is restored as cancelled rather than restarted. Normal operation and compaction
 do not rewrite or delete earlier events.
 
+SQLite also keeps a versioned, rebuildable resume index at real compaction
+boundaries. The index contains only cumulative derived state needed at startup,
+such as the user-message flag, usage and cache totals, protocol-help
+correlations, frozen-context and task event pointers, model settings, and
+token-rate calibration inputs. It never contains model history or compaction
+replacement history. On resume, model replay is loaded from the
+highest-sequence authoritative compaction event and
+the later usage and model-message events; other startup state is reduced from
+the index plus the authoritative event tail. Missing, stale, malformed, or
+newer-version index rows fall back to an event reduction and may be rebuilt.
+The append-only events remain the sole source of truth, and deleting the resume
+index cannot change replay or session behavior.
+
+Resume-index writes happen only after the authoritative event transaction
+commits. They are disposable cache writes: failure does not fail an otherwise
+valid append, publish uncommitted state, or make the session unavailable.
+
+Session event range reads use exclusive sequence cursors. `after` and `before`
+pages and tail reads are bounded and returned in ascending sequence order, so
+adjacent pages concatenate without overlap or gaps, including across
+compactions and tool call/result pairs. A page is a committed view at the time
+of its query. Appends between requests do not alter earlier sequence ranges;
+they become visible to a later `after` query when its cursor reaches them.
+Turn-aware grouping remains a presentation-layer policy.
+
 The transcript and model-replay forms of one message commit in the same SQLite transaction. Streaming text and reasoning are provisional TUI updates; only the completed response enters durable replay. Provider tool-call identity is preserved so resumed tool conversations remain valid for the selected backend.
 
 ## Model request retries

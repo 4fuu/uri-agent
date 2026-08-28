@@ -358,8 +358,15 @@ pub(super) async fn run_loop(
                     scheduler.request_coalesced();
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    for event in services.runtime.session().snapshot().await {
-                        app.apply(event);
+                    while let Some(sequence) = app.last_sequence {
+                        let page = services.runtime.session().events_after(sequence, 512).await?;
+                        let complete = page.len() < 512;
+                        for event in page {
+                            app.apply(event);
+                        }
+                        if complete {
+                            break;
+                        }
                     }
                     scheduler.request_coalesced();
                 }
@@ -508,13 +515,7 @@ pub(super) async fn apply_action(
                 cwd: app.info.cwd.clone(),
                 session_id: app.info.session_id.clone(),
                 prompt: prompt.clone(),
-                first_user_message: !services
-                    .runtime
-                    .session()
-                    .snapshot()
-                    .await
-                    .iter()
-                    .any(|event| matches!(event.kind, EventKind::User { .. })),
+                first_user_message: !services.runtime.session().has_user_message().await,
             };
             let effect_tx = background_tx.clone();
             tokio::spawn(async move {
