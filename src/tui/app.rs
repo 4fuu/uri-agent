@@ -12,8 +12,8 @@ use crate::catalog::{CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingL
 use crate::clipboard;
 use crate::compaction::ContextAccuracy;
 use crate::config::{
-    ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, display_path,
-    validate_environment_name, validate_model_role_name,
+    ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, ModelRoleInfo, ValueSource,
+    display_path, validate_environment_name, validate_model_role_name,
 };
 use crate::keymap::{KeyDisplayStyle, KeyStroke, Keymap};
 use crate::model::{clamp_thinking_level, configured_backend};
@@ -255,6 +255,40 @@ enum EditingSetting {
     OutputLimit,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SettingsTab {
+    #[default]
+    Model,
+    Agent,
+}
+
+impl SettingsTab {
+    const ALL: [Self; 2] = [Self::Model, Self::Agent];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Model => "MODEL",
+            Self::Agent => "AGENT",
+        }
+    }
+
+    fn row_count(self) -> usize {
+        match self {
+            Self::Model => 3,
+            Self::Agent => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsItem {
+    Model,
+    Credential,
+    Thinking,
+    OutputLimit,
+    Environment,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppHit {
     Transcript(usize),
@@ -264,7 +298,11 @@ enum AppHit {
     Palette(usize),
     Task(usize),
     Model(usize),
+    ModelHubTab(usize),
+    ModelRole(usize),
+    ModelRoleEffort(usize),
     Setting(usize),
+    SettingsTab(usize),
     Selector(usize),
     Status,
 }
@@ -413,6 +451,7 @@ struct SettingsState {
     active: ActiveSettings,
     model: Option<CatalogModel>,
     environment_count: usize,
+    tab: SettingsTab,
     selected: usize,
     editing: Option<EditingSetting>,
     api_key: String,
@@ -434,6 +473,7 @@ impl SettingsState {
             environment_count: environment.names().await.len(),
             active,
             model,
+            tab: SettingsTab::Model,
             selected: 0,
             editing: None,
             api_key: String::new(),
@@ -442,7 +482,11 @@ impl SettingsState {
     }
 
     fn provider(&self) -> &str {
-        &self.active.provider
+        self.model
+            .as_ref()
+            .map_or(self.active.provider.as_str(), |model| {
+                model.provider.as_str()
+            })
     }
 
     fn model(&self) -> Option<&CatalogModel> {
@@ -464,6 +508,104 @@ impl SettingsState {
             })
             .unwrap_or(ThinkingLevel::Off);
     }
+
+    fn selected_item(&self) -> SettingsItem {
+        match (self.tab, self.selected) {
+            (SettingsTab::Model, 0) => SettingsItem::Model,
+            (SettingsTab::Model, 1) => SettingsItem::Credential,
+            (SettingsTab::Model, _) => SettingsItem::Thinking,
+            (SettingsTab::Agent, 0) => SettingsItem::OutputLimit,
+            (SettingsTab::Agent, _) => SettingsItem::Environment,
+        }
+    }
+
+    fn move_selection(&mut self, distance: isize) {
+        self.selected = wrapped_index(self.selected, distance, self.tab.row_count());
+    }
+
+    fn move_tab(&mut self, distance: isize) {
+        let current = SettingsTab::ALL
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or_default();
+        let next = wrapped_index(current, distance, SettingsTab::ALL.len());
+        self.tab = SettingsTab::ALL[next];
+        self.selected = self.selected.min(self.tab.row_count().saturating_sub(1));
+        self.editing = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ModelHubTab {
+    #[default]
+    Models,
+    Roles,
+}
+
+impl ModelHubTab {
+    const ALL: [Self; 2] = [Self::Models, Self::Roles];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Models => "MODELS",
+            Self::Roles => "ROLES",
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ModelRoleFlow {
+    Naming {
+        value: String,
+    },
+    PickingModel {
+        role: String,
+    },
+    PickingEffort {
+        role: String,
+        model: CatalogModel,
+        options: Vec<ThinkingLevel>,
+        selected: usize,
+    },
+    ConfirmRemove {
+        role: String,
+        source: ValueSource,
+        reveals_global: bool,
+    },
+}
+
+struct ModelHubState {
+    tab: ModelHubTab,
+    roles: Vec<ModelRoleInfo>,
+    selected_role: usize,
+    role_flow: Option<ModelRoleFlow>,
+}
+
+impl ModelHubState {
+    fn new(tab: ModelHubTab, roles: Vec<ModelRoleInfo>) -> Self {
+        Self {
+            tab,
+            roles,
+            selected_role: 0,
+            role_flow: None,
+        }
+    }
+
+    fn move_tab(&mut self, distance: isize) {
+        let current = ModelHubTab::ALL
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or_default();
+        self.tab = ModelHubTab::ALL[wrapped_index(current, distance, ModelHubTab::ALL.len())];
+    }
+
+    fn move_role(&mut self, distance: isize) {
+        self.selected_role = wrapped_index(self.selected_role, distance, self.roles.len());
+    }
+
+    fn selected_role(&self) -> Option<&ModelRoleInfo> {
+        self.roles.get(self.selected_role)
+    }
 }
 
 #[derive(Clone)]
@@ -476,36 +618,20 @@ struct SelectorItem {
 
 enum SelectorKind {
     LoginProvider,
-    LoginMethod {
-        provider: String,
-    },
+    LoginMethod { provider: String },
     Logout,
     Resume,
     Search,
-    Effort {
-        provider: String,
-        model: String,
-    },
-    ModelRoleEffort {
-        role: String,
-        provider: String,
-        model: String,
-    },
-    Environment {
-        return_to_settings: bool,
-    },
-    ModelRoles,
-    PluginModelRole {
-        plugin: String,
-        key: String,
-    },
+    Effort { provider: String, model: String },
+    Environment { return_to_settings: bool },
+    PluginModelRole { plugin: String, key: String },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum ModelSelectionTarget {
     #[default]
     Conversation,
-    Role(String),
+    Settings,
 }
 
 struct SelectorState {
@@ -600,7 +726,6 @@ enum TextPurpose {
         name: String,
         return_to_settings: bool,
     },
-    ModelRoleName,
     SetTerminal,
 }
 
@@ -687,6 +812,7 @@ struct App {
     flashes: Vec<FlashNotice>,
     model_selector: Option<ModelSelector>,
     model_selection_target: ModelSelectionTarget,
+    model_hub: Option<ModelHubState>,
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
     keymap: Keymap,
@@ -782,6 +908,7 @@ impl App {
             flashes: Vec::new(),
             model_selector: None,
             model_selection_target: ModelSelectionTarget::Conversation,
+            model_hub: None,
             catalog_refreshing: false,
             settings: None,
             keymap,
@@ -2351,6 +2478,7 @@ impl App {
         self.settings = None;
         self.model_selector = None;
         self.model_selection_target = ModelSelectionTarget::Conversation;
+        self.model_hub = None;
         self.tui_document = None;
         self.delivery = None;
         self.dismiss_completions();

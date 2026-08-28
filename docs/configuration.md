@@ -2,7 +2,7 @@
 
 URI Agent combines the [pi model catalog](https://github.com/earendil-works/pi), live provider model discovery, local provider definitions, layered settings, and process-specific overrides. This document describes model support, authentication, file locations, precedence, and command-line configuration.
 
-Run `uri-agent --help` for the current CLI syntax. In the TUI, `:settings` shows the active provider and model, credential status and source, thinking level, output limit, and Agent environment manager.
+Run `uri-agent --help` for the current CLI syntax. In the TUI, `:settings` separates model and Agent values into tabs and shows each value's source or pending state. `:model` and `:model-roles` open the shared Model Hub for conversation models and role assignments.
 
 ## First-time setup
 
@@ -200,7 +200,7 @@ The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings f
 
 ## Agent environment
 
-Use `:set-env` to add or replace a variable such as `NPM_TOKEN`. The **Agent environment** row in `:settings` opens the complete manager: it displays names without values, `Enter` replaces the selected value, `Ctrl+N` adds a variable, and `Delete` removes one. Value prompts mask their input. Names use the portable form `[A-Za-z_][A-Za-z0-9_]*`.
+Use `:set-env` to add or replace a variable such as `NPM_TOKEN`. The **Agent environment** row in the Agent tab of Settings opens the complete manager: it displays names without values, `Enter` replaces the selected value, `Ctrl+N` adds a variable, and `Delete` removes one. Value prompts mask their input. Names use the portable form `[A-Za-z_][A-Za-z0-9_]*`.
 
 Variables are global rather than project- or session-specific. URI Agent stores them as plain text in the private `environment.json` configuration file; on Unix it enforces mode `0600` and keeps the configuration directory at `0700`. Filesystem permissions are the protection boundary—values are not encrypted.
 
@@ -284,11 +284,16 @@ a hard-coded catalog model. It starts without a model assignment: selecting the
 conversation model does not change it. Other roles are custom and exist only
 after they are explicitly added.
 
-Use `:model-roles` to inspect and assign roles. `Ctrl+N` adds a custom
-role. `Enter` first selects a runnable model and then selects one of that
-model's supported thinking levels; both choices are stored on the role.
-`Delete` removes its explicit assignment. Unassigning `small` leaves it in the
-list; removing a custom role removes it from the list.
+Use `:model-roles` to open Model Hub's Roles tab. The list shows each role's
+assignment, thinking effort, and global or project source; a project override
+of a same-named global role is marked in the source column. `Ctrl+N` adds a
+custom role without leaving the Hub. `Enter` first selects a runnable model and
+then one of that model's supported thinking levels; `Esc` returns one step and
+saving returns to the role list. `Delete` asks for confirmation before removing
+the explicit assignment and identifies the affected scope. Removing a project
+override reveals the same-named global assignment. Unassigning `small` leaves
+it in the list; removing the only assignment for a custom role removes it from
+the list.
 
 `modelRoles` stores explicit role assignments:
 

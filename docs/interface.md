@@ -27,7 +27,7 @@ and reasoning/tool jump actions reveal a folded parent automatically.
 If the model calls a protocol before reading that protocol's help, the blocked
 tool row uses a purple header. Its error detail keeps the normal error color.
 
-A click outside dismisses read-only and navigational floats, including the composer, command panel, selectors, status, help, protocols, tasks, and documents. The composer preserves its draft. Settings, text prompts, OAuth, and the embedded terminal require an explicit close so an outside click cannot discard edits or stop work.
+A click outside dismisses read-only and navigational floats, including the composer, command panel, selectors, status, help, protocols, tasks, and documents. The composer preserves its draft. Model Hub, Settings, text prompts, OAuth, and the embedded terminal require an explicit close so an outside click cannot discard a staged choice or stop work.
 
 ## Composer and commands
 
@@ -95,19 +95,38 @@ Core commands are registered through `CommandRegistry`:
 
 `:login` includes model providers plus the Parallel and Exa web providers. Selecting Parallel or Exa opens a masked API-key prompt with that provider's key-management URL. Saved credentials take effect immediately for search and page extraction in the built-in `https` protocol and appear in `:logout` like other stored credentials.
 
-`:model`, `F3`, and the Settings model action list models only for providers
-with a configured model credential source. Logging out the current provider
+`:model`, `F3`, and the Settings Model action open Model Hub. Its **Models** tab
+lists models only for providers with a configured model credential source, and
+its **Roles** tab keeps role assignments in the same workspace. `Tab` and
+`Shift+Tab` switch tabs; clicking a tab has the same effect. Model search,
+selection, and catalog refresh remain available in the Models tab. A model
+chosen from Settings returns there as a pending choice, and `s` saves it with
+the other Settings values. A conversation model chosen through `:model` or
+`F3` is saved immediately. Logging out the current provider
 clears the current session model and that provider's saved default only when no
 other credential source remains; URI Agent does not automatically switch to a
 different provider.
 
-`:model-roles` lists the built-in `small` role first, followed by custom roles.
+`:model-roles` opens Model Hub on Roles. It lists the built-in `small` role
+first, followed by custom roles, with assignment, thinking effort, and source
+columns. A project role that replaces a global assignment is marked explicitly.
 `small` starts unassigned and does not follow the conversation model. Press
-`Enter` to assign a runnable model and then its thinking effort, `Ctrl+N` to
-name and assign a custom role, or `Delete` to unassign `small` or remove a
-custom role. Plugin commands can open a second generic selector that stores any
-available role in that plugin's settings, separately from role-to-model
-assignments.
+`Enter` or double-click to choose a runnable model and then its thinking effort.
+Each `Esc` returns one step—to model selection, then the role list—rather than
+closing the whole workflow. `Ctrl+N` names and assigns a custom role inline.
+`Delete` opens a confirmation that names the affected scope and warns when
+removing a project override will reveal the global assignment. Saving returns
+to the role list.
+Plugin commands can open a generic selector that stores any available role in
+that plugin's settings, separately from role-to-model assignments.
+
+Settings is divided into **Model** and **Agent** tabs. Model contains the
+conversation model, current-provider credential status, and thinking effort;
+Agent contains the inline output limit and private Agent environment manager.
+The selected row has a short detail explanation. Value sources and unsaved
+changes are shown beside each row. Use `Tab`, `Shift+Tab`, `Left`, or `Right`
+to switch tabs, arrows or a click to select a row, `Enter` or a double-click to
+edit it, and `Esc` to close without saving pending Settings choices.
 
 On the first user message in a session, the built-in terminal-title plugin asks
 the configured `small` role for a short title while the main turn continues.
@@ -122,7 +141,7 @@ Extensions register commands through the same registry, so they appear in the pa
 
 ### Agent environment manager
 
-`:set-env` opens separate name and masked-value prompts, then saves the variable globally. The **Agent environment** row in `:settings` shows only the number of configured variables. Press `Enter` or double-click the row to open the manager; values are never shown in its list. In the manager, `Enter` or a double-click replaces the selected value, `Ctrl+N` adds a variable, `Delete` removes the selected variable, and `Esc` returns to Settings.
+`:set-env` opens separate name and masked-value prompts, then saves the variable globally. The **Agent environment** row in the Agent tab of Settings shows only the number of configured variables. Press `Enter` or double-click the row to open the manager; values are never shown in its list. In the manager, `Enter` or a double-click replaces the selected value, `Ctrl+N` adds a variable, `Delete` removes the selected variable, and `Esc` returns to Settings.
 
 Saved values apply to future Agent `bash` and `pwsh` commands without a restart. They are not added to `:terminal`; see [Agent environment](configuration.md#agent-environment) for storage, scope, and plugin access.
 

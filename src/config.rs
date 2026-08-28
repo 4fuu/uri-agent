@@ -53,6 +53,8 @@ pub struct ModelRoleInfo {
     pub name: String,
     pub role: Option<ModelRole>,
     pub error: Option<String>,
+    pub source: Option<ValueSource>,
+    pub overrides_global: bool,
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -542,7 +544,7 @@ impl ConfigManager {
     }
 
     pub async fn model_roles(&self) -> Result<Vec<ModelRoleInfo>> {
-        let custom = {
+        let (custom, sources) = {
             let files = self.files.lock().await;
             let mut custom = BTreeSet::new();
             custom.extend(files.global.model_roles.keys().cloned());
@@ -550,7 +552,20 @@ impl ConfigManager {
             for builtin in BUILTIN_MODEL_ROLES {
                 custom.remove(builtin);
             }
-            custom
+            let mut sources = BTreeMap::new();
+            for name in files.global.model_roles.keys() {
+                sources.insert(name.clone(), (ValueSource::Global, false));
+            }
+            for name in files.project.model_roles.keys() {
+                sources.insert(
+                    name.clone(),
+                    (
+                        ValueSource::Project,
+                        files.global.model_roles.contains_key(name),
+                    ),
+                );
+            }
+            (custom, sources)
         };
         let mut names = BUILTIN_MODEL_ROLES
             .into_iter()
@@ -563,7 +578,19 @@ impl ConfigManager {
                 Ok(role) => (role, None),
                 Err(error) => (None, Some(error.to_string())),
             };
-            roles.push(ModelRoleInfo { role, error, name });
+            let (source, overrides_global) = sources
+                .get(&name)
+                .cloned()
+                .map_or((None, false), |(source, overrides)| {
+                    (Some(source), overrides)
+                });
+            roles.push(ModelRoleInfo {
+                role,
+                error,
+                name,
+                source,
+                overrides_global,
+            });
         }
         Ok(roles)
     }
@@ -2236,6 +2263,10 @@ mod tests {
         );
         assert_eq!(manager.model_role("missing").await.unwrap(), None);
         assert!(manager.model_role("invalid role").await.is_err());
+        let roles = manager.model_roles().await.unwrap();
+        let commit = roles.iter().find(|role| role.name == "commit").unwrap();
+        assert_eq!(commit.source, Some(ValueSource::Project));
+        assert!(commit.overrides_global);
     }
 
     #[tokio::test]
@@ -2277,6 +2308,10 @@ mod tests {
                 thinking: ThinkingLevel::Off,
             })
         );
+        let roles = manager.model_roles().await.unwrap();
+        let small = roles.iter().find(|role| role.name == "small").unwrap();
+        assert_eq!(small.source, Some(ValueSource::Global));
+        assert!(!small.overrides_global);
 
         assert!(manager.remove_model_role("small").await.unwrap());
         assert_eq!(manager.model_role("small").await.unwrap(), None);

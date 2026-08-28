@@ -2884,23 +2884,100 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
 
 pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    let name = match &app.model_selection_target {
-        ModelSelectionTarget::Conversation => "MODELS".to_string(),
-        ModelSelectionTarget::Role(role) => format!("MODELS · ROLE {role}"),
-    };
     let title = panel_title(
-        &name,
+        "MODEL HUB",
         action_hints(&app.keymap, &[("models", "refresh", "refresh")]),
     );
     frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(inner);
+    let Some(hub) = app.model_hub.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("Model workspace is not loaded.").style(Style::default().fg(MUTED)),
+            sections[2],
+        );
+        return;
+    };
+    let active_tab = hub.tab;
+    let flow = hub.role_flow.clone();
+    render_model_hub_tabs(frame, app, sections[0], active_tab, flow.is_none());
+    frame.render_widget(
+        Paragraph::new("─".repeat(sections[1].width as usize)).style(Style::default().fg(MUTED)),
+        sections[1],
+    );
+    match &flow {
+        Some(ModelRoleFlow::PickingModel { role }) => {
+            render_model_browser(frame, app, sections[2], Some(role));
+        }
+        Some(ModelRoleFlow::PickingEffort {
+            role,
+            model,
+            options,
+            selected,
+        }) => render_model_role_effort(frame, app, sections[2], role, model, options, *selected),
+        Some(ModelRoleFlow::Naming { .. } | ModelRoleFlow::ConfirmRemove { .. }) => {
+            render_model_roles(frame, app, sections[2], false);
+        }
+        None if active_tab == ModelHubTab::Roles => {
+            render_model_roles(frame, app, sections[2], true);
+        }
+        None => render_model_browser(frame, app, sections[2], None),
+    }
+    render_model_hub_footer(frame, app, sections[3], flow.as_ref());
+}
+
+fn render_model_hub_tabs(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    active: ModelHubTab,
+    interactive: bool,
+) {
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (index, tab) in ModelHubTab::ALL.into_iter().enumerate() {
+        let label = format!(" {} ", tab.label());
+        let width = label.width() as u16;
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(if tab == active { ACCENT } else { MUTED })
+                .bg(if tab == active { ROW_ACTIVE } else { SURFACE })
+                .add_modifier(if tab == active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        if interactive {
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(x, area.y, width, 1),
+                target: AppHit::ModelHubTab(index),
+            });
+        }
+        x = x.saturating_add(width);
+        spans.push(Span::raw("  "));
+        x = x.saturating_add(2);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: Option<&str>) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
     app.overlay_viewport_rows = sections[1].height as usize;
     let selected_key = app.model_selector.as_ref().and_then(|selector| {
         selector
@@ -2913,7 +2990,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
     let Some(selector) = app.model_selector.as_ref() else {
         frame.render_widget(
             Paragraph::new("Model catalog is not loaded.").style(Style::default().fg(MUTED)),
-            inner,
+            area,
         );
         return;
     };
@@ -2930,6 +3007,10 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             selector.provider_count()
         )
     };
+    let heading = role.map_or_else(
+        || format!(" SEARCH · {summary} "),
+        |role| format!(" ASSIGN {role} · STEP 1 OF 2 · {summary} "),
+    );
     let query_width = sections[0].width.saturating_sub(6) as usize;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -2944,10 +3025,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MUTED))
-                .title(fit_panel_title(
-                    &format!(" SEARCH · {summary} "),
-                    sections[0].width,
-                )),
+                .title(fit_panel_title(&heading, sections[0].width)),
         ),
         sections[0],
     );
@@ -3016,10 +3094,279 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
         "No models match this search".to_string()
     };
     frame.render_widget(
-        Paragraph::new(footer)
-            .style(Style::default().fg(MUTED))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(single_line_preview(&footer, sections[2].width as usize))
+            .style(Style::default().fg(MUTED)),
         sections[2],
+    );
+}
+
+fn role_source_label(role: &ModelRoleInfo) -> String {
+    match (&role.source, role.overrides_global) {
+        (Some(ValueSource::Project), true) => "PROJECT ← GLOBAL".to_string(),
+        (Some(ValueSource::Project), false) => "PROJECT".to_string(),
+        (Some(ValueSource::Global), _) => "GLOBAL".to_string(),
+        (Some(source), _) => value_source_label(source),
+        (None, _) if role.name == "small" => "BUILT-IN".to_string(),
+        (None, _) => "UNASSIGNED".to_string(),
+    }
+}
+
+fn render_model_roles(frame: &mut Frame<'_>, app: &mut App, area: Rect, interactive: bool) {
+    let selected_key = app.model_hub.as_ref().and_then(|hub| {
+        hub.selected_role()
+            .map(|role| format!("model-role:{}", role.name))
+    });
+    let marquee_elapsed = selected_key
+        .map(|key| app.marquee_elapsed(key))
+        .unwrap_or_default();
+    let Some(hub) = app.model_hub.as_ref() else {
+        return;
+    };
+    if hub.roles.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No model roles are available.").style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+    app.overlay_viewport_rows = area.height as usize;
+    let row_width = area.width as usize;
+    let name_width = 18.min(row_width.saturating_sub(2));
+    let source_width = 18.min(row_width.saturating_sub(2 + name_width));
+    let effort_width = 10.min(
+        row_width
+            .saturating_sub(2 + name_width)
+            .saturating_sub(source_width),
+    );
+    let assignment_width = row_width.saturating_sub(2 + name_width + effort_width + source_width);
+    let items = hub.roles.iter().enumerate().map(|(index, role)| {
+        let selected = hub.selected_role == index;
+        let (assignment, effort) = if let Some(error) = &role.error {
+            (error.clone(), "INVALID".to_string())
+        } else if let Some(assignment) = &role.role {
+            (
+                format!("{}/{}", assignment.provider, assignment.model),
+                assignment.thinking.to_string(),
+            )
+        } else {
+            ("— no model assigned".to_string(), "—".to_string())
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                list_cell(&role.name, name_width, selected, marquee_elapsed),
+                Style::default().fg(if selected { ACCENT } else { TEXT }),
+            ),
+            Span::styled(
+                list_cell(&assignment, assignment_width, selected, marquee_elapsed),
+                Style::default().fg(if role.error.is_some() { ERROR } else { TEXT }),
+            ),
+            Span::styled(
+                list_cell(&effort, effort_width, selected, marquee_elapsed),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                list_cell(
+                    &role_source_label(role),
+                    source_width,
+                    selected,
+                    marquee_elapsed,
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ]))
+        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+    });
+    let mut state = ListState::default().with_selected(Some(hub.selected_role));
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+    if interactive {
+        for index in state.offset()..hub.roles.len() {
+            let y = area.y.saturating_add((index - state.offset()) as u16);
+            if y >= area.bottom() {
+                break;
+            }
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(area.x, y, area.width, 1),
+                target: AppHit::ModelRole(index),
+            });
+        }
+    }
+}
+
+fn render_model_role_effort(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    role: &str,
+    model: &CatalogModel,
+    options: &[ThinkingLevel],
+    selected: usize,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(2)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!("ASSIGN {role} · STEP 2 OF 2"),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!("{}/{} · choose thinking effort", model.provider, model.id),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        sections[0],
+    );
+    app.overlay_viewport_rows = sections[1].height as usize;
+    let items = options.iter().enumerate().map(|(index, level)| {
+        let active = index == selected;
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                if active { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                level.to_string(),
+                Style::default().fg(if active { ACCENT } else { TEXT }),
+            ),
+        ]))
+        .style(Style::default().bg(if active { ROW_ACTIVE } else { SURFACE }))
+    });
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
+    for index in state.offset()..options.len() {
+        let y = sections[1]
+            .y
+            .saturating_add((index - state.offset()) as u16);
+        if y >= sections[1].bottom() {
+            break;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[1].x, y, sections[1].width, 1),
+            target: AppHit::ModelRoleEffort(index),
+        });
+    }
+}
+
+fn value_source_label(source: &ValueSource) -> String {
+    match source {
+        ValueSource::Global => "GLOBAL".to_string(),
+        ValueSource::Project => "PROJECT".to_string(),
+        ValueSource::Default => "DEFAULT".to_string(),
+        ValueSource::Session => "SESSION".to_string(),
+        source => source.label().to_uppercase(),
+    }
+}
+
+fn render_model_hub_footer(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    flow: Option<&ModelRoleFlow>,
+) {
+    let Some(hub) = app.model_hub.as_ref() else {
+        return;
+    };
+    let (message, style) = match flow {
+        Some(ModelRoleFlow::Naming { value }) => {
+            let hints = action_hints(
+                &app.keymap,
+                &[("text", "confirm", "continue"), ("text", "cancel", "back")],
+            );
+            (
+                format!("NEW ROLE  {value}█  · {hints} · letters, digits, - or _"),
+                Style::default().fg(ACCENT),
+            )
+        }
+        Some(ModelRoleFlow::ConfirmRemove {
+            role,
+            source,
+            reveals_global,
+        }) => {
+            let hints = action_hints(
+                &app.keymap,
+                &[
+                    ("models", "confirm", "confirm"),
+                    ("models", "close", "keep"),
+                ],
+            );
+            let scope = match source {
+                ValueSource::Project => "PROJECT",
+                ValueSource::Global => "GLOBAL",
+                _ => "SAVED",
+            };
+            let action = if *reveals_global {
+                format!("{scope} {role} → GLOBAL fallback")
+            } else {
+                format!("REMOVE {scope} ASSIGNMENT FOR {role}")
+            };
+            (format!("{hints} · {action}"), Style::default().fg(ERROR))
+        }
+        Some(ModelRoleFlow::PickingModel { .. }) => {
+            let hints = action_hints(
+                &app.keymap,
+                &[
+                    ("models", "confirm", "choose model"),
+                    ("models", "close", "back to roles"),
+                    ("models", "refresh", "refresh"),
+                ],
+            );
+            (
+                format!("{hints} · type to search"),
+                Style::default().fg(MUTED),
+            )
+        }
+        Some(ModelRoleFlow::PickingEffort { .. }) => (
+            action_hints(
+                &app.keymap,
+                &[
+                    ("models", "confirm", "save assignment"),
+                    ("models", "previous", "choose effort"),
+                    ("models", "close", "back to model"),
+                ],
+            ),
+            Style::default().fg(MUTED),
+        ),
+        None if hub.tab == ModelHubTab::Roles => (
+            action_hints(
+                &app.keymap,
+                &[
+                    ("models", "confirm", "assign"),
+                    ("model_roles", "add", "add"),
+                    ("model_roles", "remove", "remove"),
+                    ("models", "next_tab", "models"),
+                    ("models", "close", "close"),
+                ],
+            ),
+            Style::default().fg(MUTED),
+        ),
+        None => {
+            let hints = action_hints(
+                &app.keymap,
+                &[
+                    ("models", "confirm", "select"),
+                    ("models", "next_tab", "roles"),
+                    ("models", "refresh", "refresh"),
+                    ("models", "close", "close"),
+                ],
+            );
+            (
+                format!("{hints} · type to search"),
+                Style::default().fg(MUTED),
+            )
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            single_line_preview(&message, area.width as usize),
+            style,
+        )),
+        area,
     );
 }
 
@@ -3038,110 +3385,226 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         frame.render_widget(Paragraph::new("Loading settings…").block(block), area);
         return;
     };
+    let tab = settings.tab;
+    let title = panel_title(
+        "SETTINGS",
+        action_hints(&app.keymap, &[("settings", "save", "save")]),
+    );
+    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_settings_tabs(frame, app, sections[0], tab);
+    frame.render_widget(
+        Paragraph::new("─".repeat(sections[1].width as usize)).style(Style::default().fg(MUTED)),
+        sections[1],
+    );
+    render_settings_body(frame, app, sections[2], marquee_elapsed);
+    let hints = action_hints(
+        &app.keymap,
+        &[
+            ("settings", "edit", "edit"),
+            ("settings", "next_tab", "sections"),
+            ("settings", "save", "save"),
+            ("settings", "close", "close"),
+        ],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(hints, Style::default().fg(MUTED))),
+        sections[3],
+    );
+}
+
+fn render_settings_tabs(frame: &mut Frame<'_>, app: &mut App, area: Rect, active: SettingsTab) {
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
+        let label = format!(" {} ", tab.label());
+        let width = label.width() as u16;
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(if tab == active { ACCENT } else { MUTED })
+                .bg(if tab == active { ROW_ACTIVE } else { SURFACE })
+                .add_modifier(if tab == active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(x, area.y, width, 1),
+            target: AppHit::SettingsTab(index),
+        });
+        x = x.saturating_add(width);
+        spans.push(Span::raw("  "));
+        x = x.saturating_add(2);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marquee_elapsed: usize) {
+    let Some(settings) = app.settings.as_ref() else {
+        return;
+    };
     let model = settings
         .model()
-        .map(|model| {
-            if model.name.is_empty() || model.name == model.id {
-                model.id.clone()
-            } else {
-                format!("{}  ·  {}", model.name, model.id)
-            }
-        })
-        .unwrap_or_else(|| settings.active.model.clone());
+        .map(|model| format!("{} / {}", model.provider, model_label(model)))
+        .unwrap_or_else(|| format!("{} / {}", settings.active.provider, settings.active.model));
     let credential = match settings.active.auth_kind {
-        AuthKind::Oauth => format!("OAuth  ·  {}", settings.active.api_key_source.label()),
-        AuthKind::ApiKey => format!("API key  ·  {}", settings.active.api_key_source.label()),
-        AuthKind::None => "not configured  ·  :login".to_string(),
+        AuthKind::Oauth => "OAuth".to_string(),
+        AuthKind::ApiKey => "API key".to_string(),
+        AuthKind::None => "not configured · use :login".to_string(),
+    };
+    let credential_source = if settings.active.auth_kind == AuthKind::None {
+        "—".to_string()
+    } else {
+        value_source_label(&settings.active.api_key_source)
     };
     let output_limit = if settings.editing == Some(EditingSetting::OutputLimit) {
         format!("{}█", settings.output_limit)
     } else {
         format!("{} bytes", settings.output_limit)
     };
-    let edit = app.keymap.key_hint("settings", "edit");
-    let environment = edit.as_ref().map_or_else(
-        || {
-            format!(
-                "{} variable{}",
-                settings.environment_count,
-                if settings.environment_count == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-        },
-        |key| {
-            format!(
-                "{} variable{} · {key} manages",
-                settings.environment_count,
-                if settings.environment_count == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-        },
+    let environment = format!(
+        "{} variable{}",
+        settings.environment_count,
+        if settings.environment_count == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
-    let rows = [
-        ("Model", format!("{} / {model}", settings.provider())),
-        ("Credential", credential),
-        ("Thinking", settings.thinking.to_string()),
-        ("Output limit", output_limit),
-        ("Agent environment", environment),
-    ];
-    let edit_help = edit.map_or_else(
-        || "Use :login / :logout for credentials.".to_string(),
-        |key| format!("Use :login / :logout for credentials. {key} edits the selected field."),
-    );
+    let model_pending = settings.model().is_some_and(|selected| {
+        selected.provider != settings.active.provider || selected.id != settings.active.model
+    });
+    let rows = match settings.tab {
+        SettingsTab::Model => vec![
+            (
+                SettingsItem::Model,
+                "Model",
+                model,
+                if model_pending {
+                    "PENDING".to_string()
+                } else {
+                    value_source_label(&settings.active.model_source)
+                },
+            ),
+            (
+                SettingsItem::Credential,
+                "Credential",
+                format!("{} · {credential}", settings.active.provider),
+                credential_source,
+            ),
+            (
+                SettingsItem::Thinking,
+                "Thinking",
+                settings.thinking.to_string(),
+                if settings.thinking != settings.active.thinking {
+                    "PENDING".to_string()
+                } else {
+                    value_source_label(&settings.active.thinking_source)
+                },
+            ),
+        ],
+        SettingsTab::Agent => vec![
+            (
+                SettingsItem::OutputLimit,
+                "Output limit",
+                output_limit,
+                if settings.output_limit != settings.active.output_limit.to_string() {
+                    "PENDING".to_string()
+                } else {
+                    value_source_label(&settings.active.output_limit_source)
+                },
+            ),
+            (
+                SettingsItem::Environment,
+                "Agent environment",
+                environment,
+                "PRIVATE GLOBAL".to_string(),
+            ),
+        ],
+    };
     let row_count = rows.len();
-    let row_width = inner.width as usize;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(4)])
+        .split(area);
+    app.overlay_viewport_rows = sections[0].height as usize;
+    let row_width = sections[0].width as usize;
     let label_width = 18.min(row_width.saturating_sub(2));
-    let value_width = row_width.saturating_sub(2 + label_width);
-    let mut lines = vec![
-        Line::styled(
-            single_line_preview(&edit_help, row_width),
-            Style::default().fg(MUTED),
-        ),
-        Line::default(),
-    ];
-    for (index, (label, value)) in rows.into_iter().enumerate() {
-        let selected = settings.selected == index;
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                list_cell(label, label_width, selected, marquee_elapsed),
-                Style::default().fg(if selected { ACCENT } else { MUTED }),
-            ),
-            Span::styled(
-                list_cell(&value, value_width, selected, marquee_elapsed),
-                Style::default().fg(TEXT),
-            ),
-        ]));
-        lines.push(Line::default());
-    }
-    let title = panel_title(
-        "SETTINGS",
-        action_hints(&app.keymap, &[("settings", "save", "save")]),
-    );
-    frame.render_widget(
-        Paragraph::new(lines).block(block.title(fit_panel_title(&title, area.width))),
-        area,
-    );
+    let source_width = 22.min(row_width.saturating_sub(2 + label_width));
+    let value_width = row_width.saturating_sub(2 + label_width + source_width);
+    let items = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (_, label, value, source))| {
+            let selected = settings.selected == index;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    list_cell(label, label_width, selected, marquee_elapsed),
+                    Style::default().fg(if selected { ACCENT } else { MUTED }),
+                ),
+                Span::styled(
+                    list_cell(value, value_width, selected, marquee_elapsed),
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled(
+                    list_cell(source, source_width, selected, marquee_elapsed),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        });
+    let mut state = ListState::default().with_selected(Some(settings.selected));
+    frame.render_stateful_widget(List::new(items), sections[0], &mut state);
     for index in 0..row_count {
+        let y = sections[0].y.saturating_add(index as u16);
+        if y >= sections[0].bottom() {
+            break;
+        }
         app.hit_regions.push(HitRegion {
-            area: Rect::new(
-                inner.x,
-                inner.y.saturating_add(2 + index as u16 * 2),
-                inner.width,
-                1,
-            ),
+            area: Rect::new(sections[0].x, y, sections[0].width, 1),
             target: AppHit::Setting(index),
         });
     }
+    let detail = match settings.selected_item() {
+        SettingsItem::Model => {
+            "Conversation model · opens Model Hub · selection remains pending until Settings is saved"
+        }
+        SettingsItem::Credential => {
+            "Credential for the active provider · manage stored credentials with :login / :logout"
+        }
+        SettingsItem::Thinking => {
+            "Thinking effort supported by the selected model · editing cycles available levels"
+        }
+        SettingsItem::OutputLimit => "Maximum inline tool-result bytes · minimum 1024",
+        SettingsItem::Environment => {
+            "Private variables injected into future Agent shell commands · values remain hidden"
+        }
+    };
+    let mut detail_lines = vec![Line::styled(
+        "DETAIL",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    detail_lines.extend(
+        textwrap::wrap(detail, sections[1].width as usize)
+            .into_iter()
+            .take(3)
+            .map(|line| Line::styled(Cow::into_owned(line), Style::default().fg(MUTED))),
+    );
+    frame.render_widget(Paragraph::new(detail_lines), sections[1]);
 }
 
 pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {

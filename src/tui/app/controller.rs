@@ -776,9 +776,16 @@ pub(super) enum Action {
     InterruptTurn,
     Compact,
     OpenModels(String),
+    OpenSettingsModels,
     OpenModelRoles,
     OpenRoleModel(String),
     RemoveModelRole(String),
+    SaveModelRole {
+        role: String,
+        provider: String,
+        model: String,
+        thinking: ThinkingLevel,
+    },
     SelectModel,
     OpenSettings,
     SaveSettings,
@@ -942,8 +949,31 @@ pub(super) async fn apply_action(
             .await;
             Ok(None)
         }
+        Action::OpenSettingsModels => {
+            app.model_selection_target = ModelSelectionTarget::Settings;
+            let selected = app.settings.as_ref().and_then(|settings| {
+                settings
+                    .model()
+                    .map(|model| (model.provider.clone(), model.id.clone()))
+            });
+            open_models(
+                app,
+                &services.runtime,
+                &services.manager,
+                &services.catalog,
+                String::new(),
+            )
+            .await;
+            if let Some((provider, model)) = selected
+                && let Some(selector) = app.model_selector.as_mut()
+            {
+                selector.select_model(&provider, &model);
+            }
+            Ok(None)
+        }
         Action::OpenModelRoles => {
-            open_model_roles(app, &services.manager).await;
+            app.model_selection_target = ModelSelectionTarget::Conversation;
+            open_model_roles(app, &services.runtime, &services.manager, &services.catalog).await;
             Ok(None)
         }
         Action::OpenRoleModel(role) => {
@@ -965,7 +995,34 @@ pub(super) async fn apply_action(
                     app.set_flash(format!("Could not remove model role {role}: {error:#}"))
                 }
             }
-            open_model_roles(app, &services.manager).await;
+            reload_model_roles(app, &services.manager).await;
+            Ok(None)
+        }
+        Action::SaveModelRole {
+            role,
+            provider,
+            model,
+            thinking,
+        } => {
+            match services
+                .manager
+                .set_model_role(&role, &provider, &model, thinking)
+                .await
+            {
+                Ok(()) => {
+                    app.set_flash(format!(
+                        "Model role {role} set to {provider}/{model} · effort {thinking}"
+                    ));
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.role_flow = None;
+                        hub.tab = ModelHubTab::Roles;
+                    }
+                    reload_model_roles(app, &services.manager).await;
+                }
+                Err(error) => {
+                    app.set_flash(format!("Could not save model role {role}: {error:#}"));
+                }
+            }
             Ok(None)
         }
         Action::SelectModel => {
@@ -1186,7 +1243,13 @@ pub(super) fn handle_paste(app: &mut App, text: String) {
             }
         }
         Some(Overlay::Models) => {
-            if let Some(selector) = app.model_selector.as_mut() {
+            if let Some(ModelRoleFlow::Naming { value }) = app
+                .model_hub
+                .as_mut()
+                .and_then(|hub| hub.role_flow.as_mut())
+            {
+                value.push_str(text.trim());
+            } else if let Some(selector) = app.model_selector.as_mut() {
                 selector.paste(text.trim());
             }
         }
@@ -1664,62 +1727,7 @@ pub(super) async fn handle_overlay_key(
             }
             _ => Action::Continue,
         },
-        Overlay::Models => {
-            let page_up = app.overlay_page_distance(-1);
-            let page_down = app.overlay_page_distance(1);
-            let Some(selector) = app.model_selector.as_mut() else {
-                app.overlay = None;
-                return Action::Continue;
-            };
-            match app.keymap.action("models", key_name).as_deref() {
-                Some("quit") => Action::Quit,
-                Some("close") => {
-                    app.overlay = None;
-                    app.model_selection_target = ModelSelectionTarget::Conversation;
-                    Action::Continue
-                }
-                Some("previous") => {
-                    selector.move_selection(-1);
-                    Action::Continue
-                }
-                Some("next") => {
-                    selector.move_selection(1);
-                    Action::Continue
-                }
-                Some("page_up") => {
-                    selector.page_selection(page_up);
-                    Action::Continue
-                }
-                Some("page_down") => {
-                    selector.page_selection(page_down);
-                    Action::Continue
-                }
-                Some("first") => {
-                    selector.first();
-                    Action::Continue
-                }
-                Some("last") => {
-                    selector.last();
-                    Action::Continue
-                }
-                Some("confirm") => Action::SelectModel,
-                Some("backspace") => {
-                    selector.backspace();
-                    Action::Continue
-                }
-                Some("refresh") => Action::RefreshCatalog,
-                _ => {
-                    if let KeyCode::Char(character) = key.code
-                        && !key.modifiers.intersects(
-                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                        )
-                    {
-                        selector.push(character);
-                    }
-                    Action::Continue
-                }
-            }
-        }
+        Overlay::Models => handle_models_key(app, key, key_name),
         Overlay::Settings => handle_settings_key(app, key, key_name),
         Overlay::Document => match app.keymap.action("document", key_name).as_deref() {
             Some("quit") => Action::Quit,
@@ -1875,6 +1883,383 @@ pub(super) enum SelectorKey {
     Quit,
 }
 
+pub(super) fn close_model_hub(app: &mut App) {
+    let return_to_settings =
+        app.model_selection_target == ModelSelectionTarget::Settings && app.settings.is_some();
+    app.model_selector = None;
+    app.model_hub = None;
+    app.model_selection_target = ModelSelectionTarget::Conversation;
+    app.overlay = return_to_settings.then_some(Overlay::Settings);
+}
+
+pub(super) fn handle_models_key(app: &mut App, key: KeyEvent, key_name: &str) -> Action {
+    let page_up = app.overlay_page_distance(-1);
+    let page_down = app.overlay_page_distance(1);
+    let Some(flow) = app.model_hub.as_ref().and_then(|hub| hub.role_flow.clone()) else {
+        let Some(tab) = app.model_hub.as_ref().map(|hub| hub.tab) else {
+            close_model_hub(app);
+            return Action::Continue;
+        };
+        match app.keymap.action("models", key_name).as_deref() {
+            Some("quit") => return Action::Quit,
+            Some("next_tab") => {
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.move_tab(1);
+                }
+                return Action::Continue;
+            }
+            Some("previous_tab") => {
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.move_tab(-1);
+                }
+                return Action::Continue;
+            }
+            _ => {}
+        }
+        if tab == ModelHubTab::Roles {
+            let action = app
+                .keymap
+                .action_chain(&["model_roles", "models"], key_name);
+            return match action.as_deref() {
+                Some("close") => {
+                    close_model_hub(app);
+                    Action::Continue
+                }
+                Some("previous") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.move_role(-1);
+                    }
+                    Action::Continue
+                }
+                Some("next") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.move_role(1);
+                    }
+                    Action::Continue
+                }
+                Some("page_up") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.selected_role =
+                            bounded_index(hub.selected_role, page_up, hub.roles.len());
+                    }
+                    Action::Continue
+                }
+                Some("page_down") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.selected_role =
+                            bounded_index(hub.selected_role, page_down, hub.roles.len());
+                    }
+                    Action::Continue
+                }
+                Some("add") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.role_flow = Some(ModelRoleFlow::Naming {
+                            value: String::new(),
+                        });
+                    }
+                    Action::Continue
+                }
+                Some("remove") => {
+                    let selected = app
+                        .model_hub
+                        .as_ref()
+                        .and_then(ModelHubState::selected_role)
+                        .map(|role| {
+                            (
+                                role.name.clone(),
+                                role.source.clone(),
+                                role.overrides_global,
+                            )
+                        });
+                    match selected {
+                        Some((role, Some(source), reveals_global)) => {
+                            if let Some(hub) = app.model_hub.as_mut() {
+                                hub.role_flow = Some(ModelRoleFlow::ConfirmRemove {
+                                    role,
+                                    source,
+                                    reveals_global,
+                                });
+                            }
+                        }
+                        Some((role, None, _)) => {
+                            app.set_flash(format!("Model role {role} has no assignment"));
+                        }
+                        None => {}
+                    }
+                    Action::Continue
+                }
+                Some("confirm") => app
+                    .model_hub
+                    .as_ref()
+                    .and_then(ModelHubState::selected_role)
+                    .map_or(Action::Continue, |role| {
+                        Action::OpenRoleModel(role.name.clone())
+                    }),
+                _ => Action::Continue,
+            };
+        }
+        let Some(selector) = app.model_selector.as_mut() else {
+            close_model_hub(app);
+            return Action::Continue;
+        };
+        return match app.keymap.action("models", key_name).as_deref() {
+            Some("close") => {
+                close_model_hub(app);
+                Action::Continue
+            }
+            Some("previous") => {
+                selector.move_selection(-1);
+                Action::Continue
+            }
+            Some("next") => {
+                selector.move_selection(1);
+                Action::Continue
+            }
+            Some("page_up") => {
+                selector.page_selection(page_up);
+                Action::Continue
+            }
+            Some("page_down") => {
+                selector.page_selection(page_down);
+                Action::Continue
+            }
+            Some("first") => {
+                selector.first();
+                Action::Continue
+            }
+            Some("last") => {
+                selector.last();
+                Action::Continue
+            }
+            Some("confirm") => Action::SelectModel,
+            Some("backspace") => {
+                selector.backspace();
+                Action::Continue
+            }
+            Some("refresh") => Action::RefreshCatalog,
+            _ => {
+                if let KeyCode::Char(character) = key.code
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
+                    selector.push(character);
+                }
+                Action::Continue
+            }
+        };
+    };
+
+    match flow {
+        ModelRoleFlow::Naming { .. } => match app.keymap.action("text", key_name).as_deref() {
+            Some("quit") => Action::Quit,
+            Some("cancel") => {
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.role_flow = None;
+                }
+                Action::Continue
+            }
+            Some("backspace") => {
+                if let Some(ModelRoleFlow::Naming { value }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    value.pop();
+                }
+                Action::Continue
+            }
+            Some("confirm") => {
+                let role = app
+                    .model_hub
+                    .as_ref()
+                    .and_then(|hub| hub.role_flow.as_ref())
+                    .and_then(|flow| match flow {
+                        ModelRoleFlow::Naming { value } => Some(value.trim().to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if let Err(error) = validate_model_role_name(&role) {
+                    app.set_flash(format!("Invalid model role name: {error}"));
+                    Action::Continue
+                } else {
+                    Action::OpenRoleModel(role)
+                }
+            }
+            _ => {
+                if let KeyCode::Char(character) = key.code
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                    && let Some(ModelRoleFlow::Naming { value }) = app
+                        .model_hub
+                        .as_mut()
+                        .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    value.push(character);
+                }
+                Action::Continue
+            }
+        },
+        ModelRoleFlow::ConfirmRemove { role, .. } => {
+            match app.keymap.action("models", key_name).as_deref() {
+                Some("quit") => Action::Quit,
+                Some("confirm") => Action::RemoveModelRole(role),
+                Some("close") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.role_flow = None;
+                    }
+                    Action::Continue
+                }
+                _ => Action::Continue,
+            }
+        }
+        ModelRoleFlow::PickingEffort {
+            role,
+            model,
+            options,
+            selected,
+        } => match app.keymap.action("models", key_name).as_deref() {
+            Some("quit") => Action::Quit,
+            Some("close") => {
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.role_flow = Some(ModelRoleFlow::PickingModel { role });
+                }
+                Action::Continue
+            }
+            Some("previous") => {
+                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    *selected = wrapped_index(*selected, -1, options.len());
+                }
+                Action::Continue
+            }
+            Some("next") => {
+                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    *selected = wrapped_index(*selected, 1, options.len());
+                }
+                Action::Continue
+            }
+            Some("page_up") => {
+                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    *selected = bounded_index(*selected, page_up, options.len());
+                }
+                Action::Continue
+            }
+            Some("page_down") => {
+                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    *selected = bounded_index(*selected, page_down, options.len());
+                }
+                Action::Continue
+            }
+            Some("first") => {
+                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    *selected = 0;
+                }
+                Action::Continue
+            }
+            Some("last") => {
+                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
+                    .model_hub
+                    .as_mut()
+                    .and_then(|hub| hub.role_flow.as_mut())
+                {
+                    *selected = options.len().saturating_sub(1);
+                }
+                Action::Continue
+            }
+            Some("confirm") => {
+                options
+                    .get(selected)
+                    .copied()
+                    .map_or(Action::Continue, |thinking| Action::SaveModelRole {
+                        role,
+                        provider: model.provider,
+                        model: model.id,
+                        thinking,
+                    })
+            }
+            _ => Action::Continue,
+        },
+        ModelRoleFlow::PickingModel { .. } => {
+            let Some(selector) = app.model_selector.as_mut() else {
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.role_flow = None;
+                }
+                return Action::Continue;
+            };
+            match app.keymap.action("models", key_name).as_deref() {
+                Some("quit") => Action::Quit,
+                Some("close") => {
+                    if let Some(hub) = app.model_hub.as_mut() {
+                        hub.role_flow = None;
+                    }
+                    Action::Continue
+                }
+                Some("previous") => {
+                    selector.move_selection(-1);
+                    Action::Continue
+                }
+                Some("next") => {
+                    selector.move_selection(1);
+                    Action::Continue
+                }
+                Some("page_up") => {
+                    selector.page_selection(page_up);
+                    Action::Continue
+                }
+                Some("page_down") => {
+                    selector.page_selection(page_down);
+                    Action::Continue
+                }
+                Some("first") => {
+                    selector.first();
+                    Action::Continue
+                }
+                Some("last") => {
+                    selector.last();
+                    Action::Continue
+                }
+                Some("confirm") => Action::SelectModel,
+                Some("backspace") => {
+                    selector.backspace();
+                    Action::Continue
+                }
+                Some("refresh") => Action::RefreshCatalog,
+                _ => {
+                    if let KeyCode::Char(character) = key.code
+                        && !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        )
+                    {
+                        selector.push(character);
+                    }
+                    Action::Continue
+                }
+            }
+        }
+    }
+}
+
 pub(super) async fn handle_selector_key(
     app: &mut App,
     key: KeyEvent,
@@ -1907,32 +2292,6 @@ pub(super) async fn handle_selector_key(
                     .map_or(Action::Continue, |item| Action::DeleteEnvironment {
                         name: item.id.clone(),
                         return_to_settings,
-                    });
-            }
-            _ => {}
-        }
-    }
-    if matches!(
-        app.selector.as_ref().map(|selector| &selector.kind),
-        Some(SelectorKind::ModelRoles)
-    ) {
-        match app
-            .keymap
-            .action_chain(&["model_roles", "selector"], key_name)
-            .as_deref()
-        {
-            Some("add") => {
-                app.selector = None;
-                open_model_role_name_prompt(app);
-                return Action::Continue;
-            }
-            Some("remove") => {
-                return app
-                    .selector
-                    .as_ref()
-                    .and_then(SelectorState::selected_item)
-                    .map_or(Action::Continue, |item| {
-                        Action::RemoveModelRole(item.id.clone())
                     });
             }
             _ => {}
@@ -2055,33 +2414,10 @@ pub(super) async fn confirm_selector(app: &mut App, services: &LoopServices) -> 
             set_effort(app, services, &provider, &model, thinking).await;
             Action::Continue
         }
-        SelectorKind::ModelRoleEffort {
-            role,
-            provider,
-            model,
-        } => {
-            let Ok(thinking) = item.id.parse::<ThinkingLevel>() else {
-                app.set_flash("The selected effort is invalid");
-                return Action::Continue;
-            };
-            match services
-                .manager
-                .set_model_role(&role, &provider, &model, thinking)
-                .await
-            {
-                Ok(()) => app.set_flash(format!(
-                    "Model role {role} set to {provider}/{model} · effort {thinking}"
-                )),
-                Err(error) => app.set_flash(format!("Could not save model role {role}: {error:#}")),
-            }
-            app.model_selection_target = ModelSelectionTarget::Conversation;
-            Action::Continue
-        }
         SelectorKind::Environment { return_to_settings } => {
             open_environment_value_prompt(app, item.id, return_to_settings);
             Action::Continue
         }
-        SelectorKind::ModelRoles => Action::OpenRoleModel(item.id),
         SelectorKind::PluginModelRole { plugin, key } => {
             match services
                 .manager
@@ -2159,16 +2495,6 @@ pub(super) fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> A
                     value: prompt.value,
                     return_to_settings,
                 },
-                TextPurpose::ModelRoleName => {
-                    let role = prompt.value.trim().to_string();
-                    if let Err(error) = validate_model_role_name(&role) {
-                        open_model_role_name_prompt(app);
-                        app.set_flash(format!("Invalid model role name: {error}"));
-                        Action::Continue
-                    } else {
-                        Action::OpenRoleModel(role)
-                    }
-                }
                 TextPurpose::SetTerminal => Action::SaveTerminal(prompt.value),
             }
         }
@@ -2258,29 +2584,36 @@ pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) 
             Action::Continue
         }
         Some("previous") => {
-            settings.selected = wrapped_index(settings.selected, -1, 5);
+            settings.move_selection(-1);
             Action::Continue
         }
         Some("next") => {
-            settings.selected = wrapped_index(settings.selected, 1, 5);
+            settings.move_selection(1);
             Action::Continue
         }
-        Some("edit") => match settings.selected {
-            0 => Action::OpenModels(String::new()),
-            1 => Action::Continue,
-            2 => {
+        Some("previous_tab") => {
+            settings.move_tab(-1);
+            Action::Continue
+        }
+        Some("next_tab") => {
+            settings.move_tab(1);
+            Action::Continue
+        }
+        Some("edit") => match settings.selected_item() {
+            SettingsItem::Model => Action::OpenSettingsModels,
+            SettingsItem::Credential => Action::Continue,
+            SettingsItem::Thinking => {
                 settings.cycle_thinking();
                 Action::Continue
             }
-            3 => {
+            SettingsItem::OutputLimit => {
                 settings.editing = Some(EditingSetting::OutputLimit);
                 settings.output_limit.clear();
                 Action::Continue
             }
-            4 => Action::OpenEnvironment {
+            SettingsItem::Environment => Action::OpenEnvironment {
                 return_to_settings: true,
             },
-            _ => Action::Continue,
         },
         Some("save") => Action::SaveSettings,
         Some("refresh") => Action::RefreshCatalog,
@@ -2326,6 +2659,9 @@ pub(super) async fn handle_mouse(
             return Action::History(action);
         }
         return Action::Continue;
+    }
+    if let Some(action) = handle_model_settings_mouse(app, mouse) {
+        return action;
     }
     if begin_direct_transcript_selection(app, mouse) {
         return Action::Continue;
@@ -2379,35 +2715,12 @@ pub(super) async fn handle_mouse(
                     return confirm_command(app, services).await;
                 }
                 AppHit::Task(index) => app.selected_task = index,
-                AppHit::Model(index) => {
-                    if let Some(selector) = app.model_selector.as_mut() {
-                        selector.select_position(index);
-                        if activate {
-                            return Action::SelectModel;
-                        }
-                    }
-                }
-                AppHit::Setting(index) => {
-                    if let Some(settings) = app.settings.as_mut() {
-                        settings.selected = index;
-                        if activate {
-                            match index {
-                                0 => return Action::OpenModels(String::new()),
-                                2 => settings.cycle_thinking(),
-                                3 => {
-                                    settings.editing = Some(EditingSetting::OutputLimit);
-                                    settings.output_limit.clear();
-                                }
-                                4 => {
-                                    return Action::OpenEnvironment {
-                                        return_to_settings: true,
-                                    };
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+                AppHit::Model(_)
+                | AppHit::ModelHubTab(_)
+                | AppHit::ModelRole(_)
+                | AppHit::ModelRoleEffort(_)
+                | AppHit::Setting(_)
+                | AppHit::SettingsTab(_) => {}
                 AppHit::Selector(index) => {
                     let confirm = app
                         .selector
@@ -2436,6 +2749,108 @@ pub(super) fn scrollbar_history_action(
     .then_some(HistoryAction::ScrollbarTop(mouse.row))
 }
 
+pub(super) fn handle_model_settings_mouse(app: &mut App, mouse: MouseEvent) -> Option<Action> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        || !matches!(app.overlay, Some(Overlay::Models | Overlay::Settings))
+    {
+        return None;
+    }
+    let target = hit_target(&app.hit_regions, mouse)?;
+    let activate = is_double_click(&mut app.last_click, target);
+    let action = match target {
+        AppHit::Model(index) => {
+            if let Some(selector) = app.model_selector.as_mut() {
+                selector.select_position(index);
+                if activate {
+                    return Some(Action::SelectModel);
+                }
+            }
+            Action::Continue
+        }
+        AppHit::ModelHubTab(index) => {
+            if let Some(hub) = app.model_hub.as_mut()
+                && hub.role_flow.is_none()
+                && let Some(tab) = ModelHubTab::ALL.get(index)
+            {
+                hub.tab = *tab;
+            }
+            Action::Continue
+        }
+        AppHit::ModelRole(index) => {
+            if let Some(hub) = app.model_hub.as_mut()
+                && hub.role_flow.is_none()
+                && index < hub.roles.len()
+            {
+                hub.selected_role = index;
+                if activate {
+                    return Some(Action::OpenRoleModel(hub.roles[index].name.clone()));
+                }
+            }
+            Action::Continue
+        }
+        AppHit::ModelRoleEffort(index) => {
+            if let Some(ModelRoleFlow::PickingEffort {
+                role,
+                model,
+                options,
+                selected,
+            }) = app
+                .model_hub
+                .as_mut()
+                .and_then(|hub| hub.role_flow.as_mut())
+                && index < options.len()
+            {
+                *selected = index;
+                if activate {
+                    return Some(Action::SaveModelRole {
+                        role: role.clone(),
+                        provider: model.provider.clone(),
+                        model: model.id.clone(),
+                        thinking: options[index],
+                    });
+                }
+            }
+            Action::Continue
+        }
+        AppHit::Setting(index) => {
+            if let Some(settings) = app.settings.as_mut() {
+                settings.selected = index;
+                if activate {
+                    match settings.selected_item() {
+                        SettingsItem::Model => return Some(Action::OpenSettingsModels),
+                        SettingsItem::Credential => {}
+                        SettingsItem::Thinking => settings.cycle_thinking(),
+                        SettingsItem::OutputLimit => {
+                            settings.editing = Some(EditingSetting::OutputLimit);
+                            settings.output_limit.clear();
+                        }
+                        SettingsItem::Environment => {
+                            return Some(Action::OpenEnvironment {
+                                return_to_settings: true,
+                            });
+                        }
+                    }
+                }
+            }
+            Action::Continue
+        }
+        AppHit::SettingsTab(index) => {
+            if let Some(settings) = app.settings.as_mut()
+                && let Some(tab) = SettingsTab::ALL.get(index)
+            {
+                settings.tab = *tab;
+                settings.selected = settings
+                    .selected
+                    .min(settings.tab.row_count().saturating_sub(1));
+                settings.editing = None;
+            }
+            Action::Continue
+        }
+        _ => return None,
+    };
+    Some(action)
+}
+
 pub(super) fn handle_mouse_scroll(app: &mut App, direction: isize) {
     match app.overlay {
         Some(Overlay::Command) => {
@@ -2460,14 +2875,30 @@ pub(super) fn handle_mouse_scroll(app: &mut App, direction: isize) {
         }
         Some(Overlay::Models) => {
             app.cancel_mouse_scroll_animation();
-            if let Some(selector) = app.model_selector.as_mut() {
+            if let Some(ModelRoleFlow::PickingEffort {
+                options, selected, ..
+            }) = app
+                .model_hub
+                .as_mut()
+                .and_then(|hub| hub.role_flow.as_mut())
+            {
+                *selected = wrapped_index(*selected, direction, options.len());
+            } else if app
+                .model_hub
+                .as_ref()
+                .is_some_and(|hub| hub.tab == ModelHubTab::Roles && hub.role_flow.is_none())
+            {
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.move_role(direction);
+                }
+            } else if let Some(selector) = app.model_selector.as_mut() {
                 selector.move_selection(direction * SCROLL_ROWS);
             }
         }
         Some(Overlay::Settings) => {
             app.cancel_mouse_scroll_animation();
             if let Some(settings) = app.settings.as_mut() {
-                settings.selected = wrapped_index(settings.selected, direction, 5);
+                settings.move_selection(direction);
             }
         }
         Some(Overlay::Composer) => {
@@ -2804,12 +3235,7 @@ pub(super) fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> 
             app.overlay = None;
         }
         Some(
-            Overlay::Status
-            | Overlay::Help
-            | Overlay::Protocols
-            | Overlay::Tasks
-            | Overlay::Models
-            | Overlay::Plugin,
+            Overlay::Status | Overlay::Help | Overlay::Protocols | Overlay::Tasks | Overlay::Plugin,
         ) => app.overlay = None,
         Some(Overlay::Document) => {
             app.document = None;
@@ -2825,7 +3251,14 @@ pub(super) fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> 
             app.selector = None;
             app.overlay = return_to_settings.then_some(Overlay::Settings);
         }
-        Some(Overlay::Settings | Overlay::Text | Overlay::Oauth | Overlay::Terminal) | None => {
+        Some(
+            Overlay::Models
+            | Overlay::Settings
+            | Overlay::Text
+            | Overlay::Oauth
+            | Overlay::Terminal,
+        )
+        | None => {
             return false;
         }
     }
@@ -3101,17 +3534,6 @@ pub(super) fn open_environment_name_prompt(app: &mut App, return_to_settings: bo
         value: String::new(),
         secret: false,
         purpose: TextPurpose::EnvironmentName { return_to_settings },
-    });
-    app.overlay = Some(Overlay::Text);
-}
-
-pub(super) fn open_model_role_name_prompt(app: &mut App) {
-    app.text_prompt = Some(TextPrompt {
-        title: "ADD MODEL ROLE".to_string(),
-        message: "Role name · ASCII letters, digits, - or _".to_string(),
-        value: String::new(),
-        secret: false,
-        purpose: TextPurpose::ModelRoleName,
     });
     app.overlay = Some(Overlay::Text);
 }
@@ -3518,6 +3940,34 @@ pub(super) async fn open_models(
     catalog: &ModelCatalog,
     query: String,
 ) {
+    open_model_hub(app, runtime, manager, catalog, query, ModelHubTab::Models).await;
+}
+
+pub(super) async fn open_model_roles(
+    app: &mut App,
+    runtime: &AgentRuntime,
+    manager: &ConfigManager,
+    catalog: &ModelCatalog,
+) {
+    open_model_hub(
+        app,
+        runtime,
+        manager,
+        catalog,
+        String::new(),
+        ModelHubTab::Roles,
+    )
+    .await;
+}
+
+pub(super) async fn open_model_hub(
+    app: &mut App,
+    runtime: &AgentRuntime,
+    manager: &ConfigManager,
+    catalog: &ModelCatalog,
+    query: String,
+    tab: ModelHubTab,
+) {
     let active = match active_for_runtime(manager, runtime).await {
         Ok(active) => active,
         Err(error) => {
@@ -3529,18 +3979,29 @@ pub(super) async fn open_models(
         .model_providers_with_credentials(&active.provider)
         .await;
     let selector = ModelSelector::load(catalog, &active, &providers, query).await;
-    if selector.model_count() == 0 {
+    if selector.model_count() == 0 && tab == ModelHubTab::Models {
         app.set_flash("No authenticated model providers · use :login");
     }
+    let roles = match manager.model_roles().await {
+        Ok(roles) => roles,
+        Err(error) => {
+            app.set_flash(format!("Could not load model roles: {error:#}"));
+            Vec::new()
+        }
+    };
     app.model_selector = Some(selector);
+    app.model_hub = Some(ModelHubState::new(tab, roles));
     app.overlay = Some(Overlay::Models);
 }
 
-pub(super) async fn open_model_roles(app: &mut App, manager: &ConfigManager) {
+pub(super) async fn reload_model_roles(app: &mut App, manager: &ConfigManager) {
     match manager.model_roles().await {
         Ok(roles) => {
-            app.selector = Some(model_role_selector(SelectorKind::ModelRoles, roles, None));
-            app.overlay = Some(Overlay::Selector);
+            if let Some(hub) = app.model_hub.as_mut() {
+                hub.roles = roles;
+                hub.selected_role = hub.selected_role.min(hub.roles.len().saturating_sub(1));
+            }
+            app.overlay = Some(Overlay::Models);
         }
         Err(error) => app.set_flash(format!("Could not load model roles: {error:#}")),
     }
@@ -3579,11 +4040,6 @@ pub(super) fn model_role_selector(
     roles: Vec<crate::config::ModelRoleInfo>,
     selected: Option<&str>,
 ) -> SelectorState {
-    let title = if matches!(&kind, SelectorKind::ModelRoles) {
-        "MODEL ROLES · Ctrl+N add · Delete remove"
-    } else {
-        "SELECT MODEL ROLE"
-    };
     let selected_position =
         selected.and_then(|selected| roles.iter().position(|role| role.name.as_str() == selected));
     let items = roles
@@ -3603,7 +4059,7 @@ pub(super) fn model_role_selector(
             }
         })
         .collect();
-    let mut selector = SelectorState::new(kind, title, items);
+    let mut selector = SelectorState::new(kind, "SELECT MODEL ROLE", items);
     if let Some(position) = selected_position {
         selector.selected = position;
     }
@@ -3617,35 +4073,39 @@ pub(super) async fn open_models_for_role(
     catalog: &ModelCatalog,
     role: String,
 ) {
-    let mut active = match active_for_runtime(manager, runtime).await {
+    if app.model_hub.is_none() || app.model_selector.is_none() {
+        open_model_roles(app, runtime, manager, catalog).await;
+    }
+    let active = match active_for_runtime(manager, runtime).await {
         Ok(active) => active,
         Err(error) => {
             app.set_flash(format!("Could not resolve session model: {error:#}"));
             return;
         }
     };
-    let current_provider = active.provider.clone();
+    let providers = manager
+        .model_providers_with_credentials(&active.provider)
+        .await;
+    let mut selector = ModelSelector::load(catalog, &active, &providers, String::new()).await;
     match manager.model_role(&role).await {
-        Ok(Some(configured)) => {
-            active.provider = configured.provider;
-            active.model = configured.model;
-            active.thinking = configured.thinking;
-        }
+        Ok(Some(configured)) => selector.select_model(&configured.provider, &configured.model),
         Ok(None) => {}
         Err(error) => {
             app.set_flash(format!("Could not resolve model role {role}: {error:#}"));
             return;
         }
     }
-    let providers = manager
-        .model_providers_with_credentials(&current_provider)
-        .await;
-    let selector = ModelSelector::load(catalog, &active, &providers, String::new()).await;
     if selector.model_count() == 0 {
         app.set_flash("No authenticated model providers · use :login");
     }
-    app.model_selection_target = ModelSelectionTarget::Role(role);
     app.model_selector = Some(selector);
+    if let Some(hub) = app.model_hub.as_mut() {
+        hub.tab = ModelHubTab::Roles;
+        if let Some(position) = hub.roles.iter().position(|info| info.name == role) {
+            hub.selected_role = position;
+        }
+        hub.role_flow = Some(ModelRoleFlow::PickingModel { role });
+    }
     app.overlay = Some(Overlay::Models);
 }
 
@@ -3666,12 +4126,45 @@ pub(super) async fn select_model(
         return;
     };
     let requested = format!("{}/{}", model.provider, model.id);
-    if let ModelSelectionTarget::Role(role) = app.model_selection_target.clone() {
+    if let Some(role) = app
+        .model_hub
+        .as_ref()
+        .and_then(|hub| match hub.role_flow.as_ref() {
+            Some(ModelRoleFlow::PickingModel { role }) => Some(role.clone()),
+            _ => None,
+        })
+    {
         let configured = manager.thinking_for_model(&model.provider, &model.id).await;
         let effective = clamp_thinking_level(&model, configured);
-        app.selector = Some(model_role_effort_selector(&role, &model, effective));
+        let options = ThinkingLevel::ALL
+            .into_iter()
+            .filter(|level| model.supports_thinking_level(*level))
+            .collect::<Vec<_>>();
+        let selected = options
+            .iter()
+            .position(|level| *level == effective)
+            .unwrap_or_default();
+        if let Some(hub) = app.model_hub.as_mut() {
+            hub.role_flow = Some(ModelRoleFlow::PickingEffort {
+                role,
+                model,
+                options,
+                selected,
+            });
+        }
+        return;
+    }
+    if app.model_selection_target == ModelSelectionTarget::Settings {
+        let configured = manager.thinking_for_model(&model.provider, &model.id).await;
+        let effective = clamp_thinking_level(&model, configured);
+        if let Some(settings) = app.settings.as_mut() {
+            settings.model = Some(model);
+            settings.thinking = effective;
+        }
         app.model_selector = None;
-        app.overlay = Some(Overlay::Selector);
+        app.model_hub = None;
+        app.model_selection_target = ModelSelectionTarget::Conversation;
+        app.overlay = Some(Overlay::Settings);
         return;
     }
     let result = async {
@@ -3685,6 +4178,7 @@ pub(super) async fn select_model(
         Ok(active) => {
             app.overlay = None;
             app.model_selector = None;
+            app.model_hub = None;
             app.settings = None;
             app.set_flash(
                 if active.provider == model.provider && active.model == model.id {
@@ -3755,45 +4249,6 @@ pub(super) fn effort_selector(active: &ActiveSettings, model: &CatalogModel) -> 
             model: model.id.clone(),
         },
         format!("EFFORT · {}/{}", model.provider, model.id),
-        items,
-    );
-    selector.selected = selected;
-    selector
-}
-
-pub(super) fn model_role_effort_selector(
-    role: &str,
-    model: &CatalogModel,
-    effective: ThinkingLevel,
-) -> SelectorState {
-    let available = ThinkingLevel::ALL
-        .into_iter()
-        .filter(|level| model.supports_thinking_level(*level))
-        .collect::<Vec<_>>();
-    let selected = available
-        .iter()
-        .position(|level| *level == effective)
-        .unwrap_or_default();
-    let items = available
-        .into_iter()
-        .map(|level| SelectorItem {
-            id: level.to_string(),
-            title: level.to_string(),
-            description: if level == effective {
-                "current model preference".to_string()
-            } else {
-                format!("available for {}/{}", model.provider, model.id)
-            },
-            search_text: None,
-        })
-        .collect();
-    let mut selector = SelectorState::new(
-        SelectorKind::ModelRoleEffort {
-            role: role.to_string(),
-            provider: model.provider.clone(),
-            model: model.id.clone(),
-        },
-        format!("ROLE {role} EFFORT · {}/{}", model.provider, model.id),
         items,
     );
     selector.selected = selected;
@@ -3880,6 +4335,7 @@ pub(super) async fn save_settings(
     let selection = settings
         .model()
         .map(|model| (settings.provider().to_string(), model.id.clone()));
+    let settings_view = (settings.tab, settings.selected);
     let thinking = settings.thinking;
     let output_limit = match settings.output_limit.parse::<usize>() {
         Ok(limit) if limit >= 1024 => limit,
@@ -3914,7 +4370,12 @@ pub(super) async fn save_settings(
             active_for_runtime(manager, runtime).await?
         };
         apply_active(app, runtime, manager, catalog, output, &active).await?;
-        app.settings = Some(SettingsState::load(active, catalog, environment).await);
+        let mut settings = SettingsState::load(active, catalog, environment).await;
+        settings.tab = settings_view.0;
+        settings.selected = settings_view
+            .1
+            .min(settings.tab.row_count().saturating_sub(1));
+        app.settings = Some(settings);
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -4062,36 +4523,49 @@ pub(super) async fn finish_background(
                 )
                 .await?;
                 if app.settings.is_some() {
-                    app.settings = Some(
-                        SettingsState::load(
-                            active.clone(),
-                            &services.catalog,
-                            &services.environment,
-                        )
-                        .await,
-                    );
+                    let view = app
+                        .settings
+                        .as_ref()
+                        .map(|settings| (settings.tab, settings.selected))
+                        .unwrap_or_default();
+                    let mut settings = SettingsState::load(
+                        active.clone(),
+                        &services.catalog,
+                        &services.environment,
+                    )
+                    .await;
+                    settings.tab = view.0;
+                    settings.selected = view.1.min(settings.tab.row_count().saturating_sub(1));
+                    app.settings = Some(settings);
                 }
                 if let Some(query) = app
                     .model_selector
                     .as_ref()
                     .map(|selector| selector.query().to_string())
                 {
-                    let mut selector_active = active.clone();
-                    if let ModelSelectionTarget::Role(role) = &app.model_selection_target
-                        && let Some(configured) = services.manager.model_role(role).await?
-                    {
-                        selector_active.provider = configured.provider;
-                        selector_active.model = configured.model;
-                        selector_active.thinking = configured.thinking;
-                    }
                     let providers = services
                         .manager
                         .model_providers_with_credentials(&active.provider)
                         .await;
-                    app.model_selector = Some(
-                        ModelSelector::load(&services.catalog, &selector_active, &providers, query)
-                            .await,
-                    );
+                    let mut selector =
+                        ModelSelector::load(&services.catalog, &active, &providers, query).await;
+                    let role =
+                        app.model_hub
+                            .as_ref()
+                            .and_then(|hub| match hub.role_flow.as_ref() {
+                                Some(ModelRoleFlow::PickingModel { role }) => Some(role.clone()),
+                                _ => None,
+                            });
+                    if let Some(role) = role
+                        && let Some(configured) = services.manager.model_role(&role).await?
+                    {
+                        selector.select_model(&configured.provider, &configured.model);
+                    }
+                    app.model_selector = Some(selector);
+                }
+                if let Some(hub) = app.model_hub.as_mut() {
+                    hub.roles = services.manager.model_roles().await?;
+                    hub.selected_role = hub.selected_role.min(hub.roles.len().saturating_sub(1));
                 }
                 Ok::<_, anyhow::Error>(report)
             }

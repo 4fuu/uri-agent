@@ -3292,7 +3292,6 @@ fn clicking_outside_dismisses_cancelable_floats() {
         Overlay::Help,
         Overlay::Protocols,
         Overlay::Tasks,
-        Overlay::Models,
         Overlay::Plugin,
     ] {
         app.overlay = Some(overlay);
@@ -3379,6 +3378,7 @@ fn clicking_outside_does_not_dismiss_editing_or_active_work_floats() {
     };
 
     for overlay in [
+        Overlay::Models,
         Overlay::Settings,
         Overlay::Text,
         Overlay::Oauth,
@@ -5096,6 +5096,7 @@ fn settings_panel_hides_the_api_key_and_cycles_thinking() {
         active,
         model: None,
         environment_count: 2,
+        tab: SettingsTab::Model,
         selected: 0,
         editing: None,
         api_key: String::new(),
@@ -5105,11 +5106,64 @@ fn settings_panel_hides_the_api_key_and_cycles_thinking() {
     });
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("SETTINGS"));
+    assert!(rendered.contains("MODEL"));
+    assert!(rendered.contains("AGENT"));
     assert!(rendered.contains("API key"));
     assert!(rendered.contains("Thinking"));
     assert!(rendered.contains("off"));
-    assert!(rendered.contains("Agent environment"));
-    assert!(rendered.contains("2 variables"));
+    assert!(rendered.contains("DETAIL"));
+    assert!(!rendered.contains("SAVE TARGET"));
+    assert!(!rendered.contains("Agent environment"));
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| region.target == AppHit::SettingsTab(1))
+    );
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| region.target == AppHit::Setting(2))
+    );
+    let model_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Setting(0)).then_some(region.area))
+        .unwrap();
+    let model_click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: model_row.x,
+        row: model_row.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(matches!(
+        handle_model_settings_mouse(&mut app, model_click),
+        Some(Action::Continue)
+    ));
+    assert!(app.selection.is_none());
+    assert!(matches!(
+        handle_model_settings_mouse(&mut app, model_click),
+        Some(Action::OpenSettingsModels)
+    ));
+
+    let agent_tab = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::SettingsTab(1)).then_some(region.area))
+        .unwrap();
+    assert!(matches!(
+        handle_model_settings_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: agent_tab.x,
+                row: agent_tab.y,
+                modifiers: KeyModifiers::NONE,
+            }
+        ),
+        Some(Action::Continue)
+    ));
+    assert_eq!(app.settings.as_ref().unwrap().tab, SettingsTab::Agent);
+    app.settings.as_mut().unwrap().tab = SettingsTab::Model;
     assert!(!rendered.contains("super-secret-value"));
     assert!(!rendered.contains("Editor"));
     assert!(!rendered.contains("fzf"));
@@ -5126,7 +5180,14 @@ fn settings_panel_hides_the_api_key_and_cycles_thinking() {
         }))
         .unwrap(),
     );
-    settings.selected = 2;
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("PENDING"));
+    assert!(
+        rendered.contains("selection remains pending until")
+            && rendered.contains("Settings is saved"),
+        "{rendered}"
+    );
+    app.settings.as_mut().unwrap().selected = 2;
     let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
     assert!(matches!(
         handle_settings_key(&mut app, key, &key_name(key)),
@@ -5137,13 +5198,35 @@ fn settings_panel_hides_the_api_key_and_cycles_thinking() {
         ThinkingLevel::Minimal
     );
 
-    app.settings.as_mut().unwrap().selected = 4;
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+    assert!(matches!(
+        handle_settings_key(&mut app, tab, &key_name(tab)),
+        Action::Continue
+    ));
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("Output limit"));
+    assert!(rendered.contains("Agent environment"));
+    assert!(rendered.contains("2 variables"));
+    assert!(!rendered.contains("Credential"));
+
+    app.settings.as_mut().unwrap().selected = 1;
     assert!(matches!(
         handle_settings_key(&mut app, key, &key_name(key)),
         Action::OpenEnvironment {
             return_to_settings: true
         }
     ));
+
+    app.model_selection_target = ModelSelectionTarget::Settings;
+    app.model_hub = Some(ModelHubState::new(ModelHubTab::Models, Vec::new()));
+    app.overlay = Some(Overlay::Models);
+    close_model_hub(&mut app);
+    assert!(app.overlay == Some(Overlay::Settings));
+    assert!(app.settings.as_ref().is_some_and(|settings| {
+        settings
+            .model()
+            .is_some_and(|model| model.id == "reasoning-model")
+    }));
 }
 
 #[test]
@@ -5185,12 +5268,14 @@ fn environment_prompts_hide_values_and_return_to_the_manager() {
 }
 
 #[test]
-fn model_role_selector_labels_assignments_and_custom_role_names_open_model_selection() {
+fn model_hub_labels_role_assignments_and_keeps_role_creation_inline() {
     let roles = vec![
         crate::config::ModelRoleInfo {
             name: "small".to_string(),
             role: None,
             error: None,
+            source: None,
+            overrides_global: false,
         },
         crate::config::ModelRoleInfo {
             name: "title".to_string(),
@@ -5200,30 +5285,112 @@ fn model_role_selector_labels_assignments_and_custom_role_names_open_model_selec
                 thinking: ThinkingLevel::Low,
             }),
             error: None,
+            source: Some(ValueSource::Project),
+            overrides_global: true,
         },
     ];
     let mut app = test_app();
-    app.selector = Some(model_role_selector(SelectorKind::ModelRoles, roles, None));
-    app.overlay = Some(Overlay::Selector);
+    app.model_hub = Some(ModelHubState::new(ModelHubTab::Roles, roles));
+    app.overlay = Some(Overlay::Models);
 
     let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("MODEL ROLES"));
+    assert!(rendered.contains("MODEL HUB"));
+    assert!(rendered.contains("MODELS"));
+    assert!(rendered.contains("ROLES"));
     assert!(rendered.contains("small"));
     assert!(rendered.contains("no model assigned"));
+    assert!(rendered.contains("BUILT-IN"));
     assert!(rendered.contains("title"));
-    assert!(rendered.contains("example/small-model · low"));
+    assert!(rendered.contains("example/small-model"));
+    assert!(rendered.contains("low"));
+    assert!(rendered.contains("PROJECT ← GLOBAL"));
+    assert!(!rendered.contains("SAVE TARGET"));
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| region.target == AppHit::ModelHubTab(0))
+    );
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| region.target == AppHit::ModelRole(1))
+    );
+    let role_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::ModelRole(1)).then_some(region.area))
+        .unwrap();
+    let role_click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: role_row.x,
+        row: role_row.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(matches!(
+        handle_model_settings_mouse(&mut app, role_click),
+        Some(Action::Continue)
+    ));
+    assert_eq!(app.model_hub.as_ref().unwrap().selected_role, 1);
+    assert!(app.selection.is_none());
+    assert!(matches!(
+        handle_model_settings_mouse(&mut app, role_click),
+        Some(Action::OpenRoleModel(role)) if role == "title"
+    ));
 
-    open_model_role_name_prompt(&mut app);
-    app.text_prompt.as_mut().unwrap().value = "terminal-title".to_string();
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, tab, &key_name(tab)),
+        Action::Continue
+    ));
+    assert_eq!(app.model_hub.as_ref().unwrap().tab, ModelHubTab::Models);
+    let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, backtab, &key_name(backtab)),
+        Action::Continue
+    ));
+    assert_eq!(app.model_hub.as_ref().unwrap().tab, ModelHubTab::Roles);
+
+    app.model_hub.as_mut().unwrap().selected_role = 1;
+    let delete = KeyEvent::new(KeyCode::Delete, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, delete, &key_name(delete)),
+        Action::Continue
+    ));
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("PROJECT title → GLOBAL fallback"));
+    assert!(
+        !app.hit_regions
+            .iter()
+            .any(|region| matches!(region.target, AppHit::ModelRole(_)))
+    );
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, escape, &key_name(escape)),
+        Action::Continue
+    ));
+    assert!(
+        app.model_hub
+            .as_ref()
+            .is_some_and(|hub| hub.role_flow.is_none())
+    );
+
+    let add = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+    assert!(matches!(
+        handle_models_key(&mut app, add, &key_name(add)),
+        Action::Continue
+    ));
+    handle_paste(&mut app, "terminal-title".to_string());
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("NEW ROLE terminal-title█"), "{rendered}");
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
     assert!(matches!(
-        handle_text_key(&mut app, enter, &key_name(enter)),
+        handle_models_key(&mut app, enter, &key_name(enter)),
         Action::OpenRoleModel(role) if role == "terminal-title"
     ));
 }
 
 #[test]
-fn model_role_effort_selector_keeps_role_and_model_until_effort_confirmation() {
+fn model_role_flow_returns_from_effort_to_model_and_confirms_the_complete_assignment() {
     let model = CatalogModel {
         id: "reasoning-model".to_string(),
         name: "Reasoning model".to_string(),
@@ -5233,20 +5400,55 @@ fn model_role_effort_selector_keeps_role_and_model_until_effort_confirmation() {
         headers: BTreeMap::new(),
         metadata: BTreeMap::from([("reasoning".to_string(), serde_json::json!(true))]),
     };
-    let selector = model_role_effort_selector("review", &model, ThinkingLevel::High);
+    let mut app = test_app();
+    app.model_hub = Some(ModelHubState {
+        tab: ModelHubTab::Roles,
+        roles: Vec::new(),
+        selected_role: 0,
+        role_flow: Some(ModelRoleFlow::PickingEffort {
+            role: "review".to_string(),
+            model: model.clone(),
+            options: vec![ThinkingLevel::Off, ThinkingLevel::High],
+            selected: 1,
+        }),
+    });
+    app.overlay = Some(Overlay::Models);
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("ASSIGN review · STEP 2 OF 2"));
+    assert!(rendered.contains("example/reasoning-model"));
+    assert!(rendered.contains("high"));
 
-    assert_eq!(
-        selector.title,
-        "ROLE review EFFORT · example/reasoning-model"
-    );
-    assert_eq!(selector.selected_item().unwrap().id, "high");
+    let home = KeyEvent::new(KeyCode::Home, KeyModifiers::empty());
     assert!(matches!(
-        selector.kind,
-        SelectorKind::ModelRoleEffort {
-            role,
-            provider,
-            model
-        } if role == "review" && provider == "example" && model == "reasoning-model"
+        handle_models_key(&mut app, home, &key_name(home)),
+        Action::Continue
+    ));
+    assert!(matches!(
+        app.model_hub
+            .as_ref()
+            .and_then(|hub| hub.role_flow.as_ref()),
+        Some(ModelRoleFlow::PickingEffort { selected: 0, .. })
+    ));
+    let end = KeyEvent::new(KeyCode::End, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, end, &key_name(end)),
+        Action::Continue
+    ));
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, enter, &key_name(enter)),
+        Action::SaveModelRole { role, provider, model, thinking: ThinkingLevel::High }
+            if role == "review" && provider == "example" && model == "reasoning-model"
+    ));
+
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+    assert!(matches!(
+        handle_models_key(&mut app, escape, &key_name(escape)),
+        Action::Continue
+    ));
+    assert!(matches!(
+        app.model_hub.as_ref().and_then(|hub| hub.role_flow.as_ref()),
+        Some(ModelRoleFlow::PickingModel { role }) if role == "review"
     ));
 }
 
@@ -5889,8 +6091,9 @@ fn macos_key_display_formats_composer_panel_and_help_hints() {
     assert!(rendered.contains("↩ send · ⇧ ↩ newline · ⌥ V image"));
 
     app.overlay = Some(Overlay::Models);
+    app.model_hub = Some(ModelHubState::new(ModelHubTab::Models, Vec::new()));
     let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("MODELS · ⌃ R refresh"));
+    assert!(rendered.contains("MODEL HUB · ⌃ R refresh"));
 
     let help = keymap_help(&app.keymap);
     assert!(help.contains("⌘ C"));

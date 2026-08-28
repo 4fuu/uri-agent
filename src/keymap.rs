@@ -118,6 +118,11 @@ map("settings", "k", "previous");
 map("settings", "enter", "edit");
 map("settings", "s", "save");
 map("settings", "r", "refresh");
+map("settings", "tab", "next_tab");
+map("settings", "backtab", "previous_tab");
+map("settings", "shift+tab", "previous_tab");
+map("settings", "left", "previous_tab");
+map("settings", "right", "next_tab");
 map("settings", "esc", "close");
 
 map("models", "up", "previous");
@@ -130,6 +135,9 @@ map("models", "enter", "confirm");
 map("models", "esc", "close");
 map("models", "backspace", "backspace");
 map("models", "ctrl+r", "refresh");
+map("models", "tab", "next_tab");
+map("models", "backtab", "previous_tab");
+map("models", "shift+tab", "previous_tab");
 
 map("text", "enter", "confirm");
 map("text", "esc", "cancel");
@@ -870,6 +878,15 @@ mod tests {
             Some("interrupt_on_double_press")
         );
         assert_eq!(keymap.action("models", "down").as_deref(), Some("next"));
+        assert_eq!(keymap.action("models", "tab").as_deref(), Some("next_tab"));
+        assert_eq!(
+            keymap.action("settings", "right").as_deref(),
+            Some("next_tab")
+        );
+        assert_eq!(
+            keymap.action("settings", "backtab").as_deref(),
+            Some("previous_tab")
+        );
         assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
         assert_eq!(
             keymap.action("model_roles", "ctrl+n").as_deref(),

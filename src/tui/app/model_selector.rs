@@ -103,6 +103,15 @@ impl ModelSelector {
         }
     }
 
+    pub(super) fn select_model(&mut self, provider: &str, model: &str) {
+        if let Some(position) = self.visible.iter().position(|index| {
+            let candidate = &self.models[*index];
+            candidate.provider == provider && candidate.id == model
+        }) {
+            self.selected = position;
+        }
+    }
+
     pub(super) fn selected_position(&self) -> usize {
         self.selected
     }
