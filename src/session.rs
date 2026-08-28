@@ -37,6 +37,37 @@ const RESUME_EVENT_KINDS: &[&str] = &[
     "compaction",
 ];
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SessionTuiState {
+    pub(crate) head_sequence: Option<u64>,
+    pub(crate) latest_compaction_sequence: Option<u64>,
+    pub(crate) usage: SessionTuiUsage,
+    pub(crate) token_calibration: SessionTuiTokenCalibration,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SessionTuiUsage {
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_write: u64,
+    pub(crate) cost: f64,
+    pub(crate) last_cache_hit: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SessionTuiTokenCalibration {
+    pub(crate) visible_units: u64,
+    pub(crate) output_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionEventHeader {
+    pub(crate) sequence: u64,
+    pub(crate) starts_turn: bool,
+    pub(crate) finishes_turn: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum SessionChoice {
     New,
@@ -405,6 +436,8 @@ struct State {
 struct ResumeState {
     through_sequence: Option<u64>,
     context_sequence: Option<u64>,
+    #[serde(default)]
+    latest_compaction_sequence: Option<u64>,
     model_settings: Option<SessionModelSettings>,
     has_user: bool,
     successful_help_reads: HashSet<String>,
@@ -560,6 +593,9 @@ fn restore_persisted_state(
                 .ok()
                 .flatten()
                 .unwrap_or(false);
+            if is_compaction {
+                state.latest_compaction_sequence = Some(through);
+            }
             is_compaction.then_some((through, std::mem::take(&mut state)))
         });
 
@@ -721,6 +757,15 @@ pub struct Session {
     connection: Connection,
     state: Arc<Mutex<State>>,
     events: broadcast::Sender<SessionUpdate>,
+    #[cfg(test)]
+    event_read_audit: Arc<std::sync::Mutex<SessionEventReadAudit>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SessionEventReadAudit {
+    pub(crate) payload_pages: Vec<Vec<u64>>,
+    pub(crate) header_pages: Vec<Vec<u64>>,
 }
 
 impl Session {
@@ -952,6 +997,8 @@ impl Session {
                 replay,
             })),
             events,
+            #[cfg(test)]
+            event_read_audit: Arc::default(),
         };
         Ok(session)
     }
@@ -1073,6 +1120,26 @@ impl Session {
         self.query_event_page(EventPage::All).await
     }
 
+    pub(crate) async fn tui_state(&self) -> SessionTuiState {
+        let state = self.state.lock().await;
+        SessionTuiState {
+            head_sequence: state.head_sequence,
+            latest_compaction_sequence: state.derived.latest_compaction_sequence,
+            usage: SessionTuiUsage {
+                input: state.derived.usage.input,
+                output: state.derived.usage.output,
+                cache_read: state.derived.usage.cache_read,
+                cache_write: state.derived.usage.cache_write,
+                cost: state.derived.usage.cost,
+                last_cache_hit: state.derived.usage.last_cache_hit,
+            },
+            token_calibration: SessionTuiTokenCalibration {
+                visible_units: state.derived.token_calibration.visible_units,
+                output_tokens: state.derived.token_calibration.output_tokens,
+            },
+        }
+    }
+
     pub async fn task_reports(&self) -> Result<Vec<TaskReport>> {
         let (persisted, tasks, in_memory) = {
             let state = self.state.lock().await;
@@ -1183,6 +1250,79 @@ impl Session {
     pub async fn tail_events(&self, limit: usize) -> Result<Vec<SessionEvent>> {
         self.query_event_page(EventPage::Tail(limit.min(MAX_EVENT_PAGE)))
             .await
+    }
+
+    pub(crate) async fn event_headers_before(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEventHeader>> {
+        let sequence = sequence.min(i64::MAX as u64);
+        let limit = limit.min(MAX_EVENT_PAGE);
+        let state = self.state.lock().await;
+        if !state.persisted {
+            let mut headers = state
+                .events
+                .iter()
+                .rev()
+                .filter(|event| event.sequence < sequence)
+                .take(limit)
+                .map(event_header)
+                .collect::<Vec<_>>();
+            headers.reverse();
+            #[cfg(test)]
+            self.record_header_page(&headers);
+            return Ok(headers);
+        }
+        drop(state);
+
+        let id = self.id.clone();
+        let headers = self
+            .connection
+            .call(move |db| {
+                let mut statement = db.prepare(
+                    "SELECT sequence, kind FROM (
+                       SELECT sequence, kind FROM events
+                       WHERE session_id = ?1 AND sequence < ?2
+                       ORDER BY sequence DESC LIMIT ?3
+                     ) ORDER BY sequence",
+                )?;
+                statement
+                    .query_map(params![id, sequence as i64, limit as i64], |row| {
+                        let sequence = row.get::<_, i64>(0)?;
+                        let kind = row.get::<_, String>(1)?;
+                        Ok(SessionEventHeader {
+                            sequence: sequence as u64,
+                            starts_turn: kind == "user",
+                            finishes_turn: kind == "turn_finished",
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .context("cannot read session event headers")?;
+        #[cfg(test)]
+        self.record_header_page(&headers);
+        Ok(headers)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_event_read_audit(&self) {
+        *self.event_read_audit.lock().unwrap() = SessionEventReadAudit::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_read_audit(&self) -> SessionEventReadAudit {
+        self.event_read_audit.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn record_header_page(&self, headers: &[SessionEventHeader]) {
+        self.event_read_audit
+            .lock()
+            .unwrap()
+            .header_pages
+            .push(headers.iter().map(|header| header.sequence).collect());
     }
 
     pub async fn model_history(&self) -> Vec<Message> {
@@ -1507,12 +1647,19 @@ impl Session {
                     state.events[start..].to_vec()
                 }
             };
+            #[cfg(test)]
+            self.event_read_audit
+                .lock()
+                .unwrap()
+                .payload_pages
+                .push(events.iter().map(|event| event.sequence).collect());
             return Ok(events);
         }
         drop(state);
 
         let id = self.id.clone();
-        self.connection
+        let events = self
+            .connection
             .call(move |db| {
                 let (sql, cursor, limit) = match page {
                     EventPage::All => (
@@ -1554,7 +1701,22 @@ impl Session {
                 rows.collect::<Result<Vec<_>, _>>()
             })
             .await
-            .context("cannot read session event page")
+            .context("cannot read session event page")?;
+        #[cfg(test)]
+        self.event_read_audit
+            .lock()
+            .unwrap()
+            .payload_pages
+            .push(events.iter().map(|event| event.sequence).collect());
+        Ok(events)
+    }
+}
+
+fn event_header(event: &SessionEvent) -> SessionEventHeader {
+    SessionEventHeader {
+        sequence: event.sequence,
+        starts_turn: matches!(&event.kind, EventKind::User { .. }),
+        finishes_turn: matches!(&event.kind, EventKind::TurnFinished),
     }
 }
 
@@ -1950,7 +2112,13 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.token_calibration.pending_visible_units = 0;
             state.token_calibration.pending_reasoning_visible = false;
         }
-        EventKind::ModelRetry { .. } | EventKind::Compaction { .. } | EventKind::Error { .. } => {
+        EventKind::Compaction { .. } => {
+            state.latest_compaction_sequence = Some(event.sequence);
+            state.token_calibration.pending_visible_units = 0;
+            state.token_calibration.pending_reasoning_visible = false;
+            state.token_calibration.pending_usage = None;
+        }
+        EventKind::ModelRetry { .. } | EventKind::Error { .. } => {
             state.token_calibration.pending_visible_units = 0;
             state.token_calibration.pending_reasoning_visible = false;
             state.token_calibration.pending_usage = None;

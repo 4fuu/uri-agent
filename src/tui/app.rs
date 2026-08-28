@@ -26,7 +26,9 @@ use crate::plugin::{
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
-use crate::session::{EventKind, SessionEvent, SessionSummary, SessionUpdate};
+use crate::session::{
+    EventKind, Session, SessionEvent, SessionSummary, SessionTuiState, SessionUpdate,
+};
 use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -97,6 +99,7 @@ const WEB_SEARCH_LOGIN_PROVIDERS: &[&str] = &["parallel", "exa"];
 const IMAGE_TOKEN_PREFIX: &str = "[Image #";
 const IMAGE_MARKER_PREFIX: &str = "[Image #";
 
+#[derive(Clone)]
 pub struct TuiInfo {
     pub cwd: PathBuf,
     pub provider: String,
@@ -134,6 +137,7 @@ enum BlockKind {
 }
 
 struct DisplayBlock {
+    id: u64,
     kind: BlockKind,
     title: String,
     text: String,
@@ -185,6 +189,13 @@ struct TranscriptLayoutCache {
     blocks: Vec<TranscriptLayoutBlock>,
     rows: usize,
     dirty_from: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptAnchor {
+    block_id: u64,
+    offset_from_block: isize,
+    animation_distance: Option<isize>,
 }
 
 #[cfg(test)]
@@ -667,9 +678,11 @@ struct App {
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
+    oldest_sequence: Option<u64>,
+    history_complete: bool,
     applying_transient: bool,
+    applying_sequence: u64,
     reasoning_folded_during_stream: bool,
-    next_process_id: u64,
     info: TuiInfo,
     flashes: Vec<FlashNotice>,
     model_selector: Option<ModelSelector>,
@@ -760,9 +773,11 @@ impl App {
             started: Instant::now(),
             splash_skipped: !show_splash,
             last_sequence: None,
+            oldest_sequence: None,
+            history_complete: true,
             applying_transient: false,
+            applying_sequence: 0,
             reasoning_folded_during_stream: false,
-            next_process_id: 0,
             info,
             flashes: Vec::new(),
             model_selector: None,
@@ -917,6 +932,7 @@ impl App {
         {
             return;
         }
+        self.applying_sequence = event.sequence;
         self.last_sequence = Some(event.sequence);
         if matches!(
             &event.kind,
@@ -1144,7 +1160,7 @@ impl App {
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
-                self.finish_current_turn();
+                self.finish_current_turn(self.applying_sequence);
             }
         }
         if select_tail {
@@ -1198,7 +1214,7 @@ impl App {
         }
     }
 
-    fn finish_current_turn(&mut self) {
+    fn finish_current_turn(&mut self, process_id: u64) {
         let turn_start = self
             .blocks
             .iter()
@@ -1229,8 +1245,6 @@ impl App {
             return;
         }
 
-        let process_id = self.next_process_id;
-        self.next_process_id += 1;
         for block in &mut self.blocks[turn_start..process_end] {
             block.parent_process = Some(process_id);
             if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
@@ -1241,6 +1255,7 @@ impl App {
         self.blocks.insert(
             turn_start,
             DisplayBlock {
+                id: process_id,
                 kind: BlockKind::Process,
                 title: "PROCESS".to_string(),
                 text: String::new(),
@@ -1292,6 +1307,126 @@ impl App {
         self.sync_composer_chrome();
     }
 
+    fn restore_session_stats(&mut self, state: &SessionTuiState) {
+        self.usage = UsageTotals {
+            input: state.usage.input,
+            output: state.usage.output,
+            cache_read: state.usage.cache_read,
+            cache_write: state.usage.cache_write,
+            cost: state.usage.cost,
+        };
+        self.last_cache_hit = state.usage.last_cache_hit;
+        self.token_rate.restore_calibration(
+            state.token_calibration.visible_units,
+            state.token_calibration.output_tokens,
+        );
+    }
+
+    fn set_history_range(&mut self, oldest: Option<u64>, complete: bool) {
+        self.oldest_sequence = oldest;
+        self.history_complete = complete;
+    }
+
+    fn prepend_history(&mut self, events: Vec<SessionEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let selected_id = self.blocks.get(self.selected_block).map(|block| block.id);
+        let anchor = self.transcript_anchor();
+        let mut older = App::new(
+            self.protocols.clone(),
+            self.commands.clone(),
+            self.tui.clone(),
+            self.info.clone(),
+            self.keymap.clone(),
+            String::new(),
+            false,
+        );
+        for event in events {
+            older.apply(event);
+        }
+        older.finish_hydration();
+        let mut blocks = older.blocks;
+        blocks.append(&mut self.blocks);
+        self.blocks = blocks;
+        older.flashes.append(&mut self.flashes);
+        self.flashes = older.flashes;
+        if let Some(selected_id) = selected_id {
+            self.selected_block = self
+                .blocks
+                .iter()
+                .position(|block| block.id == selected_id)
+                .unwrap_or_default();
+        }
+        self.transcript_layout.dirty_from = Some(0);
+        self.hit_regions.clear();
+        if let Some(anchor) = anchor {
+            self.restore_transcript_anchor(anchor);
+        }
+    }
+
+    fn transcript_anchor(&self) -> Option<TranscriptAnchor> {
+        let entry = self.transcript_layout.blocks.iter().find(|entry| {
+            entry.block_start + entry.block_rows + usize::from(entry.user_padding)
+                > self.transcript_offset
+        })?;
+        let target = match self.mouse_scroll_animation {
+            Some(MouseScrollAnimation::Transcript { target, .. }) => Some(target),
+            _ => None,
+        };
+        Some(TranscriptAnchor {
+            block_id: self.blocks[entry.index].id,
+            offset_from_block: self.transcript_offset as isize - entry.block_start as isize,
+            animation_distance: target
+                .map(|target| target as isize - self.transcript_offset as isize),
+        })
+    }
+
+    fn restore_transcript_anchor(&mut self, anchor: TranscriptAnchor) {
+        let message_width = self.transcript_layout.message_width;
+        let process_width = self.transcript_layout.process_width;
+        if message_width == 0 || process_width == 0 {
+            return;
+        }
+        let active_block = self.active_transcript_block();
+        rebuild_transcript_layout(self, message_width, process_width, active_block);
+        self.transcript_rows = self.transcript_layout.rows;
+        let Some(block_index) = self
+            .blocks
+            .iter()
+            .position(|block| block.id == anchor.block_id)
+        else {
+            return;
+        };
+        let Some(block_start) = self
+            .transcript_layout
+            .blocks
+            .iter()
+            .find(|entry| entry.index == block_index)
+            .map(|entry| entry.block_start)
+        else {
+            return;
+        };
+        self.transcript_offset = block_start.saturating_add_signed(anchor.offset_from_block);
+        if let Some(surface) = self
+            .selectable
+            .as_mut()
+            .filter(|surface| surface.overlay.is_none())
+        {
+            surface.scroll_origin = self.transcript_offset;
+        }
+        if let (Some(distance), Some(MouseScrollAnimation::Transcript { target, .. })) = (
+            anchor.animation_distance,
+            self.mouse_scroll_animation.as_mut(),
+        ) {
+            *target = self.transcript_offset.saturating_add_signed(distance);
+        }
+    }
+
+    fn clear_transcript_anchor(&mut self) {
+        self.transcript_center_selected = true;
+    }
+
     fn push(
         &mut self,
         kind: BlockKind,
@@ -1303,6 +1438,7 @@ impl App {
     ) {
         let index = self.blocks.len();
         self.blocks.push(DisplayBlock {
+            id: self.applying_sequence,
             kind,
             title: title.to_string(),
             text,

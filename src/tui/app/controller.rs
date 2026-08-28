@@ -4,6 +4,327 @@ use std::future::pending;
 use std::pin::Pin;
 use std::task::Poll;
 
+pub(super) const HISTORY_PAGE_EVENTS: usize = 128;
+pub(super) const FORWARD_RECOVERY_EVENTS: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HistoryAction {
+    Scroll(isize),
+    SmoothScroll(isize),
+    Page(isize),
+    Previous,
+    First,
+    Search,
+    Jump(JumpKind),
+}
+
+struct HistoryPage {
+    events: Vec<SessionEvent>,
+    complete: bool,
+}
+
+pub(super) async fn hydrate_session_history(app: &mut App, session: &Session) -> Result<()> {
+    let state = session.tui_state().await;
+    let (events, history_complete) = initial_session_events(session, &state).await?;
+    let oldest = events.first().map(|event| event.sequence);
+    for event in events {
+        app.apply(event);
+    }
+    if app.last_sequence != state.head_sequence {
+        bail!("session history changed while its initial suffix was read");
+    }
+    app.finish_hydration();
+    app.restore_session_stats(&state);
+    app.set_history_range(oldest, history_complete);
+    Ok(())
+}
+
+pub(super) async fn initial_session_events(
+    session: &Session,
+    state: &SessionTuiState,
+) -> Result<(Vec<SessionEvent>, bool)> {
+    let Some(head) = state.head_sequence else {
+        return Ok((Vec::new(), true));
+    };
+    let Some(compaction) = state.latest_compaction_sequence else {
+        let mut events = session.snapshot().await?;
+        events.retain(|event| event.sequence <= head);
+        validate_event_range(&events, Some(0), Some(head))?;
+        return Ok((events, true));
+    };
+    if compaction > head {
+        bail!("session compaction frontier is beyond its committed head");
+    }
+
+    let mut checkpoint = session
+        .events_before(compaction.saturating_add(1), 1)
+        .await?;
+    if checkpoint.len() != 1 || checkpoint[0].sequence != compaction {
+        bail!("session compaction frontier is not readable");
+    }
+    let start = complete_visible_unit_start(session, &checkpoint[0]).await?;
+    let mut events = read_exact_events_before(session, compaction, start).await?;
+    events.append(&mut checkpoint);
+    let mut cursor = compaction;
+    while cursor < head {
+        let mut page = session.events_after(cursor, HISTORY_PAGE_EVENTS).await?;
+        page.retain(|event| event.sequence <= head);
+        let Some(last) = page.last().map(|event| event.sequence) else {
+            bail!("session committed tail ended before its recorded head");
+        };
+        validate_event_range(&page, Some(cursor.saturating_add(1)), Some(last))?;
+        cursor = last;
+        events.extend(page);
+    }
+    validate_event_range(&events, Some(start), Some(head))?;
+    Ok((events, start == 0))
+}
+
+async fn read_older_history_page(session: &Session, cursor: u64) -> Result<HistoryPage> {
+    if cursor == 0 {
+        return Ok(HistoryPage {
+            events: Vec::new(),
+            complete: true,
+        });
+    }
+    let mut events = session.events_before(cursor, HISTORY_PAGE_EVENTS).await?;
+    let Some(first) = events.first().map(|event| event.sequence) else {
+        bail!("session history ended before sequence {cursor}");
+    };
+    validate_event_range(&events, Some(first), Some(cursor - 1))?;
+    let start = complete_visible_unit_start(session, &events[0]).await?;
+    if start < first {
+        let mut extension = read_exact_events_before(session, first, start).await?;
+        extension.append(&mut events);
+        events = extension;
+    }
+    validate_event_range(&events, Some(start), Some(cursor - 1))?;
+    Ok(HistoryPage {
+        events,
+        complete: start == 0,
+    })
+}
+
+async fn complete_visible_unit_start(session: &Session, first: &SessionEvent) -> Result<u64> {
+    if matches!(&first.kind, EventKind::User { .. })
+        || matches!(&first.kind, EventKind::Compaction { manual: true, .. })
+    {
+        return Ok(first.sequence);
+    }
+    let mut cursor = first.sequence;
+    loop {
+        let headers = session
+            .event_headers_before(cursor, HISTORY_PAGE_EVENTS)
+            .await?;
+        if headers.is_empty() {
+            return Ok(0);
+        }
+        for header in headers.iter().rev() {
+            if header.starts_turn {
+                return Ok(header.sequence);
+            }
+            if header.finishes_turn {
+                return Ok(header.sequence.saturating_add(1));
+            }
+        }
+        cursor = headers[0].sequence;
+    }
+}
+
+async fn read_exact_events_before(
+    session: &Session,
+    end: u64,
+    start: u64,
+) -> Result<Vec<SessionEvent>> {
+    let mut cursor = end;
+    let mut pages = Vec::new();
+    while cursor > start {
+        let count = usize::try_from(cursor - start)
+            .unwrap_or(usize::MAX)
+            .min(HISTORY_PAGE_EVENTS);
+        let page = session.events_before(cursor, count).await?;
+        let expected_start = cursor.saturating_sub(count as u64);
+        validate_event_range(&page, Some(expected_start), Some(cursor - 1))?;
+        cursor = expected_start;
+        pages.push(page);
+    }
+    pages.reverse();
+    Ok(pages.into_iter().flatten().collect())
+}
+
+fn validate_event_range(
+    events: &[SessionEvent],
+    expected_start: Option<u64>,
+    expected_end: Option<u64>,
+) -> Result<()> {
+    if events.is_empty() {
+        if expected_start
+            .zip(expected_end)
+            .is_some_and(|(start, end)| start <= end)
+        {
+            bail!("session event range is unexpectedly empty");
+        }
+        return Ok(());
+    }
+    if expected_start.is_some_and(|start| events[0].sequence != start)
+        || expected_end.is_some_and(|end| events.last().unwrap().sequence != end)
+        || events
+            .windows(2)
+            .any(|pair| pair[1].sequence != pair[0].sequence.saturating_add(1))
+    {
+        bail!("session event range is not contiguous");
+    }
+    Ok(())
+}
+
+pub(super) async fn load_older_history(app: &mut App, session: &Session) -> Result<bool> {
+    if app.history_complete {
+        return Ok(false);
+    }
+    let cursor = app
+        .oldest_sequence
+        .ok_or_else(|| anyhow!("lazy session history has no loaded frontier"))?;
+    let page = read_older_history_page(session, cursor).await?;
+    let oldest = page.events.first().map(|event| event.sequence);
+    let added = !page.events.is_empty();
+    app.prepend_history(page.events);
+    app.oldest_sequence = oldest.or(app.oldest_sequence);
+    app.history_complete = page.complete;
+    Ok(added)
+}
+
+async fn load_older_visible_history(app: &mut App, session: &Session) -> Result<()> {
+    let initial_blocks = app.blocks.len();
+    while !app.history_complete && app.blocks.len() == initial_blocks {
+        load_older_history(app, session).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn load_all_history(app: &mut App, session: &Session) -> Result<()> {
+    if app.history_complete {
+        return Ok(());
+    }
+    let mut cursor = app
+        .oldest_sequence
+        .ok_or_else(|| anyhow!("lazy session history has no loaded frontier"))?;
+    let mut pages = Vec::new();
+    let mut complete = false;
+    while !complete {
+        let page = read_older_history_page(session, cursor).await?;
+        let Some(first) = page.events.first().map(|event| event.sequence) else {
+            complete = page.complete;
+            break;
+        };
+        cursor = first;
+        complete = page.complete;
+        pages.push(page.events);
+    }
+    pages.reverse();
+    let events = pages.into_iter().flatten().collect::<Vec<_>>();
+    let oldest = events.first().map(|event| event.sequence);
+    app.prepend_history(events);
+    app.oldest_sequence = oldest.or(app.oldest_sequence);
+    app.history_complete = complete;
+    Ok(())
+}
+
+pub(super) async fn perform_history_action(
+    app: &mut App,
+    session: &Session,
+    action: HistoryAction,
+) -> Result<()> {
+    match action {
+        HistoryAction::Scroll(distance) => {
+            if distance < 0 && app.transcript_offset <= distance.unsigned_abs() {
+                load_older_visible_history(app, session).await?;
+            }
+            app.scroll_transcript(distance);
+        }
+        HistoryAction::SmoothScroll(direction) => {
+            let start = match app.mouse_scroll_animation {
+                Some(MouseScrollAnimation::Transcript {
+                    target,
+                    direction: previous_direction,
+                }) if previous_direction == direction => target,
+                _ => app.transcript_offset,
+            };
+            if direction < 0 && start <= SCROLL_ROWS.unsigned_abs() {
+                load_older_visible_history(app, session).await?;
+            }
+            app.smooth_scroll_transcript(direction);
+        }
+        HistoryAction::Page(direction) => {
+            let distance = direction * app.transcript_height.max(1) as isize;
+            if distance < 0 && app.transcript_offset <= distance.unsigned_abs() {
+                load_older_visible_history(app, session).await?;
+            }
+            app.page_transcript(direction);
+        }
+        HistoryAction::Previous => {
+            while !app.history_complete {
+                let indices = app.filtered_indices();
+                let at_oldest = indices
+                    .iter()
+                    .position(|index| *index == app.selected_block)
+                    .is_none_or(|position| position == 0);
+                if !at_oldest {
+                    break;
+                }
+                let selected_id = app.blocks.get(app.selected_block).map(|block| block.id);
+                load_older_visible_history(app, session).await?;
+                if selected_id.is_some_and(|id| {
+                    app.filtered_indices()
+                        .iter()
+                        .position(|index| app.blocks[*index].id == id)
+                        .is_some_and(|position| position > 0)
+                }) {
+                    break;
+                }
+            }
+            app.move_selection(-1);
+            app.clear_transcript_anchor();
+        }
+        HistoryAction::First => {
+            load_all_history(app, session).await?;
+            if let Some(index) = app.filtered_indices().first().copied() {
+                app.selected_block = index;
+                app.transcript_follow_tail = false;
+                app.clear_transcript_anchor();
+            }
+        }
+        HistoryAction::Search => {
+            load_all_history(app, session).await?;
+            open_search(app);
+        }
+        HistoryAction::Jump(kind) => {
+            load_all_history(app, session).await?;
+            app.jump_to(kind);
+            app.clear_transcript_anchor();
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn recover_lagged_events(app: &mut App, session: &Session) -> Result<()> {
+    while let Some(sequence) = app.last_sequence {
+        let page = session
+            .events_after(sequence, FORWARD_RECOVERY_EVENTS)
+            .await?;
+        let complete = page.len() < FORWARD_RECOVERY_EVENTS;
+        if let Some(last) = page.last().map(|event| event.sequence) {
+            validate_event_range(&page, Some(sequence.saturating_add(1)), Some(last))?;
+        }
+        for event in page {
+            app.apply(event);
+        }
+        if complete {
+            break;
+        }
+    }
+    Ok(())
+}
+
 struct AnimationClock {
     active: Duration,
     resumed_at: Option<Instant>,
@@ -160,10 +481,7 @@ impl TuiTerminal {
         );
         app.pending_messages = pending_receiver.borrow().clone();
         app.protocol_source = Some(protocols);
-        for event in session.snapshot().await? {
-            app.apply(event);
-        }
-        app.finish_hydration();
+        hydrate_session_history(&mut app, &session).await?;
         if runtime.turn_running().await {
             app.busy = true;
             app.busy_since = Some(Instant::now());
@@ -358,16 +676,7 @@ pub(super) async fn run_loop(
                     scheduler.request_coalesced();
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    while let Some(sequence) = app.last_sequence {
-                        let page = services.runtime.session().events_after(sequence, 512).await?;
-                        let complete = page.len() < 512;
-                        for event in page {
-                            app.apply(event);
-                        }
-                        if complete {
-                            break;
-                        }
-                    }
+                    recover_lagged_events(app, services.runtime.session()).await?;
                     scheduler.request_coalesced();
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -431,6 +740,7 @@ pub(super) enum BackgroundEvent {
 
 pub(super) enum Action {
     Continue,
+    History(HistoryAction),
     Quit,
     Submit {
         prompt: String,
@@ -494,6 +804,10 @@ pub(super) async fn apply_action(
 ) -> Result<Option<TuiOutcome>> {
     match action {
         Action::Continue => Ok(None),
+        Action::History(action) => {
+            perform_history_action(app, services.runtime.session(), action).await?;
+            Ok(None)
+        }
         Action::Quit => Ok(Some(TuiOutcome::Quit)),
         Action::NewSession => Ok(Some(TuiOutcome::NewSession)),
         Action::Resume(id) => {
@@ -1000,10 +1314,7 @@ pub(super) async fn dispatch_ui_command(
         CoreCommand::Login => open_login(app, &services.catalog).await,
         CoreCommand::Logout => open_logout(app, &services.manager).await,
         CoreCommand::Resume => open_resume(app, services).await,
-        CoreCommand::Search => {
-            open_search(app);
-            Action::Continue
-        }
+        CoreCommand::Search => Action::History(HistoryAction::Search),
         CoreCommand::NewSession => Action::NewSession,
         CoreCommand::Compact => Action::Compact,
         CoreCommand::Help => {
@@ -1110,50 +1421,25 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServ
             app.overlay = Some(Overlay::Command);
             Action::Continue
         }
-        Some("jump_reasoning") => {
-            app.jump_to(JumpKind::Reasoning);
-            Action::Continue
-        }
-        Some("jump_tools") => {
-            app.jump_to(JumpKind::Tool);
-            Action::Continue
-        }
-        Some("jump_user") => {
-            app.jump_to(JumpKind::User);
-            Action::Continue
-        }
+        Some("jump_reasoning") => Action::History(HistoryAction::Jump(JumpKind::Reasoning)),
+        Some("jump_tools") => Action::History(HistoryAction::Jump(JumpKind::Tool)),
+        Some("jump_user") => Action::History(HistoryAction::Jump(JumpKind::User)),
         Some("next") => {
             app.move_selection(1);
             Action::Continue
         }
-        Some("previous") => {
-            app.move_selection(-1);
-            Action::Continue
-        }
+        Some("previous") => Action::History(HistoryAction::Previous),
         Some("page_down") => {
             app.page_transcript(1);
             Action::Continue
         }
-        Some("page_up") => {
-            app.page_transcript(-1);
-            Action::Continue
-        }
+        Some("page_up") => Action::History(HistoryAction::Page(-1)),
         Some("scroll_down") => {
             app.scroll_transcript(SCROLL_ROWS);
             Action::Continue
         }
-        Some("scroll_up") => {
-            app.scroll_transcript(-SCROLL_ROWS);
-            Action::Continue
-        }
-        Some("first") => {
-            if let Some(index) = app.filtered_indices().first().copied() {
-                app.selected_block = index;
-                app.transcript_follow_tail = false;
-                app.transcript_center_selected = true;
-            }
-            Action::Continue
-        }
+        Some("scroll_up") => Action::History(HistoryAction::Scroll(-SCROLL_ROWS)),
+        Some("first") => Action::History(HistoryAction::First),
         Some("last") => {
             if let Some(index) = app.filtered_indices().last().copied() {
                 app.selected_block = index;
@@ -2028,6 +2314,17 @@ pub(super) async fn handle_mouse(
     }
     if activate_transcript_mouse(app, mouse) {
         return Action::Continue;
+    }
+    if app.overlay.is_none() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                return Action::History(HistoryAction::SmoothScroll(-1));
+            }
+            MouseEventKind::ScrollDown => {
+                return Action::History(HistoryAction::SmoothScroll(1));
+            }
+            _ => {}
+        }
     }
     match mouse.kind {
         MouseEventKind::ScrollUp => handle_mouse_scroll(app, -1),

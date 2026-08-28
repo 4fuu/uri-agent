@@ -44,11 +44,11 @@ do not rewrite or delete earlier events.
 
 SQLite also keeps a versioned, rebuildable resume index at real compaction
 boundaries. The index contains only cumulative derived state needed at startup,
-such as the user-message flag, usage and cache totals, protocol-help
-correlations, frozen-context and task event pointers, model settings, and
-token-rate calibration inputs. It never contains model history or compaction
-replacement history. On resume, model replay is loaded from the
-highest-sequence authoritative compaction event and
+such as the user-message flag, latest-compaction pointer, usage and cache
+totals, protocol-help correlations, frozen-context and task event pointers,
+model settings, and token-rate calibration inputs. It never contains model
+history or compaction replacement history. On resume, model replay is loaded
+from the highest-sequence authoritative compaction event and
 the later usage and model-message events; other startup state is reduced from
 the index plus the authoritative event tail. Each row carries an integrity
 checksum over its version, session identity, sequence, and payload. Missing,

@@ -1015,7 +1015,7 @@ pub(super) fn render_transcript(
     visible_row_separators
 }
 
-fn rebuild_transcript_layout(
+pub(super) fn rebuild_transcript_layout(
     app: &mut App,
     message_width: usize,
     process_width: usize,

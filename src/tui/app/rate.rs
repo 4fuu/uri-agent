@@ -129,6 +129,13 @@ pub(super) struct TokenRateState {
 }
 
 impl TokenRateState {
+    pub(super) fn restore_calibration(&mut self, visible_units: u64, output_tokens: u64) {
+        self.ratio = ThreadTokenRatio {
+            visible_units,
+            output_tokens,
+        };
+    }
+
     pub(super) fn start_turn(&mut self) {
         self.stream = StreamRateEstimator::default();
         self.response = ResponseObservation::default();
