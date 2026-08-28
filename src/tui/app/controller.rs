@@ -386,9 +386,16 @@ impl RenderScheduler {
 
     fn did_draw(&mut self, now: Instant) {
         self.coalesced_redraw = false;
-        // Anchor to the actual presentation time so delayed frames are skipped
-        // instead of being replayed in a burst.
-        self.next_frame_at = now + PRESENTATION_FRAME_DURATION;
+        if now >= self.next_frame_at {
+            // Keep presentation on one stable cadence. Immediate input may
+            // draw between presentation frames, but must not postpone the
+            // next frame and starve animation or smooth scrolling. A late
+            // draw skips elapsed slots without rebasing later deadlines.
+            let period_nanos = PRESENTATION_FRAME_DURATION.as_nanos();
+            let elapsed_nanos = now.duration_since(self.next_frame_at).as_nanos();
+            let until_next = period_nanos - elapsed_nanos % period_nanos;
+            self.next_frame_at = now + Duration::from_nanos(until_next as u64);
+        }
     }
 
     fn frame_due(&self, continuous: bool, now: Instant) -> bool {
@@ -558,6 +565,11 @@ pub(super) async fn run_loop(
         let now = Instant::now();
         animation_clock.set_paused(app.animations_paused(), now);
         if redraw {
+            if scheduler.frame_due(app.continuous_render_demand(), now)
+                && app.mouse_scroll_animating()
+            {
+                app.advance_mouse_scroll_animation();
+            }
             app.animation_phase = animation_clock.phase_at(now);
             let context = services.runtime.context_usage();
             app.info.context_tokens = context.tokens;
@@ -584,12 +596,8 @@ pub(super) async fn run_loop(
         };
         tokio::select! {
             _ = scheduled_wake => {
-                let now = Instant::now();
-                if scheduler.frame_due(app.continuous_render_demand(), now)
-                    && app.mouse_scroll_animating()
-                {
-                    app.advance_mouse_scroll_animation();
-                }
+                // Reaching a scheduled deadline always gets a final draw,
+                // even when that deadline ends the underlying demand.
                 redraw = true;
             },
             _ = pty_wake => {
@@ -4253,13 +4261,30 @@ mod scheduler_tests {
             Some(now + PRESENTATION_FRAME_DURATION)
         );
 
-        let delayed = now + PRESENTATION_FRAME_DURATION * 5;
+        let delayed = now + PRESENTATION_FRAME_DURATION * 5 + Duration::from_millis(3);
         assert!(scheduler.frame_due(true, delayed));
         scheduler.did_draw(delayed);
         assert_eq!(
             scheduler.next_wake(true, None, delayed),
-            Some(delayed + PRESENTATION_FRAME_DURATION)
+            Some(now + PRESENTATION_FRAME_DURATION * 6)
         );
+    }
+
+    #[test]
+    fn immediate_draws_do_not_postpone_the_presentation_cadence() {
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::new(now);
+        scheduler.did_draw(now);
+        let presentation = now + PRESENTATION_FRAME_DURATION;
+
+        for millis in [2, 5, 9, 12, 16] {
+            scheduler.did_draw(now + Duration::from_millis(millis));
+            assert_eq!(
+                scheduler.next_wake(true, None, now + Duration::from_millis(millis)),
+                Some(presentation)
+            );
+        }
+        assert!(scheduler.frame_due(true, presentation));
     }
 
     #[test]

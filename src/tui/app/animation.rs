@@ -24,8 +24,12 @@ pub(super) fn wordmark_reveal(phase: f64, progress: f32) -> Vec<String> {
 }
 
 fn render_mark(phase: f64, visible_columns: usize) -> Vec<String> {
-    let frame = phase.floor().max(0.0) as usize;
-    let fraction = phase.fract().max(0.0);
+    // The original shimmer changed every two 90 ms animation samples. Move
+    // continuously between those distinct states so presentation frames do
+    // not sit still for one interval and then change in a correlated burst.
+    let shimmer_phase = phase.max(0.0) / 2.0;
+    let frame = shimmer_phase.floor() as usize;
+    let fraction = shimmer_phase.fract();
     MARK.iter()
         .enumerate()
         .map(|(y, row)| {
@@ -34,7 +38,9 @@ fn render_mark(phase: f64, visible_columns: usize) -> Vec<String> {
             for x in 0..cells.len() {
                 let current = mark_symbol(frame, x, y, visible_columns);
                 let next = mark_symbol(frame.wrapping_add(1), x, y, visible_columns);
-                let threshold = (BAYER_4X4[y % 4][x % 4] + 1) as f64 / 17.0;
+                // Do not reuse the shimmer's Bayer class as its transition
+                // time: that makes all cells in one class jump together.
+                let threshold = ((x * 6 + y * 3 + 3) % 17 + 1) as f64 / 18.0;
                 let symbol = if fraction >= threshold { next } else { current };
                 rendered.push(symbol);
                 rendered.push(symbol);
@@ -45,7 +51,7 @@ fn render_mark(phase: f64, visible_columns: usize) -> Vec<String> {
 }
 
 fn mark_symbol(frame: usize, x: usize, y: usize, visible_columns: usize) -> char {
-    let phase = (BAYER_4X4[y % 4][x % 4] + frame / 2) % 16;
+    let phase = (BAYER_4X4[y % 4][x % 4] + frame) % 16;
     if x >= visible_columns {
         ' '
     } else if MARK[y].as_bytes()[x] == b'1' {
@@ -94,10 +100,10 @@ pub(super) fn activity(phase: f64, width: usize) -> String {
         .zip(legacy_activity(frame.wrapping_add(1), width).chars())
         .enumerate()
         .map(|(x, (current, next))| {
-            // Stagger cell transitions across the legacy interval. Integer
+            // Move one coherent transition front across the wave. Integer
             // phases retain the exact old frame, while fractional phases make
             // intermediate movement visible at the presentation cadence.
-            let threshold = ((x * 5) % width + 1) as f64 / (width + 1) as f64;
+            let threshold = (x + 1) as f64 / (width + 1) as f64;
             if fraction >= threshold { next } else { current }
         })
         .collect()
@@ -165,6 +171,16 @@ mod tests {
     }
 
     #[test]
+    fn activity_interpolation_moves_one_coherent_front() {
+        let current = legacy_activity(0, 8).chars().collect::<Vec<_>>();
+        let next = legacy_activity(1, 8).chars().collect::<Vec<_>>();
+        let midway = activity(0.5, 8).chars().collect::<Vec<_>>();
+
+        assert_eq!(&midway[..4], &next[..4]);
+        assert_eq!(&midway[4..], &current[4..]);
+    }
+
+    #[test]
     fn progress_has_a_stable_width_and_tracks_the_ratio() {
         assert_eq!(progress(0.0, 8, 0.0), "········");
         assert_eq!(progress(0.0, 8, 1.0).chars().count(), 8);
@@ -177,13 +193,56 @@ mod tests {
     }
 
     #[test]
-    fn wordmark_interpolates_but_legacy_samples_and_spinner_timing_remain_compatible() {
-        let between = wordmark(1.5);
-        assert_ne!(between, wordmark(1.0));
+    fn wordmark_interpolates_and_keeps_its_cycle_and_spinner_timing() {
+        let between = wordmark(1.0);
+        assert_ne!(between, wordmark(0.0));
         assert_ne!(between, wordmark(2.0));
+        assert_eq!(wordmark(32.0), wordmark(0.0));
 
         assert_eq!(spinner(0.0), spinner(0.99));
         assert_ne!(spinner(0.99), spinner(1.0));
         assert_eq!(spinner(0.0), spinner(8.0));
+    }
+
+    #[test]
+    fn wordmark_spreads_shimmer_changes_across_sixty_hertz_frames() {
+        let phase_per_presentation: f64 = (1.0 / 60.0) / 0.09;
+        let full_cycle_presentations = (32.0 / phase_per_presentation).floor() as usize;
+        let mut previous = wordmark(0.0);
+        let mut longest_still_run = 0;
+        let mut still_run = 0;
+        let mut largest_change = 0;
+
+        for sample in 1..=full_cycle_presentations {
+            let current = wordmark(sample as f64 * phase_per_presentation);
+            let changed_cells = previous
+                .iter()
+                .zip(&current)
+                .map(|(left, right)| {
+                    left.chars()
+                        .step_by(2)
+                        .zip(right.chars().step_by(2))
+                        .filter(|(left, right)| left != right)
+                        .count()
+                })
+                .sum::<usize>();
+            largest_change = largest_change.max(changed_cells);
+            if changed_cells == 0 {
+                still_run += 1;
+                longest_still_run = longest_still_run.max(still_run);
+            } else {
+                still_run = 0;
+            }
+            previous = current;
+        }
+
+        assert!(
+            longest_still_run <= 2,
+            "shimmer remained unchanged for {longest_still_run} presentation frames"
+        );
+        assert!(
+            largest_change <= 3,
+            "shimmer changed {largest_change} cells in one presentation frame"
+        );
     }
 }

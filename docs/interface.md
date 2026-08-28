@@ -2,7 +2,7 @@
 
 URI Agent presents one conversation surface with floating controls for composition, commands, settings, selection, and an embedded terminal. It has no Browse, Insert, or Detail modes and no slash-command syntax.
 
-Rendering is demand-driven. Continuous visual states are presented at a 60 Hz target from a continuous wall-clock phase, while fully idle screens do not redraw periodically. Cell graphics such as activity waves and wordmark shimmer interpolate between their original 90 ms samples without changing their cycle duration. Finite-state spinner glyphs and marquee character steps necessarily repeat across presentation frames and retain their original timing instead of speeding up. Streaming and background updates are coalesced to the display cadence; direct input and resize events redraw immediately. Embedded terminal output explicitly wakes the interface even when no other activity is present.
+Rendering is demand-driven. Continuous visual states are presented at a 60 Hz target from a continuous wall-clock phase, while fully idle screens do not redraw periodically. Cell graphics such as activity waves and wordmark shimmer distribute their transitions across presentation frames without changing their cycle duration. Finite-state spinner glyphs and marquee character steps necessarily repeat across presentation frames and retain their original timing instead of speeding up. Streaming and background updates are coalesced to the display cadence; direct input and resize events redraw immediately without postponing that cadence. Embedded terminal output explicitly wakes the interface even when no other activity is present.
 
 ## Conversation surface
 
