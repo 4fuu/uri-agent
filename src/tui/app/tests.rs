@@ -3573,6 +3573,54 @@ fn smooth_mouse_scroll_preserves_the_full_distance_of_rapid_events() {
 }
 
 #[test]
+fn smooth_mouse_scroll_catches_up_quickly_on_a_long_backlog() {
+    let mut app = test_app();
+    for index in 0..100 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let tail_offset = app.transcript_offset;
+
+    for _ in 0..10 {
+        handle_mouse_scroll(&mut app, -1);
+    }
+    app.advance_mouse_scroll_animation();
+    assert!(
+        tail_offset - app.transcript_offset > 1,
+        "a long backlog advances more than one row per frame"
+    );
+    let mut frames = 1;
+    while app.mouse_scroll_animating() {
+        app.advance_mouse_scroll_animation();
+        frames += 1;
+    }
+    assert_eq!(app.transcript_offset, tail_offset - 60);
+    assert!(frames < 60, "the backlog drains in fewer frames than rows");
+
+    app.overlay = Some(Overlay::Document);
+    app.overlay_scroll = 100;
+    for _ in 0..10 {
+        handle_mouse_scroll(&mut app, -1);
+    }
+    app.advance_mouse_scroll_animation();
+    assert!(100 - app.overlay_scroll > 1);
+    let mut frames = 1;
+    while app.mouse_scroll_animating() {
+        app.advance_mouse_scroll_animation();
+        frames += 1;
+    }
+    assert_eq!(app.overlay_scroll, 40);
+    assert!(frames < 60);
+}
+
+#[test]
 fn transcript_pages_by_the_rendered_viewport_without_moving_selection() {
     let mut app = test_app();
     for index in 0..50 {

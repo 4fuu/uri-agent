@@ -86,6 +86,7 @@ const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const SMOOTH_SCROLL_FRAME_DURATION: Duration = Duration::from_millis(16);
 const SCROLL_ROWS: isize = 6;
+const SMOOTH_SCROLL_CATCH_UP_FRAMES: usize = 8;
 const EXPANDED_PREVIEW_LINES: usize = 24;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
@@ -1906,9 +1907,10 @@ impl App {
                 let reading_end =
                     transcript_reading_end(self.transcript_rows, self.transcript_height);
                 let target = target.min(reading_end);
+                let step = smooth_scroll_step(self.transcript_offset.abs_diff(target));
                 self.transcript_offset = match self.transcript_offset.cmp(&target) {
-                    std::cmp::Ordering::Less => self.transcript_offset.saturating_add(1),
-                    std::cmp::Ordering::Greater => self.transcript_offset.saturating_sub(1),
+                    std::cmp::Ordering::Less => self.transcript_offset.saturating_add(step),
+                    std::cmp::Ordering::Greater => self.transcript_offset.saturating_sub(step),
                     std::cmp::Ordering::Equal => self.transcript_offset,
                 };
                 let finished = self.transcript_offset == target;
@@ -1921,9 +1923,11 @@ impl App {
                 }
             }
             MouseScrollAnimation::Overlay { target, direction } => {
+                let step = smooth_scroll_step(usize::from(self.overlay_scroll.abs_diff(target)))
+                    .min(u16::MAX as usize) as u16;
                 self.overlay_scroll = match self.overlay_scroll.cmp(&target) {
-                    std::cmp::Ordering::Less => self.overlay_scroll.saturating_add(1),
-                    std::cmp::Ordering::Greater => self.overlay_scroll.saturating_sub(1),
+                    std::cmp::Ordering::Less => self.overlay_scroll.saturating_add(step),
+                    std::cmp::Ordering::Greater => self.overlay_scroll.saturating_sub(step),
                     std::cmp::Ordering::Equal => self.overlay_scroll,
                 };
                 if self.overlay_scroll != target {
@@ -2134,6 +2138,13 @@ fn bounded_index(current: usize, distance: isize, count: usize) -> usize {
     } else {
         current.saturating_add(distance as usize).min(count - 1)
     }
+}
+
+// Short scrolls advance one row per frame; longer backlogs catch up
+// geometrically so rapid wheel bursts drain in a bounded number of frames
+// instead of trailing the input at a fixed one-row rate.
+fn smooth_scroll_step(remaining: usize) -> usize {
+    remaining.div_ceil(SMOOTH_SCROLL_CATCH_UP_FRAMES).max(1)
 }
 
 fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: T) -> bool {
