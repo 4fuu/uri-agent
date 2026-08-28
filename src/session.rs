@@ -578,24 +578,7 @@ fn restore_persisted_state(
         }
         state.context_sequence = context_sequence;
         if let Ok(payload) = serde_json::to_string(&state) {
-            let checksum = resume_checksum(id, compaction.sequence, &payload);
-            let _ = db.execute(
-                "INSERT INTO session_resume_index
-                 (session_id, version, through_sequence, payload_json, checksum)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                   version = excluded.version,
-                   through_sequence = excluded.through_sequence,
-                   payload_json = excluded.payload_json,
-                   checksum = excluded.checksum",
-                params![
-                    id,
-                    i64::from(RESUME_INDEX_VERSION),
-                    compaction.sequence as i64,
-                    payload,
-                    checksum
-                ],
-            );
+            let _ = persist_rebuilt_resume_index(db, id, compaction.sequence, &payload);
         }
         (state, Some(compaction.sequence))
     } else {
@@ -690,6 +673,34 @@ fn resume_checksum(session_id: &str, through: u64, payload: &str) -> String {
     digest.update(through.to_be_bytes());
     digest.update(payload.as_bytes());
     format!("{:x}", digest.finalize())
+}
+
+fn persist_rebuilt_resume_index(
+    db: &SqliteConnection,
+    session_id: &str,
+    through: u64,
+    payload: &str,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    let checksum = resume_checksum(session_id, through, payload);
+    db.execute(
+        "INSERT INTO session_resume_index
+         (session_id, version, through_sequence, payload_json, checksum)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+           version = excluded.version,
+           through_sequence = excluded.through_sequence,
+           payload_json = excluded.payload_json,
+           checksum = excluded.checksum
+         WHERE excluded.through_sequence >= session_resume_index.through_sequence",
+        params![
+            session_id,
+            i64::from(RESUME_INDEX_VERSION),
+            through as i64,
+            payload,
+            checksum
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -3320,8 +3331,15 @@ mod tests {
             .unwrap();
 
         opened
-            .persist_resume_index(first.sequence, first_payload)
+            .persist_resume_index(first.sequence, first_payload.clone())
             .await;
+        opened
+            .connection
+            .call(move |db| {
+                persist_rebuilt_resume_index(db, "monotonic-index", first.sequence, &first_payload)
+            })
+            .await
+            .unwrap();
         let through = opened
             .connection
             .call(|db| {
