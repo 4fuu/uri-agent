@@ -2,6 +2,8 @@
 
 URI Agent presents one conversation surface with floating controls for composition, commands, settings, selection, and an embedded terminal. It has no Browse, Insert, or Detail modes and no slash-command syntax.
 
+Rendering is demand-driven. Continuous visual states are presented at a 60 Hz target, while animation phase remains wall-clock based and fully idle screens do not redraw periodically. Streaming and background updates are coalesced to that display cadence; direct input and resize events redraw immediately. Embedded terminal output explicitly wakes the interface even when no other activity is present.
+
 ## Conversation surface
 
 Startup may show a short splash. An empty conversation then shows the project, active model and thinking effort, and compose, command, and help hints; if no model is configured, it prompts for `:login`. `:new` returns directly to this welcome view.

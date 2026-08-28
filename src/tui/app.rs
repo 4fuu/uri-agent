@@ -84,7 +84,8 @@ const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-const SMOOTH_SCROLL_FRAME_DURATION: Duration = Duration::from_millis(16);
+const LEGACY_ANIMATION_FRAME_DURATION: Duration = Duration::from_millis(90);
+const PRESENTATION_FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const SCROLL_ROWS: isize = 6;
 const SMOOTH_SCROLL_CATCH_UP_FRAMES: usize = 8;
 const EXPANDED_PREVIEW_LINES: usize = 24;
@@ -756,6 +757,34 @@ impl App {
     fn animations_paused(&self) -> bool {
         matches!(self.overlay, Some(Overlay::Delivery))
             || (self.overlay == Some(Overlay::Composer) && self.completions.is_none())
+    }
+
+    fn continuous_render_demand(&self) -> bool {
+        self.mouse_scroll_animating()
+            || (!self.animations_paused()
+                && (self.showing_splash()
+                    || self.busy
+                    || self.marquee.is_some()
+                    || (self.catalog_refreshing && self.overlay == Some(Overlay::Models))))
+    }
+
+    fn next_render_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let flash = self
+            .flashes
+            .iter()
+            .map(|notice| notice.created + flash_duration(&notice.message))
+            .filter(|deadline| *deadline > now)
+            .min();
+        let interrupt = self
+            .last_interrupt_press
+            .as_ref()
+            .filter(|_| self.busy)
+            .map(|(_, at)| *at + DOUBLE_CLICK_INTERVAL);
+        flash
+            .into_iter()
+            .chain(interrupt.filter(|deadline| *deadline > now))
+            .min()
     }
 
     fn marquee_elapsed(&mut self, key: String) -> usize {

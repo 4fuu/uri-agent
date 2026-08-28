@@ -58,6 +58,25 @@ fn test_app() -> App {
     test_app_with_splash(true)
 }
 
+#[test]
+fn continuous_render_demand_stops_when_the_ui_is_idle() {
+    let mut app = test_app();
+    app.skip_splash();
+    assert!(!app.continuous_render_demand());
+
+    app.busy = true;
+    assert!(app.continuous_render_demand());
+
+    app.overlay = Some(Overlay::Composer);
+    assert!(!app.continuous_render_demand());
+
+    app.mouse_scroll_animation = Some(MouseScrollAnimation::Overlay {
+        target: 1,
+        direction: 1,
+    });
+    assert!(app.continuous_render_demand());
+}
+
 fn apply_event(app: &mut App, sequence: u64, kind: EventKind) {
     app.apply(SessionEvent {
         sequence,

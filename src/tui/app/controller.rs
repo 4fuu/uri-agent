@@ -1,7 +1,80 @@
 use super::*;
 use futures_util::{Stream, StreamExt};
+use std::future::pending;
 use std::pin::Pin;
 use std::task::Poll;
+
+struct AnimationClock {
+    active: Duration,
+    resumed_at: Option<Instant>,
+}
+
+impl AnimationClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            active: Duration::ZERO,
+            resumed_at: Some(now),
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool, now: Instant) {
+        match (paused, self.resumed_at) {
+            (true, Some(resumed_at)) => {
+                self.active = self.active.saturating_add(now.duration_since(resumed_at));
+                self.resumed_at = None;
+            }
+            (false, None) => self.resumed_at = Some(now),
+            _ => {}
+        }
+    }
+
+    fn frame_at(&self, now: Instant) -> usize {
+        let elapsed = self.active
+            + self
+                .resumed_at
+                .map_or(Duration::ZERO, |resumed_at| now.duration_since(resumed_at));
+        (elapsed.as_nanos() / LEGACY_ANIMATION_FRAME_DURATION.as_nanos()) as usize
+    }
+}
+
+struct RenderScheduler {
+    coalesced_redraw: bool,
+    next_frame_at: Instant,
+}
+
+impl RenderScheduler {
+    fn new(now: Instant) -> Self {
+        Self {
+            coalesced_redraw: false,
+            next_frame_at: now,
+        }
+    }
+
+    fn request_coalesced(&mut self) {
+        self.coalesced_redraw = true;
+    }
+
+    fn did_draw(&mut self, now: Instant) {
+        self.coalesced_redraw = false;
+        // Anchor to the actual presentation time so delayed frames are skipped
+        // instead of being replayed in a burst.
+        self.next_frame_at = now + PRESENTATION_FRAME_DURATION;
+    }
+
+    fn frame_due(&self, continuous: bool, now: Instant) -> bool {
+        (continuous || self.coalesced_redraw) && now >= self.next_frame_at
+    }
+
+    fn next_wake(
+        &self,
+        continuous: bool,
+        deadline: Option<Instant>,
+        now: Instant,
+    ) -> Option<Instant> {
+        let frame = (continuous || self.coalesced_redraw).then_some(self.next_frame_at.max(now));
+        frame.into_iter().chain(deadline).min()
+    }
+}
 
 pub struct TuiServices {
     pub runtime: Arc<AgentRuntime>,
@@ -146,29 +219,54 @@ pub(super) async fn run_loop(
     refresh_catalog_on_start: bool,
 ) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
-    let mut animation = time::interval(Duration::from_millis(90));
-    animation.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut smooth_scroll = time::interval(SMOOTH_SCROLL_FRAME_DURATION);
-    smooth_scroll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
     if refresh_catalog_on_start {
         start_background_catalog_refresh(app, &services, background_tx.clone());
     }
+    let now = Instant::now();
+    let mut animation_clock = AnimationClock::new(now);
+    let mut scheduler = RenderScheduler::new(now);
     let mut redraw = true;
     loop {
+        let now = Instant::now();
+        animation_clock.set_paused(app.animations_paused(), now);
         if redraw {
+            app.frame = animation_clock.frame_at(now);
             let context = services.runtime.context_usage();
             app.info.context_tokens = context.tokens;
             app.info.context_accuracy = context.accuracy;
             terminal.draw(|frame| render(frame, app))?;
+            scheduler.did_draw(now);
+            redraw = false;
         }
-        redraw = true;
+        let now = Instant::now();
+        let continuous = app.continuous_render_demand();
+        let wake_at = scheduler.next_wake(continuous, app.next_render_deadline(), now);
+        let scheduled_wake = async move {
+            match wake_at {
+                Some(at) => time::sleep_until(time::Instant::from_std(at)).await,
+                None => pending().await,
+            }
+        };
+        let pty_notify = app.pty.as_ref().map(|pty| pty.terminal.output_notifier());
+        let pty_wake = async move {
+            match pty_notify {
+                Some(notify) => notify.notified().await,
+                None => pending().await,
+            }
+        };
         tokio::select! {
-            _ = animation.tick(), if !app.animations_paused() => {
-                app.frame = app.frame.wrapping_add(1);
+            _ = scheduled_wake => {
+                let now = Instant::now();
+                if scheduler.frame_due(app.continuous_render_demand(), now)
+                    && app.mouse_scroll_animating()
+                {
+                    app.advance_mouse_scroll_animation();
+                }
+                redraw = true;
             },
-            _ = smooth_scroll.tick(), if app.mouse_scroll_animating() => {
-                app.advance_mouse_scroll_animation();
+            _ = pty_wake => {
+                scheduler.request_coalesced();
             },
             event = terminal_events.next() => {
                 let Some(event) = event else { return persist_and_exit(app, &services, TuiOutcome::Quit).await; };
@@ -251,12 +349,19 @@ pub(super) async fn run_loop(
                 redraw = handled;
             }
             event = receiver.recv() => match event {
-                Ok(SessionUpdate::Persisted(event)) => app.apply(event),
-                Ok(SessionUpdate::Transient(kind)) => app.apply_transient(kind),
+                Ok(SessionUpdate::Persisted(event)) => {
+                    app.apply(event);
+                    scheduler.request_coalesced();
+                }
+                Ok(SessionUpdate::Transient(kind)) => {
+                    app.apply_transient(kind);
+                    scheduler.request_coalesced();
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for event in services.runtime.session().snapshot().await {
                         app.apply(event);
                     }
+                    scheduler.request_coalesced();
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return persist_and_exit(app, &services, TuiOutcome::Quit).await;
@@ -265,14 +370,17 @@ pub(super) async fn run_loop(
             changed = pending_receiver.changed() => {
                 if changed.is_ok() {
                     app.pending_messages = pending_receiver.borrow().clone();
+                    scheduler.request_coalesced();
                 }
             },
             Some(event) = background_rx.recv() => {
                 finish_background(app, &services, background_tx.clone(), event).await;
+                scheduler.request_coalesced();
             },
         }
         if pty_finished(app)? {
             close_pty(app, "Terminal exited");
+            redraw = true;
         }
     }
 }
@@ -3786,4 +3894,65 @@ pub(super) async fn active_for_runtime(
     manager
         .for_session(&settings.provider, &settings.model, settings.thinking)
         .await
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn idle_scheduler_has_no_periodic_wake_and_coalesces_updates() {
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::new(now);
+        scheduler.did_draw(now);
+
+        assert_eq!(scheduler.next_wake(false, None, now), None);
+
+        scheduler.request_coalesced();
+        scheduler.request_coalesced();
+        assert_eq!(
+            scheduler.next_wake(false, None, now),
+            Some(now + PRESENTATION_FRAME_DURATION)
+        );
+
+        let presented = now + PRESENTATION_FRAME_DURATION;
+        assert!(scheduler.frame_due(false, presented));
+        scheduler.did_draw(presented);
+        assert_eq!(scheduler.next_wake(false, None, presented), None);
+    }
+
+    #[test]
+    fn continuous_scheduler_skips_missed_presentation_frames() {
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::new(now);
+        scheduler.did_draw(now);
+        assert_eq!(
+            scheduler.next_wake(true, None, now),
+            Some(now + PRESENTATION_FRAME_DURATION)
+        );
+
+        let delayed = now + PRESENTATION_FRAME_DURATION * 5;
+        assert!(scheduler.frame_due(true, delayed));
+        scheduler.did_draw(delayed);
+        assert_eq!(
+            scheduler.next_wake(true, None, delayed),
+            Some(delayed + PRESENTATION_FRAME_DURATION)
+        );
+    }
+
+    #[test]
+    fn animation_clock_keeps_legacy_velocity_across_sixty_hertz_presentations() {
+        let now = Instant::now();
+        let mut clock = AnimationClock::new(now);
+
+        assert_eq!(clock.frame_at(now + Duration::from_millis(16)), 0);
+        assert_eq!(clock.frame_at(now + Duration::from_millis(89)), 0);
+        assert_eq!(clock.frame_at(now + Duration::from_millis(90)), 1);
+        assert_eq!(clock.frame_at(now + Duration::from_millis(900)), 10);
+
+        clock.set_paused(true, now + Duration::from_millis(900));
+        assert_eq!(clock.frame_at(now + Duration::from_secs(2)), 10);
+        clock.set_paused(false, now + Duration::from_secs(2));
+        assert_eq!(clock.frame_at(now + Duration::from_millis(2_090)), 11);
+    }
 }

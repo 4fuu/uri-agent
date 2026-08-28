@@ -7,11 +7,13 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
+use tokio::sync::Notify;
 
 type SharedWriter = Arc<Mutex<BufWriter<Box<dyn Write + Send>>>>;
 
 pub struct EmbeddedTerminal {
     parser: Arc<RwLock<vt100::Parser>>,
+    output_notify: Arc<Notify>,
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<SharedWriter>,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -44,8 +46,10 @@ impl EmbeddedTerminal {
 
         let writer = Arc::new(Mutex::new(BufWriter::new(writer)));
         let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 2_000)));
+        let output_notify = Arc::new(Notify::new());
         let reader_parser = parser.clone();
         let reader_writer = writer.clone();
+        let reader_notify = output_notify.clone();
         let reader = thread::spawn(move || {
             let mut buffer = [0_u8; 8_192];
             let mut queries = CursorPositionQuery::default();
@@ -66,13 +70,16 @@ impl EmbeddedTerminal {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let _ = writer.write_all(&replies).and_then(|()| writer.flush());
                         }
+                        reader_notify.notify_one();
                     }
                 }
             }
+            reader_notify.notify_one();
         });
 
         Ok(Self {
             parser,
+            output_notify,
             master: Some(pair.master),
             writer: Some(writer),
             child: Some(child),
@@ -86,6 +93,10 @@ impl EmbeddedTerminal {
         self.parser
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn output_notifier(&self) -> Arc<Notify> {
+        self.output_notify.clone()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
@@ -331,6 +342,8 @@ fn function_key(number: u8) -> Option<&'static [u8]> {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use futures_util::FutureExt;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -377,6 +390,7 @@ mod tests {
         let mut terminal =
             EmbeddedTerminal::start(command, Path::new(env!("CARGO_MANIFEST_DIR")), 24, 80)
                 .unwrap();
+        let output_notify = terminal.output_notifier();
         let deadline = Instant::now() + Duration::from_secs(2);
 
         while Instant::now() < deadline {
@@ -386,6 +400,7 @@ mod tests {
                 .contents()
                 .contains("terminal-ready")
             {
+                assert!(output_notify.notified().now_or_never().is_some());
                 return;
             }
             let _ = terminal.try_wait().unwrap();
