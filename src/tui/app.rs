@@ -55,6 +55,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use rate::*;
 use render::*;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
@@ -145,6 +146,59 @@ struct DisplayBlock {
     turn_result: bool,
     parent_process: Option<u64>,
     process: Option<ProcessDisplay>,
+    render_revision: u64,
+    render_cache: RefCell<Option<TranscriptBlockRenderCache>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TranscriptBlockRenderKey {
+    revision: u64,
+    message_width: usize,
+    process_width: usize,
+    expanded: bool,
+    nested: bool,
+    selected: bool,
+    live: bool,
+    status: String,
+    open_hint: String,
+    expand_hint: String,
+}
+
+struct TranscriptBlockRenderCache {
+    key: TranscriptBlockRenderKey,
+    rows: Vec<(ListItem<'static>, TextRowSeparator)>,
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptLayoutBlock {
+    index: usize,
+    start: usize,
+    block_start: usize,
+    block_rows: usize,
+    user_padding: bool,
+}
+
+#[derive(Default)]
+struct TranscriptLayoutCache {
+    message_width: usize,
+    process_width: usize,
+    blocks: Vec<TranscriptLayoutBlock>,
+    rows: usize,
+    dirty_from: Option<usize>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TranscriptRenderStats {
+    rendered_blocks: usize,
+    materialized_rows: usize,
+}
+
+impl DisplayBlock {
+    fn invalidate_render(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+        *self.render_cache.get_mut() = None;
+    }
 }
 
 struct ToolDisplay {
@@ -607,6 +661,9 @@ struct App {
     transcript_scrollbar_area: Option<Rect>,
     transcript_scrollbar_drag: Option<TranscriptScrollbarDrag>,
     mouse_scroll_animation: Option<MouseScrollAnimation>,
+    transcript_layout: TranscriptLayoutCache,
+    #[cfg(test)]
+    transcript_render_stats: TranscriptRenderStats,
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
@@ -697,6 +754,9 @@ impl App {
             transcript_scrollbar_area: None,
             transcript_scrollbar_drag: None,
             mouse_scroll_animation: None,
+            transcript_layout: TranscriptLayoutCache::default(),
+            #[cfg(test)]
+            transcript_render_stats: TranscriptRenderStats::default(),
             started: Instant::now(),
             splash_skipped: !show_splash,
             last_sequence: None,
@@ -939,11 +999,13 @@ impl App {
                     false,
                     false,
                 );
-                self.blocks.last_mut().unwrap().tool = Some(ToolDisplay {
+                let block = self.blocks.last_mut().unwrap();
+                block.tool = Some(ToolDisplay {
                     name,
                     arguments,
                     output: None,
                 });
+                block.invalidate_render();
             }
             EventKind::ToolResult {
                 call_id,
@@ -952,17 +1014,23 @@ impl App {
                 failed,
                 protocol_help_required,
             } => {
-                if let Some(block) = self
-                    .blocks
-                    .iter_mut()
-                    .rev()
-                    .find(|block| block.call_id.as_deref() == Some(&call_id))
+                if let Some(index) =
+                    self.blocks
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, block)| {
+                            (block.call_id.as_deref() == Some(&call_id)).then_some(index)
+                        })
                 {
+                    let block = &mut self.blocks[index];
                     block.failed = failed;
                     block.protocol_help_required = protocol_help_required;
                     if let Some(tool) = block.tool.as_mut() {
                         tool.output = Some(output.clone());
                     }
+                    block.invalidate_render();
+                    self.invalidate_transcript_layout_from(index);
                 } else {
                     let tool_output = output.clone();
                     self.push(
@@ -986,6 +1054,7 @@ impl App {
                         arguments: serde_json::Value::Null,
                         output: Some(tool_output),
                     });
+                    block.invalidate_render();
                 }
                 self.activity = Some(Activity::Thinking);
             }
@@ -1107,7 +1176,11 @@ impl App {
             .blocks
             .iter()
             .any(|block| block.transient && block.kind == BlockKind::Reasoning && !block.expanded);
+        let first_transient = self.blocks.iter().position(|block| block.transient);
         self.blocks.retain(|block| !block.transient);
+        if let Some(index) = first_transient {
+            self.invalidate_transcript_layout_from(index);
+        }
         self.selected_block = self.selected_block.min(self.blocks.len().saturating_sub(1));
     }
 
@@ -1116,8 +1189,12 @@ impl App {
             .blocks
             .last_mut()
             .filter(|block| block.kind == BlockKind::Reasoning)
+            && block.expanded
         {
             block.expanded = false;
+            block.invalidate_render();
+            let index = self.blocks.len().saturating_sub(1);
+            self.invalidate_transcript_layout_from(index);
         }
     }
 
@@ -1137,6 +1214,7 @@ impl App {
             let mut result = self.blocks.remove(index);
             result.expanded = true;
             result.turn_result = true;
+            result.invalidate_render();
             result
         });
         let process_end = self.blocks.len();
@@ -1157,6 +1235,7 @@ impl App {
             if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
                 block.expanded = false;
             }
+            block.invalidate_render();
         }
         self.blocks.insert(
             turn_start,
@@ -1176,6 +1255,8 @@ impl App {
                     id: process_id,
                     steps: process_end - turn_start,
                 }),
+                render_revision: 0,
+                render_cache: RefCell::new(None),
             },
         );
         if let Some(result) = result {
@@ -1188,6 +1269,7 @@ impl App {
                 turn_start
             };
         }
+        self.invalidate_transcript_layout_from(turn_start);
     }
 
     fn finish_hydration(&mut self) {
@@ -1196,11 +1278,16 @@ impl App {
         self.activity = None;
         self.busy_since = None;
         for block in &mut self.blocks {
-            block.expanded = matches!(
+            let expanded = matches!(
                 block.kind,
                 BlockKind::Assistant | BlockKind::Notice | BlockKind::Error
             );
+            if block.expanded != expanded {
+                block.expanded = expanded;
+                block.invalidate_render();
+            }
         }
+        self.invalidate_transcript_layout_from(0);
         self.sync_composer_chrome();
     }
 
@@ -1213,6 +1300,7 @@ impl App {
         failed: bool,
         expanded: bool,
     ) {
+        let index = self.blocks.len();
         self.blocks.push(DisplayBlock {
             kind,
             title: title.to_string(),
@@ -1226,7 +1314,10 @@ impl App {
             turn_result: false,
             parent_process: None,
             process: None,
+            render_revision: 0,
+            render_cache: RefCell::new(None),
         });
+        self.invalidate_transcript_layout_from(index);
     }
 
     fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String, expanded: bool) {
@@ -1236,9 +1327,20 @@ impl App {
             .filter(|block| block.kind == kind && block.transient == self.applying_transient)
         {
             block.text.push_str(&text);
+            block.invalidate_render();
+            let index = self.blocks.len().saturating_sub(1);
+            self.invalidate_transcript_layout_from(index);
         } else {
             self.push(kind, title, text, None, false, expanded);
         }
+    }
+
+    fn invalidate_transcript_layout_from(&mut self, index: usize) {
+        self.transcript_layout.dirty_from = Some(
+            self.transcript_layout
+                .dirty_from
+                .map_or(index, |dirty| dirty.min(index)),
+        );
     }
 
     fn submit(&mut self) -> Option<(String, Vec<ImageAttachment>)> {
@@ -1688,8 +1790,10 @@ impl App {
         let Some(block) = self.blocks.get_mut(index) else {
             return false;
         };
-        if !matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
+        if !matches!(block.kind, BlockKind::User | BlockKind::Assistant) && !block.expanded {
             block.expanded = true;
+            block.invalidate_render();
+            self.invalidate_transcript_layout_from(index);
         }
         self.expand_parent_process(index);
         self.jump = JumpKind::All;
@@ -1765,13 +1869,16 @@ impl App {
         else {
             return;
         };
-        if let Some(parent) = self.blocks.iter_mut().find(|block| {
+        if let Some(parent_index) = self.blocks.iter().position(|block| {
             block
                 .process
                 .as_ref()
                 .is_some_and(|process| process.id == parent_id)
-        }) {
-            parent.expanded = true;
+        }) && !self.blocks[parent_index].expanded
+        {
+            self.blocks[parent_index].expanded = true;
+            self.blocks[parent_index].invalidate_render();
+            self.invalidate_transcript_layout_from(parent_index);
         }
     }
 
@@ -1783,6 +1890,8 @@ impl App {
             return;
         }
         block.expanded = !block.expanded;
+        block.invalidate_render();
+        self.invalidate_transcript_layout_from(self.selected_block);
         self.transcript_center_selected = true;
     }
 

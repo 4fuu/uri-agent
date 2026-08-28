@@ -3501,6 +3501,93 @@ fn transcript_scroll_is_independent_from_selection_and_follows_the_tail_again() 
 }
 
 #[test]
+fn transcript_cache_invalidates_content_width_and_fold_state() {
+    let mut app = test_app();
+    app.skip_splash();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "**cached** response".into(),
+        None,
+        false,
+        true,
+    );
+    render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+
+    render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 0);
+
+    app.append_or_push(
+        BlockKind::Assistant,
+        "AGENT",
+        " with new content".into(),
+        true,
+    );
+    let changed = render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+    assert!(changed.contains("cached response with new content"));
+
+    render_to_string(&mut app, 40, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+
+    app.push(
+        BlockKind::Reasoning,
+        "THINKING",
+        "one two three four five six seven eight".into(),
+        None,
+        false,
+        false,
+    );
+    app.selected_block = 1;
+    render_to_string(&mut app, 40, 12);
+    let collapsed_rows = app.transcript_rows;
+    app.toggle_selected();
+    let expanded = render_to_string(&mut app, 40, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+    assert!(app.transcript_rows > collapsed_rows);
+    assert!(expanded.contains("one two three"));
+}
+
+#[test]
+fn unchanged_large_transcript_materializes_only_the_viewport() {
+    let mut app = test_app();
+    app.skip_splash();
+    for index in 0..400 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("## Message {index}\n\n{}", "markdown content ".repeat(20)),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 14);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 400);
+
+    render_to_string(&mut app, 80, 14);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 0);
+    assert!(
+        app.transcript_render_stats.materialized_rows <= app.transcript_height,
+        "materialized {} rows for a {}-row viewport and {}-row transcript",
+        app.transcript_render_stats.materialized_rows,
+        app.transcript_height,
+        app.transcript_rows
+    );
+
+    app.append_or_push(
+        BlockKind::Assistant,
+        "AGENT",
+        "\nstreamed tail".into(),
+        true,
+    );
+    render_to_string(&mut app, 80, 14);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+    assert!(app.transcript_render_stats.materialized_rows <= app.transcript_height);
+}
+
+#[test]
 fn mouse_wheel_smooths_each_six_row_step_without_reducing_distance() {
     let mut app = test_app();
     for index in 0..30 {
@@ -5098,7 +5185,7 @@ fn tool_call_and_result_share_one_block() {
     assert!(collapsed.contains("✓ Read src/main.rs"));
     assert!(!collapsed.contains("{\"uri\""));
     assert!(!collapsed.contains("CALL"));
-    app.blocks[0].expanded = true;
+    app.toggle_selected();
     let expanded = render_to_string(&mut app, 100, 24);
     assert!(expanded.contains("↳ file://src/main.rs"));
     assert!(expanded.contains("└ complete tool output"));
