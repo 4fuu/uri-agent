@@ -3828,6 +3828,191 @@ fn transcript_text_selection_stops_before_the_scrollbar_column() {
 }
 
 #[test]
+fn transcript_text_selection_follows_scroll_until_it_leaves_the_view() {
+    let mut app = test_app();
+    for index in 0..30 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let selection = TextSelection {
+        start: (area.x + 4, area.y + 3),
+        end: (area.x + 12, area.y + 4),
+    };
+    app.selection = Some(selection);
+    let selected = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
+    assert!(!selected.trim().is_empty());
+
+    app.scroll_transcript(-2);
+    render_to_string(&mut app, 80, 12);
+    let followed = app.selection.expect("selection follows while visible");
+    assert_eq!(followed.start.1, selection.start.1 + 2);
+    assert_eq!(followed.end.1, selection.end.1 + 2);
+    assert_eq!(followed.start.0, selection.start.0);
+    assert_eq!(followed.end.0, selection.end.0);
+    assert_eq!(
+        selected_surface_text(app.selectable.as_ref().unwrap(), followed),
+        selected
+    );
+
+    app.scroll_transcript(2);
+    render_to_string(&mut app, 80, 12);
+    let followed = app.selection.expect("selection follows back to the tail");
+    assert_eq!(followed.start.1, selection.start.1);
+    assert_eq!(followed.end.1, selection.end.1);
+
+    app.scroll_transcript(4);
+    render_to_string(&mut app, 80, 12);
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn transcript_text_selection_clears_when_scrolled_below_the_view() {
+    let mut app = test_app();
+    for index in 0..30 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    app.selection = Some(TextSelection {
+        start: (area.x + 4, area.bottom() - 3),
+        end: (area.x + 12, area.bottom() - 2),
+    });
+
+    app.scroll_transcript(-3);
+    render_to_string(&mut app, 80, 12);
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn mouse_wheel_scroll_keeps_the_text_selection_on_its_content() {
+    let mut app = test_app();
+    for index in 0..30 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    app.scroll_transcript(-5);
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let selection = TextSelection {
+        start: (area.x + 4, area.y + 6),
+        end: (area.x + 12, area.y + 7),
+    };
+    app.selection = Some(selection);
+    let selected = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
+    assert!(!selected.trim().is_empty());
+
+    handle_mouse_scroll(&mut app, 1);
+    app.advance_mouse_scroll_animation();
+    render_to_string(&mut app, 80, 12);
+    let followed = app.selection.expect("selection follows the wheel step");
+    assert_eq!(followed.start.1, selection.start.1 - 1);
+    assert_eq!(followed.end.1, selection.end.1 - 1);
+    assert_eq!(
+        selected_surface_text(app.selectable.as_ref().unwrap(), followed),
+        selected
+    );
+
+    for _ in 0..10 {
+        handle_mouse_scroll(&mut app, 1);
+        while app.mouse_scroll_animating() {
+            app.advance_mouse_scroll_animation();
+        }
+    }
+    render_to_string(&mut app, 80, 12);
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn float_text_selection_follows_overlay_scroll_until_it_leaves_the_view() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "background".to_string(),
+        None,
+        false,
+        true,
+    );
+    app.document = Some((
+        "DOC".to_string(),
+        (0..40)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ));
+    app.overlay = Some(Overlay::Document);
+    render_to_string(&mut app, 80, 24);
+    let area = app.selectable.as_ref().unwrap().area;
+    let selection = TextSelection {
+        start: (area.x, area.y + 2),
+        end: (area.x + 6, area.y + 3),
+    };
+    app.selection = Some(selection);
+    let selected = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
+    assert!(selected.contains("line"));
+
+    app.overlay_scroll = 1;
+    render_to_string(&mut app, 80, 24);
+    let followed = app.selection.expect("selection follows the float scroll");
+    assert_eq!(followed.start.1, selection.start.1 - 1);
+    assert_eq!(followed.end.1, selection.end.1 - 1);
+    assert_eq!(
+        selected_surface_text(app.selectable.as_ref().unwrap(), followed),
+        selected
+    );
+
+    app.overlay_scroll = 10;
+    render_to_string(&mut app, 80, 24);
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn opening_a_float_clears_the_transcript_text_selection() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "message".to_string(),
+        None,
+        false,
+        true,
+    );
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    app.selection = Some(TextSelection {
+        start: (area.x + 2, area.y),
+        end: (area.x + 6, area.y),
+    });
+
+    app.document = Some(("DOC".to_string(), "float body".to_string()));
+    app.overlay = Some(Overlay::Document);
+    render_to_string(&mut app, 80, 12);
+    assert!(app.selection.is_none());
+}
+
+#[test]
 fn overlays_page_by_their_rendered_content_height() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Document);
@@ -5450,6 +5635,8 @@ fn cell_selection_preserves_lines_and_trims_padding() {
         ],
         row_separators: vec![TextRowSeparator::Newline; 2],
         left_padding: 0,
+        scroll_origin: 0,
+        overlay: None,
     };
     let selection = TextSelection {
         start: (11, 5),
@@ -5472,6 +5659,8 @@ fn rendered_word_double_click_obeys_the_shift_requirement() {
         ],
         row_separators: vec![TextRowSeparator::Newline],
         left_padding: 0,
+        scroll_origin: 0,
+        overlay: None,
     });
     let event = |kind, modifiers| MouseEvent {
         kind,
@@ -5524,6 +5713,8 @@ fn cell_selection_omits_soft_wraps_but_preserves_source_separators() {
             TextRowSeparator::Newline,
         ],
         left_padding: 0,
+        scroll_origin: 0,
+        overlay: None,
     };
     let selection = TextSelection {
         start: (0, 0),

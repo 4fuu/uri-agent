@@ -270,6 +270,8 @@ struct SelectableSurface {
     cells: Vec<Vec<String>>,
     row_separators: Vec<TextRowSeparator>,
     left_padding: usize,
+    scroll_origin: usize,
+    overlay: Option<Overlay>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

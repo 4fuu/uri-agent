@@ -433,7 +433,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.overlay_bounds = None;
     app.overlay_viewport_rows = 0;
     app.transcript_scrollbar_area = None;
-    app.selectable = None;
     app.composer_view = None;
     if app.overlay != Some(Overlay::Composer) {
         if app.composer_mouse_selecting {
@@ -458,6 +457,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
     if app.showing_splash() {
+        app.selectable = None;
         render_brand(frame, app, area, true);
         return;
     }
@@ -559,6 +559,8 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         let left_padding = usize::from(row_separators.is_some());
         capture_surface(frame, app, selectable_area, row_separators, left_padding);
         render_selection(frame, app);
+    } else {
+        app.selectable = None;
     }
     if app.overlay.is_none() && !idle {
         render_transcript_scrollbar(frame, app);
@@ -3177,6 +3179,12 @@ pub(super) fn capture_surface(
     row_separators: Option<Vec<TextRowSeparator>>,
     left_padding: usize,
 ) {
+    let scroll_origin = if app.overlay.is_some() {
+        usize::from(app.overlay_scroll)
+    } else {
+        app.transcript_offset
+    };
+    follow_scrolled_selection(app, area, scroll_origin);
     let cells = (area.y..area.bottom())
         .map(|row| {
             let mut hidden_cells = 0;
@@ -3204,7 +3212,35 @@ pub(super) fn capture_surface(
         cells,
         row_separators,
         left_padding,
+        scroll_origin,
+        overlay: app.overlay,
     });
+}
+
+// A selection anchors to the scrolled content rather than the screen: shift it
+// by the surface's row movement, and clear it as soon as either end leaves the
+// visible area or the captured surface changes.
+fn follow_scrolled_selection(app: &mut App, area: Rect, scroll_origin: usize) {
+    let (Some(mut selection), Some(previous)) = (app.selection, app.selectable.as_ref()) else {
+        return;
+    };
+    if previous.overlay != app.overlay {
+        app.selection = None;
+        return;
+    }
+    let delta = area.y as isize - previous.area.y as isize + previous.scroll_origin as isize
+        - scroll_origin as isize;
+    let start_row = selection.start.1 as isize + delta;
+    let end_row = selection.end.1 as isize + delta;
+    let top = area.y as isize;
+    let bottom = area.bottom() as isize;
+    if start_row < top || start_row >= bottom || end_row < top || end_row >= bottom {
+        app.selection = None;
+        return;
+    }
+    selection.start.1 = start_row as u16;
+    selection.end.1 = end_row as u16;
+    app.selection = Some(selection);
 }
 
 pub(super) fn render_selection(frame: &mut Frame<'_>, app: &App) {
