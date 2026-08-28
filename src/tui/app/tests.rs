@@ -6899,6 +6899,86 @@ async fn global_history_actions_load_the_complete_session_before_navigating() {
     assert!(!end.history_complete);
 }
 
+#[tokio::test]
+async fn scrollbar_reaching_a_lazy_frontier_loads_older_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-scrollbar").await;
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "older user".into(),
+            },
+            EventKind::AssistantText {
+                text: "older answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("older answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "checkpoint".into(),
+            10,
+            vec![Message::user("summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    opened
+        .append_batch(
+            (0..50)
+                .map(|index| EventKind::Notice {
+                    text: format!("tail notice {index}"),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    drop(opened);
+
+    let resumed = persisted_tui_session(&path, "lazy-scrollbar").await;
+    let mut app = test_app();
+    hydrate_session_history(&mut app, &resumed).await.unwrap();
+    render_to_string(&mut app, 40, 12);
+    assert!(!app.history_complete);
+    let old_frontier = app.oldest_sequence;
+    let old_blocks = app.blocks.len();
+    let previous_offset = app.transcript_offset;
+    assert!(previous_offset > 0);
+    let area = app.transcript_scrollbar_area.unwrap();
+    let mouse = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(handle_transcript_scrollbar_mouse(&mut app, mouse));
+    assert_eq!(app.transcript_offset, 0);
+    let action = scrollbar_history_action(&app, mouse, previous_offset).unwrap();
+    assert_eq!(action, HistoryAction::ScrollbarTop(area.y));
+    perform_history_action(&mut app, &resumed, action)
+        .await
+        .unwrap();
+
+    assert!(app.history_complete);
+    assert!(app.oldest_sequence < old_frontier);
+    assert!(app.blocks.len() > old_blocks);
+    assert_eq!(app.transcript_offset, 0);
+    let drag = app.transcript_scrollbar_drag.unwrap();
+    assert_eq!(drag.row, area.y);
+    assert_eq!(drag.offset, 0);
+    assert!(
+        app.blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::User && block.text == "older user")
+    );
+}
+
 #[test]
 fn web_search_providers_use_api_key_login_prompts() {
     let parallel = login_provider_item("parallel", "openai");

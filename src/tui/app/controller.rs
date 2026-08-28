@@ -12,6 +12,7 @@ pub(super) enum HistoryAction {
     Scroll(isize),
     SmoothScroll(isize),
     Page(isize),
+    ScrollbarTop(u16),
     Previous,
     First,
     Search,
@@ -260,6 +261,14 @@ pub(super) async fn perform_history_action(
                 load_older_visible_history(app, session).await?;
             }
             app.page_transcript(direction);
+        }
+        HistoryAction::ScrollbarTop(row) => {
+            load_older_visible_history(app, session).await?;
+            app.set_transcript_scrollbar_offset(0);
+            if let Some(drag) = app.transcript_scrollbar_drag.as_mut() {
+                drag.row = row;
+                drag.offset = 0;
+            }
         }
         HistoryAction::Previous => {
             while !app.history_complete {
@@ -2303,7 +2312,11 @@ pub(super) async fn handle_mouse(
     if close_float_on_outside_click(app, mouse) {
         return Action::Continue;
     }
+    let previous_transcript_offset = app.transcript_offset;
     if handle_transcript_scrollbar_mouse(app, mouse) {
+        if let Some(action) = scrollbar_history_action(app, mouse, previous_transcript_offset) {
+            return Action::History(action);
+        }
         return Action::Continue;
     }
     if begin_direct_transcript_selection(app, mouse) {
@@ -2402,6 +2415,17 @@ pub(super) async fn handle_mouse(
         _ => {}
     }
     Action::Continue
+}
+
+pub(super) fn scrollbar_history_action(
+    app: &App,
+    mouse: MouseEvent,
+    previous_offset: usize,
+) -> Option<HistoryAction> {
+    (!app.history_complete
+        && app.transcript_offset == 0
+        && (previous_offset > 0 || matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left))))
+    .then_some(HistoryAction::ScrollbarTop(mouse.row))
 }
 
 pub(super) fn handle_mouse_scroll(app: &mut App, direction: isize) {

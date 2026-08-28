@@ -569,7 +569,9 @@ fn restore_persisted_state(
                 ))
             },
         )
-        .optional()?
+        .optional()
+        .ok()
+        .flatten()
         .and_then(|(version, through, payload, checksum)| {
             let through = u64::try_from(through).ok()?;
             if version != i64::from(RESUME_INDEX_VERSION) || through > authoritative_head {
@@ -3094,19 +3096,27 @@ mod tests {
             .append_compaction("two".into(), 20, vec![Message::user("two")], false)
             .await
             .unwrap();
-        let index_payload = opened
+        let latest_index = opened
             .connection
             .call(|db| {
                 db.query_row(
-                    "SELECT payload_json FROM session_resume_index
+                    "SELECT version, through_sequence, payload_json, checksum
+                     FROM session_resume_index
                      WHERE session_id = 'index-fallbacks'",
                     [],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
                 )
             })
             .await
             .unwrap();
-        assert!(!index_payload.contains("result"));
+        assert!(!latest_index.2.contains("result"));
         opened
             .append(EventKind::ModelMessage {
                 message: Message::assistant("tail"),
@@ -3163,6 +3173,10 @@ mod tests {
         enum Corruption {
             Absent,
             UnknownVersion,
+            InvalidVersionType,
+            InvalidThroughType,
+            InvalidPayloadType,
+            InvalidChecksumType,
             Malformed,
             SemanticPayload,
             ImpossibleHead,
@@ -3171,6 +3185,10 @@ mod tests {
         for corruption in [
             Corruption::Absent,
             Corruption::UnknownVersion,
+            Corruption::InvalidVersionType,
+            Corruption::InvalidThroughType,
+            Corruption::InvalidPayloadType,
+            Corruption::InvalidChecksumType,
             Corruption::Malformed,
             Corruption::SemanticPayload,
             Corruption::ImpossibleHead,
@@ -3178,15 +3196,42 @@ mod tests {
         ] {
             let database_path = path.clone();
             let old_index = old_index.clone();
+            let latest_index = latest_index.clone();
             let mutator = Connection::open(&database_path).await.unwrap();
             mutator
                 .call(move |db| {
+                    db.execute(
+                        "INSERT INTO session_resume_index
+                         (session_id, version, through_sequence, payload_json, checksum)
+                         VALUES ('index-fallbacks', ?1, ?2, ?3, ?4)
+                         ON CONFLICT(session_id) DO UPDATE SET version=excluded.version,
+                           through_sequence=excluded.through_sequence,
+                           payload_json=excluded.payload_json, checksum=excluded.checksum",
+                        params![
+                            latest_index.0,
+                            latest_index.1,
+                            latest_index.2,
+                            latest_index.3
+                        ],
+                    )?;
                     match corruption {
                         Corruption::Absent => {
                             db.execute("DELETE FROM session_resume_index WHERE session_id = 'index-fallbacks'", [])?;
                         }
                         Corruption::UnknownVersion => {
                             db.execute("UPDATE session_resume_index SET version = 999 WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::InvalidVersionType => {
+                            db.execute("UPDATE session_resume_index SET version = 'bad' WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::InvalidThroughType => {
+                            db.execute("UPDATE session_resume_index SET through_sequence = 'bad' WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::InvalidPayloadType => {
+                            db.execute("UPDATE session_resume_index SET payload_json = x'00' WHERE session_id = 'index-fallbacks'", [])?;
+                        }
+                        Corruption::InvalidChecksumType => {
+                            db.execute("UPDATE session_resume_index SET checksum = x'00' WHERE session_id = 'index-fallbacks'", [])?;
                         }
                         Corruption::Malformed => {
                             db.execute("UPDATE session_resume_index SET payload_json = '{bad' WHERE session_id = 'index-fallbacks'", [])?;
