@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BUILTIN_MODEL_ROLES: [&str; 3] = ["default", "small", "large"];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
@@ -45,6 +46,14 @@ pub struct ModelRole {
     pub provider: String,
     pub model: String,
     pub thinking: ThinkingLevel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelRoleInfo {
+    pub name: String,
+    pub role: Option<ModelRole>,
+    pub configured: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -247,6 +256,8 @@ struct SettingsFile {
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_roles: BTreeMap<String, ModelRoleConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    plugin_settings: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,41 +501,181 @@ impl ConfigManager {
     /// does not change the active conversation model.
     pub async fn model_role(&self, name: &str) -> Result<Option<ModelRole>> {
         validate_model_role_name(name)?;
-        let configured = {
+        let (configured, fallback) = {
             let files = self.files.lock().await;
-            let Some(configured) = files
+            let configured = files
                 .project
                 .model_roles
                 .get(name)
                 .or_else(|| files.global.model_roles.get(name))
-            else {
-                return Ok(None);
-            };
+                .cloned();
+            let fallback = (BUILTIN_MODEL_ROLES.contains(&name) && configured.is_none())
+                .then(|| {
+                    files
+                        .project
+                        .model_roles
+                        .get("default")
+                        .or_else(|| files.global.model_roles.get("default"))
+                        .cloned()
+                })
+                .flatten();
+            (configured, fallback)
+        };
+        let configured = configured.or(fallback);
+        let role = if let Some(configured) = configured {
             if configured.provider.trim().is_empty() || configured.model.trim().is_empty() {
                 bail!("model role {name:?} requires nonempty provider and model values");
             }
-            let thinking = configured.thinking.unwrap_or_else(|| {
+            let thinking = if let Some(thinking) = configured.thinking {
+                thinking
+            } else {
+                let files = self.files.lock().await;
                 configured_thinking(&files, &configured.provider, &configured.model).0
-            });
+            };
             ModelRole {
-                provider: configured.provider.clone(),
-                model: configured.model.clone(),
+                provider: configured.provider,
+                model: configured.model,
                 thinking,
             }
+        } else if BUILTIN_MODEL_ROLES.contains(&name) {
+            let active = self.current().await;
+            if !active.model_configured() {
+                return Ok(None);
+            }
+            ModelRole {
+                provider: active.provider,
+                model: active.model,
+                thinking: active.thinking,
+            }
+        } else {
+            return Ok(None);
         };
         if self
             .catalog
-            .model(&configured.provider, &configured.model)
+            .model(&role.provider, &role.model)
             .await
             .is_none()
         {
             bail!(
                 "model role {name:?} selects unavailable model {}/{}",
-                configured.provider,
-                configured.model
+                role.provider,
+                role.model
             );
         }
-        Ok(Some(configured))
+        Ok(Some(role))
+    }
+
+    pub async fn model_roles(&self) -> Result<Vec<ModelRoleInfo>> {
+        let (custom, configured) = {
+            let files = self.files.lock().await;
+            let mut custom = BTreeSet::new();
+            custom.extend(files.global.model_roles.keys().cloned());
+            custom.extend(files.project.model_roles.keys().cloned());
+            let configured = custom.clone();
+            for builtin in BUILTIN_MODEL_ROLES {
+                custom.remove(builtin);
+            }
+            (custom, configured)
+        };
+        let mut names = BUILTIN_MODEL_ROLES
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.extend(custom);
+        let mut roles = Vec::with_capacity(names.len());
+        for name in names {
+            let (role, error) = match self.model_role(&name).await {
+                Ok(role) => (role, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            roles.push(ModelRoleInfo {
+                role,
+                configured: configured.contains(&name),
+                error,
+                name,
+            });
+        }
+        Ok(roles)
+    }
+
+    /// Read one project-overridable value from a plugin-owned settings
+    /// namespace. Plugin settings are independent from model-role routes.
+    pub async fn plugin_setting(&self, plugin: &str, key: &str) -> Result<Option<Value>> {
+        validate_plugin_setting_name("plugin", plugin)?;
+        validate_plugin_setting_name("plugin setting key", key)?;
+        let files = self.files.lock().await;
+        Ok(files
+            .project
+            .plugin_settings
+            .get(plugin)
+            .and_then(|settings| settings.get(key))
+            .or_else(|| {
+                files
+                    .global
+                    .plugin_settings
+                    .get(plugin)
+                    .and_then(|settings| settings.get(key))
+            })
+            .cloned())
+    }
+
+    /// Persist one value in a plugin-owned settings namespace. The value is
+    /// written to the project file when that file already exists, matching
+    /// other interactive settings.
+    pub async fn set_plugin_setting(&self, plugin: &str, key: &str, value: Value) -> Result<()> {
+        validate_plugin_setting_name("plugin", plugin)?;
+        validate_plugin_setting_name("plugin setting key", key)?;
+        if serde_json::to_vec(&value)?.len() > 1024 * 1024 {
+            bail!("plugin setting value exceeds 1 MiB");
+        }
+        let mut files = self.files.lock().await;
+        let (settings, path) = if self.project_path.exists() {
+            (&mut files.project, self.project_path.clone())
+        } else {
+            (&mut files.global, self.settings_path())
+        };
+        settings
+            .plugin_settings
+            .entry(plugin.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
+        write_json(&path, settings, false).await
+    }
+
+    pub async fn remove_plugin_setting(&self, plugin: &str, key: &str) -> Result<bool> {
+        validate_plugin_setting_name("plugin", plugin)?;
+        validate_plugin_setting_name("plugin setting key", key)?;
+        let mut files = self.files.lock().await;
+        let (settings, path) = if files
+            .project
+            .plugin_settings
+            .get(plugin)
+            .is_some_and(|settings| settings.contains_key(key))
+        {
+            (&mut files.project, self.project_path.clone())
+        } else if files
+            .global
+            .plugin_settings
+            .get(plugin)
+            .is_some_and(|settings| settings.contains_key(key))
+        {
+            (&mut files.global, self.settings_path())
+        } else {
+            return Ok(false);
+        };
+        let plugin_is_empty =
+            settings
+                .plugin_settings
+                .get_mut(plugin)
+                .is_some_and(|plugin_settings| {
+                    plugin_settings.remove(key);
+                    plugin_settings.is_empty()
+                });
+        if plugin_is_empty {
+            settings.plugin_settings.remove(plugin);
+        }
+        write_json(&path, settings, false).await?;
+        Ok(true)
     }
 
     /// Return catalog providers that currently have a configured model
@@ -618,6 +769,40 @@ impl ConfigManager {
         Ok(active)
     }
 
+    pub(crate) async fn for_model_role(
+        &self,
+        name: &str,
+    ) -> Result<Option<(ModelRole, ActiveSettings)>> {
+        let Some(role) = self.model_role(name).await? else {
+            return Ok(None);
+        };
+        let current_provider = self.active.read().await.provider.clone();
+        let files = self.files.lock().await;
+        let mut invocation = self.invocation.clone();
+        invocation.provider = Some(role.provider.clone());
+        invocation.model = Some(role.model.clone());
+        invocation.thinking = Some(role.thinking);
+        let mut active = calculate_active(&files, &self.catalog, &invocation).await?;
+        if role.provider != current_provider {
+            let credential = resolve_model_credential(
+                &files,
+                &self.catalog,
+                &self.invocation,
+                &role.provider,
+                false,
+            )
+            .await;
+            active.api_key = credential.api_key;
+            active.api_key_source = credential.source;
+            active.auth_kind = credential.kind;
+            active.credential_environment = credential.environment;
+        }
+        active.provider_source = ValueSource::Global;
+        active.model_source = ValueSource::Global;
+        active.thinking_source = ValueSource::Global;
+        Ok(Some((role, active)))
+    }
+
     pub async fn thinking_for_model(&self, provider: &str, model: &str) -> ThinkingLevel {
         let files = self.files.lock().await;
         let (configured, _) = configured_thinking(&files, provider, model);
@@ -664,6 +849,52 @@ impl ConfigManager {
         settings.default_model = Some(model.to_string());
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
+    }
+
+    pub async fn set_model_role(
+        &self,
+        name: &str,
+        provider: &str,
+        model: &str,
+        thinking: ThinkingLevel,
+    ) -> Result<()> {
+        validate_model_role_name(name)?;
+        let Some(catalog_model) = self.catalog.model(provider, model).await else {
+            bail!("model {provider}/{model} is not runnable in the current catalog");
+        };
+        if !catalog_model.supports_thinking_level(thinking) {
+            bail!("model {provider}/{model} does not support thinking effort {thinking}");
+        }
+        let mut files = self.files.lock().await;
+        let (settings, path) = if self.project_path.exists() {
+            (&mut files.project, self.project_path.clone())
+        } else {
+            (&mut files.global, self.settings_path())
+        };
+        settings.model_roles.insert(
+            name.to_string(),
+            ModelRoleConfig {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                thinking: Some(thinking),
+            },
+        );
+        write_json(&path, settings, false).await
+    }
+
+    pub async fn remove_model_role(&self, name: &str) -> Result<bool> {
+        validate_model_role_name(name)?;
+        let mut files = self.files.lock().await;
+        let (settings, path) = if files.project.model_roles.contains_key(name) {
+            (&mut files.project, self.project_path.clone())
+        } else if files.global.model_roles.contains_key(name) {
+            (&mut files.global, self.settings_path())
+        } else {
+            return Ok(false);
+        };
+        settings.model_roles.remove(name);
+        write_json(&path, settings, false).await?;
+        Ok(true)
     }
 
     /// Remove persisted default model selections that resolve through
@@ -952,6 +1183,10 @@ impl ConfigManager {
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    pub(crate) fn catalog(&self) -> Arc<ModelCatalog> {
+        self.catalog.clone()
     }
 
     pub fn settings_path(&self) -> PathBuf {
@@ -1321,13 +1556,25 @@ fn model_setting_key(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
 }
 
-fn validate_model_role_name(name: &str) -> Result<()> {
+pub fn validate_model_role_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
     {
         bail!("invalid model role name {name:?}; use ASCII letters, digits, '-' or '_'");
+    }
+    Ok(())
+}
+
+fn validate_plugin_setting_name(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '.' | '/' | '\\'))
+    {
+        bail!("invalid {kind} {name:?}");
     }
     Ok(())
 }
@@ -2019,6 +2266,155 @@ mod tests {
         );
         assert_eq!(manager.model_role("missing").await.unwrap(), None);
         assert!(manager.model_role("invalid role").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn built_in_roles_fall_back_to_default_then_the_active_model() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(&project).await.unwrap();
+        fs::write(
+            directory.join("models.json"),
+            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"active-model","name":"Active"},{"id":"role-model","name":"Role"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            br#"{"defaultProvider":"example","defaultModel":"active-model","modelRoles":{"default":{"provider":"example","model":"role-model","thinking":"high"}}}"#,
+        )
+        .await
+        .unwrap();
+
+        let manager = ConfigManager::load_for_test(&directory, &project)
+            .await
+            .unwrap();
+        for name in BUILTIN_MODEL_ROLES {
+            assert_eq!(
+                manager.model_role(name).await.unwrap(),
+                Some(ModelRole {
+                    provider: "example".to_string(),
+                    model: "role-model".to_string(),
+                    thinking: ThinkingLevel::High,
+                })
+            );
+        }
+
+        assert!(manager.remove_model_role("default").await.unwrap());
+        for name in BUILTIN_MODEL_ROLES {
+            assert_eq!(
+                manager.model_role(name).await.unwrap().unwrap().model,
+                "active-model"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_roles_and_plugin_settings_use_project_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::create_dir_all(project.join(".uri-agent"))
+            .await
+            .unwrap();
+        fs::write(
+            directory.join("models.json"),
+            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"active-model","name":"Active"},{"id":"custom-model","name":"Custom"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            br#"{"defaultProvider":"example","defaultModel":"active-model","pluginSettings":{"terminal-title":{"role":"small","format":{"words":5}}}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            project.join(".uri-agent/settings.json"),
+            br#"{"pluginSettings":{"terminal-title":{"role":"large"}}}"#,
+        )
+        .await
+        .unwrap();
+
+        let manager = ConfigManager::load_for_test(&directory, &project)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .plugin_setting("terminal-title", "role")
+                .await
+                .unwrap(),
+            Some(Value::String("large".to_string()))
+        );
+        assert_eq!(
+            manager
+                .plugin_setting("terminal-title", "format")
+                .await
+                .unwrap(),
+            Some(serde_json::json!({"words": 5}))
+        );
+
+        manager
+            .set_model_role("title", "example", "custom-model", ThinkingLevel::Off)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .model_roles()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|role| role.name)
+                .collect::<Vec<_>>(),
+            ["default", "small", "large", "title"]
+        );
+        manager
+            .set_plugin_setting("terminal-title", "role", Value::String("title".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .plugin_setting("terminal-title", "role")
+                .await
+                .unwrap(),
+            Some(Value::String("title".to_string()))
+        );
+        assert!(manager.remove_model_role("title").await.unwrap());
+        assert_eq!(manager.model_role("title").await.unwrap(), None);
+        assert_eq!(
+            manager
+                .plugin_setting("terminal-title", "role")
+                .await
+                .unwrap(),
+            Some(Value::String("title".to_string()))
+        );
+
+        let project_settings: Value = serde_json::from_slice(
+            &fs::read(project.join(".uri-agent/settings.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            project_settings["pluginSettings"]["terminal-title"]["role"],
+            "title"
+        );
+        assert!(
+            manager
+                .remove_plugin_setting("terminal-title", "role")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            manager
+                .plugin_setting("terminal-title", "role")
+                .await
+                .unwrap(),
+            Some(Value::String("small".to_string()))
+        );
     }
 
     #[tokio::test]

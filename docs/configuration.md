@@ -184,7 +184,7 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 
 | Path | Purpose |
 | --- | --- |
-| `<config>/settings.json` | Global provider, model, model-role, thinking, output, and terminal settings |
+| `<config>/settings.json` | Global provider, model, model-role, plugin-owned, thinking, output, and terminal settings |
 | `<config>/auth.json` | Global provider credentials |
 | `<config>/environment.json` | Global environment variables for Agent shell commands and trusted plugins |
 | `<config>/models.json` | Custom providers, models, headers, and model overrides |
@@ -220,6 +220,7 @@ The dedicated linked Rust and WASM host interface requires an explicitly request
 | `defaultThinkingLevel` | Fallback reasoning effort | `off` |
 | `modelThinkingLevels` | Per-model effort keyed by `provider/model` | `{}` |
 | `modelRoles` | Named model routes available to linked and WASM plugins | `{}` |
+| `pluginSettings` | Plugin-owned JSON key/value settings grouped by namespace | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
 | `keyDisplay` | Key-hint style: `auto`, `macos`, or `text` | `auto` |
 | `compaction.enabled` | Run threshold and overflow compaction automatically | `true` |
@@ -247,7 +248,7 @@ Relevant environment variables are:
 | `URI_AGENT_TERMINAL` | Embedded terminal command |
 | `URI_AGENT_KEY_DISPLAY` | Key-hint style |
 
-When the project settings file already exists, changes made through model selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
+When the project settings file already exists, changes made through model selection, model-role selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
 
 Compaction fields merge individually across global and project settings. Token values must be greater than zero. For models with small context windows, the effective reserve and recent-history budgets are each capped at one quarter of the model context window. Disabling automatic compaction also disables automatic provider-overflow recovery; `:compact` remains available.
 
@@ -278,8 +279,19 @@ The active model determines which levels are available. Run `:effort` to open a 
 
 ## Model roles for plugins
 
-`modelRoles` lets plugins resolve a named provider, model, and thinking effort
-without changing the active conversation model:
+URI Agent provides the built-in roles `default`, `small`, and `large`. Each is
+a semantic route rather than a hard-coded catalog model. An explicitly
+configured role wins; an unconfigured `small` or `large` role inherits an
+explicit `default` role, and an otherwise unconfigured built-in role uses the
+currently configured default conversation model.
+
+Use `:model-roles` to inspect and assign these roles. `Ctrl+N` adds a custom
+role. `Enter` first selects a runnable model and then selects one of that
+model's supported thinking levels; both choices are stored on the role.
+`Delete` removes its explicit assignment. Resetting a built-in role restores
+its fallback; removing a custom role removes it from the list.
+
+`modelRoles` stores explicit role assignments:
 
 ```json
 {
@@ -291,7 +303,8 @@ without changing the active conversation model:
     },
     "commit": {
       "provider": "openai",
-      "model": "gpt-5.2"
+      "model": "gpt-5.2",
+      "thinking": "low"
     }
   }
 }
@@ -302,8 +315,47 @@ project role replaces the complete global role. `provider` and `model` are
 required and must identify a runnable catalog model. When `thinking` is
 omitted, resolution uses that model's `modelThinkingLevels` entry and then
 `defaultThinkingLevel`. Lookup is dynamic, returns no credential, and does not
-alter the current session. URI Agent exposes this interface for plugins but
-does not otherwise use model roles yet; see [WASM model-role lookup](plugins.md#model-role-lookup).
+alter the current session.
+
+Plugins store their own settings independently of role assignments. Each
+namespace contains arbitrary JSON values keyed by the plugin. For example, the
+built-in terminal-title plugin defaults to `small` and stores an explicit role
+selection like this:
+
+```json
+{
+  "pluginSettings": {
+    "terminal-title": {
+      "role": "large"
+    }
+  }
+}
+```
+
+A project value overrides the same global namespace and key without replacing
+the plugin's other global keys. Linked plugins choose their namespace through
+`PluginHost::settings`; a WASM plugin automatically uses its `.wasm` filename
+stem. Keys and namespaces may not contain control characters, `.`, `/`, or
+`\\`; each must be nonempty and at most 128 bytes. One encoded value may not
+exceed 1 MiB. These values are trusted plugin configuration, not a secret store
+or permission boundary.
+
+Linked plugins can register `CommandTarget::ModelRole` to open the generic role
+selector and persist the result as one of these string values, or provide their
+own settings UI. The built-in `:terminal-title-role` (`:title-role`) command
+uses that selector. A plugin decides its own default and missing-role behavior;
+terminal-title uses `small` only when the setting is absent and silently skips
+generation if the selected role cannot run.
+
+Plugins with subagent access can run a bounded, ephemeral model/tool loop
+through a role. A request can inherit the current tools and protocols or
+replace either set with exact registered names, choose a working directory,
+and append instructions to the generated system prompt. It may replace the
+whole system prompt only when both effective capability sets are empty. Calls
+cannot select a provider or model directly. They use the configured route's
+thinking level, normal credential, request compatibility, usage accounting,
+and transient retry behavior without changing the active conversation or
+session. See [Subagent inference](plugins.md#subagent-inference).
 
 ## Command-line options
 

@@ -289,6 +289,7 @@ pub(super) enum BackgroundEvent {
         submitted_image_ids: Vec<u64>,
         result: Result<()>,
     },
+    Effects(Vec<TuiEffect>),
     OauthFinished(Result<OauthToken>),
     ClipboardImageRead(Result<Vec<u8>>),
     ClipboardRead(Result<clipboard::ClipboardContent>),
@@ -318,6 +319,9 @@ pub(super) enum Action {
     InterruptTurn,
     Compact,
     OpenModels(String),
+    OpenModelRoles,
+    OpenRoleModel(String),
+    RemoveModelRole(String),
     SelectModel,
     OpenSettings,
     SaveSettings,
@@ -376,13 +380,34 @@ pub(super) async fn apply_action(
             // interface and its animation keep rendering meanwhile.
             let submitted_image_ids = app.composer_images.keys().copied().collect();
             let runtime = services.runtime.clone();
+            let tui = app.tui.clone();
+            let context = TuiSubmissionContext {
+                cwd: app.info.cwd.clone(),
+                session_id: app.info.session_id.clone(),
+                prompt: prompt.clone(),
+                first_user_message: !services
+                    .runtime
+                    .session()
+                    .snapshot()
+                    .await
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::User { .. })),
+            };
+            let effect_tx = background_tx.clone();
             tokio::spawn(async move {
                 let result = runtime.start_turn_with_images(prompt.clone(), images).await;
+                let started = result.is_ok();
                 let _ = background_tx.send(BackgroundEvent::TurnStarted {
                     prompt,
                     submitted_image_ids,
                     result,
                 });
+                if started {
+                    let effects = tui.submission_effects(&context).await;
+                    if !effects.is_empty() {
+                        let _ = effect_tx.send(BackgroundEvent::Effects(effects));
+                    }
+                }
             });
             Ok(None)
         }
@@ -451,6 +476,7 @@ pub(super) async fn apply_action(
             Ok(None)
         }
         Action::OpenModels(query) => {
+            app.model_selection_target = ModelSelectionTarget::Conversation;
             open_models(
                 app,
                 &services.runtime,
@@ -459,6 +485,32 @@ pub(super) async fn apply_action(
                 query,
             )
             .await;
+            Ok(None)
+        }
+        Action::OpenModelRoles => {
+            open_model_roles(app, &services.manager).await;
+            Ok(None)
+        }
+        Action::OpenRoleModel(role) => {
+            open_models_for_role(
+                app,
+                &services.runtime,
+                &services.manager,
+                &services.catalog,
+                role,
+            )
+            .await;
+            Ok(None)
+        }
+        Action::RemoveModelRole(role) => {
+            match services.manager.remove_model_role(&role).await {
+                Ok(true) => app.set_flash(format!("Model role {role} reset")),
+                Ok(false) => app.set_flash(format!("Model role {role} already uses its fallback")),
+                Err(error) => {
+                    app.set_flash(format!("Could not reset model role {role}: {error:#}"))
+                }
+            }
+            open_model_roles(app, &services.manager).await;
             Ok(None)
         }
         Action::SelectModel => {
@@ -775,6 +827,14 @@ pub(super) async fn dispatch_ui_command(
             }
             return Action::Continue;
         }
+        CommandTarget::ModelRole {
+            plugin,
+            key,
+            default_role,
+        } => {
+            open_plugin_model_roles(app, services, plugin, key, default_role).await;
+            return Action::Continue;
+        }
     };
     match command {
         CoreCommand::Compose => {
@@ -806,6 +866,7 @@ pub(super) async fn dispatch_ui_command(
             Action::Continue
         }
         CoreCommand::Models => Action::OpenModels(String::new()),
+        CoreCommand::ModelRoles => Action::OpenModelRoles,
         CoreCommand::RefreshCatalog => Action::RefreshCatalog,
         CoreCommand::Effort => {
             open_effort(app, services).await;
@@ -1187,6 +1248,7 @@ pub(super) async fn handle_overlay_key(
                 Some("quit") => Action::Quit,
                 Some("close") => {
                     app.overlay = None;
+                    app.model_selection_target = ModelSelectionTarget::Conversation;
                     Action::Continue
                 }
                 Some("previous") => {
@@ -1423,6 +1485,32 @@ pub(super) async fn handle_selector_key(
             _ => {}
         }
     }
+    if matches!(
+        app.selector.as_ref().map(|selector| &selector.kind),
+        Some(SelectorKind::ModelRoles)
+    ) {
+        match app
+            .keymap
+            .action_chain(&["model_roles", "selector"], key_name)
+            .as_deref()
+        {
+            Some("add") => {
+                app.selector = None;
+                open_model_role_name_prompt(app);
+                return Action::Continue;
+            }
+            Some("remove") => {
+                return app
+                    .selector
+                    .as_ref()
+                    .and_then(SelectorState::selected_item)
+                    .map_or(Action::Continue, |item| {
+                        Action::RemoveModelRole(item.id.clone())
+                    });
+            }
+            _ => {}
+        }
+    }
     match apply_selector_key(app, key, key_name) {
         SelectorKey::Quit => Action::Quit,
         SelectorKey::Confirm => confirm_selector(app, services).await,
@@ -1540,8 +1628,42 @@ pub(super) async fn confirm_selector(app: &mut App, services: &LoopServices) -> 
             set_effort(app, services, &provider, &model, thinking).await;
             Action::Continue
         }
+        SelectorKind::ModelRoleEffort {
+            role,
+            provider,
+            model,
+        } => {
+            let Ok(thinking) = item.id.parse::<ThinkingLevel>() else {
+                app.set_flash("The selected effort is invalid");
+                return Action::Continue;
+            };
+            match services
+                .manager
+                .set_model_role(&role, &provider, &model, thinking)
+                .await
+            {
+                Ok(()) => app.set_flash(format!(
+                    "Model role {role} set to {provider}/{model} · effort {thinking}"
+                )),
+                Err(error) => app.set_flash(format!("Could not save model role {role}: {error:#}")),
+            }
+            app.model_selection_target = ModelSelectionTarget::Conversation;
+            Action::Continue
+        }
         SelectorKind::Environment { return_to_settings } => {
             open_environment_value_prompt(app, item.id, return_to_settings);
+            Action::Continue
+        }
+        SelectorKind::ModelRoles => Action::OpenRoleModel(item.id),
+        SelectorKind::PluginModelRole { plugin, key } => {
+            match services
+                .manager
+                .set_plugin_setting(&plugin, &key, serde_json::Value::String(item.id.clone()))
+                .await
+            {
+                Ok(()) => app.set_flash(format!("{plugin} now uses model role {}", item.id)),
+                Err(error) => app.set_flash(format!("Could not save {plugin}: {error:#}")),
+            }
             Action::Continue
         }
     }
@@ -1610,6 +1732,16 @@ pub(super) fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> A
                     value: prompt.value,
                     return_to_settings,
                 },
+                TextPurpose::ModelRoleName => {
+                    let role = prompt.value.trim().to_string();
+                    if let Err(error) = validate_model_role_name(&role) {
+                        open_model_role_name_prompt(app);
+                        app.set_flash(format!("Invalid model role name: {error}"));
+                        Action::Continue
+                    } else {
+                        Action::OpenRoleModel(role)
+                    }
+                }
                 TextPurpose::SetTerminal => Action::SaveTerminal(prompt.value),
             }
         }
@@ -2516,6 +2648,17 @@ pub(super) fn open_environment_name_prompt(app: &mut App, return_to_settings: bo
     app.overlay = Some(Overlay::Text);
 }
 
+pub(super) fn open_model_role_name_prompt(app: &mut App) {
+    app.text_prompt = Some(TextPrompt {
+        title: "ADD MODEL ROLE".to_string(),
+        message: "Role name · ASCII letters, digits, - or _".to_string(),
+        value: String::new(),
+        secret: false,
+        purpose: TextPurpose::ModelRoleName,
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
 pub(super) fn open_environment_value_prompt(app: &mut App, name: String, return_to_settings: bool) {
     app.text_prompt = Some(TextPrompt {
         title: format!("SET {name}"),
@@ -2936,6 +3079,127 @@ pub(super) async fn open_models(
     app.overlay = Some(Overlay::Models);
 }
 
+pub(super) async fn open_model_roles(app: &mut App, manager: &ConfigManager) {
+    match manager.model_roles().await {
+        Ok(roles) => {
+            app.selector = Some(model_role_selector(SelectorKind::ModelRoles, roles, None));
+            app.overlay = Some(Overlay::Selector);
+        }
+        Err(error) => app.set_flash(format!("Could not load model roles: {error:#}")),
+    }
+}
+
+pub(super) async fn open_plugin_model_roles(
+    app: &mut App,
+    services: &LoopServices,
+    plugin: String,
+    key: String,
+    default_role: String,
+) {
+    let selected = services
+        .manager
+        .plugin_setting(&plugin, &key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| default_role.clone());
+    match services.manager.model_roles().await {
+        Ok(roles) => {
+            app.selector = Some(model_role_selector(
+                SelectorKind::PluginModelRole { plugin, key },
+                roles,
+                Some(&selected),
+            ));
+            app.overlay = Some(Overlay::Selector);
+        }
+        Err(error) => app.set_flash(format!("Could not load model roles: {error:#}")),
+    }
+}
+
+pub(super) fn model_role_selector(
+    kind: SelectorKind,
+    roles: Vec<crate::config::ModelRoleInfo>,
+    selected: Option<&str>,
+) -> SelectorState {
+    let title = if matches!(&kind, SelectorKind::ModelRoles) {
+        "MODEL ROLES · Ctrl+N add · Delete reset"
+    } else {
+        "SELECT MODEL ROLE"
+    };
+    let selected_position =
+        selected.and_then(|selected| roles.iter().position(|role| role.name.as_str() == selected));
+    let items = roles
+        .into_iter()
+        .map(|info| {
+            let description = info.error.unwrap_or_else(|| {
+                info.role.map_or_else(
+                    || "no default model selected".to_string(),
+                    |role| {
+                        format!(
+                            "{}/{} · {}{}",
+                            role.provider,
+                            role.model,
+                            role.thinking,
+                            if info.configured { "" } else { " · fallback" }
+                        )
+                    },
+                )
+            });
+            SelectorItem {
+                id: info.name.clone(),
+                title: info.name,
+                description,
+                search_text: None,
+            }
+        })
+        .collect();
+    let mut selector = SelectorState::new(kind, title, items);
+    if let Some(position) = selected_position {
+        selector.selected = position;
+    }
+    selector
+}
+
+pub(super) async fn open_models_for_role(
+    app: &mut App,
+    runtime: &AgentRuntime,
+    manager: &ConfigManager,
+    catalog: &ModelCatalog,
+    role: String,
+) {
+    let mut active = match active_for_runtime(manager, runtime).await {
+        Ok(active) => active,
+        Err(error) => {
+            app.set_flash(format!("Could not resolve session model: {error:#}"));
+            return;
+        }
+    };
+    let current_provider = active.provider.clone();
+    match manager.model_role(&role).await {
+        Ok(Some(configured)) => {
+            active.provider = configured.provider;
+            active.model = configured.model;
+            active.thinking = configured.thinking;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            app.set_flash(format!("Could not resolve model role {role}: {error:#}"));
+            return;
+        }
+    }
+    let providers = manager
+        .model_providers_with_credentials(&current_provider)
+        .await;
+    let selector = ModelSelector::load(catalog, &active, &providers, String::new()).await;
+    if selector.model_count() == 0 {
+        app.set_flash("No authenticated model providers · use :login");
+    }
+    app.model_selection_target = ModelSelectionTarget::Role(role);
+    app.model_selector = Some(selector);
+    app.overlay = Some(Overlay::Models);
+}
+
 pub(super) async fn select_model(
     app: &mut App,
     runtime: &AgentRuntime,
@@ -2953,6 +3217,14 @@ pub(super) async fn select_model(
         return;
     };
     let requested = format!("{}/{}", model.provider, model.id);
+    if let ModelSelectionTarget::Role(role) = app.model_selection_target.clone() {
+        let configured = manager.thinking_for_model(&model.provider, &model.id).await;
+        let effective = clamp_thinking_level(&model, configured);
+        app.selector = Some(model_role_effort_selector(&role, &model, effective));
+        app.model_selector = None;
+        app.overlay = Some(Overlay::Selector);
+        return;
+    }
     let result = async {
         manager.set_model(&model.provider, &model.id).await?;
         let active = manager.current().await;
@@ -3034,6 +3306,45 @@ pub(super) fn effort_selector(active: &ActiveSettings, model: &CatalogModel) -> 
             model: model.id.clone(),
         },
         format!("EFFORT · {}/{}", model.provider, model.id),
+        items,
+    );
+    selector.selected = selected;
+    selector
+}
+
+pub(super) fn model_role_effort_selector(
+    role: &str,
+    model: &CatalogModel,
+    effective: ThinkingLevel,
+) -> SelectorState {
+    let available = ThinkingLevel::ALL
+        .into_iter()
+        .filter(|level| model.supports_thinking_level(*level))
+        .collect::<Vec<_>>();
+    let selected = available
+        .iter()
+        .position(|level| *level == effective)
+        .unwrap_or_default();
+    let items = available
+        .into_iter()
+        .map(|level| SelectorItem {
+            id: level.to_string(),
+            title: level.to_string(),
+            description: if level == effective {
+                "current model preference".to_string()
+            } else {
+                format!("available for {}/{}", model.provider, model.id)
+            },
+            search_text: None,
+        })
+        .collect();
+    let mut selector = SelectorState::new(
+        SelectorKind::ModelRoleEffort {
+            role: role.to_string(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+        },
+        format!("ROLE {role} EFFORT · {}/{}", model.provider, model.id),
         items,
     );
     selector.selected = selected;
@@ -3278,6 +3589,15 @@ pub(super) async fn finish_background(
                 app.set_flash(format!("Cannot start turn: {error:#}"));
             }
         },
+        BackgroundEvent::Effects(effects) => {
+            for effect in effects {
+                match effect {
+                    TuiEffect::TerminalTitle(title) => {
+                        let _ = execute!(stdout(), SetTitle(title));
+                    }
+                }
+            }
+        }
         BackgroundEvent::CatalogRefreshed { result, announced } => {
             app.catalog_refreshing = false;
             let result = async {
@@ -3307,12 +3627,21 @@ pub(super) async fn finish_background(
                     .as_ref()
                     .map(|selector| selector.query().to_string())
                 {
+                    let mut selector_active = active.clone();
+                    if let ModelSelectionTarget::Role(role) = &app.model_selection_target
+                        && let Some(configured) = services.manager.model_role(role).await?
+                    {
+                        selector_active.provider = configured.provider;
+                        selector_active.model = configured.model;
+                        selector_active.thinking = configured.thinking;
+                    }
                     let providers = services
                         .manager
                         .model_providers_with_credentials(&active.provider)
                         .await;
                     app.model_selector = Some(
-                        ModelSelector::load(&services.catalog, &active, &providers, query).await,
+                        ModelSelector::load(&services.catalog, &selector_active, &providers, query)
+                            .await,
                     );
                 }
                 Ok::<_, anyhow::Error>(report)

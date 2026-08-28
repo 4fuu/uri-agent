@@ -94,6 +94,9 @@ map("selector", "backspace", "backspace");
 map("environment", "ctrl+n", "add");
 map("environment", "delete", "remove");
 
+map("model_roles", "ctrl+n", "add");
+map("model_roles", "delete", "remove");
+
 map("tasks", "x", "cancel");
 
 map("command", "enter", "confirm");
@@ -868,6 +871,14 @@ mod tests {
         );
         assert_eq!(keymap.action("models", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
+        assert_eq!(
+            keymap.action("model_roles", "ctrl+n").as_deref(),
+            Some("add")
+        );
+        assert_eq!(
+            keymap.action("model_roles", "delete").as_deref(),
+            Some("remove")
+        );
         assert_eq!(keymap.action("selector", "k"), None);
         assert_eq!(keymap.action("terminal", "esc").as_deref(), Some("escape"));
         assert_eq!(

@@ -8,6 +8,7 @@ mod antigravity;
 mod codex_websocket;
 mod failure;
 mod request_transform;
+mod retry;
 mod rig_backend;
 
 use crate::catalog::{CatalogModel, ThinkingLevel};
@@ -20,6 +21,9 @@ use tokio::sync::mpsc;
 pub(crate) use failure::{
     ModelFailure, ModelFailureKind, ModelFailurePhase, looks_like_context_overflow,
 };
+#[cfg(test)]
+pub(crate) use retry::MAX_RETRY_AFTER;
+pub(crate) use retry::{model_retry_delay, model_retry_policy, model_retry_reason};
 pub use rig_backend::configured_backend;
 
 #[derive(Clone, Debug)]

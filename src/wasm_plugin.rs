@@ -2,8 +2,8 @@ use crate::config::display_path;
 use crate::output::OutputStore;
 use crate::plugin::{
     DynamicModelToolSource, ModelTool, ModelToolDescriptor, Plugin, PluginCredentials,
-    PluginEnvironment, PluginHost, PluginModelRoles, PluginPermission,
-    validate_model_tool_descriptor,
+    PluginEnvironment, PluginHost, PluginModelRoleResolver, PluginPermission, PluginSettings,
+    PluginSubagents, validate_model_tool_descriptor,
 };
 use crate::protocol::{
     DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRegistry,
@@ -22,7 +22,10 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell as AsyncOnceCell, RwLock as AsyncRwLock};
 use uri_agent_plugin_sdk::{
     ABI_VERSION, HANDLE_EXPORT, HOST_CREDENTIALS, HOST_ENVIRONMENT, HOST_EXEC, HOST_MODEL_ROLE,
-    HOST_READ, HandlerRequest, MANIFEST_EXPORT, Operation, PluginManifest,
+    HOST_PLUGIN_SETTING_GET, HOST_PLUGIN_SETTING_SET, HOST_READ, HOST_SUBAGENT, HandlerRequest,
+    MANIFEST_EXPORT, Operation, PluginManifest, PluginSettingGetResponse, PluginSettingSetRequest,
+    SubagentRequest as SdkSubagentRequest, SubagentResponse as SdkSubagentResponse,
+    SubagentSystemPrompt as SdkSubagentSystemPrompt, SubagentUsage as SdkSubagentUsage,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
@@ -34,7 +37,7 @@ const MAX_PROTOCOLS_PER_PLUGIN: usize = 64;
 const MAX_MODEL_TOOLS_PER_PLUGIN: usize = 64;
 const MAX_MEMORY_PAGES: u32 = 256;
 const MAX_VAR_BYTES: u64 = 1024 * 1024;
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const CALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const FUEL_LIMIT: u64 = 100_000_000;
 
 fn help(
@@ -126,7 +129,7 @@ and enable code you trust. Plugins run with WASI, unrestricted outbound HTTP,
 and writable host filesystem access on Unix. Through host `read`/`exec` they
 can also use URI Agent's built-in file and shell protocols with the same user
 permissions as URI Agent. Calls remain subject to memory, fuel, response-size,
-and 30-second reliability limits.
+and 60-minute reliability limits.
 "#,
         directory = display_path(directory),
     )
@@ -137,8 +140,8 @@ fn author_help() -> String {
         r##"# wasm_plugin authoring
 
 Author WASM plugins that register protocols and typed direct model tools.
-The SDK targets ABI version 4. Existing ABI version 3 plugins remain supported;
-rebuild them to use model-role lookup.
+The SDK targets ABI version 5. Existing ABI versions 3 and 4 remain supported;
+rebuild them to use role-based subagent inference.
 
 ## Rust SDK
 
@@ -234,6 +237,25 @@ manifest permission, performs no inference, and does not change the active
 conversation model. Role names use only ASCII letters, digits, `-`, and `_`;
 see the model-role settings documentation for global/project precedence.
 
+Persistent JSON values are available through
+`uri_agent_plugin_sdk::plugin_setting(key)` and
+`set_plugin_setting(key, value)`. They need no manifest permission and use the
+`.wasm` filename stem as a project-overridable `pluginSettings` namespace. One
+encoded value may not exceed 1 MiB; this is trusted configuration, not a secret
+store.
+
+Bounded, ephemeral model/tool loops through one of those roles are available
+through `uri_agent_plugin_sdk::subagent(&request)`. The manifest must call
+`.request_subagent_access()` once. A request names a role and user prompt;
+optional exact tool and protocol sets, working directory, appended or replaced
+system prompt, output-token limit, and timeout customize the isolated loop.
+Omitted capability sets inherit all registered capabilities. A replacement
+system prompt requires both effective sets to be empty. Plugins cannot select a
+provider or model directly. The calling module's own declared capabilities are
+excluded to prevent recursive runtime entry. Subagent depth is one: a plugin
+reached by this loop cannot start another subagent. Subagent and WASM calls
+have a one-hour timeout limit.
+
 Read `wasm_plugin://help/load` before loading or reloading the completed plugin.
 "##,
         version = env!("CARGO_PKG_VERSION"),
@@ -256,7 +278,12 @@ struct HostBridge {
     environment_allowed: Arc<OnceLock<bool>>,
     credentials: Arc<OnceLock<PluginCredentials>>,
     credentials_allowed: Arc<OnceLock<bool>>,
-    model_roles: Arc<OnceLock<PluginModelRoles>>,
+    model_roles: Arc<OnceLock<PluginModelRoleResolver>>,
+    settings: Arc<OnceLock<PluginSettings>>,
+    subagents: Arc<OnceLock<PluginSubagents>>,
+    subagents_allowed: Arc<OnceLock<bool>>,
+    subagent_excluded_tools: Arc<OnceLock<Vec<String>>>,
+    subagent_excluded_protocols: Arc<OnceLock<Vec<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -281,10 +308,19 @@ impl HostBridge {
             credentials: Arc::new(OnceLock::new()),
             credentials_allowed: Arc::new(OnceLock::new()),
             model_roles: Arc::new(OnceLock::new()),
+            settings: Arc::new(OnceLock::new()),
+            subagents: Arc::new(OnceLock::new()),
+            subagents_allowed: Arc::new(OnceLock::new()),
+            subagent_excluded_tools: Arc::new(OnceLock::new()),
+            subagent_excluded_protocols: Arc::new(OnceLock::new()),
         }
     }
 
-    fn for_plugin(&self) -> Self {
+    fn for_plugin(&self, plugin: &str) -> Self {
+        let settings = Arc::new(OnceLock::new());
+        if let Some(root) = self.settings.get() {
+            let _ = settings.set(root.scoped(plugin));
+        }
         Self {
             runtime: self.runtime.clone(),
             registry: self.registry.clone(),
@@ -293,6 +329,11 @@ impl HostBridge {
             credentials: self.credentials.clone(),
             credentials_allowed: Arc::new(OnceLock::new()),
             model_roles: self.model_roles.clone(),
+            settings,
+            subagents: self.subagents.clone(),
+            subagents_allowed: Arc::new(OnceLock::new()),
+            subagent_excluded_tools: Arc::new(OnceLock::new()),
+            subagent_excluded_protocols: Arc::new(OnceLock::new()),
         }
     }
 
@@ -326,10 +367,49 @@ impl HostBridge {
             .map_err(|_| anyhow!("WASM plugin credential permission is already bound"))
     }
 
-    fn bind_model_roles(&self, model_roles: PluginModelRoles) -> Result<()> {
+    fn bind_model_roles(&self, model_roles: PluginModelRoleResolver) -> Result<()> {
         self.model_roles
             .set(model_roles)
             .map_err(|_| anyhow!("WASM plugin model roles are already bound"))
+    }
+
+    fn bind_settings(&self, settings: PluginSettings) -> Result<()> {
+        self.settings
+            .set(settings)
+            .map_err(|_| anyhow!("WASM plugin settings are already bound"))
+    }
+
+    fn bind_subagents(&self, subagents: PluginSubagents) -> Result<()> {
+        self.subagents
+            .set(subagents)
+            .map_err(|_| anyhow!("WASM plugin subagents are already bound"))
+    }
+
+    fn set_subagents_allowed(&self, allowed: bool) -> Result<()> {
+        self.subagents_allowed
+            .set(allowed)
+            .map_err(|_| anyhow!("WASM plugin subagent permission is already bound"))
+    }
+
+    fn set_subagent_exclusions(&self, manifest: &PluginManifest) -> Result<()> {
+        self.subagent_excluded_tools
+            .set(
+                manifest
+                    .model_tools
+                    .iter()
+                    .map(|descriptor| descriptor.name.clone())
+                    .collect(),
+            )
+            .map_err(|_| anyhow!("WASM plugin subagent tool exclusions are already bound"))?;
+        self.subagent_excluded_protocols
+            .set(
+                manifest
+                    .protocols
+                    .iter()
+                    .map(|descriptor| descriptor.name.clone())
+                    .collect(),
+            )
+            .map_err(|_| anyhow!("WASM plugin subagent protocol exclusions are already bound"))
     }
 
     fn dispatch(&self, operation: Operation, input: &str) -> Result<String> {
@@ -383,6 +463,95 @@ impl HostBridge {
         let value = self.runtime.block_on(model_roles.resolve(name))?;
         serde_json::to_string(&value).context("cannot encode model role result")
     }
+
+    fn plugin_setting(&self, key: &str) -> Result<String> {
+        let settings = self
+            .settings
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin settings are not attached"))?;
+        let value = self.runtime.block_on(settings.get(key))?;
+        let response = match value {
+            Some(value) => PluginSettingGetResponse { found: true, value },
+            None => PluginSettingGetResponse {
+                found: false,
+                value: Value::Null,
+            },
+        };
+        serde_json::to_string(&response).context("cannot encode plugin setting result")
+    }
+
+    fn set_plugin_setting(&self, input: &str) -> Result<String> {
+        let input: PluginSettingSetRequest =
+            serde_json::from_str(input).context("invalid plugin setting request")?;
+        let settings = self
+            .settings
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin settings are not attached"))?;
+        self.runtime
+            .block_on(settings.set(&input.key, input.value))?;
+        Ok(String::new())
+    }
+
+    fn subagent(&self, input: &str) -> Result<String> {
+        if !self.subagents_allowed.get().copied().unwrap_or(false) {
+            bail!("WASM plugin did not request subagent access in uri_agent_manifest");
+        }
+        let input: SdkSubagentRequest =
+            serde_json::from_str(input).context("invalid subagent request")?;
+        let mut request = crate::subagent::SubagentRequest::new(input.prompt);
+        request.system_prompt = match input.system_prompt {
+            SdkSubagentSystemPrompt::Append(prompt) => {
+                crate::subagent::SubagentSystemPrompt::Append(prompt)
+            }
+            SdkSubagentSystemPrompt::Replace(prompt) => {
+                crate::subagent::SubagentSystemPrompt::Replace(prompt)
+            }
+        };
+        request.tools = input.tools;
+        request.protocols = input.protocols;
+        request.working_directory = input.working_directory.map(PathBuf::from);
+        if let Some(max_output_tokens) = input.max_output_tokens {
+            request = request.with_max_output_tokens(max_output_tokens);
+        }
+        if let Some(timeout_ms) = input.timeout_ms {
+            request = request.with_timeout(Duration::from_millis(timeout_ms));
+        }
+        let subagents = self
+            .subagents
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin subagents are not attached"))?;
+        let response = self.runtime.block_on(
+            subagents.complete_excluding(
+                &input.role,
+                request,
+                self.subagent_excluded_tools
+                    .get()
+                    .cloned()
+                    .unwrap_or_default(),
+                self.subagent_excluded_protocols
+                    .get()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        )?;
+        let usage = response.usage.map(|usage| SdkSubagentUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+            cost: usage.cost,
+        });
+        serde_json::to_string(&SdkSubagentResponse {
+            text: response.text,
+            role: response.role,
+            provider: response.provider,
+            model: response.model,
+            thinking: response.thinking.to_string(),
+            usage,
+        })
+        .context("cannot encode subagent result")
+    }
 }
 
 extism::host_fn!(uri_agent_read_host(user_data: HostBridge; input: String) -> String {
@@ -428,6 +597,33 @@ extism::host_fn!(uri_agent_model_role_host(user_data: HostBridge; input: String)
         .map_err(|_| anyhow!("WASM plugin model role host bridge lock is poisoned"))?
         .clone();
     bridge.model_role(&input)
+});
+
+extism::host_fn!(uri_agent_subagent_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin subagent host bridge lock is poisoned"))?
+        .clone();
+    bridge.subagent(&input)
+});
+
+extism::host_fn!(uri_agent_plugin_setting_get_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin settings host bridge lock is poisoned"))?
+        .clone();
+    bridge.plugin_setting(&input)
+});
+
+extism::host_fn!(uri_agent_plugin_setting_set_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin settings host bridge lock is poisoned"))?
+        .clone();
+    bridge.set_plugin_setting(&input)
 });
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -642,13 +838,19 @@ impl Plugin for WasmPluginManager {
     }
 
     fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Environment, PluginPermission::Credentials]
+        vec![
+            PluginPermission::Environment,
+            PluginPermission::Credentials,
+            PluginPermission::Subagents,
+        ]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         self.bridge.bind_environment(host.environment()?)?;
         self.bridge.bind_credentials(host.credentials()?)?;
         self.bridge.bind_model_roles(host.model_roles()?)?;
+        self.bridge.bind_settings(host.settings("wasm-plugin")?)?;
+        self.bridge.bind_subagents(host.subagents()?)?;
         host.protocols.register(self.clone())
     }
 }
@@ -764,11 +966,20 @@ async fn load_plugin_set(
     let mut claimed = reserved.clone();
     let mut claimed_model_tools = reserved_model_tools.clone();
     for path in paths {
+        let plugin_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "WASM plugin filename is not valid Unicode: {}",
+                    path.display()
+                )
+            })?;
         let module = match WasmModule::load(
             &path,
             working_directory,
             directory,
-            bridge.for_plugin(),
+            bridge.for_plugin(plugin_name),
         )
         .await
         {
@@ -860,6 +1071,8 @@ impl WasmModule {
             let manifest = read_manifest(&mut plugin, &display)?;
             permission_bridge.set_environment_allowed(manifest.permissions.environment)?;
             permission_bridge.set_credentials_allowed(manifest.permissions.credentials)?;
+            permission_bridge.set_subagents_allowed(manifest.permissions.subagents)?;
+            permission_bridge.set_subagent_exclusions(&manifest)?;
             if (!manifest.protocols.is_empty() || !manifest.model_tools.is_empty())
                 && !plugin.function_exists(HANDLE_EXPORT)
             {
@@ -976,17 +1189,20 @@ async fn call_wasm_handler(
 ) -> Result<Vec<u8>> {
     let runtime = runtime.clone();
     let display = plugin_path.display().to_string();
+    let subagent_depth = crate::subagent::capture_subagent_depth();
     tokio::task::spawn_blocking(move || {
-        let mut plugin = runtime
-            .lock()
-            .map_err(|_| anyhow!("WASM plugin runtime lock is poisoned: {display}"))?;
-        let output = plugin
-            .call::<&[u8], Vec<u8>>(HANDLE_EXPORT, input.as_slice())
-            .with_context(|| format!("WASM plugin call failed: {display}"))?;
-        if output.len() > MAX_RESPONSE_BYTES {
-            bail!("WASM plugin response exceeds {MAX_RESPONSE_BYTES} bytes: {display}");
-        }
-        Ok(output)
+        crate::subagent::with_blocking_subagent_depth(subagent_depth, || {
+            let mut plugin = runtime
+                .lock()
+                .map_err(|_| anyhow!("WASM plugin runtime lock is poisoned: {display}"))?;
+            let output = plugin
+                .call::<&[u8], Vec<u8>>(HANDLE_EXPORT, input.as_slice())
+                .with_context(|| format!("WASM plugin call failed: {display}"))?;
+            if output.len() > MAX_RESPONSE_BYTES {
+                bail!("WASM plugin response exceeds {MAX_RESPONSE_BYTES} bytes: {display}");
+            }
+            Ok(output)
+        })
     })
     .await
     .context("WASM plugin call task failed")?
@@ -1081,8 +1297,32 @@ fn build_runtime(
             HOST_MODEL_ROLE,
             [ValType::I64],
             [ValType::I64],
-            user_data,
+            user_data.clone(),
             uri_agent_model_role_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_SUBAGENT,
+            [ValType::I64],
+            [ValType::I64],
+            user_data.clone(),
+            uri_agent_subagent_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_PLUGIN_SETTING_GET,
+            [ValType::I64],
+            [ValType::I64],
+            user_data.clone(),
+            uri_agent_plugin_setting_get_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_PLUGIN_SETTING_SET,
+            [ValType::I64],
+            [ValType::I64],
+            user_data,
+            uri_agent_plugin_setting_set_host,
         )
         .build()
 }
@@ -1397,6 +1637,7 @@ mod tests {
         let credentials = crate::config::ConfigManager::load_for_test(directory, directory)
             .await
             .unwrap();
+        let subagents = crate::subagent::SubagentService::new(credentials.clone());
         let mut registry = ProtocolRegistry::new(output.clone(), TaskManager::new());
         let mut model_tools = ModelToolRegistry::new();
         registry.register(CaptureProtocol).unwrap();
@@ -1415,7 +1656,8 @@ mod tests {
                     &mut tui,
                     environment,
                 )
-                .with_credentials(credentials),
+                .with_credentials(credentials)
+                .with_subagents(subagents),
             )
             .unwrap();
         manager
@@ -1691,6 +1933,8 @@ mod tests {
             .unwrap();
         assert!(author.contains("ModelToolDescriptor"));
         assert!(author.contains("request_environment_access"));
+        assert!(author.contains("request_subagent_access"));
+        assert!(author.contains("ABI version 5"));
         assert!(!author.contains("atomic enable step"));
 
         assert!(registry.read("wasm_plugin://list", "").await.is_err());
@@ -1850,6 +2094,97 @@ mod tests {
             registry.read("model_role://read", "").await.unwrap(),
             r#"{"provider":"example","model":"review-model","thinking":"low"}"#
         );
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_plugin_settings_persist_and_are_scoped_by_module_filename() {
+        let directory = tempfile::tempdir().unwrap();
+        let (registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let plugin_path = manager.directory().join("settings-owner.wasm");
+        tokio::fs::write(
+            &plugin_path,
+            host_call_module_with_input(
+                &valid_manifest("settings_owner"),
+                HOST_PLUGIN_SETTING_SET,
+                br#"{"key":"role","value":"small"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+        restore_help_read(&registry, "settings_owner").await;
+        registry.read("settings_owner://write", "").await.unwrap();
+
+        tokio::fs::write(
+            &plugin_path,
+            host_call_module_with_input(
+                &valid_manifest("settings_owner"),
+                HOST_PLUGIN_SETTING_GET,
+                b"role",
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+        restore_help_read(&registry, "settings_owner").await;
+        assert_eq!(
+            registry
+                .read("settings_owner://read", "")
+                .await
+                .unwrap()
+                .trim(),
+            r#"{"found":true,"value":"small"}"#
+        );
+
+        tokio::fs::write(
+            manager.directory().join("settings-other.wasm"),
+            host_call_module_with_input(
+                &valid_manifest("settings_other"),
+                HOST_PLUGIN_SETTING_GET,
+                b"role",
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+        restore_help_read(&registry, "settings_other").await;
+        assert_eq!(
+            registry
+                .read("settings_other://read", "")
+                .await
+                .unwrap()
+                .trim(),
+            r#"{"found":false,"value":null}"#
+        );
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_subagent_access_requires_manifest_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let (registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let request = serde_json::to_vec(&SdkSubagentRequest::new("small", "Fix parser")).unwrap();
+        tokio::fs::write(
+            manager.directory().join("denied-subagent.wasm"),
+            host_call_module_with_input(
+                &valid_manifest("denied_subagent"),
+                HOST_SUBAGENT,
+                &request,
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        restore_help_read(&registry, "denied_subagent").await;
+        let error = registry
+            .read("denied_subagent://run", "")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("did not request subagent access"));
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 

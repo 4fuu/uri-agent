@@ -1,9 +1,11 @@
 use crate::catalog::ModelLimits;
 use crate::compaction;
 use crate::config::{display_path, path_is_within};
+#[cfg(test)]
+use crate::model::MAX_RETRY_AFTER;
 use crate::model::{
-    ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelFailurePhase, ModelRequest,
-    ModelResponse, looks_like_context_overflow,
+    ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelRequest, ModelResponse,
+    looks_like_context_overflow, model_retry_delay, model_retry_policy, model_retry_reason,
 };
 use crate::plugin::ModelToolRegistry;
 use crate::protocol::{ProtocolHelpRequired, ProtocolRegistry};
@@ -22,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock as SyncRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::{Mutex, OnceCell, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -33,7 +37,6 @@ const TASK_NOTIFICATION_MAX_LINES: usize = 20;
 const TASK_NOTIFICATION_MAX_CHARS: usize = 4_000;
 const TASK_NOTIFICATION_MAX_EVENTS: usize = 10;
 const TASK_NOTIFICATION_MAX_CONTENT_CHARS: usize = 16_000;
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
 const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
 
@@ -61,14 +64,6 @@ fn png_ihdr_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     (width > 0 && height > 0).then_some((width, height))
-}
-
-#[derive(Clone, Copy)]
-struct ModelRetryPolicy {
-    max_retries: usize,
-    base_delay: Duration,
-    max_delay: Duration,
-    reason: &'static str,
 }
 
 #[derive(Default)]
@@ -1503,100 +1498,6 @@ fn is_recoverable_length(
     (desired_max_output > 0 && output < desired_max_output)
         || (output == 0
             && reported_input_tokens(response) as usize >= context_window.saturating_mul(99) / 100)
-}
-
-fn model_retry_policy(kind: ModelFailureKind) -> Option<ModelRetryPolicy> {
-    match kind {
-        ModelFailureKind::RateLimit => Some(ModelRetryPolicy {
-            max_retries: 20,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(30),
-            reason: "rate limit",
-        }),
-        ModelFailureKind::Network => Some(ModelRetryPolicy {
-            max_retries: 5,
-            base_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(8),
-            reason: "network error",
-        }),
-        ModelFailureKind::Server => Some(ModelRetryPolicy {
-            max_retries: 5,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(15),
-            reason: "server error",
-        }),
-        ModelFailureKind::Timeout => Some(ModelRetryPolicy {
-            max_retries: 4,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(10),
-            reason: "timeout",
-        }),
-        ModelFailureKind::Conflict => Some(ModelRetryPolicy {
-            max_retries: 4,
-            base_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(8),
-            reason: "request conflict",
-        }),
-        ModelFailureKind::EmptyResponse => Some(ModelRetryPolicy {
-            max_retries: 4,
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(8),
-            reason: "empty response",
-        }),
-        ModelFailureKind::ContextOverflow
-        | ModelFailureKind::Authentication
-        | ModelFailureKind::Quota
-        | ModelFailureKind::Client
-        | ModelFailureKind::Other => None,
-    }
-}
-
-fn model_retry_delay(failure: &ModelFailure, policy: ModelRetryPolicy, retry: usize) -> Duration {
-    if let Some(requested) = failure.retry_after() {
-        return requested.min(MAX_RETRY_AFTER);
-    }
-    let multiplier = 1_u32 << retry.saturating_sub(1).min(31);
-    let backoff = policy
-        .base_delay
-        .saturating_mul(multiplier)
-        .min(policy.max_delay);
-    let jitter_limit_ms = (backoff / 4).as_millis();
-    let jitter_ms = if jitter_limit_ms == 0 {
-        0
-    } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            % (jitter_limit_ms + 1)
-    };
-    backoff
-        .saturating_add(Duration::from_millis(
-            jitter_ms.try_into().unwrap_or(u64::MAX),
-        ))
-        .min(policy.max_delay)
-}
-
-fn model_retry_reason(failure: &ModelFailure, policy: ModelRetryPolicy) -> String {
-    let phase = match failure.phase() {
-        ModelFailurePhase::Request => "request",
-        ModelFailurePhase::Stream => "stream",
-        ModelFailurePhase::Response => "response",
-    };
-    let mut reason = failure.status().map_or_else(
-        || format!("{} during {phase}", policy.reason),
-        |status| {
-            format!(
-                "{} during {phase} (HTTP {})",
-                policy.reason,
-                status.as_u16()
-            )
-        },
-    );
-    if let Some(request_id) = failure.provider_request_id() {
-        reason.push_str(&format!("; request id {request_id}"));
-    }
-    reason
 }
 
 fn memory_image_attachments(images: &[ImageAttachment]) -> Vec<UserContent> {
@@ -3239,7 +3140,8 @@ mod tests {
                     &mut tui,
                     environment,
                 )
-                .with_credentials(manager),
+                .with_credentials(manager.clone())
+                .with_subagents(crate::subagent::SubagentService::new(manager)),
             )
             .unwrap();
         let call = ToolCall::new(

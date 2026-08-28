@@ -53,21 +53,22 @@ protocol registry and reflects that part of the replacement set.
 
 Frozen session prompts contain the stable `wasm_plugin` manager, not a dynamic protocol list. New and resumed sessions load the current persistent plugin set. After a change, the reload result and `wasm_plugin://help` describe the active state; the detailed loading and authoring pages remain separately addressable.
 
-## ABI version 4
+## ABI version 5
 
-ABI version 4 lets a module contribute protocols and typed direct model tools
-and resolve configured model roles through a read-only host call. It does not
-contribute system prompt fragments, commands, panels, status providers, or
-composer completions. Exports use Extism's bytes-in/bytes-out functions and may
-be implemented with any compatible PDK. ABI version 3 modules remain supported;
-rebuild them with the version 4 SDK to use model-role lookup. ABI version 2 is
-intentionally unsupported.
+ABI version 5 adds bounded role-based subagent inference and plugin-owned
+persistent settings to the protocols, typed direct model tools, and read-only
+model-role lookup available in version 4. WASM plugins do not contribute system
+prompt fragments, commands, panels, status providers, or composer completions.
+Exports use Extism's bytes-in/bytes-out functions and may be implemented with
+any compatible PDK.
+ABI versions 3 and 4 remain supported; rebuild with the version 5 SDK to call a
+subagent or use plugin settings. ABI version 2 is intentionally unsupported.
 
 Every module exports `uri_agent_manifest`, which takes no input and returns:
 
 ```json
 {
-  "abi_version": 4,
+  "abi_version": 5,
   "protocols": [
     {
       "name": "example",
@@ -90,14 +91,15 @@ Every module exports `uri_agent_manifest`, which takes no input and returns:
   ],
   "permissions": {
     "environment": false,
-    "credentials": false
+    "credentials": false,
+    "subagents": false
   }
 }
 ```
 
-Every manifest declares `protocols`, `model_tools`, and both permission fields;
+Every version 5 manifest declares `protocols`, `model_tools`, and all permission fields;
 use an empty array when it contributes no capability of one kind. Set a
-permission to `true` to request the corresponding sensitive host capability.
+permission to `true` to request the corresponding audited host capability.
 
 Protocol names must be unique within the module and satisfy the normal registry
 rules. Descriptions must be nonempty. Every protocol must set `can_read` to
@@ -142,11 +144,31 @@ calls into one module are serialized.
 
 Each plugin implements its protocol help through the same handler. That help must describe every supported address and body shape.
 
+## Plugin settings
+
+ABI version 5 gives every WASM module a persistent JSON key/value namespace.
+The namespace is the module's `.wasm` filename stem and needs no manifest
+permission:
+
+```rust
+let role = uri_agent_plugin_sdk::plugin_setting("role")?
+    .and_then(|value| value.as_str().map(str::to_owned))
+    .unwrap_or_else(|| "small".to_string());
+uri_agent_plugin_sdk::set_plugin_setting("role", serde_json::json!("large"))?;
+```
+
+Values live under `pluginSettings` in global or project `settings.json`. A
+project value overrides the same global key independently of other keys. One
+encoded value may not exceed 1 MiB. The store is trusted plugin configuration,
+not a secret store or permission boundary; see
+[Model roles for plugins](configuration.md#model-roles-for-plugins) for the
+complete precedence and naming contract.
+
 ## Model-role lookup
 
 Model roles are named model routes configured in global or project
 `settings.json`; see [Model roles for plugins](configuration.md#model-roles-for-plugins).
-An ABI version 4 Rust guest resolves one dynamically without declaring a
+An ABI version 4 or 5 Rust guest resolves one dynamically without declaring a
 manifest permission:
 
 ```rust
@@ -159,6 +181,67 @@ Lookup returns `None` for an unconfigured role and fails when the role name or
 configured model is invalid. It returns no API key, does not perform inference,
 and does not change the conversation model. A settings reload or project
 override is reflected without reloading the plugin.
+
+## Subagent inference
+
+ABI version 5 plugins can run a bounded, ephemeral model/tool loop through a
+configured role. Request the capability in source:
+
+```rust
+fn manifest() -> PluginManifest {
+    PluginManifest::new(protocols).request_subagent_access()
+}
+```
+
+Then call a role without naming its provider, model, or credential:
+
+```rust
+let request = uri_agent_plugin_sdk::SubagentRequest::new(
+    "small",
+    "Fix parser recovery after an incomplete expression",
+)
+.with_tools(std::iter::empty::<String>())
+.with_protocols(std::iter::empty::<String>())
+.replace_system_prompt("Create a short terminal title. Return only the title.")
+.with_max_output_tokens(32)
+.with_timeout_ms(10_000);
+let response = uri_agent_plugin_sdk::subagent(&request)?;
+```
+
+The request fields are `role`, `prompt`, `systemPrompt`, `tools`, `protocols`,
+`workingDirectory`, `maxOutputTokens`, and `timeoutMs`. Omitting `tools` or
+`protocols` inherits that complete registered set; providing a list is an exact
+override, including `[]`. Unknown or repeated names fail the request. Append
+mode adds `systemPrompt` after URI Agent's generated capability and plugin
+instructions. Replace mode uses it as the whole prompt and is accepted only
+when both effective capability sets are empty.
+
+A WASM caller's own declared protocols and direct tools are excluded from
+inheritance and rejected when selected explicitly. The module is still active
+on the host-call stack, so re-entering that same runtime would deadlock. Other
+registered capabilities remain available.
+
+Subagent depth is exactly one. A linked or WASM plugin reached through a
+subagent may use its other capabilities, but an attempt to start another
+subagent fails before a model request is made. Independent top-level subagent
+calls may still run concurrently.
+
+The default working directory is the active project. A different existing path
+rebuilds the linked built-ins, project instructions, and Skills rooted there;
+it does not carry the active dynamic WASM set into that alternate toolbox. The
+prompt must be nonempty; the combined system and user input is limited to 16
+MiB. Timeouts default to 60 minutes and may not exceed 60 minutes. WASM module
+calls have the same wall-clock limit.
+
+Each call starts with only the supplied user prompt, runs tool calls until the
+model returns text, and aggregates usage and estimated cost across rounds. It
+uses the role's configured thinking, normal credential, provider request
+transforms, and transient retry policy without modifying the active
+conversation or session history. The response contains `text`, the serving
+`role`, `provider`, `model`, and `thinking`, plus optional usage and `cost`.
+The capability is a source-audit marker with no interactive approval flow.
+Calls from a manifest that omitted it are rejected. Plugins cannot bypass
+roles to submit a provider or model ID.
 
 ## Agent environment access
 
@@ -209,7 +292,7 @@ Host calls reject dynamic WASM protocols and `wasm_plugin` itself, preventing re
 
 Each guest call has these limits:
 
-- 30-second wall-clock timeout;
+- 60-minute wall-clock timeout;
 - 100-million fuel limit;
 - 16 MiB WebAssembly memory ceiling;
 - 1 MiB Extism variable store;
@@ -217,6 +300,8 @@ Each guest call has these limits:
 - 256 KiB manifest limit;
 - 64 protocols per manifest;
 - 64 direct model tools per manifest.
+
+Subagent input and timeout limits apply in addition to these module limits.
 
 ## Rust guest SDK
 

@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod runtime;
 pub mod session;
 pub mod skill;
+pub mod subagent;
 pub mod task;
 pub mod terminal;
 mod tool_download;

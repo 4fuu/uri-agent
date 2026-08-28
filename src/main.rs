@@ -16,6 +16,7 @@ use uri_agent::protocol::ProtocolRegistry;
 use uri_agent::runtime::{AgentRuntime, RuntimeInitializer, forward_task_notices};
 use uri_agent::session::{EventKind, Session, SessionChoice, SessionContext};
 use uri_agent::skill::{SkillProtocol, SkillProtocolSource};
+use uri_agent::subagent::SubagentService;
 use uri_agent::task::TaskManager;
 use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
 use uri_agent::wasm_plugin::WasmPluginManager;
@@ -232,6 +233,7 @@ async fn run_session(
     let mut model_tools = ModelToolRegistry::new();
     let mut commands = CommandRegistry::with_core_commands();
     let mut tui = TuiRegistry::default();
+    let subagents = SubagentService::new(config.manager.clone());
     plugins.install(
         &mut PluginHost::new(
             &mut protocols,
@@ -240,7 +242,8 @@ async fn run_session(
             &mut tui,
             config.environment.clone(),
         )
-        .with_credentials(config.manager.clone()),
+        .with_credentials(config.manager.clone())
+        .with_subagents(subagents.clone()),
     )?;
     wasm_plugins.set_reserved_model_tools(
         model_tools
@@ -284,11 +287,20 @@ async fn run_session(
         .await;
     let protocols = Arc::new(protocols);
     let model_tools = Arc::new(model_tools);
+    let plugins = Arc::new(plugins);
+    subagents.bind(
+        config.cwd.clone(),
+        protocols.clone(),
+        model_tools.clone(),
+        plugins.clone(),
+        config.environment.clone(),
+        output.clone(),
+    )?;
     wasm_plugins.bind_host(Arc::downgrade(&protocols))?;
     let context_window = limits.context_window;
     let initializer = Arc::new(SessionInitializer {
         session: session.clone(),
-        plugins: Arc::new(plugins),
+        plugins,
         cwd: config.cwd.clone(),
         prompt_tools,
         prompt_protocols,

@@ -2613,8 +2613,12 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
 
 pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
+    let name = match &app.model_selection_target {
+        ModelSelectionTarget::Conversation => "MODELS".to_string(),
+        ModelSelectionTarget::Role(role) => format!("MODELS · ROLE {role}"),
+    };
     let title = panel_title(
-        "MODELS",
+        &name,
         action_hints(&app.keymap, &[("models", "refresh", "refresh")]),
     );
     frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);

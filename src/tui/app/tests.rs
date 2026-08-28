@@ -4683,6 +4683,78 @@ fn environment_prompts_hide_values_and_return_to_the_manager() {
     assert!(app.text_prompt.is_none());
 }
 
+#[test]
+fn model_role_selector_labels_fallbacks_and_custom_role_names_open_model_selection() {
+    let roles = vec![
+        crate::config::ModelRoleInfo {
+            name: "default".to_string(),
+            role: Some(crate::config::ModelRole {
+                provider: "example".to_string(),
+                model: "main-model".to_string(),
+                thinking: ThinkingLevel::Medium,
+            }),
+            configured: false,
+            error: None,
+        },
+        crate::config::ModelRoleInfo {
+            name: "title".to_string(),
+            role: Some(crate::config::ModelRole {
+                provider: "example".to_string(),
+                model: "small-model".to_string(),
+                thinking: ThinkingLevel::Low,
+            }),
+            configured: true,
+            error: None,
+        },
+    ];
+    let mut app = test_app();
+    app.selector = Some(model_role_selector(SelectorKind::ModelRoles, roles, None));
+    app.overlay = Some(Overlay::Selector);
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("MODEL ROLES"));
+    assert!(rendered.contains("default"));
+    assert!(rendered.contains("example/main-model · medium · fallback"));
+    assert!(rendered.contains("title"));
+    assert!(rendered.contains("example/small-model · low"));
+
+    open_model_role_name_prompt(&mut app);
+    app.text_prompt.as_mut().unwrap().value = "terminal-title".to_string();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    assert!(matches!(
+        handle_text_key(&mut app, enter, &key_name(enter)),
+        Action::OpenRoleModel(role) if role == "terminal-title"
+    ));
+}
+
+#[test]
+fn model_role_effort_selector_keeps_role_and_model_until_effort_confirmation() {
+    let model = CatalogModel {
+        id: "reasoning-model".to_string(),
+        name: "Reasoning model".to_string(),
+        api: "openai-responses".to_string(),
+        provider: "example".to_string(),
+        base_url: "https://example.invalid".to_string(),
+        headers: BTreeMap::new(),
+        metadata: BTreeMap::from([("reasoning".to_string(), serde_json::json!(true))]),
+    };
+    let selector = model_role_effort_selector("review", &model, ThinkingLevel::High);
+
+    assert_eq!(
+        selector.title,
+        "ROLE review EFFORT · example/reasoning-model"
+    );
+    assert_eq!(selector.selected_item().unwrap().id, "high");
+    assert!(matches!(
+        selector.kind,
+        SelectorKind::ModelRoleEffort {
+            role,
+            provider,
+            model
+        } if role == "review" && provider == "example" && model == "reasoning-model"
+    ));
+}
+
 #[tokio::test]
 async fn environment_manager_lists_names_without_values_and_updates_storage() {
     let directory = tempfile::tempdir().unwrap();

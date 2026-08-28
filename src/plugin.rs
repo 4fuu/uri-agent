@@ -1,5 +1,6 @@
 use crate::config::{AgentEnvironment, ConfigManager, ModelRole};
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
+use crate::subagent::{SubagentRequest, SubagentResponse, SubagentService};
 use crate::tool_download::BinaryDownloader;
 pub use crate::tool_download::{BinaryDownload, DownloadArchive};
 use anyhow::{Context, Result, bail};
@@ -18,6 +19,7 @@ pub enum CoreCommand {
     Protocols,
     Status,
     Models,
+    ModelRoles,
     RefreshCatalog,
     Effort,
     Settings,
@@ -38,6 +40,11 @@ pub enum CoreCommand {
 pub enum CommandTarget {
     Core(CoreCommand),
     Panel(String),
+    ModelRole {
+        plugin: String,
+        key: String,
+        default_role: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +116,16 @@ impl CommandRegistry {
             if let Some(owner) = self.names.get(name) {
                 bail!("command name or alias {name:?} is already registered by {owner}");
             }
+        }
+        if let CommandTarget::ModelRole {
+            plugin,
+            key,
+            default_role,
+        } = &spec.target
+        {
+            validate_name(plugin)?;
+            validate_name(key)?;
+            validate_name(default_role)?;
         }
         let id = spec.id.clone();
         for name in names {
@@ -193,6 +210,13 @@ fn core_commands() -> Vec<CommandSpec> {
             "search all runnable models from the Pi catalog",
             ["models"],
             CommandTarget::Core(Models),
+        ),
+        CommandSpec::new(
+            "model-roles",
+            "Model roles",
+            "assign models to default, small, large, and custom plugin roles",
+            ["roles"],
+            CommandTarget::Core(ModelRoles),
         ),
         CommandSpec::new(
             "refresh-catalog",
@@ -351,6 +375,24 @@ pub trait TuiCompletionProvider: Send + Sync {
     async fn complete(&self, context: &TuiCompletionContext) -> Result<Option<TuiCompletions>>;
 }
 
+#[derive(Clone, Debug)]
+pub struct TuiSubmissionContext {
+    pub cwd: PathBuf,
+    pub session_id: String,
+    pub prompt: String,
+    pub first_user_message: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiEffect {
+    TerminalTitle(String),
+}
+
+#[async_trait]
+pub trait TuiSubmissionProvider: Send + Sync {
+    async fn submitted(&self, context: &TuiSubmissionContext) -> Result<Option<TuiEffect>>;
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TuiStatusTone {
     #[default]
@@ -417,6 +459,7 @@ pub struct TuiRegistry {
     panels: BTreeMap<String, TuiPanelSpec>,
     status: BTreeMap<String, Arc<dyn TuiStatusProvider>>,
     completions: BTreeMap<String, Arc<dyn TuiCompletionProvider>>,
+    submissions: BTreeMap<String, Arc<dyn TuiSubmissionProvider>>,
 }
 
 impl TuiRegistry {
@@ -494,6 +537,30 @@ impl TuiRegistry {
             }
         }
         Ok(None)
+    }
+
+    pub fn register_submission(
+        &mut self,
+        id: impl Into<String>,
+        provider: impl TuiSubmissionProvider + 'static,
+    ) -> Result<()> {
+        let id = id.into();
+        validate_name(&id)?;
+        if self.submissions.contains_key(&id) {
+            bail!("TUI submission provider is already registered: {id}");
+        }
+        self.submissions.insert(id, Arc::new(provider));
+        Ok(())
+    }
+
+    pub async fn submission_effects(&self, context: &TuiSubmissionContext) -> Vec<TuiEffect> {
+        let mut effects = Vec::new();
+        for provider in self.submissions.values() {
+            if let Ok(Some(effect)) = provider.submitted(context).await {
+                effects.push(effect);
+            }
+        }
+        effects
     }
 }
 
@@ -589,6 +656,27 @@ impl ModelToolRegistry {
             .collect()
     }
 
+    pub fn restricted_definitions(&self, names: &[String]) -> Result<Vec<ToolDefinition>> {
+        let descriptors = self
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| (descriptor.name.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        let mut seen = HashSet::new();
+        let mut selected = Vec::with_capacity(names.len());
+        for name in names {
+            if !seen.insert(name) {
+                bail!("subagent model tool is selected more than once: {name}");
+            }
+            let descriptor = descriptors
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown subagent model tool: {name}"))?;
+            selected.push(descriptor.definition());
+        }
+        selected.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(selected)
+    }
+
     pub async fn dispatch(
         &self,
         name: &str,
@@ -677,6 +765,10 @@ pub enum PluginPermission {
     /// Download and cache a pinned external executable. This declaration is an
     /// audit marker for trusted plugin code, not an interactive approval boundary.
     Downloads,
+    /// Run a bounded, ephemeral model/tool loop through a user-configured role.
+    /// This declaration is an audit marker for trusted plugin code, not an
+    /// interactive approval boundary.
+    Subagents,
 }
 
 #[derive(Clone)]
@@ -714,17 +806,77 @@ impl PluginCredentials {
 }
 
 #[derive(Clone)]
-pub struct PluginModelRoles {
+pub struct PluginModelRoleResolver {
     manager: Arc<ConfigManager>,
 }
 
-impl PluginModelRoles {
+impl PluginModelRoleResolver {
     pub(crate) fn new(manager: Arc<ConfigManager>) -> Self {
         Self { manager }
     }
 
     pub async fn resolve(&self, name: &str) -> Result<Option<ModelRole>> {
         self.manager.model_role(name).await
+    }
+}
+
+#[derive(Clone)]
+pub struct PluginSettings {
+    manager: Arc<ConfigManager>,
+    plugin: String,
+}
+
+impl PluginSettings {
+    pub(crate) fn new(manager: Arc<ConfigManager>, plugin: impl Into<String>) -> Self {
+        Self {
+            manager,
+            plugin: plugin.into(),
+        }
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Option<Value>> {
+        self.manager.plugin_setting(&self.plugin, key).await
+    }
+
+    pub async fn set(&self, key: &str, value: Value) -> Result<()> {
+        self.manager
+            .set_plugin_setting(&self.plugin, key, value)
+            .await
+    }
+
+    pub async fn remove(&self, key: &str) -> Result<bool> {
+        self.manager.remove_plugin_setting(&self.plugin, key).await
+    }
+
+    pub(crate) fn scoped(&self, plugin: impl Into<String>) -> Self {
+        Self::new(self.manager.clone(), plugin)
+    }
+}
+
+#[derive(Clone)]
+pub struct PluginSubagents {
+    service: SubagentService,
+}
+
+impl PluginSubagents {
+    pub(crate) fn new(service: SubagentService) -> Self {
+        Self { service }
+    }
+
+    pub async fn complete(&self, role: &str, request: SubagentRequest) -> Result<SubagentResponse> {
+        self.service.complete(role, request).await
+    }
+
+    pub(crate) async fn complete_excluding(
+        &self,
+        role: &str,
+        request: SubagentRequest,
+        tools: Vec<String>,
+        protocols: Vec<String>,
+    ) -> Result<SubagentResponse> {
+        self.service
+            .complete_excluding(role, request, tools, protocols)
+            .await
     }
 }
 
@@ -757,6 +909,7 @@ pub struct PluginHost<'a> {
     pub tui: &'a mut TuiRegistry,
     environment: Arc<AgentEnvironment>,
     credentials: Option<Arc<ConfigManager>>,
+    subagents: Option<SubagentService>,
     downloads: PluginDownloads,
     permissions: HashSet<PluginPermission>,
 }
@@ -776,6 +929,7 @@ impl<'a> PluginHost<'a> {
             tui,
             environment,
             credentials: None,
+            subagents: None,
             downloads: PluginDownloads::new(),
             permissions: HashSet::new(),
         }
@@ -783,6 +937,12 @@ impl<'a> PluginHost<'a> {
 
     pub fn with_credentials(mut self, manager: Arc<ConfigManager>) -> Self {
         self.credentials = Some(manager);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_subagents(mut self, subagents: SubagentService) -> Self {
+        self.subagents = Some(subagents);
         self
     }
 
@@ -804,12 +964,31 @@ impl<'a> PluginHost<'a> {
         Ok(PluginCredentials::new(manager))
     }
 
-    pub fn model_roles(&self) -> Result<PluginModelRoles> {
+    pub fn model_roles(&self) -> Result<PluginModelRoleResolver> {
         let manager = self
             .credentials
             .clone()
             .ok_or_else(|| anyhow::anyhow!("plugin model roles are not attached"))?;
-        Ok(PluginModelRoles::new(manager))
+        Ok(PluginModelRoleResolver::new(manager))
+    }
+
+    pub fn settings(&self, plugin: impl Into<String>) -> Result<PluginSettings> {
+        let manager = self
+            .credentials
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("plugin settings are not attached"))?;
+        Ok(PluginSettings::new(manager, plugin))
+    }
+
+    pub fn subagents(&self) -> Result<PluginSubagents> {
+        if !self.permissions.contains(&PluginPermission::Subagents) {
+            bail!("plugin did not request subagent access");
+        }
+        let service = self
+            .subagents
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("plugin subagents are not attached"))?;
+        Ok(PluginSubagents::new(service))
     }
 
     pub fn downloads(&self) -> Result<PluginDownloads> {
@@ -1054,6 +1233,10 @@ mod tests {
             CommandTarget::Core(CoreCommand::Models)
         );
         assert_eq!(
+            registry.resolve(":roles").unwrap().spec.target,
+            CommandTarget::Core(CoreCommand::ModelRoles)
+        );
+        assert_eq!(
             registry.resolve(":refresh-catalog").unwrap().spec.target,
             CommandTarget::Core(CoreCommand::RefreshCatalog)
         );
@@ -1109,6 +1292,48 @@ mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("repeats"));
+    }
+
+    #[test]
+    fn plugin_model_role_commands_validate_their_namespace_key_and_default_role() {
+        let mut registry = CommandRegistry::with_core_commands();
+        registry
+            .register(CommandSpec::new(
+                "terminal-title-model",
+                "Terminal title model",
+                "choose the role used for generated terminal titles",
+                std::iter::empty::<&str>(),
+                CommandTarget::ModelRole {
+                    plugin: "terminal-title".to_string(),
+                    key: "role".to_string(),
+                    default_role: "small".to_string(),
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            registry
+                .resolve(":terminal-title-model")
+                .unwrap()
+                .spec
+                .target,
+            CommandTarget::ModelRole { plugin, key, default_role }
+                if plugin == "terminal-title" && key == "role" && default_role == "small"
+        ));
+
+        let error = registry
+            .register(CommandSpec::new(
+                "invalid-role-setting",
+                "Invalid role setting",
+                "test invalid role settings",
+                std::iter::empty::<&str>(),
+                CommandTarget::ModelRole {
+                    plugin: "invalid setting".to_string(),
+                    key: "role".to_string(),
+                    default_role: "small".to_string(),
+                },
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid command name or alias"));
     }
 
     #[tokio::test]
@@ -1182,7 +1407,16 @@ mod tests {
     }
 
     struct ModelRolePlugin {
-        model_roles: Arc<std::sync::OnceLock<PluginModelRoles>>,
+        model_roles: Arc<std::sync::OnceLock<PluginModelRoleResolver>>,
+    }
+
+    struct SettingsPlugin {
+        settings: Arc<std::sync::OnceLock<PluginSettings>>,
+    }
+
+    struct SubagentPlugin {
+        requests_subagents: bool,
+        subagents: Arc<std::sync::OnceLock<PluginSubagents>>,
     }
 
     #[derive(Clone)]
@@ -1267,6 +1501,29 @@ mod tests {
             self.model_roles
                 .set(host.model_roles()?)
                 .map_err(|_| anyhow::anyhow!("model roles were already captured"))
+        }
+    }
+
+    impl Plugin for SettingsPlugin {
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            self.settings
+                .set(host.settings("test-plugin")?)
+                .map_err(|_| anyhow::anyhow!("settings were already captured"))
+        }
+    }
+
+    impl Plugin for SubagentPlugin {
+        fn permissions(&self) -> Vec<PluginPermission> {
+            self.requests_subagents
+                .then_some(PluginPermission::Subagents)
+                .into_iter()
+                .collect()
+        }
+
+        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
+            self.subagents
+                .set(host.subagents()?)
+                .map_err(|_| anyhow::anyhow!("subagents were already captured"))
         }
     }
 
@@ -1725,6 +1982,84 @@ mod tests {
                 thinking: ThinkingLevel::High,
             })
         );
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_store_dynamic_json_values_in_their_own_namespace() {
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        let manager = ConfigManager::load_for_test(&output, &output)
+            .await
+            .unwrap();
+        let capture = Arc::new(std::sync::OnceLock::new());
+        let mut plugins = PluginRegistry::new();
+        plugins.add(SettingsPlugin {
+            settings: capture.clone(),
+        });
+        plugins
+            .install(
+                &mut PluginHost::new(
+                    &mut protocols,
+                    &mut model_tools,
+                    &mut commands,
+                    &mut tui,
+                    environment,
+                )
+                .with_credentials(manager),
+            )
+            .unwrap();
+        let settings = capture.get().unwrap();
+        settings
+            .set("options", serde_json::json!({"role": "small", "words": 5}))
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.get("options").await.unwrap(),
+            Some(serde_json::json!({"role": "small", "words": 5}))
+        );
+        assert!(settings.remove("options").await.unwrap());
+        assert_eq!(settings.get("options").await.unwrap(), None);
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn plugins_must_request_subagent_access() {
+        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
+        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
+        let manager = ConfigManager::load_for_test(&output, &output)
+            .await
+            .unwrap();
+        let subagents = SubagentService::new(manager.clone());
+        let denied_capture = Arc::new(std::sync::OnceLock::new());
+        let mut denied = PluginRegistry::new();
+        denied.add(SubagentPlugin {
+            requests_subagents: false,
+            subagents: denied_capture,
+        });
+        let mut host = PluginHost::new(
+            &mut protocols,
+            &mut model_tools,
+            &mut commands,
+            &mut tui,
+            environment,
+        )
+        .with_credentials(manager)
+        .with_subagents(subagents);
+
+        let error = denied.install(&mut host).unwrap_err();
+        assert!(format!("{error:#}").contains("did not request subagent access"));
+        assert!(host.subagents().is_err());
+
+        let allowed_capture = Arc::new(std::sync::OnceLock::new());
+        let mut allowed = PluginRegistry::new();
+        allowed.add(SubagentPlugin {
+            requests_subagents: true,
+            subagents: allowed_capture.clone(),
+        });
+        allowed.install(&mut host).unwrap();
+        assert!(allowed_capture.get().is_some());
+        assert!(host.subagents().is_err());
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 }

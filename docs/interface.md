@@ -75,6 +75,8 @@ Core commands are registered through `CommandRegistry`:
 | `:protocols` | List registered read and exec routes |
 | `:status` | Show project, model, usage, and extension status |
 | `:model` | Search runnable models |
+| `:model-roles` or `:roles` | Assign models to built-in and custom plugin roles |
+| `:terminal-title-role` or `:title-role` | Choose the role used to generate terminal titles |
 | `:refresh-catalog` | Force-refresh and apply pi and provider model catalogs |
 | `:effort` | Select thinking effort supported by the active model |
 | `:settings` | Inspect and edit active settings |
@@ -94,6 +96,21 @@ with a configured model credential source. Logging out the current provider
 clears the current session model and that provider's saved default only when no
 other credential source remains; URI Agent does not automatically switch to a
 different provider.
+
+`:model-roles` lists `default`, `small`, and `large` first, followed by custom
+roles. Fallback routes are labeled in the list. Press `Enter` to assign a
+runnable model and then its thinking effort, `Ctrl+N` to name and assign a
+custom role, or `Delete` to reset the selected built-in role or remove a custom
+role. Plugin commands can open a second generic selector that stores any
+available role in that plugin's settings, separately from role-to-model
+assignments.
+
+On the first user message in a session, the built-in terminal-title plugin asks
+the configured `small` role for a short title while the main turn continues.
+It runs without tools or protocols and updates the outer terminal title when
+the result arrives. Use `:terminal-title-role` to choose another role. Missing
+roles, credentials, and generation failures do not interrupt or notify the
+conversation.
 
 Conversation search includes user, assistant, reasoning, tool, notice, compaction, and error text currently loaded in the transcript. Type to filter the results, use the arrow keys to choose one and press `Enter`, or click a result to return to that block. It is unavailable before the conversation has any text and while the `:resume` session selector is open.
 

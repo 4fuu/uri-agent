@@ -13,7 +13,7 @@ use crate::clipboard;
 use crate::compaction::ContextAccuracy;
 use crate::config::{
     ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, display_path,
-    validate_environment_name,
+    validate_environment_name, validate_model_role_name,
 };
 use crate::keymap::{KeyDisplayStyle, KeyStroke, Keymap};
 use crate::model::{clamp_thinking_level, configured_backend};
@@ -21,8 +21,8 @@ use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
     CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiCompletionContext, TuiCompletions,
-    TuiDocument, TuiPanelContext, TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
-    TuiTextPosition, TuiTextRange,
+    TuiDocument, TuiEffect, TuiPanelContext, TuiRegistry, TuiStatusContext, TuiStatusItem,
+    TuiStatusTone, TuiSubmissionContext, TuiTextPosition, TuiTextRange,
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
@@ -41,6 +41,7 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use model_selector::{ModelSelector, context_label, model_label, reasoning};
 use portable_pty::CommandBuilder;
 use ratatui::buffer::CellWidth;
@@ -406,12 +407,36 @@ struct SelectorItem {
 
 enum SelectorKind {
     LoginProvider,
-    LoginMethod { provider: String },
+    LoginMethod {
+        provider: String,
+    },
     Logout,
     Resume,
     Search,
-    Effort { provider: String, model: String },
-    Environment { return_to_settings: bool },
+    Effort {
+        provider: String,
+        model: String,
+    },
+    ModelRoleEffort {
+        role: String,
+        provider: String,
+        model: String,
+    },
+    Environment {
+        return_to_settings: bool,
+    },
+    ModelRoles,
+    PluginModelRole {
+        plugin: String,
+        key: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum ModelSelectionTarget {
+    #[default]
+    Conversation,
+    Role(String),
 }
 
 struct SelectorState {
@@ -506,6 +531,7 @@ enum TextPurpose {
         name: String,
         return_to_settings: bool,
     },
+    ModelRoleName,
     SetTerminal,
 }
 
@@ -586,6 +612,7 @@ struct App {
     info: TuiInfo,
     flashes: Vec<FlashNotice>,
     model_selector: Option<ModelSelector>,
+    model_selection_target: ModelSelectionTarget,
     catalog_refreshing: bool,
     settings: Option<SettingsState>,
     keymap: Keymap,
@@ -675,6 +702,7 @@ impl App {
             info,
             flashes: Vec::new(),
             model_selector: None,
+            model_selection_target: ModelSelectionTarget::Conversation,
             catalog_refreshing: false,
             settings: None,
             keymap,
@@ -2040,6 +2068,7 @@ impl App {
         self.document = None;
         self.settings = None;
         self.model_selector = None;
+        self.model_selection_target = ModelSelectionTarget::Conversation;
         self.tui_document = None;
         self.delivery = None;
         self.dismiss_completions();

@@ -13,7 +13,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -22,6 +22,9 @@ pub const HOST_EXEC: &str = "uri_agent_exec";
 pub const HOST_ENVIRONMENT: &str = "uri_agent_environment";
 pub const HOST_CREDENTIALS: &str = "uri_agent_credentials";
 pub const HOST_MODEL_ROLE: &str = "uri_agent_model_role";
+pub const HOST_SUBAGENT: &str = "uri_agent_subagent";
+pub const HOST_PLUGIN_SETTING_GET: &str = "uri_agent_plugin_setting_get";
+pub const HOST_PLUGIN_SETTING_SET: &str = "uri_agent_plugin_setting_set";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -29,6 +32,120 @@ pub struct ModelRole {
     pub provider: String,
     pub model: String,
     pub thinking: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentRequest {
+    pub role: String,
+    pub prompt: String,
+    pub system_prompt: SubagentSystemPrompt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocols: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl SubagentRequest {
+    pub fn new(role: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            prompt: prompt.into(),
+            system_prompt: SubagentSystemPrompt::Append(String::new()),
+            tools: None,
+            protocols: None,
+            working_directory: None,
+            max_output_tokens: None,
+            timeout_ms: None,
+        }
+    }
+
+    pub fn append_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = SubagentSystemPrompt::Append(prompt.into());
+        self
+    }
+
+    pub fn replace_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = SubagentSystemPrompt::Replace(prompt.into());
+        self
+    }
+
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.tools = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_protocols(
+        mut self,
+        protocols: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.protocols = Some(protocols.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_working_directory(mut self, path: impl Into<String>) -> Self {
+        self.working_directory = Some(path.into());
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: usize) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", content = "content", rename_all = "snake_case")]
+pub enum SubagentSystemPrompt {
+    Append(String),
+    Replace(String),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSettingSetRequest {
+    pub key: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginSettingGetResponse {
+    pub found: bool,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentResponse {
+    pub text: String,
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+    pub usage: Option<SubagentUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,6 +193,13 @@ impl PluginManifest {
         self.permissions.credentials = true;
         self
     }
+
+    /// Request access to bounded, ephemeral model/tool loops through configured
+    /// roles. Plugins cannot select a provider or model directly.
+    pub fn request_subagent_access(mut self) -> Self {
+        self.permissions.subagents = true;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +207,8 @@ impl PluginManifest {
 pub struct PluginPermissions {
     pub environment: bool,
     pub credentials: bool,
+    #[serde(default)]
+    pub subagents: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,6 +299,9 @@ mod host {
         pub fn uri_agent_environment(input: String) -> String;
         pub fn uri_agent_credentials(input: String) -> String;
         pub fn uri_agent_model_role(input: String) -> String;
+        pub fn uri_agent_subagent(input: String) -> String;
+        pub fn uri_agent_plugin_setting_get(input: String) -> String;
+        pub fn uri_agent_plugin_setting_set(input: String) -> String;
     }
 }
 
@@ -210,6 +339,34 @@ pub fn provider_api_key(provider: &str) -> Result<Option<String>, Error> {
 pub fn model_role(name: &str) -> Result<Option<ModelRole>, Error> {
     let output = unsafe { host::uri_agent_model_role(name.to_string())? };
     Ok(serde_json::from_str(&output)?)
+}
+
+/// Run one bounded, ephemeral model/tool loop through a configured role after
+/// requesting subagent access in the plugin manifest.
+#[cfg(target_family = "wasm")]
+pub fn subagent(request: &SubagentRequest) -> Result<SubagentResponse, Error> {
+    let input = serde_json::to_string(request)?;
+    let output = unsafe { host::uri_agent_subagent(input)? };
+    Ok(serde_json::from_str(&output)?)
+}
+
+/// Read one value from this plugin module's persistent settings namespace.
+#[cfg(target_family = "wasm")]
+pub fn plugin_setting(key: &str) -> Result<Option<Value>, Error> {
+    let output = unsafe { host::uri_agent_plugin_setting_get(key.to_string())? };
+    let response: PluginSettingGetResponse = serde_json::from_str(&output)?;
+    Ok(response.found.then_some(response.value))
+}
+
+/// Persist one value in this plugin module's settings namespace.
+#[cfg(target_family = "wasm")]
+pub fn set_plugin_setting(key: &str, value: Value) -> Result<(), Error> {
+    let input = serde_json::to_string(&PluginSettingSetRequest {
+        key: key.to_string(),
+        value,
+    })?;
+    unsafe { host::uri_agent_plugin_setting_set(input)? };
+    Ok(())
 }
 
 #[cfg(target_family = "wasm")]
@@ -273,15 +430,23 @@ mod tests {
         assert_eq!(value["model_tools"], serde_json::json!([]));
         assert_eq!(value["permissions"]["environment"], false);
         assert_eq!(value["permissions"]["credentials"], false);
+        assert_eq!(value["permissions"]["subagents"], false);
 
         let manifest = PluginManifest::new([]).request_environment_access();
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["permissions"]["environment"], true);
         assert_eq!(value["permissions"]["credentials"], false);
+        assert_eq!(value["permissions"]["subagents"], false);
         let manifest = PluginManifest::new([]).request_credentials_access();
         let value = serde_json::to_value(manifest).unwrap();
         assert_eq!(value["permissions"]["environment"], false);
         assert_eq!(value["permissions"]["credentials"], true);
+        assert_eq!(value["permissions"]["subagents"], false);
+        let manifest = PluginManifest::new([]).request_subagent_access();
+        let value = serde_json::to_value(manifest).unwrap();
+        assert_eq!(value["permissions"]["environment"], false);
+        assert_eq!(value["permissions"]["credentials"], false);
+        assert_eq!(value["permissions"]["subagents"], true);
         let incomplete = serde_json::from_value::<PluginManifest>(serde_json::json!({
             "abi_version": ABI_VERSION,
             "protocols": []
@@ -311,6 +476,21 @@ mod tests {
                 "provider": "openai",
                 "model": "gpt-5",
                 "thinking": "low"
+            })
+        );
+
+        let request = SubagentRequest::new("small", "Fix parser")
+            .with_tools(std::iter::empty::<String>())
+            .with_protocols(std::iter::empty::<String>())
+            .replace_system_prompt("Create a title.");
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "role": "small",
+                "prompt": "Fix parser",
+                "systemPrompt": {"mode": "replace", "content": "Create a title."},
+                "tools": [],
+                "protocols": []
             })
         );
     }

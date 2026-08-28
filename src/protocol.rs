@@ -90,6 +90,7 @@ pub struct ProtocolRegistry {
     output: Arc<OutputStore>,
     context: ProtocolContext,
     help_read: AsyncMutex<HashSet<String>>,
+    allowed: Option<HashSet<String>>,
 }
 
 impl ProtocolRegistry {
@@ -100,7 +101,31 @@ impl ProtocolRegistry {
             output,
             context: ProtocolContext { tasks },
             help_read: AsyncMutex::new(HashSet::new()),
+            allowed: None,
         }
+    }
+
+    /// Create a view that exposes exactly the named protocols and owns an
+    /// independent protocol-help gate. Protocol implementations, task state,
+    /// and output presentation remain shared with the source registry.
+    pub fn restricted(&self, names: &[String]) -> Result<Self> {
+        let available = self
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<HashSet<_>>();
+        let allowed = names.iter().cloned().collect::<HashSet<_>>();
+        if let Some(name) = allowed.iter().find(|name| !available.contains(*name)) {
+            bail!("unknown subagent protocol: {name}");
+        }
+        Ok(Self {
+            protocols: self.protocols.clone(),
+            dynamic: self.dynamic.clone(),
+            output: self.output.clone(),
+            context: self.context.clone(),
+            help_read: AsyncMutex::new(HashSet::new()),
+            allowed: Some(allowed),
+        })
     }
 
     pub fn register(&mut self, protocol: impl Protocol + 'static) -> Result<()> {
@@ -144,6 +169,9 @@ impl ProtocolRegistry {
             .collect::<Vec<_>>();
         for dynamic in &self.dynamic {
             descriptors.extend(dynamic.descriptors());
+        }
+        if let Some(allowed) = &self.allowed {
+            descriptors.retain(|descriptor| allowed.contains(&descriptor.name));
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
         descriptors
@@ -288,6 +316,13 @@ impl ProtocolRegistry {
     }
 
     async fn find_protocol(&self, name: &str, include_dynamic: bool) -> Option<Arc<dyn Protocol>> {
+        if self
+            .allowed
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            return None;
+        }
         if let Some(protocol) = self.protocols.get(name) {
             return Some(protocol.clone());
         }

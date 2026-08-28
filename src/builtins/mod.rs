@@ -8,6 +8,7 @@ mod replace;
 mod sessions;
 mod shell;
 mod tasks;
+mod title;
 mod uri_agent_docs;
 
 use crate::plugin::PluginRegistry;
@@ -85,6 +86,18 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
 
 pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
+    add_subagent_plugins(&mut plugins, cwd);
+    plugins.add(title::TerminalTitlePlugin);
+    plugins
+}
+
+pub(crate) fn subagent_plugins(cwd: &Path) -> PluginRegistry {
+    let mut plugins = PluginRegistry::new();
+    add_subagent_plugins(&mut plugins, cwd);
+    plugins
+}
+
+fn add_subagent_plugins(plugins: &mut PluginRegistry, cwd: &Path) {
     plugins.add(model_tools::ProtocolToolsPlugin);
     plugins.add(agents::AgentsPlugin::new(cwd));
     plugins.add(uri_agent_docs::UriAgentDocsProtocol);
@@ -95,8 +108,7 @@ pub fn plugins(cwd: &Path) -> PluginRegistry {
     plugins.add(apply_patch::ApplyPatchTool::new(cwd));
     plugins.add(sessions::SessionsPlugin::new(cwd));
     plugins.add(tasks::TasksProtocol);
-    shell::add_plugins(&mut plugins, cwd);
-    plugins
+    shell::add_plugins(plugins, cwd);
 }
 
 async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
