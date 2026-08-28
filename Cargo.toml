@@ -1,6 +1,6 @@
 [package]
 name = "uri-agent"
-version = "2026.828.0"
+version = "2026.828.1"
 edition = "2024"
 license = "MIT"
 description = "A protocol-oriented coding agent with a focused terminal interface"
@@ -56,7 +56,7 @@ tui-textarea = { package = "tui-textarea-2", version = "0.9" }
 unicode-general-category = "1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
-uri-agent-plugin-sdk = { version = "=2026.828.0", path = "sdk" }
+uri-agent-plugin-sdk = { version = "=2026.828.1", path = "sdk" }
 uuid = { version = "1", features = ["serde", "v7"] }
 vt100 = "0.16"
 zip = { version = "4", default-features = false, features = ["deflate"] }
