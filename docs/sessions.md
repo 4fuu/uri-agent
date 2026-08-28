@@ -50,14 +50,17 @@ token-rate calibration inputs. It never contains model history or compaction
 replacement history. On resume, model replay is loaded from the
 highest-sequence authoritative compaction event and
 the later usage and model-message events; other startup state is reduced from
-the index plus the authoritative event tail. Missing, stale, malformed, or
-newer-version index rows fall back to an event reduction and may be rebuilt.
-The append-only events remain the sole source of truth, and deleting the resume
-index cannot change replay or session behavior.
+the index plus the authoritative event tail. Each row carries an integrity
+checksum over its version, session identity, sequence, and payload. Missing,
+stale, malformed, checksum-invalid, or newer-version rows fall back to an event
+reduction and may be rebuilt. The append-only events remain the sole source of
+truth, and deleting the resume index cannot change replay or session behavior.
 
 Resume-index writes happen only after the authoritative event transaction
-commits. They are disposable cache writes: failure does not fail an otherwise
-valid append, publish uncommitted state, or make the session unavailable.
+commits and cannot replace a checkpoint at a later sequence. Committed events
+are published in sequence before the disposable cache write begins: cache
+failure does not fail an otherwise valid append, publish uncommitted state, or
+make the session unavailable.
 
 Session event range reads use exclusive sequence cursors. `after` and `before`
 pages and tail reads are bounded and returned in ascending sequence order, so

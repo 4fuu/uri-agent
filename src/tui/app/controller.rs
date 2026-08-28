@@ -160,7 +160,7 @@ impl TuiTerminal {
         );
         app.pending_messages = pending_receiver.borrow().clone();
         app.protocol_source = Some(protocols);
-        for event in session.snapshot().await {
+        for event in session.snapshot().await? {
             app.apply(event);
         }
         app.finish_hydration();

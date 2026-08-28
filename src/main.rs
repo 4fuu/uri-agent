@@ -226,7 +226,7 @@ async fn run_session(
             session_settings.thinking,
         )
         .await?;
-    let tasks = TaskManager::from_reports(session.task_reports().await);
+    let tasks = TaskManager::from_reports(session.task_reports().await?);
     let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
     wasm_plugins.bind_output(output.clone())?;
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());

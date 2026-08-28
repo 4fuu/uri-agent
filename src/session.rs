@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use rig::message::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -488,11 +489,20 @@ fn restore_persisted_state(
         .as_ref()
         .and_then(|(sequence, _)| u64::try_from(*sequence).ok());
     let context = context_event
-        .and_then(|(_, payload)| serde_json::from_str::<EventKind>(&payload).ok())
-        .and_then(|kind| match kind {
-            EventKind::SessionContext { context } => Some(context),
-            _ => None,
-        });
+        .map(|(_, payload)| {
+            let kind = serde_json::from_str::<EventKind>(&payload).map_err(|error| {
+                tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    tokio_rusqlite::rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            match kind {
+                EventKind::SessionContext { context } => Ok(context),
+                _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+            }
+        })
+        .transpose()?;
     let has_creation = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM events
          WHERE session_id = ?1 AND kind = 'session_created')",
@@ -514,7 +524,7 @@ fn restore_persisted_state(
         .optional()?;
     let checkpoint = db
         .query_row(
-            "SELECT version, through_sequence, payload_json
+            "SELECT version, through_sequence, payload_json, checksum
              FROM session_resume_index WHERE session_id = ?1",
             [id],
             |row| {
@@ -522,13 +532,17 @@ fn restore_persisted_state(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?
-        .and_then(|(version, through, payload)| {
+        .and_then(|(version, through, payload, checksum)| {
             let through = u64::try_from(through).ok()?;
             if version != i64::from(RESUME_INDEX_VERSION) || through > authoritative_head {
+                return None;
+            }
+            if resume_checksum(id, through, &payload) != checksum {
                 return None;
             }
             let mut state = serde_json::from_str::<ResumeState>(&payload).ok()?;
@@ -564,19 +578,22 @@ fn restore_persisted_state(
         }
         state.context_sequence = context_sequence;
         if let Ok(payload) = serde_json::to_string(&state) {
+            let checksum = resume_checksum(id, compaction.sequence, &payload);
             let _ = db.execute(
                 "INSERT INTO session_resume_index
-                 (session_id, version, through_sequence, payload_json)
-                 VALUES (?1, ?2, ?3, ?4)
+                 (session_id, version, through_sequence, payload_json, checksum)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(session_id) DO UPDATE SET
                    version = excluded.version,
                    through_sequence = excluded.through_sequence,
-                   payload_json = excluded.payload_json",
+                   payload_json = excluded.payload_json,
+                   checksum = excluded.checksum",
                 params![
                     id,
                     i64::from(RESUME_INDEX_VERSION),
                     compaction.sequence as i64,
-                    payload
+                    payload,
+                    checksum
                 ],
             );
         }
@@ -663,6 +680,16 @@ fn stored_event_from_row(
         at,
         kind,
     })
+}
+
+fn resume_checksum(session_id: &str, through: u64, payload: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(RESUME_INDEX_VERSION.to_be_bytes());
+    digest.update((session_id.len() as u64).to_be_bytes());
+    digest.update(session_id.as_bytes());
+    digest.update(through.to_be_bytes());
+    digest.update(payload.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 #[derive(Clone, Debug)]
@@ -1026,56 +1053,78 @@ impl Session {
         let _ = self.events.send(SessionUpdate::Transient(kind));
     }
 
-    pub async fn snapshot(&self) -> Vec<SessionEvent> {
+    pub async fn snapshot(&self) -> Result<Vec<SessionEvent>> {
         let state = self.state.lock().await;
         if !state.persisted {
-            return state.events.clone();
+            return Ok(state.events.clone());
         }
         drop(state);
-        self.query_event_page(EventPage::All)
-            .await
-            .expect("persisted session snapshot must remain readable")
+        self.query_event_page(EventPage::All).await
     }
 
-    pub async fn task_reports(&self) -> Vec<TaskReport> {
-        let (persisted, pointers, in_memory) = {
+    pub async fn task_reports(&self) -> Result<Vec<TaskReport>> {
+        let (persisted, tasks, in_memory) = {
             let state = self.state.lock().await;
             (
                 state.persisted,
-                state.derived.tasks.values().cloned().collect::<Vec<_>>(),
+                state.derived.tasks.clone(),
                 state.events.clone(),
             )
         };
         if !persisted {
-            return task_reports_from_events(&in_memory);
+            return Ok(task_reports_from_events(&in_memory));
         }
         let id = self.id.clone();
         self.connection
             .call(move |db| {
-                let mut sequences = HashSet::new();
-                for pointers in pointers {
-                    sequences.insert(pointers.first_sequence);
-                    sequences.insert(pointers.latest_sequence);
-                    sequences.extend(pointers.output_sequence);
-                }
-                let mut events = Vec::with_capacity(sequences.len());
+                let mut events = HashMap::<u64, SessionEvent>::new();
                 let mut statement = db.prepare(
                     "SELECT sequence, at, payload_json FROM events
-                     WHERE session_id = ?1 AND sequence = ?2 AND kind = 'task'",
+                     WHERE session_id = ?1 AND sequence = ?2",
                 )?;
-                for sequence in sequences {
-                    if let Some(event) = statement
-                        .query_row(params![id, sequence as i64], stored_event_from_row)
-                        .optional()?
-                    {
-                        events.push(event);
+                let mut valid = true;
+                for (task_id, pointers) in &tasks {
+                    let expected = [
+                        Some(pointers.first_sequence),
+                        Some(pointers.latest_sequence),
+                        pointers.output_sequence,
+                    ];
+                    for sequence in expected.into_iter().flatten() {
+                        let event = if let Some(event) = events.get(&sequence) {
+                            Some(event.clone())
+                        } else {
+                            statement
+                                .query_row(params![id, sequence as i64], stored_event_from_row)
+                                .optional()?
+                        };
+                        let Some(event) = event else {
+                            valid = false;
+                            continue;
+                        };
+                        if !matches!(&event.kind, EventKind::Task { id, .. } if id == task_id) {
+                            valid = false;
+                        }
+                        events.insert(sequence, event);
                     }
                 }
+                if !valid {
+                    let mut statement = db.prepare(
+                        "SELECT sequence, at, payload_json FROM events
+                         WHERE session_id = ?1 AND kind = 'task' ORDER BY sequence",
+                    )?;
+                    let events = statement
+                        .query_map([id], stored_event_from_row)?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok::<_, tokio_rusqlite::rusqlite::Error>(task_reports_from_events(
+                        &events,
+                    ));
+                }
+                let mut events = events.into_values().collect::<Vec<_>>();
                 events.sort_by_key(|event| event.sequence);
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(task_reports_from_events(&events))
+                Ok(task_reports_from_events(&events))
             })
             .await
-            .unwrap_or_default()
+            .context("cannot restore session task reports")
     }
 
     pub async fn model_settings(&self) -> SessionModelSettings {
@@ -1249,8 +1298,8 @@ impl Session {
             if !events.iter().any(|event| starts_session(&event.kind)) {
                 state.model_settings = next_settings;
                 apply_committed_events(&mut state, &events, false);
-                drop(state);
                 self.publish_persisted(&events);
+                drop(state);
                 return Ok(events);
             }
 
@@ -1316,11 +1365,11 @@ impl Session {
             state.persisted = true;
             state.model_settings = next_settings;
             let checkpoint = apply_committed_events(&mut state, &events, true);
+            self.publish_persisted(&events);
             drop(state);
             if let Some((through, payload)) = checkpoint {
                 self.persist_resume_index(through, payload).await;
             }
-            self.publish_persisted(&events);
             return Ok(events);
         }
 
@@ -1375,11 +1424,11 @@ impl Session {
             .context("cannot append session event batch")?;
         state.model_settings = next_settings;
         let checkpoint = apply_committed_events(&mut state, &events, true);
+        self.publish_persisted(&events);
         drop(state);
         if let Some((through, payload)) = checkpoint {
             self.persist_resume_index(through, payload).await;
         }
-        self.publish_persisted(&events);
         Ok(events)
     }
 
@@ -1391,18 +1440,27 @@ impl Session {
 
     async fn persist_resume_index(&self, through: u64, payload: String) {
         let id = self.id.clone();
+        let checksum = resume_checksum(&id, through, &payload);
         let _ = self
             .connection
             .call(move |db| {
                 db.execute(
                     "INSERT INTO session_resume_index
-                     (session_id, version, through_sequence, payload_json)
-                     VALUES (?1, ?2, ?3, ?4)
+                     (session_id, version, through_sequence, payload_json, checksum)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(session_id) DO UPDATE SET
                        version = excluded.version,
                        through_sequence = excluded.through_sequence,
-                       payload_json = excluded.payload_json",
-                    params![id, i64::from(RESUME_INDEX_VERSION), through as i64, payload],
+                       payload_json = excluded.payload_json,
+                       checksum = excluded.checksum
+                     WHERE excluded.through_sequence >= session_resume_index.through_sequence",
+                    params![
+                        id,
+                        i64::from(RESUME_INDEX_VERSION),
+                        through as i64,
+                        payload,
+                        checksum
+                    ],
                 )?;
                 Ok::<_, tokio_rusqlite::rusqlite::Error>(())
             })
@@ -1635,12 +1693,28 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                    version INTEGER NOT NULL,
                    through_sequence INTEGER NOT NULL,
                    payload_json TEXT NOT NULL,
+                   checksum TEXT NOT NULL,
                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                  );
                  CREATE TABLE IF NOT EXISTS pending_drafts (
                    cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
                  );",
             )?;
+            let has_checksum = {
+                let mut statement = db.prepare("PRAGMA table_info(session_resume_index)")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .any(|column| column == "checksum")
+            };
+            if !has_checksum {
+                db.execute(
+                    "ALTER TABLE session_resume_index
+                     ADD COLUMN checksum TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
             Ok::<_, tokio_rusqlite::rusqlite::Error>(())
         })
         .await
@@ -1780,8 +1854,8 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.token_calibration.pending_visible_units = state
                 .token_calibration
                 .pending_visible_units
-                .saturating_add(crate::tui::visible_units(name) as u64)
-                .saturating_add(crate::tui::visible_units(&arguments.to_string()) as u64);
+                .saturating_add(crate::text_metrics::visible_units(name) as u64)
+                .saturating_add(crate::text_metrics::visible_units(&arguments.to_string()) as u64);
         }
         EventKind::ToolResult {
             call_id,
@@ -1835,14 +1909,14 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.token_calibration.pending_visible_units = state
                 .token_calibration
                 .pending_visible_units
-                .saturating_add(crate::tui::visible_units(text) as u64);
+                .saturating_add(crate::text_metrics::visible_units(text) as u64);
         }
         EventKind::AssistantReasoning { text } => {
             state.token_calibration.pending_reasoning_visible |= !text.is_empty();
             state.token_calibration.pending_visible_units = state
                 .token_calibration
                 .pending_visible_units
-                .saturating_add(crate::tui::visible_units(text) as u64);
+                .saturating_add(crate::text_metrics::visible_units(text) as u64);
         }
         EventKind::ModelMessage {
             message: Message::Assistant { .. },
@@ -1876,6 +1950,7 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
 
 fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
     struct ReportState {
+        first_sequence: u64,
         protocol: String,
         label: String,
         status: TaskStatus,
@@ -1897,6 +1972,7 @@ fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
             continue;
         };
         let report = reports.entry(id.clone()).or_insert_with(|| ReportState {
+            first_sequence: event.sequence,
             protocol: protocol.clone(),
             label: label.clone(),
             status: *status,
@@ -1913,22 +1989,33 @@ fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
         }
     }
 
-    reports
+    let mut reports = reports
         .into_iter()
-        .map(|(id, report)| TaskReport {
-            id,
-            protocol: report.protocol,
-            label: report.label,
-            status: if report.status.terminal() {
-                report.status
-            } else {
-                TaskStatus::Cancelled
-            },
-            started_at: report.started_at,
-            finished_at: report.updated_at,
-            content: report.output.into_bytes(),
+        .map(|(id, report)| {
+            (
+                report.first_sequence,
+                TaskReport {
+                    id,
+                    protocol: report.protocol,
+                    label: report.label,
+                    status: if report.status.terminal() {
+                        report.status
+                    } else {
+                        TaskStatus::Cancelled
+                    },
+                    started_at: report.started_at,
+                    finished_at: report.updated_at,
+                    content: report.output.into_bytes(),
+                },
+            )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    reports.sort_by(|(left_sequence, left), (right_sequence, right)| {
+        left_sequence
+            .cmp(right_sequence)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    reports.into_iter().map(|(_, report)| report).collect()
 }
 
 fn apply_model_settings<'a>(
@@ -2085,7 +2172,7 @@ mod tests {
         first.append(EventKind::TurnFinished).await.unwrap();
         drop(first);
         let reopened = session(&path, Some("ordered")).await;
-        let events = reopened.snapshot().await;
+        let events = reopened.snapshot().await.unwrap();
         assert_eq!(
             events
                 .iter()
@@ -2136,13 +2223,157 @@ mod tests {
         drop(first);
 
         let reopened = session(&path, Some("task-reports")).await;
-        let reports = reopened.task_reports().await;
+        let reports = reopened.task_reports().await.unwrap();
         let completed = reports.iter().find(|report| report.id == "00a").unwrap();
         assert_eq!(completed.status, TaskStatus::Completed);
         assert_eq!(completed.content, b"complete output");
         let interrupted = reports.iter().find(|report| report.id == "00b").unwrap();
         assert_eq!(interrupted.status, TaskStatus::Cancelled);
         assert!(interrupted.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_task_pointers_rebuild_exact_reports_and_task_read_failures_propagate() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("task-pointer-validation")).await;
+        opened
+            .append_batch(vec![
+                EventKind::User {
+                    text: "tasks".into(),
+                },
+                EventKind::Task {
+                    id: "first".into(),
+                    protocol: "bash".into(),
+                    label: "first task".into(),
+                    status: TaskStatus::Completed,
+                    output: Some("first output".into()),
+                },
+                EventKind::Task {
+                    id: "second".into(),
+                    protocol: "bash".into(),
+                    label: "second task".into(),
+                    status: TaskStatus::Completed,
+                    output: Some("second output".into()),
+                },
+            ])
+            .await
+            .unwrap();
+        opened
+            .append_compaction("tasks".into(), 10, Vec::new(), false)
+            .await
+            .unwrap();
+        drop(opened);
+
+        let resumed = session(&path, Some("task-pointer-validation")).await;
+        let expected = resumed.task_reports().await.unwrap();
+        resumed
+            .state
+            .lock()
+            .await
+            .derived
+            .tasks
+            .get_mut("first")
+            .unwrap()
+            .latest_sequence = u64::MAX;
+        assert_eq!(resumed.task_reports().await.unwrap(), expected);
+
+        let second_sequence = resumed.state.lock().await.derived.tasks["second"].first_sequence;
+        resumed
+            .state
+            .lock()
+            .await
+            .derived
+            .tasks
+            .get_mut("first")
+            .unwrap()
+            .latest_sequence = second_sequence;
+        assert_eq!(resumed.task_reports().await.unwrap(), expected);
+
+        let first_sequence = resumed.state.lock().await.derived.tasks["first"].first_sequence;
+        resumed
+            .connection
+            .call(move |db| {
+                db.execute(
+                    "UPDATE events SET payload_json = '{bad task payload'
+                     WHERE session_id = 'task-pointer-validation' AND sequence = ?1",
+                    [first_sequence as i64],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        let error = resumed.task_reports().await.unwrap_err();
+        assert!(format!("{error:#}").contains("cannot restore session task reports"));
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_and_frozen_context_deserialization_failures_propagate() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("strict-session-reads")).await;
+        let notice = opened
+            .append_batch(vec![
+                EventKind::User {
+                    text: "persist".into(),
+                },
+                EventKind::Notice {
+                    text: "break me".into(),
+                },
+            ])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        opened
+            .connection
+            .call(move |db| {
+                db.execute(
+                    "UPDATE events SET payload_json = '{bad snapshot payload'
+                     WHERE session_id = 'strict-session-reads' AND sequence = ?1",
+                    [notice.sequence as i64],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        assert!(opened.snapshot().await.is_err());
+        drop(opened);
+
+        let context_session = session(&path, Some("strict-context")).await;
+        context_session
+            .append(EventKind::User {
+                text: "persist context".into(),
+            })
+            .await
+            .unwrap();
+        context_session
+            .connection
+            .call(|db| {
+                db.execute(
+                    "UPDATE events SET payload_json = '{bad context payload'
+                     WHERE session_id = 'strict-context' AND kind = 'session_context'",
+                    [],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        drop(context_session);
+        let error = match Session::open_at(
+            path,
+            Some("strict-context"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("ignored"),
+        )
+        .await
+        {
+            Ok(_) => panic!("malformed frozen context unexpectedly resumed"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("cannot restore session state"));
     }
 
     #[test]
@@ -2291,6 +2522,7 @@ mod tests {
             !opened
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::SessionContext { .. }))
         );
@@ -2414,7 +2646,7 @@ mod tests {
 
         assert_eq!(compacted.model_history().await.len(), 2);
         assert_eq!(compacted.model_history().await[0], replacement[0]);
-        assert!(compacted.snapshot().await.iter().any(|event| {
+        assert!(compacted.snapshot().await.unwrap().iter().any(|event| {
             matches!(
                 &event.kind,
                 EventKind::ModelMessage { message } if message == &Message::user("old history")
@@ -2564,7 +2796,7 @@ mod tests {
             .await
             .unwrap();
 
-        let events = opened.snapshot().await;
+        let events = opened.snapshot().await.unwrap();
         for (provider, model) in [
             ("provider-b", "model-b"),
             ("provider-a", "model-a"),
@@ -2609,7 +2841,7 @@ mod tests {
             .connection
             .call(|db| {
                 db.query_row(
-                    "SELECT version, through_sequence, payload_json
+                    "SELECT version, through_sequence, payload_json, checksum
                      FROM session_resume_index WHERE session_id = 'index-fallbacks'",
                     [],
                     |row| {
@@ -2617,6 +2849,7 @@ mod tests {
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
@@ -2740,7 +2973,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let expected_events = opened.snapshot().await;
+        let expected_events = opened.snapshot().await.unwrap();
         let mut expected_derived = ResumeState::default();
         for event in &expected_events {
             apply_resume_event(&mut expected_derived, event);
@@ -2752,6 +2985,7 @@ mod tests {
             Absent,
             UnknownVersion,
             Malformed,
+            SemanticPayload,
             ImpossibleHead,
             Stale,
         }
@@ -2759,6 +2993,7 @@ mod tests {
             Corruption::Absent,
             Corruption::UnknownVersion,
             Corruption::Malformed,
+            Corruption::SemanticPayload,
             Corruption::ImpossibleHead,
             Corruption::Stale,
         ] {
@@ -2777,16 +3012,33 @@ mod tests {
                         Corruption::Malformed => {
                             db.execute("UPDATE session_resume_index SET payload_json = '{bad' WHERE session_id = 'index-fallbacks'", [])?;
                         }
+                        Corruption::SemanticPayload => {
+                            let payload: String = db.query_row(
+                                "SELECT payload_json FROM session_resume_index
+                                 WHERE session_id = 'index-fallbacks'",
+                                [],
+                                |row| row.get(0),
+                            )?;
+                            let mut payload = serde_json::from_str::<Value>(&payload).unwrap();
+                            payload["has_user"] = Value::Bool(false);
+                            db.execute(
+                                "UPDATE session_resume_index SET payload_json = ?1
+                                 WHERE session_id = 'index-fallbacks'",
+                                [payload.to_string()],
+                            )?;
+                        }
                         Corruption::ImpossibleHead => {
                             db.execute("UPDATE session_resume_index SET through_sequence = 999999 WHERE session_id = 'index-fallbacks'", [])?;
                         }
                         Corruption::Stale => {
                             db.execute(
-                                "INSERT INTO session_resume_index (session_id, version, through_sequence, payload_json)
-                                 VALUES ('index-fallbacks', ?1, ?2, ?3)
+                                "INSERT INTO session_resume_index
+                                 (session_id, version, through_sequence, payload_json, checksum)
+                                 VALUES ('index-fallbacks', ?1, ?2, ?3, ?4)
                                  ON CONFLICT(session_id) DO UPDATE SET version=excluded.version,
-                                   through_sequence=excluded.through_sequence, payload_json=excluded.payload_json",
-                                params![old_index.0, old_index.1, old_index.2],
+                                   through_sequence=excluded.through_sequence,
+                                   payload_json=excluded.payload_json, checksum=excluded.checksum",
+                                params![old_index.0, old_index.1, old_index.2, old_index.3],
                             )?;
                         }
                     }
@@ -2801,7 +3053,7 @@ mod tests {
             let actual = resumed.model_context("test", "model").await;
             assert_eq!(actual.history, expected_context.history);
             assert_eq!(actual.latest_api_usage, expected_context.latest_api_usage);
-            let reports = resumed.task_reports().await;
+            let reports = resumed.task_reports().await.unwrap();
             assert_eq!(
                 reports
                     .iter()
@@ -2891,7 +3143,7 @@ mod tests {
             ])
             .await
             .unwrap();
-        let initial = opened.snapshot().await;
+        let initial = opened.snapshot().await.unwrap();
         let first = opened.events_after(0, 2).await.unwrap();
         opened
             .append(EventKind::Notice {
@@ -2908,7 +3160,7 @@ mod tests {
             }
             forward.extend(page);
         }
-        let all = opened.snapshot().await;
+        let all = opened.snapshot().await.unwrap();
         assert_eq!(forward, all.into_iter().skip(1).collect::<Vec<_>>());
 
         let boundary = initial.last().unwrap().sequence.saturating_add(1);
@@ -2923,7 +3175,7 @@ mod tests {
             backward.splice(0..0, page);
         }
         assert_eq!(backward, initial);
-        let snapshot = opened.snapshot().await;
+        let snapshot = opened.snapshot().await.unwrap();
         assert_eq!(
             opened.tail_events(3).await.unwrap(),
             snapshot[snapshot.len() - 3..]
@@ -2976,12 +3228,113 @@ mod tests {
             .unwrap();
         assert_eq!(stored_head as u64, event.sequence);
         assert!(matches!(
-            opened.snapshot().await.last().map(|event| &event.kind),
+            opened
+                .snapshot()
+                .await
+                .unwrap()
+                .last()
+                .map(|event| &event.kind),
             Some(EventKind::Compaction { .. })
         ));
         drop(opened);
         let reopened = session(&path, Some("cache-failure")).await;
         assert_eq!(reopened.model_history().await, vec![Message::user("safe")]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_publish_in_sequence_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("ordered-publication")).await;
+        opened
+            .append(EventKind::User {
+                text: "start".into(),
+            })
+            .await
+            .unwrap();
+        let mut updates = opened.subscribe();
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut appends = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let session = opened.clone();
+            let barrier = barrier.clone();
+            appends.spawn(async move {
+                barrier.wait().await;
+                let kind = if index % 2 == 0 {
+                    EventKind::Compaction {
+                        summary: format!("checkpoint {index}"),
+                        tokens_before: index,
+                        replacement_history: vec![Message::user(format!("summary {index}"))],
+                        manual: false,
+                    }
+                } else {
+                    EventKind::Notice {
+                        text: format!("notice {index}"),
+                    }
+                };
+                session.append(kind).await.unwrap()
+            });
+        }
+        barrier.wait().await;
+
+        let mut published = Vec::new();
+        while published.len() < 16 {
+            if let SessionUpdate::Persisted(event) = updates.recv().await.unwrap() {
+                published.push(event.sequence);
+            }
+        }
+        while appends.join_next().await.is_some() {}
+        assert!(published.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[tokio::test]
+    async fn delayed_older_checkpoint_cannot_replace_a_newer_resume_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("monotonic-index")).await;
+        opened
+            .append(EventKind::User {
+                text: "start".into(),
+            })
+            .await
+            .unwrap();
+        let first = opened
+            .append_compaction("first".into(), 1, vec![Message::user("first")], false)
+            .await
+            .unwrap();
+        let first_payload = opened
+            .connection
+            .call(|db| {
+                db.query_row(
+                    "SELECT payload_json FROM session_resume_index
+                     WHERE session_id = 'monotonic-index'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        let second = opened
+            .append_compaction("second".into(), 2, vec![Message::user("second")], false)
+            .await
+            .unwrap();
+
+        opened
+            .persist_resume_index(first.sequence, first_payload)
+            .await;
+        let through = opened
+            .connection
+            .call(|db| {
+                db.query_row(
+                    "SELECT through_sequence FROM session_resume_index
+                     WHERE session_id = 'monotonic-index'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(through as u64, second.sequence);
     }
 
     #[tokio::test]
@@ -3076,6 +3429,36 @@ mod tests {
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','events')",
             [], |row| row.get(0))).await.unwrap();
         assert_eq!(tables, 2);
+    }
+
+    #[tokio::test]
+    async fn resume_index_schema_adds_checksum_to_legacy_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        {
+            let db = SqliteConnection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE session_resume_index (
+                   session_id TEXT PRIMARY KEY,
+                   version INTEGER NOT NULL,
+                   through_sequence INTEGER NOT NULL,
+                   payload_json TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+
+        let (_, connection) = open_database(path).await.unwrap();
+        let columns = connection
+            .call(|db| {
+                let mut statement = db.prepare("PRAGMA table_info(session_resume_index)")?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "checksum"));
     }
 
     #[test]
@@ -3207,7 +3590,7 @@ mod tests {
         drop(opened);
         let reopened = session(&path, Some("drafty")).await;
         assert_eq!(reopened.draft().await, "keep me");
-        assert_eq!(reopened.snapshot().await.len(), 3);
+        assert_eq!(reopened.snapshot().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -3299,13 +3682,20 @@ mod tests {
             .update_model_settings("anthropic", "claude-new", ThinkingLevel::Medium)
             .await
             .unwrap();
-        assert!(original.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::ModelSettingsChanged { provider, model, thinking }
-                if provider == "anthropic"
-                    && model == "claude-new"
-                    && *thinking == ThinkingLevel::Medium
-        )));
+        assert!(
+            original
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::ModelSettingsChanged { provider, model, thinking }
+                        if provider == "anthropic"
+                            && model == "claude-new"
+                            && *thinking == ThinkingLevel::Medium
+                ))
+        );
         drop(original);
 
         let resumed = Session::open_at_with_thinking(
@@ -3417,10 +3807,17 @@ mod tests {
             ])
             .await;
         assert!(result.is_err());
-        assert!(!opened.snapshot().await.iter().any(|event| matches!(
-            event.kind,
-            EventKind::User { .. } | EventKind::ModelMessage { .. }
-        )));
+        assert!(
+            !opened
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    EventKind::User { .. } | EventKind::ModelMessage { .. }
+                ))
+        );
         let counts: (i64, i64) = opened
             .connection
             .call(|db| {
