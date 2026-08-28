@@ -1221,6 +1221,7 @@ impl App {
         if process_end == turn_start {
             if let Some(result) = result {
                 self.blocks.push(result);
+                self.invalidate_transcript_layout_from(turn_start);
             }
             if selected_was_in_turn {
                 self.selected_block = turn_start;

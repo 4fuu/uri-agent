@@ -1825,6 +1825,54 @@ fn final_assistant_response_has_one_blank_row_after_the_user_when_there_is_no_pr
 }
 
 #[test]
+fn settling_a_rendered_assistant_only_turn_invalidates_its_result_gap() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "hello".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::AssistantText {
+            text: "live response".into(),
+        },
+    );
+    app.skip_splash();
+    render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_rows, 4);
+
+    apply_event(&mut app, 2, EventKind::TurnFinished);
+    let settled = render_to_string(&mut app, 80, 12);
+    let user_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+        .unwrap();
+    let result_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+        .unwrap();
+
+    assert_eq!(app.transcript_rows, 5);
+    assert_eq!(app.transcript_layout.rows, 5);
+    assert_eq!(result_row, user_row + 3);
+    assert!(
+        settled
+            .lines()
+            .nth((user_row + 2) as usize)
+            .unwrap()
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+}
+
+#[test]
 fn assistant_transcript_renders_markdown_instead_of_source_markers() {
     let mut app = test_app();
     app.push(
