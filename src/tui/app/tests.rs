@@ -6228,6 +6228,93 @@ async fn compacted_startup_is_payload_lazy_but_restores_exact_stats_and_model_st
 }
 
 #[tokio::test]
+async fn prepending_manual_compaction_history_preserves_live_flashes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-flashes").await;
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "historical turn".into(),
+            },
+            EventKind::AssistantText {
+                text: "historical answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("historical answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "manual checkpoint".into(),
+            10,
+            vec![Message::user("manual summary")],
+            true,
+        )
+        .await
+        .unwrap();
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "newer turn".into(),
+            },
+            EventKind::AssistantText {
+                text: "newer answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("newer answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "latest checkpoint".into(),
+            20,
+            vec![Message::user("latest summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    drop(opened);
+
+    let resumed = persisted_tui_session(&path, "lazy-flashes").await;
+    let eager = eager_session_app(&resumed).await;
+    let mut lazy = test_app();
+    hydrate_session_history(&mut lazy, &resumed).await.unwrap();
+    lazy.set_flash("live notice");
+    let live_flashes = lazy
+        .flashes
+        .iter()
+        .map(|notice| (notice.message.clone(), notice.created))
+        .collect::<Vec<_>>();
+
+    load_older_history(&mut lazy, &resumed).await.unwrap();
+
+    assert_eq!(
+        lazy.flashes
+            .iter()
+            .map(|notice| (notice.message.clone(), notice.created))
+            .collect::<Vec<_>>(),
+        live_flashes
+    );
+    assert!(
+        !lazy
+            .flashes
+            .iter()
+            .any(|notice| notice.message == "Context compacted; original events retained")
+    );
+    assert!(lazy.blocks.iter().any(
+        |block| block.kind == BlockKind::Compaction && block.text.contains("manual checkpoint")
+    ));
+    assert_eq!(block_fingerprints(&lazy), block_fingerprints(&eager));
+}
+
+#[tokio::test]
 async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rendering() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("sessions.db");
@@ -6497,6 +6584,7 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
             app.selection = None;
             app.mouse_scroll_animation = None;
             app.transcript_follow_tail = true;
+            app.flashes.clear();
         }
         let lazy_render = render_to_string(&mut lazy, width, 20);
         let eager_render = render_to_string(&mut eager, width, 20);

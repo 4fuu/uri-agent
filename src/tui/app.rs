@@ -1349,8 +1349,6 @@ impl App {
         let mut blocks = older.blocks;
         blocks.append(&mut self.blocks);
         self.blocks = blocks;
-        older.flashes.append(&mut self.flashes);
-        self.flashes = older.flashes;
         if let Some(selected_id) = selected_id {
             self.selected_block = self
                 .blocks
