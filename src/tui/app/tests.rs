@@ -3482,7 +3482,7 @@ fn transcript_scroll_is_independent_from_selection_and_follows_the_tail_again() 
 }
 
 #[test]
-fn mouse_wheel_smooths_each_three_row_step_without_reducing_distance() {
+fn mouse_wheel_smooths_each_six_row_step_without_reducing_distance() {
     let mut app = test_app();
     for index in 0..30 {
         app.push(
@@ -3506,31 +3506,37 @@ fn mouse_wheel_smooths_each_three_row_step_without_reducing_distance() {
     assert_eq!(app.transcript_offset, tail_offset - 2);
     app.advance_mouse_scroll_animation();
     assert_eq!(app.transcript_offset, tail_offset - 3);
+    for _ in 0..3 {
+        app.advance_mouse_scroll_animation();
+    }
+    assert_eq!(app.transcript_offset, tail_offset - 6);
     assert!(!app.mouse_scroll_animating());
 
     handle_mouse_scroll(&mut app, 1);
-    for _ in 0..3 {
+    for _ in 0..6 {
         app.advance_mouse_scroll_animation();
     }
     assert_eq!(app.transcript_offset, tail_offset);
 
     app.overlay = Some(Overlay::Document);
-    app.overlay_scroll = 3;
+    app.overlay_scroll = 6;
     handle_mouse_scroll(&mut app, -1);
-    assert_eq!(app.overlay_scroll, 3);
+    assert_eq!(app.overlay_scroll, 6);
     app.advance_mouse_scroll_animation();
-    assert_eq!(app.overlay_scroll, 2);
+    assert_eq!(app.overlay_scroll, 5);
     app.advance_mouse_scroll_animation();
-    assert_eq!(app.overlay_scroll, 1);
-    app.advance_mouse_scroll_animation();
+    assert_eq!(app.overlay_scroll, 4);
+    for _ in 0..4 {
+        app.advance_mouse_scroll_animation();
+    }
     assert_eq!(app.overlay_scroll, 0);
     assert!(!app.mouse_scroll_animating());
 }
 
 #[test]
-fn smooth_mouse_scroll_coalesces_bursts_without_a_long_backlog() {
+fn smooth_mouse_scroll_preserves_the_full_distance_of_rapid_events() {
     let mut app = test_app();
-    for index in 0..50 {
+    for index in 0..100 {
         app.push(
             BlockKind::Assistant,
             "AGENT",
@@ -3546,11 +3552,23 @@ fn smooth_mouse_scroll_coalesces_bursts_without_a_long_backlog() {
     for _ in 0..10 {
         handle_mouse_scroll(&mut app, -1);
     }
-    for _ in 0..MAX_PENDING_SCROLL_ROWS {
+    for _ in 0..60 {
         app.advance_mouse_scroll_animation();
     }
 
-    assert_eq!(app.transcript_offset, tail_offset - MAX_PENDING_SCROLL_ROWS);
+    assert_eq!(app.transcript_offset, tail_offset - 60);
+    assert!(!app.mouse_scroll_animating());
+
+    app.overlay = Some(Overlay::Document);
+    app.overlay_scroll = 100;
+    for _ in 0..10 {
+        handle_mouse_scroll(&mut app, -1);
+    }
+    for _ in 0..60 {
+        app.advance_mouse_scroll_animation();
+    }
+
+    assert_eq!(app.overlay_scroll, 40);
     assert!(!app.mouse_scroll_animating());
 }
 

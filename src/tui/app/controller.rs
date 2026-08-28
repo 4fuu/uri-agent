@@ -954,11 +954,11 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServ
             Action::Continue
         }
         Some("scroll_down") => {
-            app.scroll_transcript(3);
+            app.scroll_transcript(SCROLL_ROWS);
             Action::Continue
         }
         Some("scroll_up") => {
-            app.scroll_transcript(-3);
+            app.scroll_transcript(-SCROLL_ROWS);
             Action::Continue
         }
         Some("first") => {
@@ -1872,7 +1872,7 @@ pub(super) fn handle_mouse_scroll(app: &mut App, direction: isize) {
         Some(Overlay::Models) => {
             app.cancel_mouse_scroll_animation();
             if let Some(selector) = app.model_selector.as_mut() {
-                selector.move_selection(direction * MOUSE_SCROLL_ROWS);
+                selector.move_selection(direction * SCROLL_ROWS);
             }
         }
         Some(Overlay::Settings) => {

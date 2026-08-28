@@ -84,8 +84,7 @@ const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const SMOOTH_SCROLL_FRAME_DURATION: Duration = Duration::from_millis(16);
-const MOUSE_SCROLL_ROWS: isize = 3;
-const MAX_PENDING_SCROLL_ROWS: usize = 12;
+const SCROLL_ROWS: isize = 6;
 const EXPANDED_PREVIEW_LINES: usize = 24;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
@@ -1837,18 +1836,7 @@ impl App {
             }) if previous_direction == direction => target,
             _ => self.transcript_offset,
         };
-        let target = self.transcript_scroll_destination(start, direction * MOUSE_SCROLL_ROWS);
-        let target = if direction < 0 {
-            target.max(
-                self.transcript_offset
-                    .saturating_sub(MAX_PENDING_SCROLL_ROWS),
-            )
-        } else {
-            target.min(
-                self.transcript_offset
-                    .saturating_add(MAX_PENDING_SCROLL_ROWS),
-            )
-        };
+        let target = self.transcript_scroll_destination(start, direction * SCROLL_ROWS);
         self.mouse_scroll_animation = (target != self.transcript_offset)
             .then_some(MouseScrollAnimation::Transcript { target, direction });
         if self.mouse_scroll_animation.is_some() {
@@ -1865,17 +1853,11 @@ impl App {
             }) if previous_direction == direction => target,
             _ => self.overlay_scroll,
         };
-        let distance = direction * MOUSE_SCROLL_ROWS;
+        let distance = direction * SCROLL_ROWS;
         let target = if distance < 0 {
             start.saturating_sub(distance.unsigned_abs().min(u16::MAX as usize) as u16)
         } else {
             start.saturating_add((distance as usize).min(u16::MAX as usize) as u16)
-        };
-        let maximum_pending = MAX_PENDING_SCROLL_ROWS.min(u16::MAX as usize) as u16;
-        let target = if direction < 0 {
-            target.max(self.overlay_scroll.saturating_sub(maximum_pending))
-        } else {
-            target.min(self.overlay_scroll.saturating_add(maximum_pending))
         };
         self.mouse_scroll_animation = (target != self.overlay_scroll)
             .then_some(MouseScrollAnimation::Overlay { target, direction });
