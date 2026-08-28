@@ -3621,6 +3621,24 @@ fn smooth_mouse_scroll_catches_up_quickly_on_a_long_backlog() {
 }
 
 #[test]
+fn only_button_mouse_input_cancels_smooth_scrolling() {
+    assert!(mouse_cancels_smooth_scroll(MouseEventKind::Down(
+        MouseButton::Left
+    )));
+    assert!(mouse_cancels_smooth_scroll(MouseEventKind::Drag(
+        MouseButton::Left
+    )));
+    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::Moved));
+    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::Up(
+        MouseButton::Left
+    )));
+    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollUp));
+    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollDown));
+    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollLeft));
+    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollRight));
+}
+
+#[test]
 fn transcript_pages_by_the_rendered_viewport_without_moving_selection() {
     let mut app = test_app();
     for index in 0..50 {

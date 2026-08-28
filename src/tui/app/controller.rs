@@ -154,11 +154,15 @@ pub(super) async fn run_loop(
     if refresh_catalog_on_start {
         start_background_catalog_refresh(app, &services, background_tx.clone());
     }
+    let mut redraw = true;
     loop {
-        let context = services.runtime.context_usage();
-        app.info.context_tokens = context.tokens;
-        app.info.context_accuracy = context.accuracy;
-        terminal.draw(|frame| render(frame, app))?;
+        if redraw {
+            let context = services.runtime.context_usage();
+            app.info.context_tokens = context.tokens;
+            app.info.context_accuracy = context.accuracy;
+            terminal.draw(|frame| render(frame, app))?;
+        }
+        redraw = true;
         tokio::select! {
             _ = animation.tick(), if !app.animations_paused() => {
                 app.frame = app.frame.wrapping_add(1);
@@ -171,12 +175,14 @@ pub(super) async fn run_loop(
                 let (events, paste) =
                     collect_possible_paste(&mut terminal_events, event?, app.pty.is_none())
                         .await?;
+                let mut handled = paste.is_some();
                 if let Some(text) = paste {
                     apply_surface_paste(app, text, &background_tx);
                 }
                 for event in events {
                 match event {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        handled = true;
                         let selection_active = app.selection.is_some()
                             || (app.overlay == Some(Overlay::Composer)
                                 && composer_has_selection(&app.input));
@@ -204,6 +210,7 @@ pub(super) async fn run_loop(
                         }
                     }
                     Event::Paste(text) => {
+                        handled = true;
                         if let Some(pty) = app.pty.as_mut() {
                             if let Err(error) = pty.terminal.send_paste(&text) {
                                 app.set_flash(format!("Terminal paste failed: {error:#}"));
@@ -213,6 +220,12 @@ pub(super) async fn run_loop(
                         }
                     }
                     Event::Mouse(mouse) => {
+                        // No surface handles hover motion; skip it so it neither
+                        // interrupts smooth scrolling nor forces a redraw.
+                        if matches!(mouse.kind, MouseEventKind::Moved) {
+                            continue;
+                        }
+                        handled = true;
                         if app.showing_splash() {
                             app.skip_splash();
                         }
@@ -231,9 +244,11 @@ pub(super) async fn run_loop(
                             }
                         }
                     }
-                    Event::FocusGained | Event::FocusLost | Event::Resize(_, _) | Event::Key(_) => {}
+                    Event::Resize(_, _) => handled = true,
+                    Event::FocusGained | Event::FocusLost | Event::Key(_) => {}
                 }
                 }
+                redraw = handled;
             }
             event = receiver.recv() => match event {
                 Ok(SessionUpdate::Persisted(event)) => app.apply(event),
@@ -1861,15 +1876,19 @@ pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) 
     }
 }
 
+// Only button-driven mouse input interrupts smooth scrolling; hover motion,
+// button releases, and horizontal wheel noise must not cancel an in-flight
+// scroll animation.
+pub(super) fn mouse_cancels_smooth_scroll(kind: MouseEventKind) -> bool {
+    matches!(kind, MouseEventKind::Down(_) | MouseEventKind::Drag(_))
+}
+
 pub(super) async fn handle_mouse(
     app: &mut App,
     mouse: MouseEvent,
     services: &LoopServices,
 ) -> Action {
-    if !matches!(
-        mouse.kind,
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-    ) {
+    if mouse_cancels_smooth_scroll(mouse.kind) {
         app.cancel_mouse_scroll_animation();
     }
     if consume_copy_click_release(app, mouse) {
