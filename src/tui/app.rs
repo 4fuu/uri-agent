@@ -285,6 +285,12 @@ struct TextSelection {
     end: (u16, u16),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TextClickTarget {
+    Surface(Option<Overlay>, (u16, u16)),
+    Composer((u16, u16)),
+}
+
 #[derive(Clone, Copy)]
 struct TranscriptScrollbarDrag {
     row: u16,
@@ -594,6 +600,8 @@ struct App {
     document: Option<(String, String)>,
     hit_regions: Vec<HitRegion<AppHit>>,
     last_click: Option<(AppHit, Instant)>,
+    last_text_click: Option<(TextClickTarget, Instant)>,
+    mouse_word_selecting: bool,
     overlay_bounds: Option<Rect>,
     copy_click_release_pending: bool,
     selectable: Option<SelectableSurface>,
@@ -681,6 +689,8 @@ impl App {
             document: None,
             hit_regions: Vec::new(),
             last_click: None,
+            last_text_click: None,
+            mouse_word_selecting: false,
             overlay_bounds: None,
             copy_click_release_pending: false,
             selectable: None,
@@ -1195,6 +1205,7 @@ impl App {
         self.input = TextArea::default();
         self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
+        self.mouse_word_selecting = false;
         self.dismiss_completions();
         self.token_rate.start_turn();
         self.busy = true;
@@ -1317,6 +1328,7 @@ impl App {
         self.next_composer_image_id = 1;
         self.sync_composer_chrome();
         self.composer_mouse_selecting = false;
+        self.mouse_word_selecting = false;
         self.dismiss_completions();
         self.delivery = None;
         self.overlay = None;
@@ -2118,4 +2130,16 @@ fn is_double_click<T: Copy + Eq>(last_click: &mut Option<(T, Instant)>, target: 
     });
     *last_click = (!repeated).then_some((target, now));
     repeated
+}
+
+fn word_bounds_at(text: &str, character_index: usize) -> Option<(usize, usize)> {
+    let byte_index = text.char_indices().nth(character_index)?.0;
+    let (start_byte, word) = text
+        .split_word_bound_indices()
+        .find(|(start, word)| *start <= byte_index && byte_index < *start + word.len())?;
+    if word.chars().all(char::is_whitespace) {
+        return None;
+    }
+    let start = text[..start_byte].chars().count();
+    Some((start, start + word.chars().count()))
 }

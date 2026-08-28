@@ -44,6 +44,7 @@ map("main", "enter", "toggle");
 map("main", "o", "open");
 map("main", "esc", "clear");
 map("main", "y", "copy");
+map("main", "ctrl+x", "copy_last_response");
 
 map("composer", "enter", "submit");
 map("composer", "shift+enter", "newline");
@@ -144,6 +145,7 @@ map("document", "esc", "close");
 
 map("selection", "y", "copy");
 map("selection", "ctrl+c", "copy");
+map("selection", "ctrl+x", "copy");
 map("selection", "ctrl+shift+c", "copy");
 map("selection", "super+c", "copy");
 map("selection", "esc", "close");
@@ -156,9 +158,11 @@ map("terminal", "super+c", "copy");
 const MACOS_KEYMAP: &str = r#"
 map("global", "super+,", "settings");
 map("main", "super+v", "paste");
+map("main", "super+x", "copy_last_response");
 map("composer", "super+v", "paste");
 map("composer", "super+z", "undo");
 map("composer", "super+shift+z", "redo");
+map("selection", "super+x", "copy");
 "#;
 
 const CONTROL: u8 = 1;
@@ -766,9 +770,17 @@ mod tests {
         );
         assert_eq!(keymap.action("main", "q"), None);
         assert_eq!(keymap.action("main", "ctrl+c"), None);
+        assert_eq!(
+            keymap.action("main", "ctrl+x").as_deref(),
+            Some("copy_last_response")
+        );
         assert_eq!(keymap.action("composer", "ctrl+c").as_deref(), Some("copy"));
         assert_eq!(
             keymap.action("selection", "ctrl+c").as_deref(),
+            Some("copy")
+        );
+        assert_eq!(
+            keymap.action("selection", "ctrl+x").as_deref(),
             Some("copy")
         );
         assert_eq!(
@@ -914,6 +926,10 @@ mod tests {
             text.key_hint("global", "copy").as_deref(),
             Some("Ctrl+Shift+C")
         );
+        assert_eq!(
+            text.key_hint("main", "copy_last_response").as_deref(),
+            Some("Ctrl+X")
+        );
 
         let macos = Keymap::with_display_style(KeyDisplayStyle::Macos).unwrap();
         assert_eq!(macos.key_hint("main", "previous").as_deref(), Some("↑"));
@@ -932,6 +948,11 @@ mod tests {
             "⇧ ⌘ Z"
         );
         assert_eq!(macos.key_hint("global", "copy").as_deref(), Some("⌘ C"));
+        assert_eq!(
+            macos.key_hint("main", "copy_last_response").as_deref(),
+            Some("⌘ X")
+        );
+        assert_eq!(macos.action("selection", "cmd+x").as_deref(), Some("copy"));
         assert_eq!(macos.key_hint("main", "paste").as_deref(), Some("⌘ V"));
         assert_eq!(macos.modifier_hint("shift").as_deref(), Some("⇧"));
         assert_eq!(macos.action("composer", "cmd+z").as_deref(), Some("undo"));

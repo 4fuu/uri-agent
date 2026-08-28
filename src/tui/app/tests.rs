@@ -1439,6 +1439,56 @@ fn assistant_reply_supports_direct_mouse_drag_selection() {
 }
 
 #[test]
+fn assistant_reply_double_click_selects_the_rendered_word() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "Select this response with the mouse.".into(),
+        None,
+        false,
+        true,
+    );
+    render_to_string(&mut app, 80, 12);
+    let row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+        .unwrap();
+    let surface = app.selectable.as_ref().unwrap();
+    let cells = &surface.cells[row.saturating_sub(surface.area.y) as usize];
+    let response_column = surface.area.x
+        + cells
+            .iter()
+            .position(|cell| cell == "r")
+            .expect("response starts with the first rendered r") as u16;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: response_column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..down
+    };
+
+    assert!(begin_direct_transcript_selection(&mut app, down));
+    assert!(update_mouse_selection(&mut app, up, true));
+    assert!(app.selection.is_none());
+    assert!(begin_direct_transcript_selection(&mut app, down));
+    assert_eq!(
+        selected_surface_text(app.selectable.as_ref().unwrap(), app.selection.unwrap()),
+        "response"
+    );
+    assert!(update_mouse_selection(&mut app, up, true));
+    assert_eq!(
+        selected_surface_text(app.selectable.as_ref().unwrap(), app.selection.unwrap()),
+        "response"
+    );
+}
+
+#[test]
 fn transcript_copy_omits_visual_soft_wraps() {
     for (kind, text, width, separator, expected) in [
         (
@@ -2630,6 +2680,63 @@ fn ctrl_c_copies_a_selection_and_is_otherwise_ignored() {
         app.keymap.action("selection", "ctrl+c").as_deref(),
         Some("copy")
     );
+    assert_eq!(
+        app.keymap.action("main", "ctrl+x").as_deref(),
+        Some("copy_last_response")
+    );
+    assert_eq!(
+        app.keymap.action("selection", "ctrl+x").as_deref(),
+        Some("copy")
+    );
+}
+
+#[test]
+fn copy_last_response_reports_when_no_assistant_response_exists() {
+    let mut app = test_app();
+    copy_last_assistant_response(&mut app);
+    assert_eq!(
+        app.visible_flashes().next_back(),
+        Some("No assistant response to copy yet")
+    );
+}
+
+#[test]
+fn last_assistant_response_uses_the_latest_nonempty_assistant_block() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "first response".to_string(),
+        None,
+        false,
+        true,
+    );
+    app.push(
+        BlockKind::User,
+        "YOU",
+        "follow-up".to_string(),
+        None,
+        false,
+        true,
+    );
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "latest **response**".to_string(),
+        None,
+        false,
+        true,
+    );
+    app.push(
+        BlockKind::Notice,
+        "SYSTEM",
+        "later notice".to_string(),
+        None,
+        false,
+        true,
+    );
+
+    assert_eq!(last_assistant_response(&app), Some("latest **response**"));
 }
 
 #[test]
@@ -2786,6 +2893,37 @@ fn composer_mouse_click_moves_the_caret_and_drag_selects_editable_text() {
         KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
     );
     assert_eq!(app.draft_text(), "X beta");
+}
+
+#[test]
+fn composer_double_click_selects_a_unicode_word() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Composer);
+    app.input.insert_str("你 naïve beta");
+    render_to_string(&mut app, 80, 24);
+    let inner = app.composer_view.as_ref().unwrap().inner;
+    let event = |kind| MouseEvent {
+        kind,
+        column: inner.x + 5,
+        row: inner.y,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(handle_composer_mouse(&mut app, event(kind)));
+    }
+
+    assert_eq!(composer_selected_text(&app.input).as_deref(), Some("naïve"));
+    edit_composer_with_default_keymap(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.draft_text(), "你 X beta");
 }
 
 #[test]
@@ -5172,6 +5310,8 @@ fn macos_key_display_formats_composer_panel_and_help_hints() {
     let help = keymap_help(&app.keymap);
     assert!(help.contains("⌘ C"));
     assert!(help.contains("⌘ V"));
+    assert!(help.contains("⌘ X"));
+    assert!(help.contains("copy last response"));
     assert!(help.contains("⌘ Z"));
 }
 
@@ -5230,6 +5370,51 @@ fn cell_selection_preserves_lines_and_trims_padding() {
 }
 
 #[test]
+fn rendered_word_double_click_obeys_the_shift_requirement() {
+    let mut app = test_app();
+    app.selectable = Some(SelectableSurface {
+        area: Rect::new(10, 5, 10, 1),
+        cells: vec![
+            "alpha beta"
+                .chars()
+                .map(|character| character.to_string())
+                .collect(),
+        ],
+        row_separators: vec![TextRowSeparator::Newline],
+        left_padding: 0,
+    });
+    let event = |kind, modifiers| MouseEvent {
+        kind,
+        column: 17,
+        row: 5,
+        modifiers,
+    };
+
+    assert!(!update_mouse_selection(
+        &mut app,
+        event(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+        true,
+    ));
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(update_mouse_selection(
+            &mut app,
+            event(kind, KeyModifiers::SHIFT),
+            true,
+        ));
+    }
+
+    assert_eq!(
+        selected_surface_text(app.selectable.as_ref().unwrap(), app.selection.unwrap()),
+        "beta"
+    );
+}
+
+#[test]
 fn cell_selection_omits_soft_wraps_but_preserves_source_separators() {
     let surface = SelectableSurface {
         area: Rect::new(0, 0, 5, 4),
@@ -5273,6 +5458,8 @@ fn captured_wide_characters_do_not_include_their_hidden_cells() {
         .unwrap();
 
     let surface = app.selectable.as_ref().unwrap();
+    let word = surface_word_selection(surface, (1, 0)).unwrap();
+    assert_eq!(selected_surface_text(surface, word), "复");
     assert_eq!(
         selected_surface_text(
             surface,

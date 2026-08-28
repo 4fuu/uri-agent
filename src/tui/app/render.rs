@@ -436,6 +436,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     app.selectable = None;
     app.composer_view = None;
     if app.overlay != Some(Overlay::Composer) {
+        if app.composer_mouse_selecting {
+            app.mouse_word_selecting = false;
+        }
         app.composer_mouse_selecting = false;
     }
     let marquee_visible = matches!(
@@ -3245,35 +3248,52 @@ pub(super) fn update_mouse_selection(
     mouse: MouseEvent,
     require_shift: bool,
 ) -> bool {
-    let Some(surface) = app.selectable.as_ref() else {
+    let Some(area) = app.selectable.as_ref().map(|surface| surface.area) else {
         return false;
     };
     let point = (
-        mouse
-            .column
-            .clamp(surface.area.x, surface.area.right().saturating_sub(1)),
-        mouse
-            .row
-            .clamp(surface.area.y, surface.area.bottom().saturating_sub(1)),
+        mouse.column.clamp(area.x, area.right().saturating_sub(1)),
+        mouse.row.clamp(area.y, area.bottom().saturating_sub(1)),
     );
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left)
             if (!require_shift || mouse.modifiers.contains(KeyModifiers::SHIFT))
-                && surface.area.contains(point.into()) =>
+                && area.contains(point.into()) =>
         {
+            let double_click = is_double_click(
+                &mut app.last_text_click,
+                TextClickTarget::Surface(app.overlay, point),
+            );
+            if double_click
+                && let Some(selection) = app
+                    .selectable
+                    .as_ref()
+                    .and_then(|surface| surface_word_selection(surface, point))
+            {
+                app.selection = Some(selection);
+                app.mouse_word_selecting = true;
+                return true;
+            }
             app.selection = Some(TextSelection {
                 start: point,
                 end: point,
             });
+            app.mouse_word_selecting = false;
             true
         }
         MouseEventKind::Drag(MouseButton::Left) if app.selection.is_some() => {
+            app.last_text_click = None;
+            app.mouse_word_selecting = false;
             if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
             }
             true
         }
         MouseEventKind::Up(MouseButton::Left) if app.selection.is_some() => {
+            if app.mouse_word_selecting {
+                app.mouse_word_selecting = false;
+                return true;
+            }
             let empty = if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
                 selection.start == selection.end
@@ -3287,6 +3307,46 @@ pub(super) fn update_mouse_selection(
         }
         _ => false,
     }
+}
+
+pub(super) fn surface_word_selection(
+    surface: &SelectableSurface,
+    point: (u16, u16),
+) -> Option<TextSelection> {
+    let row = point.1.saturating_sub(surface.area.y) as usize;
+    let cells = surface.cells.get(row)?;
+    let last_column = cells.len().checked_sub(1)?;
+    let column = point.0.saturating_sub(surface.area.x) as usize;
+    let clicked = (0..=column.min(last_column))
+        .rev()
+        .find(|index| !cells[*index].is_empty())?;
+    let text = cells.concat();
+    let clicked_character = cells[..clicked]
+        .iter()
+        .map(|cell| cell.chars().count())
+        .sum();
+    let (word_start, word_end) = word_bounds_at(&text, clicked_character)?;
+
+    let mut offset = 0usize;
+    let mut start = None;
+    let mut end = None;
+    for (index, cell) in cells.iter().enumerate() {
+        let next = offset + cell.chars().count();
+        if next > word_start && offset < word_end {
+            start.get_or_insert(index);
+            end = Some(index);
+        }
+        offset = next;
+    }
+    let start = start?;
+    let mut end = end?;
+    while end + 1 < cells.len() && cells[end + 1].is_empty() {
+        end += 1;
+    }
+    Some(TextSelection {
+        start: (surface.area.x + start as u16, point.1),
+        end: (surface.area.x + end as u16, point.1),
+    })
 }
 
 pub(super) fn copy_current_surface(app: &mut App) {
@@ -3305,6 +3365,22 @@ pub(super) fn copy_current_surface(app: &mut App) {
     }
     copy_text_with_osc52(app, &text);
     app.selection = None;
+}
+
+pub(super) fn last_assistant_response(app: &App) -> Option<&str> {
+    app.blocks
+        .iter()
+        .rev()
+        .find(|block| block.kind == BlockKind::Assistant && !block.text.trim().is_empty())
+        .map(|block| block.text.as_str())
+}
+
+pub(super) fn copy_last_assistant_response(app: &mut App) {
+    let Some(text) = last_assistant_response(app).map(str::to_string) else {
+        app.set_flash("No assistant response to copy yet");
+        return;
+    };
+    copy_text_with_osc52(app, &text);
 }
 
 pub(super) fn copy_document(app: &mut App) {

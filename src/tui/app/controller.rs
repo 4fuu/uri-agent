@@ -989,6 +989,10 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServ
             app.jump = JumpKind::All;
             Action::Continue
         }
+        Some("copy_last_response") => {
+            copy_last_assistant_response(app);
+            Action::Continue
+        }
         Some("copy") => {
             copy_current_surface(app);
             Action::Continue
@@ -1083,6 +1087,7 @@ pub(super) async fn handle_overlay_key(
                 Some("upgrade_pending") => Action::UpgradePending,
                 Some("close") => {
                     app.composer_mouse_selecting = false;
+                    app.mouse_word_selecting = false;
                     app.dismiss_completions();
                     app.overlay = None;
                     Action::Continue
@@ -1915,10 +1920,14 @@ pub(super) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         return false;
     }
 
+    let pointed = composer_character_at(view, &app.input, mouse.column, mouse.row);
     let mut cursor = composer_cursor_at(view, &app.input, mouse.column, mouse.row);
-    if let Some(token) = image_token_spans(&app.input.lines()[cursor.0])
+    let tokens = image_token_spans(&app.input.lines()[cursor.0])
         .into_iter()
         .filter(|token| app.composer_images.contains_key(&token.id))
+        .collect::<Vec<_>>();
+    if let Some(token) = tokens
+        .iter()
         .find(|token| token.start_col < cursor.1 && cursor.1 < token.end_col)
     {
         cursor.1 = if cursor.1 - token.start_col < token.end_col - cursor.1 {
@@ -1928,12 +1937,44 @@ pub(super) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         };
     }
     if starting {
+        let word_selection = is_double_click(
+            &mut app.last_text_click,
+            TextClickTarget::Composer((mouse.column, mouse.row)),
+        )
+        .then(|| {
+            tokens
+                .iter()
+                .find(|token| token.start_col <= pointed.1 && pointed.1 < token.end_col)
+                .map(|token| (token.start_col, token.end_col))
+                .or_else(|| word_bounds_at(&app.input.lines()[pointed.0], pointed.1))
+        })
+        .flatten();
         app.input.cancel_selection();
+        if let Some((start, end)) = word_selection {
+            app.input
+                .move_cursor(CursorMove::Jump(pointed.0 as u16, start as u16));
+            app.input.start_selection();
+            app.input
+                .move_cursor(CursorMove::Jump(pointed.0 as u16, end as u16));
+            app.composer_mouse_selecting = true;
+            app.mouse_word_selecting = true;
+            return true;
+        }
         app.input
             .move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
         app.input.start_selection();
         app.composer_mouse_selecting = true;
+        app.mouse_word_selecting = false;
     } else {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) && app.mouse_word_selecting {
+            app.composer_mouse_selecting = false;
+            app.mouse_word_selecting = false;
+            return true;
+        }
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            app.last_text_click = None;
+            app.mouse_word_selecting = false;
+        }
         app.input
             .move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
@@ -1950,12 +1991,11 @@ pub(super) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     true
 }
 
-pub(super) fn composer_cursor_at(
+fn composer_visual_target(
     view: &ComposerView,
-    input: &TextArea<'_>,
     column: u16,
     row: u16,
-) -> (usize, usize) {
+) -> (ComposerVisualRow, usize) {
     let visual_row = view.top
         + row
             .clamp(view.inner.y, view.inner.bottom().saturating_sub(1))
@@ -1964,6 +2004,16 @@ pub(super) fn composer_cursor_at(
     let target = column
         .clamp(view.inner.x, view.inner.right().saturating_sub(1))
         .saturating_sub(view.inner.x) as usize;
+    (wrapped, target)
+}
+
+pub(super) fn composer_cursor_at(
+    view: &ComposerView,
+    input: &TextArea<'_>,
+    column: u16,
+    row: u16,
+) -> (usize, usize) {
+    let (wrapped, target) = composer_visual_target(view, column, row);
     let line = &input.lines()[wrapped.logical_row];
     let mut width = 0usize;
     let mut best = (wrapped.start_col, target);
@@ -1985,6 +2035,29 @@ pub(super) fn composer_cursor_at(
     } else {
         (wrapped.logical_row, best.0)
     }
+}
+
+fn composer_character_at(
+    view: &ComposerView,
+    input: &TextArea<'_>,
+    column: u16,
+    row: u16,
+) -> (usize, usize) {
+    let (wrapped, target) = composer_visual_target(view, column, row);
+    let line = &input.lines()[wrapped.logical_row];
+    let mut width = 0usize;
+    for (offset, character) in line
+        .chars()
+        .skip(wrapped.start_col)
+        .take(wrapped.end_col.saturating_sub(wrapped.start_col))
+        .enumerate()
+    {
+        width = display_width_to(character, width, input.tab_length());
+        if target < width {
+            return (wrapped.logical_row, wrapped.start_col + offset);
+        }
+    }
+    (wrapped.logical_row, wrapped.end_col)
 }
 
 pub(super) fn activate_transcript_mouse(app: &mut App, mouse: MouseEvent) -> bool {
@@ -2129,6 +2202,7 @@ pub(super) fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> 
     match app.overlay {
         Some(Overlay::Composer) => {
             app.composer_mouse_selecting = false;
+            app.mouse_word_selecting = false;
             app.dismiss_completions();
             app.overlay = None;
         }
