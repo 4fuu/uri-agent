@@ -5,8 +5,13 @@ use crate::catalog::{
 use crate::compaction;
 use crate::keymap::KeyDisplayStyle;
 use crate::oauth::{self, OauthToken};
+#[cfg(windows)]
+use crate::process::PWSH_STDIN_BOOTSTRAP;
+use crate::process::ProcessTree;
 use crate::session::SessionChoice;
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(windows)]
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -14,14 +19,17 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
+const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
@@ -1339,15 +1347,9 @@ pub(crate) async fn resolve_config_value(
         if let Some(value) = cache.lock().await.get(command).cloned() {
             return Ok(value);
         }
-        #[cfg(windows)]
-        let child = Command::new("pwsh")
-            .args(["-NoProfile", "-NonInteractive", "-Command", command])
-            .output();
-        #[cfg(not(windows))]
-        let child = Command::new("sh").args(["-c", command]).output();
-        let output = tokio::time::timeout(Duration::from_secs(10), child)
-            .await
-            .context("credential command timed out after 10 seconds")??;
+        let output = execute_config_command(command, CONFIG_COMMAND_TIMEOUT)
+            .await?
+            .context("credential command timed out after 10 seconds")?;
         if !output.status.success() {
             bail!("credential command failed with {}", output.status);
         }
@@ -1362,6 +1364,95 @@ pub(crate) async fn resolve_config_value(
         return Ok(resolved);
     }
     interpolate_environment(value, environment)
+}
+
+async fn execute_config_command(command: &str, timeout: Duration) -> Result<Option<Output>> {
+    #[cfg(windows)]
+    let (mut process, input) = {
+        let mut process = Command::new("pwsh");
+        process.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            PWSH_STDIN_BOOTSTRAP,
+        ]);
+        (process, Some(BASE64.encode(command)))
+    };
+    #[cfg(not(windows))]
+    let (mut process, input) = {
+        let mut process = Command::new("sh");
+        process.args(["-c", command]);
+        (process, None::<String>)
+    };
+    if input.is_some() {
+        process.stdin(Stdio::piped());
+    } else {
+        process.stdin(Stdio::null());
+    }
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let (mut child, process_tree) = ProcessTree::spawn(&mut process)?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("credential command timeout is too large"))?;
+    if let Some(input) = input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open credential command stdin"))?;
+        let write = tokio::time::timeout_at(deadline, stdin.write_all(input.as_bytes())).await;
+        drop(stdin);
+        match write {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                process_tree.terminate_and_wait(&mut child).await?;
+                return Err(error.into());
+            }
+            Err(_) => {
+                process_tree.terminate_and_wait(&mut child).await?;
+                return Ok(None);
+            }
+        }
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open credential command stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to open credential command stderr"))?;
+    let completion = async {
+        let wait = async {
+            let status = child.wait().await?;
+            process_tree.terminate();
+            Ok::<_, std::io::Error>(status)
+        };
+        let (status, stdout, stderr) = tokio::try_join!(
+            wait,
+            read_config_command_output(stdout),
+            read_config_command_output(stderr),
+        )?;
+        Ok::<_, std::io::Error>(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    match tokio::time::timeout_at(deadline, completion).await {
+        Ok(output) => Ok(Some(output?)),
+        Err(_) => {
+            process_tree.terminate_and_wait(&mut child).await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn read_config_command_output(
+    mut output: impl AsyncRead + Unpin,
+) -> std::io::Result<Vec<u8>> {
+    let mut content = Vec::new();
+    output.read_to_end(&mut content).await?;
+    Ok(content)
 }
 
 fn interpolate_environment(value: &str, environment: &BTreeMap<String, String>) -> Result<String> {
@@ -2559,6 +2650,72 @@ mod tests {
         );
         // SAFETY: this process-unique variable is no longer used.
         unsafe { env::remove_var("URI_AGENT_CONFIG_TEST_VALUE") };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn config_commands_cannot_read_stdin_or_extra_descriptors() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().unwrap();
+        let inherited = std::fs::File::create(directory.path().join("inherited")).unwrap();
+        let descriptor = inherited.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        let command = format!(
+            "if read value; then printf stdin; elif [ -e /proc/self/fd/{descriptor} ]; then printf fd; else printf isolated; fi"
+        );
+
+        let output = execute_config_command(&command, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let restored = unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags) };
+
+        assert_eq!(restored, 0);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"isolated");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_command_timeout_terminates_background_descendants_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("leaked");
+        let command = format!("sleep 0.2; printf leaked > '{}'", marker.display());
+
+        let output = execute_config_command(&command, Duration::from_millis(30))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(output.is_none());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_config_command_terminates_lingering_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("leaked");
+        let command = format!(
+            "printf secret; (sleep 0.2; printf leaked > '{}') &",
+            marker.display()
+        );
+
+        let output = execute_config_command(&command, Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"secret");
+        assert!(!marker.exists());
     }
 
     #[test]

@@ -313,7 +313,7 @@ Foreground and background commands share one execution deadline. `timeout` is an
 exec("bash://run?timeout=120", "cargo test")
 ```
 
-The deadline is unchanged when an operation moves to the background. Timing out produces a failed task for background work or a direct `exec` error for foreground work, and terminates the process tree. Interrupting a shell tool call before automatic background conversion cancels its process rather than leaving detached work behind. Shell help tells the model not to create another background layer inside the command.
+The deadline is unchanged when an operation moves to the background. Timing out produces a failed task for background work or a direct `exec` error for foreground work, and terminates the process tree. Interrupting a shell tool call before automatic background conversion cancels its process rather than leaving detached work behind. When the root shell exits, URI Agent drains ready output briefly and terminates descendants that remain in the execution boundary instead of letting inherited output handles keep them alive. Shell help tells the model not to create another background layer inside the command.
 
 The shared `tasks` protocol covers work from every protocol:
 
@@ -347,7 +347,7 @@ a summary that already presents it suppresses the duplicate notification.
 Notifications are delivered in batches of at most 10 and approximately 16,000
 output characters.
 
-Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree, not only the Rust future that waits for it.
+Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree and reap the root process before the task reaches its terminal state, rather than only dropping the Rust future that waits for it.
 
 ## Complete output preservation
 

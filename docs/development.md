@@ -47,6 +47,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
 | `src/builtins/` | Built-in project-instruction, embedded-documentation, file, grep, session archive, HTTPS, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific HTTPS internals |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, and model-tool, protocol, command, generic panel, status, and composer completion registration |
+| `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
 | `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
 | `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol and model-tool routing, trusted permissions, and atomic reload |
 | `sdk/` | Rust guest ABI types, export macro, and built-in protocol host calls |
@@ -112,7 +113,7 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - Use a managed task only when an operation necessarily runs long enough that keeping the tool call open is inappropriate, or when the caller explicitly requests background execution.
 - Managed task acceptance is not completion. Status, latest output, final content, and cancellation remain available through the unified `tasks` protocol.
 - URI syntax belongs to its protocol; the registry must not interpret protocol-specific options.
-- Shell cancellation terminates child processes, not only the parent future.
+- Shell cancellation terminates child processes, waits for root-process cleanup, and only then settles the managed task.
 - File writes remain atomic. Exact replacement rejects missing and ambiguous matches.
 - Patch application preflights the complete in-memory plan before writing and
   rolls back every affected file after a commit failure.

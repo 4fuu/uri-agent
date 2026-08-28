@@ -1,4 +1,5 @@
 use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, PluginRegistry};
+use crate::process::{PWSH_STDIN_BOOTSTRAP, ProcessTree};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use crate::task::{PromoteBackground, TaskManager, TaskRecord, TaskStatus};
@@ -14,7 +15,6 @@ use tokio::process::Command;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
-const PWSH_SOURCE_BOOTSTRAP: &str = "$__uri_agent_source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($__uri_agent_source))";
 const PWSH_UTF8_PREFIX: &str = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ";
 const PWSH_EXIT_EPILOGUE: &str = "\n; $__uri_agent_ok = $?; $__uri_agent_native = $global:LASTEXITCODE; if ($__uri_agent_ok) { $global:__uri_agent_exit_code = 0 } elseif ($null -ne $__uri_agent_native -and $__uri_agent_native -ne 0) { $global:__uri_agent_exit_code = $__uri_agent_native } else { $global:__uri_agent_exit_code = 1 }";
 const PWSH_WINDOWS_WARNING: &str =
@@ -51,9 +51,11 @@ and `timeout=0` disables the timeout:
 exec("bash://run?timeout=120", "cargo test")
 ```
 
-You MUST NOT add another background layer inside the command. Background task
-status, output, and cancellation use the unified `tasks://` protocol.
-Completion is delivered automatically, so you MUST NOT poll.
+You MUST NOT add another background layer inside the command. Child processes
+remain owned by this execution and are terminated when the root shell exits or
+the task times out or is cancelled. Background task status, output, and
+cancellation use the unified `tasks://` protocol. Completion is delivered
+automatically, so you MUST NOT poll.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -98,9 +100,11 @@ Foreground and background commands share one execution timeout. `timeout` is
 an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
 and `timeout=0` disables the timeout.
 
-You MUST NOT add another background layer inside the command. Background task
-status, output, and cancellation use the unified `tasks://` protocol.
-Completion is delivered automatically, so you MUST NOT poll.
+You MUST NOT add another background layer inside the command. Child processes
+remain owned by this execution and are terminated when the root shell exits or
+the task times out or is cancelled. Background task status, output, and
+cancellation use the unified `tasks://` protocol. Completion is delivered
+automatically, so you MUST NOT poll.
 
 PowerShell source and plain-text output use UTF-8. Command success follows the
 final PowerShell or native command, and native exit codes are preserved.
@@ -113,11 +117,6 @@ identified by `stderr:`, and both streams are labeled when both exist. A
 successful command with no output returns `(no output)`. Failures retain the
 exit code or timeout and any output observed before termination.
 "#;
-
-struct ProcessTreeGuard {
-    pid: u32,
-    armed: bool,
-}
 
 struct ForegroundTaskGuard {
     tasks: TaskManager,
@@ -166,22 +165,10 @@ struct ShellOptions {
     timeout: Option<Duration>,
 }
 
-impl ProcessTreeGuard {
-    fn new(pid: u32) -> Self {
-        Self { pid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            terminate_process_tree(self.pid);
-        }
-    }
+struct ExecutionControl<'a> {
+    timeout: Option<Duration>,
+    progress: Option<(&'a TaskManager, &'a str)>,
+    cancellation: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -394,16 +381,19 @@ impl ShellProtocol {
         let progress_tasks = tasks.clone();
         let progress_id = id.clone();
         tasks
-            .spawn(record, async move {
+            .spawn_with_cancellation(record, move |cancellation| async move {
                 let environment = environment.snapshot().await;
-                execute(
+                execute_with_cancellation(
                     &protocol,
                     &executable,
                     &cwd,
                     &command,
                     &environment,
-                    options.timeout,
-                    Some((&progress_tasks, &progress_id)),
+                    ExecutionControl {
+                        timeout: options.timeout,
+                        progress: Some((&progress_tasks, &progress_id)),
+                        cancellation,
+                    },
                 )
                 .await
             })
@@ -545,6 +535,7 @@ fn encode_pwsh_script(script: &str) -> String {
     BASE64.encode(source)
 }
 
+#[cfg(test)]
 async fn execute(
     protocol: &str,
     executable: &Path,
@@ -554,6 +545,34 @@ async fn execute(
     timeout: Option<Duration>,
     progress: Option<(&TaskManager, &str)>,
 ) -> Result<Vec<u8>> {
+    execute_with_cancellation(
+        protocol,
+        executable,
+        cwd,
+        script,
+        environment,
+        ExecutionControl {
+            timeout,
+            progress,
+            cancellation: CancellationToken::new(),
+        },
+    )
+    .await
+}
+
+async fn execute_with_cancellation(
+    protocol: &str,
+    executable: &Path,
+    cwd: &Path,
+    script: &str,
+    environment: &BTreeMap<String, String>,
+    control: ExecutionControl<'_>,
+) -> Result<Vec<u8>> {
+    let ExecutionControl {
+        timeout,
+        progress,
+        cancellation,
+    } = control;
     let deadline = timeout
         .map(|timeout| {
             Instant::now()
@@ -571,46 +590,54 @@ async fn execute(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            PWSH_SOURCE_BOOTSTRAP,
+            PWSH_STDIN_BOOTSTRAP,
         ]);
         encode_pwsh_script(script)
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().process_group(0);
-    }
-    let mut child = command
+    command
         .envs(environment)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut process_tree = ProcessTreeGuard::new(
-        child
-            .id()
-            .ok_or_else(|| anyhow!("failed to get shell process ID"))?,
-    );
+        .stderr(Stdio::piped());
+    let (mut child, process_tree) = ProcessTree::spawn(&mut command)?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("failed to open shell stdin"))?;
-    if let Some(deadline) = deadline {
-        match time::timeout_at(deadline, stdin.write_all(input.as_bytes())).await {
-            Ok(result) => result?,
-            Err(_) => {
-                bail!(
-                    "Command timed out after {}s.",
-                    timeout
-                        .expect("a deadline is only present when a timeout is configured")
-                        .as_secs()
-                )
-            }
+    enum InputWrite {
+        Complete(std::io::Result<()>),
+        TimedOut,
+        Cancelled,
+    }
+    let write_result = {
+        let write_deadline = time::sleep_until(
+            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
+        );
+        let write = stdin.write_all(input.as_bytes());
+        tokio::pin!(write_deadline);
+        tokio::pin!(write);
+        tokio::select! {
+            biased;
+            _ = &mut write_deadline, if timeout.is_some() => InputWrite::TimedOut,
+            _ = cancellation.cancelled() => InputWrite::Cancelled,
+            result = &mut write => InputWrite::Complete(result),
         }
-    } else {
-        stdin.write_all(input.as_bytes()).await?;
+    };
+    if !matches!(&write_result, InputWrite::Complete(Ok(()))) {
+        drop(stdin);
+        process_tree.terminate_and_wait(&mut child).await?;
+        match write_result {
+            InputWrite::TimedOut => bail!(
+                "Command timed out after {}s.",
+                timeout
+                    .expect("a write timeout requires a configured timeout")
+                    .as_secs()
+            ),
+            InputWrite::Cancelled => bail!("shell command was cancelled"),
+            InputWrite::Complete(Err(error)) => return Err(error.into()),
+            InputWrite::Complete(Ok(())) => unreachable!("successful writes returned above"),
+        }
     }
     drop(stdin);
 
@@ -632,6 +659,7 @@ async fn execute(
     let mut stderr_buffer = [0_u8; 8192];
     let mut status = None;
     let mut timed_out = false;
+    let mut cancelled = false;
     let output_idle = time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
     let deadline = time::sleep_until(
         deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
@@ -648,6 +676,10 @@ async fn execute(
             biased;
             _ = &mut deadline, if timeout.is_some() => {
                 timed_out = true;
+                break;
+            }
+            _ = cancellation.cancelled() => {
+                cancelled = true;
                 break;
             }
             result = child.wait(), if status.is_none() => {
@@ -702,7 +734,11 @@ async fn execute(
         }
     }
 
-    if timed_out {
+    if timed_out || cancelled {
+        process_tree.terminate_and_wait(&mut child).await?;
+        if cancelled {
+            bail!("shell command was cancelled");
+        }
         let mut result = format!(
             "Command timed out after {}s.",
             timeout
@@ -714,7 +750,7 @@ async fn execute(
         return Err(anyhow!(String::from_utf8_lossy(&result).into_owned()));
     }
     let status = status.ok_or_else(|| anyhow!("shell process exited without a status"))?;
-    process_tree.disarm();
+    process_tree.terminate();
     if status.success() {
         let mut result = Vec::new();
         append_process_output(&mut result, &stdout_content, &stderr_content, true);
@@ -757,29 +793,6 @@ fn append_process_output(result: &mut Vec<u8>, stdout: &[u8], stderr: &[u8], emp
         (true, true) => unreachable!("empty streams returned above"),
     }
 }
-
-#[cfg(unix)]
-fn terminate_process_tree(pid: u32) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    // SAFETY: kill only reads the process-group ID, and a negative ID targets
-    // the group created for this shell immediately before it was spawned.
-    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-}
-
-#[cfg(windows)]
-fn terminate_process_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_process_tree(_pid: u32) {}
 
 fn find_executable(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
@@ -869,6 +882,7 @@ mod tests {
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
+        assert!(PWSH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
         assert!(PWSH_HELP.contains("MUST NOT poll"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
@@ -877,6 +891,7 @@ mod tests {
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
+        assert!(BASH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(BASH_HELP.contains("unified `tasks://` protocol"));
         assert!(BASH_HELP.contains("MUST NOT poll"));
         assert!(!BASH_HELP.contains("?wait="));
@@ -983,7 +998,7 @@ mod tests {
         assert!(decoded.contains("Write-Output '中文 ✓' # trailing comment\n; "));
         assert!(decoded.contains("$__uri_agent_native = $global:LASTEXITCODE"));
         assert!(decoded.contains("} | Out-Default\nexit $global:__uri_agent_exit_code"));
-        assert!(PWSH_SOURCE_BOOTSTRAP.is_ascii());
+        assert!(PWSH_STDIN_BOOTSTRAP.is_ascii());
     }
 
     #[test]
@@ -1261,24 +1276,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn shell_completion_does_not_wait_for_quiet_inherited_output_handles() {
+    async fn shell_completion_terminates_quiet_descendants_after_parent_exit() {
         let directory = tempfile::tempdir().unwrap();
+        let leaked_path = directory.path().join("leaked");
         let executable = find_executable("bash").unwrap();
         let started = Instant::now();
+        let command = format!(
+            "printf finished; (sleep 0.2; printf leaked > '{}') &",
+            leaked_path.display()
+        );
         let output = execute(
             "bash",
             &executable,
             directory.path(),
-            "printf finished; sleep 2 &",
+            &command,
             &BTreeMap::new(),
             None,
             None,
         )
         .await
         .unwrap();
+        time::sleep(Duration::from_millis(300)).await;
 
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(String::from_utf8(output).unwrap().contains("finished"));
+        assert!(!leaked_path.exists());
     }
 
     #[cfg(unix)]

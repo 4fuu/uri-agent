@@ -353,7 +353,7 @@ API keys and configured header values support pi-style environment expansion. Th
 }
 ```
 
-Command values run when the credential or header is first needed, not while URI Agent starts. They time out after 10 seconds and are cached for the process. On Windows they run through PowerShell; on other platforms they run through `sh -c`.
+Command values run when the credential or header is first needed, not while URI Agent starts. They time out after 10 seconds and are cached for the process. On Windows they run through PowerShell; on other platforms they run through `sh -c`. Standard input is closed, standard output and error are captured, and unrelated inherited file descriptors are closed on Unix. The command and remaining descendants are terminated when the root command exits or the deadline expires; a timeout is returned only after the root process has been reaped.
 
 > [!WARNING]
 > A leading `!` executes with the permissions of URI Agent. Do not load credential or header configuration from an untrusted project.

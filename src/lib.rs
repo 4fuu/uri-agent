@@ -8,6 +8,7 @@ pub mod model;
 pub mod oauth;
 pub mod output;
 pub mod plugin;
+mod process;
 pub mod prompts;
 pub mod protocol;
 pub mod runtime;

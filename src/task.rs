@@ -239,38 +239,50 @@ impl TaskManager {
     where
         F: Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
     {
+        let cancellation = record.cancellation.clone();
+        self.spawn_worker(record, async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => None,
+                result = future => Some(result),
+            }
+        })
+        .await;
+    }
+
+    /// Runs work that observes the supplied token and settles only after its
+    /// cancellation cleanup is complete.
+    pub async fn spawn_with_cancellation<W, F>(&self, record: TaskRecord, work: W)
+    where
+        W: FnOnce(CancellationToken) -> F,
+        F: Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
+    {
+        let cancellation = record.cancellation.clone();
+        let future = work(cancellation.clone());
+        self.spawn_worker(record, async move { Some(future.await) })
+            .await;
+    }
+
+    async fn spawn_worker<F>(&self, record: TaskRecord, future: F)
+    where
+        F: Future<Output = Option<anyhow::Result<Vec<u8>>>> + Send + 'static,
+    {
         let manager = self.clone();
         let id = record.id.clone();
         let worker_id = id.clone();
+        let cancellation = record.cancellation.clone();
         let handle = tokio::spawn(async move {
             manager
                 .set_status(&record.id, TaskStatus::Running, None)
                 .await;
-            let result = tokio::select! {
-                _ = record.cancellation.cancelled() => None,
-                result = future => Some(result),
+            let result = future.await;
+            let (status, content) = match result {
+                None => (TaskStatus::Cancelled, None),
+                Some(Ok(content)) => (TaskStatus::Completed, Some(content)),
+                Some(Err(error)) => (TaskStatus::Failed, Some(error.to_string().into_bytes())),
             };
-            match result {
-                None => {
-                    manager
-                        .set_status(&record.id, TaskStatus::Cancelled, None)
-                        .await
-                }
-                Some(Ok(content)) => {
-                    manager
-                        .set_status(&record.id, TaskStatus::Completed, Some(content))
-                        .await
-                }
-                Some(Err(error)) => {
-                    manager
-                        .set_status(
-                            &record.id,
-                            TaskStatus::Failed,
-                            Some(error.to_string().into_bytes()),
-                        )
-                        .await
-                }
-            }
+            manager
+                .set_status_after_work(&record.id, status, content, &cancellation)
+                .await;
             manager
                 .workers
                 .lock()
@@ -284,6 +296,27 @@ impl TaskManager {
     }
 
     async fn set_status(&self, id: &str, status: TaskStatus, content: Option<Vec<u8>>) {
+        self.set_status_inner(id, status, content, None).await;
+    }
+
+    async fn set_status_after_work(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        content: Option<Vec<u8>>,
+        cancellation: &CancellationToken,
+    ) {
+        self.set_status_inner(id, status, content, Some(cancellation))
+            .await;
+    }
+
+    async fn set_status_inner(
+        &self,
+        id: &str,
+        mut status: TaskStatus,
+        mut content: Option<Vec<u8>>,
+        cancellation: Option<&CancellationToken>,
+    ) {
         let notice = {
             let mut records = self.inner.write().await;
             let Some(record) = records.get_mut(id) else {
@@ -291,6 +324,10 @@ impl TaskManager {
             };
             if record.status.terminal() {
                 return;
+            }
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                status = TaskStatus::Cancelled;
+                content = None;
             }
             record.status = status;
             if let Some(content) = content {
@@ -682,6 +719,72 @@ mod tests {
 
         assert_eq!(record.status, TaskStatus::Cancelled);
         assert_eq!(record.content, b"partial output");
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancellation_settles_after_cleanup() {
+        let tasks = TaskManager::new();
+        let record = tasks
+            .allocate_background("bash", "cancelled")
+            .await
+            .unwrap();
+        let id = record.id.clone();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let work_cleaned = cleaned.clone();
+        tasks
+            .spawn_with_cancellation(record, move |cancellation| async move {
+                cancellation.cancelled().await;
+                time::sleep(Duration::from_millis(20)).await;
+                work_cleaned.store(true, Ordering::Release);
+                anyhow::bail!("cancelled")
+            })
+            .await;
+
+        assert!(tasks.cancel(&id).await);
+        let record = tasks.wait_until_terminal(&id).await.unwrap();
+
+        assert_eq!(record.status, TaskStatus::Cancelled);
+        assert!(cleaned.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn accepted_cooperative_cancellation_wins_the_terminal_commit_race() {
+        let tasks = TaskManager::new();
+        let record = tasks
+            .allocate_background("bash", "racing completion")
+            .await
+            .unwrap();
+        let id = record.id.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let work_release = release.clone();
+        tasks
+            .spawn_with_cancellation(record, move |_cancellation| async move {
+                work_release.notified().await;
+                Ok(b"completed".to_vec())
+            })
+            .await;
+        while tasks.get(&id).await.unwrap().status != TaskStatus::Running {
+            tokio::task::yield_now().await;
+        }
+
+        let records = tasks.inner.write().await;
+        let cancel_started = Arc::new(tokio::sync::Notify::new());
+        let cancelling_started = cancel_started.clone();
+        let cancelling_tasks = tasks.clone();
+        let cancelling_id = id.clone();
+        let cancelling = tokio::spawn(async move {
+            cancelling_started.notify_one();
+            cancelling_tasks.cancel(&cancelling_id).await
+        });
+        cancel_started.notified().await;
+        release.notify_one();
+        tokio::task::yield_now().await;
+        drop(records);
+
+        assert!(cancelling.await.unwrap());
+        let record = tasks.wait_until_terminal(&id).await.unwrap();
+        assert_eq!(record.status, TaskStatus::Cancelled);
+        assert_ne!(record.content, b"completed");
     }
 
     #[tokio::test]
