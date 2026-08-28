@@ -590,9 +590,9 @@ pub(super) fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, spl
     let brand_area = wordmark_box(area);
     let progress = (app.started.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()) * 1.25;
     let mut lines = if splash && progress < 1.0 {
-        animation::wordmark_reveal(app.frame, progress)
+        animation::wordmark_reveal(app.animation_phase, progress)
     } else {
-        animation::wordmark(app.frame)
+        animation::wordmark(app.animation_phase)
     }
     .into_iter()
     .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
@@ -667,11 +667,11 @@ pub(super) fn render_footer(
         _ if show_context_estimate(app) => format!("≈{percent:.1}%"),
         _ => format!("{percent:.1}%"),
     };
-    let progress_frame = if app.busy { app.frame } else { 0 };
+    let progress_phase = if app.busy { app.animation_phase } else { 0.0 };
     let progress = if app.info.context_accuracy == ContextAccuracy::Unknown {
-        animation::progress(progress_frame, 8, 0.0)
+        animation::progress(progress_phase, 8, 0.0)
     } else {
-        animation::progress(progress_frame, 8, percent / 100.0)
+        animation::progress(progress_phase, 8, percent / 100.0)
     };
     let context = single_line_preview(
         &format!(
@@ -822,8 +822,8 @@ pub(super) fn footer_activity(app: &mut App) -> Option<String> {
         .unwrap_or_default();
     Some(format!(
         "{} {activity}{elapsed}  {}{token_rate}",
-        animation::spinner(app.frame),
-        animation::activity(app.frame, 8)
+        animation::spinner(app.animation_phase),
+        animation::activity(app.animation_phase, 8)
     ))
 }
 
@@ -1306,7 +1306,7 @@ pub(super) fn transcript_block_items(
                 |tool| tool.output.is_some(),
             );
             let status = if live {
-                animation::spinner(app.frame).to_string()
+                animation::spinner(app.animation_phase).to_string()
             } else if block.failed {
                 "×".to_string()
             } else if has_result {
@@ -2651,7 +2651,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
     let summary = if app.catalog_refreshing {
         format!(
             "{} refreshing model catalogs",
-            animation::spinner(app.frame)
+            animation::spinner(app.animation_phase)
         )
     } else {
         format!(

@@ -28,12 +28,12 @@ impl AnimationClock {
         }
     }
 
-    fn frame_at(&self, now: Instant) -> usize {
+    fn phase_at(&self, now: Instant) -> f64 {
         let elapsed = self.active
             + self
                 .resumed_at
                 .map_or(Duration::ZERO, |resumed_at| now.duration_since(resumed_at));
-        (elapsed.as_nanos() / LEGACY_ANIMATION_FRAME_DURATION.as_nanos()) as usize
+        elapsed.as_secs_f64() / LEGACY_ANIMATION_FRAME_DURATION.as_secs_f64()
     }
 }
 
@@ -231,7 +231,7 @@ pub(super) async fn run_loop(
         let now = Instant::now();
         animation_clock.set_paused(app.animations_paused(), now);
         if redraw {
-            app.frame = animation_clock.frame_at(now);
+            app.animation_phase = animation_clock.phase_at(now);
             let context = services.runtime.context_usage();
             app.info.context_tokens = context.tokens;
             app.info.context_accuracy = context.accuracy;
@@ -3945,14 +3945,23 @@ mod scheduler_tests {
         let now = Instant::now();
         let mut clock = AnimationClock::new(now);
 
-        assert_eq!(clock.frame_at(now + Duration::from_millis(16)), 0);
-        assert_eq!(clock.frame_at(now + Duration::from_millis(89)), 0);
-        assert_eq!(clock.frame_at(now + Duration::from_millis(90)), 1);
-        assert_eq!(clock.frame_at(now + Duration::from_millis(900)), 10);
+        let presentation_phase = clock.phase_at(now + PRESENTATION_FRAME_DURATION);
+        assert!(presentation_phase > 0.18 && presentation_phase < 0.19);
+        assert_ne!(
+            animation::activity(presentation_phase, 8),
+            animation::activity(0.0, 8)
+        );
+        assert!((clock.phase_at(now + Duration::from_millis(90)) - 1.0).abs() < f64::EPSILON);
+        let full_cycle_phase = clock.phase_at(now + Duration::from_millis(720));
+        assert!((full_cycle_phase - 8.0).abs() < f64::EPSILON);
+        assert_eq!(
+            animation::activity(full_cycle_phase, 8),
+            animation::activity(0.0, 8)
+        );
 
         clock.set_paused(true, now + Duration::from_millis(900));
-        assert_eq!(clock.frame_at(now + Duration::from_secs(2)), 10);
+        assert!((clock.phase_at(now + Duration::from_secs(2)) - 10.0).abs() < f64::EPSILON);
         clock.set_paused(false, now + Duration::from_secs(2));
-        assert_eq!(clock.frame_at(now + Duration::from_millis(2_090)), 11);
+        assert!((clock.phase_at(now + Duration::from_millis(2_090)) - 11.0).abs() < f64::EPSILON);
     }
 }

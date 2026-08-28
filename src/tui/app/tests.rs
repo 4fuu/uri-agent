@@ -960,19 +960,19 @@ fn context_meter_marks_only_idle_estimates_and_animates_only_while_busy() {
             .to_string()
     };
 
-    app.frame = 0;
+    app.animation_phase = 0.0;
     let idle = footer(&mut app);
     assert!(idle.ends_with("≈50.0%/128k"));
-    app.frame = 1;
+    app.animation_phase = 1.0;
     assert_eq!(footer(&mut app), idle);
 
     app.busy = true;
     app.activity = Some(Activity::Thinking);
-    app.frame = 0;
+    app.animation_phase = 0.0;
     let active = footer(&mut app);
     assert!(active.ends_with("50.0%/128k"));
     assert!(!active.contains('≈'));
-    app.frame = 1;
+    app.animation_phase = 1.0;
     assert_ne!(footer(&mut app), active);
 }
 
@@ -4432,7 +4432,7 @@ fn selected_command_description_scrolls_inside_its_single_row() {
         .to_string();
     assert!(initial_row.contains('…'));
 
-    app.frame = MARQUEE_HOLD_FRAMES + 4 * MARQUEE_STEP_FRAMES;
+    app.animation_phase = (MARQUEE_HOLD_FRAMES + 4 * MARQUEE_STEP_FRAMES) as f64;
     let advanced = render_to_string(&mut app, 80, 24);
     let advanced_row = advanced
         .lines()
@@ -5473,7 +5473,7 @@ fn token_rate_follows_the_activity_animation_and_moves_to_the_ready_footer() {
     app.busy = true;
     app.activity = Some(Activity::Thinking);
     app.busy_since = Some(now - Duration::from_secs(1));
-    let animation = animation::activity(app.frame, 8);
+    let animation = animation::activity(app.animation_phase, 8);
     let rendered = render_to_string(&mut app, 100, 24);
     let activity = rendered
         .lines()
@@ -5599,7 +5599,7 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
     app.selected_block = 1;
 
     assert_eq!(app.active_transcript_block(), Some(2));
-    let spinner = animation::spinner(app.frame);
+    let spinner = animation::spinner(app.animation_phase);
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("✓ Read old.rs"));
     assert!(rendered.contains(&format!("{spinner} Read current.rs")));

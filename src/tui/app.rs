@@ -596,7 +596,7 @@ struct App {
     busy: bool,
     activity: Option<Activity>,
     busy_since: Option<Instant>,
-    frame: usize,
+    animation_phase: f64,
     marquee: Option<MarqueeState>,
     transcript_body_width: usize,
     transcript_offset: usize,
@@ -686,7 +686,7 @@ impl App {
             busy: false,
             activity: None,
             busy_since: None,
-            frame: 0,
+            animation_phase: 0.0,
             marquee: None,
             transcript_body_width: 72,
             transcript_offset: 0,
@@ -788,7 +788,9 @@ impl App {
     }
 
     fn marquee_elapsed(&mut self, key: String) -> usize {
-        let frame = self.frame;
+        // Marquee movement is terminal-cell discrete, so it intentionally
+        // keeps the legacy 90 ms step timing while other visuals interpolate.
+        let frame = self.animation_phase.floor().max(0.0) as usize;
         let marquee = self.marquee.get_or_insert_with(|| MarqueeState {
             key: key.clone(),
             started_at_frame: frame,
