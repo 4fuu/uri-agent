@@ -2041,6 +2041,7 @@ mod tests {
         let user_texts = session
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::User { text } => Some(text),
@@ -2195,15 +2196,22 @@ mod tests {
         tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
 
         requests_started.recv().await.unwrap();
-        assert!(session.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::Task {
-                id,
-                status: crate::task::TaskStatus::Completed,
-                output: Some(output),
-                ..
-            } if id == "001" && output == "background result"
-        )));
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::Task {
+                        id,
+                        status: crate::task::TaskStatus::Completed,
+                        output: Some(output),
+                        ..
+                    } if id == "001" && output == "background result"
+                ))
+        );
         let requests = backend.requests.lock().await;
         let history = serde_json::to_string(&requests[0].history).unwrap();
         assert!(history.contains("Terminal background task results"));
@@ -2214,6 +2222,7 @@ mod tests {
             !session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::User { .. }))
         );
@@ -2269,6 +2278,7 @@ mod tests {
         let user_messages = session
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::User { text } => Some(text),
@@ -2386,10 +2396,17 @@ mod tests {
         runtime.run_turn("keep working".into()).await.unwrap();
 
         assert_eq!(backend.requests.lock().await.len(), 34);
-        assert!(session.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::AssistantText { text } if text == "finished after 33 tool rounds"
-        )));
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::AssistantText { text } if text == "finished after 33 tool rounds"
+                ))
+        );
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
@@ -2425,10 +2442,17 @@ mod tests {
                 .contains("tool_call_loop_detected")
         }));
         drop(requests);
-        assert!(!session.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::User { text } if text.contains("tool_call_loop_detected")
-        )));
+        assert!(
+            !session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::User { text } if text.contains("tool_call_loop_detected")
+                ))
+        );
 
         drop(runtime);
         drop(session);
@@ -2511,6 +2535,7 @@ mod tests {
         let user_messages = session
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::User { text } => Some(text),
@@ -3079,7 +3104,7 @@ mod tests {
 
         assert!(runtime.run_turn("hello".to_string()).await.is_err());
         assert!(session.model_history().await.is_empty());
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(
             !events
                 .iter()
@@ -3183,7 +3208,7 @@ mod tests {
 
         runtime.run_turn("Read the help".to_string()).await.unwrap();
 
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             EventKind::ToolResult { name, output, failed: false, .. }
@@ -3294,7 +3319,7 @@ mod tests {
         runtime.run_turn("skip help".into()).await.unwrap();
 
         let expected = "Read \"blocking://help\" with an empty body before using this protocol.";
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             EventKind::ToolResult {
@@ -3395,7 +3420,7 @@ mod tests {
 
         runtime.compact().await.unwrap();
 
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             EventKind::Compaction { summary, tokens_before, .. }
@@ -3494,6 +3519,7 @@ mod tests {
             session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::Compaction { manual: true, .. }))
         );
@@ -3562,6 +3588,7 @@ mod tests {
             session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::Compaction { .. }))
         );
@@ -3629,11 +3656,18 @@ mod tests {
         assert!(requests[1].tools.is_empty());
         assert!(!requests[2].tools.is_empty());
         drop(requests);
-        assert!(session.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::ModelRetry { attempt: 1, max_retries: 5, reason, .. }
-                if reason.contains("server error")
-        )));
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::ModelRetry { attempt: 1, max_retries: 5, reason, .. }
+                        if reason.contains("server error")
+                ))
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -3693,14 +3727,21 @@ mod tests {
         runtime.run_turn("current task".into()).await.unwrap();
 
         assert_eq!(backend.requests.lock().await.len(), 3);
-        assert!(session.snapshot().await.iter().any(|event| matches!(
-            event.kind,
-            EventKind::ModelRetry {
-                attempt: 1,
-                max_retries: 4,
-                ..
-            }
-        )));
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    EventKind::ModelRetry {
+                        attempt: 1,
+                        max_retries: 4,
+                        ..
+                    }
+                ))
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -3795,6 +3836,7 @@ mod tests {
             session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::Compaction { .. }))
         );
@@ -3879,6 +3921,7 @@ mod tests {
         let retries = session
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::ModelRetry {
@@ -3920,6 +3963,7 @@ mod tests {
             session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .filter(|event| matches!(event.kind, EventKind::ModelRetry { .. }))
                 .count(),
@@ -3963,6 +4007,7 @@ mod tests {
         let retries = session
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::ModelRetry {
@@ -3998,6 +4043,7 @@ mod tests {
             !session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .any(|event| matches!(event.kind, EventKind::ModelRetry { .. }))
         );
@@ -4023,6 +4069,7 @@ mod tests {
                 if session
                     .snapshot()
                     .await
+                    .unwrap()
                     .iter()
                     .any(|event| matches!(event.kind, EventKind::ModelRetry { .. }))
                 {
@@ -4043,10 +4090,17 @@ mod tests {
         .await
         .expect("user interruption should cancel retry backoff promptly");
 
-        assert!(session.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::Error { text } if text == TURN_INTERRUPTED_BY_USER
-        )));
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::Error { text } if text == TURN_INTERRUPTED_BY_USER
+                ))
+        );
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
@@ -4113,13 +4167,19 @@ mod tests {
             session
                 .snapshot()
                 .await
+                .unwrap()
                 .iter()
                 .filter(|event| matches!(event.kind, EventKind::Compaction { .. }))
                 .count(),
             1
         );
         assert!(matches!(
-            session.snapshot().await.last().map(|event| &event.kind),
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .last()
+                .map(|event| &event.kind),
             Some(EventKind::TurnFinished)
         ));
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -4172,7 +4232,7 @@ mod tests {
 
         assert!(format!("{error:#}").contains("prompt is too long"));
         assert_eq!(backend.requests.lock().await.len(), 3);
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(matches!(
             events.last().map(|event| &event.kind),
             Some(EventKind::TurnFinished)
@@ -4206,7 +4266,7 @@ mod tests {
         .expect("user interruption should cancel the model request promptly");
         assert!(!runtime.interrupt_turn().await);
 
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(matches!(
             events.last().map(|event| &event.kind),
             Some(EventKind::TurnFinished)
@@ -4284,6 +4344,7 @@ mod tests {
         let failed_results = session
             .snapshot()
             .await
+            .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
                 EventKind::ToolResult {
@@ -4352,7 +4413,7 @@ mod tests {
             .await
             .expect("shutdown should cancel the model request promptly");
 
-        let events = session.snapshot().await;
+        let events = session.snapshot().await.unwrap();
         assert!(matches!(
             events.last().map(|event| &event.kind),
             Some(EventKind::TurnFinished)
@@ -4361,6 +4422,134 @@ mod tests {
             &event.kind,
             EventKind::Error { text } if text == TURN_INTERRUPTED_BY_SHUTDOWN
         )));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn next_model_request_is_identical_after_checkpointed_reopen() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend_before = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("unused")],
+                Some(fake_usage()),
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let (runtime_before, session, output_directory) = test_runtime(
+            workspace.path(),
+            backend_before.clone(),
+            ModelLimits::default(),
+        )
+        .await;
+        session
+            .append_batch(vec![
+                EventKind::User {
+                    text: "question".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::user("question"),
+                },
+                EventKind::Usage {
+                    input: 20,
+                    output: 5,
+                    reasoning: 1,
+                    cache_read: 2,
+                    cache_write: 0,
+                    cost: 0.0,
+                    total: 27,
+                    context: true,
+                    provider: "fake".into(),
+                    model: "fake-model".into(),
+                },
+                EventKind::ModelMessage {
+                    message: Message::assistant("answer"),
+                },
+            ])
+            .await
+            .unwrap();
+        session
+            .append_compaction(
+                "summary".into(),
+                27,
+                vec![Message::user("summary"), Message::assistant("answer")],
+                false,
+            )
+            .await
+            .unwrap();
+        session
+            .append(EventKind::ModelMessage {
+                message: Message::user("tail"),
+            })
+            .await
+            .unwrap();
+
+        let (_cancel_tx, mut cancel) = watch::channel(None);
+        runtime_before
+            .complete_once(backend_before.as_ref(), &mut cancel)
+            .await
+            .unwrap();
+        let request_before = backend_before.requests.lock().await[0].clone();
+        let session_id = session.id().to_string();
+        drop(runtime_before);
+        drop(session);
+
+        let reopened = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "different-default",
+            "different-model",
+            SessionContext {
+                system_prompt: "changed system".into(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let backend_after = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("unused")],
+                Some(fake_usage()),
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let frozen_system = reopened.context().await.system_prompt;
+        let runtime_after = AgentRuntime::new(
+            Some(backend_after.clone()),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
+            reopened,
+            frozen_system,
+            ModelLimits::default(),
+        );
+        let (_cancel_tx, mut cancel) = watch::channel(None);
+        runtime_after
+            .complete_once(backend_after.as_ref(), &mut cancel)
+            .await
+            .unwrap();
+        let request_after = backend_after.requests.lock().await[0].clone();
+
+        assert_eq!(request_after.system, request_before.system);
+        assert_eq!(request_after.history, request_before.history);
+        assert_eq!(
+            serde_json::to_value(&request_after.tools).unwrap(),
+            serde_json::to_value(&request_before.tools).unwrap()
+        );
+        assert_eq!(
+            request_after.estimated_context,
+            request_before.estimated_context
+        );
+        assert_eq!(
+            request_after.max_output_tokens,
+            request_before.max_output_tokens
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -4384,7 +4573,12 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if matches!(
-                    session.snapshot().await.last().map(|event| &event.kind),
+                    session
+                        .snapshot()
+                        .await
+                        .unwrap()
+                        .last()
+                        .map(|event| &event.kind),
                     Some(EventKind::TurnFinished)
                 ) {
                     break;
@@ -4394,10 +4588,17 @@ mod tests {
         })
         .await
         .expect("the detached turn should finish after the old surface is gone");
-        assert!(session.snapshot().await.iter().any(|event| matches!(
-            &event.kind,
-            EventKind::AssistantText { text } if text == "released"
-        )));
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::AssistantText { text } if text == "released"
+                ))
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 }

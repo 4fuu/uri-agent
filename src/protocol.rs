@@ -259,6 +259,10 @@ impl ProtocolRegistry {
         self.help_read.lock().await.extend(restored);
     }
 
+    pub async fn restore_help_read_names(&self, protocols: HashSet<String>) {
+        self.help_read.lock().await.extend(protocols);
+    }
+
     async fn dispatch_read(
         &self,
         uri: &str,

@@ -590,9 +590,9 @@ pub(super) fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, spl
     let brand_area = wordmark_box(area);
     let progress = (app.started.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()) * 1.25;
     let mut lines = if splash && progress < 1.0 {
-        animation::wordmark_reveal(app.frame, progress)
+        animation::wordmark_reveal(app.animation_phase, progress)
     } else {
-        animation::wordmark(app.frame)
+        animation::wordmark(app.animation_phase)
     }
     .into_iter()
     .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
@@ -667,11 +667,11 @@ pub(super) fn render_footer(
         _ if show_context_estimate(app) => format!("≈{percent:.1}%"),
         _ => format!("{percent:.1}%"),
     };
-    let progress_frame = if app.busy { app.frame } else { 0 };
+    let progress_phase = if app.busy { app.animation_phase } else { 0.0 };
     let progress = if app.info.context_accuracy == ContextAccuracy::Unknown {
-        animation::progress(progress_frame, 8, 0.0)
+        animation::progress(progress_phase, 8, 0.0)
     } else {
-        animation::progress(progress_frame, 8, percent / 100.0)
+        animation::progress(progress_phase, 8, percent / 100.0)
     };
     let context = single_line_preview(
         &format!(
@@ -822,8 +822,8 @@ pub(super) fn footer_activity(app: &mut App) -> Option<String> {
         .unwrap_or_default();
     Some(format!(
         "{} {activity}{elapsed}  {}{token_rate}",
-        animation::spinner(app.frame),
-        animation::activity(app.frame, 8)
+        animation::spinner(app.animation_phase),
+        animation::activity(app.animation_phase, 8)
     ))
 }
 
@@ -946,71 +946,21 @@ pub(super) fn render_transcript(
     let message_width = area.width.saturating_sub(2).max(1) as usize;
     let process_width = message_width.saturating_sub(2).max(1);
     app.transcript_body_width = process_width;
-    let mut items = Vec::new();
-    let mut row_separators = Vec::new();
-    let mut block_for_row = Vec::new();
-    let mut user_surface_for_row = Vec::new();
-    let mut block_rows = vec![None; app.blocks.len()];
     let active_block = app.active_transcript_block();
-    let collapsed_processes = app.collapsed_processes();
-    let mut previous_visible = None;
-    for (index, block) in app.blocks.iter().enumerate() {
-        if block
-            .parent_process
-            .is_some_and(|process| collapsed_processes.contains(&process))
-        {
-            continue;
-        }
-        if previous_visible.is_some_and(|(previous, previous_turn_result)| {
-            transcript_needs_gap(
-                previous,
-                previous_turn_result,
-                block.kind,
-                block.turn_result,
-            )
-        }) {
-            items.push(ListItem::new(Line::default()).style(Style::default().bg(BG)));
-            row_separators.push(TextRowSeparator::Newline);
-            block_for_row.push(None);
-            user_surface_for_row.push(false);
-        }
-        if block.kind == BlockKind::User {
-            items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
-            row_separators.push(TextRowSeparator::Newline);
-            block_for_row.push(None);
-            user_surface_for_row.push(true);
-        }
-        let first = items.len();
-        for (item, separator) in transcript_block_items(
-            block,
-            index == app.selected_block,
-            Some(index) == active_block,
-            message_width,
-            process_width,
-            app,
-        ) {
-            items.push(item);
-            row_separators.push(separator);
-            block_for_row.push(Some(index));
-            user_surface_for_row.push(block.kind == BlockKind::User);
-        }
-        block_rows[index] = Some((first, items.len().saturating_sub(1)));
-        if block.kind == BlockKind::User {
-            items.push(ListItem::new(Line::default()).style(Style::default().bg(USER_SURFACE)));
-            row_separators.push(TextRowSeparator::Newline);
-            block_for_row.push(None);
-            user_surface_for_row.push(true);
-        }
-        previous_visible = Some((block.kind, block.turn_result));
-    }
-    app.transcript_rows = items.len();
+    rebuild_transcript_layout(app, message_width, process_width, active_block);
+    app.transcript_rows = app.transcript_layout.rows;
     app.transcript_height = area.height as usize;
     let live_tail = transcript_live_tail(app.transcript_rows, app.transcript_height);
     let reading_end = transcript_reading_end(app.transcript_rows, app.transcript_height);
     if app.transcript_follow_tail {
         app.transcript_offset = live_tail;
     } else if app.transcript_center_selected
-        && let Some((first, _)) = block_rows.get(app.selected_block).copied().flatten()
+        && let Some(first) = app
+            .transcript_layout
+            .blocks
+            .iter()
+            .find(|block| block.index == app.selected_block)
+            .map(|block| block.block_start)
         && (first < app.transcript_offset
             || first >= app.transcript_offset.saturating_add(app.transcript_height))
     {
@@ -1022,16 +972,15 @@ pub(super) fn render_transcript(
     }
     app.transcript_center_selected = false;
     let offset = app.transcript_offset;
-    let visible = items
-        .into_iter()
-        .skip(offset)
-        .take(app.transcript_height)
-        .collect::<Vec<_>>();
-    let mut visible_row_separators = row_separators
-        .into_iter()
-        .skip(offset)
-        .take(app.transcript_height)
-        .collect::<Vec<_>>();
+    let (visible, mut visible_row_separators, block_for_row, user_surface_for_row) =
+        materialize_transcript_viewport(
+            app,
+            offset,
+            app.transcript_height,
+            message_width,
+            process_width,
+            active_block,
+        );
     visible_row_separators.resize(app.transcript_height, TextRowSeparator::Newline);
     frame.render_widget(
         List::new(visible).block(Block::new().padding(Padding::horizontal(1))),
@@ -1043,12 +992,7 @@ pub(super) fn render_transcript(
         horizontal: 1,
         vertical: 0,
     });
-    for (row, user_surface) in user_surface_for_row
-        .into_iter()
-        .skip(offset)
-        .take(app.transcript_height)
-        .enumerate()
-    {
+    for (row, user_surface) in user_surface_for_row.into_iter().enumerate() {
         if user_surface {
             frame.buffer_mut().set_style(
                 Rect::new(content_area.x, area.y + row as u16, content_area.width, 1),
@@ -1056,8 +1000,8 @@ pub(super) fn render_transcript(
             );
         }
     }
-    for (row, index) in block_for_row.into_iter().enumerate().skip(offset) {
-        let y = area.y.saturating_add((row - offset) as u16);
+    for (row, index) in block_for_row.into_iter().enumerate() {
+        let y = area.y.saturating_add(row as u16);
         if y >= area.bottom() {
             break;
         }
@@ -1069,6 +1013,224 @@ pub(super) fn render_transcript(
         }
     }
     visible_row_separators
+}
+
+pub(super) fn rebuild_transcript_layout(
+    app: &mut App,
+    message_width: usize,
+    process_width: usize,
+    active_block: Option<usize>,
+) {
+    #[cfg(test)]
+    {
+        app.transcript_render_stats = TranscriptRenderStats::default();
+    }
+    if app.transcript_layout.message_width != message_width
+        || app.transcript_layout.process_width != process_width
+    {
+        app.transcript_layout.message_width = message_width;
+        app.transcript_layout.process_width = process_width;
+        app.transcript_layout.blocks.clear();
+        app.transcript_layout.rows = 0;
+        app.transcript_layout.dirty_from = Some(0);
+    }
+    let Some(dirty_from) = app.transcript_layout.dirty_from.take() else {
+        return;
+    };
+
+    let keep = app
+        .transcript_layout
+        .blocks
+        .partition_point(|block| block.index < dirty_from);
+    app.transcript_layout.blocks.truncate(keep);
+    let mut row = app.transcript_layout.blocks.last().map_or(0, |block| {
+        block.block_start + block.block_rows + usize::from(block.user_padding)
+    });
+    let mut previous_visible = app.transcript_layout.blocks.last().map(|entry| {
+        let block = &app.blocks[entry.index];
+        (block.kind, block.turn_result)
+    });
+    let collapsed_processes = app.collapsed_processes();
+    for index in dirty_from..app.blocks.len() {
+        let block = &app.blocks[index];
+        if block
+            .parent_process
+            .is_some_and(|process| collapsed_processes.contains(&process))
+        {
+            continue;
+        }
+        let start = row;
+        if previous_visible.is_some_and(|(previous, previous_turn_result)| {
+            transcript_needs_gap(
+                previous,
+                previous_turn_result,
+                block.kind,
+                block.turn_result,
+            )
+        }) {
+            row += 1;
+        }
+        let user_padding = block.kind == BlockKind::User;
+        row += usize::from(user_padding);
+        let block_start = row;
+        let (block_rows, rendered) = cached_transcript_block_row_count(
+            block,
+            index == app.selected_block,
+            Some(index) == active_block,
+            message_width,
+            process_width,
+            app,
+        );
+        #[cfg(test)]
+        if rendered {
+            app.transcript_render_stats.rendered_blocks += 1;
+        }
+        #[cfg(not(test))]
+        let _ = rendered;
+        row += block_rows + usize::from(user_padding);
+        app.transcript_layout.blocks.push(TranscriptLayoutBlock {
+            index,
+            start,
+            block_start,
+            block_rows,
+            user_padding,
+        });
+        previous_visible = Some((block.kind, block.turn_result));
+    }
+    app.transcript_layout.rows = row;
+}
+
+type MaterializedTranscript = (
+    Vec<ListItem<'static>>,
+    Vec<TextRowSeparator>,
+    Vec<Option<usize>>,
+    Vec<bool>,
+);
+
+fn materialize_transcript_viewport(
+    app: &mut App,
+    offset: usize,
+    height: usize,
+    message_width: usize,
+    process_width: usize,
+    active_block: Option<usize>,
+) -> MaterializedTranscript {
+    let end = offset.saturating_add(height);
+    let mut items = Vec::with_capacity(height);
+    let mut separators = Vec::with_capacity(height);
+    let mut block_for_row = Vec::with_capacity(height);
+    let mut user_surface_for_row = Vec::with_capacity(height);
+    let first = app.transcript_layout.blocks.partition_point(|entry| {
+        entry.block_start + entry.block_rows + usize::from(entry.user_padding) <= offset
+    });
+    let entries = app.transcript_layout.blocks[first..]
+        .iter()
+        .take_while(|entry| entry.start < end)
+        .copied()
+        .collect::<Vec<_>>();
+    for entry in entries {
+        let entry_end = entry.block_start + entry.block_rows + usize::from(entry.user_padding);
+        let top_padding_start = entry
+            .block_start
+            .saturating_sub(usize::from(entry.user_padding));
+        append_blank_transcript_rows(
+            entry.start,
+            top_padding_start,
+            offset,
+            end,
+            false,
+            &mut items,
+            &mut separators,
+            &mut block_for_row,
+            &mut user_surface_for_row,
+        );
+        append_blank_transcript_rows(
+            top_padding_start,
+            entry.block_start,
+            offset,
+            end,
+            true,
+            &mut items,
+            &mut separators,
+            &mut block_for_row,
+            &mut user_surface_for_row,
+        );
+        let visible_start = offset
+            .saturating_sub(entry.block_start)
+            .min(entry.block_rows);
+        let visible_end = end.saturating_sub(entry.block_start).min(entry.block_rows);
+        if visible_start < visible_end {
+            let (rows, rendered) = {
+                let block = &app.blocks[entry.index];
+                cached_transcript_block_rows(
+                    block,
+                    entry.index == app.selected_block,
+                    Some(entry.index) == active_block,
+                    message_width,
+                    process_width,
+                    app,
+                    visible_start..visible_end,
+                )
+            };
+            #[cfg(test)]
+            {
+                app.transcript_render_stats.rendered_blocks += usize::from(rendered);
+            }
+            #[cfg(not(test))]
+            let _ = rendered;
+            for (item, separator) in rows {
+                items.push(item);
+                separators.push(separator);
+                block_for_row.push(Some(entry.index));
+                user_surface_for_row.push(entry.user_padding);
+            }
+        }
+        append_blank_transcript_rows(
+            entry.block_start + entry.block_rows,
+            entry_end,
+            offset,
+            end,
+            true,
+            &mut items,
+            &mut separators,
+            &mut block_for_row,
+            &mut user_surface_for_row,
+        );
+    }
+    #[cfg(test)]
+    {
+        app.transcript_render_stats.materialized_rows = items.len();
+    }
+    (items, separators, block_for_row, user_surface_for_row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_blank_transcript_rows(
+    start: usize,
+    end: usize,
+    viewport_start: usize,
+    viewport_end: usize,
+    user_surface: bool,
+    items: &mut Vec<ListItem<'static>>,
+    separators: &mut Vec<TextRowSeparator>,
+    block_for_row: &mut Vec<Option<usize>>,
+    user_surface_for_row: &mut Vec<bool>,
+) {
+    let count = end
+        .min(viewport_end)
+        .saturating_sub(start.max(viewport_start));
+    for _ in 0..count {
+        items.push(
+            ListItem::new(Line::default()).style(Style::default().bg(if user_surface {
+                USER_SURFACE
+            } else {
+                BG
+            })),
+        );
+        separators.push(TextRowSeparator::Newline);
+        block_for_row.push(None);
+        user_surface_for_row.push(user_surface);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1153,6 +1315,113 @@ pub(super) fn transcript_live_tail(rows: usize, height: usize) -> usize {
 
 pub(super) fn transcript_reading_end(rows: usize, height: usize) -> usize {
     rows.saturating_add(height / 2).saturating_sub(height)
+}
+
+fn transcript_block_render_key(
+    block: &DisplayBlock,
+    selected: bool,
+    live: bool,
+    message_width: usize,
+    process_width: usize,
+    app: &App,
+) -> TranscriptBlockRenderKey {
+    let is_message = matches!(block.kind, BlockKind::User | BlockKind::Assistant);
+    let live = live && matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool);
+    TranscriptBlockRenderKey {
+        revision: block.render_revision,
+        message_width,
+        process_width: if block.kind == BlockKind::Assistant {
+            0
+        } else {
+            process_width
+        },
+        expanded: block.expanded,
+        nested: block.parent_process.is_some(),
+        selected: !is_message && selected,
+        live,
+        status: if live && block.kind == BlockKind::Tool {
+            animation::spinner(app.animation_phase).to_string()
+        } else {
+            String::new()
+        },
+        open_hint: if is_message {
+            String::new()
+        } else {
+            app.keymap.key_hint("main", "open").map_or_else(
+                || "right-click opens full".to_string(),
+                |key| format!("{key} or right-click opens full"),
+            )
+        },
+        expand_hint: if is_message {
+            String::new()
+        } else {
+            app.keymap.key_hint("main", "toggle").map_or_else(
+                || "select to expand".to_string(),
+                |key| format!("{key} to expand"),
+            )
+        },
+    }
+}
+
+fn ensure_transcript_block_cache(
+    block: &DisplayBlock,
+    selected: bool,
+    live: bool,
+    message_width: usize,
+    process_width: usize,
+    app: &App,
+) -> bool {
+    let key = transcript_block_render_key(block, selected, live, message_width, process_width, app);
+    if block
+        .render_cache
+        .borrow()
+        .as_ref()
+        .is_some_and(|cache| cache.key == key)
+    {
+        return false;
+    }
+    let rows = transcript_block_items(block, selected, live, message_width, process_width, app);
+    *block.render_cache.borrow_mut() = Some(TranscriptBlockRenderCache { key, rows });
+    true
+}
+
+fn cached_transcript_block_row_count(
+    block: &DisplayBlock,
+    selected: bool,
+    live: bool,
+    message_width: usize,
+    process_width: usize,
+    app: &App,
+) -> (usize, bool) {
+    let rendered =
+        ensure_transcript_block_cache(block, selected, live, message_width, process_width, app);
+    let rows = block
+        .render_cache
+        .borrow()
+        .as_ref()
+        .map_or(0, |cache| cache.rows.len());
+    (rows, rendered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_transcript_block_rows(
+    block: &DisplayBlock,
+    selected: bool,
+    live: bool,
+    message_width: usize,
+    process_width: usize,
+    app: &App,
+    range: std::ops::Range<usize>,
+) -> (Vec<(ListItem<'static>, TextRowSeparator)>, bool) {
+    let rendered =
+        ensure_transcript_block_cache(block, selected, live, message_width, process_width, app);
+    let rows = block
+        .render_cache
+        .borrow()
+        .as_ref()
+        .map(|cache| cache.rows[range].to_vec())
+        .unwrap_or_default();
+    (rows, rendered)
 }
 
 pub(super) fn transcript_block_items(
@@ -1306,7 +1575,7 @@ pub(super) fn transcript_block_items(
                 |tool| tool.output.is_some(),
             );
             let status = if live {
-                animation::spinner(app.frame).to_string()
+                animation::spinner(app.animation_phase).to_string()
             } else if block.failed {
                 "×".to_string()
             } else if has_result {
@@ -2651,7 +2920,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
     let summary = if app.catalog_refreshing {
         format!(
             "{} refreshing model catalogs",
-            animation::spinner(app.frame)
+            animation::spinner(app.animation_phase)
         )
     } else {
         format!(

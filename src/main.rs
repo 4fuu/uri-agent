@@ -226,7 +226,7 @@ async fn run_session(
             session_settings.thinking,
         )
         .await?;
-    let tasks = TaskManager::from_reports(session.task_reports().await);
+    let tasks = TaskManager::from_reports(session.task_reports().await?);
     let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
     wasm_plugins.bind_output(output.clone())?;
     let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
@@ -283,7 +283,7 @@ async fn run_session(
     protocols.set_dynamic_source(Arc::new(skill_source.clone()))?;
     protocols.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
     protocols
-        .restore_help_reads(&session.snapshot().await)
+        .restore_help_read_names(session.successful_protocol_help_reads().await)
         .await;
     let protocols = Arc::new(protocols);
     let model_tools = Arc::new(model_tools);

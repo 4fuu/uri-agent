@@ -26,7 +26,9 @@ use crate::plugin::{
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
-use crate::session::{EventKind, SessionEvent, SessionSummary, SessionUpdate};
+use crate::session::{
+    EventKind, Session, SessionEvent, SessionSummary, SessionTuiState, SessionUpdate,
+};
 use crate::task::{TaskManager, TaskRecord};
 use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -55,6 +57,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use rate::*;
 use render::*;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
@@ -84,7 +87,8 @@ const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-const SMOOTH_SCROLL_FRAME_DURATION: Duration = Duration::from_millis(16);
+const LEGACY_ANIMATION_FRAME_DURATION: Duration = Duration::from_millis(90);
+const PRESENTATION_FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const SCROLL_ROWS: isize = 6;
 const SMOOTH_SCROLL_CATCH_UP_FRAMES: usize = 8;
 const EXPANDED_PREVIEW_LINES: usize = 24;
@@ -95,6 +99,7 @@ const WEB_SEARCH_LOGIN_PROVIDERS: &[&str] = &["parallel", "exa"];
 const IMAGE_TOKEN_PREFIX: &str = "[Image #";
 const IMAGE_MARKER_PREFIX: &str = "[Image #";
 
+#[derive(Clone)]
 pub struct TuiInfo {
     pub cwd: PathBuf,
     pub provider: String,
@@ -132,6 +137,7 @@ enum BlockKind {
 }
 
 struct DisplayBlock {
+    id: u64,
     kind: BlockKind,
     title: String,
     text: String,
@@ -144,6 +150,66 @@ struct DisplayBlock {
     turn_result: bool,
     parent_process: Option<u64>,
     process: Option<ProcessDisplay>,
+    render_revision: u64,
+    render_cache: RefCell<Option<TranscriptBlockRenderCache>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TranscriptBlockRenderKey {
+    revision: u64,
+    message_width: usize,
+    process_width: usize,
+    expanded: bool,
+    nested: bool,
+    selected: bool,
+    live: bool,
+    status: String,
+    open_hint: String,
+    expand_hint: String,
+}
+
+struct TranscriptBlockRenderCache {
+    key: TranscriptBlockRenderKey,
+    rows: Vec<(ListItem<'static>, TextRowSeparator)>,
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptLayoutBlock {
+    index: usize,
+    start: usize,
+    block_start: usize,
+    block_rows: usize,
+    user_padding: bool,
+}
+
+#[derive(Default)]
+struct TranscriptLayoutCache {
+    message_width: usize,
+    process_width: usize,
+    blocks: Vec<TranscriptLayoutBlock>,
+    rows: usize,
+    dirty_from: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptAnchor {
+    block_id: u64,
+    offset_from_block: isize,
+    animation_distance: Option<isize>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TranscriptRenderStats {
+    rendered_blocks: usize,
+    materialized_rows: usize,
+}
+
+impl DisplayBlock {
+    fn invalidate_render(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+        *self.render_cache.get_mut() = None;
+    }
 }
 
 struct ToolDisplay {
@@ -595,7 +661,7 @@ struct App {
     busy: bool,
     activity: Option<Activity>,
     busy_since: Option<Instant>,
-    frame: usize,
+    animation_phase: f64,
     marquee: Option<MarqueeState>,
     transcript_body_width: usize,
     transcript_offset: usize,
@@ -606,12 +672,17 @@ struct App {
     transcript_scrollbar_area: Option<Rect>,
     transcript_scrollbar_drag: Option<TranscriptScrollbarDrag>,
     mouse_scroll_animation: Option<MouseScrollAnimation>,
+    transcript_layout: TranscriptLayoutCache,
+    #[cfg(test)]
+    transcript_render_stats: TranscriptRenderStats,
     started: Instant,
     splash_skipped: bool,
     last_sequence: Option<u64>,
+    oldest_sequence: Option<u64>,
+    history_complete: bool,
     applying_transient: bool,
+    applying_sequence: u64,
     reasoning_folded_during_stream: bool,
-    next_process_id: u64,
     info: TuiInfo,
     flashes: Vec<FlashNotice>,
     model_selector: Option<ModelSelector>,
@@ -685,7 +756,7 @@ impl App {
             busy: false,
             activity: None,
             busy_since: None,
-            frame: 0,
+            animation_phase: 0.0,
             marquee: None,
             transcript_body_width: 72,
             transcript_offset: 0,
@@ -696,12 +767,17 @@ impl App {
             transcript_scrollbar_area: None,
             transcript_scrollbar_drag: None,
             mouse_scroll_animation: None,
+            transcript_layout: TranscriptLayoutCache::default(),
+            #[cfg(test)]
+            transcript_render_stats: TranscriptRenderStats::default(),
             started: Instant::now(),
             splash_skipped: !show_splash,
             last_sequence: None,
+            oldest_sequence: None,
+            history_complete: true,
             applying_transient: false,
+            applying_sequence: 0,
             reasoning_folded_during_stream: false,
-            next_process_id: 0,
             info,
             flashes: Vec::new(),
             model_selector: None,
@@ -758,8 +834,39 @@ impl App {
             || (self.overlay == Some(Overlay::Composer) && self.completions.is_none())
     }
 
+    fn continuous_render_demand(&self) -> bool {
+        self.mouse_scroll_animating()
+            || (!self.animations_paused()
+                && (self.showing_splash()
+                    || self.blocks.is_empty()
+                    || self.busy
+                    || self.marquee.is_some()
+                    || (self.catalog_refreshing && self.overlay == Some(Overlay::Models))))
+    }
+
+    fn next_render_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let flash = self
+            .flashes
+            .iter()
+            .map(|notice| notice.created + flash_duration(&notice.message))
+            .filter(|deadline| *deadline > now)
+            .min();
+        let interrupt = self
+            .last_interrupt_press
+            .as_ref()
+            .filter(|_| self.busy)
+            .map(|(_, at)| *at + DOUBLE_CLICK_INTERVAL);
+        flash
+            .into_iter()
+            .chain(interrupt.filter(|deadline| *deadline > now))
+            .min()
+    }
+
     fn marquee_elapsed(&mut self, key: String) -> usize {
-        let frame = self.frame;
+        // Marquee movement is terminal-cell discrete, so it intentionally
+        // keeps the legacy 90 ms step timing while other visuals interpolate.
+        let frame = self.animation_phase.floor().max(0.0) as usize;
         let marquee = self.marquee.get_or_insert_with(|| MarqueeState {
             key: key.clone(),
             started_at_frame: frame,
@@ -826,6 +933,7 @@ impl App {
         {
             return;
         }
+        self.applying_sequence = event.sequence;
         self.last_sequence = Some(event.sequence);
         if matches!(
             &event.kind,
@@ -908,11 +1016,13 @@ impl App {
                     false,
                     false,
                 );
-                self.blocks.last_mut().unwrap().tool = Some(ToolDisplay {
+                let block = self.blocks.last_mut().unwrap();
+                block.tool = Some(ToolDisplay {
                     name,
                     arguments,
                     output: None,
                 });
+                block.invalidate_render();
             }
             EventKind::ToolResult {
                 call_id,
@@ -921,17 +1031,23 @@ impl App {
                 failed,
                 protocol_help_required,
             } => {
-                if let Some(block) = self
-                    .blocks
-                    .iter_mut()
-                    .rev()
-                    .find(|block| block.call_id.as_deref() == Some(&call_id))
+                if let Some(index) =
+                    self.blocks
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, block)| {
+                            (block.call_id.as_deref() == Some(&call_id)).then_some(index)
+                        })
                 {
+                    let block = &mut self.blocks[index];
                     block.failed = failed;
                     block.protocol_help_required = protocol_help_required;
                     if let Some(tool) = block.tool.as_mut() {
                         tool.output = Some(output.clone());
                     }
+                    block.invalidate_render();
+                    self.invalidate_transcript_layout_from(index);
                 } else {
                     let tool_output = output.clone();
                     self.push(
@@ -955,6 +1071,7 @@ impl App {
                         arguments: serde_json::Value::Null,
                         output: Some(tool_output),
                     });
+                    block.invalidate_render();
                 }
                 self.activity = Some(Activity::Thinking);
             }
@@ -1044,7 +1161,7 @@ impl App {
                 self.busy = false;
                 self.activity = None;
                 self.busy_since = None;
-                self.finish_current_turn();
+                self.finish_current_turn(self.applying_sequence);
             }
         }
         if select_tail {
@@ -1076,7 +1193,11 @@ impl App {
             .blocks
             .iter()
             .any(|block| block.transient && block.kind == BlockKind::Reasoning && !block.expanded);
+        let first_transient = self.blocks.iter().position(|block| block.transient);
         self.blocks.retain(|block| !block.transient);
+        if let Some(index) = first_transient {
+            self.invalidate_transcript_layout_from(index);
+        }
         self.selected_block = self.selected_block.min(self.blocks.len().saturating_sub(1));
     }
 
@@ -1085,12 +1206,16 @@ impl App {
             .blocks
             .last_mut()
             .filter(|block| block.kind == BlockKind::Reasoning)
+            && block.expanded
         {
             block.expanded = false;
+            block.invalidate_render();
+            let index = self.blocks.len().saturating_sub(1);
+            self.invalidate_transcript_layout_from(index);
         }
     }
 
-    fn finish_current_turn(&mut self) {
+    fn finish_current_turn(&mut self, process_id: u64) {
         let turn_start = self
             .blocks
             .iter()
@@ -1106,12 +1231,14 @@ impl App {
             let mut result = self.blocks.remove(index);
             result.expanded = true;
             result.turn_result = true;
+            result.invalidate_render();
             result
         });
         let process_end = self.blocks.len();
         if process_end == turn_start {
             if let Some(result) = result {
                 self.blocks.push(result);
+                self.invalidate_transcript_layout_from(turn_start);
             }
             if selected_was_in_turn {
                 self.selected_block = turn_start;
@@ -1119,17 +1246,17 @@ impl App {
             return;
         }
 
-        let process_id = self.next_process_id;
-        self.next_process_id += 1;
         for block in &mut self.blocks[turn_start..process_end] {
             block.parent_process = Some(process_id);
             if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
                 block.expanded = false;
             }
+            block.invalidate_render();
         }
         self.blocks.insert(
             turn_start,
             DisplayBlock {
+                id: process_id,
                 kind: BlockKind::Process,
                 title: "PROCESS".to_string(),
                 text: String::new(),
@@ -1145,6 +1272,8 @@ impl App {
                     id: process_id,
                     steps: process_end - turn_start,
                 }),
+                render_revision: 0,
+                render_cache: RefCell::new(None),
             },
         );
         if let Some(result) = result {
@@ -1157,6 +1286,7 @@ impl App {
                 turn_start
             };
         }
+        self.invalidate_transcript_layout_from(turn_start);
     }
 
     fn finish_hydration(&mut self) {
@@ -1165,12 +1295,135 @@ impl App {
         self.activity = None;
         self.busy_since = None;
         for block in &mut self.blocks {
-            block.expanded = matches!(
+            let expanded = matches!(
                 block.kind,
                 BlockKind::Assistant | BlockKind::Notice | BlockKind::Error
             );
+            if block.expanded != expanded {
+                block.expanded = expanded;
+                block.invalidate_render();
+            }
         }
+        self.invalidate_transcript_layout_from(0);
         self.sync_composer_chrome();
+    }
+
+    fn restore_session_stats(&mut self, state: &SessionTuiState) {
+        self.usage = UsageTotals {
+            input: state.usage.input,
+            output: state.usage.output,
+            cache_read: state.usage.cache_read,
+            cache_write: state.usage.cache_write,
+            cost: state.usage.cost,
+        };
+        self.last_cache_hit = state.usage.last_cache_hit;
+        self.token_rate.restore_calibration(
+            state.token_calibration.visible_units,
+            state.token_calibration.output_tokens,
+        );
+    }
+
+    fn set_history_range(&mut self, oldest: Option<u64>, complete: bool) {
+        self.oldest_sequence = oldest;
+        self.history_complete = complete;
+    }
+
+    fn prepend_history(&mut self, events: Vec<SessionEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let selected_id = self.blocks.get(self.selected_block).map(|block| block.id);
+        let anchor = self.transcript_anchor();
+        let mut older = App::new(
+            self.protocols.clone(),
+            self.commands.clone(),
+            self.tui.clone(),
+            self.info.clone(),
+            self.keymap.clone(),
+            String::new(),
+            false,
+        );
+        for event in events {
+            older.apply(event);
+        }
+        older.finish_hydration();
+        let mut blocks = older.blocks;
+        blocks.append(&mut self.blocks);
+        self.blocks = blocks;
+        if let Some(selected_id) = selected_id {
+            self.selected_block = self
+                .blocks
+                .iter()
+                .position(|block| block.id == selected_id)
+                .unwrap_or_default();
+        }
+        self.transcript_layout.dirty_from = Some(0);
+        self.hit_regions.clear();
+        if let Some(anchor) = anchor {
+            self.restore_transcript_anchor(anchor);
+        }
+    }
+
+    fn transcript_anchor(&self) -> Option<TranscriptAnchor> {
+        let entry = self.transcript_layout.blocks.iter().find(|entry| {
+            entry.block_start + entry.block_rows + usize::from(entry.user_padding)
+                > self.transcript_offset
+        })?;
+        let target = match self.mouse_scroll_animation {
+            Some(MouseScrollAnimation::Transcript { target, .. }) => Some(target),
+            _ => None,
+        };
+        Some(TranscriptAnchor {
+            block_id: self.blocks[entry.index].id,
+            offset_from_block: self.transcript_offset as isize - entry.block_start as isize,
+            animation_distance: target
+                .map(|target| target as isize - self.transcript_offset as isize),
+        })
+    }
+
+    fn restore_transcript_anchor(&mut self, anchor: TranscriptAnchor) {
+        let message_width = self.transcript_layout.message_width;
+        let process_width = self.transcript_layout.process_width;
+        if message_width == 0 || process_width == 0 {
+            return;
+        }
+        let active_block = self.active_transcript_block();
+        rebuild_transcript_layout(self, message_width, process_width, active_block);
+        self.transcript_rows = self.transcript_layout.rows;
+        let Some(block_index) = self
+            .blocks
+            .iter()
+            .position(|block| block.id == anchor.block_id)
+        else {
+            return;
+        };
+        let Some(block_start) = self
+            .transcript_layout
+            .blocks
+            .iter()
+            .find(|entry| entry.index == block_index)
+            .map(|entry| entry.block_start)
+        else {
+            return;
+        };
+        self.transcript_offset = block_start.saturating_add_signed(anchor.offset_from_block);
+        if let Some(surface) = self
+            .selectable
+            .as_mut()
+            .filter(|surface| surface.overlay.is_none())
+        {
+            surface.scroll_origin = self.transcript_offset;
+        }
+        if let (Some(distance), Some(MouseScrollAnimation::Transcript { target, .. })) = (
+            anchor.animation_distance,
+            self.mouse_scroll_animation.as_mut(),
+        ) {
+            *target = self.transcript_offset.saturating_add_signed(distance);
+        }
+    }
+
+    fn clear_transcript_anchor(&mut self) {
+        self.transcript_center_selected = true;
     }
 
     fn push(
@@ -1182,7 +1435,9 @@ impl App {
         failed: bool,
         expanded: bool,
     ) {
+        let index = self.blocks.len();
         self.blocks.push(DisplayBlock {
+            id: self.applying_sequence,
             kind,
             title: title.to_string(),
             text,
@@ -1195,7 +1450,10 @@ impl App {
             turn_result: false,
             parent_process: None,
             process: None,
+            render_revision: 0,
+            render_cache: RefCell::new(None),
         });
+        self.invalidate_transcript_layout_from(index);
     }
 
     fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String, expanded: bool) {
@@ -1205,9 +1463,20 @@ impl App {
             .filter(|block| block.kind == kind && block.transient == self.applying_transient)
         {
             block.text.push_str(&text);
+            block.invalidate_render();
+            let index = self.blocks.len().saturating_sub(1);
+            self.invalidate_transcript_layout_from(index);
         } else {
             self.push(kind, title, text, None, false, expanded);
         }
+    }
+
+    fn invalidate_transcript_layout_from(&mut self, index: usize) {
+        self.transcript_layout.dirty_from = Some(
+            self.transcript_layout
+                .dirty_from
+                .map_or(index, |dirty| dirty.min(index)),
+        );
     }
 
     fn submit(&mut self) -> Option<(String, Vec<ImageAttachment>)> {
@@ -1657,8 +1926,10 @@ impl App {
         let Some(block) = self.blocks.get_mut(index) else {
             return false;
         };
-        if !matches!(block.kind, BlockKind::User | BlockKind::Assistant) {
+        if !matches!(block.kind, BlockKind::User | BlockKind::Assistant) && !block.expanded {
             block.expanded = true;
+            block.invalidate_render();
+            self.invalidate_transcript_layout_from(index);
         }
         self.expand_parent_process(index);
         self.jump = JumpKind::All;
@@ -1734,13 +2005,16 @@ impl App {
         else {
             return;
         };
-        if let Some(parent) = self.blocks.iter_mut().find(|block| {
+        if let Some(parent_index) = self.blocks.iter().position(|block| {
             block
                 .process
                 .as_ref()
                 .is_some_and(|process| process.id == parent_id)
-        }) {
-            parent.expanded = true;
+        }) && !self.blocks[parent_index].expanded
+        {
+            self.blocks[parent_index].expanded = true;
+            self.blocks[parent_index].invalidate_render();
+            self.invalidate_transcript_layout_from(parent_index);
         }
     }
 
@@ -1752,6 +2026,8 @@ impl App {
             return;
         }
         block.expanded = !block.expanded;
+        block.invalidate_render();
+        self.invalidate_transcript_layout_from(self.selected_block);
         self.transcript_center_selected = true;
     }
 

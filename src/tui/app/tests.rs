@@ -1,8 +1,10 @@
 use super::*;
 use crate::config::ValueSource;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolRequest};
+use crate::session::{SessionContext, SessionModelSettings};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use rig::message::Message;
 use std::collections::BTreeMap;
 
 struct LiveProtocol;
@@ -58,6 +60,36 @@ fn test_app() -> App {
     test_app_with_splash(true)
 }
 
+#[test]
+fn continuous_render_demand_keeps_the_welcome_wordmark_live_but_stops_when_idle() {
+    let mut app = test_app();
+    app.skip_splash();
+    assert!(app.blocks.is_empty());
+    assert!(app.continuous_render_demand());
+
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "settled".to_string(),
+        None,
+        false,
+        true,
+    );
+    assert!(!app.continuous_render_demand());
+
+    app.busy = true;
+    assert!(app.continuous_render_demand());
+
+    app.overlay = Some(Overlay::Composer);
+    assert!(!app.continuous_render_demand());
+
+    app.mouse_scroll_animation = Some(MouseScrollAnimation::Overlay {
+        target: 1,
+        direction: 1,
+    });
+    assert!(app.continuous_render_demand());
+}
+
 fn apply_event(app: &mut App, sequence: u64, kind: EventKind) {
     app.apply(SessionEvent {
         sequence,
@@ -104,6 +136,89 @@ fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+async fn persisted_tui_session(path: &Path, id: &str) -> Session {
+    Session::open_at(
+        path.to_path_buf(),
+        Some(id),
+        Path::new("/work"),
+        "test",
+        "model",
+        SessionContext {
+            system_prompt: "frozen prompt".into(),
+            skills: Vec::new(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn eager_session_app(session: &Session) -> App {
+    let state = session.tui_state().await;
+    let mut app = test_app();
+    for event in session.snapshot().await.unwrap() {
+        app.apply(event);
+    }
+    app.finish_hydration();
+    app.restore_session_stats(&state);
+    app.set_history_range(Some(0), true);
+    app
+}
+
+fn block_fingerprints(app: &App) -> Vec<String> {
+    app.blocks
+        .iter()
+        .map(|block| {
+            let tool = block.tool.as_ref().map(|tool| {
+                (
+                    tool.name.clone(),
+                    tool.arguments.clone(),
+                    tool.output.clone(),
+                )
+            });
+            let process = block
+                .process
+                .as_ref()
+                .map(|process| (process.id, process.steps));
+            format!(
+                "{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{:?}|{:?}",
+                block.id,
+                block.kind,
+                block.title,
+                block.text,
+                block.call_id,
+                block.failed,
+                block.protocol_help_required,
+                block.expanded,
+                block.turn_result,
+                block.parent_process,
+                (tool, process),
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+struct ModelFacingState {
+    context: SessionContext,
+    settings: SessionModelSettings,
+    history: Vec<Message>,
+    latest_api_usage: Option<(usize, usize)>,
+    after_compaction: bool,
+    help_reads: HashSet<String>,
+}
+
+async fn model_facing_state(session: &Session) -> ModelFacingState {
+    let model = session.model_context("test", "model").await;
+    ModelFacingState {
+        context: session.context().await,
+        settings: session.model_settings().await,
+        history: model.history,
+        latest_api_usage: model.latest_api_usage,
+        after_compaction: model.after_compaction,
+        help_reads: session.successful_protocol_help_reads().await,
+    }
 }
 
 #[test]
@@ -941,19 +1056,19 @@ fn context_meter_marks_only_idle_estimates_and_animates_only_while_busy() {
             .to_string()
     };
 
-    app.frame = 0;
+    app.animation_phase = 0.0;
     let idle = footer(&mut app);
     assert!(idle.ends_with("≈50.0%/128k"));
-    app.frame = 1;
+    app.animation_phase = 1.0;
     assert_eq!(footer(&mut app), idle);
 
     app.busy = true;
     app.activity = Some(Activity::Thinking);
-    app.frame = 0;
+    app.animation_phase = 0.0;
     let active = footer(&mut app);
     assert!(active.ends_with("50.0%/128k"));
     assert!(!active.contains('≈'));
-    app.frame = 1;
+    app.animation_phase = 1.0;
     assert_ne!(footer(&mut app), active);
 }
 
@@ -1803,6 +1918,54 @@ fn final_assistant_response_has_one_blank_row_after_the_user_when_there_is_no_pr
         BlockKind::Error,
         true,
     ));
+}
+
+#[test]
+fn settling_a_rendered_assistant_only_turn_invalidates_its_result_gap() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "hello".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::AssistantText {
+            text: "live response".into(),
+        },
+    );
+    app.skip_splash();
+    render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_rows, 4);
+
+    apply_event(&mut app, 2, EventKind::TurnFinished);
+    let settled = render_to_string(&mut app, 80, 12);
+    let user_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+        .unwrap();
+    let result_row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
+        .unwrap();
+
+    assert_eq!(app.transcript_rows, 5);
+    assert_eq!(app.transcript_layout.rows, 5);
+    assert_eq!(result_row, user_row + 3);
+    assert!(
+        settled
+            .lines()
+            .nth((user_row + 2) as usize)
+            .unwrap()
+            .trim()
+            .is_empty()
+    );
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
 }
 
 #[test]
@@ -3482,6 +3645,93 @@ fn transcript_scroll_is_independent_from_selection_and_follows_the_tail_again() 
 }
 
 #[test]
+fn transcript_cache_invalidates_content_width_and_fold_state() {
+    let mut app = test_app();
+    app.skip_splash();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "**cached** response".into(),
+        None,
+        false,
+        true,
+    );
+    render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+
+    render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 0);
+
+    app.append_or_push(
+        BlockKind::Assistant,
+        "AGENT",
+        " with new content".into(),
+        true,
+    );
+    let changed = render_to_string(&mut app, 80, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+    assert!(changed.contains("cached response with new content"));
+
+    render_to_string(&mut app, 40, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+
+    app.push(
+        BlockKind::Reasoning,
+        "THINKING",
+        "one two three four five six seven eight".into(),
+        None,
+        false,
+        false,
+    );
+    app.selected_block = 1;
+    render_to_string(&mut app, 40, 12);
+    let collapsed_rows = app.transcript_rows;
+    app.toggle_selected();
+    let expanded = render_to_string(&mut app, 40, 12);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+    assert!(app.transcript_rows > collapsed_rows);
+    assert!(expanded.contains("one two three"));
+}
+
+#[test]
+fn unchanged_large_transcript_materializes_only_the_viewport() {
+    let mut app = test_app();
+    app.skip_splash();
+    for index in 0..400 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("## Message {index}\n\n{}", "markdown content ".repeat(20)),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 14);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 400);
+
+    render_to_string(&mut app, 80, 14);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 0);
+    assert!(
+        app.transcript_render_stats.materialized_rows <= app.transcript_height,
+        "materialized {} rows for a {}-row viewport and {}-row transcript",
+        app.transcript_render_stats.materialized_rows,
+        app.transcript_height,
+        app.transcript_rows
+    );
+
+    app.append_or_push(
+        BlockKind::Assistant,
+        "AGENT",
+        "\nstreamed tail".into(),
+        true,
+    );
+    render_to_string(&mut app, 80, 14);
+    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
+    assert!(app.transcript_render_stats.materialized_rows <= app.transcript_height);
+}
+
+#[test]
 fn mouse_wheel_smooths_each_six_row_step_without_reducing_distance() {
     let mut app = test_app();
     for index in 0..30 {
@@ -4413,7 +4663,7 @@ fn selected_command_description_scrolls_inside_its_single_row() {
         .to_string();
     assert!(initial_row.contains('…'));
 
-    app.frame = MARQUEE_HOLD_FRAMES + 4 * MARQUEE_STEP_FRAMES;
+    app.animation_phase = (MARQUEE_HOLD_FRAMES + 4 * MARQUEE_STEP_FRAMES) as f64;
     let advanced = render_to_string(&mut app, 80, 24);
     let advanced_row = advanced
         .lines()
@@ -5073,7 +5323,7 @@ fn tool_call_and_result_share_one_block() {
     assert!(collapsed.contains("✓ Read src/main.rs"));
     assert!(!collapsed.contains("{\"uri\""));
     assert!(!collapsed.contains("CALL"));
-    app.blocks[0].expanded = true;
+    app.toggle_selected();
     let expanded = render_to_string(&mut app, 100, 24);
     assert!(expanded.contains("↳ file://src/main.rs"));
     assert!(expanded.contains("└ complete tool output"));
@@ -5448,7 +5698,7 @@ fn token_rate_follows_the_activity_animation_and_moves_to_the_ready_footer() {
     app.busy = true;
     app.activity = Some(Activity::Thinking);
     app.busy_since = Some(now - Duration::from_secs(1));
-    let animation = animation::activity(app.frame, 8);
+    let animation = animation::activity(app.animation_phase, 8);
     let rendered = render_to_string(&mut app, 100, 24);
     let activity = rendered
         .lines()
@@ -5574,7 +5824,7 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
     app.selected_block = 1;
 
     assert_eq!(app.active_transcript_block(), Some(2));
-    let spinner = animation::spinner(app.frame);
+    let spinner = animation::spinner(app.animation_phase);
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("✓ Read old.rs"));
     assert!(rendered.contains(&format!("{spinner} Read current.rs")));
@@ -5812,6 +6062,926 @@ fn captured_wide_characters_do_not_include_their_hidden_cells() {
         "复制内容"
     );
     assert_eq!(complete_surface_text(surface), "复制内容");
+}
+
+#[tokio::test]
+async fn compacted_startup_is_payload_lazy_but_restores_exact_stats_and_model_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-startup").await;
+    let large = "x".repeat(110_000);
+    let large_payload = serde_json::to_string(&EventKind::AssistantText {
+        text: large.clone(),
+    })
+    .unwrap();
+    let old = opened
+        .append_batch(vec![
+            EventKind::User { text: "old".into() },
+            EventKind::ModelMessage {
+                message: Message::user("old"),
+            },
+            EventKind::Usage {
+                input: 100,
+                output: 10,
+                reasoning: 0,
+                cache_read: 20,
+                cache_write: 5,
+                cost: 1.25,
+                total: 135,
+                context: true,
+                provider: "test".into(),
+                model: "model".into(),
+            },
+            EventKind::AssistantText {
+                text: large.clone(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant(large),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    let large_sequence = old[3].sequence;
+    opened
+        .append_compaction(
+            "checkpoint".into(),
+            30_000,
+            vec![Message::user("summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "current".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::user("current"),
+            },
+            EventKind::Usage {
+                input: 7,
+                output: 5,
+                reasoning: 0,
+                cache_read: 3,
+                cache_write: 2,
+                cost: 0.5,
+                total: 17,
+                context: true,
+                provider: "test".into(),
+                model: "model".into(),
+            },
+            EventKind::AssistantText {
+                text: "tail answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("tail answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    drop(opened);
+
+    let mutator = tokio_rusqlite::Connection::open(&path).await.unwrap();
+    mutator
+        .call(move |db| {
+            db.execute(
+                "UPDATE events SET payload_json = '{unread pre-checkpoint payload'
+                 WHERE session_id = 'lazy-startup' AND sequence = ?1",
+                [large_sequence as i64],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let resumed = persisted_tui_session(&path, "lazy-startup").await;
+    let model_before = model_facing_state(&resumed).await;
+    resumed.reset_event_read_audit();
+    let mut app = test_app();
+    hydrate_session_history(&mut app, &resumed).await.unwrap();
+
+    let startup_reads = resumed.event_read_audit();
+    assert!(
+        startup_reads
+            .payload_pages
+            .iter()
+            .all(|page| page.len() <= HISTORY_PAGE_EVENTS)
+    );
+    assert!(
+        startup_reads
+            .header_pages
+            .iter()
+            .all(|page| page.len() <= HISTORY_PAGE_EVENTS)
+    );
+    assert!(
+        !startup_reads
+            .payload_pages
+            .iter()
+            .flatten()
+            .any(|sequence| *sequence == large_sequence)
+    );
+    assert!(!app.history_complete);
+    assert!(!app.blocks.iter().any(|block| block.text.len() >= 100_000));
+    render_to_string(&mut app, 72, 18);
+    assert!(app.transcript_render_stats.rendered_blocks > 0);
+
+    assert_eq!(app.usage.input, 107);
+    assert_eq!(app.usage.output, 15);
+    assert_eq!(app.usage.cache_read, 23);
+    assert_eq!(app.usage.cache_write, 7);
+    assert_eq!(app.usage.cost, 1.75);
+    assert_eq!(app.last_cache_hit, Some(25.0));
+    let now = Instant::now();
+    app.token_rate.start_turn();
+    app.token_rate
+        .observe_stream_text("one two three", false, now - Duration::from_secs(1));
+    assert_eq!(app.token_rate.display_rate(now), Some(15.0));
+    assert_eq!(model_facing_state(&resumed).await, model_before);
+
+    mutator
+        .call(move |db| {
+            db.execute(
+                "UPDATE events SET payload_json = ?1
+                 WHERE session_id = 'lazy-startup' AND sequence = ?2",
+                tokio_rusqlite::rusqlite::params![large_payload, large_sequence as i64],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+    app.scroll_transcript(isize::MIN);
+    perform_history_action(&mut app, &resumed, HistoryAction::Page(-1))
+        .await
+        .unwrap();
+    assert_eq!(model_facing_state(&resumed).await, model_before);
+    perform_history_action(&mut app, &resumed, HistoryAction::First)
+        .await
+        .unwrap();
+    assert!(app.history_complete);
+    assert_eq!(model_facing_state(&resumed).await, model_before);
+    perform_history_action(&mut app, &resumed, HistoryAction::Search)
+        .await
+        .unwrap();
+    assert_eq!(model_facing_state(&resumed).await, model_before);
+    perform_history_action(&mut app, &resumed, HistoryAction::Jump(JumpKind::Tool))
+        .await
+        .unwrap();
+    assert_eq!(model_facing_state(&resumed).await, model_before);
+}
+
+#[tokio::test]
+async fn prepending_manual_compaction_history_preserves_live_flashes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-flashes").await;
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "historical turn".into(),
+            },
+            EventKind::AssistantText {
+                text: "historical answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("historical answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "manual checkpoint".into(),
+            10,
+            vec![Message::user("manual summary")],
+            true,
+        )
+        .await
+        .unwrap();
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "newer turn".into(),
+            },
+            EventKind::AssistantText {
+                text: "newer answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("newer answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "latest checkpoint".into(),
+            20,
+            vec![Message::user("latest summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    drop(opened);
+
+    let resumed = persisted_tui_session(&path, "lazy-flashes").await;
+    let eager = eager_session_app(&resumed).await;
+    let mut lazy = test_app();
+    hydrate_session_history(&mut lazy, &resumed).await.unwrap();
+    lazy.set_flash("live notice");
+    let live_flashes = lazy
+        .flashes
+        .iter()
+        .map(|notice| (notice.message.clone(), notice.created))
+        .collect::<Vec<_>>();
+
+    load_older_history(&mut lazy, &resumed).await.unwrap();
+
+    assert_eq!(
+        lazy.flashes
+            .iter()
+            .map(|notice| (notice.message.clone(), notice.created))
+            .collect::<Vec<_>>(),
+        live_flashes
+    );
+    assert!(
+        !lazy
+            .flashes
+            .iter()
+            .any(|notice| notice.message == "Context compacted; original events retained")
+    );
+    assert!(lazy.blocks.iter().any(
+        |block| block.kind == BlockKind::Compaction && block.text.contains("manual checkpoint")
+    ));
+    assert_eq!(block_fingerprints(&lazy), block_fingerprints(&eager));
+}
+
+#[tokio::test]
+async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rendering() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-equivalence").await;
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "oldest user".into(),
+            },
+            EventKind::AssistantText {
+                text: "oldest answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("oldest answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "manual checkpoint".into(),
+            10,
+            vec![Message::user("manual summary")],
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut giant = vec![EventKind::User {
+        text: "giant tool turn".into(),
+    }];
+    for index in 0..70 {
+        giant.push(EventKind::ToolCall {
+            call_id: format!("giant-{index}"),
+            name: "read".into(),
+            arguments: serde_json::json!({
+                "uri": format!("file://giant-{index}"),
+                "body": ""
+            }),
+        });
+        giant.push(EventKind::ToolResult {
+            call_id: format!("giant-{index}"),
+            name: "read".into(),
+            output: format!("result {index}"),
+            failed: false,
+            protocol_help_required: false,
+        });
+    }
+    giant.extend([
+        EventKind::AssistantText {
+            text: "giant complete".into(),
+        },
+        EventKind::ModelMessage {
+            message: Message::assistant("giant complete"),
+        },
+        EventKind::TurnFinished,
+    ]);
+    opened.append_batch(giant).await.unwrap();
+
+    let mut current = vec![
+        EventKind::User {
+            text: "current user".into(),
+        },
+        EventKind::ToolCall {
+            call_id: "current-tool".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"uri": "file://current", "body": ""}),
+        },
+    ];
+    opened
+        .append_batch(std::mem::take(&mut current))
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "mid-turn checkpoint".into(),
+            20_000,
+            vec![Message::user("latest summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    opened
+        .append_batch(vec![
+            EventKind::ToolResult {
+                call_id: "current-tool".into(),
+                name: "read".into(),
+                output: "current result".into(),
+                failed: false,
+                protocol_help_required: false,
+            },
+            EventKind::AssistantText {
+                text: (0..45)
+                    .map(|line| format!("current answer line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("current answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    drop(opened);
+
+    let resumed = persisted_tui_session(&path, "lazy-equivalence").await;
+    let mut eager = eager_session_app(&resumed).await;
+    resumed.reset_event_read_audit();
+    let mut lazy = test_app();
+    hydrate_session_history(&mut lazy, &resumed).await.unwrap();
+    assert!(!lazy.history_complete);
+    assert!(matches!(
+        lazy.blocks.first().map(|block| block.kind),
+        Some(BlockKind::User)
+    ));
+    let current_tool = lazy
+        .blocks
+        .iter()
+        .find(|block| block.call_id.as_deref() == Some("current-tool"))
+        .unwrap();
+    assert_eq!(
+        current_tool
+            .tool
+            .as_ref()
+            .and_then(|tool| tool.output.as_deref()),
+        Some("current result")
+    );
+    assert!(current_tool.parent_process.is_some());
+
+    render_to_string(&mut lazy, 64, 14);
+    lazy.scroll_transcript(isize::MIN);
+    render_to_string(&mut lazy, 64, 14);
+    let process_index = lazy
+        .blocks
+        .iter()
+        .position(|block| block.kind == BlockKind::Process)
+        .unwrap();
+    lazy.selected_block = process_index;
+    lazy.toggle_selected();
+    let tool_index = lazy
+        .blocks
+        .iter()
+        .position(|block| block.call_id.as_deref() == Some("current-tool"))
+        .unwrap();
+    lazy.selected_block = tool_index;
+    lazy.toggle_selected();
+    render_to_string(&mut lazy, 64, 14);
+    let selected_id = lazy.blocks[lazy.selected_block].id;
+    let visible_before = complete_surface_text(lazy.selectable.as_ref().unwrap());
+    let row = lazy
+        .selectable
+        .as_ref()
+        .unwrap()
+        .cells
+        .iter()
+        .position(|row| !row.concat().trim().is_empty())
+        .unwrap() as u16;
+    let area = lazy.selectable.as_ref().unwrap().area;
+    lazy.selection = Some(TextSelection {
+        start: (area.x, area.y + row),
+        end: (area.x + 6, area.y + row),
+    });
+    let copied_before =
+        selected_surface_text(lazy.selectable.as_ref().unwrap(), lazy.selection.unwrap());
+    lazy.mouse_scroll_animation = Some(MouseScrollAnimation::Transcript {
+        target: lazy.transcript_offset.saturating_add(4),
+        direction: 1,
+    });
+    let animation_before = match lazy.mouse_scroll_animation {
+        Some(MouseScrollAnimation::Transcript { target, .. }) => {
+            target as isize - lazy.transcript_offset as isize
+        }
+        _ => unreachable!(),
+    };
+
+    load_older_history(&mut lazy, &resumed).await.unwrap();
+    assert_eq!(lazy.blocks[lazy.selected_block].id, selected_id);
+    assert!(!lazy.transcript_follow_tail);
+    let animation_after = match lazy.mouse_scroll_animation {
+        Some(MouseScrollAnimation::Transcript { target, .. }) => {
+            target as isize - lazy.transcript_offset as isize
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(animation_after, animation_before);
+    render_to_string(&mut lazy, 64, 14);
+    assert_eq!(
+        complete_surface_text(lazy.selectable.as_ref().unwrap()),
+        visible_before
+    );
+    assert_eq!(
+        selected_surface_text(lazy.selectable.as_ref().unwrap(), lazy.selection.unwrap(),),
+        copied_before
+    );
+    assert!(
+        lazy.blocks
+            .iter()
+            .find(|block| block.id == selected_id)
+            .unwrap()
+            .expanded
+    );
+
+    let giant_tools = lazy
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .call_id
+                .as_deref()
+                .is_some_and(|call_id| call_id.starts_with("giant-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(giant_tools.len(), 70);
+    assert!(giant_tools.iter().all(|block| {
+        block.parent_process.is_some()
+            && block
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.output.as_ref())
+                .is_some()
+    }));
+    let paging_reads = resumed.event_read_audit();
+    assert!(
+        paging_reads
+            .payload_pages
+            .iter()
+            .all(|page| page.len() <= HISTORY_PAGE_EVENTS)
+    );
+    assert!(
+        paging_reads
+            .payload_pages
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+            > HISTORY_PAGE_EVENTS
+    );
+
+    let reads_before_resize = resumed.event_read_audit();
+    render_to_string(&mut lazy, 91, 17);
+    assert_eq!(resumed.event_read_audit(), reads_before_resize);
+
+    load_all_history(&mut lazy, &resumed).await.unwrap();
+    assert!(lazy.history_complete);
+    assert!(lazy.blocks.iter().any(
+        |block| block.kind == BlockKind::Compaction && block.text.contains("manual checkpoint")
+    ));
+    for block in &mut eager.blocks {
+        if let Some(loaded) = lazy.blocks.iter().find(|loaded| loaded.id == block.id) {
+            block.expanded = loaded.expanded;
+            block.invalidate_render();
+        }
+    }
+    eager.invalidate_transcript_layout_from(0);
+    eager.selected_block = eager
+        .blocks
+        .iter()
+        .position(|block| block.id == selected_id)
+        .unwrap();
+    assert_eq!(block_fingerprints(&lazy), block_fingerprints(&eager));
+
+    for width in [52, 96] {
+        for app in [&mut lazy, &mut eager] {
+            app.overlay = None;
+            app.selector = None;
+            app.selection = None;
+            app.mouse_scroll_animation = None;
+            app.transcript_follow_tail = true;
+            app.flashes.clear();
+        }
+        let lazy_render = render_to_string(&mut lazy, width, 20);
+        let eager_render = render_to_string(&mut eager, width, 20);
+        assert_eq!(lazy_render, eager_render);
+        assert_eq!(lazy.transcript_rows, eager.transcript_rows);
+        assert_eq!(
+            transcript_scrollbar_metrics(&lazy),
+            transcript_scrollbar_metrics(&eager)
+        );
+        assert_eq!(
+            lazy.hit_regions
+                .iter()
+                .map(|hit| (hit.area, hit.target))
+                .collect::<Vec<_>>(),
+            eager
+                .hit_regions
+                .iter()
+                .map(|hit| (hit.area, hit.target))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            complete_surface_text(lazy.selectable.as_ref().unwrap()),
+            complete_surface_text(eager.selectable.as_ref().unwrap())
+        );
+    }
+
+    open_search(&mut lazy);
+    open_search(&mut eager);
+    let search_fingerprint = |app: &App| {
+        app.selector
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.id.clone(),
+                    item.title.clone(),
+                    item.description.clone(),
+                    item.search_text.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(search_fingerprint(&lazy), search_fingerprint(&eager));
+    lazy.overlay = None;
+    eager.overlay = None;
+    lazy.jump_to(JumpKind::Tool);
+    eager.jump_to(JumpKind::Tool);
+    assert_eq!(
+        lazy.blocks[lazy.selected_block].id,
+        eager.blocks[eager.selected_block].id
+    );
+}
+
+#[tokio::test]
+async fn lazy_hydration_caps_a_concurrent_head_and_lag_recovery_stays_forward_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let session = persisted_tui_session(&path, "lazy-forward").await;
+    session
+        .append_batch(vec![
+            EventKind::User { text: "old".into() },
+            EventKind::AssistantText {
+                text: "old answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("old answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    session
+        .append_compaction(
+            "checkpoint".into(),
+            10,
+            vec![Message::user("summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    let captured = session.tui_state().await;
+    let concurrent = session
+        .append(EventKind::Notice {
+            text: "concurrent".into(),
+        })
+        .await
+        .unwrap();
+    let (events, complete) = initial_session_events(&session, &captured).await.unwrap();
+    assert!(!complete);
+    assert_eq!(
+        events.last().map(|event| event.sequence),
+        captured.head_sequence
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.sequence == concurrent.sequence)
+    );
+
+    let mut app = test_app();
+    for event in events {
+        app.apply(event);
+    }
+    app.finish_hydration();
+    app.restore_session_stats(&captured);
+    app.set_history_range(app.last_sequence, false);
+    let original_frontier = app.oldest_sequence;
+    recover_lagged_events(&mut app, &session).await.unwrap();
+    assert_eq!(app.last_sequence, Some(concurrent.sequence));
+    assert_eq!(
+        app.blocks
+            .iter()
+            .filter(|block| block.id == concurrent.sequence)
+            .count(),
+        1
+    );
+
+    let kinds = (0..600)
+        .map(|index| EventKind::Notice {
+            text: format!("lag {index}"),
+        })
+        .collect::<Vec<_>>();
+    let appended = session.append_batch(kinds).await.unwrap();
+    let first_forward = appended.first().unwrap().sequence;
+    let final_head = appended.last().unwrap().sequence;
+    session.reset_event_read_audit();
+    recover_lagged_events(&mut app, &session).await.unwrap();
+    assert_eq!(app.last_sequence, Some(final_head));
+    assert_eq!(app.oldest_sequence, original_frontier);
+    let ids = app
+        .blocks
+        .iter()
+        .map(|block| block.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(ids.len(), app.blocks.len());
+    let reads = session.event_read_audit();
+    assert!(
+        reads
+            .payload_pages
+            .iter()
+            .all(|page| page.len() <= FORWARD_RECOVERY_EVENTS)
+    );
+    assert!(
+        reads
+            .payload_pages
+            .iter()
+            .flatten()
+            .all(|sequence| *sequence >= first_forward)
+    );
+}
+
+#[tokio::test]
+async fn lazy_page_payload_errors_propagate_without_omitting_the_frontier() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-errors").await;
+    let old = opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "will break".into(),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "checkpoint".into(),
+            10,
+            vec![Message::user("summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    drop(opened);
+
+    let resumed = persisted_tui_session(&path, "lazy-errors").await;
+    let mut app = test_app();
+    hydrate_session_history(&mut app, &resumed).await.unwrap();
+    let frontier = app.oldest_sequence;
+    let broken_sequence = old[0].sequence;
+    let mutator = tokio_rusqlite::Connection::open(&path).await.unwrap();
+    mutator
+        .call(move |db| {
+            db.execute(
+                "UPDATE events SET payload_json = '{broken history payload'
+                 WHERE session_id = 'lazy-errors' AND sequence = ?1",
+                [broken_sequence as i64],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let error = perform_history_action(&mut app, &resumed, HistoryAction::First)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("cannot read session event page"));
+    assert_eq!(app.oldest_sequence, frontier);
+    assert!(!app.history_complete);
+}
+
+#[tokio::test]
+async fn global_history_actions_load_the_complete_session_before_navigating() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-global-actions").await;
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "searchable old user".into(),
+            },
+            EventKind::ToolCall {
+                call_id: "old-tool".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"uri": "file://old", "body": ""}),
+            },
+            EventKind::ToolResult {
+                call_id: "old-tool".into(),
+                name: "read".into(),
+                output: "searchable old result".into(),
+                failed: false,
+                protocol_help_required: false,
+            },
+            EventKind::AssistantText {
+                text: "old answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("old answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "checkpoint".into(),
+            10,
+            vec![Message::user("summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    opened
+        .append(EventKind::Notice {
+            text: "tail".into(),
+        })
+        .await
+        .unwrap();
+    drop(opened);
+    let resumed = persisted_tui_session(&path, "lazy-global-actions").await;
+
+    let mut home = test_app();
+    hydrate_session_history(&mut home, &resumed).await.unwrap();
+    perform_history_action(&mut home, &resumed, HistoryAction::First)
+        .await
+        .unwrap();
+    assert!(home.history_complete);
+    assert_eq!(home.blocks[home.selected_block].kind, BlockKind::User);
+
+    let mut search = test_app();
+    hydrate_session_history(&mut search, &resumed)
+        .await
+        .unwrap();
+    perform_history_action(&mut search, &resumed, HistoryAction::Search)
+        .await
+        .unwrap();
+    assert!(search.history_complete);
+    assert!(search.selector.as_ref().unwrap().items.iter().any(|item| {
+        item.search_text
+            .as_deref()
+            .is_some_and(|text| text.contains("searchable old result"))
+    }));
+
+    let mut jump = test_app();
+    hydrate_session_history(&mut jump, &resumed).await.unwrap();
+    perform_history_action(&mut jump, &resumed, HistoryAction::Jump(JumpKind::Tool))
+        .await
+        .unwrap();
+    assert!(jump.history_complete);
+    assert_eq!(
+        jump.blocks[jump.selected_block].call_id.as_deref(),
+        Some("old-tool")
+    );
+
+    let mut previous = test_app();
+    hydrate_session_history(&mut previous, &resumed)
+        .await
+        .unwrap();
+    previous.selected_block = previous.filtered_indices()[0];
+    let loaded_oldest_id = previous.blocks[previous.selected_block].id;
+    perform_history_action(&mut previous, &resumed, HistoryAction::Previous)
+        .await
+        .unwrap();
+    assert_ne!(
+        previous.blocks[previous.selected_block].id,
+        loaded_oldest_id
+    );
+    assert!(previous.blocks[previous.selected_block].id < loaded_oldest_id);
+
+    resumed.reset_event_read_audit();
+    let mut end = test_app();
+    hydrate_session_history(&mut end, &resumed).await.unwrap();
+    let reads_after_startup = resumed.event_read_audit();
+    if let Some(index) = end.filtered_indices().last().copied() {
+        end.selected_block = index;
+        end.transcript_follow_tail = true;
+        end.transcript_center_selected = true;
+    }
+    assert_eq!(resumed.event_read_audit(), reads_after_startup);
+    assert!(!end.history_complete);
+}
+
+#[tokio::test]
+async fn scrollbar_reaching_a_lazy_frontier_loads_older_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sessions.db");
+    let opened = persisted_tui_session(&path, "lazy-scrollbar").await;
+    opened
+        .append_batch(vec![
+            EventKind::User {
+                text: "older user".into(),
+            },
+            EventKind::AssistantText {
+                text: "older answer".into(),
+            },
+            EventKind::ModelMessage {
+                message: Message::assistant("older answer"),
+            },
+            EventKind::TurnFinished,
+        ])
+        .await
+        .unwrap();
+    opened
+        .append_compaction(
+            "checkpoint".into(),
+            10,
+            vec![Message::user("summary")],
+            false,
+        )
+        .await
+        .unwrap();
+    opened
+        .append_batch(
+            (0..50)
+                .map(|index| EventKind::Notice {
+                    text: format!("tail notice {index}"),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    drop(opened);
+
+    let resumed = persisted_tui_session(&path, "lazy-scrollbar").await;
+    let mut app = test_app();
+    hydrate_session_history(&mut app, &resumed).await.unwrap();
+    render_to_string(&mut app, 40, 12);
+    assert!(!app.history_complete);
+    let old_frontier = app.oldest_sequence;
+    let old_blocks = app.blocks.len();
+    let previous_offset = app.transcript_offset;
+    assert!(previous_offset > 0);
+    let area = app.transcript_scrollbar_area.unwrap();
+    let mouse = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(handle_transcript_scrollbar_mouse(&mut app, mouse));
+    assert_eq!(app.transcript_offset, 0);
+    let action = scrollbar_history_action(&app, mouse, previous_offset).unwrap();
+    assert_eq!(action, HistoryAction::ScrollbarTop(area.y));
+    perform_history_action(&mut app, &resumed, action)
+        .await
+        .unwrap();
+
+    assert!(app.history_complete);
+    assert!(app.oldest_sequence < old_frontier);
+    assert!(app.blocks.len() > old_blocks);
+    assert_eq!(app.transcript_offset, 0);
+    let drag = app.transcript_scrollbar_drag.unwrap();
+    assert_eq!(drag.row, area.y);
+    assert_eq!(drag.offset, 0);
+    assert!(
+        app.blocks
+            .iter()
+            .any(|block| block.kind == BlockKind::User && block.text == "older user")
+    );
 }
 
 #[test]

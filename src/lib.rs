@@ -17,6 +17,7 @@ pub mod skill;
 pub mod subagent;
 pub mod task;
 pub mod terminal;
+mod text_metrics;
 mod tool_download;
 pub mod tui;
 pub mod wasm_plugin;
