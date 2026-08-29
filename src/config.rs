@@ -95,6 +95,10 @@ pub struct Cli {
     /// Working directory exposed to file and shell plugins.
     #[arg(long, value_name = "PATH")]
     pub cwd: Option<PathBuf>,
+
+    /// Run resident plugin callbacks without starting the terminal interface.
+    #[arg(long, conflicts_with_all = ["continue_session", "session"])]
+    pub background: bool,
 }
 
 pub struct Config {
@@ -103,6 +107,7 @@ pub struct Config {
     pub catalog: Arc<ModelCatalog>,
     pub session: SessionChoice,
     pub cwd: PathBuf,
+    pub background: bool,
 }
 
 impl Config {
@@ -149,6 +154,7 @@ impl Config {
             catalog,
             session,
             cwd,
+            background: cli.background,
         })
     }
 }
@@ -767,40 +773,6 @@ impl ConfigManager {
         Ok(active)
     }
 
-    pub(crate) async fn for_model_role(
-        &self,
-        name: &str,
-    ) -> Result<Option<(ModelRole, ActiveSettings)>> {
-        let Some(role) = self.model_role(name).await? else {
-            return Ok(None);
-        };
-        let current_provider = self.active.read().await.provider.clone();
-        let files = self.files.lock().await;
-        let mut invocation = self.invocation.clone();
-        invocation.provider = Some(role.provider.clone());
-        invocation.model = Some(role.model.clone());
-        invocation.thinking = Some(role.thinking);
-        let mut active = calculate_active(&files, &self.catalog, &invocation).await?;
-        if role.provider != current_provider {
-            let credential = resolve_model_credential(
-                &files,
-                &self.catalog,
-                &self.invocation,
-                &role.provider,
-                false,
-            )
-            .await;
-            active.api_key = credential.api_key;
-            active.api_key_source = credential.source;
-            active.auth_kind = credential.kind;
-            active.credential_environment = credential.environment;
-        }
-        active.provider_source = ValueSource::Global;
-        active.model_source = ValueSource::Global;
-        active.thinking_source = ValueSource::Global;
-        Ok(Some((role, active)))
-    }
-
     pub async fn thinking_for_model(&self, provider: &str, model: &str) -> ThinkingLevel {
         let files = self.files.lock().await;
         let (configured, _) = configured_thinking(&files, provider, model);
@@ -1243,10 +1215,6 @@ impl ConfigManager {
 
     pub fn directory(&self) -> &Path {
         &self.directory
-    }
-
-    pub(crate) fn catalog(&self) -> Arc<ModelCatalog> {
-        self.catalog.clone()
     }
 
     pub fn settings_path(&self) -> PathBuf {

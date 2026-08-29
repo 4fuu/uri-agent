@@ -7,12 +7,38 @@ URI Agent stores conversations as append-only sessions and preserves the exact s
 Sessions are stored in SQLite at:
 
 ```text
-<platform-data-dir>/uri-agent/sessions-v2.db
+<platform-data-dir>/uri-agent/sessions-v3.db
 ```
 
-On macOS this path is `~/.config/uri-agent/sessions-v2.db`, colocated with configuration. If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions-v2.db`.
+On macOS this path is `~/.config/uri-agent/sessions-v3.db`, colocated with configuration. If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions-v3.db`.
 
-Earlier unversioned `sessions.db` files and their sidecars remain untouched beside the new database as an archive. URI Agent does not open, import, or modify them.
+Earlier session databases and their sidecars remain untouched. There is no
+migration into `sessions-v3.db`.
+
+## AgentHost and Agent specifications
+
+One process-wide `AgentHost` gives the TUI, linked and WASM plugins, child
+Agents, and resident plugins the same full `AgentRuntime` behavior and normal
+session persistence. The former subagent API, SDK, and ABI have been removed
+without a compatibility path.
+
+An `AgentSpec` selects provider, model, thinking effort, working directory,
+required parent session, system-prompt mode (`inherit`, `append`, or `replace`),
+all/exact tool and protocol sets, and an optional output-token cap. Prompt and
+capability selection is established at creation. Provider/model and thinking
+freeze after the first submission is durably accepted; later configuration
+changes do not alter that Agent.
+
+The global maximum depth is 2. A root Agent is depth 1. A plugin may create or
+open only a depth-2 Agent whose parent is a persisted, same-project depth-1
+session; depth-2 Agents cannot create children. The TUI lists only depth-1
+conversations. Child conversations use the same normal session database.
+
+Submissions are `Prompt` or `Steer`. Prompt starts an idle Agent or queues a new
+turn behind active work. Steer follows Pi-style model-boundary delivery and
+targets the next boundary while work is active; when the Agent is idle it is
+accepted as Prompt and starts a new turn. Acceptance and undelivered input are
+durable.
 
 A new session remains in memory while its startup context prepares in the background. On the first submit, the TUI leaves the welcome view and presents the user message immediately while that preparation continues. Persistence still waits for the context, then URI Agent writes the frozen context, queued startup events, and message in one transaction. Opening and closing an empty session creates no session record.
 
@@ -127,7 +153,16 @@ frozen system prompt
 + events after the checkpoint
 ```
 
-Summary generation uses a dedicated prompt without registered tools and treats conversation content as untrusted data. Each tool result contributes at most a 2,000-character head-and-tail preview; an earlier checkpoint receives at most one quarter of the input token budget; and total input is bounded against the remaining context, prioritizing the newest complete messages when necessary. Output is capped at 80% of the configured reserve. The session's frozen system prompt remains unchanged.
+Summary generation uses a dedicated prompt without registered tools and treats conversation content as untrusted data. Each tool result contributes at most a 2,000-character head-and-tail preview; an earlier checkpoint receives at most one quarter of the input token budget; and total input is bounded against the remaining context, prioritizing the newest complete messages when necessary. Output is capped at 80% of the configured reserve.
+
+Ordinarily the frozen prompt and capability selections remain unchanged. An
+Agent created or opened with the optional compaction callback receives the
+summary through its plugin after summary generation and before checkpointing.
+The callback may return an `AgentSpecPatch` changing only the system prompt,
+tools, or protocols. URI Agent commits that spec update and the compaction
+checkpoint atomically. Provider, model, thinking, working directory, parent,
+depth, and output cap cannot change. WASM receives this callback as
+`PluginEvent::Compacted`.
 
 Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the budget, it may summarize the older prefix while keeping a suffix that never starts with a tool result. Original events remain in SQLite.
 

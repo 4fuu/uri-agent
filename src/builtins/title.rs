@@ -1,9 +1,9 @@
+use crate::agent::{AgentSpec, AgentStatus, SubmitKind};
 use crate::plugin::{
-    CommandSpec, CommandTarget, Plugin, PluginHost, PluginPermission, PluginSettings,
-    PluginSubagents, TuiEffect, TuiSubmissionContext, TuiSubmissionProvider,
+    CommandSpec, CommandTarget, Plugin, PluginAgents, PluginHost, PluginModelRoleResolver,
+    PluginPermission, PluginSettings, TuiEffect, TuiSubmissionContext, TuiSubmissionProvider,
 };
-use crate::subagent::SubagentRequest;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,28 +17,50 @@ pub(super) struct TerminalTitlePlugin;
 
 #[async_trait]
 trait TitleCompletion: Send + Sync {
-    async fn complete(&self, prompt: &str) -> Result<String>;
+    async fn complete(&self, context: &TuiSubmissionContext) -> Result<String>;
 }
 
 struct RoleTitleCompletion {
-    subagents: PluginSubagents,
+    agents: PluginAgents,
+    model_roles: PluginModelRoleResolver,
     settings: PluginSettings,
 }
 
 #[async_trait]
 impl TitleCompletion for RoleTitleCompletion {
-    async fn complete(&self, prompt: &str) -> Result<String> {
+    async fn complete(&self, context: &TuiSubmissionContext) -> Result<String> {
         let role = self
             .settings
             .get(ROLE_KEY)
             .await?
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_else(|| DEFAULT_ROLE.to_string());
-        Ok(self
-            .subagents
-            .complete(&role, title_request(prompt))
+        let role = self
+            .model_roles
+            .resolve(&role)
             .await?
-            .text)
+            .ok_or_else(|| anyhow!("terminal title model role is not configured"))?;
+        let handle = self.agents.create(title_spec(context, role), None).await?;
+        handle
+            .submit(context.prompt.clone(), SubmitKind::Prompt)
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if handle.status().await != AgentStatus::Running {
+                    break handle
+                        .result()
+                        .await
+                        .ok_or_else(|| anyhow!("title Agent returned no text"));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            handle.cancel().await;
+        }
+        handle.close().await;
+        result.map_err(|_| anyhow!("title Agent timed out"))?
     }
 }
 
@@ -52,7 +74,7 @@ impl TuiSubmissionProvider for TerminalTitleProvider {
         if !context.first_user_message {
             return Ok(None);
         }
-        let title = match self.completion.complete(&context.prompt).await {
+        let title = match self.completion.complete(context).await {
             Ok(title) => sanitize_title(&title),
             Err(_) => None,
         };
@@ -62,12 +84,13 @@ impl TuiSubmissionProvider for TerminalTitleProvider {
 
 impl Plugin for TerminalTitlePlugin {
     fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Subagents]
+        vec![PluginPermission::Agents]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         let completion = Arc::new(RoleTitleCompletion {
-            subagents: host.subagents()?,
+            agents: host.agents()?,
+            model_roles: host.model_roles()?,
             settings: host.settings(PLUGIN)?,
         });
         host.commands.register(CommandSpec::new(
@@ -86,13 +109,18 @@ impl Plugin for TerminalTitlePlugin {
     }
 }
 
-fn title_request(prompt: &str) -> SubagentRequest {
-    SubagentRequest::new(prompt)
-        .with_tools(std::iter::empty::<String>())
-        .with_protocols(std::iter::empty::<String>())
-        .replace_system_prompt(TITLE_SYSTEM_PROMPT)
-        .with_max_output_tokens(32)
-        .with_timeout(Duration::from_secs(15))
+fn title_spec(context: &TuiSubmissionContext, role: crate::config::ModelRole) -> AgentSpec {
+    AgentSpec::new(
+        role.provider,
+        role.model,
+        role.thinking,
+        context.cwd.clone(),
+        context.session_id.clone(),
+    )
+    .with_tools(std::iter::empty::<String>())
+    .with_protocols(std::iter::empty::<String>())
+    .replace_system_prompt(TITLE_SYSTEM_PROMPT)
+    .with_max_output_tokens(32)
 }
 
 fn sanitize_title(title: &str) -> Option<String> {
@@ -123,7 +151,7 @@ mod tests {
 
     #[async_trait]
     impl TitleCompletion for FakeCompletion {
-        async fn complete(&self, _prompt: &str) -> Result<String> {
+        async fn complete(&self, _context: &TuiSubmissionContext) -> Result<String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.result.clone().map_err(|error| anyhow::anyhow!(error))
         }
@@ -167,15 +195,29 @@ mod tests {
     }
 
     #[test]
-    fn title_request_has_no_capabilities_and_replaces_the_system_prompt() {
-        let request = title_request("task");
-        assert_eq!(request.tools, Some(Vec::new()));
-        assert_eq!(request.protocols, Some(Vec::new()));
+    fn title_agent_has_no_capabilities_and_replaces_the_system_prompt() {
+        let spec = title_spec(
+            &context(true),
+            crate::config::ModelRole {
+                provider: "example".to_string(),
+                model: "small".to_string(),
+                thinking: crate::catalog::ThinkingLevel::Low,
+            },
+        );
+        assert_eq!(
+            spec.tools,
+            crate::agent::CapabilitySelection::Only(Vec::new())
+        );
+        assert_eq!(
+            spec.protocols,
+            crate::agent::CapabilitySelection::Only(Vec::new())
+        );
         assert!(matches!(
-            request.system_prompt,
-            crate::subagent::SubagentSystemPrompt::Replace(ref prompt)
+            spec.system_prompt,
+            crate::agent::SystemPromptSelection::Replace(ref prompt)
                 if prompt == TITLE_SYSTEM_PROMPT
         ));
-        assert_eq!(request.max_output_tokens, Some(32));
+        assert_eq!(spec.max_output_tokens, Some(32));
+        assert_eq!(spec.parent_session_id.as_deref(), Some("session"));
     }
 }

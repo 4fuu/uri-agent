@@ -42,7 +42,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
 | `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, dedicated Cloudflare AI Gateway boundary, Codex WebSocket and experimental Antigravity transports, and multimodal support |
-| `src/subagent.rs` | Ephemeral role-based model/tool loops, capability restriction, working-directory toolboxes, and usage aggregation |
+| `src/agent.rs` | Process-wide `AgentHost`, Agent specifications and handles, depth enforcement, child lifecycle, and background resident execution |
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, text and image read output, descriptors, registry, address splitting, dispatch, and output presentation |
@@ -51,7 +51,8 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
 | `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
 | `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol and model-tool routing, trusted permissions, and atomic reload |
-| `sdk/` | Rust guest ABI types, export macro, and built-in protocol, model-role, plugin-setting, and subagent host calls |
+| `sdk/` | ABI-v6 Rust guest types, export macro, and built-in protocol, Agent, state, resident, model-role, and plugin-setting host calls |
+| `src/plugin_state.rs` | Separate global/project plugin-state SQLite storage, revisions, and compare-and-set |
 | `examples/wasm-plugin/` | Buildable Rust guest plugin example |
 | `src/task.rs` | In-process task lifecycle, foreground-to-background promotion, capacity, progress, waiting, cancellation, records, and notices |
 | `src/output.rs` | Inline output limits, previews, complete-output persistence, and per-session JSONL diagnostics |
@@ -72,20 +73,17 @@ First-party capabilities use the plugin path exposed to linked Rust extensions:
 
 1. A [`Plugin`](../src/plugin.rs) may declare protocol and direct model-tool descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen.
 2. `PluginRegistry` validates descriptor names and tool schemas, rejects duplicates, requires declarations to match installed capabilities, collects notices, and preserves registration order for prompt fragments.
-3. Plugins install model tools, protocols, commands, panel providers, status providers, composer completion providers, and submission effects through `PluginHost`; they may resolve user-configured model routes through `PluginHost::model_roles`, store plugin-owned values through `PluginHost::settings`, and run role-based model/tool loops through `PluginHost::subagents`, while prompt-only plugins need no runtime registration.
+3. Plugins install model tools, protocols, commands, panel providers, status providers, composer completion providers, and submission effects through `PluginHost`; they may resolve model roles, use plugin settings or separately permissioned state, create child Agents through the process-wide `AgentHost`, and opt into resident callbacks, while prompt-only plugins need no runtime registration.
 4. Simple string-input capabilities remain behind `read` and `exec`; typed or escape-heavy operations should register a direct model tool, while commands join the searchable panel and key-bindable command registry.
 
-Sensitive or model-consuming host access uses explicit plugin permissions. `PluginPermission::Environment` exposes `PluginEnvironment` for dynamic reads from the user-managed Agent environment. `PluginPermission::Credentials` exposes `PluginCredentials` for dynamic provider API-key resolution without coupling a plugin to configuration internals. `PluginPermission::Downloads` exposes the pinned binary installer used by `grep`. `PluginPermission::Subagents` exposes bounded, ephemeral inference through configured roles without exposing direct provider/model selection. These declarations are audit markers for trusted source, not approval state; an undeclared plugin is refused by the corresponding host interface. `PluginModelRoleResolver` is only a non-sensitive, read-only resolver for provider, model, and thinking metadata. `PluginSettings` provides project-overridable JSON key/value storage in a plugin-owned namespace and requires no permission.
+Sensitive or model-consuming host access uses explicit plugin permissions. Environment, credentials, downloads, Agents, and separate plugin state are refused when undeclared. These declarations are audit markers for trusted source, not approval state. Model-role lookup and project-overridable `PluginSettings` require no permission.
 
 A linked plugin can register `CommandTarget::ModelRole` with its settings
 namespace, key, and default role to reuse the generic TUI selector. The
 selection is an ordinary value under `pluginSettings`, separate from the
-`modelRoles` route definitions. Subagent calls may inherit the registered tool
-and protocol sets or replace either with an exact named set. System additions
-are appended after the generated prompt; replacing the generated prompt is
-valid only when both effective capability sets are empty. Subagent calls must
-stay internal to plugins; do not register a generic model-facing subagent
-protocol or tool.
+`modelRoles` route definitions. Agent creation selects prompt mode and all or
+exact named tool/protocol sets in `AgentSpec`; no generic model-facing Agent
+creation protocol or tool is registered.
 
 TUI extensions return generic documents, semantic status items, text replacement candidates for the composer, or failure-isolated effects for an accepted submission. Completion providers receive the current lines and character-based cursor position, then return a replacement range and labeled candidates; the TUI owns popup rendering, stale-result rejection, selection, and insertion. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, panel providers, or submission providers; reserve prompt fragments for context required before the first tool call.
 
@@ -212,11 +210,11 @@ bounded download, process and cross-process lock, and atomic cache install.
 
 ### WASM plugin and SDK changes
 
-Keep `wasm_plugin://help` and its detailed help paths, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. Test both a valid module and the affected reload, collision, permission, persistence, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing. A module must request the `subagents` manifest permission before calling role-based inference; subagent depth is limited to one and its request is also bounded by the module's 60-minute wall-clock limit. Plugin-setting host calls are scoped by the module filename stem and need no manifest permission.
+Keep `wasm_plugin://help` and its detailed help paths, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. ABI v6 has no compatibility path. Test both a valid module and the affected reload, collision, permission, persistence, resident, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing. Agent access and separate state require manifest permissions; plugin settings do not. Enforce the global depth-2 maximum and persisted same-project depth-1 parent requirement.
 
-### Model, Skill, session, and runtime changes
+### Agent, model, Skill, session, and runtime changes
 
-Preserve provider-independent model-loop behavior and append-only persistence. Shared changes to protocol, task, session, compaction, or runtime boundaries need both a normal-path test and the affected boundary-condition test. Session tests should verify persisted replay, not only in-memory state.
+Preserve the single process-wide `AgentHost`, full `AgentRuntime` behavior for every caller, provider-independent model loops, append-only persistence, durable submissions, model/thinking freeze, and atomic compaction spec-update/checkpoint invariant. Shared changes to Agent, protocol, task, session, compaction, or runtime boundaries need both a normal-path test and the affected boundary-condition test. Session tests should verify persisted replay, not only in-memory state.
 
 ### TUI changes
 

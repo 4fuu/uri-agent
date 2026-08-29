@@ -87,18 +87,12 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
 
 pub fn plugins(cwd: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
-    add_subagent_plugins(&mut plugins, cwd);
+    add_agent_plugins(&mut plugins, cwd);
     plugins.add(title::TerminalTitlePlugin);
     plugins
 }
 
-pub(crate) fn subagent_plugins(cwd: &Path) -> PluginRegistry {
-    let mut plugins = PluginRegistry::new();
-    add_subagent_plugins(&mut plugins, cwd);
-    plugins
-}
-
-fn add_subagent_plugins(plugins: &mut PluginRegistry, cwd: &Path) {
+fn add_agent_plugins(plugins: &mut PluginRegistry, cwd: &Path) {
     plugins.add(model_tools::ProtocolToolsPlugin);
     plugins.add(agents::AgentsPlugin::new(cwd));
     plugins.add(uri_agent_docs::UriAgentDocsProtocol);

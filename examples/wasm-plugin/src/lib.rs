@@ -1,6 +1,6 @@
 use uri_agent_plugin_sdk::{
-    define_plugin, HandlerRequest, HandlerResult, ModelToolDescriptor, Operation, PluginManifest,
-    ProtocolDescriptor,
+    define_plugin, HandlerRequest, HandlerResult, ModelToolDescriptor, Operation, PluginEvent,
+    PluginManifest, ProtocolDescriptor, ResidentEvent, ResidentResponse,
 };
 
 fn manifest() -> PluginManifest {
@@ -20,6 +20,8 @@ fn manifest() -> PluginManifest {
             "additionalProperties": false
         }),
     )])
+    .request_state_access()
+    .with_resident()
 }
 
 fn handle(request: HandlerRequest) -> HandlerResult {
@@ -45,8 +47,43 @@ fn handle(request: HandlerRequest) -> HandlerResult {
                 .ok_or_else(|| "name must be a string".to_string())?;
             Ok(format!("Hello, {name}!\n").into_bytes())
         }
+        HandlerRequest::Event {
+            event: PluginEvent::Resident { event },
+        } => resident(event),
+        HandlerRequest::Event {
+            event: PluginEvent::Compacted { .. },
+        } => Ok(b"null".to_vec()),
         _ => Err("unsupported plugin request".to_string()),
     }
+}
+
+fn resident(event: ResidentEvent) -> HandlerResult {
+    #[cfg(target_family = "wasm")]
+    {
+        let entry = uri_agent_plugin_sdk::plugin_state_get(
+            uri_agent_plugin_sdk::PluginStateScope::Global,
+            "resident-events",
+        )
+        .map_err(|error| error.to_string())?;
+        let count = entry
+            .as_ref()
+            .and_then(|entry| entry.value.as_u64())
+            .unwrap_or(0)
+            + 1;
+        uri_agent_plugin_sdk::plugin_state_compare_and_set(
+            uri_agent_plugin_sdk::PluginStateScope::Global,
+            "resident-events",
+            entry.map(|entry| entry.revision),
+            serde_json::json!(count),
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "resident event counter changed concurrently".to_string())?;
+    }
+
+    let response = ResidentResponse {
+        wake_after_ms: (event == ResidentEvent::Start).then_some(60_000),
+    };
+    serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
 define_plugin!(manifest(), handle);

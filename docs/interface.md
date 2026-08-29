@@ -35,11 +35,11 @@ Press `Space` to open the rounded, bottom-anchored composer. An empty composer s
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Send when idle; while running, choose Queue or Guidance |
+| `Enter` | Send when idle; while running, choose Queue or Steer |
 | `Shift+Enter` | Insert a newline; Windows consoles never report Shift with Enter, so Windows shows and expects `Ctrl+Enter` instead |
 | `Ctrl+Enter` or `Ctrl+J` | Insert a newline |
-| `Alt+Up` | Restore the latest undelivered Queue or Guidance message to the draft |
-| `Alt+Enter` | Upgrade the latest queued message to Guidance |
+| `Alt+Up` | Restore the latest undelivered Queue or Steer message to the draft |
+| `Alt+Enter` | Upgrade the latest queued message to Steer |
 | `Up`/`Down` | Move between lines; at the first or last line, move to the start or end of the draft |
 | `Home`/`End`, `Ctrl+A`/`Ctrl+E` | Move to the start or end of the current line |
 | `Ctrl+Home`/`Ctrl+End` | Move to the start or end of the draft |
@@ -59,9 +59,9 @@ Type `@` at the start of a token to list project files and insert an `@file://<p
 
 Pressing `@` on the conversation surface opens the composer with the same file completion, so reference entry has one interaction path.
 
-While a turn is running, `Enter` opens a keyboard- and mouse-selectable delivery float. **Guidance** is appended as user input after the current assistant response and its tool calls finish, immediately before the next model request. It does not interrupt an in-flight model request or tool operation. **Queue** waits until the active agent run reaches its terminal response, then starts a new user turn. Guidance takes priority over queued follow-ups at a shared boundary.
+While a turn is running, `Enter` opens a keyboard- and mouse-selectable delivery float. **Steer** follows Pi-style model-boundary delivery: it is appended as user input after the current assistant response and its tool calls finish, immediately before the next model request. It does not interrupt an in-flight model request or tool operation. If the Agent becomes idle before Steer is accepted, the runtime treats it as Prompt and starts a new turn. **Queue** waits until the active Agent run reaches its terminal response, then starts a new prompt. Steer takes priority over queued prompts at a shared boundary. Accepted input that has not reached its delivery boundary remains durable.
 
-The composer preview contains only messages that have not been taken for delivery. `Alt+Up` removes the newest such message and prepends it to the current draft; `Alt+Enter` changes the newest queued follow-up to Guidance. Once the runtime takes a message at its delivery boundary, it leaves the preview and can no longer be restored or upgraded. If URI Agent exits first, all still-undelivered messages are restored ahead of the saved draft.
+The composer preview contains only messages that have not been taken for delivery. `Alt+Up` removes the newest such message and prepends it to the current draft; `Alt+Enter` changes the newest queued follow-up to Steer while the Agent is still active. Once the runtime takes a message at its delivery boundary, it leaves the preview and can no longer be restored or upgraded. If URI Agent exits first, accepted undelivered input remains pending in the session database and resumes after that Agent is reopened; a lone pending Steer is promoted to Prompt on resume.
 
 While a turn is running, press `Esc` twice within 500 milliseconds on the conversation surface to interrupt its current model request or tool operation. An `Esc` consumed by an open float only closes or steps back from that float and does not prime interruption. With no float open, the first press keeps the conversation surface's normal `Esc` behavior, such as clearing a row filter, and a fixed status above the footer prompts for the second press. The interrupted turn records an error and a complete turn boundary so another request can be sent normally. The embedded terminal keeps its separate double-`Esc` behavior: it closes the terminal float instead of interrupting the model turn.
 
@@ -85,7 +85,7 @@ Core commands are registered through `CommandRegistry`:
 | `:effort` | Select thinking effort supported by the active model |
 | `:settings` | Inspect and edit active settings |
 | `:login`, `:logout` | Manage provider credentials |
-| `:resume`, `:new` | Switch project sessions or create one |
+| `:resume`, `:new` | Switch project depth-1 sessions or create a root Agent; plugin-owned depth-2 conversations are not listed |
 | `:search` or `:find` | Search text already shown in the current conversation and jump to a matching block |
 | `:compact` | Request a context checkpoint when older completed history is available |
 | `:set-env` | Add or replace an Agent environment variable through a masked value prompt |

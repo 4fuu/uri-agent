@@ -9,6 +9,7 @@ use rig::message::{ImageMediaType, ToolResultContent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug)]
@@ -202,7 +203,7 @@ pub struct ProtocolRegistry {
     output: Arc<OutputStore>,
     context: ProtocolContext,
     help_read: AsyncMutex<HashSet<String>>,
-    allowed: Option<HashSet<String>>,
+    allowed: RwLock<Option<HashSet<String>>>,
 }
 
 impl ProtocolRegistry {
@@ -213,31 +214,35 @@ impl ProtocolRegistry {
             output,
             context: ProtocolContext { tasks },
             help_read: AsyncMutex::new(HashSet::new()),
-            allowed: None,
+            allowed: RwLock::new(None),
         }
     }
 
-    /// Create a view that exposes exactly the named protocols and owns an
-    /// independent protocol-help gate. Protocol implementations, task state,
-    /// and output presentation remain shared with the source registry.
-    pub fn restricted(&self, names: &[String]) -> Result<Self> {
+    pub fn select(&self, names: Option<&[String]>) -> Result<()> {
+        let selected = names
+            .map(|names| self.validate_selection(names))
+            .transpose()?;
+        *self
+            .allowed
+            .write()
+            .expect("protocol selection lock poisoned") = selected;
+        Ok(())
+    }
+
+    pub(crate) fn validate_selection(&self, names: &[String]) -> Result<HashSet<String>> {
         let available = self
-            .descriptors()
+            .all_descriptors()
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<HashSet<_>>();
-        let allowed = names.iter().cloned().collect::<HashSet<_>>();
-        if let Some(name) = allowed.iter().find(|name| !available.contains(*name)) {
-            bail!("unknown subagent protocol: {name}");
+        let selected = names.iter().cloned().collect::<HashSet<_>>();
+        if selected.len() != names.len() {
+            bail!("Agent protocol is selected more than once");
         }
-        Ok(Self {
-            protocols: self.protocols.clone(),
-            dynamic: self.dynamic.clone(),
-            output: self.output.clone(),
-            context: self.context.clone(),
-            help_read: AsyncMutex::new(HashSet::new()),
-            allowed: Some(allowed),
-        })
+        if let Some(name) = selected.iter().find(|name| !available.contains(*name)) {
+            bail!("unknown Agent protocol: {name}");
+        }
+        Ok(selected)
     }
 
     pub fn register(&mut self, protocol: impl Protocol + 'static) -> Result<()> {
@@ -273,7 +278,7 @@ impl ProtocolRegistry {
         Ok(())
     }
 
-    pub fn descriptors(&self) -> Vec<ProtocolDescriptor> {
+    fn all_descriptors(&self) -> Vec<ProtocolDescriptor> {
         let mut descriptors = self
             .protocols
             .values()
@@ -282,7 +287,17 @@ impl ProtocolRegistry {
         for dynamic in &self.dynamic {
             descriptors.extend(dynamic.descriptors());
         }
-        if let Some(allowed) = &self.allowed {
+        descriptors
+    }
+
+    pub fn descriptors(&self) -> Vec<ProtocolDescriptor> {
+        let mut descriptors = self.all_descriptors();
+        if let Some(allowed) = self
+            .allowed
+            .read()
+            .expect("protocol selection lock poisoned")
+            .as_ref()
+        {
             descriptors.retain(|descriptor| allowed.contains(&descriptor.name));
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
@@ -297,6 +312,27 @@ impl ProtocolRegistry {
                 description: descriptor.description,
             })
             .collect()
+    }
+
+    pub(crate) fn prompt_protocols_for(
+        &self,
+        names: Option<&[String]>,
+    ) -> Result<Vec<PromptEntry>> {
+        let selected = names
+            .map(|names| self.validate_selection(names))
+            .transpose()?;
+        let mut descriptors = self.all_descriptors();
+        if let Some(selected) = selected {
+            descriptors.retain(|descriptor| selected.contains(&descriptor.name));
+        }
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(descriptors
+            .into_iter()
+            .map(|descriptor| PromptEntry {
+                name: descriptor.name,
+                description: descriptor.description,
+            })
+            .collect())
     }
 
     pub(crate) fn tasks(&self) -> TaskManager {
@@ -443,6 +479,8 @@ impl ProtocolRegistry {
     async fn find_protocol(&self, name: &str, include_dynamic: bool) -> Option<Arc<dyn Protocol>> {
         if self
             .allowed
+            .read()
+            .expect("protocol selection lock poisoned")
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(name))
         {
@@ -745,6 +783,41 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("already registered"));
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn selection_limits_protocol_descriptors_and_dispatch() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(NamedProtocol("first".to_string()))
+            .unwrap();
+        registry
+            .register(NamedProtocol("second".to_string()))
+            .unwrap();
+
+        registry.select(Some(&["second".to_string()])).unwrap();
+
+        assert_eq!(
+            registry
+                .descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>(),
+            vec!["second"]
+        );
+        assert_eq!(registry.read("second://help", "").await.unwrap(), "second");
+        assert_eq!(
+            registry
+                .read("first://help", "")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "unknown protocol: first"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 

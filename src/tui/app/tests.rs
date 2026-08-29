@@ -2708,7 +2708,7 @@ fn image_token_spans_accept_optional_dimensions() {
 }
 
 #[test]
-fn running_composer_enter_opens_queue_or_guidance_delivery() {
+fn running_composer_enter_opens_queue_or_steer_delivery() {
     let mut app = test_app();
     app.skip_splash();
     app.busy = true;
@@ -2737,14 +2737,14 @@ fn running_composer_enter_opens_queue_or_guidance_delivery() {
         Action::Enqueue {
             prompt,
             images,
-            kind: PendingMessageKind::Guidance,
+            kind: PendingMessageKind::Steer,
         } if prompt == "adjust the implementation[Image #1]"
             && images.as_slice() == std::slice::from_ref(&image)
     ));
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("SEND WHILE RUNNING"));
     assert!(rendered.contains("Queue"));
-    assert!(rendered.contains("Guidance"));
+    assert!(rendered.contains("Steer"));
     assert_eq!(
         app.hit_regions
             .iter()
@@ -2770,14 +2770,14 @@ fn composer_previews_pending_messages_and_restores_them_in_order() {
         PendingMessage {
             id: 1,
             text: "guide now".to_string(),
-            kind: PendingMessageKind::Guidance,
+            kind: PendingMessageKind::Steer,
         },
     ];
 
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("QUEUE"));
     assert!(rendered.contains("queued follow-up"));
-    assert!(rendered.contains("GUIDE"));
+    assert!(rendered.contains("STEER"));
     assert!(rendered.contains("guide now"));
     assert_eq!(
         app.keymap.action("composer", "alt+up").as_deref(),

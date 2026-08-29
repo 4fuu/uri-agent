@@ -69,7 +69,7 @@ separate manual.
 - **Reliable and extensible:** the stable string-based `read` / `exec` contract handles simple protocols, while typed direct tools avoid nested escaping and both paths remain plugin-registered.
 - **Current models and sign-in:** URI Agent combines pi.dev's cloud catalog and provider login methods with credential-scoped live discovery, exposing runnable new provider models before the shared catalog catches up.
 - **Durable, observable work:** managed tasks expose status and final output, automatically notify the model on completion, and restore settled reports with their session; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
-- **One controllable terminal workflow:** built-in web access, live Queue and Guidance, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
+- **One controllable terminal workflow:** built-in web access, live Queue and Steer, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.
 
 ## pi.dev model coverage
 
@@ -148,6 +148,10 @@ The first session is working when protocol activity appears and the assistant re
 Run `:set-env` to save a variable such as `NPM_TOKEN`; future Agent shell commands receive it automatically. Settings lists variable names without showing their values. See [Agent environment](docs/configuration.md#agent-environment) for its global scope, private file storage, `:terminal` separation, and plugin access.
 
 See [Models and configuration](docs/configuration.md) for supported API families, authentication, offline mode, and custom endpoints.
+
+For externally supervised resident plugins, `uri-agent --background` runs the
+process without the TUI but intentionally remains foreground-blocking. See
+[WASM plugins](docs/plugins.md#resident-plugins) for the lifecycle and scope.
 
 ## Extensions
 
