@@ -8,31 +8,31 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 
-const EXTERNAL_ENDPOINT: &str = "https://www.codebuddy.ai";
-const INTERNAL_ENDPOINT: &str = "https://copilot.tencent.com";
-const PLATFORM: &str = "CLI";
+const WORKBUDDY_ENDPOINT: &str = "https://www.workbuddy.ai";
+const PLATFORM: &str = "workbuddy-ai";
 const PREFIX_PATH: &str = "/plugin";
-const REFERENCE_VERSION: &str = "2.141.0";
+const REFERENCE_VERSION: &str = "5.4.2.36857725";
+pub(crate) const USER_AGENT: &str = concat!(
+    "workbuddy-ai/5.4.2.36857725 WorkBuddy/5.4.2.36857725 ",
+    "CLI/2.132.0-dev.9772d7b.202608221848"
+);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_FETCH_TOKEN: i64 = 11217;
 const RETRY_FETCH_ACCOUNT: i64 = 12151;
 const ACCOUNT_AUTH_RETRIES: usize = 5;
 
-pub(crate) const ENDPOINT_EXTRA: &str = "codebuddyEndpoint";
-pub(crate) const ENVIRONMENT_EXTRA: &str = "codebuddyEnvironment";
-pub(crate) const DOMAIN_EXTRA: &str = "codebuddyDomain";
-pub(crate) const METHOD_EXTRA: &str = "codebuddyAuthMethod";
-pub(crate) const ACCOUNT_EXTRA: &str = "codebuddyAccount";
-pub(crate) const ACCOUNTS_EXTRA: &str = "codebuddyAccounts";
-const AUTH_EXTRA: &str = "codebuddyAuth";
+pub(crate) const ENDPOINT_EXTRA: &str = "workbuddyEndpoint";
+pub(crate) const ENVIRONMENT_EXTRA: &str = "workbuddyEnvironment";
+pub(crate) const DOMAIN_EXTRA: &str = "workbuddyDomain";
+pub(crate) const METHOD_EXTRA: &str = "workbuddyAuthMethod";
+pub(crate) const ACCOUNT_EXTRA: &str = "workbuddyAccount";
+pub(crate) const ACCOUNTS_EXTRA: &str = "workbuddyAccounts";
+const AUTH_EXTRA: &str = "workbuddyAuth";
 
-pub(in crate::oauth) fn start_codebuddy(
-    environment: &str,
-    endpoint: Option<&str>,
-) -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
-    let endpoint = login_endpoint(environment, endpoint)?;
-    let environment = environment.to_string();
+pub(in crate::oauth) fn start_codebuddy()
+-> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
+    let endpoint = WORKBUDDY_ENDPOINT.to_string();
     let LoginSetup {
         login,
         paste_rx: _,
@@ -43,17 +43,17 @@ pub(in crate::oauth) fn start_codebuddy(
     } = channels(
         endpoint.clone(),
         None,
-        "Generating the CodeBuddy login URL…",
+        "Generating the WorkBuddy login URL…",
     );
     tokio::spawn(async move {
         let result = match tokio::time::timeout(
             LOGIN_TIMEOUT,
-            codebuddy_login(endpoint, environment, cancel_rx, display),
+            codebuddy_login(endpoint, cancel_rx, display),
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(anyhow!("CodeBuddy login timed out after 5 minutes")),
+            Err(_) => Err(anyhow!("WorkBuddy login timed out after 5 minutes")),
         };
         let _ = done_tx.send(result);
     });
@@ -62,7 +62,6 @@ pub(in crate::oauth) fn start_codebuddy(
 
 async fn codebuddy_login(
     endpoint: String,
-    environment: String,
     mut cancel_rx: watch::Receiver<bool>,
     display: std::sync::Arc<std::sync::Mutex<super::super::OauthDisplay>>,
 ) -> Result<OauthToken> {
@@ -86,16 +85,16 @@ async fn codebuddy_login(
             .send(),
     )
     .await
-    .context("CodeBuddy auth state request failed")?;
+    .context("WorkBuddy auth state request failed")?;
     let state_reply = ProviderReply::read(response).await?;
-    let state_payload = state_reply.payload("CodeBuddy auth state")?;
+    let state_payload = state_reply.payload("WorkBuddy auth state")?;
     let state = required_string(&state_payload, "state")?;
     let auth_url = decorate_auth_url(required_string(&state_payload, "authUrl")?)?;
     set_display(
         &display,
         auth_url.clone(),
         None,
-        "Complete CodeBuddy sign-in in the browser. This window will continue polling.",
+        "Complete WorkBuddy sign-in in the browser. This window will continue polling.",
     );
     open_url(&auth_url);
 
@@ -114,7 +113,7 @@ async fn codebuddy_login(
     .await?;
     let accounts = fetch_accounts(&client, &endpoint, &auth, false).await?;
     let account = merge_current_account(account, &accounts);
-    token_from_session(auth, &endpoint, &environment, account, accounts)
+    token_from_session(auth, &endpoint, "external", account, accounts)
 }
 
 async fn poll_token(
@@ -143,12 +142,12 @@ async fn poll_token(
                 .send(),
         )
         .await
-        .context("CodeBuddy token polling failed")?;
+        .context("WorkBuddy token polling failed")?;
         let reply = ProviderReply::read(response).await?;
         if reply.code() == Some(RETRY_FETCH_TOKEN) {
             continue;
         }
-        let payload = reply.payload("CodeBuddy auth token")?;
+        let payload = reply.payload("WorkBuddy auth token")?;
         if payload
             .get("accessToken")
             .and_then(Value::as_str)
@@ -187,7 +186,7 @@ async fn poll_account(
                 .send(),
         )
         .await
-        .context("CodeBuddy account polling failed")?;
+        .context("WorkBuddy account polling failed")?;
         let reply = ProviderReply::read(response).await?;
         if reply.code() == Some(RETRY_FETCH_ACCOUNT) {
             continue;
@@ -200,7 +199,7 @@ async fn poll_account(
             auth_retries += 1;
             continue;
         }
-        let payload = reply.payload("CodeBuddy login account")?;
+        let payload = reply.payload("WorkBuddy login account")?;
         if payload.get("uid").and_then(Value::as_str).is_some() {
             return Ok(payload);
         }
@@ -209,14 +208,14 @@ async fn poll_account(
 
 pub(in crate::oauth) async fn refresh_codebuddy(token: &OauthToken) -> Result<OauthToken> {
     if token.refresh.is_empty() {
-        bail!("CodeBuddy credential has no refresh token; run :login again");
+        bail!("WorkBuddy credential has no refresh token; run :login again");
     }
     let endpoint = extra_string(token, ENDPOINT_EXTRA)
         .or_else(|| {
             extra_string(token, ENVIRONMENT_EXTRA)
                 .and_then(|environment| default_endpoint(&environment).map(str::to_string))
         })
-        .ok_or_else(|| anyhow!("CodeBuddy credential has no endpoint; run :login again"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy credential has no endpoint; run :login again"))?;
     let endpoint = auth_endpoint(&endpoint)?;
     let environment = extra_string(token, ENVIRONMENT_EXTRA).unwrap_or_else(|| "external".into());
     let domain = extra_string(token, DOMAIN_EXTRA).unwrap_or(endpoint_domain(&endpoint)?);
@@ -234,12 +233,12 @@ pub(in crate::oauth) async fn refresh_codebuddy(token: &OauthToken) -> Result<Oa
         .json(&json!({}))
         .send()
         .await
-        .context("CodeBuddy token refresh failed")?;
+        .context("WorkBuddy token refresh failed")?;
     let reply = ProviderReply::read(response).await?;
-    let mut auth = reply.payload("CodeBuddy token refresh")?;
+    let mut auth = reply.payload("WorkBuddy token refresh")?;
     let auth_object = auth
         .as_object_mut()
-        .ok_or_else(|| anyhow!("CodeBuddy token refresh returned no token"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy token refresh returned no token"))?;
     auth_object
         .entry("domain")
         .or_insert_with(|| Value::String(domain));
@@ -247,12 +246,11 @@ pub(in crate::oauth) async fn refresh_codebuddy(token: &OauthToken) -> Result<Oa
         .entry("refreshToken")
         .or_insert_with(|| Value::String(token.refresh.clone()));
     let accounts = fetch_accounts(&client, &endpoint, &auth, true).await?;
-    let account = accounts
-        .iter()
-        .find(|account| account.get("lastLogin").and_then(Value::as_bool) == Some(true))
-        .or_else(|| accounts.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("CodeBuddy refresh returned an empty account list"))?;
+    let account =
+        token.extra.get(ACCOUNT_EXTRA).cloned().ok_or_else(|| {
+            anyhow!("WorkBuddy credential has no current account; run :login again")
+        })?;
+    let account = merge_current_account(account, &accounts);
     token_from_session(auth, &endpoint, &environment, account, accounts)
 }
 
@@ -268,23 +266,33 @@ async fn fetch_accounts(
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or(endpoint_domain(endpoint)?);
-    let response = client
-        .get(api_url(endpoint, &format!("/v2{PREFIX_PATH}/accounts")))
-        .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {access}"))
-        .header("X-Domain", domain)
-        .send()
-        .await
-        .context("CodeBuddy account list request failed")?;
-    let reply = ProviderReply::read(response).await?;
-    let payload = reply.payload("CodeBuddy account list")?;
-    let accounts = payload
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let result = async {
+        let response = client
+            .get(api_url(endpoint, &format!("/v2{PREFIX_PATH}/accounts")))
+            .header("Accept", "application/json")
+            .header("Authorization", format!("Bearer {access}"))
+            .header("X-Domain", domain)
+            .send()
+            .await
+            .context("WorkBuddy account list request failed")?;
+        let reply = ProviderReply::read(response).await?;
+        let payload = reply.payload("WorkBuddy account list")?;
+        Ok::<_, anyhow::Error>(
+            payload
+                .get("accounts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+    .await;
+    let accounts = match result {
+        Ok(accounts) => accounts,
+        Err(error) if required => return Err(error),
+        Err(_) => Vec::new(),
+    };
     if required && accounts.is_empty() {
-        bail!("CodeBuddy account list is empty");
+        bail!("WorkBuddy account list is empty");
     }
     Ok(accounts)
 }
@@ -362,7 +370,7 @@ fn token_expiry(auth: &Value, nonrenewable: bool) -> i64 {
                 .filter(|value| *value > 0)
                 .map(|seconds| now + seconds * 1000)
         })
-        // CodeBuddy normally returns expiresAt or expiresIn. Preserve a
+        // WorkBuddy normally returns expiresAt or expiresIn. Preserve a
         // renewable session if an older enterprise deployment omits both;
         // forcing it immediately expired would create a refresh loop.
         .unwrap_or(now + 24 * 60 * 60 * 1000);
@@ -422,7 +430,7 @@ impl ProviderReply {
                 .unwrap_or("provider rejected the request");
             if matches!(code, Some(12005 | 11212 | 11216)) {
                 bail!(
-                    "{label} failed because the CodeBuddy license is unavailable ({code:?}): {message}"
+                    "{label} failed because the WorkBuddy license is unavailable ({code:?}): {message}"
                 );
             }
             if code == Some(10081) {
@@ -447,26 +455,26 @@ async fn send_or_cancel<T>(
     future: impl Future<Output = Result<T, reqwest::Error>>,
 ) -> Result<T> {
     if *cancel_rx.borrow() {
-        bail!("CodeBuddy login was cancelled");
+        bail!("WorkBuddy login was cancelled");
     }
     tokio::select! {
         result = future => Ok(result?),
         changed = cancel_rx.changed() => {
             let _ = changed;
-            bail!("CodeBuddy login was cancelled")
+            bail!("WorkBuddy login was cancelled")
         }
     }
 }
 
 async fn wait_to_poll(cancel_rx: &mut watch::Receiver<bool>) -> Result<()> {
     if *cancel_rx.borrow() {
-        bail!("CodeBuddy login was cancelled");
+        bail!("WorkBuddy login was cancelled");
     }
     tokio::select! {
         () = tokio::time::sleep(POLL_INTERVAL) => Ok(()),
         changed = cancel_rx.changed() => {
             let _ = changed;
-            bail!("CodeBuddy login was cancelled")
+            bail!("WorkBuddy login was cancelled")
         }
     }
 }
@@ -477,43 +485,26 @@ fn http_client() -> Result<reqwest::Client> {
         "x-requested-with",
         "XMLHttpRequest".parse().expect("static header value"),
     );
+    headers.insert("x-product", "SaaS".parse().expect("static header value"));
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent(format!("CodeBuddy/{REFERENCE_VERSION}"))
+        .user_agent(USER_AGENT)
         .default_headers(headers)
         .build()?)
 }
 
-fn login_endpoint(environment: &str, endpoint: Option<&str>) -> Result<String> {
-    match environment {
-        "external" | "internal" => normalize_endpoint(
-            default_endpoint(environment).expect("built-in CodeBuddy environment has endpoint"),
-        ),
-        "selfhosted" => {
-            let value = endpoint
-                .map(str::to_string)
-                .or_else(|| std::env::var("CODEBUDDY_BASE_URL").ok())
-                .ok_or_else(|| anyhow!("CodeBuddy Enterprise Domain requires an endpoint"))?;
-            auth_endpoint(&value)
-        }
-        "iOA" | "ioa" => bail!("CodeBuddy iOA login is not supported"),
-        other => bail!("unsupported CodeBuddy login environment {other:?}"),
-    }
-}
-
 pub(crate) fn default_endpoint(environment: &str) -> Option<&'static str> {
     match environment {
-        "external" => Some(EXTERNAL_ENDPOINT),
-        "internal" => Some(INTERNAL_ENDPOINT),
+        "external" => Some(WORKBUDDY_ENDPOINT),
         _ => None,
     }
 }
 
 pub(crate) fn normalize_endpoint(value: &str) -> Result<String> {
     let value = value.trim().trim_end_matches('/');
-    let url = Url::parse(value).context("invalid CodeBuddy endpoint")?;
+    let url = Url::parse(value).context("invalid WorkBuddy endpoint")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("CodeBuddy endpoint must be an HTTP or HTTPS URL");
+        bail!("WorkBuddy endpoint must be an HTTP or HTTPS URL");
     }
     Ok(value.to_string())
 }
@@ -524,10 +515,10 @@ fn auth_endpoint(value: &str) -> Result<String> {
 }
 
 fn endpoint_domain(endpoint: &str) -> Result<String> {
-    let url = Url::parse(endpoint).context("invalid CodeBuddy endpoint")?;
+    let url = Url::parse(endpoint).context("invalid WorkBuddy endpoint")?;
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("CodeBuddy endpoint has no domain"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy endpoint has no domain"))?;
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
@@ -544,7 +535,7 @@ fn api_url(endpoint: &str, path: &str) -> String {
 
 fn decorate_auth_url(value: String) -> Result<String> {
     let value = trusted_http_url(&value)?;
-    let mut url = Url::parse(&value).context("invalid CodeBuddy login URL")?;
+    let mut url = Url::parse(&value).context("invalid WorkBuddy login URL")?;
     url.query_pairs_mut()
         .append_pair("version", REFERENCE_VERSION);
     Ok(url.to_string())
@@ -556,7 +547,7 @@ fn required_string(value: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("CodeBuddy response has no {key}"))
+        .ok_or_else(|| anyhow!("WorkBuddy response has no {key}"))
 }
 
 fn extra_string(token: &OauthToken, key: &str) -> Option<String> {
@@ -604,18 +595,15 @@ mod tests {
     }
 
     #[test]
-    fn login_environments_use_the_reference_endpoints() {
-        assert_eq!(login_endpoint("external", None).unwrap(), EXTERNAL_ENDPOINT);
-        assert_eq!(login_endpoint("internal", None).unwrap(), INTERNAL_ENDPOINT);
-        assert!(login_endpoint("iOA", None).is_err());
-        assert!(login_endpoint("unknown", None).is_err());
+    fn authentication_identity_matches_workbuddy_ai() {
+        assert_eq!(default_endpoint("external"), Some(WORKBUDDY_ENDPOINT));
+        assert_eq!(default_endpoint("internal"), None);
+        assert_eq!(PLATFORM, "workbuddy-ai");
+        assert_eq!(REFERENCE_VERSION, "5.4.2.36857725");
         assert_eq!(
-            login_endpoint("selfhosted", Some("http://localhost:3000/")).unwrap(),
-            "http://localhost:3000"
-        );
-        assert_eq!(
-            login_endpoint("selfhosted", Some("http://localhost:3000/v2/")).unwrap(),
-            "http://localhost:3000"
+            USER_AGENT,
+            "workbuddy-ai/5.4.2.36857725 WorkBuddy/5.4.2.36857725 \
+             CLI/2.132.0-dev.9772d7b.202608221848"
         );
     }
 
@@ -626,10 +614,10 @@ mod tests {
                 "accessToken": "access",
                 "refreshToken": "refresh",
                 "expiresIn": 3600,
-                "domain": "www.codebuddy.ai",
+                "domain": "www.workbuddy.ai",
                 "method": "github"
             }),
-            EXTERNAL_ENDPOINT,
+            WORKBUDDY_ENDPOINT,
             "external",
             json!({"uid": "user-1", "enterpriseId": "enterprise-1"}),
             vec![json!({"uid": "user-1", "enterpriseId": "enterprise-1"})],
@@ -638,14 +626,14 @@ mod tests {
 
         assert_eq!(token.access, "access");
         assert_eq!(token.refresh, "refresh");
-        assert_eq!(token.extra[DOMAIN_EXTRA], "www.codebuddy.ai");
+        assert_eq!(token.extra[DOMAIN_EXTRA], "www.workbuddy.ai");
         assert_eq!(token.extra[METHOD_EXTRA], "github");
         assert!(token.extra[AUTH_EXTRA].get("accessToken").is_none());
         assert!(token.extra[AUTH_EXTRA].get("refreshToken").is_none());
     }
 
     #[test]
-    fn provider_reply_unwraps_codebuddy_data_and_pending_codes() {
+    fn provider_reply_unwraps_workbuddy_data_and_pending_codes() {
         let reply = ProviderReply {
             status: StatusCode::OK,
             value: json!({"code": 0, "data": {"state": "one"}}),
@@ -662,7 +650,7 @@ mod tests {
     #[test]
     fn browser_url_includes_the_reference_client_version() {
         let url =
-            decorate_auth_url("https://www.codebuddy.ai/login?state=one".to_string()).unwrap();
+            decorate_auth_url("https://www.workbuddy.ai/login?state=one".to_string()).unwrap();
         let url = Url::parse(&url).unwrap();
         assert!(
             url.query_pairs()
@@ -671,7 +659,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_uses_codebuddy_headers_and_selects_last_login_account() {
+    async fn login_tolerates_an_unavailable_optional_account_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut socket).await;
+            let body = json!({"code": 1, "msg": "temporarily unavailable"}).to_string();
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let accounts = fetch_accounts(
+            &http_client().unwrap(),
+            &format!("http://{address}"),
+            &json!({"accessToken": "access", "domain": "www.workbuddy.ai"}),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(accounts.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_workbuddy_headers_and_preserves_the_current_account() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -692,7 +707,12 @@ mod tests {
                     "code": 0,
                     "data": {
                         "accounts": [
-                            {"uid": "first", "enterpriseId": "one", "lastLogin": false},
+                            {
+                                "uid": "current",
+                                "enterpriseId": "one",
+                                "lastLogin": false,
+                                "departmentFullName": "engineering"
+                            },
                             {"uid": "selected", "enterpriseId": "two", "lastLogin": true}
                         ]
                     }
@@ -725,13 +745,21 @@ mod tests {
                     DOMAIN_EXTRA.to_string(),
                     Value::String("enterprise.example".to_string()),
                 ),
+                (
+                    ACCOUNT_EXTRA.to_string(),
+                    json!({"uid": "current", "enterpriseId": "one"}),
+                ),
             ]),
         };
 
         let refreshed = refresh_codebuddy(&token).await.unwrap();
         assert_eq!(refreshed.access, "fresh-access");
         assert_eq!(refreshed.refresh, "rotated-refresh");
-        assert_eq!(refreshed.extra[ACCOUNT_EXTRA]["uid"], "selected");
+        assert_eq!(refreshed.extra[ACCOUNT_EXTRA]["uid"], "current");
+        assert_eq!(
+            refreshed.extra[ACCOUNT_EXTRA]["departmentFullName"],
+            "engineering"
+        );
         assert_eq!(refreshed.extra[METHOD_EXTRA], "github");
         assert!(refreshed.extra[AUTH_EXTRA].get("accessToken").is_none());
         assert!(refreshed.extra[AUTH_EXTRA].get("refreshToken").is_none());
@@ -744,11 +772,15 @@ mod tests {
         assert!(refresh.contains("x-auth-refresh-source: plugin"));
         assert!(refresh.contains("x-domain: enterprise.example"));
         assert!(refresh.contains("x-requested-with: xmlhttprequest"));
+        assert!(refresh.contains("x-product: saas"));
+        assert!(refresh.contains(&format!("user-agent: {}", USER_AGENT.to_ascii_lowercase())));
         assert!(refresh.ends_with("{}"));
         let accounts = requests[1].to_ascii_lowercase();
         assert!(accounts.starts_with("get /v2/plugin/accounts http/1.1"));
         assert!(accounts.contains("authorization: bearer fresh-access"));
         assert!(accounts.contains("x-domain: enterprise.example"));
         assert!(accounts.contains("x-requested-with: xmlhttprequest"));
+        assert!(accounts.contains("x-product: saas"));
+        assert!(accounts.contains(&format!("user-agent: {}", USER_AGENT.to_ascii_lowercase())));
     }
 }

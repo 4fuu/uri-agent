@@ -1,7 +1,7 @@
 use crate::oauth::{
     CODEBUDDY_ACCOUNT_EXTRA, CODEBUDDY_DOMAIN_EXTRA, CODEBUDDY_ENDPOINT_EXTRA,
-    CODEBUDDY_ENVIRONMENT_EXTRA, CODEBUDDY_METHOD_EXTRA, OauthToken, codebuddy_default_endpoint,
-    normalize_codebuddy_endpoint,
+    CODEBUDDY_ENVIRONMENT_EXTRA, CODEBUDDY_METHOD_EXTRA, OauthToken, WORKBUDDY_USER_AGENT,
+    codebuddy_default_endpoint, normalize_codebuddy_endpoint,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -27,7 +27,7 @@ pub(crate) fn session_from_oauth(token: &OauthToken, base_url: Option<&str>) -> 
         .map(str::to_string)
         .or_else(|| extra_string(token, CODEBUDDY_ENDPOINT_EXTRA))
         .or_else(|| codebuddy_default_endpoint(&environment).map(str::to_string))
-        .ok_or_else(|| anyhow!("CodeBuddy OAuth session has no endpoint; run :login again"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy OAuth session has no endpoint; run :login again"))?;
     Ok(Session {
         endpoint: normalize_codebuddy_endpoint(&endpoint)?,
         domain: extra_string(token, CODEBUDDY_DOMAIN_EXTRA),
@@ -47,12 +47,14 @@ pub(crate) fn process_session_from(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "external".to_string());
         match environment.as_str() {
-            "external" | "internal" => codebuddy_default_endpoint(&environment)
-                .expect("built-in CodeBuddy environment has an endpoint")
+            "external" => codebuddy_default_endpoint(&environment)
+                .expect("the built-in WorkBuddy environment has an endpoint")
                 .to_string(),
-            "selfhosted" => bail!("self-hosted CodeBuddy requires {BASE_URL_VARIABLE}"),
-            "iOA" | "ioa" => bail!("CodeBuddy iOA is not supported"),
-            other => bail!("unsupported CodeBuddy environment {other:?}"),
+            "selfhosted" => bail!("a custom WorkBuddy endpoint requires {BASE_URL_VARIABLE}"),
+            "internal" | "iOA" | "ioa" => {
+                bail!("the {environment} login environment is not supported by WorkBuddy")
+            }
+            other => bail!("unsupported WorkBuddy environment {other:?}"),
         }
     };
     Ok(Session {
@@ -73,14 +75,22 @@ pub(crate) fn authenticated_headers(
         &mut headers,
         http::header::AUTHORIZATION,
         &format!("Bearer {token}"),
-        "CodeBuddy bearer token",
+        "WorkBuddy bearer token",
     )?;
     headers.insert(
         HeaderName::from_static("x-requested-with"),
         HeaderValue::from_static("XMLHttpRequest"),
     );
+    headers.insert(
+        HeaderName::from_static("x-product"),
+        HeaderValue::from_static("SaaS"),
+    );
+    headers.insert(
+        http::header::USER_AGENT,
+        HeaderValue::from_static(WORKBUDDY_USER_AGENT),
+    );
     if api_key {
-        insert_static(&mut headers, "x-api-key", token, "CodeBuddy API key")?;
+        insert_static(&mut headers, "x-api-key", token, "WorkBuddy API key")?;
     }
     apply_session_headers(&mut headers, session)?;
     Ok(headers)
@@ -88,7 +98,7 @@ pub(crate) fn authenticated_headers(
 
 fn apply_session_headers(headers: &mut HeaderMap, session: &Session) -> Result<()> {
     if let Some(domain) = &session.domain {
-        insert_static(headers, "x-domain", domain, "CodeBuddy domain")?;
+        insert_static(headers, "x-domain", domain, "WorkBuddy domain")?;
     }
     let Some(account) = session.account.as_ref() else {
         return Ok(());
@@ -98,34 +108,34 @@ fn apply_session_headers(headers: &mut HeaderMap, session: &Session) -> Result<(
     let department = value_string(account, "departmentFullName");
     let id_source = value_string(account, "idSource");
     if let Some(uid) = uid {
-        insert_static(headers, "x-user-id", uid, "CodeBuddy user ID")?;
+        insert_static(headers, "x-user-id", uid, "WorkBuddy user ID")?;
     }
     if let Some(enterprise) = enterprise {
         insert_static(
             headers,
             "x-enterprise-id",
             enterprise,
-            "CodeBuddy enterprise ID",
+            "WorkBuddy enterprise ID",
         )?;
-        insert_static(headers, "x-tenant-id", enterprise, "CodeBuddy tenant ID")?;
+        insert_static(headers, "x-tenant-id", enterprise, "WorkBuddy tenant ID")?;
     }
     if let Some(department) = department {
         insert_static(
             headers,
             "x-department-info",
             department,
-            "CodeBuddy department",
+            "WorkBuddy department",
         )?;
     }
     if let Some(method) = &session.method {
-        insert_static(headers, "x-auth-method", method, "CodeBuddy auth method")?;
+        insert_static(headers, "x-auth-method", method, "WorkBuddy auth method")?;
     }
     if let Some(id_source) = id_source {
         insert_static(
             headers,
             "x-id-source",
             id_source,
-            "CodeBuddy identity source",
+            "WorkBuddy identity source",
         )?;
     }
     if let Some(uid) = uid
@@ -154,7 +164,7 @@ fn apply_session_headers(headers: &mut HeaderMap, session: &Session) -> Result<(
             headers,
             "x-userinfo",
             &BASE64.encode(serde_json::to_vec(&userinfo)?),
-            "CodeBuddy encoded user info",
+            "WorkBuddy encoded user info",
         )?;
     }
     Ok(())

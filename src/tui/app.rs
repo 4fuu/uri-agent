@@ -729,7 +729,6 @@ enum TextPurpose {
         token: String,
         account_id: String,
     },
-    CodeBuddyEndpoint,
     CopilotDomain,
     EnvironmentName {
         return_to_settings: bool,

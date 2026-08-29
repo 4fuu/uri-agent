@@ -1093,7 +1093,7 @@ pub fn api_key_environment(provider: &str) -> String {
         "cerebras" => "CEREBRAS_API_KEY",
         "cloudflare-ai-gateway" => "CLOUDFLARE_API_TOKEN",
         "cloudflare-workers-ai" => "CLOUDFLARE_API_KEY",
-        "codebuddy" => "CODEBUDDY_API_KEY",
+        "workbuddy" => "CODEBUDDY_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
         "github-copilot" => "COPILOT_GITHUB_TOKEN",
@@ -1294,7 +1294,7 @@ mod tests {
         let mut catalog = ModelCatalog::load(root.path(), false).await.unwrap();
         catalog.providers_url = base_url.clone();
         let credentials = BTreeMap::from([(
-            "codebuddy".to_string(),
+            "workbuddy".to_string(),
             CatalogCredential {
                 secret: "oauth-access".to_string(),
                 oauth: true,
@@ -1316,13 +1316,13 @@ mod tests {
         let first = catalog.refresh(true, &credentials).await.unwrap();
         assert_eq!(first.discovery_failures, 0);
         assert_eq!(first.discovered_models, 1);
-        assert_eq!(catalog.models("codebuddy").await[0].id, "cloud-chat");
+        assert_eq!(catalog.models("workbuddy").await[0].id, "cloud-chat");
 
         let second = catalog.refresh(true, &credentials).await.unwrap();
         let requests = server.await.unwrap();
 
         assert_eq!(second.discovery_failures, 1);
-        assert_eq!(catalog.models("codebuddy").await[0].id, "cloud-chat");
+        assert_eq!(catalog.models("workbuddy").await[0].id, "cloud-chat");
         assert!(requests[1].starts_with("GET /v3/config "));
         assert!(requests[3].starts_with("GET /v3/config "));
     }
@@ -1504,13 +1504,13 @@ mod tests {
         let model = |name: &str| {
             serde_json::from_value::<CatalogModel>(serde_json::json!({
                 "id": "shared", "name": name, "api": "openai-completions",
-                "provider": "codebuddy", "baseUrl": "https://example.test/v2",
+                "provider": "workbuddy", "baseUrl": "https://example.test/v2",
                 "contextWindow": 128000, "maxTokens": 16000
             }))
             .unwrap()
         };
         let store = BTreeMap::from([(
-            "codebuddy".to_string(),
+            "workbuddy".to_string(),
             StoreEntry {
                 models: vec![model("Pi Name")],
                 discoveries: BTreeMap::from([(
@@ -1524,18 +1524,18 @@ mod tests {
             },
         )]);
         let user: ModelsFile = serde_json::from_value(serde_json::json!({
-            "providers": {"codebuddy": {"modelOverrides": {"shared": {"name": "User Name"}}}}
+            "providers": {"workbuddy": {"modelOverrides": {"shared": {"name": "User Name"}}}}
         }))
         .unwrap();
-        let scopes = BTreeMap::from([("codebuddy".to_string(), "account-a".to_string())]);
+        let scopes = BTreeMap::from([("workbuddy".to_string(), "account-a".to_string())]);
 
         let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &scopes);
         let (overridden, override_warnings) = merge_catalog(&store, &user, &scopes);
 
         assert!(warnings.is_empty());
         assert!(override_warnings.is_empty());
-        assert_eq!(merged["codebuddy"][0].name, "Cloud Name");
-        assert_eq!(overridden["codebuddy"][0].name, "User Name");
+        assert_eq!(merged["workbuddy"][0].name, "Cloud Name");
+        assert_eq!(overridden["workbuddy"][0].name, "User Name");
     }
 
     #[test]

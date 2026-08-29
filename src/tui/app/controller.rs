@@ -2400,10 +2400,6 @@ pub(super) async fn confirm_selector(app: &mut App, services: &LoopServices) -> 
                 open_copilot_domain_prompt(app);
                 Action::Continue
             }
-            "selfhosted" if provider == "codebuddy" => {
-                open_codebuddy_endpoint_prompt(app);
-                Action::Continue
-            }
             method => Action::StartOauth {
                 provider,
                 method: method.to_string(),
@@ -2522,23 +2518,6 @@ pub(super) fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> A
                         } else {
                             gateway_id
                         },
-                    }
-                }
-                TextPurpose::CodeBuddyEndpoint => {
-                    match oauth::normalize_codebuddy_endpoint(&prompt.value) {
-                        Ok(endpoint) => Action::StartOauth {
-                            provider: "codebuddy".to_string(),
-                            method: "selfhosted".to_string(),
-                            extra: std::collections::BTreeMap::from([(
-                                "endpoint".to_string(),
-                                endpoint,
-                            )]),
-                        },
-                        Err(error) => {
-                            open_codebuddy_endpoint_prompt(app);
-                            app.set_flash(format!("Invalid CodeBuddy endpoint: {error}"));
-                            Action::Continue
-                        }
                     }
                 }
                 TextPurpose::CopilotDomain => Action::StartOauth {
@@ -3549,18 +3528,6 @@ fn open_cloudflare_gateway_prompt(app: &mut App, token: String, account_id: Stri
     app.overlay = Some(Overlay::Text);
 }
 
-pub(super) fn open_codebuddy_endpoint_prompt(app: &mut App) {
-    app.text_prompt = Some(TextPrompt {
-        title: "CODEBUDDY ENTERPRISE DOMAIN".to_string(),
-        message: "Enter the enterprise CodeBuddy endpoint, including http:// or https://."
-            .to_string(),
-        value: std::env::var("CODEBUDDY_BASE_URL").unwrap_or_default(),
-        secret: false,
-        purpose: TextPurpose::CodeBuddyEndpoint,
-    });
-    app.overlay = Some(Overlay::Text);
-}
-
 pub(super) fn open_copilot_domain_prompt(app: &mut App) {
     app.text_prompt = Some(TextPrompt {
         title: "GITHUB COPILOT".to_string(),
@@ -3968,9 +3935,9 @@ pub(super) fn start_oauth(
 
 async fn refresh_codebuddy_models(manager: &ConfigManager, catalog: &ModelCatalog) -> Result<()> {
     manager.refresh_catalog(true).await?;
-    if catalog.models("codebuddy").await.is_empty() {
+    if catalog.models("workbuddy").await.is_empty() {
         bail!(
-            "CodeBuddy cloud configuration is disabled or /v3/config returned no runnable models"
+            "WorkBuddy cloud configuration is disabled or /v3/config returned no runnable models"
         );
     }
     Ok(())
@@ -3988,7 +3955,7 @@ pub(super) async fn store_api_key(
     }
     let result = async {
         services.manager.set_api_key(provider, key).await?;
-        if provider == "codebuddy" {
+        if provider == "workbuddy" {
             refresh_codebuddy_models(&services.manager, &services.catalog).await?;
         }
         let active = active_for_runtime(&services.manager, &services.runtime).await?;
@@ -4812,7 +4779,7 @@ pub(super) async fn finish_background(
                 Ok(token) => {
                     let applied = async {
                         services.manager.set_oauth(&provider, token).await?;
-                        if provider == "codebuddy" {
+                        if provider == "workbuddy" {
                             refresh_codebuddy_models(&services.manager, &services.catalog).await?;
                         }
                         let active =

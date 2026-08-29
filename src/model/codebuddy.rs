@@ -1,8 +1,8 @@
-//! CodeBuddy's provider-owned request and authentication boundary.
+//! WorkBuddy's provider-owned request and authentication boundary.
 //!
-//! Model capability metadata comes from CodeBuddy's cloud product
+//! Model capability metadata comes from WorkBuddy's cloud product
 //! configuration, while endpoint and authentication fields are resolved here.
-//! Catalog or user model overrides must not be able to redirect a CodeBuddy
+//! Catalog or user model overrides must not be able to redirect a WorkBuddy
 //! credential or replace its identity headers.
 
 use super::failure::ModelFailurePhase;
@@ -26,7 +26,7 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-pub(crate) const PROVIDER: &str = "codebuddy";
+pub(crate) const PROVIDER: &str = "workbuddy";
 
 #[derive(Clone, PartialEq)]
 struct CodeBuddyCredential {
@@ -136,12 +136,12 @@ async fn resolve_credential(
         .resolve_model_api_key(settings)
         .await?
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("CodeBuddy requires a login, API key, or auth token"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy requires a login, API key, or auth token"))?;
     let custom_token = matches!(
         &settings.api_key_source,
         ValueSource::Environment(name) if name == AUTH_TOKEN_VARIABLE
     );
-    // An API key overrides the bearer token in CodeBuddy but does not discard
+    // An API key overrides the bearer token in WorkBuddy but does not discard
     // the current signed-in account identity. A custom auth token is itself a
     // complete non-refreshable session and therefore does replace it.
     let stored = if custom_token {
@@ -174,11 +174,11 @@ fn request_model(
     credential: &CodeBuddyCredential,
 ) -> Result<(CatalogModel, RigRequestOptions)> {
     if catalog.provider != PROVIDER {
-        bail!("CodeBuddy backend cannot run provider {}", catalog.provider);
+        bail!("WorkBuddy backend cannot run provider {}", catalog.provider);
     }
     if catalog.api != "openai-completions" {
         bail!(
-            "CodeBuddy does not support catalog API {:?} through its model endpoint",
+            "WorkBuddy does not support catalog API {:?} through its model endpoint",
             catalog.api
         );
     }
@@ -266,6 +266,8 @@ mod tests {
         let headers = options.extra_headers;
         assert_eq!(headers["authorization"], "Bearer oauth-access");
         assert_eq!(headers["x-requested-with"], "XMLHttpRequest");
+        assert_eq!(headers["x-product"], "SaaS");
+        assert_eq!(headers["user-agent"], crate::oauth::WORKBUDDY_USER_AGENT);
         assert_eq!(headers["x-domain"], "enterprise.example");
         assert_eq!(headers["x-user-id"], "user-1");
         assert_eq!(headers["x-enterprise-id"], "enterprise-1");
@@ -326,7 +328,7 @@ mod tests {
                 ),
                 (
                     CODEBUDDY_ENDPOINT_EXTRA.to_string(),
-                    Value::String("https://www.codebuddy.ai".to_string()),
+                    Value::String("https://www.workbuddy.ai".to_string()),
                 ),
             ]),
         };
@@ -339,6 +341,11 @@ mod tests {
     #[test]
     fn ioa_and_unsupported_catalog_apis_are_rejected() {
         assert!(process_session_from(None, Some("iOA".to_string())).is_err());
+        assert!(process_session_from(None, Some("internal".to_string())).is_err());
+        assert_eq!(
+            process_session_from(None, None).unwrap().endpoint,
+            "https://www.workbuddy.ai"
+        );
 
         let mut unsupported = model();
         unsupported.api = "openai-responses".to_string();

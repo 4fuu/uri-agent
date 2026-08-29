@@ -809,13 +809,13 @@ impl ConfigManager {
                 &files,
                 &self.catalog,
                 &self.invocation,
-                "codebuddy",
-                current_provider == "codebuddy",
+                "workbuddy",
+                current_provider == "workbuddy",
             )
             .await;
             credential.kind == AuthKind::Oauth
                 && credential.source == ValueSource::Global
-                && files.auth.0.get("codebuddy").is_some_and(|entry| {
+                && files.auth.0.get("workbuddy").is_some_and(|entry| {
                     entry.kind == "oauth"
                         && entry
                             .expires
@@ -823,7 +823,7 @@ impl ConfigManager {
                 })
         };
         if refresh_codebuddy {
-            self.refresh_oauth("codebuddy", false).await?;
+            self.refresh_oauth("workbuddy", false).await?;
         }
         let candidates = {
             let files = self.files.lock().await;
@@ -1267,8 +1267,8 @@ async fn discovery_credential_candidates(
 ) -> Vec<DiscoveryCredentialCandidate> {
     let current_provider = selected_provider(files, invocation).0;
     let mut providers = catalog.providers().await;
-    if !providers.iter().any(|provider| provider == "codebuddy") {
-        providers.push("codebuddy".to_string());
+    if !providers.iter().any(|provider| provider == "workbuddy") {
+        providers.push("workbuddy".to_string());
     }
     let mut candidates = Vec::new();
     for provider in providers {
@@ -1286,7 +1286,7 @@ async fn discovery_credential_candidates(
         let Some(value) = credential.api_key else {
             continue;
         };
-        let codebuddy = if provider == "codebuddy" {
+        let codebuddy = if provider == "workbuddy" {
             let custom_token = matches!(
                 &credential.source,
                 ValueSource::Environment(name) if name == CODEBUDDY_AUTH_TOKEN_VARIABLE
@@ -1297,9 +1297,9 @@ async fn discovery_credential_candidates(
                 files
                     .auth
                     .0
-                    .get("codebuddy")
+                    .get("workbuddy")
                     .filter(|entry| entry.kind == "oauth")
-                    .and_then(|entry| oauth_token_from_entry("codebuddy", entry).ok())
+                    .and_then(|entry| oauth_token_from_entry("workbuddy", entry).ok())
             };
             let base_url = env::var(CODEBUDDY_BASE_URL_VARIABLE)
                 .ok()
@@ -1528,7 +1528,7 @@ async fn resolve_model_credential(
     if kind == AuthKind::None && api_key.is_some() {
         kind = AuthKind::ApiKey;
     }
-    if provider == "codebuddy" {
+    if provider == "workbuddy" {
         if let Ok(value) = env::var("CODEBUDDY_API_KEY")
             && !value.trim().is_empty()
         {
@@ -1537,7 +1537,7 @@ async fn resolve_model_credential(
             kind = AuthKind::ApiKey;
         }
         // models.json supports `apiKey: "!command"`, which is URI Agent's
-        // equivalent of CodeBuddy's apiKeyHelper and has the same precedence.
+        // equivalent of WorkBuddy's apiKeyHelper and has the same precedence.
         if let Some(value) = models_key {
             api_key = Some(value);
             source = ValueSource::ModelsFile;
@@ -3218,7 +3218,7 @@ mod tests {
             global: SettingsFile::default(),
             project: SettingsFile::default(),
             auth: serde_json::from_value(serde_json::json!({
-                "codebuddy": {
+                "workbuddy": {
                     "type": "oauth",
                     "refresh": "expired-refresh",
                     "access": "expired-access",
@@ -3228,13 +3228,13 @@ mod tests {
             .unwrap(),
         };
         let invocation = InvocationOverrides {
-            provider: Some("codebuddy".to_string()),
+            provider: Some("workbuddy".to_string()),
             api_key: Some("invocation-key".to_string()),
             ..InvocationOverrides::default()
         };
 
         let credential =
-            resolve_model_credential(&files, &catalog, &invocation, "codebuddy", true).await;
+            resolve_model_credential(&files, &catalog, &invocation, "workbuddy", true).await;
 
         assert_eq!(credential.api_key.as_deref(), Some("invocation-key"));
         assert_eq!(credential.kind, AuthKind::ApiKey);

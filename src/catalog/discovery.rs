@@ -22,7 +22,7 @@ const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("anthropic", DiscoveryKind::Anthropic),
     ("baseten", DiscoveryKind::OpenAi),
     ("cerebras", DiscoveryKind::OpenAi),
-    ("codebuddy", DiscoveryKind::CodeBuddy),
+    ("workbuddy", DiscoveryKind::CodeBuddy),
     ("deepseek", DiscoveryKind::OpenAi),
     ("google", DiscoveryKind::Gemini),
     ("groq", DiscoveryKind::OpenAi),
@@ -621,7 +621,8 @@ mod tests {
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
         assert_eq!(provider_ids().count(), 29);
-        assert!(supports_provider("codebuddy"));
+        assert!(supports_provider("workbuddy"));
+        assert!(!supports_provider("codebuddy"));
         assert!(supports_provider("opencode-go"));
         assert!(supports_provider("google"));
         assert!(!supports_provider("amazon-bedrock"));
@@ -635,8 +636,8 @@ mod tests {
             oauth: true,
             codebuddy: Some(CodeBuddyCatalogCredential {
                 session: Session {
-                    endpoint: "https://www.codebuddy.ai".to_string(),
-                    domain: Some("www.codebuddy.ai".to_string()),
+                    endpoint: "https://www.workbuddy.ai".to_string(),
+                    domain: Some("www.workbuddy.ai".to_string()),
                     method: Some("github".to_string()),
                     account: Some(serde_json::json!({
                         "uid": uid,
@@ -647,9 +648,9 @@ mod tests {
             }),
         };
 
-        let original = credential_fingerprint("codebuddy", &credential("old-access", "user-1"));
-        let rotated = credential_fingerprint("codebuddy", &credential("new-access", "user-1"));
-        let other = credential_fingerprint("codebuddy", &credential("new-access", "user-2"));
+        let original = credential_fingerprint("workbuddy", &credential("old-access", "user-1"));
+        let rotated = credential_fingerprint("workbuddy", &credential("new-access", "user-1"));
+        let other = credential_fingerprint("workbuddy", &credential("new-access", "user-2"));
         let mut first_api_key = credential("api-key-one", "user-1");
         first_api_key.oauth = false;
         first_api_key.codebuddy.as_mut().unwrap().api_key = true;
@@ -659,8 +660,8 @@ mod tests {
         assert_eq!(original, rotated);
         assert_ne!(original, other);
         assert_ne!(
-            credential_fingerprint("codebuddy", &first_api_key),
-            credential_fingerprint("codebuddy", &second_api_key)
+            credential_fingerprint("workbuddy", &first_api_key),
+            credential_fingerprint("workbuddy", &second_api_key)
         );
     }
 

@@ -1,4 +1,4 @@
-//! CodeBuddy cloud product configuration model discovery.
+//! WorkBuddy cloud product configuration model discovery.
 
 use super::{CatalogCredential, CatalogModel};
 use crate::codebuddy::authenticated_headers;
@@ -8,7 +8,7 @@ use reqwest::{Client, Url};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
-pub(super) const PROVIDER: &str = "codebuddy";
+pub(super) const PROVIDER: &str = "workbuddy";
 pub(super) const REFRESH_INTERVAL_MS: i64 = 8 * 60 * 1000;
 pub(super) const MAX_CACHED_CONFIGS: usize = 20;
 
@@ -25,13 +25,12 @@ pub(super) async fn discover(
     let context = credential
         .codebuddy
         .as_ref()
-        .ok_or_else(|| anyhow!("CodeBuddy model discovery has no session context"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy model discovery has no session context"))?;
     let endpoint = context.session.endpoint.trim_end_matches('/');
     let endpoint = endpoint.strip_suffix("/v2").unwrap_or(endpoint);
     let url = Url::parse(&format!("{endpoint}/v3/config"))
-        .context("invalid CodeBuddy cloud product configuration URL")?;
+        .context("invalid WorkBuddy cloud product configuration URL")?;
     let mut headers = authenticated_headers(&credential.secret, context.api_key, &context.session)?;
-    headers.insert("x-product", "SaaS".parse().expect("static header value"));
     headers.insert(CONNECTION, "close".parse().expect("static header value"));
     headers.insert(
         ACCEPT,
@@ -51,7 +50,7 @@ pub(super) async fn discover(
         .and_then(code_value)
         .is_some_and(|code| code != 0)
     {
-        bail!("CodeBuddy cloud product configuration was rejected");
+        bail!("WorkBuddy cloud product configuration was rejected");
     }
     parse_product_config(value, endpoint)
 }
@@ -65,13 +64,13 @@ fn parse_product_config(value: Value, endpoint: &str) -> Result<Vec<CatalogModel
     let records = product
         .get("models")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("CodeBuddy cloud product configuration has no models array"))?;
+        .ok_or_else(|| anyhow!("WorkBuddy cloud product configuration has no models array"))?;
     let models = records
         .iter()
         .filter_map(|record| catalog_model(record, endpoint))
         .collect::<Vec<_>>();
     if models.is_empty() {
-        bail!("CodeBuddy cloud product configuration has no runnable chat models");
+        bail!("WorkBuddy cloud product configuration has no runnable chat models");
     }
     Ok(models)
 }
@@ -141,7 +140,7 @@ fn catalog_model(raw: &Value, endpoint: &str) -> Option<CatalogModel> {
             }),
         ),
         ("discovered".to_string(), Value::Bool(true)),
-        ("codebuddy".to_string(), raw.clone()),
+        ("workbuddy".to_string(), raw.clone()),
     ]);
     Some(CatalogModel {
         id: id.to_string(),
@@ -236,21 +235,21 @@ mod tests {
                     {"id": "image-only", "name": "Image only"}
                 ]}}
             }),
-            "https://www.codebuddy.ai",
+            "https://www.workbuddy.ai",
         )
         .unwrap();
 
         assert_eq!(models.len(), 1);
         let model = &models[0];
         assert_eq!(model.id, "gpt-cloud");
-        assert_eq!(model.base_url, "https://www.codebuddy.ai/v2");
+        assert_eq!(model.base_url, "https://www.workbuddy.ai/v2");
         assert_eq!(model.context_window(), 200_000);
         assert_eq!(model.max_tokens(), 32_000);
         assert_eq!(model.metadata["input"], json!(["text", "image"]));
         assert_eq!(model.metadata["thinkingLevelMap"]["off"], Value::Null);
         assert_eq!(model.metadata["thinkingLevelMap"]["high"], "high");
         assert_eq!(model.metadata["samplingParams"]["temperature"], 1);
-        assert_eq!(model.metadata["codebuddy"]["name"], "GPT Cloud");
+        assert_eq!(model.metadata["workbuddy"]["name"], "GPT Cloud");
     }
 
     #[test]
@@ -327,6 +326,10 @@ mod tests {
         assert!(lower.contains("authorization: bearer oauth-access\r\n"));
         assert!(lower.contains("x-requested-with: xmlhttprequest\r\n"));
         assert!(lower.contains("x-product: saas\r\n"));
+        assert!(lower.contains(&format!(
+            "user-agent: {}\r\n",
+            crate::oauth::WORKBUDDY_USER_AGENT.to_ascii_lowercase()
+        )));
         assert!(lower.contains("x-domain: enterprise.example\r\n"));
         assert!(lower.contains("x-user-id: user@example.com\r\n"));
         assert!(lower.contains("x-enterprise-id: enterprise-1\r\n"));

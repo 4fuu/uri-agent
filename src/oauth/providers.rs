@@ -14,7 +14,8 @@ pub(super) use antigravity::{refresh_antigravity, start_antigravity};
 pub(crate) use codebuddy::{
     ACCOUNT_EXTRA as CODEBUDDY_ACCOUNT_EXTRA, DOMAIN_EXTRA as CODEBUDDY_DOMAIN_EXTRA,
     ENDPOINT_EXTRA as CODEBUDDY_ENDPOINT_EXTRA, ENVIRONMENT_EXTRA as CODEBUDDY_ENVIRONMENT_EXTRA,
-    METHOD_EXTRA as CODEBUDDY_METHOD_EXTRA, default_endpoint as codebuddy_default_endpoint,
+    METHOD_EXTRA as CODEBUDDY_METHOD_EXTRA, USER_AGENT as WORKBUDDY_USER_AGENT,
+    default_endpoint as codebuddy_default_endpoint,
     normalize_endpoint as normalize_codebuddy_endpoint,
 };
 pub(super) use codebuddy::{refresh_codebuddy, start_codebuddy};

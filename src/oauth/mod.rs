@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) use providers::{
     CODEBUDDY_ACCOUNT_EXTRA, CODEBUDDY_DOMAIN_EXTRA, CODEBUDDY_ENDPOINT_EXTRA,
-    CODEBUDDY_ENVIRONMENT_EXTRA, CODEBUDDY_METHOD_EXTRA, chatgpt_account_id,
+    CODEBUDDY_ENVIRONMENT_EXTRA, CODEBUDDY_METHOD_EXTRA, WORKBUDDY_USER_AGENT, chatgpt_account_id,
     codebuddy_default_endpoint, normalize_codebuddy_endpoint,
 };
 pub use util::parse_authorization_input;
@@ -53,7 +53,7 @@ impl OauthProvider {
         Some(match id {
             "antigravity" => Self::Antigravity,
             "anthropic" => Self::Anthropic,
-            "codebuddy" => Self::CodeBuddy,
+            "workbuddy" => Self::CodeBuddy,
             "openrouter" => Self::OpenRouter,
             "openai-codex" => Self::OpenAiCodex,
             "github-copilot" => Self::GitHubCopilot,
@@ -68,7 +68,7 @@ impl OauthProvider {
         match self {
             Self::Antigravity => "antigravity",
             Self::Anthropic => "anthropic",
-            Self::CodeBuddy => "codebuddy",
+            Self::CodeBuddy => "workbuddy",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCodex => "openai-codex",
             Self::GitHubCopilot => "github-copilot",
@@ -82,7 +82,7 @@ impl OauthProvider {
         match self {
             Self::Antigravity => "Google Antigravity",
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
-            Self::CodeBuddy => "CodeBuddy",
+            Self::CodeBuddy => "WorkBuddy",
             Self::OpenRouter => "OpenRouter OAuth",
             Self::OpenAiCodex => "OpenAI Codex",
             Self::GitHubCopilot => "GitHub Copilot",
@@ -104,23 +104,11 @@ impl OauthProvider {
                 label: "Claude Pro/Max",
                 description: "Browser OAuth, same flow as Pi Agent",
             }],
-            Self::CodeBuddy => &[
-                OauthMethod {
-                    id: "internal",
-                    label: "Chinese Site",
-                    description: "Sign in with WeChat",
-                },
-                OauthMethod {
-                    id: "external",
-                    label: "International Site",
-                    description: "Sign in with Google or GitHub",
-                },
-                OauthMethod {
-                    id: "selfhosted",
-                    label: "Enterprise Domain",
-                    description: "Sign in through an enterprise CodeBuddy endpoint",
-                },
-            ],
+            Self::CodeBuddy => &[OauthMethod {
+                id: "workbuddy",
+                label: "WorkBuddy AI",
+                description: "Browser login at workbuddy.ai",
+            }],
             Self::OpenRouter => &[OauthMethod {
                 id: "oauth",
                 label: "Sign in with OpenRouter",
@@ -261,9 +249,7 @@ pub fn start_login(
     match kind {
         OauthProvider::Antigravity => providers::start_antigravity(),
         OauthProvider::Anthropic => providers::start_anthropic(),
-        OauthProvider::CodeBuddy => {
-            providers::start_codebuddy(method, extra.get("endpoint").map(String::as_str))
-        }
+        OauthProvider::CodeBuddy => providers::start_codebuddy(),
         OauthProvider::OpenRouter => providers::start_openrouter(),
         OauthProvider::OpenAiCodex if method == "device_code" => providers::start_codex_device(),
         OauthProvider::OpenAiCodex => providers::start_codex_browser(),
@@ -372,7 +358,7 @@ mod tests {
         assert_eq!(OauthProvider::ALL.len(), 9);
         assert!(oauth_enabled("antigravity"));
         assert!(oauth_enabled("anthropic"));
-        assert!(oauth_enabled("codebuddy"));
+        assert!(oauth_enabled("workbuddy"));
         assert!(oauth_enabled("openrouter"));
         assert!(oauth_enabled("openai-codex"));
         assert!(oauth_enabled("github-copilot"));
@@ -380,8 +366,11 @@ mod tests {
         assert!(oauth_enabled("xai"));
         assert!(oauth_enabled("radius"));
         assert!(!oauth_enabled("openai"));
+        assert!(!oauth_enabled("codebuddy"));
         assert_eq!(OauthProvider::Antigravity.name(), "Google Antigravity");
-        assert_eq!(OauthProvider::CodeBuddy.methods().len(), 3);
+        assert_eq!(OauthProvider::CodeBuddy.name(), "WorkBuddy");
+        assert_eq!(OauthProvider::CodeBuddy.methods().len(), 1);
+        assert_eq!(OauthProvider::CodeBuddy.methods()[0].id, "workbuddy");
         assert_eq!(OauthProvider::OpenAiCodex.methods().len(), 2);
         assert!(!OauthProvider::OpenAiCodex.offers_api_key());
         assert!(!OauthProvider::Antigravity.offers_api_key());
