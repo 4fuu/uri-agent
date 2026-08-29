@@ -40,6 +40,9 @@ automatically become managed background tasks when long, and notify the model
 on completion without polling. Append-only session history is stored in
 SQLite.
 
+For image-capable models, the built-in `file` protocol returns PNG, JPEG, GIF,
+and WebP files directly to the model when they are read.
+
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols run with the permissions of the `uri-agent` process. Use it only with projects and configuration you trust.
 

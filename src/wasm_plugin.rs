@@ -1172,13 +1172,20 @@ impl ModelTool for WasmModelTool {
         self.descriptor.clone()
     }
 
-    async fn execute(&self, arguments: &Value, protocols: &ProtocolRegistry) -> Result<String> {
+    async fn execute(
+        &self,
+        arguments: &Value,
+        protocols: &ProtocolRegistry,
+    ) -> Result<crate::plugin::ModelToolOutput> {
         let input = serde_json::to_vec(&HandlerRequest::ModelTool {
             name: self.descriptor.name.clone(),
             arguments: arguments.clone(),
         })?;
         let output = call_wasm_handler(&self.runtime, &self.plugin_path, input).await?;
-        protocols.present(output, &self.descriptor.name).await
+        protocols
+            .present(output, &self.descriptor.name)
+            .await
+            .map(Into::into)
     }
 }
 
@@ -1821,7 +1828,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request: Value = serde_json::from_str(&result).unwrap();
+        let request: Value = serde_json::from_str(result.output()).unwrap();
         assert_eq!(request["kind"], "model_tool");
         assert_eq!(request["name"], "example_direct");
         assert_eq!(

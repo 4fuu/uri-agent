@@ -1,7 +1,7 @@
 use super::file::resolve_path;
 use super::{EditableText, atomic_write};
 use crate::config::display_path;
-use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
+use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -88,13 +88,19 @@ impl ModelTool for ApplyPatchTool {
         }
     }
 
-    async fn execute(&self, arguments: &Value, _protocols: &ProtocolRegistry) -> Result<String> {
+    async fn execute(
+        &self,
+        arguments: &Value,
+        _protocols: &ProtocolRegistry,
+    ) -> Result<ModelToolOutput> {
         let arguments: ApplyPatchArguments = serde_json::from_value(arguments.clone())
             .context("invalid apply_patch tool arguments")?;
         if arguments.patch.is_empty() {
             bail!("apply_patch patch must be nonempty");
         }
-        apply_patch(&self.cwd, &arguments.patch).await
+        apply_patch(&self.cwd, &arguments.patch)
+            .await
+            .map(Into::into)
     }
 }
 
@@ -738,7 +744,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(output.contains("A added.txt"));
+        assert!(output.output().contains("A added.txt"));
         assert_eq!(
             fs::read_to_string(directory.path().join("added.txt"))
                 .await

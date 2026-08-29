@@ -45,7 +45,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/subagent.rs` | Ephemeral role-based model/tool loops, capability restriction, working-directory toolboxes, and usage aggregation |
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
-| `src/protocol.rs` | `Protocol`, descriptors, registry, address splitting, dispatch, and output presentation |
+| `src/protocol.rs` | `Protocol`, text and image read output, descriptors, registry, address splitting, dispatch, and output presentation |
 | `src/builtins/` | Built-in project-instruction, embedded-documentation, file, grep, session archive, HTTPS, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific HTTPS internals |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, persistent settings, and model-tool, protocol, command, generic panel, status, composer completion, and submission-effect registration |
 | `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
@@ -108,6 +108,11 @@ and direct tools use the trusted [WASM plugin](plugins.md) path instead.
 - Protocol names are unique. Every protocol implements `read` so its mandatory
   `<protocol>://help` route is available; it may additionally implement `exec`.
 - Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
+- Linked protocols that return images use `Protocol::read_output` and retain a
+  textual result for transcript presentation. The runtime carries images as
+  typed model content, rejects them for text-only models, and persists them in
+  the correlated model-message boundary. Ordinary `Protocol::read`
+  implementations remain text-compatible through the default adapter.
 - Keep protocol bodies semantically plain text when practical. Put operation
   selection and bounded options in the protocol-owned URI path or query. If a
   capability needs complex structured arguments, or its common calls require

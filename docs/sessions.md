@@ -70,7 +70,13 @@ of its query. Appends between requests do not alter earlier sequence ranges;
 they become visible to a later `after` query when its cursor reaches them.
 Turn-aware grouping remains a presentation-layer policy.
 
-The transcript and model-replay forms of one message commit in the same SQLite transaction. Streaming text and reasoning are provisional TUI updates; only the completed response enters durable replay. Provider tool-call identity is preserved so resumed tool conversations remain valid for the selected backend.
+The transcript and model-replay forms of one message commit in the same SQLite
+transaction. This includes typed images returned by a protocol read: the
+transcript retains its textual tool-result summary while the corresponding
+model message retains the image content for replay and resume. Streaming text
+and reasoning are provisional TUI updates; only the completed response enters
+durable replay. Provider tool-call identity is preserved so resumed tool
+conversations remain valid for the selected backend.
 
 ## Model request retries
 

@@ -8,7 +8,7 @@ use crate::model::{
 use crate::output::OutputStore;
 use crate::plugin::{CommandRegistry, ModelToolRegistry, PluginHost, PluginRegistry, TuiRegistry};
 use crate::prompts::{self, PromptEntry};
-use crate::protocol::ProtocolRegistry;
+use crate::protocol::{ProtocolImage, ProtocolRegistry};
 use crate::skill::SkillProtocolSource;
 use crate::task::TaskManager;
 use anyhow::{Context, Result, anyhow, bail};
@@ -522,15 +522,31 @@ async fn complete_with_backend(
                     .model_tools
                     .dispatch(&name, &call.function.arguments, &protocols)
                     .await
-                    .unwrap_or_else(|error| format!("Error: {error:#}"))
             } else {
-                format!("Error: unknown subagent model tool: {name}")
+                Err(anyhow!("unknown subagent model tool: {name}"))
             };
+            let output = output.and_then(|output| {
+                if !output.images().is_empty() && !backend.accepts_image_input() {
+                    bail!("the active model does not accept image input")
+                }
+                Ok(output)
+            });
+            let (output, images) = match output {
+                Ok(output) => output.into_parts(),
+                Err(error) => (format!("Error: {error:#}"), Vec::new()),
+            };
+            let mut content = Vec::with_capacity(images.len() + 1);
+            content.push(ToolResultContent::Text(Text::new(output)));
+            content.extend(
+                images
+                    .into_iter()
+                    .map(ProtocolImage::into_tool_result_content),
+            );
             results.push(UserContent::tool_result_for(
                 call.id,
                 call.provider,
                 name,
-                vec![ToolResultContent::Text(Text::new(output))],
+                content,
             ));
         }
         history.push(Message::User { content: results });
@@ -652,8 +668,8 @@ mod tests {
             &self,
             arguments: &serde_json::Value,
             _protocols: &ProtocolRegistry,
-        ) -> Result<String> {
-            Ok(arguments["message"].as_str().unwrap().to_string())
+        ) -> Result<crate::plugin::ModelToolOutput> {
+            Ok(arguments["message"].as_str().unwrap().into())
         }
     }
 

@@ -4,7 +4,10 @@ use crate::plugin::{
     Plugin, PluginHost, TuiCompletionContext, TuiCompletionItem, TuiCompletionProvider,
     TuiCompletions, TuiTextPosition, TuiTextRange,
 };
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolImage, ProtocolImageMediaType,
+    ProtocolReadOutput, ProtocolRequest,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use ignore::{DirEntry, WalkBuilder, overrides::OverrideBuilder};
@@ -22,7 +25,7 @@ fn help(cwd: &Path) -> String {
     format!(
         r#"# file
 
-Read files and directories.
+Read text files, images, and directories.
 
 Current working directory: `file://{}`
 
@@ -30,7 +33,10 @@ Current working directory: `file://{}`
   project-relative path or an absolute filesystem path; relative paths resolve
   from the current working directory. On Unix, `~` and paths beginning with
   `~/` resolve from the current user's home directory; `~user` is not expanded.
-- Add `?offset=<line>&limit=<count>` to read a bounded range. `<line>` is the
+- PNG, JPEG, GIF, and WebP files are detected from their contents and returned
+  as images for models that accept image input. Image reads do not accept query
+  parameters.
+- Add `?offset=<line>&limit=<count>` to read a bounded text range. `<line>` is the
   one-based starting line or directory-entry position, and `<count>` is the
   maximum number of lines or entries to return. The default is 200 and the
   maximum is 2000.
@@ -61,6 +67,51 @@ impl FileProtocol {
     pub(super) fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+        }
+    }
+
+    async fn read_request(&self, request: ProtocolRequest<'_>) -> Result<ProtocolReadOutput> {
+        if !request.body.is_empty() {
+            if request.target == "help" {
+                bail!(r#"file://help requires an empty body; retry read("file://help", "")"#);
+            }
+            if request.target.is_empty() {
+                bail!(
+                    r#"file reads require an empty body; put the path in the URI, for example read("file://<path>", "")"#
+                );
+            }
+            bail!(
+                "file reads require an empty body; retry read({:?}, \"\")",
+                request.uri
+            );
+        }
+        if request.target == "help" {
+            return Ok(help(&self.cwd).into_bytes().into());
+        }
+
+        let (target, query) = split_query(request.target);
+        let path = resolve_path(&self.cwd, target)?;
+        let range = Range::parse(query)?;
+        let metadata = fs::metadata(&path)
+            .await
+            .with_context(|| format!("cannot read {}", display_path(&path)))?;
+        if let Some(pattern) = range.glob.clone() {
+            if !metadata.is_dir() {
+                bail!("file glob root is not a directory: {}", display_path(&path));
+            }
+            if range.line_numbers {
+                bail!("line_numbers is not supported with file glob");
+            }
+            return Ok(read_glob(&self.cwd, &path, &pattern, request.uri, range)
+                .await?
+                .into());
+        }
+        if metadata.is_dir() {
+            Ok(read_directory(&path, request.uri, range).await?.into())
+        } else if metadata.is_file() {
+            read_file(&path, request.uri, query.is_some(), range).await
+        } else {
+            bail!("not a regular file or directory: {}", display_path(&path))
         }
     }
 }
@@ -221,7 +272,8 @@ impl Protocol for FileProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: "file".to_string(),
-            description: "Read files and directory listings with bounded line ranges.".to_string(),
+            description: "Read text files, supported images, and directory listings with bounded line ranges."
+                .to_string(),
             can_read: true,
             can_exec: false,
         }
@@ -232,46 +284,15 @@ impl Protocol for FileProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        if !request.body.is_empty() {
-            if request.target == "help" {
-                bail!(r#"file://help requires an empty body; retry read("file://help", "")"#);
-            }
-            if request.target.is_empty() {
-                bail!(
-                    r#"file reads require an empty body; put the path in the URI, for example read("file://<path>", "")"#
-                );
-            }
-            bail!(
-                "file reads require an empty body; retry read({:?}, \"\")",
-                request.uri
-            );
-        }
-        if request.target == "help" {
-            return Ok(help(&self.cwd).into_bytes());
-        }
+        Ok(self.read_request(request).await?.into_parts().0)
+    }
 
-        let (target, query) = split_query(request.target);
-        let path = resolve_path(&self.cwd, target)?;
-        let range = Range::parse(query)?;
-        let metadata = fs::metadata(&path)
-            .await
-            .with_context(|| format!("cannot read {}", display_path(&path)))?;
-        if let Some(pattern) = range.glob.clone() {
-            if !metadata.is_dir() {
-                bail!("file glob root is not a directory: {}", display_path(&path));
-            }
-            if range.line_numbers {
-                bail!("line_numbers is not supported with file glob");
-            }
-            return read_glob(&self.cwd, &path, &pattern, request.uri, range).await;
-        }
-        if metadata.is_dir() {
-            read_directory(&path, request.uri, range).await
-        } else if metadata.is_file() {
-            read_file(&path, request.uri, range).await
-        } else {
-            bail!("not a regular file or directory: {}", display_path(&path))
-        }
+    async fn read_output(
+        &self,
+        request: ProtocolRequest<'_>,
+        _context: ProtocolContext,
+    ) -> Result<ProtocolReadOutput> {
+        self.read_request(request).await
     }
 }
 
@@ -427,10 +448,31 @@ fn glob_output_path(cwd: &Path, path: &Path) -> String {
         .map_or_else(|_| display_path(path).replace('\\', "/"), completion_path)
 }
 
-async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
+async fn read_file(
+    path: &Path,
+    uri: &str,
+    has_query: bool,
+    range: Range,
+) -> Result<ProtocolReadOutput> {
     let content = fs::read(path)
         .await
         .with_context(|| format!("cannot read {}", display_path(path)))?;
+    if let Some(media_type) = ProtocolImageMediaType::detect(&content) {
+        if has_query {
+            bail!("file query parameters are not supported for image reads");
+        }
+        let size = content.len();
+        let output = format!(
+            "Read image {} ({}, {} bytes).",
+            display_path(path),
+            media_type.mime_type(),
+            size
+        );
+        return Ok(ProtocolReadOutput::new(
+            output.into_bytes(),
+            vec![ProtocolImage::new(content, media_type)],
+        ));
+    }
     let content = String::from_utf8_lossy(&content);
     let content = EditableText::new(&content);
     let lines = content.normalized().lines().collect::<Vec<_>>();
@@ -463,7 +505,7 @@ async fn read_file(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
             line_numbers
         );
     }
-    Ok(output.into_bytes())
+    Ok(output.into_bytes().into())
 }
 
 async fn read_directory(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
@@ -517,6 +559,8 @@ mod tests {
         assert!(help.contains("`?offset=<line>&limit=<count>`"));
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
+        assert!(help.contains("PNG, JPEG, GIF, and WebP"));
+        assert!(help.contains("Image reads do not accept query"));
         assert!(help.contains("`?glob=<pattern>`"));
         assert!(help.contains("standard percent-encoding"));
         assert!(help.contains("Unknown, duplicate, malformed, or invalid query parameters"));
@@ -675,20 +719,24 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha\nbeta\n").await.unwrap();
 
-        let plain = read_file(&path, "file://file.txt", Range::parse(None).unwrap())
+        let plain = read_file(&path, "file://file.txt", false, Range::parse(None).unwrap())
             .await
             .unwrap();
-        assert_eq!(String::from_utf8(plain).unwrap(), "alpha\nbeta\n");
+        assert_eq!(
+            String::from_utf8(plain.into_parts().0).unwrap(),
+            "alpha\nbeta\n"
+        );
 
         let numbered = read_file(
             &path,
             "file://file.txt?line_numbers=true",
+            true,
             Range::parse(Some("line_numbers=true")).unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(
-            String::from_utf8(numbered).unwrap(),
+            String::from_utf8(numbered.into_parts().0).unwrap(),
             "1 │ alpha\n2 │ beta\n"
         );
     }
@@ -701,11 +749,14 @@ mod tests {
             .await
             .unwrap();
 
-        let output = read_file(&path, "file://file.txt", Range::parse(None).unwrap())
+        let output = read_file(&path, "file://file.txt", false, Range::parse(None).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(String::from_utf8(output).unwrap(), "alpha\nbeta\ngamma\n");
+        assert_eq!(
+            String::from_utf8(output.into_parts().0).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
     }
 
     #[tokio::test]
@@ -717,12 +768,45 @@ mod tests {
         let output = read_file(
             &path,
             "file://file.txt?offset=1&limit=1&line_numbers=true",
+            true,
             Range::parse(Some("offset=1&limit=1&line_numbers=true")).unwrap(),
         )
         .await
         .unwrap();
-        let output = String::from_utf8(output).unwrap();
+        let output = String::from_utf8(output.into_parts().0).unwrap();
         assert!(output.contains("Next: file://file.txt?offset=2&limit=1&line_numbers=true"));
+    }
+
+    #[tokio::test]
+    async fn image_reads_return_typed_content_detected_from_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("screenshot.bin");
+        let bytes = b"\x89PNG\r\n\x1a\nimage-data".to_vec();
+        fs::write(&path, &bytes).await.unwrap();
+
+        let output = read_file(
+            &path,
+            "file://screenshot.bin",
+            false,
+            Range::parse(None).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(String::from_utf8_lossy(output.content()).contains("image/png"));
+        assert_eq!(output.images().len(), 1);
+        assert_eq!(output.images()[0].bytes(), bytes);
+        assert_eq!(output.images()[0].media_type(), ProtocolImageMediaType::Png);
+
+        let error = read_file(
+            &path,
+            "file://screenshot.bin?limit=1",
+            true,
+            Range::parse(Some("limit=1")).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not supported for image reads"));
     }
 
     #[test]

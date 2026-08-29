@@ -25,12 +25,13 @@ call `read("<protocol>://help", "")`. The runtime blocks calls that skip this
 first help read and returns the exact help address required. Each protocol is
 tracked independently.
 
-`read` is used for resources, help, task snapshots, and completed output. `exec`
-starts work through protocols that support execution. `replace` and
-`apply_patch` avoid nesting edit payloads inside a serialized protocol body.
-Runtime-loaded WASM plugins may add more typed direct tools, so the active tool
-set is not limited to these four. A protocol may implement `read`, `exec`, or
-both.
+`read` is used for resources, help, task snapshots, and completed output. A
+linked protocol read may return supported images alongside its textual result;
+the model receives those images as typed tool-result content. `exec` starts
+work through protocols that support execution. `replace` and `apply_patch`
+avoid nesting edit payloads inside a serialized protocol body. Runtime-loaded
+WASM plugins may add more typed direct tools, so the active tool set is not
+limited to these four. A protocol may implement `read`, `exec`, or both.
 
 Model dispatch and the [protocol registry](../src/protocol.rs) apply three routing rules:
 
@@ -93,8 +94,17 @@ supported.
 Relative paths resolve from the canonical startup working directory; absolute
 paths remain absolute. On Unix, `~` and paths beginning with `~/` resolve from
 the current user's home directory; `~user` remains an ordinary relative path.
-Reading a directory returns a sorted, bounded listing. Text reads accept a
-one-based line range:
+Reading a directory returns a sorted, bounded listing. PNG, JPEG, GIF, and WebP
+files are detected from their signatures rather than their extensions and are
+returned directly as model-visible images:
+
+```text
+read("file://screenshots/error.png", "")
+```
+
+Image reads require a model whose catalog input includes `image` and reject all
+query parameters. Other regular files remain text reads and accept a one-based
+line range:
 
 ```text
 read("file://src/main.rs?offset=1&limit=200", "")
@@ -115,11 +125,11 @@ percent-encoding:
 read("file://src?glob=**/*.rs&limit=200", "")
 ```
 
-`file://help` reports the accepted range and glob options, active limits, and
-current working directory. Paginated file, directory, and glob results omit a
-redundant remaining-count field and return the exact next address. Empty
-directories return `No entries.` and empty globs return `No matches.`; an empty
-file remains empty content.
+`file://help` reports image support, the accepted range and glob options,
+active limits, and current working directory. Paginated file, directory, and
+glob results omit a redundant remaining-count field and return the exact next
+address. Empty directories return `No entries.` and empty globs return `No
+matches.`; an empty file remains empty content.
 
 ### `grep`
 

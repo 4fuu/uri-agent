@@ -7,8 +7,10 @@ use crate::model::{
     ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelRequest, ModelResponse,
     looks_like_context_overflow, model_retry_delay, model_retry_policy, model_retry_reason,
 };
-use crate::plugin::ModelToolRegistry;
-use crate::protocol::{ProtocolHelpRequired, ProtocolRegistry};
+use crate::plugin::{ModelToolOutput, ModelToolRegistry};
+use crate::protocol::{
+    ProtocolHelpRequired, ProtocolImage, ProtocolImageMediaType, ProtocolRegistry,
+};
 use crate::session::{EventKind, Session};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Context, Result, anyhow, bail};
@@ -997,7 +999,8 @@ impl AgentRuntime {
             let mut sole_result = None;
             let mut cancellation = None;
             for call in tool_calls.iter().cloned() {
-                let (result, interrupted) = self.execute_tool(call, cancel).await?;
+                let (result, interrupted) =
+                    self.execute_tool(call, backend.as_ref(), cancel).await?;
                 cancellation = cancellation.or(interrupted);
                 if tool_calls.len() == 1 {
                     sole_result = Some(result);
@@ -1304,6 +1307,7 @@ impl AgentRuntime {
     async fn execute_tool(
         &self,
         call: ToolCall,
+        backend: &dyn ModelBackend,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<(String, Option<TurnCancellation>)> {
         let name = call.function.name.clone();
@@ -1348,10 +1352,19 @@ impl AgentRuntime {
                 }
             }
         };
-        let (output, failed, protocol_help_required) = match result {
-            Ok(output) => (output, false, false),
+        let result = result.and_then(|output| {
+            if !output.images().is_empty() && !backend.accepts_image_input() {
+                bail!("the active model does not accept image input")
+            }
+            Ok(output)
+        });
+        let (output, images, failed, protocol_help_required) = match result {
+            Ok(output) => {
+                let (output, images) = output.into_parts();
+                (output, images, false, false)
+            }
             Err(error) if error.downcast_ref::<ProtocolHelpRequired>().is_some() => {
-                (error.to_string(), true, true)
+                (error.to_string(), Vec::new(), true, true)
             }
             Err(error) => {
                 let error = format!("Error: {error:#}");
@@ -1360,7 +1373,7 @@ impl AgentRuntime {
                     .present(error.as_bytes().to_vec(), &format!("{name}-error"))
                     .await
                     .unwrap_or(error);
-                (output, true, false)
+                (output, Vec::new(), true, false)
             }
         };
         self.protocols
@@ -1374,15 +1387,19 @@ impl AgentRuntime {
                     "failed": failed,
                     "protocol_help_required": protocol_help_required,
                     "output_bytes": output.len(),
+                    "image_count": images.len(),
                 }),
             )
             .await;
-        let result = UserContent::tool_result_for(
-            call.id,
-            call.provider,
-            name.clone(),
-            vec![ToolResultContent::Text(Text::new(output.clone()))],
+        let mut result_content = Vec::with_capacity(images.len() + 1);
+        result_content.push(ToolResultContent::Text(Text::new(output.clone())));
+        result_content.extend(
+            images
+                .into_iter()
+                .map(ProtocolImage::into_tool_result_content),
         );
+        let result =
+            UserContent::tool_result_for(call.id, call.provider, name.clone(), result_content);
         self.session
             .append_batch(vec![
                 EventKind::ToolResult {
@@ -1404,7 +1421,7 @@ impl AgentRuntime {
         Ok((output, cancellation))
     }
 
-    async fn dispatch(&self, name: &str, arguments: &Value) -> Result<String> {
+    async fn dispatch(&self, name: &str, arguments: &Value) -> Result<ModelToolOutput> {
         self.model_tools
             .dispatch(name, arguments, &self.protocols)
             .await
@@ -1513,6 +1530,15 @@ fn memory_image_attachments(images: &[ImageAttachment]) -> Vec<UserContent> {
         .collect()
 }
 
+fn rig_image_media_type(media_type: ProtocolImageMediaType) -> ImageMediaType {
+    match media_type {
+        ProtocolImageMediaType::Jpeg => ImageMediaType::JPEG,
+        ProtocolImageMediaType::Png => ImageMediaType::PNG,
+        ProtocolImageMediaType::Gif => ImageMediaType::GIF,
+        ProtocolImageMediaType::Webp => ImageMediaType::WEBP,
+    }
+}
+
 async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>> {
     let arguments = prompt_arguments(prompt);
     let root = tokio::fs::canonicalize(cwd)
@@ -1550,7 +1576,7 @@ async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>>
         let bytes = tokio::fs::read(&canonical)
             .await
             .with_context(|| format!("cannot read image {}", display_path(&canonical)))?;
-        let media_type = detect_image_type(&bytes).with_context(|| {
+        let media_type = ProtocolImageMediaType::detect(&bytes).with_context(|| {
             format!(
                 "unsupported or invalid image file: {}",
                 display_path(&canonical)
@@ -1558,7 +1584,7 @@ async fn image_attachments(prompt: &str, cwd: &Path) -> Result<Vec<UserContent>>
         })?;
         images.push(UserContent::image_base64(
             base64::engine::general_purpose::STANDARD.encode(bytes),
-            Some(media_type),
+            Some(rig_image_media_type(media_type)),
             None,
         ));
     }
@@ -1604,20 +1630,6 @@ fn take_prompt_argument(chars: &mut std::iter::Peekable<impl Iterator<Item = cha
         chars.next();
     }
     argument
-}
-
-fn detect_image_type(bytes: &[u8]) -> Option<ImageMediaType> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some(ImageMediaType::PNG)
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some(ImageMediaType::JPEG)
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some(ImageMediaType::GIF)
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        Some(ImageMediaType::WEBP)
-    } else {
-        None
-    }
 }
 
 fn bounded_task_output(content: &[u8]) -> (String, bool) {
@@ -1774,6 +1786,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct ImageProtocol;
+
     struct GatedBackend {
         responses: Mutex<VecDeque<Result<ModelResponse>>>,
         requests: Mutex<Vec<ModelRequest>>,
@@ -1871,6 +1885,47 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.started.notify_one();
             std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl Protocol for ImageProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "image".to_string(),
+                description: "return a test image".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+
+        async fn read(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            Ok(if request.target == "help" {
+                b"image help".to_vec()
+            } else {
+                b"test image".to_vec()
+            })
+        }
+
+        async fn read_output(
+            &self,
+            request: ProtocolRequest<'_>,
+            context: ProtocolContext,
+        ) -> Result<crate::protocol::ProtocolReadOutput> {
+            if request.target == "help" {
+                return self.read(request, context).await.map(Into::into);
+            }
+            Ok(crate::protocol::ProtocolReadOutput::new(
+                b"test image".to_vec(),
+                vec![ProtocolImage::new(
+                    b"\x89PNG\r\n\x1a\nimage-data".to_vec(),
+                    ProtocolImageMediaType::Png,
+                )],
+            ))
         }
     }
 
@@ -3120,6 +3175,10 @@ mod tests {
     #[tokio::test]
     async fn fake_backend_completes_a_read_tool_loop_end_to_end() {
         let workspace = tempfile::tempdir().unwrap();
+        let image_bytes = b"\x89PNG\r\n\x1a\nimage-data".to_vec();
+        tokio::fs::write(workspace.path().join("screenshot.png"), &image_bytes)
+            .await
+            .unwrap();
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let session = crate::session::Session::open_at(
             workspace.path().join("sessions.db"),
@@ -3169,7 +3228,7 @@ mod tests {
                 .with_subagents(crate::subagent::SubagentService::new(manager)),
             )
             .unwrap();
-        let call = ToolCall::new(
+        let help_call = ToolCall::new(
             ToolCallId::new("read-help").unwrap(),
             ToolFunction::new(
                 "read".to_string(),
@@ -3179,16 +3238,27 @@ mod tests {
                 }),
             ),
         );
+        let image_call = ToolCall::new(
+            ToolCallId::new("read-image").unwrap(),
+            ToolFunction::new(
+                "read".to_string(),
+                serde_json::json!({
+                    "uri": "file://screenshot.png",
+                    "body": ""
+                }),
+            ),
+        );
         let backend = Arc::new(FakeBackend {
             responses: Mutex::new(VecDeque::from([
-                (vec![AssistantContent::ToolCall(call)], None),
+                (vec![AssistantContent::ToolCall(help_call)], None),
+                (vec![AssistantContent::ToolCall(image_call)], None),
                 (vec![AssistantContent::text("Done")], Some(fake_usage())),
             ])),
             requests: Mutex::new(Vec::new()),
-            accepts_images: false,
+            accepts_images: true,
         });
         let runtime = AgentRuntime::new(
-            Some(backend),
+            Some(backend.clone()),
             Arc::new(protocols),
             Arc::new(model_tools),
             session.clone(),
@@ -3214,11 +3284,43 @@ mod tests {
             EventKind::ToolResult { name, output, failed: false, .. }
                 if name == "read" && output.contains("# file")
         )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ToolResult { name, output, failed: false, .. }
+                if name == "read" && output.contains("image/png")
+        )));
         assert!(matches!(
             events.last().map(|event| &event.kind),
             Some(EventKind::TurnFinished)
         ));
-        assert_eq!(session.model_history().await.len(), 4);
+        assert_eq!(session.model_history().await.len(), 6);
+        let requests = backend.requests.lock().await;
+        let image = requests[2]
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|content| match content {
+                UserContent::ToolResult(result) => result.content.iter().find_map(|content| {
+                    if let ToolResultContent::Image(image) = content {
+                        Some(image)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            })
+            .expect("file read image should reach the next model request");
+        assert_eq!(image.media_type, Some(ImageMediaType::PNG));
+        assert!(matches!(
+            &image.data,
+            rig::message::DocumentSourceKind::Base64(data)
+                if base64::engine::general_purpose::STANDARD.decode(data).unwrap() == image_bytes
+        ));
+        drop(requests);
         let usage = events
             .iter()
             .find_map(|event| match &event.kind {
@@ -3256,6 +3358,133 @@ mod tests {
             runtime.context_usage().accuracy,
             compaction::ContextAccuracy::Api
         );
+
+        let session_id = session.id().to_string();
+        drop(runtime);
+        drop(session);
+        let reopened = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "changed system prompt".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(reopened.model_history().await.iter().any(|message| {
+            matches!(message, Message::User { content } if content.iter().any(|content| {
+                matches!(content, UserContent::ToolResult(result)
+                    if result.content.iter().any(|content| matches!(content, ToolResultContent::Image(_))))
+            }))
+        }));
+        drop(reopened);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn text_only_models_receive_an_error_instead_of_protocol_images() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let mut protocols = ProtocolRegistry::new(output, TaskManager::new());
+        protocols.register(ImageProtocol).unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([
+                (
+                    vec![AssistantContent::ToolCall(read_call(
+                        "image-help",
+                        "image://help",
+                    ))],
+                    None,
+                ),
+                (
+                    vec![AssistantContent::ToolCall(read_call(
+                        "image-read",
+                        "image://value",
+                    ))],
+                    None,
+                ),
+                (vec![AssistantContent::text("Done")], None),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let runtime = AgentRuntime::new(
+            Some(backend.clone()),
+            Arc::new(protocols),
+            protocol_model_tools(),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        );
+
+        runtime.run_turn("inspect image".into()).await.unwrap();
+
+        assert!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    EventKind::ToolResult { output, failed: true, .. }
+                        if output.contains("does not accept image input")
+                ))
+        );
+        let requests = backend.requests.lock().await;
+        let result = requests[2]
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .find_map(|content| match content {
+                UserContent::ToolResult(result)
+                    if result.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            ToolResultContent::Text(text)
+                                if text.text.contains("does not accept image input")
+                        )
+                    }) =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .expect("text-only model should receive the image error");
+        assert!(
+            result
+                .content
+                .iter()
+                .all(|content| !matches!(content, ToolResultContent::Image(_)))
+        );
+        drop(requests);
 
         drop(runtime);
         drop(session);

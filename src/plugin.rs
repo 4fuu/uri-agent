@@ -1,5 +1,5 @@
 use crate::config::{AgentEnvironment, ConfigManager, ModelRole};
-use crate::protocol::{ProtocolDescriptor, ProtocolRegistry, validate_descriptor};
+use crate::protocol::{ProtocolDescriptor, ProtocolImage, ProtocolRegistry, validate_descriptor};
 use crate::subagent::{SubagentRequest, SubagentResponse, SubagentService};
 use crate::tool_download::BinaryDownloader;
 pub use crate::tool_download::{BinaryDownload, DownloadArchive};
@@ -581,11 +581,51 @@ impl ModelToolDescriptor {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelToolOutput {
+    output: String,
+    images: Vec<ProtocolImage>,
+}
+
+impl ModelToolOutput {
+    pub fn new(output: String, images: Vec<ProtocolImage>) -> Self {
+        Self { output, images }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    pub fn images(&self) -> &[ProtocolImage] {
+        &self.images
+    }
+
+    pub(crate) fn into_parts(self) -> (String, Vec<ProtocolImage>) {
+        (self.output, self.images)
+    }
+}
+
+impl From<String> for ModelToolOutput {
+    fn from(output: String) -> Self {
+        Self::new(output, Vec::new())
+    }
+}
+
+impl From<&str> for ModelToolOutput {
+    fn from(output: &str) -> Self {
+        output.to_string().into()
+    }
+}
+
 #[async_trait]
 pub trait ModelTool: Send + Sync {
     fn descriptor(&self) -> ModelToolDescriptor;
 
-    async fn execute(&self, arguments: &Value, protocols: &ProtocolRegistry) -> Result<String>;
+    async fn execute(
+        &self,
+        arguments: &Value,
+        protocols: &ProtocolRegistry,
+    ) -> Result<ModelToolOutput>;
 }
 
 pub trait DynamicModelToolSource: Send + Sync {
@@ -682,7 +722,7 @@ impl ModelToolRegistry {
         name: &str,
         arguments: &Value,
         protocols: &ProtocolRegistry,
-    ) -> Result<String> {
+    ) -> Result<ModelToolOutput> {
         let tool = self
             .tools
             .get(name)
@@ -1447,8 +1487,8 @@ mod tests {
             &self,
             _arguments: &Value,
             _protocols: &ProtocolRegistry,
-        ) -> Result<String> {
-            Ok("ok".to_string())
+        ) -> Result<ModelToolOutput> {
+            Ok("ok".into())
         }
     }
 

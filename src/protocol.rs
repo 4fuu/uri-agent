@@ -4,6 +4,8 @@ use crate::session::{EventKind, SessionEvent};
 use crate::task::TaskManager;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use base64::Engine;
+use rig::message::{ImageMediaType, ToolResultContent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -53,6 +55,108 @@ pub struct ProtocolRequest<'a> {
     pub body: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtocolImageMediaType {
+    Jpeg,
+    Png,
+    Gif,
+    Webp,
+}
+
+impl ProtocolImageMediaType {
+    pub fn detect(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"\xff\xd8\xff") {
+            Some(Self::Jpeg)
+        } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(Self::Png)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some(Self::Gif)
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            Some(Self::Webp)
+        } else {
+            None
+        }
+    }
+
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolImage {
+    bytes: Vec<u8>,
+    media_type: ProtocolImageMediaType,
+}
+
+impl ProtocolImage {
+    pub fn new(bytes: Vec<u8>, media_type: ProtocolImageMediaType) -> Self {
+        Self { bytes, media_type }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn media_type(&self) -> ProtocolImageMediaType {
+        self.media_type
+    }
+
+    pub(crate) fn into_tool_result_content(self) -> ToolResultContent {
+        let media_type = match self.media_type {
+            ProtocolImageMediaType::Jpeg => ImageMediaType::JPEG,
+            ProtocolImageMediaType::Png => ImageMediaType::PNG,
+            ProtocolImageMediaType::Gif => ImageMediaType::GIF,
+            ProtocolImageMediaType::Webp => ImageMediaType::WEBP,
+        };
+        ToolResultContent::image_base64(
+            base64::engine::general_purpose::STANDARD.encode(self.bytes),
+            Some(media_type),
+            None,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolReadOutput {
+    content: Vec<u8>,
+    images: Vec<ProtocolImage>,
+}
+
+impl ProtocolReadOutput {
+    pub fn new(content: Vec<u8>, images: Vec<ProtocolImage>) -> Self {
+        Self { content, images }
+    }
+
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+
+    pub fn images(&self) -> &[ProtocolImage] {
+        &self.images
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<ProtocolImage>) {
+        (self.content, self.images)
+    }
+}
+
+impl From<Vec<u8>> for ProtocolReadOutput {
+    fn from(content: Vec<u8>) -> Self {
+        Self::new(content, Vec::new())
+    }
+}
+
+pub(crate) struct PresentedProtocolRead {
+    pub output: String,
+    pub images: Vec<ProtocolImage>,
+}
+
 #[async_trait]
 pub trait Protocol: Send + Sync {
     fn descriptor(&self) -> ProtocolDescriptor;
@@ -63,6 +167,14 @@ pub trait Protocol: Send + Sync {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         bail!("this protocol does not support read")
+    }
+
+    async fn read_output(
+        &self,
+        request: ProtocolRequest<'_>,
+        context: ProtocolContext,
+    ) -> Result<ProtocolReadOutput> {
+        self.read(request, context).await.map(Into::into)
     }
 
     async fn exec(
@@ -204,6 +316,14 @@ impl ProtocolRegistry {
     }
 
     pub async fn read(&self, uri: &str, body: &str) -> Result<String> {
+        Ok(self.dispatch_read(uri, body, true, true).await?.output)
+    }
+
+    pub(crate) async fn read_for_model(
+        &self,
+        uri: &str,
+        body: &str,
+    ) -> Result<PresentedProtocolRead> {
         self.dispatch_read(uri, body, true, true).await
     }
 
@@ -212,7 +332,7 @@ impl ProtocolRegistry {
     }
 
     pub(crate) async fn read_static(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_read(uri, body, false, false).await
+        Ok(self.dispatch_read(uri, body, false, false).await?.output)
     }
 
     pub(crate) async fn exec_static(&self, uri: &str, body: &str) -> Result<String> {
@@ -269,7 +389,7 @@ impl ProtocolRegistry {
         body: &str,
         include_dynamic: bool,
         require_help: bool,
-    ) -> Result<String> {
+    ) -> Result<PresentedProtocolRead> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
@@ -282,14 +402,15 @@ impl ProtocolRegistry {
         if require_help && target != "help" && !self.help_read.lock().await.contains(name) {
             return Err(ProtocolHelpRequired::new(name).into());
         }
-        let content = protocol
-            .read(ProtocolRequest { uri, target, body }, self.context.clone())
+        let response = protocol
+            .read_output(ProtocolRequest { uri, target, body }, self.context.clone())
             .await?;
+        let (content, images) = response.into_parts();
         let output = self.output.present(content, name).await?;
         if require_help && target == "help" && body.is_empty() {
             self.help_read.lock().await.insert(name.to_string());
         }
-        Ok(output)
+        Ok(PresentedProtocolRead { output, images })
     }
 
     async fn dispatch_exec(
@@ -494,6 +615,27 @@ mod tests {
     fn address_requires_an_unambiguous_separator() {
         assert!(split_address("file/path").is_err());
         assert!(split_address("://path").is_err());
+    }
+
+    #[test]
+    fn image_media_types_are_detected_from_signatures() {
+        assert_eq!(
+            ProtocolImageMediaType::detect(b"\xff\xd8\xffjpeg"),
+            Some(ProtocolImageMediaType::Jpeg)
+        );
+        assert_eq!(
+            ProtocolImageMediaType::detect(b"\x89PNG\r\n\x1a\npng"),
+            Some(ProtocolImageMediaType::Png)
+        );
+        assert_eq!(
+            ProtocolImageMediaType::detect(b"GIF89agif"),
+            Some(ProtocolImageMediaType::Gif)
+        );
+        assert_eq!(
+            ProtocolImageMediaType::detect(b"RIFF\x04\0\0\0WEBPdata"),
+            Some(ProtocolImageMediaType::Webp)
+        );
+        assert_eq!(ProtocolImageMediaType::detect(b"not an image"), None);
     }
 
     #[test]

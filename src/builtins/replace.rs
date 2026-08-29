@@ -1,7 +1,7 @@
 use super::file::resolve_path;
 use super::{EditableText, atomic_write, normalize_line_endings};
 use crate::config::display_path;
-use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
+use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -60,7 +60,11 @@ impl ModelTool for ReplaceTool {
         }
     }
 
-    async fn execute(&self, arguments: &Value, _protocols: &ProtocolRegistry) -> Result<String> {
+    async fn execute(
+        &self,
+        arguments: &Value,
+        _protocols: &ProtocolRegistry,
+    ) -> Result<ModelToolOutput> {
         let arguments: ReplaceArguments =
             serde_json::from_value(arguments.clone()).context("invalid replace tool arguments")?;
         if arguments.path.is_empty() {
@@ -68,7 +72,7 @@ impl ModelTool for ReplaceTool {
         }
         let path = resolve_path(&self.cwd, &arguments.path)?;
         replace_exact(&path, &arguments.old_text, &arguments.new_text).await?;
-        Ok(format!("Updated {}", display_path(&path)))
+        Ok(format!("Updated {}", display_path(&path)).into())
     }
 }
 
@@ -134,7 +138,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(output.contains("Updated"));
+        assert!(output.output().contains("Updated"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha gamma\n");
         assert!(
             tool.descriptor().parameters["properties"]["path"]["description"]

@@ -13,7 +13,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use rig::client::CompletionClient;
 use rig::completion::CompletionModel as RigCompletionModel;
 use rig::http_client::HttpClientExt;
-use rig::message::AssistantContent;
+use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
 use rig::providers::{anthropic, chatgpt, gemini, openai};
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use serde_json::Value;
@@ -511,7 +511,7 @@ pub(super) fn normalize_chatgpt_codex_base_url(base_url: &str) -> String {
 impl ModelBackend for RigBackend {
     async fn complete(
         &self,
-        request: ModelRequest,
+        mut request: ModelRequest,
         deltas: mpsc::UnboundedSender<ModelDelta>,
     ) -> Result<ModelResponse> {
         let max_tokens = clamp_max_tokens_to_context(&self.limits, request.estimated_context).min(
@@ -520,6 +520,9 @@ impl ModelBackend for RigBackend {
                 .and_then(|tokens| u64::try_from(tokens).ok())
                 .unwrap_or(u64::MAX),
         );
+        if matches!(self.client, RigClient::OpenAiCompletions(_)) {
+            request.history = openai_chat_compatible_history(request.history);
+        }
         let mut response = match &self.client {
             RigClient::OpenAiResponses(model) => {
                 complete_with(model, request, max_tokens, deltas).await
@@ -557,6 +560,55 @@ impl ModelBackend for RigBackend {
     fn desired_max_output_tokens(&self) -> usize {
         self.limits.max_tokens as usize
     }
+}
+
+fn openai_chat_compatible_history(history: Vec<Message>) -> Vec<Message> {
+    fn flush_images(history: &mut Vec<Message>, images: &mut Vec<UserContent>) {
+        if !images.is_empty() {
+            history.push(Message::User {
+                content: std::mem::take(images),
+            });
+        }
+    }
+
+    let mut compatible = Vec::with_capacity(history.len());
+    let mut images = Vec::new();
+    for message in history {
+        match message {
+            Message::User { content }
+                if content
+                    .iter()
+                    .any(|content| matches!(content, UserContent::ToolResult(_))) =>
+            {
+                let content = content
+                    .into_iter()
+                    .map(|content| match content {
+                        UserContent::ToolResult(mut result) => {
+                            let mut retained = Vec::with_capacity(result.content.len());
+                            for content in std::mem::take(&mut result.content) {
+                                match content {
+                                    ToolResultContent::Image(image) => {
+                                        images.push(UserContent::Image(image));
+                                    }
+                                    other => retained.push(other),
+                                }
+                            }
+                            result.content = retained;
+                            UserContent::ToolResult(result)
+                        }
+                        other => other,
+                    })
+                    .collect();
+                compatible.push(Message::User { content });
+            }
+            other => {
+                flush_images(&mut compatible, &mut images);
+                compatible.push(other);
+            }
+        }
+    }
+    flush_images(&mut compatible, &mut images);
+    compatible
 }
 
 #[async_trait]
@@ -698,6 +750,55 @@ mod deferred_tests {
     use super::*;
     use crate::config::ValueSource;
     use crate::oauth::OauthToken;
+    use rig::message::ToolCallId;
+
+    #[test]
+    fn openai_chat_moves_images_after_consecutive_tool_results() {
+        let result = |id: &str, image: &str| Message::User {
+            content: vec![UserContent::tool_result_for(
+                ToolCallId::new(id).unwrap(),
+                None,
+                "read".to_string(),
+                vec![
+                    ToolResultContent::text(format!("result {id}")),
+                    ToolResultContent::image_base64(
+                        image.to_string(),
+                        Some(rig::message::ImageMediaType::PNG),
+                        None,
+                    ),
+                ],
+            )],
+        };
+
+        let history = openai_chat_compatible_history(vec![
+            result("one", "image-one"),
+            result("two", "image-two"),
+            Message::assistant("done"),
+        ]);
+
+        assert_eq!(history.len(), 4);
+        for message in &history[..2] {
+            let Message::User { content } = message else {
+                panic!("tool result should remain a user message");
+            };
+            let UserContent::ToolResult(result) = &content[0] else {
+                panic!("tool result should retain its correlation");
+            };
+            assert!(
+                result
+                    .content
+                    .iter()
+                    .all(|content| !matches!(content, ToolResultContent::Image(_)))
+            );
+        }
+        assert!(matches!(
+            &history[2],
+            Message::User { content }
+                if content.len() == 2
+                    && content.iter().all(|content| matches!(content, UserContent::Image(_)))
+        ));
+        assert_eq!(history[3], Message::assistant("done"));
+    }
 
     #[tokio::test]
     async fn rebuilds_after_kimi_oauth_credential_rotates() {

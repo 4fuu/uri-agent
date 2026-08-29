@@ -1,4 +1,4 @@
-use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
+use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::ProtocolRegistry;
 use anyhow::{Result, anyhow};
@@ -65,12 +65,24 @@ impl ModelTool for ProtocolTool {
         }
     }
 
-    async fn execute(&self, arguments: &Value, protocols: &ProtocolRegistry) -> Result<String> {
+    async fn execute(
+        &self,
+        arguments: &Value,
+        protocols: &ProtocolRegistry,
+    ) -> Result<ModelToolOutput> {
         let arguments: ProtocolArguments = serde_json::from_value(arguments.clone())
             .map_err(|error| anyhow!("invalid {} arguments: {error}", self.name()))?;
         match self.operation {
-            ProtocolOperation::Read => protocols.read(&arguments.uri, &arguments.body).await,
-            ProtocolOperation::Exec => protocols.exec(&arguments.uri, &arguments.body).await,
+            ProtocolOperation::Read => {
+                let result = protocols
+                    .read_for_model(&arguments.uri, &arguments.body)
+                    .await?;
+                Ok(ModelToolOutput::new(result.output, result.images))
+            }
+            ProtocolOperation::Exec => protocols
+                .exec(&arguments.uri, &arguments.body)
+                .await
+                .map(Into::into),
         }
     }
 }
@@ -174,8 +186,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(read, "read:");
-        assert_eq!(exec, "exec:{\"answer\":42}");
+        assert_eq!(read.output(), "read:");
+        assert_eq!(exec.output(), "exec:{\"answer\":42}");
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 
