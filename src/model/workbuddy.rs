@@ -1,4 +1,4 @@
-//! WorkBuddy's provider-owned request and authentication boundary.
+//! WorkBuddy's provider-owned model request boundary.
 //!
 //! Model capability metadata comes from WorkBuddy's cloud product
 //! configuration, while endpoint and authentication fields are resolved here.
@@ -9,14 +9,14 @@ use super::failure::ModelFailurePhase;
 use super::rig_backend::{RigBackend, RigRequestOptions};
 use super::{ModelBackend, ModelDelta, ModelFailure, ModelRequest, ModelResponse};
 use crate::catalog::CatalogModel;
-use crate::codebuddy::{
-    AUTH_TOKEN_VARIABLE, BASE_URL_VARIABLE, ENVIRONMENT_VARIABLE, Session as CodeBuddySession,
-    authenticated_headers, process_session_from, session_from_oauth,
-};
 use crate::config::{ActiveSettings, AuthKind, ConfigManager, ValueSource};
-use crate::oauth::normalize_codebuddy_endpoint;
 #[cfg(test)]
-use crate::oauth::{CODEBUDDY_ENDPOINT_EXTRA, CODEBUDDY_ENVIRONMENT_EXTRA, OauthToken};
+use crate::oauth::{OauthToken, WORKBUDDY_ENDPOINT_EXTRA, WORKBUDDY_ENVIRONMENT_EXTRA};
+use crate::oauth::{
+    WORKBUDDY_AUTH_TOKEN_VARIABLE, WORKBUDDY_BASE_URL_VARIABLE, WORKBUDDY_ENVIRONMENT_VARIABLE,
+    WorkBuddySession, process_workbuddy_session, workbuddy_authenticated_headers,
+    workbuddy_session_from_oauth,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use http::StatusCode;
@@ -29,22 +29,22 @@ use tokio::sync::{Mutex, mpsc};
 pub(crate) const PROVIDER: &str = "workbuddy";
 
 #[derive(Clone, PartialEq)]
-struct CodeBuddyCredential {
+struct WorkBuddyCredential {
     token: String,
     api_key: bool,
     refreshable: bool,
-    session: CodeBuddySession,
+    session: WorkBuddySession,
 }
 
-pub(super) struct CodeBuddyBackend {
+pub(super) struct WorkBuddyBackend {
     model: CatalogModel,
     settings: ActiveSettings,
     session_id: Option<String>,
     manager: Arc<ConfigManager>,
-    backend: Mutex<Option<(CodeBuddyCredential, Arc<RigBackend>)>>,
+    backend: Mutex<Option<(WorkBuddyCredential, Arc<RigBackend>)>>,
 }
 
-impl CodeBuddyBackend {
+impl WorkBuddyBackend {
     pub(super) fn new(
         model: CatalogModel,
         settings: ActiveSettings,
@@ -92,7 +92,7 @@ impl CodeBuddyBackend {
 }
 
 #[async_trait]
-impl ModelBackend for CodeBuddyBackend {
+impl ModelBackend for WorkBuddyBackend {
     async fn prepare(&self) -> Result<()> {
         self.backend().await.map(|_| ())
     }
@@ -131,7 +131,7 @@ impl ModelBackend for CodeBuddyBackend {
 async fn resolve_credential(
     manager: &ConfigManager,
     settings: &ActiveSettings,
-) -> Result<CodeBuddyCredential> {
+) -> Result<WorkBuddyCredential> {
     let token = manager
         .resolve_model_api_key(settings)
         .await?
@@ -139,7 +139,7 @@ async fn resolve_credential(
         .ok_or_else(|| anyhow!("WorkBuddy requires a login, API key, or auth token"))?;
     let custom_token = matches!(
         &settings.api_key_source,
-        ValueSource::Environment(name) if name == AUTH_TOKEN_VARIABLE
+        ValueSource::Environment(name) if name == WORKBUDDY_AUTH_TOKEN_VARIABLE
     );
     // An API key overrides the bearer token in WorkBuddy but does not discard
     // the current signed-in account identity. A custom auth token is itself a
@@ -149,19 +149,19 @@ async fn resolve_credential(
     } else {
         manager.oauth_token(PROVIDER).await.ok()
     };
-    let base_url = env::var(BASE_URL_VARIABLE)
+    let base_url = env::var(WORKBUDDY_BASE_URL_VARIABLE)
         .ok()
         .filter(|value| !value.trim().is_empty());
     let session = match stored.as_ref() {
-        Some(stored) => session_from_oauth(stored, base_url.as_deref())?,
-        None => process_session_from(base_url, env::var(ENVIRONMENT_VARIABLE).ok())?,
+        Some(stored) => workbuddy_session_from_oauth(stored, base_url.as_deref())?,
+        None => process_workbuddy_session(base_url, env::var(WORKBUDDY_ENVIRONMENT_VARIABLE).ok())?,
     };
     let refreshable = settings.auth_kind == AuthKind::Oauth
         && settings.api_key_source == ValueSource::Global
         && stored
             .as_ref()
             .is_some_and(|stored| !stored.refresh.is_empty());
-    Ok(CodeBuddyCredential {
+    Ok(WorkBuddyCredential {
         token,
         api_key: settings.auth_kind == AuthKind::ApiKey,
         refreshable,
@@ -171,7 +171,7 @@ async fn resolve_credential(
 
 fn request_model(
     catalog: &CatalogModel,
-    credential: &CodeBuddyCredential,
+    credential: &WorkBuddyCredential,
 ) -> Result<(CatalogModel, RigRequestOptions)> {
     if catalog.provider != PROVIDER {
         bail!("WorkBuddy backend cannot run provider {}", catalog.provider);
@@ -190,8 +190,11 @@ fn request_model(
         model.metadata.remove(key);
     }
 
-    let headers =
-        authenticated_headers(&credential.token, credential.api_key, &credential.session)?;
+    let headers = workbuddy_authenticated_headers(
+        &credential.token,
+        credential.api_key,
+        &credential.session,
+    )?;
     Ok((
         model,
         RigRequestOptions {
@@ -202,7 +205,7 @@ fn request_model(
 }
 
 fn model_base_url(endpoint: &str) -> Result<String> {
-    let endpoint = normalize_codebuddy_endpoint(endpoint)?;
+    let endpoint = crate::oauth::normalize_workbuddy_endpoint(endpoint)?;
     if endpoint.ends_with("/v2") {
         Ok(endpoint)
     } else {
@@ -236,12 +239,12 @@ mod tests {
         }
     }
 
-    fn oauth_credential() -> CodeBuddyCredential {
-        CodeBuddyCredential {
+    fn oauth_credential() -> WorkBuddyCredential {
+        WorkBuddyCredential {
             token: "oauth-access".to_string(),
             api_key: false,
             refreshable: true,
-            session: CodeBuddySession {
+            session: WorkBuddySession {
                 endpoint: "https://enterprise.example/base".to_string(),
                 domain: Some("enterprise.example".to_string()),
                 method: Some("github".to_string()),
@@ -323,28 +326,29 @@ mod tests {
             expires: i64::MAX,
             extra: BTreeMap::from([
                 (
-                    CODEBUDDY_ENVIRONMENT_EXTRA.to_string(),
-                    Value::String("external".to_string()),
+                    WORKBUDDY_ENVIRONMENT_EXTRA.to_string(),
+                    Value::String("internal".to_string()),
                 ),
                 (
-                    CODEBUDDY_ENDPOINT_EXTRA.to_string(),
-                    Value::String("https://www.workbuddy.ai".to_string()),
+                    WORKBUDDY_ENDPOINT_EXTRA.to_string(),
+                    Value::String("https://copilot.tencent.com".to_string()),
                 ),
             ]),
         };
 
-        let session = session_from_oauth(&token, Some("https://override.example/v2/")).unwrap();
+        let session =
+            workbuddy_session_from_oauth(&token, Some("https://override.example/v2/")).unwrap();
 
         assert_eq!(session.endpoint, "https://override.example/v2");
     }
 
     #[test]
-    fn ioa_and_unsupported_catalog_apis_are_rejected() {
-        assert!(process_session_from(None, Some("iOA".to_string())).is_err());
-        assert!(process_session_from(None, Some("internal".to_string())).is_err());
+    fn non_china_environments_and_unsupported_catalog_apis_are_rejected() {
+        assert!(process_workbuddy_session(None, Some("iOA".to_string())).is_err());
+        assert!(process_workbuddy_session(None, Some("external".to_string())).is_err());
         assert_eq!(
-            process_session_from(None, None).unwrap().endpoint,
-            "https://www.workbuddy.ai"
+            process_workbuddy_session(None, None).unwrap().endpoint,
+            "https://copilot.tencent.com"
         );
 
         let mut unsupported = model();

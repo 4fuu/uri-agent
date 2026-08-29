@@ -1,21 +1,20 @@
 use super::super::util::{open_url, trusted_http_url};
-use super::super::{LoginSetup, OauthLogin, OauthToken, channels, set_display};
+use super::super::{LoginSetup, OauthDisplay, OauthLogin, OauthToken, channels, set_display};
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{StatusCode, Url};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 
-const WORKBUDDY_ENDPOINT: &str = "https://www.workbuddy.ai";
-const PLATFORM: &str = "workbuddy-ai";
+const WORKBUDDY_ENDPOINT: &str = "https://copilot.tencent.com";
+const PLATFORM: &str = "workbuddy";
 const PREFIX_PATH: &str = "/plugin";
-const REFERENCE_VERSION: &str = "5.4.2.36857725";
-pub(crate) const USER_AGENT: &str = concat!(
-    "workbuddy-ai/5.4.2.36857725 WorkBuddy/5.4.2.36857725 ",
-    "CLI/2.132.0-dev.9772d7b.202608221848"
-);
+const REFERENCE_VERSION: &str = "5.3.14";
+pub(crate) const USER_AGENT: &str = "WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_FETCH_TOKEN: i64 = 11217;
@@ -30,8 +29,208 @@ pub(crate) const ACCOUNT_EXTRA: &str = "workbuddyAccount";
 pub(crate) const ACCOUNTS_EXTRA: &str = "workbuddyAccounts";
 const AUTH_EXTRA: &str = "workbuddyAuth";
 
-pub(in crate::oauth) fn start_codebuddy()
--> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
+pub(crate) const WORKBUDDY_ENVIRONMENT_VARIABLE: &str = "CODEBUDDY_INTERNET_ENVIRONMENT";
+pub(crate) const WORKBUDDY_BASE_URL_VARIABLE: &str = "CODEBUDDY_BASE_URL";
+pub(crate) const WORKBUDDY_AUTH_TOKEN_VARIABLE: &str = "CODEBUDDY_AUTH_TOKEN";
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WorkBuddySession {
+    pub endpoint: String,
+    pub domain: Option<String>,
+    pub method: Option<String>,
+    pub account: Option<Value>,
+}
+
+pub(crate) fn workbuddy_session_from_oauth(
+    token: &OauthToken,
+    base_url: Option<&str>,
+) -> Result<WorkBuddySession> {
+    let environment =
+        extra_string(token, ENVIRONMENT_EXTRA).unwrap_or_else(|| "internal".to_string());
+    let endpoint = base_url
+        .map(str::to_string)
+        .or_else(|| extra_string(token, ENDPOINT_EXTRA))
+        .or_else(|| default_endpoint(&environment).map(str::to_string))
+        .ok_or_else(|| anyhow!("WorkBuddy OAuth session has no endpoint; run :login again"))?;
+    Ok(WorkBuddySession {
+        endpoint: normalize_endpoint(&endpoint)?,
+        domain: extra_string(token, DOMAIN_EXTRA),
+        method: extra_string(token, METHOD_EXTRA),
+        account: token.extra.get(ACCOUNT_EXTRA).cloned(),
+    })
+}
+
+pub(crate) fn process_workbuddy_session(
+    base_url: Option<String>,
+    environment: Option<String>,
+) -> Result<WorkBuddySession> {
+    let endpoint = if let Some(value) = base_url.filter(|value| !value.trim().is_empty()) {
+        normalize_endpoint(&value)?
+    } else {
+        let environment = environment
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "internal".to_string());
+        match environment.as_str() {
+            "internal" => default_endpoint(&environment)
+                .expect("the built-in WorkBuddy environment has an endpoint")
+                .to_string(),
+            "selfhosted" => {
+                bail!("a custom WorkBuddy endpoint requires {WORKBUDDY_BASE_URL_VARIABLE}")
+            }
+            "external" | "iOA" | "ioa" => {
+                bail!("the {environment} login environment is not supported by WorkBuddy")
+            }
+            other => bail!("unsupported WorkBuddy environment {other:?}"),
+        }
+    };
+    Ok(WorkBuddySession {
+        endpoint,
+        domain: None,
+        method: None,
+        account: None,
+    })
+}
+
+pub(crate) fn workbuddy_authenticated_headers(
+    token: &str,
+    api_key: bool,
+    session: &WorkBuddySession,
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    insert_header(
+        &mut headers,
+        http::header::AUTHORIZATION,
+        &format!("Bearer {token}"),
+        "WorkBuddy bearer token",
+    )?;
+    headers.insert(
+        HeaderName::from_static("x-requested-with"),
+        HeaderValue::from_static("XMLHttpRequest"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-product"),
+        HeaderValue::from_static("SaaS"),
+    );
+    headers.insert(
+        http::header::USER_AGENT,
+        HeaderValue::from_static(USER_AGENT),
+    );
+    if api_key {
+        insert_header(
+            &mut headers,
+            HeaderName::from_static("x-api-key"),
+            token,
+            "WorkBuddy API key",
+        )?;
+    }
+    apply_session_headers(&mut headers, session)?;
+    Ok(headers)
+}
+
+fn apply_session_headers(headers: &mut HeaderMap, session: &WorkBuddySession) -> Result<()> {
+    if let Some(domain) = &session.domain {
+        insert_static(headers, "x-domain", domain, "WorkBuddy domain")?;
+    }
+    let Some(account) = session.account.as_ref() else {
+        return Ok(());
+    };
+    let uid = value_string(account, "uid");
+    let enterprise = value_string(account, "enterpriseId");
+    let department = value_string(account, "departmentFullName");
+    let id_source = value_string(account, "idSource");
+    if let Some(uid) = uid {
+        insert_static(headers, "x-user-id", uid, "WorkBuddy user ID")?;
+    }
+    if let Some(enterprise) = enterprise {
+        insert_static(
+            headers,
+            "x-enterprise-id",
+            enterprise,
+            "WorkBuddy enterprise ID",
+        )?;
+        insert_static(headers, "x-tenant-id", enterprise, "WorkBuddy tenant ID")?;
+    }
+    if let Some(department) = department {
+        insert_static(
+            headers,
+            "x-department-info",
+            department,
+            "WorkBuddy department",
+        )?;
+    }
+    if let Some(method) = &session.method {
+        insert_static(headers, "x-auth-method", method, "WorkBuddy auth method")?;
+    }
+    if let Some(id_source) = id_source {
+        insert_static(
+            headers,
+            "x-id-source",
+            id_source,
+            "WorkBuddy identity source",
+        )?;
+    }
+    if let Some(uid) = uid
+        && (enterprise.is_some() || id_source.is_some() || session.method.is_some())
+    {
+        let mut userinfo = Map::from_iter([("uin".to_string(), Value::String(uid.to_string()))]);
+        if let Some(enterprise) = enterprise {
+            userinfo.insert(
+                "owner_uin".to_string(),
+                Value::String(enterprise.to_string()),
+            );
+        }
+        if let Some(id_source) = id_source {
+            userinfo.insert(
+                "id_source".to_string(),
+                Value::String(id_source.to_string()),
+            );
+        }
+        if let Some(method) = &session.method {
+            userinfo.insert(
+                "token_source".to_string(),
+                Value::String(method.to_string()),
+            );
+        }
+        insert_static(
+            headers,
+            "x-userinfo",
+            &BASE64.encode(serde_json::to_vec(&userinfo)?),
+            "WorkBuddy encoded user info",
+        )?;
+    }
+    Ok(())
+}
+
+fn value_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn insert_static(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+    label: &str,
+) -> Result<()> {
+    insert_header(headers, HeaderName::from_static(name), value, label)
+}
+
+fn insert_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: &str,
+    label: &str,
+) -> Result<()> {
+    headers.insert(
+        name,
+        HeaderValue::from_str(value).with_context(|| format!("invalid {label} header value"))?,
+    );
+    Ok(())
+}
+
+pub(crate) fn start_login() -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
     let endpoint = WORKBUDDY_ENDPOINT.to_string();
     let LoginSetup {
         login,
@@ -48,7 +247,7 @@ pub(in crate::oauth) fn start_codebuddy()
     tokio::spawn(async move {
         let result = match tokio::time::timeout(
             LOGIN_TIMEOUT,
-            codebuddy_login(endpoint, cancel_rx, display),
+            workbuddy_login(endpoint, cancel_rx, display),
         )
         .await
         {
@@ -60,10 +259,10 @@ pub(in crate::oauth) fn start_codebuddy()
     Ok((login, done_rx))
 }
 
-async fn codebuddy_login(
+async fn workbuddy_login(
     endpoint: String,
     mut cancel_rx: watch::Receiver<bool>,
-    display: std::sync::Arc<std::sync::Mutex<super::super::OauthDisplay>>,
+    display: std::sync::Arc<std::sync::Mutex<OauthDisplay>>,
 ) -> Result<OauthToken> {
     let client = http_client()?;
     let domain = endpoint_domain(&endpoint)?;
@@ -113,7 +312,7 @@ async fn codebuddy_login(
     .await?;
     let accounts = fetch_accounts(&client, &endpoint, &auth, false).await?;
     let account = merge_current_account(account, &accounts);
-    token_from_session(auth, &endpoint, "external", account, accounts)
+    token_from_session(auth, &endpoint, "internal", account, accounts)
 }
 
 async fn poll_token(
@@ -206,7 +405,7 @@ async fn poll_account(
     }
 }
 
-pub(in crate::oauth) async fn refresh_codebuddy(token: &OauthToken) -> Result<OauthToken> {
+pub(crate) async fn refresh_token(token: &OauthToken) -> Result<OauthToken> {
     if token.refresh.is_empty() {
         bail!("WorkBuddy credential has no refresh token; run :login again");
     }
@@ -217,7 +416,7 @@ pub(in crate::oauth) async fn refresh_codebuddy(token: &OauthToken) -> Result<Oa
         })
         .ok_or_else(|| anyhow!("WorkBuddy credential has no endpoint; run :login again"))?;
     let endpoint = auth_endpoint(&endpoint)?;
-    let environment = extra_string(token, ENVIRONMENT_EXTRA).unwrap_or_else(|| "external".into());
+    let environment = extra_string(token, ENVIRONMENT_EXTRA).unwrap_or_else(|| "internal".into());
     let domain = extra_string(token, DOMAIN_EXTRA).unwrap_or(endpoint_domain(&endpoint)?);
     let client = http_client()?;
     let response = client
@@ -495,7 +694,7 @@ fn http_client() -> Result<reqwest::Client> {
 
 pub(crate) fn default_endpoint(environment: &str) -> Option<&'static str> {
     match environment {
-        "external" => Some(WORKBUDDY_ENDPOINT),
+        "internal" => Some(WORKBUDDY_ENDPOINT),
         _ => None,
     }
 }
@@ -555,6 +754,7 @@ fn extra_string(token: &OauthToken, key: &str) -> Option<String> {
         .extra
         .get(key)
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
@@ -595,16 +795,13 @@ mod tests {
     }
 
     #[test]
-    fn authentication_identity_matches_workbuddy_ai() {
-        assert_eq!(default_endpoint("external"), Some(WORKBUDDY_ENDPOINT));
-        assert_eq!(default_endpoint("internal"), None);
-        assert_eq!(PLATFORM, "workbuddy-ai");
-        assert_eq!(REFERENCE_VERSION, "5.4.2.36857725");
-        assert_eq!(
-            USER_AGENT,
-            "workbuddy-ai/5.4.2.36857725 WorkBuddy/5.4.2.36857725 \
-             CLI/2.132.0-dev.9772d7b.202608221848"
-        );
+    fn authentication_identity_matches_workbuddy_china() {
+        assert_eq!(default_endpoint("internal"), Some(WORKBUDDY_ENDPOINT));
+        assert_eq!(default_endpoint("external"), None);
+        assert_eq!(default_endpoint("iOA"), None);
+        assert_eq!(PLATFORM, "workbuddy");
+        assert_eq!(REFERENCE_VERSION, "5.3.14");
+        assert_eq!(USER_AGENT, "WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0");
     }
 
     #[test]
@@ -614,11 +811,11 @@ mod tests {
                 "accessToken": "access",
                 "refreshToken": "refresh",
                 "expiresIn": 3600,
-                "domain": "www.workbuddy.ai",
+                "domain": "copilot.tencent.com",
                 "method": "github"
             }),
             WORKBUDDY_ENDPOINT,
-            "external",
+            "internal",
             json!({"uid": "user-1", "enterpriseId": "enterprise-1"}),
             vec![json!({"uid": "user-1", "enterpriseId": "enterprise-1"})],
         )
@@ -626,7 +823,7 @@ mod tests {
 
         assert_eq!(token.access, "access");
         assert_eq!(token.refresh, "refresh");
-        assert_eq!(token.extra[DOMAIN_EXTRA], "www.workbuddy.ai");
+        assert_eq!(token.extra[DOMAIN_EXTRA], "copilot.tencent.com");
         assert_eq!(token.extra[METHOD_EXTRA], "github");
         assert!(token.extra[AUTH_EXTRA].get("accessToken").is_none());
         assert!(token.extra[AUTH_EXTRA].get("refreshToken").is_none());
@@ -650,7 +847,7 @@ mod tests {
     #[test]
     fn browser_url_includes_the_reference_client_version() {
         let url =
-            decorate_auth_url("https://www.workbuddy.ai/login?state=one".to_string()).unwrap();
+            decorate_auth_url("https://copilot.tencent.com/login?state=one".to_string()).unwrap();
         let url = Url::parse(&url).unwrap();
         assert!(
             url.query_pairs()
@@ -675,7 +872,7 @@ mod tests {
         let accounts = fetch_accounts(
             &http_client().unwrap(),
             &format!("http://{address}"),
-            &json!({"accessToken": "access", "domain": "www.workbuddy.ai"}),
+            &json!({"accessToken": "access", "domain": "copilot.tencent.com"}),
             false,
         )
         .await
@@ -752,7 +949,7 @@ mod tests {
             ]),
         };
 
-        let refreshed = refresh_codebuddy(&token).await.unwrap();
+        let refreshed = refresh_token(&token).await.unwrap();
         assert_eq!(refreshed.access, "fresh-access");
         assert_eq!(refreshed.refresh, "rotated-refresh");
         assert_eq!(refreshed.extra[ACCOUNT_EXTRA]["uid"], "current");

@@ -122,7 +122,7 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 2. 运行 `:model` 并选择一个可运行模型。
 3. 按空格键，输入一个小型只读请求，例如 `读取顶层文件并说明这个项目的用途，不要修改文件。`，再按 `Enter` 发送。
 
-如需使用 `workbuddy` 提供商，请在 `:login` 下选择 **WorkBuddy AI**。URI Agent 会使用 `workbuddy.ai` 的 WorkBuddy 浏览器登录流程，再把云端产品配置返回的账号模型合并到当前模型目录。暂不支持腾讯内部、CodeBuddy 站点及企业域名的浏览器登录路径。端点行为、环境变量和凭据优先级见英文文档 [WorkBuddy authentication](docs/configuration.md#workbuddy)。
+如需使用 `workbuddy` 提供商，请在 `:login` 下选择 **WorkBuddy China**。URI Agent 会通过 `copilot.tencent.com` 使用 WorkBuddy 中国站的浏览器登录流程，再把云端产品配置返回的账号模型合并到当前模型目录。暂不支持国际站、腾讯内部 iOA 及自定义企业域名的浏览器登录路径。端点行为、环境变量和凭据优先级见英文文档 [WorkBuddy authentication](docs/configuration.md#workbuddy)。
 
 当界面出现协议活动，并且 assistant 根据项目内容返回答案时，第一个会话就已正常工作。按 `F1` 或运行 `:help` 可查看当前生效的命令和快捷键。
 

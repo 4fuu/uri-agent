@@ -3933,7 +3933,7 @@ pub(super) fn start_oauth(
     }
 }
 
-async fn refresh_codebuddy_models(manager: &ConfigManager, catalog: &ModelCatalog) -> Result<()> {
+async fn refresh_workbuddy_models(manager: &ConfigManager, catalog: &ModelCatalog) -> Result<()> {
     manager.refresh_catalog(true).await?;
     if catalog.models("workbuddy").await.is_empty() {
         bail!(
@@ -3956,7 +3956,7 @@ pub(super) async fn store_api_key(
     let result = async {
         services.manager.set_api_key(provider, key).await?;
         if provider == "workbuddy" {
-            refresh_codebuddy_models(&services.manager, &services.catalog).await?;
+            refresh_workbuddy_models(&services.manager, &services.catalog).await?;
         }
         let active = active_for_runtime(&services.manager, &services.runtime).await?;
         apply_active(
@@ -4780,7 +4780,7 @@ pub(super) async fn finish_background(
                     let applied = async {
                         services.manager.set_oauth(&provider, token).await?;
                         if provider == "workbuddy" {
-                            refresh_codebuddy_models(&services.manager, &services.catalog).await?;
+                            refresh_workbuddy_models(&services.manager, &services.catalog).await?;
                         }
                         let active =
                             active_for_runtime(&services.manager, &services.runtime).await?;

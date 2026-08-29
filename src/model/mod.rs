@@ -7,12 +7,12 @@
 
 mod antigravity;
 mod cloudflare;
-mod codebuddy;
 mod codex_websocket;
 mod failure;
 mod request_transform;
 mod retry;
 mod rig_backend;
+mod workbuddy;
 
 use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits, ThinkingLevel};
 use crate::config::{ActiveSettings, ConfigManager};
@@ -103,8 +103,8 @@ pub async fn configured_backend(
             session_id,
             manager,
         ))
-    } else if model.provider == codebuddy::PROVIDER {
-        Arc::new(codebuddy::CodeBuddyBackend::new(
+    } else if model.provider == workbuddy::PROVIDER {
+        Arc::new(workbuddy::WorkBuddyBackend::new(
             model,
             settings.clone(),
             session_id,

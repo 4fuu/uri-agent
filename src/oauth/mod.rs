@@ -10,9 +10,13 @@ use std::collections::BTreeMap;
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub(crate) use providers::{
-    CODEBUDDY_ACCOUNT_EXTRA, CODEBUDDY_DOMAIN_EXTRA, CODEBUDDY_ENDPOINT_EXTRA,
-    CODEBUDDY_ENVIRONMENT_EXTRA, CODEBUDDY_METHOD_EXTRA, WORKBUDDY_USER_AGENT, chatgpt_account_id,
-    codebuddy_default_endpoint, normalize_codebuddy_endpoint,
+    WORKBUDDY_AUTH_TOKEN_VARIABLE, WORKBUDDY_BASE_URL_VARIABLE, WORKBUDDY_ENVIRONMENT_VARIABLE,
+    WorkBuddySession, chatgpt_account_id, normalize_workbuddy_endpoint, process_workbuddy_session,
+    workbuddy_authenticated_headers, workbuddy_session_from_oauth,
+};
+#[cfg(test)]
+pub(crate) use providers::{
+    WORKBUDDY_ENDPOINT_EXTRA, WORKBUDDY_ENVIRONMENT_EXTRA, WORKBUDDY_USER_AGENT,
 };
 pub use util::parse_authorization_input;
 
@@ -20,7 +24,7 @@ pub use util::parse_authorization_input;
 pub enum OauthProvider {
     Antigravity,
     Anthropic,
-    CodeBuddy,
+    WorkBuddy,
     OpenRouter,
     OpenAiCodex,
     GitHubCopilot,
@@ -40,7 +44,7 @@ impl OauthProvider {
     pub const ALL: [Self; 9] = [
         Self::Antigravity,
         Self::Anthropic,
-        Self::CodeBuddy,
+        Self::WorkBuddy,
         Self::OpenRouter,
         Self::OpenAiCodex,
         Self::GitHubCopilot,
@@ -53,7 +57,7 @@ impl OauthProvider {
         Some(match id {
             "antigravity" => Self::Antigravity,
             "anthropic" => Self::Anthropic,
-            "workbuddy" => Self::CodeBuddy,
+            "workbuddy" => Self::WorkBuddy,
             "openrouter" => Self::OpenRouter,
             "openai-codex" => Self::OpenAiCodex,
             "github-copilot" => Self::GitHubCopilot,
@@ -68,7 +72,7 @@ impl OauthProvider {
         match self {
             Self::Antigravity => "antigravity",
             Self::Anthropic => "anthropic",
-            Self::CodeBuddy => "workbuddy",
+            Self::WorkBuddy => "workbuddy",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCodex => "openai-codex",
             Self::GitHubCopilot => "github-copilot",
@@ -82,7 +86,7 @@ impl OauthProvider {
         match self {
             Self::Antigravity => "Google Antigravity",
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
-            Self::CodeBuddy => "WorkBuddy",
+            Self::WorkBuddy => "WorkBuddy",
             Self::OpenRouter => "OpenRouter OAuth",
             Self::OpenAiCodex => "OpenAI Codex",
             Self::GitHubCopilot => "GitHub Copilot",
@@ -104,10 +108,10 @@ impl OauthProvider {
                 label: "Claude Pro/Max",
                 description: "Browser OAuth, same flow as Pi Agent",
             }],
-            Self::CodeBuddy => &[OauthMethod {
+            Self::WorkBuddy => &[OauthMethod {
                 id: "workbuddy",
-                label: "WorkBuddy AI",
-                description: "Browser login at workbuddy.ai",
+                label: "WorkBuddy China",
+                description: "Chinese browser login via copilot.tencent.com",
             }],
             Self::OpenRouter => &[OauthMethod {
                 id: "oauth",
@@ -249,7 +253,7 @@ pub fn start_login(
     match kind {
         OauthProvider::Antigravity => providers::start_antigravity(),
         OauthProvider::Anthropic => providers::start_anthropic(),
-        OauthProvider::CodeBuddy => providers::start_codebuddy(),
+        OauthProvider::WorkBuddy => providers::start_workbuddy(),
         OauthProvider::OpenRouter => providers::start_openrouter(),
         OauthProvider::OpenAiCodex if method == "device_code" => providers::start_codex_device(),
         OauthProvider::OpenAiCodex => providers::start_codex_browser(),
@@ -272,7 +276,7 @@ pub async fn refresh_token(provider: &str, token: &OauthToken) -> Result<OauthTo
     let refreshed = match kind {
         OauthProvider::Antigravity => providers::refresh_antigravity(token).await,
         OauthProvider::Anthropic => providers::refresh_anthropic(&token.refresh).await,
-        OauthProvider::CodeBuddy => providers::refresh_codebuddy(token).await,
+        OauthProvider::WorkBuddy => providers::refresh_workbuddy(token).await,
         OauthProvider::OpenRouter => Ok(token.clone()),
         OauthProvider::OpenAiCodex => providers::refresh_codex(&token.refresh).await,
         OauthProvider::GitHubCopilot => providers::refresh_github_copilot(token).await,
@@ -368,9 +372,9 @@ mod tests {
         assert!(!oauth_enabled("openai"));
         assert!(!oauth_enabled("codebuddy"));
         assert_eq!(OauthProvider::Antigravity.name(), "Google Antigravity");
-        assert_eq!(OauthProvider::CodeBuddy.name(), "WorkBuddy");
-        assert_eq!(OauthProvider::CodeBuddy.methods().len(), 1);
-        assert_eq!(OauthProvider::CodeBuddy.methods()[0].id, "workbuddy");
+        assert_eq!(OauthProvider::WorkBuddy.name(), "WorkBuddy");
+        assert_eq!(OauthProvider::WorkBuddy.methods().len(), 1);
+        assert_eq!(OauthProvider::WorkBuddy.methods()[0].id, "workbuddy");
         assert_eq!(OauthProvider::OpenAiCodex.methods().len(), 2);
         assert!(!OauthProvider::OpenAiCodex.offers_api_key());
         assert!(!OauthProvider::Antigravity.offers_api_key());

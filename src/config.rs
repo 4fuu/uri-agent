@@ -1,16 +1,13 @@
 use crate::catalog::{
-    CatalogCredential, CatalogModel, CatalogRefreshReport, CodeBuddyCatalogCredential,
-    ModelCatalog, ThinkingLevel, api_key_environments, supports_live_discovery,
-};
-use crate::codebuddy::{
-    AUTH_TOKEN_VARIABLE as CODEBUDDY_AUTH_TOKEN_VARIABLE,
-    BASE_URL_VARIABLE as CODEBUDDY_BASE_URL_VARIABLE,
-    ENVIRONMENT_VARIABLE as CODEBUDDY_ENVIRONMENT_VARIABLE, process_session_from,
-    session_from_oauth,
+    CatalogCredential, CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel,
+    WorkBuddyCatalogCredential, api_key_environments, supports_live_discovery,
 };
 use crate::compaction;
 use crate::keymap::KeyDisplayStyle;
-use crate::oauth::{self, OauthToken};
+use crate::oauth::{
+    self, OauthToken, WORKBUDDY_AUTH_TOKEN_VARIABLE, WORKBUDDY_BASE_URL_VARIABLE,
+    WORKBUDDY_ENVIRONMENT_VARIABLE, process_workbuddy_session, workbuddy_session_from_oauth,
+};
 #[cfg(windows)]
 use crate::process::PWSH_STDIN_BOOTSTRAP;
 use crate::process::ProcessTree;
@@ -451,7 +448,7 @@ struct DiscoveryCredentialCandidate {
     value: String,
     oauth: bool,
     environment: BTreeMap<String, String>,
-    codebuddy: Option<CodeBuddyCatalogCredential>,
+    workbuddy: Option<WorkBuddyCatalogCredential>,
 }
 
 pub struct ConfigManager {
@@ -802,7 +799,7 @@ impl ConfigManager {
     }
 
     pub async fn refresh_catalog(&self, force: bool) -> Result<CatalogRefreshReport> {
-        let refresh_codebuddy = {
+        let refresh_workbuddy = {
             let files = self.files.lock().await;
             let current_provider = selected_provider(&files, &self.invocation).0;
             let credential = resolve_model_credential(
@@ -822,7 +819,7 @@ impl ConfigManager {
                             .is_some_and(|expires| expires <= chrono::Utc::now().timestamp_millis())
                 })
         };
-        if refresh_codebuddy {
+        if refresh_workbuddy {
             self.refresh_oauth("workbuddy", false).await?;
         }
         let candidates = {
@@ -1286,10 +1283,10 @@ async fn discovery_credential_candidates(
         let Some(value) = credential.api_key else {
             continue;
         };
-        let codebuddy = if provider == "workbuddy" {
+        let workbuddy = if provider == "workbuddy" {
             let custom_token = matches!(
                 &credential.source,
-                ValueSource::Environment(name) if name == CODEBUDDY_AUTH_TOKEN_VARIABLE
+                ValueSource::Environment(name) if name == WORKBUDDY_AUTH_TOKEN_VARIABLE
             );
             let stored = if custom_token {
                 None
@@ -1301,19 +1298,20 @@ async fn discovery_credential_candidates(
                     .filter(|entry| entry.kind == "oauth")
                     .and_then(|entry| oauth_token_from_entry("workbuddy", entry).ok())
             };
-            let base_url = env::var(CODEBUDDY_BASE_URL_VARIABLE)
+            let base_url = env::var(WORKBUDDY_BASE_URL_VARIABLE)
                 .ok()
                 .filter(|value| !value.trim().is_empty());
             let session = match stored.as_ref() {
-                Some(token) => session_from_oauth(token, base_url.as_deref()),
-                None => {
-                    process_session_from(base_url, env::var(CODEBUDDY_ENVIRONMENT_VARIABLE).ok())
-                }
+                Some(token) => workbuddy_session_from_oauth(token, base_url.as_deref()),
+                None => process_workbuddy_session(
+                    base_url,
+                    env::var(WORKBUDDY_ENVIRONMENT_VARIABLE).ok(),
+                ),
             };
             let Ok(session) = session else {
                 continue;
             };
-            Some(CodeBuddyCatalogCredential {
+            Some(WorkBuddyCatalogCredential {
                 session,
                 api_key: credential.kind == AuthKind::ApiKey,
             })
@@ -1325,7 +1323,7 @@ async fn discovery_credential_candidates(
             value,
             oauth: credential.kind == AuthKind::Oauth,
             environment: credential.environment,
-            codebuddy,
+            workbuddy,
         });
     }
     candidates
@@ -1362,7 +1360,7 @@ async fn resolve_discovery_credentials(
                 CatalogCredential {
                     secret,
                     oauth: candidate.oauth,
-                    codebuddy: candidate.codebuddy,
+                    workbuddy: candidate.workbuddy,
                 },
             );
         }
@@ -3139,7 +3137,7 @@ mod tests {
             value: command.clone(),
             oauth: false,
             environment: BTreeMap::new(),
-            codebuddy: None,
+            workbuddy: None,
         };
 
         let credentials = resolve_discovery_credentials(vec![candidate()], false).await;
@@ -3165,7 +3163,7 @@ mod tests {
             value,
             oauth: false,
             environment: BTreeMap::new(),
-            codebuddy: None,
+            workbuddy: None,
         };
 
         let credentials = resolve_discovery_credentials(
@@ -3211,7 +3209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codebuddy_invocation_key_overrides_stored_oauth() {
+    async fn workbuddy_invocation_key_overrides_stored_oauth() {
         let root = tempfile::tempdir().unwrap();
         let catalog = ModelCatalog::load(root.path(), true).await.unwrap();
         let files = ConfigFiles {

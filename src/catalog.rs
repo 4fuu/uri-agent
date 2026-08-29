@@ -1,8 +1,8 @@
-mod codebuddy;
 mod discovery;
+mod workbuddy;
 
-use crate::codebuddy::Session as CodeBuddySession;
 use crate::config::display_path;
+use crate::oauth::WorkBuddySession;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
@@ -25,12 +25,12 @@ const REQUEST_CONCURRENCY: usize = 8;
 pub(crate) struct CatalogCredential {
     pub secret: String,
     pub oauth: bool,
-    pub codebuddy: Option<CodeBuddyCatalogCredential>,
+    pub workbuddy: Option<WorkBuddyCatalogCredential>,
 }
 
 #[derive(Clone)]
-pub(crate) struct CodeBuddyCatalogCredential {
-    pub session: CodeBuddySession,
+pub(crate) struct WorkBuddyCatalogCredential {
+    pub session: WorkBuddySession,
     pub api_key: bool,
 }
 
@@ -511,7 +511,7 @@ impl ModelCatalog {
             .filter_map(|(provider, credential)| {
                 if !discovery::supports_provider(provider)
                     || !discovery::refresh_enabled(provider)
-                    || (provider != codebuddy::PROVIDER && !base_models.contains_key(provider))
+                    || (provider != workbuddy::PROVIDER && !base_models.contains_key(provider))
                 {
                     return None;
                 }
@@ -547,7 +547,7 @@ impl ModelCatalog {
         let mut state = self.inner.write().await;
         for (provider, fingerprint, cached, result) in discovery_results {
             let entry = state.store.entry(provider.clone()).or_default();
-            if provider != codebuddy::PROVIDER {
+            if provider != workbuddy::PROVIDER {
                 entry
                     .discoveries
                     .retain(|existing, _| existing == &fingerprint);
@@ -573,8 +573,8 @@ impl ModelCatalog {
                     );
                 }
             }
-            while provider == codebuddy::PROVIDER
-                && entry.discoveries.len() > codebuddy::MAX_CACHED_CONFIGS
+            while provider == workbuddy::PROVIDER
+                && entry.discoveries.len() > workbuddy::MAX_CACHED_CONFIGS
             {
                 let Some(oldest) = entry
                     .discoveries
@@ -783,7 +783,7 @@ fn merge_catalog(
             let Ok(value) = serde_json::to_value(model) else {
                 continue;
             };
-            if provider == codebuddy::PROVIDER {
+            if provider == workbuddy::PROVIDER {
                 models.insert(model.id.clone(), value);
             } else {
                 models.entry(model.id.clone()).or_insert(value);
@@ -1255,7 +1255,7 @@ mod tests {
             CatalogCredential {
                 secret: "configured-key".to_string(),
                 oauth: false,
-                codebuddy: None,
+                workbuddy: None,
             },
         )]);
 
@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codebuddy_cloud_failure_keeps_the_credential_scoped_last_good_models() {
+    async fn workbuddy_cloud_failure_keeps_the_credential_scoped_last_good_models() {
         let root = tempfile::tempdir().unwrap();
         let cloud = serde_json::json!({
             "code": 0,
@@ -1298,8 +1298,8 @@ mod tests {
             CatalogCredential {
                 secret: "oauth-access".to_string(),
                 oauth: true,
-                codebuddy: Some(CodeBuddyCatalogCredential {
-                    session: CodeBuddySession {
+                workbuddy: Some(WorkBuddyCatalogCredential {
+                    session: WorkBuddySession {
                         endpoint: base_url,
                         domain: Some("enterprise.example".to_string()),
                         method: Some("github".to_string()),
@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn codebuddy_cloud_models_overlay_pi_and_user_metadata() {
+    fn workbuddy_cloud_models_overlay_pi_and_user_metadata() {
         let model = |name: &str| {
             serde_json::from_value::<CatalogModel>(serde_json::json!({
                 "id": "shared", "name": name, "api": "openai-completions",

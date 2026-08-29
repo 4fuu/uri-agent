@@ -1,36 +1,37 @@
 //! WorkBuddy cloud product configuration model discovery.
 
 use super::{CatalogCredential, CatalogModel};
-use crate::codebuddy::authenticated_headers;
+use crate::oauth::workbuddy_authenticated_headers;
 use anyhow::{Context, Result, anyhow, bail};
 use http::header::{ACCEPT, CONNECTION};
 use reqwest::{Client, Url};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
-pub(super) const PROVIDER: &str = "workbuddy";
-pub(super) const REFRESH_INTERVAL_MS: i64 = 8 * 60 * 1000;
-pub(super) const MAX_CACHED_CONFIGS: usize = 20;
+pub(crate) const PROVIDER: &str = "workbuddy";
+pub(crate) const REFRESH_INTERVAL_MS: i64 = 8 * 60 * 1000;
+pub(crate) const MAX_CACHED_CONFIGS: usize = 20;
 
-pub(super) fn remote_config_enabled() -> bool {
+pub(crate) fn remote_config_enabled() -> bool {
     !std::env::var("CODEBUDDY_REMOTE_CONFIG_DISABLED")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true"))
 }
 
-pub(super) async fn discover(
+pub(crate) async fn discover(
     client: &Client,
     credential: &CatalogCredential,
 ) -> Result<Vec<CatalogModel>> {
     let context = credential
-        .codebuddy
+        .workbuddy
         .as_ref()
         .ok_or_else(|| anyhow!("WorkBuddy model discovery has no session context"))?;
     let endpoint = context.session.endpoint.trim_end_matches('/');
     let endpoint = endpoint.strip_suffix("/v2").unwrap_or(endpoint);
     let url = Url::parse(&format!("{endpoint}/v3/config"))
         .context("invalid WorkBuddy cloud product configuration URL")?;
-    let mut headers = authenticated_headers(&credential.secret, context.api_key, &context.session)?;
+    let mut headers =
+        workbuddy_authenticated_headers(&credential.secret, context.api_key, &context.session)?;
     headers.insert(CONNECTION, "close".parse().expect("static header value"));
     headers.insert(
         ACCEPT,
@@ -206,8 +207,8 @@ fn code_value(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::CodeBuddyCatalogCredential;
-    use crate::codebuddy::Session;
+    use crate::catalog::WorkBuddyCatalogCredential;
+    use crate::oauth::WorkBuddySession;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -235,14 +236,14 @@ mod tests {
                     {"id": "image-only", "name": "Image only"}
                 ]}}
             }),
-            "https://www.workbuddy.ai",
+            "https://copilot.tencent.com",
         )
         .unwrap();
 
         assert_eq!(models.len(), 1);
         let model = &models[0];
         assert_eq!(model.id, "gpt-cloud");
-        assert_eq!(model.base_url, "https://www.workbuddy.ai/v2");
+        assert_eq!(model.base_url, "https://copilot.tencent.com/v2");
         assert_eq!(model.context_window(), 200_000);
         assert_eq!(model.max_tokens(), 32_000);
         assert_eq!(model.metadata["input"], json!(["text", "image"]));
@@ -300,8 +301,8 @@ mod tests {
         let credential = CatalogCredential {
             secret: "oauth-access".to_string(),
             oauth: true,
-            codebuddy: Some(CodeBuddyCatalogCredential {
-                session: Session {
+            workbuddy: Some(WorkBuddyCatalogCredential {
+                session: WorkBuddySession {
                     endpoint: format!("http://{address}/v2"),
                     domain: Some("enterprise.example".to_string()),
                     method: Some("github".to_string()),

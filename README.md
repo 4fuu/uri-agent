@@ -143,7 +143,7 @@ URI Agent does not choose a default model. In the TUI:
 2. Run `:model` and select a runnable model.
 3. Press `Space`, enter a small read-only request such as `Read the top-level files and explain what this project does. Do not modify files.`, and press `Enter`.
 
-For the `workbuddy` provider, choose **WorkBuddy AI** under `:login`. URI Agent follows WorkBuddy's browser login at `workbuddy.ai`, then merges any account models returned by its cloud product configuration into the current catalog. Tencent-internal, CodeBuddy-site, and enterprise-domain browser login routes are not supported. See [WorkBuddy authentication](docs/configuration.md#workbuddy) for endpoint behavior, environment variables, and credential precedence.
+For the `workbuddy` provider, choose **WorkBuddy China** under `:login`. URI Agent follows the Chinese WorkBuddy browser login through `copilot.tencent.com`, then merges any account models returned by its cloud product configuration into the current catalog. International, Tencent-internal iOA, and custom enterprise-domain browser login routes are not supported. See [WorkBuddy authentication](docs/configuration.md#workbuddy) for endpoint behavior, environment variables, and credential precedence.
 
 The first session is working when protocol activity appears and the assistant returns an answer based on the project. Press `F1` or run `:help` for the active commands and key bindings.
 

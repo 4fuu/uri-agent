@@ -108,7 +108,7 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 | `cloudflare-ai-gateway` | Cloudflare API token, account ID, and AI Gateway ID |
 | `antigravity` | Experimental Google browser OAuth for the private Antigravity protocol |
 | `anthropic` | Claude Pro/Max browser OAuth |
-| `workbuddy` | WorkBuddy AI browser login at `https://www.workbuddy.ai` |
+| `workbuddy` | WorkBuddy China browser login through `https://copilot.tencent.com` |
 | `openrouter` | Browser PKCE |
 | `openai-codex` | Browser or device-code login |
 | `github-copilot` | Device-code login, including an optional Enterprise domain |
@@ -125,11 +125,11 @@ Models using `openai-codex-responses` require the `openai-codex` OAuth entry cre
 
 ### WorkBuddy
 
-The provider ID is `workbuddy`. Run `:login`, choose **WorkBuddy**, then choose **WorkBuddy AI**. Login always targets `https://www.workbuddy.ai`; the former Chinese, international CodeBuddy, Tencent-internal iOA, and custom enterprise-domain browser routes are not offered. URI Agent does not recognize `codebuddy` as an alias: existing `codebuddy` entries in `auth.json` or `models.json` must be removed or recreated under `workbuddy`.
+The provider ID is `workbuddy`. Run `:login`, choose **WorkBuddy**, then choose **WorkBuddy China**. Login always targets the Chinese WorkBuddy endpoint `https://copilot.tencent.com`; international, Tencent-internal iOA, and custom enterprise-domain browser routes are not offered. URI Agent does not recognize `codebuddy` as an alias: existing `codebuddy` entries in `auth.json` or `models.json` must be removed or recreated under `workbuddy`.
 
-A WorkBuddy login has a five-minute deadline. It creates browser state through `POST /v2/plugin/auth/state?platform=workbuddy-ai`, opens the returned URL with WorkBuddy version `5.4.2.36857725`, and polls the token and account routes once per second. Authentication requests use WorkBuddy's `SaaS` product header and desktop identity `workbuddy-ai/5.4.2.36857725 WorkBuddy/5.4.2.36857725 CLI/2.132.0-dev.9772d7b.202608221848`. Token code `11217` and account code `12151` mean the browser flow is still pending; account polling retries HTTP 401 or 403 up to five times. The resulting access token, refresh token, endpoint, environment, domain, authentication method, and account identity are saved in `auth.json`; access and refresh secrets are not duplicated in metadata.
+A WorkBuddy login has a five-minute deadline. It creates browser state through `POST /v2/plugin/auth/state?platform=workbuddy`, opens the returned URL with WorkBuddy version `5.3.14`, and polls the token and account routes once per second. Authentication requests use WorkBuddy's `SaaS` product header and Chinese desktop identity `WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0`. Token code `11217` and account code `12151` mean the browser flow is still pending; account polling retries HTTP 401 or 403 up to five times. The resulting access token, refresh token, endpoint, `internal` network environment, domain, authentication method, and account identity are saved in `auth.json`; access and refresh secrets are not duplicated in metadata. In WorkBuddy's own environment enum, `internal` identifies its Chinese public SaaS domains and is distinct from the unsupported `iOA` environment.
 
-The state and polling requests reuse one HTTP client but deliberately do not enable a cookie store. The inspected WorkBuddy desktop client uses Axios's Node transport without a cookie jar, and the WorkBuddy state endpoint does not issue a session cookie; the protocol correlates these requests with the returned `state` value.
+The state and polling requests reuse one HTTP client but deliberately do not enable a cookie store. The inspected WorkBuddy China desktop client uses Axios's Node transport without a cookie jar; the protocol correlates these requests with the returned `state` value.
 
 WorkBuddy refresh sends the old bearer token and `X-Refresh-Token` to `POST /v2/plugin/auth/token/refresh`, then requires a successful `GET /v2/plugin/accounts`. URI Agent saves a rotated refresh token when returned and preserves the current account while enriching it from the returned account snapshot. The account snapshot is optional during initial login, matching the desktop client, so a temporary account-list failure does not discard an otherwise completed browser login. License failures and disallowed-IP failures are returned as login or refresh errors. A request-phase HTTP 401 refreshes a stored OAuth credential and retries once before any streamed event; API keys and custom bearer tokens are never refreshed.
 
@@ -142,7 +142,7 @@ WorkBuddy cloud configuration is cached for eight minutes and scoped to the cred
 The reference process variables are supported:
 
 ```bash
-export CODEBUDDY_INTERNET_ENVIRONMENT='external' # external is the only built-in default
+export CODEBUDDY_INTERNET_ENVIRONMENT='internal' # Chinese public SaaS; iOA is unsupported
 export CODEBUDDY_BASE_URL='https://custom.example' # model/config endpoint override
 export CODEBUDDY_API_KEY='<workbuddy-api-key>'
 export CODEBUDDY_AUTH_TOKEN='<custom-bearer-token>'
