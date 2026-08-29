@@ -909,7 +909,7 @@ pub(super) async fn apply_action(
         Action::UpgradePending => {
             if services.runtime.upgrade_latest_queued().await.is_some() {
                 app.pending_messages = services.runtime.pending_messages().await;
-                app.set_flash("Queued message upgraded to guidance");
+                app.set_flash("Queued message upgraded to Steer");
             } else {
                 app.set_flash("No queued message to upgrade");
             }
@@ -1026,7 +1026,7 @@ pub(super) async fn apply_action(
             Ok(None)
         }
         Action::SelectModel => {
-            select_model(
+            let new_session = select_model(
                 app,
                 &services.runtime,
                 &services.manager,
@@ -1034,7 +1034,7 @@ pub(super) async fn apply_action(
                 &services.output,
             )
             .await;
-            Ok(None)
+            Ok(new_session.then_some(TuiOutcome::NewSession))
         }
         Action::OpenSettings => {
             let active = active_for_runtime(&services.manager, &services.runtime).await?;
@@ -1044,7 +1044,7 @@ pub(super) async fn apply_action(
             Ok(None)
         }
         Action::SaveSettings => {
-            save_settings(
+            let new_session = save_settings(
                 app,
                 &services.runtime,
                 &services.manager,
@@ -1053,7 +1053,7 @@ pub(super) async fn apply_action(
                 &services.environment,
             )
             .await;
-            Ok(None)
+            Ok(new_session.then_some(TuiOutcome::NewSession))
         }
         Action::OpenEnvironment { return_to_settings } => {
             open_environment(app, &services.environment, return_to_settings).await;
@@ -1802,7 +1802,7 @@ pub(super) fn confirm_delivery(app: &App) -> Action {
         kind: if delivery.selected == 0 {
             PendingMessageKind::Queued
         } else {
-            PendingMessageKind::Guidance
+            PendingMessageKind::Steer
         },
     }
 }
@@ -2411,8 +2411,11 @@ pub(super) async fn confirm_selector(app: &mut App, services: &LoopServices) -> 
                 app.set_flash("The selected effort is invalid");
                 return Action::Continue;
             };
-            set_effort(app, services, &provider, &model, thinking).await;
-            Action::Continue
+            if set_effort(app, services, &provider, &model, thinking).await {
+                Action::NewSession
+            } else {
+                Action::Continue
+            }
         }
         SelectorKind::Environment { return_to_settings } => {
             open_environment_value_prompt(app, item.id, return_to_settings);
@@ -4119,7 +4122,7 @@ pub(super) async fn select_model(
     manager: &Arc<ConfigManager>,
     catalog: &ModelCatalog,
     output: &OutputStore,
-) {
+) -> bool {
     let Some(model) = app
         .model_selector
         .as_ref()
@@ -4127,7 +4130,7 @@ pub(super) async fn select_model(
         .cloned()
     else {
         app.set_flash("No model matches the current search");
-        return;
+        return false;
     };
     let requested = format!("{}/{}", model.provider, model.id);
     if let Some(role) = app
@@ -4156,7 +4159,7 @@ pub(super) async fn select_model(
                 selected,
             });
         }
-        return;
+        return false;
     }
     if app.model_selection_target == ModelSelectionTarget::Settings {
         let configured = manager.thinking_for_model(&model.provider, &model.id).await;
@@ -4169,22 +4172,27 @@ pub(super) async fn select_model(
         app.model_hub = None;
         app.model_selection_target = ModelSelectionTarget::Conversation;
         app.overlay = Some(Overlay::Settings);
-        return;
+        return false;
     }
     let result = async {
         manager.set_model(&model.provider, &model.id).await?;
         let active = manager.current().await;
+        if model_change_requires_new_session(runtime, &active).await {
+            return Ok::<_, anyhow::Error>((active, true));
+        }
         apply_active(app, runtime, manager, catalog, output, &active).await?;
-        Ok::<_, anyhow::Error>(active)
+        Ok::<_, anyhow::Error>((active, false))
     }
     .await;
     match result {
-        Ok(active) => {
+        Ok((active, new_session)) => {
             app.overlay = None;
             app.model_selector = None;
             app.model_hub = None;
             app.settings = None;
-            app.set_flash(
+            app.set_flash(if new_session {
+                format!("Model changed to {requested}; starting a new session")
+            } else {
                 if active.provider == model.provider && active.model == model.id {
                     format!("Model changed to {requested}")
                 } else {
@@ -4194,10 +4202,14 @@ pub(super) async fn select_model(
                         active.provider,
                         active.model
                     )
-                },
-            );
+                }
+            });
+            new_session
         }
-        Err(error) => app.set_flash(format!("Could not select {requested}: {error:#}")),
+        Err(error) => {
+            app.set_flash(format!("Could not select {requested}: {error:#}"));
+            false
+        }
     }
 }
 
@@ -4265,7 +4277,7 @@ pub(super) async fn set_effort(
     provider: &str,
     model: &str,
     requested: ThinkingLevel,
-) {
+) -> bool {
     let key = format!("{provider}/{model}");
     let result = async {
         services
@@ -4279,6 +4291,9 @@ pub(super) async fn set_effort(
                 .manager
                 .for_session(provider, model, requested)
                 .await?;
+            if model_change_requires_new_session(&services.runtime, &active).await {
+                return Ok::<_, anyhow::Error>((applies_to_session, true));
+            }
             apply_active(
                 app,
                 &services.runtime,
@@ -4289,20 +4304,23 @@ pub(super) async fn set_effort(
             )
             .await?;
         }
-        Ok::<_, anyhow::Error>(applies_to_session)
+        Ok::<_, anyhow::Error>((applies_to_session, false))
     }
     .await;
+    let new_session = matches!(&result, Ok((true, true)));
     app.set_flash(match result {
-        Ok(true) if app.info.thinking == requested => {
+        Ok((true, true)) => format!("Effort for {key} set to {requested}; starting a new session"),
+        Ok((true, false)) if app.info.thinking == requested => {
             format!("Effort for {key} set to {requested}")
         }
-        Ok(true) => format!(
+        Ok((true, false)) => format!(
             "Saved {requested} for {key}; active effort is {}",
             app.info.thinking
         ),
-        Ok(false) => format!("Effort for {key} saved"),
+        Ok((false, _)) => format!("Effort for {key} saved"),
         Err(error) => format!("Could not set effort for {key}: {error:#}"),
     });
+    new_session
 }
 
 pub(super) async fn effective_thinking(
@@ -4332,9 +4350,9 @@ pub(super) async fn save_settings(
     catalog: &ModelCatalog,
     output: &OutputStore,
     environment: &AgentEnvironment,
-) {
+) -> bool {
     let Some(settings) = app.settings.as_ref() else {
-        return;
+        return false;
     };
     let selection = settings
         .model()
@@ -4345,11 +4363,11 @@ pub(super) async fn save_settings(
         Ok(limit) if limit >= 1024 => limit,
         Ok(_) => {
             app.set_flash("Output limit must be at least 1024 bytes");
-            return;
+            return false;
         }
         Err(error) => {
             app.set_flash(format!("Output limit is invalid: {error}"));
-            return;
+            return false;
         }
     };
     let api_key = settings
@@ -4373,20 +4391,39 @@ pub(super) async fn save_settings(
         } else {
             active_for_runtime(manager, runtime).await?
         };
-        apply_active(app, runtime, manager, catalog, output, &active).await?;
+        let new_session = model_change_requires_new_session(runtime, &active).await;
+        if !new_session {
+            apply_active(app, runtime, manager, catalog, output, &active).await?;
+        }
         let mut settings = SettingsState::load(active, catalog, environment).await;
         settings.tab = settings_view.0;
         settings.selected = settings_view
             .1
             .min(settings.tab.row_count().saturating_sub(1));
         app.settings = Some(settings);
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(new_session)
     }
     .await;
+    let new_session = matches!(&result, Ok(true));
     app.set_flash(match result {
-        Ok(()) => "Settings saved and applied".to_string(),
+        Ok(true) => "Settings saved; starting a new session for the model change".to_string(),
+        Ok(false) => "Settings saved and applied".to_string(),
         Err(error) => format!("Settings were not fully applied: {error:#}"),
     });
+    new_session
+}
+
+async fn model_change_requires_new_session(
+    runtime: &AgentRuntime,
+    active: &ActiveSettings,
+) -> bool {
+    if !runtime.session().is_persisted().await {
+        return false;
+    }
+    let current = runtime.session().model_settings().await;
+    current.provider != active.provider
+        || current.model != active.model
+        || current.thinking != active.thinking
 }
 
 pub(super) fn start_clipboard_image_read(
@@ -4669,7 +4706,7 @@ pub(super) async fn apply_active(
         .map_or(128_000, |limits| limits.context_window);
     runtime
         .session()
-        .update_model_settings(&active.provider, &active.model, active.thinking)
+        .update_new_model_settings(&active.provider, &active.model, active.thinking)
         .await?;
     runtime.set_backend(backend, limits).await;
     runtime.set_compaction_settings(active.compaction).await;

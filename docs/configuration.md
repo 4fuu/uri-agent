@@ -352,19 +352,18 @@ uses that selector. A plugin decides its own default and missing-role behavior;
 terminal-title uses `small` only when the setting is absent and silently skips
 generation if the selected role cannot run.
 
-Plugins with subagent access can run a bounded, ephemeral model/tool loop
-through a role. A request can inherit the current tools and protocols or
-replace either set with exact registered names, choose a working directory,
-and append instructions to the generated system prompt. It may replace the
-whole system prompt only when both effective capability sets are empty. Calls
-cannot select a provider or model directly. They use the configured route's
-thinking level, normal credential, request compatibility, usage accounting,
-and transient retry behavior without changing the active conversation or
-session. See [Subagent inference](plugins.md#subagent-inference).
+Plugins may resolve a role and use its provider, model, and thinking values to
+construct an `AgentSpec`. Agent provider/model and thinking freeze after the
+first durably accepted submission, so later role or configuration changes do
+not retarget that Agent. See [Agent sessions](sessions.md#agenthost-and-agent-specifications).
 
 ## Command-line options
 
 Command-line flags can override the provider, model, process-only API key, project working directory, thinking effort, inline output limit, and offline catalog behavior. They can also resume the latest project session or a project-scoped session ID. Run `uri-agent --help` for the exact names, accepted values, and current syntax.
+
+`--background` omits the TUI and runs opted-in resident plugins while remaining
+foreground-blocking for an external supervisor. It does not daemonize, schedule
+jobs, or provide a trigger or gateway service. See [Resident plugins](plugins.md#resident-plugins).
 
 `--continue-session` and `--session` conflict. Session selection remains scoped to the canonical `--cwd`; see [Sessions and context](sessions.md).
 

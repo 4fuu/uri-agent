@@ -1,10 +1,16 @@
+use crate::agent::{
+    AgentHandle, AgentSpec, AgentSpecPatch, AgentStatus, CapabilitySelection, CompactionCallback,
+    CompactionContext, SubmitKind, SystemPromptSelection, SystemPromptUpdate,
+};
 use crate::config::display_path;
 use crate::output::OutputStore;
 use crate::plugin::{
-    DynamicModelToolSource, ModelTool, ModelToolDescriptor, Plugin, PluginCredentials,
-    PluginEnvironment, PluginHost, PluginModelRoleResolver, PluginPermission, PluginSettings,
-    PluginSubagents, validate_model_tool_descriptor,
+    DynamicModelToolSource, ModelTool, ModelToolDescriptor, Plugin, PluginAgents,
+    PluginCredentials, PluginEnvironment, PluginHost, PluginModelRoleResolver, PluginPermission,
+    PluginSettings, ResidentEvent, ResidentPlugin, ResidentResponse,
+    validate_model_tool_descriptor,
 };
+use crate::plugin_state::{PluginState, PluginStateScope};
 use crate::protocol::{
     DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRegistry,
     ProtocolRequest, split_address, validate_descriptor,
@@ -16,20 +22,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell as AsyncOnceCell, RwLock as AsyncRwLock};
 use uri_agent_plugin_sdk::{
-    ABI_VERSION, HANDLE_EXPORT, HOST_CREDENTIALS, HOST_ENVIRONMENT, HOST_EXEC, HOST_MODEL_ROLE,
-    HOST_PLUGIN_SETTING_GET, HOST_PLUGIN_SETTING_SET, HOST_READ, HOST_SUBAGENT, HandlerRequest,
-    MANIFEST_EXPORT, Operation, PluginManifest, PluginSettingGetResponse, PluginSettingSetRequest,
-    SubagentRequest as SdkSubagentRequest, SubagentResponse as SdkSubagentResponse,
-    SubagentSystemPrompt as SdkSubagentSystemPrompt, SubagentUsage as SdkSubagentUsage,
+    ABI_VERSION, AgentOpenResponse, AgentRequest, AgentResultResponse, AgentSpec as SdkAgentSpec,
+    AgentSpecPatch as SdkAgentSpecPatch, AgentStatus as SdkAgentStatus, AgentSubmitResponse,
+    CapabilitySelection as SdkCapabilitySelection, HANDLE_EXPORT, HOST_AGENT, HOST_CREDENTIALS,
+    HOST_ENVIRONMENT, HOST_EXEC, HOST_MODEL_ROLE, HOST_PLUGIN_SETTING_GET, HOST_PLUGIN_SETTING_SET,
+    HOST_PLUGIN_STATE, HOST_READ, HandlerRequest, MANIFEST_EXPORT, Operation, PluginEvent,
+    PluginManifest, PluginSettingGetResponse, PluginSettingSetRequest,
+    PluginStateEntry as SdkPluginStateEntry, PluginStateRequest,
+    PluginStateScope as SdkPluginStateScope, ResidentEvent as SdkResidentEvent,
+    ResidentResponse as SdkResidentResponse, SubmitKind as SdkSubmitKind,
+    SystemPromptSelection as SdkSystemPromptSelection, SystemPromptUpdate as SdkSystemPromptUpdate,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
-const MIN_SUPPORTED_ABI_VERSION: u32 = 3;
+const MIN_SUPPORTED_ABI_VERSION: u32 = ABI_VERSION;
 const MAX_MODULE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -140,8 +152,7 @@ fn author_help() -> String {
         r##"# wasm_plugin authoring
 
 Author WASM plugins that register protocols and typed direct model tools.
-The SDK targets ABI version 5. Existing ABI versions 3 and 4 remain supported;
-rebuild them to use role-based subagent inference.
+The SDK and host use ABI version 6. Older ABIs are intentionally unsupported.
 
 ## Rust SDK
 
@@ -244,17 +255,37 @@ Persistent JSON values are available through
 encoded value may not exceed 1 MiB; this is trusted configuration, not a secret
 store.
 
-Bounded, ephemeral model/tool loops through one of those roles are available
-through `uri_agent_plugin_sdk::subagent(&request)`. The manifest must call
-`.request_subagent_access()` once. A request names a role and user prompt;
-optional exact tool and protocol sets, working directory, appended or replaced
-system prompt, output-token limit, and timeout customize the isolated loop.
-Omitted capability sets inherit all registered capabilities. A replacement
-system prompt requires both effective sets to be empty. Plugins cannot select a
-provider or model directly. The calling module's own declared capabilities are
-excluded to prevent recursive runtime entry. Subagent depth is one: a plugin
-reached by this loop cannot start another subagent. Subagent and WASM calls
-have a one-hour timeout limit.
+Persistent Agents are available through `uri_agent_plugin_sdk::AgentHandle`.
+The manifest must call `.request_agent_access()` once. `AgentSpec` directly
+selects provider, model, thinking, working directory, required parent session,
+system-prompt inheritance/append/replacement, exact or inherited tools and
+protocols, and an optional output-token limit. Submit with `SubmitKind::Prompt`
+to start an idle Agent or `SubmitKind::Steer` to add input at the next model
+boundary while active; idle Steer is accepted as Prompt. Acceptance is durable; use
+`status`, `result`, `cancel`, and `close` on the opaque handle. Agent sessions
+use URI Agent's normal session database and are fixed at depth 2 below a
+persisted depth-1 parent. A depth-2 Agent cannot create another Agent.
+
+Creation fixes the model and thinking configuration. A create/open request may
+enable the compaction callback; after summary generation the module receives
+`HandlerRequest::Event {{ event: PluginEvent::Compacted {{ .. }} }}` and may
+return an `AgentSpecPatch`. Only the system prompt, tool set, and protocol set
+can change there. A callback error aborts both that spec update and the
+compaction checkpoint.
+
+Plugin-owned operational state is separate from Agent sessions. Call
+`.request_state_access()` and use `plugin_state_get`, `plugin_state_put`,
+`plugin_state_delete`, `plugin_state_list`, or
+`plugin_state_compare_and_set`. Global and project scopes are isolated by the
+module filename stem, values are JSON up to 1 MiB, and revisions support
+compare-and-set updates.
+
+To opt into `uri-agent --background`, call `.with_resident()` on the manifest
+and handle `PluginEvent::Resident` start, wake, and shutdown events. Return
+`ResidentResponse {{ wake_after_ms: Some(delay) }}` to request another wake;
+set `wake_after_ms` to `None` to remain idle until shutdown. Plugins without this flag remain
+ordinary request-driven plugins. Background mode stays in the foreground for
+an external supervisor and adds no scheduler or trigger framework.
 
 Read `wasm_plugin://help/load` before loading or reloading the completed plugin.
 "##,
@@ -263,11 +294,14 @@ Read `wasm_plugin://help/load` before loading or reloading the completed plugin.
 }
 
 type Runtime = Arc<std::sync::Mutex<extism::Plugin>>;
+type ResidentSchedule = BTreeMap<PathBuf, Option<tokio::time::Instant>>;
 
 #[derive(Clone, Default)]
 struct PluginSet {
     protocols: BTreeMap<String, Arc<dyn Protocol>>,
     model_tools: BTreeMap<String, Arc<dyn ModelTool>>,
+    residents: BTreeMap<PathBuf, Arc<WasmResident>>,
+    bridges: Vec<HostBridge>,
 }
 
 #[derive(Clone)]
@@ -280,10 +314,13 @@ struct HostBridge {
     credentials_allowed: Arc<OnceLock<bool>>,
     model_roles: Arc<OnceLock<PluginModelRoleResolver>>,
     settings: Arc<OnceLock<PluginSettings>>,
-    subagents: Arc<OnceLock<PluginSubagents>>,
-    subagents_allowed: Arc<OnceLock<bool>>,
-    subagent_excluded_tools: Arc<OnceLock<Vec<String>>>,
-    subagent_excluded_protocols: Arc<OnceLock<Vec<String>>>,
+    agents: Arc<OnceLock<PluginAgents>>,
+    agents_allowed: Arc<OnceLock<bool>>,
+    state: Arc<OnceLock<PluginState>>,
+    state_allowed: Arc<OnceLock<bool>>,
+    agent_handles: Arc<StdMutex<BTreeMap<u64, AgentHandle>>>,
+    next_agent_handle: Arc<AtomicU64>,
+    module: Arc<OnceLock<(Weak<StdMutex<extism::Plugin>>, PathBuf)>>,
 }
 
 #[derive(Deserialize)]
@@ -309,10 +346,13 @@ impl HostBridge {
             credentials_allowed: Arc::new(OnceLock::new()),
             model_roles: Arc::new(OnceLock::new()),
             settings: Arc::new(OnceLock::new()),
-            subagents: Arc::new(OnceLock::new()),
-            subagents_allowed: Arc::new(OnceLock::new()),
-            subagent_excluded_tools: Arc::new(OnceLock::new()),
-            subagent_excluded_protocols: Arc::new(OnceLock::new()),
+            agents: Arc::new(OnceLock::new()),
+            agents_allowed: Arc::new(OnceLock::new()),
+            state: Arc::new(OnceLock::new()),
+            state_allowed: Arc::new(OnceLock::new()),
+            agent_handles: Arc::new(StdMutex::new(BTreeMap::new())),
+            next_agent_handle: Arc::new(AtomicU64::new(1)),
+            module: Arc::new(OnceLock::new()),
         }
     }
 
@@ -320,6 +360,12 @@ impl HostBridge {
         let settings = Arc::new(OnceLock::new());
         if let Some(root) = self.settings.get() {
             let _ = settings.set(root.scoped(plugin));
+        }
+        let state = Arc::new(OnceLock::new());
+        if let Some(root) = self.state.get()
+            && let Ok(scoped) = root.scoped(plugin, PluginStateScope::Global)
+        {
+            let _ = state.set(scoped);
         }
         Self {
             runtime: self.runtime.clone(),
@@ -330,10 +376,13 @@ impl HostBridge {
             credentials_allowed: Arc::new(OnceLock::new()),
             model_roles: self.model_roles.clone(),
             settings,
-            subagents: self.subagents.clone(),
-            subagents_allowed: Arc::new(OnceLock::new()),
-            subagent_excluded_tools: Arc::new(OnceLock::new()),
-            subagent_excluded_protocols: Arc::new(OnceLock::new()),
+            agents: self.agents.clone(),
+            agents_allowed: Arc::new(OnceLock::new()),
+            state,
+            state_allowed: Arc::new(OnceLock::new()),
+            agent_handles: Arc::new(StdMutex::new(BTreeMap::new())),
+            next_agent_handle: Arc::new(AtomicU64::new(1)),
+            module: Arc::new(OnceLock::new()),
         }
     }
 
@@ -379,37 +428,34 @@ impl HostBridge {
             .map_err(|_| anyhow!("WASM plugin settings are already bound"))
     }
 
-    fn bind_subagents(&self, subagents: PluginSubagents) -> Result<()> {
-        self.subagents
-            .set(subagents)
-            .map_err(|_| anyhow!("WASM plugin subagents are already bound"))
+    fn bind_agents(&self, agents: PluginAgents) -> Result<()> {
+        self.agents
+            .set(agents)
+            .map_err(|_| anyhow!("WASM plugin Agents are already bound"))
     }
 
-    fn set_subagents_allowed(&self, allowed: bool) -> Result<()> {
-        self.subagents_allowed
+    fn set_agents_allowed(&self, allowed: bool) -> Result<()> {
+        self.agents_allowed
             .set(allowed)
-            .map_err(|_| anyhow!("WASM plugin subagent permission is already bound"))
+            .map_err(|_| anyhow!("WASM plugin Agent permission is already bound"))
     }
 
-    fn set_subagent_exclusions(&self, manifest: &PluginManifest) -> Result<()> {
-        self.subagent_excluded_tools
-            .set(
-                manifest
-                    .model_tools
-                    .iter()
-                    .map(|descriptor| descriptor.name.clone())
-                    .collect(),
-            )
-            .map_err(|_| anyhow!("WASM plugin subagent tool exclusions are already bound"))?;
-        self.subagent_excluded_protocols
-            .set(
-                manifest
-                    .protocols
-                    .iter()
-                    .map(|descriptor| descriptor.name.clone())
-                    .collect(),
-            )
-            .map_err(|_| anyhow!("WASM plugin subagent protocol exclusions are already bound"))
+    fn bind_state(&self, state: PluginState) -> Result<()> {
+        self.state
+            .set(state)
+            .map_err(|_| anyhow!("WASM plugin state is already bound"))
+    }
+
+    fn set_state_allowed(&self, allowed: bool) -> Result<()> {
+        self.state_allowed
+            .set(allowed)
+            .map_err(|_| anyhow!("WASM plugin state permission is already bound"))
+    }
+
+    fn bind_module(&self, runtime: &Runtime, path: PathBuf) -> Result<()> {
+        self.module
+            .set((Arc::downgrade(runtime), path))
+            .map_err(|_| anyhow!("WASM plugin module is already bound"))
     }
 
     fn dispatch(&self, operation: Operation, input: &str) -> Result<String> {
@@ -492,65 +538,291 @@ impl HostBridge {
         Ok(String::new())
     }
 
-    fn subagent(&self, input: &str) -> Result<String> {
-        if !self.subagents_allowed.get().copied().unwrap_or(false) {
-            bail!("WASM plugin did not request subagent access in uri_agent_manifest");
+    fn agent(&self, input: &str) -> Result<String> {
+        if !self.agents_allowed.get().copied().unwrap_or(false) {
+            bail!("WASM plugin did not request Agent access in uri_agent_manifest");
         }
-        let input: SdkSubagentRequest =
-            serde_json::from_str(input).context("invalid subagent request")?;
-        let mut request = crate::subagent::SubagentRequest::new(input.prompt);
-        request.system_prompt = match input.system_prompt {
-            SdkSubagentSystemPrompt::Append(prompt) => {
-                crate::subagent::SubagentSystemPrompt::Append(prompt)
+        let request: AgentRequest = serde_json::from_str(input).context("invalid Agent request")?;
+        let agents = self
+            .agents
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin Agents are not attached"))?;
+        match request {
+            AgentRequest::Create {
+                spec,
+                compaction_callback,
+            } => {
+                let callback = compaction_callback.then(|| {
+                    Arc::new(WasmCompactionCallback {
+                        module: self.module.clone(),
+                    }) as Arc<dyn CompactionCallback>
+                });
+                let handle = self
+                    .runtime
+                    .block_on(agents.create(host_agent_spec(spec)?, callback))?;
+                self.store_agent_handle(handle)
             }
-            SdkSubagentSystemPrompt::Replace(prompt) => {
-                crate::subagent::SubagentSystemPrompt::Replace(prompt)
+            AgentRequest::Open {
+                session_id,
+                compaction_callback,
+            } => {
+                let callback = compaction_callback.then(|| {
+                    Arc::new(WasmCompactionCallback {
+                        module: self.module.clone(),
+                    }) as Arc<dyn CompactionCallback>
+                });
+                let handle = self.runtime.block_on(agents.open(&session_id, callback))?;
+                self.store_agent_handle(handle)
+            }
+            AgentRequest::Submit { handle, text, kind } => {
+                let agent = self.agent_handle(handle)?;
+                let submission_id = self.runtime.block_on(agent.submit(
+                    text,
+                    match kind {
+                        SdkSubmitKind::Prompt => SubmitKind::Prompt,
+                        SdkSubmitKind::Steer => SubmitKind::Steer,
+                    },
+                ))?;
+                serde_json::to_string(&AgentSubmitResponse { submission_id })
+                    .context("cannot encode Agent submission")
+            }
+            AgentRequest::Status { handle } => {
+                let agent = self.agent_handle(handle)?;
+                let status = match self.runtime.block_on(agent.status()) {
+                    AgentStatus::Idle => SdkAgentStatus::Idle,
+                    AgentStatus::Running => SdkAgentStatus::Running,
+                    AgentStatus::Closed => SdkAgentStatus::Closed,
+                };
+                serde_json::to_string(&status).context("cannot encode Agent status")
+            }
+            AgentRequest::Result { handle } => {
+                let agent = self.agent_handle(handle)?;
+                let text = self.runtime.block_on(agent.result());
+                serde_json::to_string(&AgentResultResponse { text })
+                    .context("cannot encode Agent result")
+            }
+            AgentRequest::Cancel { handle } => {
+                let agent = self.agent_handle(handle)?;
+                serde_json::to_string(&self.runtime.block_on(agent.cancel()))
+                    .context("cannot encode Agent cancellation")
+            }
+            AgentRequest::Close { handle } => {
+                let agent = self
+                    .agent_handles
+                    .lock()
+                    .map_err(|_| anyhow!("WASM plugin Agent handle lock is poisoned"))?
+                    .remove(&handle)
+                    .ok_or_else(|| anyhow!("unknown Agent handle: {handle}"))?;
+                self.runtime.block_on(agent.close());
+                Ok("null".to_string())
+            }
+        }
+    }
+
+    fn store_agent_handle(&self, agent: AgentHandle) -> Result<String> {
+        let handle = self.next_agent_handle.fetch_add(1, Ordering::Relaxed);
+        let response = AgentOpenResponse {
+            handle,
+            session_id: agent.session_id().to_string(),
+        };
+        self.agent_handles
+            .lock()
+            .map_err(|_| anyhow!("WASM plugin Agent handle lock is poisoned"))?
+            .insert(handle, agent);
+        serde_json::to_string(&response).context("cannot encode Agent handle")
+    }
+
+    fn agent_handle(&self, handle: u64) -> Result<AgentHandle> {
+        self.agent_handles
+            .lock()
+            .map_err(|_| anyhow!("WASM plugin Agent handle lock is poisoned"))?
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown Agent handle: {handle}"))
+    }
+
+    async fn close_agent_handles(&self) {
+        let handles = self
+            .agent_handles
+            .lock()
+            .map(|mut handles| {
+                std::mem::take(&mut *handles)
+                    .into_values()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for handle in handles {
+            Box::pin(handle.close()).await;
+        }
+    }
+
+    fn plugin_state(&self, input: &str) -> Result<String> {
+        if !self.state_allowed.get().copied().unwrap_or(false) {
+            bail!("WASM plugin did not request state access in uri_agent_manifest");
+        }
+        let request: PluginStateRequest =
+            serde_json::from_str(input).context("invalid plugin state request")?;
+        let root = self
+            .state
+            .get()
+            .ok_or_else(|| anyhow!("WASM plugin state is not attached"))?;
+        let scope = |scope| match scope {
+            SdkPluginStateScope::Global => PluginStateScope::Global,
+            SdkPluginStateScope::Project => PluginStateScope::Project,
+        };
+        let output = match request {
+            PluginStateRequest::Get {
+                scope: selected,
+                key,
+            } => {
+                let state = root.with_scope(scope(selected))?;
+                let entry = self.runtime.block_on(state.get(&key))?.map(sdk_state_entry);
+                serde_json::to_value(entry)?
+            }
+            PluginStateRequest::Put {
+                scope: selected,
+                key,
+                value,
+            } => {
+                let state = root.with_scope(scope(selected))?;
+                serde_json::to_value(sdk_state_entry(
+                    self.runtime.block_on(state.put(&key, value))?,
+                ))?
+            }
+            PluginStateRequest::Delete {
+                scope: selected,
+                key,
+            } => {
+                let state = root.with_scope(scope(selected))?;
+                serde_json::to_value(self.runtime.block_on(state.delete(&key))?)?
+            }
+            PluginStateRequest::List {
+                scope: selected,
+                prefix,
+                limit,
+            } => {
+                let state = root.with_scope(scope(selected))?;
+                let entries = self
+                    .runtime
+                    .block_on(state.list(&prefix, limit))?
+                    .into_iter()
+                    .map(sdk_state_entry)
+                    .collect::<Vec<_>>();
+                serde_json::to_value(entries)?
+            }
+            PluginStateRequest::CompareAndSet {
+                scope: selected,
+                key,
+                expected_revision,
+                value,
+            } => {
+                let state = root.with_scope(scope(selected))?;
+                let entry = self
+                    .runtime
+                    .block_on(state.compare_and_set(&key, expected_revision, value))?
+                    .map(sdk_state_entry);
+                serde_json::to_value(entry)?
             }
         };
-        request.tools = input.tools;
-        request.protocols = input.protocols;
-        request.working_directory = input.working_directory.map(PathBuf::from);
-        if let Some(max_output_tokens) = input.max_output_tokens {
-            request = request.with_max_output_tokens(max_output_tokens);
-        }
-        if let Some(timeout_ms) = input.timeout_ms {
-            request = request.with_timeout(Duration::from_millis(timeout_ms));
-        }
-        let subagents = self
-            .subagents
+        serde_json::to_string(&output).context("cannot encode plugin state result")
+    }
+}
+
+fn host_agent_spec(spec: SdkAgentSpec) -> Result<AgentSpec> {
+    let mut host = AgentSpec::new(
+        spec.provider,
+        spec.model,
+        spec.thinking
+            .parse()
+            .context("invalid Agent thinking level")?,
+        PathBuf::from(spec.working_directory),
+        spec.parent_session_id,
+    );
+    host.system_prompt = match spec.system_prompt {
+        SdkSystemPromptSelection::Inherit => SystemPromptSelection::Inherit,
+        SdkSystemPromptSelection::Append(prompt) => SystemPromptSelection::Append(prompt),
+        SdkSystemPromptSelection::Replace(prompt) => SystemPromptSelection::Replace(prompt),
+    };
+    host.tools = host_capabilities(spec.tools);
+    host.protocols = host_capabilities(spec.protocols);
+    host.max_output_tokens = spec.max_output_tokens;
+    Ok(host)
+}
+
+fn host_capabilities(selection: SdkCapabilitySelection) -> CapabilitySelection {
+    match selection {
+        SdkCapabilitySelection::All => CapabilitySelection::All,
+        SdkCapabilitySelection::Only(names) => CapabilitySelection::Only(names),
+    }
+}
+
+fn sdk_capabilities(selection: CapabilitySelection) -> SdkCapabilitySelection {
+    match selection {
+        CapabilitySelection::All => SdkCapabilitySelection::All,
+        CapabilitySelection::Only(names) => SdkCapabilitySelection::Only(names),
+    }
+}
+
+fn sdk_agent_spec(spec: AgentSpec) -> SdkAgentSpec {
+    SdkAgentSpec {
+        provider: spec.provider,
+        model: spec.model,
+        thinking: spec.thinking.to_string(),
+        working_directory: spec.working_directory.to_string_lossy().into_owned(),
+        parent_session_id: spec.parent_session_id.unwrap_or_default(),
+        system_prompt: match spec.system_prompt {
+            SystemPromptSelection::Inherit => SdkSystemPromptSelection::Inherit,
+            SystemPromptSelection::Append(prompt) => SdkSystemPromptSelection::Append(prompt),
+            SystemPromptSelection::Replace(prompt) => SdkSystemPromptSelection::Replace(prompt),
+        },
+        tools: sdk_capabilities(spec.tools),
+        protocols: sdk_capabilities(spec.protocols),
+        max_output_tokens: spec.max_output_tokens,
+    }
+}
+
+fn sdk_state_entry(entry: crate::plugin_state::PluginStateEntry) -> SdkPluginStateEntry {
+    SdkPluginStateEntry {
+        key: entry.key,
+        value: entry.value,
+        revision: entry.revision,
+    }
+}
+
+struct WasmCompactionCallback {
+    module: Arc<OnceLock<(Weak<StdMutex<extism::Plugin>>, PathBuf)>>,
+}
+
+#[async_trait]
+impl CompactionCallback for WasmCompactionCallback {
+    async fn compacted(&self, context: CompactionContext) -> Result<Option<AgentSpecPatch>> {
+        let (runtime, path) = self
+            .module
             .get()
-            .ok_or_else(|| anyhow!("WASM plugin subagents are not attached"))?;
-        let response = self.runtime.block_on(
-            subagents.complete_excluding(
-                &input.role,
-                request,
-                self.subagent_excluded_tools
-                    .get()
-                    .cloned()
-                    .unwrap_or_default(),
-                self.subagent_excluded_protocols
-                    .get()
-                    .cloned()
-                    .unwrap_or_default(),
-            ),
-        )?;
-        let usage = response.usage.map(|usage| SdkSubagentUsage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-            cache_read_tokens: usage.cache_read_tokens,
-            cache_write_tokens: usage.cache_write_tokens,
-            cost: usage.cost,
-        });
-        serde_json::to_string(&SdkSubagentResponse {
-            text: response.text,
-            role: response.role,
-            provider: response.provider,
-            model: response.model,
-            thinking: response.thinking.to_string(),
-            usage,
-        })
-        .context("cannot encode subagent result")
+            .and_then(|(runtime, path)| runtime.upgrade().map(|runtime| (runtime, path.clone())))
+            .ok_or_else(|| anyhow!("WASM plugin module is no longer loaded"))?;
+        let input = serde_json::to_vec(&HandlerRequest::Event {
+            event: PluginEvent::Compacted {
+                session_id: context.session_id,
+                summary: context.summary,
+                manual: context.manual,
+                spec: Box::new(sdk_agent_spec(context.spec)),
+            },
+        })?;
+        let output = call_wasm_handler(&runtime, &path, input).await?;
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let patch: Option<SdkAgentSpecPatch> =
+            serde_json::from_slice(&output).context("invalid WASM compaction callback response")?;
+        Ok(patch.map(|patch| AgentSpecPatch {
+            system_prompt: patch.system_prompt.map(|prompt| match prompt {
+                SdkSystemPromptUpdate::Append(prompt) => SystemPromptUpdate::Append(prompt),
+                SdkSystemPromptUpdate::Replace(prompt) => SystemPromptUpdate::Replace(prompt),
+            }),
+            tools: patch.tools.map(host_capabilities),
+            protocols: patch.protocols.map(host_capabilities),
+        }))
     }
 }
 
@@ -599,13 +871,22 @@ extism::host_fn!(uri_agent_model_role_host(user_data: HostBridge; input: String)
     bridge.model_role(&input)
 });
 
-extism::host_fn!(uri_agent_subagent_host(user_data: HostBridge; input: String) -> String {
+extism::host_fn!(uri_agent_agent_host(user_data: HostBridge; input: String) -> String {
     let bridge = user_data.get()?;
     let bridge = bridge
         .lock()
-        .map_err(|_| anyhow!("WASM plugin subagent host bridge lock is poisoned"))?
+        .map_err(|_| anyhow!("WASM plugin Agent host bridge lock is poisoned"))?
         .clone();
-    bridge.subagent(&input)
+    bridge.agent(&input)
+});
+
+extism::host_fn!(uri_agent_plugin_state_host(user_data: HostBridge; input: String) -> String {
+    let bridge = user_data.get()?;
+    let bridge = bridge
+        .lock()
+        .map_err(|_| anyhow!("WASM plugin state host bridge lock is poisoned"))?
+        .clone();
+    bridge.plugin_state(&input)
 });
 
 extism::host_fn!(uri_agent_plugin_setting_get_host(user_data: HostBridge; input: String) -> String {
@@ -676,6 +957,7 @@ pub struct WasmPluginManager {
     reserved_model_tools: Arc<RwLock<HashSet<String>>>,
     output: Arc<OnceLock<Arc<OutputStore>>>,
     bridge: HostBridge,
+    resident_schedule: Arc<Mutex<Option<ResidentSchedule>>>,
 }
 
 impl WasmPluginManager {
@@ -699,6 +981,7 @@ impl WasmPluginManager {
             reserved_model_tools: Arc::new(RwLock::new(HashSet::new())),
             output: Arc::new(OnceLock::new()),
             bridge: HostBridge::new(),
+            resident_schedule: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -774,10 +1057,33 @@ impl WasmPluginManager {
         )
         .await?;
 
-        *self
-            .current
-            .write()
-            .map_err(|_| anyhow!("WASM plugin set lock is poisoned"))? = Arc::new(next);
+        let next = Arc::new(next);
+        let previous = self.current();
+        let active_schedule = self.resident_schedule.lock().await.take();
+        if let Some(schedule) = active_schedule.as_ref() {
+            let stopped = stop_resident_set(&previous, schedule).await;
+            close_agent_handles(&previous).await;
+            stopped.context("cannot stop active WASM residents before reload")?;
+        }
+        {
+            let mut current = self
+                .current
+                .write()
+                .map_err(|_| anyhow!("WASM plugin set lock is poisoned"))?;
+            *current = next.clone();
+        }
+        if active_schedule.is_some() {
+            let schedule = match start_resident_set(&next).await {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    close_agent_handles(&next).await;
+                    return Err(error).context("cannot start reloaded WASM residents");
+                }
+            };
+            *self.resident_schedule.lock().await = Some(schedule);
+        } else {
+            close_agent_handles(&previous).await;
+        }
         *self.last_report.write().await = report.clone();
         Ok(report)
     }
@@ -796,6 +1102,127 @@ impl WasmPluginManager {
             can_read: true,
             can_exec: true,
         }
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let _guard = self.reload_lock.lock().await;
+        let scheduled = self.resident_schedule.lock().await.take();
+        let current = self.current();
+        let stopped = match scheduled {
+            Some(schedule) => stop_resident_set(&current, &schedule).await,
+            None => Ok(()),
+        };
+        close_agent_handles(&current).await;
+        stopped
+    }
+
+    async fn resident_event(&self, event: ResidentEvent) -> Result<ResidentResponse> {
+        match event {
+            ResidentEvent::Start => self.start_residents().await,
+            ResidentEvent::Wake => self.wake_residents().await,
+            ResidentEvent::Shutdown => {
+                self.shutdown().await?;
+                Ok(ResidentResponse::default())
+            }
+        }
+    }
+
+    async fn start_residents(&self) -> Result<ResidentResponse> {
+        self.initialize().await?;
+        let _guard = self.reload_lock.lock().await;
+        if let Some(schedule) = self.resident_schedule.lock().await.as_ref() {
+            return Ok(resident_schedule_response(schedule));
+        }
+        let current = self.current();
+        let schedule = match start_resident_set(&current).await {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                close_agent_handles(&current).await;
+                return Err(error);
+            }
+        };
+        let response = resident_schedule_response(&schedule);
+        *self.resident_schedule.lock().await = Some(schedule);
+        Ok(response)
+    }
+
+    async fn wake_residents(&self) -> Result<ResidentResponse> {
+        let _guard = self.reload_lock.lock().await;
+        let current = self.current();
+        let now = tokio::time::Instant::now();
+        let mut schedule = self.resident_schedule.lock().await;
+        let schedule = schedule
+            .as_mut()
+            .ok_or_else(|| anyhow!("WASM residents have not started"))?;
+        let due = schedule
+            .iter()
+            .filter_map(|(path, wake)| wake.filter(|wake| *wake <= now).map(|_| path.clone()))
+            .collect::<Vec<_>>();
+        for path in due {
+            let Some(resident) = current.residents.get(&path) else {
+                schedule.remove(&path);
+                continue;
+            };
+            let response = resident.call(SdkResidentEvent::Wake).await?;
+            if let Some(wake) = schedule.get_mut(&path) {
+                *wake = next_resident_wake(response);
+            }
+        }
+        Ok(resident_schedule_response(schedule))
+    }
+}
+
+async fn start_resident_set(set: &PluginSet) -> Result<ResidentSchedule> {
+    let mut schedule = BTreeMap::new();
+    for (path, resident) in &set.residents {
+        match resident.call(SdkResidentEvent::Start).await {
+            Ok(response) => {
+                schedule.insert(path.clone(), next_resident_wake(response));
+            }
+            Err(error) => {
+                let _ = stop_resident_set(set, &schedule).await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(schedule)
+}
+
+async fn stop_resident_set(set: &PluginSet, schedule: &ResidentSchedule) -> Result<()> {
+    let mut failure = None;
+    for path in schedule.keys().rev() {
+        let Some(resident) = set.residents.get(path) else {
+            continue;
+        };
+        if let Err(error) = resident.call(SdkResidentEvent::Shutdown).await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+async fn close_agent_handles(set: &PluginSet) {
+    for bridge in &set.bridges {
+        bridge.close_agent_handles().await;
+    }
+}
+
+fn next_resident_wake(response: ResidentResponse) -> Option<tokio::time::Instant> {
+    response
+        .wake_after
+        .map(|delay| tokio::time::Instant::now() + delay)
+}
+
+fn resident_schedule_response(schedule: &ResidentSchedule) -> ResidentResponse {
+    let now = tokio::time::Instant::now();
+    ResidentResponse {
+        wake_after: schedule
+            .values()
+            .filter_map(|wake| *wake)
+            .min()
+            .map(|wake| wake.saturating_duration_since(now)),
     }
 }
 
@@ -841,8 +1268,13 @@ impl Plugin for WasmPluginManager {
         vec![
             PluginPermission::Environment,
             PluginPermission::Credentials,
-            PluginPermission::Subagents,
+            PluginPermission::Agents,
+            PluginPermission::State,
         ]
+    }
+
+    fn resident(&self) -> Option<Arc<dyn ResidentPlugin>> {
+        Some(Arc::new(self.clone()))
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
@@ -850,8 +1282,21 @@ impl Plugin for WasmPluginManager {
         self.bridge.bind_credentials(host.credentials()?)?;
         self.bridge.bind_model_roles(host.model_roles()?)?;
         self.bridge.bind_settings(host.settings("wasm-plugin")?)?;
-        self.bridge.bind_subagents(host.subagents()?)?;
+        self.bridge.bind_agents(host.agents()?)?;
+        self.bridge
+            .bind_state(host.state("wasm-plugin", PluginStateScope::Global)?)?;
         host.protocols.register(self.clone())
+    }
+}
+
+#[async_trait]
+impl ResidentPlugin for WasmPluginManager {
+    fn name(&self) -> &str {
+        "wasm-plugin"
+    }
+
+    async fn handle(&self, event: ResidentEvent) -> Result<ResidentResponse> {
+        self.resident_event(event).await
     }
 }
 
@@ -1018,6 +1463,10 @@ async fn load_plugin_set(
             continue;
         }
         report.loaded_files.push(module.path.clone());
+        set.bridges.push(module.bridge.clone());
+        if let Some(resident) = module.resident() {
+            set.residents.insert(module.path.clone(), resident);
+        }
         for protocol in module.protocols() {
             let name = protocol.descriptor().name;
             claimed.insert(name.clone());
@@ -1048,6 +1497,7 @@ struct WasmModule {
     path: PathBuf,
     manifest: PluginManifest,
     runtime: Runtime,
+    bridge: HostBridge,
 }
 
 impl WasmModule {
@@ -1065,15 +1515,18 @@ impl WasmModule {
         let working_directory = working_directory.to_path_buf();
         let plugin_directory = plugin_directory.to_path_buf();
         let permission_bridge = bridge.clone();
+        let module_bridge = permission_bridge.clone();
         let (runtime, manifest) = tokio::task::spawn_blocking(move || {
             let mut plugin = build_runtime(bytes, &working_directory, &plugin_directory, bridge)
                 .with_context(|| format!("cannot load {display}"))?;
             let manifest = read_manifest(&mut plugin, &display)?;
             permission_bridge.set_environment_allowed(manifest.permissions.environment)?;
             permission_bridge.set_credentials_allowed(manifest.permissions.credentials)?;
-            permission_bridge.set_subagents_allowed(manifest.permissions.subagents)?;
-            permission_bridge.set_subagent_exclusions(&manifest)?;
-            if (!manifest.protocols.is_empty() || !manifest.model_tools.is_empty())
+            permission_bridge.set_agents_allowed(manifest.permissions.agents)?;
+            permission_bridge.set_state_allowed(manifest.permissions.state)?;
+            if (!manifest.protocols.is_empty()
+                || !manifest.model_tools.is_empty()
+                || manifest.resident)
                 && !plugin.function_exists(HANDLE_EXPORT)
             {
                 bail!("WASM plugin {display} does not export {HANDLE_EXPORT}");
@@ -1082,10 +1535,21 @@ impl WasmModule {
         })
         .await
         .context("WASM plugin loader task failed")??;
+        module_bridge.bind_module(&runtime, path.clone())?;
         Ok(Self {
             path,
             manifest,
             runtime,
+            bridge: module_bridge,
+        })
+    }
+
+    fn resident(&self) -> Option<Arc<WasmResident>> {
+        self.manifest.resident.then(|| {
+            Arc::new(WasmResident {
+                runtime: self.runtime.clone(),
+                plugin_path: self.path.clone(),
+            })
         })
     }
 
@@ -1115,6 +1579,33 @@ impl WasmModule {
                 }) as Arc<dyn ModelTool>
             })
             .collect()
+    }
+}
+
+struct WasmResident {
+    runtime: Runtime,
+    plugin_path: PathBuf,
+}
+
+impl WasmResident {
+    async fn call(&self, event: SdkResidentEvent) -> Result<ResidentResponse> {
+        let input = serde_json::to_vec(&HandlerRequest::Event {
+            event: PluginEvent::Resident { event },
+        })?;
+        let output = call_wasm_handler(&self.runtime, &self.plugin_path, input).await?;
+        let response = if output.is_empty() {
+            SdkResidentResponse::default()
+        } else {
+            serde_json::from_slice(&output).with_context(|| {
+                format!(
+                    "invalid resident response from {}",
+                    display_path(&self.plugin_path)
+                )
+            })?
+        };
+        Ok(ResidentResponse {
+            wake_after: response.wake_after_ms.map(Duration::from_millis),
+        })
     }
 }
 
@@ -1189,20 +1680,17 @@ async fn call_wasm_handler(
 ) -> Result<Vec<u8>> {
     let runtime = runtime.clone();
     let display = display_path(plugin_path);
-    let subagent_depth = crate::subagent::capture_subagent_depth();
     tokio::task::spawn_blocking(move || {
-        crate::subagent::with_blocking_subagent_depth(subagent_depth, || {
-            let mut plugin = runtime
-                .lock()
-                .map_err(|_| anyhow!("WASM plugin runtime lock is poisoned: {display}"))?;
-            let output = plugin
-                .call::<&[u8], Vec<u8>>(HANDLE_EXPORT, input.as_slice())
-                .with_context(|| format!("WASM plugin call failed: {display}"))?;
-            if output.len() > MAX_RESPONSE_BYTES {
-                bail!("WASM plugin response exceeds {MAX_RESPONSE_BYTES} bytes: {display}");
-            }
-            Ok(output)
-        })
+        let mut plugin = runtime
+            .lock()
+            .map_err(|_| anyhow!("WASM plugin runtime lock is poisoned: {display}"))?;
+        let output = plugin
+            .call::<&[u8], Vec<u8>>(HANDLE_EXPORT, input.as_slice())
+            .with_context(|| format!("WASM plugin call failed: {display}"))?;
+        if output.len() > MAX_RESPONSE_BYTES {
+            bail!("WASM plugin response exceeds {MAX_RESPONSE_BYTES} bytes: {display}");
+        }
+        Ok(output)
     })
     .await
     .context("WASM plugin call task failed")?
@@ -1302,11 +1790,19 @@ fn build_runtime(
         )
         .with_function_in_namespace(
             extism::EXTISM_USER_MODULE,
-            HOST_SUBAGENT,
+            HOST_AGENT,
             [ValType::I64],
             [ValType::I64],
             user_data.clone(),
-            uri_agent_subagent_host,
+            uri_agent_agent_host,
+        )
+        .with_function_in_namespace(
+            extism::EXTISM_USER_MODULE,
+            HOST_PLUGIN_STATE,
+            [ValType::I64],
+            [ValType::I64],
+            user_data.clone(),
+            uri_agent_plugin_state_host,
         )
         .with_function_in_namespace(
             extism::EXTISM_USER_MODULE,
@@ -1527,6 +2023,23 @@ mod tests {
         .unwrap()
     }
 
+    fn response_module(manifest: &str, response: &[u8]) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"
+            (module
+                (import "extism:host/env" "alloc" (func $alloc (param i64) (result i64)))
+                (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
+                (import "extism:host/env" "store_u8" (func $store_u8 (param i64 i32)))
+                {}
+                {}
+            )
+            "#,
+            output_function(MANIFEST_EXPORT, manifest.as_bytes()),
+            output_function(HANDLE_EXPORT, response),
+        ))
+        .unwrap()
+    }
+
     fn valid_manifest(name: &str) -> String {
         format!(
             r#"{{"abi_version":{ABI_VERSION},"protocols":[{{"name":"{name}","description":"Test protocol","can_read":true,"can_exec":true}}],"model_tools":[],"permissions":{{"environment":false,"credentials":false}}}}"#
@@ -1602,7 +2115,7 @@ mod tests {
     }
 
     #[test]
-    fn current_and_previous_abi_versions_are_supported() {
+    fn only_the_current_abi_version_is_supported() {
         let mut manifest = PluginManifest::new([]);
         manifest.abi_version = MIN_SUPPORTED_ABI_VERSION;
         validate_manifest(&manifest).unwrap();
@@ -1637,7 +2150,24 @@ mod tests {
         let credentials = crate::config::ConfigManager::load_for_test(directory, directory)
             .await
             .unwrap();
-        let subagents = crate::subagent::SubagentService::new(credentials.clone());
+        let agent_host = crate::agent::AgentHost::new(
+            credentials.clone(),
+            environment.clone(),
+            Arc::new(
+                crate::catalog::ModelCatalog::load(directory, true)
+                    .await
+                    .unwrap(),
+            ),
+            directory.to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let state = crate::plugin_state::PluginStateStore::open(
+            directory.join("plugin-state-test.db"),
+            directory,
+        )
+        .await
+        .unwrap();
         let mut registry = ProtocolRegistry::new(output.clone(), TaskManager::new());
         let mut model_tools = ModelToolRegistry::new();
         registry.register(CaptureProtocol).unwrap();
@@ -1657,7 +2187,8 @@ mod tests {
                     environment,
                 )
                 .with_credentials(credentials)
-                .with_subagents(subagents),
+                .with_agents(PluginAgents::new(agent_host, None))
+                .with_state(state),
             )
             .unwrap();
         manager
@@ -1933,8 +2464,11 @@ mod tests {
             .unwrap();
         assert!(author.contains("ModelToolDescriptor"));
         assert!(author.contains("request_environment_access"));
-        assert!(author.contains("request_subagent_access"));
-        assert!(author.contains("ABI version 5"));
+        assert!(author.contains("request_agent_access"));
+        assert!(author.contains("request_state_access"));
+        assert!(author.contains("with_resident"));
+        assert!(author.contains("ABI version 6"));
+        assert!(!author.contains("subagent"));
         assert!(!author.contains("atomic enable step"));
 
         assert!(registry.read("wasm_plugin://list", "").await.is_err());
@@ -2162,16 +2696,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn guest_subagent_access_requires_manifest_permission() {
+    async fn guest_agent_access_requires_manifest_permission() {
         let directory = tempfile::tempdir().unwrap();
         let (registry, _model_tools, manager, output) =
             registry_with_manager(directory.path()).await;
-        let request = serde_json::to_vec(&SdkSubagentRequest::new("small", "Fix parser")).unwrap();
+        let request = serde_json::to_vec(&AgentRequest::Open {
+            session_id: "missing".to_string(),
+            compaction_callback: false,
+        })
+        .unwrap();
         tokio::fs::write(
-            manager.directory().join("denied-subagent.wasm"),
+            manager.directory().join("denied-agent.wasm"),
+            host_call_module_with_input(&valid_manifest("denied_agent"), HOST_AGENT, &request),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        restore_help_read(&registry, "denied_agent").await;
+        let error = registry.read("denied_agent://run", "").await.unwrap_err();
+        assert!(format!("{error:#}").contains("did not request Agent access"));
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_state_access_requires_manifest_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let (registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let request = serde_json::to_vec(&PluginStateRequest::Get {
+            scope: SdkPluginStateScope::Global,
+            key: "checkpoint".to_string(),
+        })
+        .unwrap();
+        let mut allowed = PluginManifest::new([uri_agent_plugin_sdk::ProtocolDescriptor::new(
+            "allowed_state",
+            "Test protocol",
+            true,
+            true,
+        )]);
+        allowed.permissions.state = true;
+        tokio::fs::write(
+            manager.directory().join("allowed-state.wasm"),
             host_call_module_with_input(
-                &valid_manifest("denied_subagent"),
-                HOST_SUBAGENT,
+                &serde_json::to_string(&allowed).unwrap(),
+                HOST_PLUGIN_STATE,
+                &request,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("denied-state.wasm"),
+            host_call_module_with_input(
+                &valid_manifest("denied_state"),
+                HOST_PLUGIN_STATE,
                 &request,
             ),
         )
@@ -2179,12 +2758,95 @@ mod tests {
         .unwrap();
         manager.reload().await.unwrap();
 
-        restore_help_read(&registry, "denied_subagent").await;
-        let error = registry
-            .read("denied_subagent://run", "")
+        restore_help_read(&registry, "allowed_state").await;
+        assert_eq!(
+            registry
+                .read("allowed_state://run", "")
+                .await
+                .unwrap()
+                .trim(),
+            "null"
+        );
+        restore_help_read(&registry, "denied_state").await;
+        let error = registry.read("denied_state://run", "").await.unwrap_err();
+        assert!(format!("{error:#}").contains("did not request state access"));
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resident_manifest_receives_lifecycle_events_and_schedules_wake() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let manifest = PluginManifest::new([]).with_resident();
+        tokio::fs::write(
+            manager.directory().join("resident.wasm"),
+            response_module(
+                &serde_json::to_string(&manifest).unwrap(),
+                br#"{"wakeAfterMs":250}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let response = manager.start_residents().await.unwrap();
+        assert!(response.wake_after.is_some_and(|delay| {
+            delay <= Duration::from_millis(250) && delay > Duration::from_millis(100)
+        }));
+        assert_eq!(
+            manager
+                .resident_schedule
+                .lock()
+                .await
+                .as_ref()
+                .map(BTreeMap::len),
+            Some(1)
+        );
+        manager.shutdown().await.unwrap();
+        assert!(manager.resident_schedule.lock().await.is_none());
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_restarts_active_resident_and_replaces_its_schedule() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let manifest = serde_json::to_string(&PluginManifest::new([]).with_resident()).unwrap();
+        let path = manager.directory().join("resident.wasm");
+        tokio::fs::write(&path, response_module(&manifest, br#"{"wakeAfterMs":250}"#))
             .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("did not request subagent access"));
+            .unwrap();
+        manager.start_residents().await.unwrap();
+        assert!(
+            manager
+                .resident_schedule
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|schedule| schedule.get(&path))
+                .is_some_and(Option::is_some)
+        );
+
+        tokio::fs::write(
+            &path,
+            response_module(&manifest, br#"{"wakeAfterMs":null}"#),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        assert_eq!(
+            manager
+                .resident_schedule
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|schedule| schedule.get(&path)),
+            Some(&None)
+        );
+        manager.shutdown().await.unwrap();
+        assert!(manager.resident_schedule.lock().await.is_none());
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 

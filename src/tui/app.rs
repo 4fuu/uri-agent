@@ -1081,7 +1081,7 @@ impl App {
             EventKind::SessionCreated { .. }
             | EventKind::SessionContext { .. }
             | EventKind::Task { .. } => {}
-            EventKind::ModelSettingsChanged { .. } => self.token_rate.clear_final(),
+            EventKind::AgentSpecUpdated { .. } => self.token_rate.clear_final(),
             EventKind::ModelMessage { message } => {
                 if matches!(message, rig::message::Message::Assistant { .. }) {
                     self.token_rate.finish_response(Instant::now());

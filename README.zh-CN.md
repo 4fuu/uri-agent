@@ -46,7 +46,7 @@ Skills 也遵循同一路径：启动时只加入每个已发现 Skill 的名称
 - **调用可靠且易于扩展：**稳定的字符串 `read` / `exec` 契约处理简单协议，有类型的直接工具避免嵌套转义，而且两条路径都由插件注册。
 - **最新模型与登录方式：**把 pi.dev 的云端目录和 Provider 登录方式与按凭据隔离的实时发现结合起来，在共享目录更新前即可选择 Provider 新上线的可运行模型。
 - **工作持久且可观察：**受管任务公开状态和最终输出，完成时自动通知模型，并随会话恢复已结束的报告；只追加会话、草稿、固化上下文与压缩 checkpoint 都能跨重启保留。
-- **统一且可控的终端工作流：**内置网络访问、实时 Queue 与 Guidance、完整键盘操作以及 `@` 文件和 `@@` 会话引用都集中在同一界面。
+- **统一且可控的终端工作流：**内置网络访问、实时 Queue 与 Steer、完整键盘操作以及 `@` 文件和 `@@` 会话引用都集中在同一界面。
 
 ## pi.dev 模型覆盖
 
@@ -125,6 +125,8 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 运行 `:set-env` 可保存 `NPM_TOKEN` 等变量；后续 Agent Shell 命令会自动收到这些变量。设置界面只列出变量名，不显示变量值。全局作用域、私密文件存储、与 `:terminal` 的隔离以及插件访问规则见英文文档 [Agent environment](docs/configuration.md#agent-environment)。
 
 受支持的 API 系列、认证、离线模式和自定义端点见英文文档 [Models and configuration](docs/configuration.md)。
+
+如需由外部进程管理器监督常驻插件，可使用 `uri-agent --background`：它不启动 TUI，但会刻意保持前台阻塞。生命周期与功能边界见英文文档 [WASM plugins](docs/plugins.md#resident-plugins)。
 
 ## 扩展
 

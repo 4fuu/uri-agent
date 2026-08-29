@@ -1,3 +1,6 @@
+use crate::agent::{
+    CapabilitySelection, CompactionCallback, CompactionContext, SubmitKind, SystemPromptUpdate,
+};
 use crate::catalog::ModelLimits;
 use crate::compaction;
 use crate::config::{display_path, path_is_within};
@@ -9,7 +12,7 @@ use crate::model::{
 };
 use crate::plugin::ModelToolRegistry;
 use crate::protocol::{ProtocolHelpRequired, ProtocolRegistry};
-use crate::session::{EventKind, Session};
+use crate::session::{EventKind, PendingInput, Session};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -39,6 +42,20 @@ const TASK_NOTIFICATION_MAX_EVENTS: usize = 10;
 const TASK_NOTIFICATION_MAX_CONTENT_CHARS: usize = 16_000;
 const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
 const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
+
+fn capability_names(selection: &CapabilitySelection) -> Option<&[String]> {
+    match selection {
+        CapabilitySelection::All => None,
+        CapabilitySelection::Only(names) => Some(names),
+    }
+}
+
+fn validate_prompt_update(prompt: &str) -> Result<()> {
+    if prompt.trim().is_empty() {
+        bail!("system prompt update cannot be empty");
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImageAttachment {
@@ -139,7 +156,7 @@ struct ActiveTurn {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingMessageKind {
     Queued,
-    Guidance,
+    Steer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +168,7 @@ pub struct PendingMessage {
 
 #[derive(Clone)]
 struct PendingMessageEntry {
+    persistent_id: Option<i64>,
     message: PendingMessage,
     content: Vec<UserContent>,
     clipboard_images: Vec<ImageAttachment>,
@@ -159,7 +177,8 @@ struct PendingMessageEntry {
 }
 
 struct InputDelivery<'a> {
-    take_initial_guidance: bool,
+    pending_id: Option<i64>,
+    take_initial_steer: bool,
     visible: bool,
     task_notification_ids: &'a [String],
 }
@@ -167,8 +186,25 @@ struct InputDelivery<'a> {
 #[derive(Default)]
 struct PendingState {
     accepting: bool,
-    next_id: u64,
     messages: VecDeque<PendingMessageEntry>,
+}
+
+fn pending_entry(input: PendingInput) -> PendingMessageEntry {
+    PendingMessageEntry {
+        persistent_id: Some(input.id),
+        message: PendingMessage {
+            id: u64::try_from(input.id).unwrap_or_default(),
+            text: input.text,
+            kind: match input.kind {
+                SubmitKind::Prompt => PendingMessageKind::Queued,
+                SubmitKind::Steer => PendingMessageKind::Steer,
+            },
+        },
+        content: input.content,
+        clipboard_images: Vec::new(),
+        visible: input.visible,
+        task_notification_ids: Vec::new(),
+    }
 }
 
 pub struct AgentRuntime {
@@ -178,20 +214,31 @@ pub struct AgentRuntime {
     tasks: TaskManager,
     session: Session,
     system_prompt: OnceCell<String>,
+    system_prompt_override: RwLock<Option<String>>,
     initializer: Option<Arc<dyn RuntimeInitializer>>,
     limits: RwLock<ModelLimits>,
     context_usage: SyncRwLock<compaction::ContextUsage>,
     compaction_settings: RwLock<compaction::Settings>,
+    compaction_callback: RwLock<Option<Arc<dyn CompactionCallback>>>,
+    max_output_tokens: RwLock<Option<usize>>,
     turn: Mutex<()>,
     active_turn: Mutex<Option<ActiveTurn>>,
     shutting_down: AtomicBool,
     pending: Mutex<PendingState>,
     pending_updates: watch::Sender<Vec<PendingMessage>>,
+    pending_restored: OnceCell<()>,
 }
 
 #[async_trait]
 pub trait RuntimeInitializer: Send + Sync {
     async fn initialize(&self) -> Result<String>;
+
+    async fn render_system_prompt(
+        &self,
+        _spec: &crate::agent::AgentSpec,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 impl AgentRuntime {
@@ -216,6 +263,7 @@ impl AgentRuntime {
             tasks,
             session,
             system_prompt: system_prompt_cell,
+            system_prompt_override: RwLock::new(None),
             initializer: None,
             limits: RwLock::new(limits),
             context_usage: SyncRwLock::new(compaction::ContextUsage {
@@ -223,11 +271,14 @@ impl AgentRuntime {
                 accuracy: compaction::ContextAccuracy::Estimated,
             }),
             compaction_settings: RwLock::new(compaction::Settings::default()),
+            compaction_callback: RwLock::new(None),
+            max_output_tokens: RwLock::new(None),
             turn: Mutex::new(()),
             active_turn: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             pending: Mutex::new(PendingState::default()),
             pending_updates,
+            pending_restored: OnceCell::new(),
         }
     }
 
@@ -252,7 +303,10 @@ impl AgentRuntime {
         runtime
     }
 
-    async fn system_prompt(&self) -> Result<&str> {
+    async fn system_prompt(&self) -> Result<String> {
+        if let Some(prompt) = self.system_prompt_override.read().await.clone() {
+            return Ok(prompt);
+        }
         self.system_prompt
             .get_or_try_init(|| async {
                 self.initializer
@@ -262,11 +316,28 @@ impl AgentRuntime {
                     .await
             })
             .await
-            .map(String::as_str)
+            .cloned()
     }
 
     pub async fn prepare_context(&self) -> Result<()> {
-        self.system_prompt().await.map(|_| ())
+        self.system_prompt().await?;
+        self.pending_restored
+            .get_or_try_init(|| async {
+                let restored = self.session.pending_inputs().await?;
+                if restored.is_empty() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                let mut pending = self.pending.lock().await;
+                if pending.messages.is_empty() {
+                    pending
+                        .messages
+                        .extend(restored.into_iter().map(pending_entry));
+                    self.publish_pending(&pending);
+                }
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 
     pub fn session(&self) -> &Session {
@@ -296,7 +367,7 @@ impl AgentRuntime {
             .model_context(&model.provider, &model.model)
             .await;
         let usage = compaction::context_usage(
-            system_prompt,
+            &system_prompt,
             &context.history,
             &self.model_tools.definitions(),
             context.latest_api_usage,
@@ -310,6 +381,14 @@ impl AgentRuntime {
 
     pub async fn set_compaction_settings(&self, settings: compaction::Settings) {
         *self.compaction_settings.write().await = settings;
+    }
+
+    pub async fn set_compaction_callback(&self, callback: Option<Arc<dyn CompactionCallback>>) {
+        *self.compaction_callback.write().await = callback;
+    }
+
+    pub async fn set_max_output_tokens(&self, max_output_tokens: Option<usize>) {
+        *self.max_output_tokens.write().await = max_output_tokens;
     }
 
     pub async fn set_backend(
@@ -346,7 +425,7 @@ impl AgentRuntime {
     }
 
     pub async fn enqueue_message(
-        &self,
+        self: &Arc<Self>,
         prompt: String,
         kind: PendingMessageKind,
     ) -> Result<PendingMessage> {
@@ -354,16 +433,150 @@ impl AgentRuntime {
             .await
     }
 
-    pub(crate) async fn enqueue_message_with_images(
-        &self,
+    /// Durably accept plugin input. Prompt starts a run when idle; Steer waits
+    /// for the next model boundary while active and becomes Prompt when idle.
+    pub async fn submit(
+        self: &Arc<Self>,
         prompt: String,
-        clipboard_images: Vec<ImageAttachment>,
-        kind: PendingMessageKind,
+        kind: SubmitKind,
     ) -> Result<PendingMessage> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("Agent runtime is shutting down")
+        }
         let prompt = prompt.trim();
         if prompt.is_empty() {
             bail!("message is empty")
         }
+        self.prepare_context().await?;
+        let content = vec![UserContent::text(prompt)];
+        let (message, kind) = {
+            let mut pending = self.pending.lock().await;
+            let kind = match kind {
+                SubmitKind::Steer if !pending.accepting => SubmitKind::Prompt,
+                kind => kind,
+            };
+            let persistent_id = self
+                .session
+                .add_pending_input(kind, prompt, &content, true)
+                .await?;
+            let message = PendingMessage {
+                id: u64::try_from(persistent_id).unwrap_or_default(),
+                text: prompt.to_string(),
+                kind: match kind {
+                    SubmitKind::Prompt => PendingMessageKind::Queued,
+                    SubmitKind::Steer => PendingMessageKind::Steer,
+                },
+            };
+            pending.messages.push_back(PendingMessageEntry {
+                persistent_id: Some(persistent_id),
+                message: message.clone(),
+                content,
+                clipboard_images: Vec::new(),
+                visible: true,
+                task_notification_ids: Vec::new(),
+            });
+            self.publish_pending(&pending);
+            (message, kind)
+        };
+        if kind == SubmitKind::Prompt {
+            self.start_accepted_prompt().await?;
+        }
+        Ok(message)
+    }
+
+    /// Continue durable input after reopening an Agent. A lone Steer is
+    /// promoted to Prompt because there is no active model boundary to steer.
+    pub async fn resume_pending(self: &Arc<Self>) -> Result<bool> {
+        self.prepare_context().await?;
+        {
+            let mut pending = self.pending.lock().await;
+            if !pending
+                .messages
+                .iter()
+                .any(|entry| entry.message.kind == PendingMessageKind::Queued)
+                && let Some(index) = pending
+                    .messages
+                    .iter()
+                    .position(|entry| entry.message.kind == PendingMessageKind::Steer)
+            {
+                if let Some(id) = pending.messages[index].persistent_id
+                    && !self
+                        .session
+                        .update_pending_input_kind(id, SubmitKind::Prompt)
+                        .await?
+                {
+                    bail!("cannot promote missing pending Steer input")
+                }
+                pending.messages[index].message.kind = PendingMessageKind::Queued;
+                self.publish_pending(&pending);
+            }
+        }
+        self.start_accepted_prompt().await
+    }
+
+    async fn start_accepted_prompt(self: &Arc<Self>) -> Result<bool> {
+        let mut active = self.active_turn.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            self.pending.lock().await.accepting = false;
+            return Ok(false);
+        }
+        if let Some(previous) = active.take() {
+            if !previous.handle.is_finished() && self.pending.lock().await.accepting {
+                *active = Some(previous);
+                return Ok(false);
+            }
+            let _ = previous.handle.await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                self.pending.lock().await.accepting = false;
+                return Ok(false);
+            }
+        }
+        let (index, input) = {
+            let mut pending = self.pending.lock().await;
+            let Some(index) = pending
+                .messages
+                .iter()
+                .position(|entry| entry.message.kind == PendingMessageKind::Queued)
+            else {
+                pending.accepting = false;
+                return Ok(false);
+            };
+            let input = pending
+                .messages
+                .remove(index)
+                .expect("the selected pending Prompt exists");
+            pending.accepting = true;
+            self.publish_pending(&pending);
+            (index, input)
+        };
+        let (cancel, receiver) = watch::channel(None);
+        let runtime = self.clone();
+        let handle = tokio::spawn(async move {
+            runtime
+                .run_active_turn(input, true, true, Some(index), receiver)
+                .await;
+        });
+        *active = Some(ActiveTurn { cancel, handle });
+        Ok(true)
+    }
+
+    pub(crate) async fn enqueue_message_with_images(
+        self: &Arc<Self>,
+        prompt: String,
+        clipboard_images: Vec<ImageAttachment>,
+        kind: PendingMessageKind,
+    ) -> Result<PendingMessage> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("Agent runtime is shutting down")
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            bail!("message is empty")
+        }
+        if kind == PendingMessageKind::Queued && !self.pending.lock().await.accepting {
+            bail!("the active turn has already finished")
+        }
+        self.prepare_context().await?;
         let backend = self
             .backend
             .read()
@@ -374,16 +587,30 @@ impl AgentRuntime {
             .user_content(prompt, &clipboard_images, backend.as_ref())
             .await?;
         let mut pending = self.pending.lock().await;
-        if !pending.accepting {
+        let start = kind == PendingMessageKind::Steer && !pending.accepting;
+        if !pending.accepting && !start {
             bail!("the active turn has already finished")
         }
-        let message = PendingMessage {
-            id: pending.next_id,
-            text: prompt.to_string(),
-            kind,
+        let effective_kind = if start {
+            PendingMessageKind::Queued
+        } else {
+            kind
         };
-        pending.next_id = pending.next_id.saturating_add(1);
+        let submit_kind = match effective_kind {
+            PendingMessageKind::Queued => SubmitKind::Prompt,
+            PendingMessageKind::Steer => SubmitKind::Steer,
+        };
+        let persistent_id = self
+            .session
+            .add_pending_input(submit_kind, prompt, &content, true)
+            .await?;
+        let message = PendingMessage {
+            id: u64::try_from(persistent_id).unwrap_or_default(),
+            text: prompt.to_string(),
+            kind: effective_kind,
+        };
         pending.messages.push_back(PendingMessageEntry {
+            persistent_id: Some(persistent_id),
             message: message.clone(),
             content,
             clipboard_images,
@@ -391,6 +618,10 @@ impl AgentRuntime {
             task_notification_ids: Vec::new(),
         });
         self.publish_pending(&pending);
+        drop(pending);
+        if start {
+            self.start_accepted_prompt().await?;
+        }
         Ok(message)
     }
 
@@ -398,6 +629,11 @@ impl AgentRuntime {
         &self,
     ) -> Option<(PendingMessage, Vec<ImageAttachment>)> {
         let mut pending = self.pending.lock().await;
+        if let Some(id) = pending.messages.back()?.persistent_id
+            && self.session.remove_pending_input(id).await.ok() != Some(true)
+        {
+            return None;
+        }
         let entry = pending.messages.pop_back()?;
         self.publish_pending(&pending);
         Some((entry.message, entry.clipboard_images))
@@ -405,12 +641,25 @@ impl AgentRuntime {
 
     pub async fn upgrade_latest_queued(&self) -> Option<PendingMessage> {
         let mut pending = self.pending.lock().await;
+        if !pending.accepting {
+            return None;
+        }
         let entry = pending
             .messages
             .iter_mut()
             .rev()
             .find(|entry| entry.message.kind == PendingMessageKind::Queued)?;
-        entry.message.kind = PendingMessageKind::Guidance;
+        if let Some(id) = entry.persistent_id
+            && self
+                .session
+                .update_pending_input_kind(id, SubmitKind::Steer)
+                .await
+                .ok()
+                != Some(true)
+        {
+            return None;
+        }
+        entry.message.kind = PendingMessageKind::Steer;
         let message = entry.message.clone();
         self.publish_pending(&pending);
         Some(message)
@@ -456,6 +705,9 @@ impl AgentRuntime {
         images: Vec<ImageAttachment>,
     ) -> Result<()> {
         let mut active = self.active_turn.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("Agent runtime is shutting down")
+        }
         if let Some(previous) = active.take() {
             if !previous.handle.is_finished() {
                 *active = Some(previous);
@@ -487,13 +739,31 @@ impl AgentRuntime {
             self.stop_accepting_pending().await;
             return Err(error);
         }
+        let backend = self
+            .backend
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
+        let content = self
+            .user_content(&prompt, &images, backend.as_ref())
+            .await?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            self.stop_accepting_pending().await;
+            bail!("Agent runtime is shutting down")
+        }
+        let persistent_id = self
+            .session
+            .add_pending_input(SubmitKind::Prompt, &prompt, &content, true)
+            .await?;
         let input = PendingMessageEntry {
+            persistent_id: Some(persistent_id),
             message: PendingMessage {
-                id: u64::MAX,
+                id: u64::try_from(persistent_id).unwrap_or_default(),
                 text: prompt,
                 kind: PendingMessageKind::Queued,
             },
-            content: Vec::new(),
+            content,
             clipboard_images: images,
             visible: true,
             task_notification_ids: Vec::new(),
@@ -501,7 +771,9 @@ impl AgentRuntime {
         let (cancel, receiver) = watch::channel(None);
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
-            runtime.run_active_turn(input, false, receiver).await;
+            runtime
+                .run_active_turn(input, true, true, None, receiver)
+                .await;
         });
         *active = Some(ActiveTurn { cancel, handle });
         Ok(())
@@ -538,10 +810,11 @@ impl AgentRuntime {
         }
         let prompt = task_notification_message(&records);
         let input = PendingMessageEntry {
+            persistent_id: None,
             message: PendingMessage {
                 id: u64::MAX,
                 text: prompt.clone(),
-                kind: PendingMessageKind::Guidance,
+                kind: PendingMessageKind::Steer,
             },
             content: vec![UserContent::text(prompt)],
             clipboard_images: Vec::new(),
@@ -551,7 +824,9 @@ impl AgentRuntime {
         let (cancel, receiver) = watch::channel(None);
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
-            runtime.run_active_turn(input, true, receiver).await;
+            runtime
+                .run_active_turn(input, true, false, None, receiver)
+                .await;
         });
         *active = Some(ActiveTurn { cancel, handle });
     }
@@ -559,23 +834,25 @@ impl AgentRuntime {
     async fn run_active_turn(
         self: Arc<Self>,
         mut input: PendingMessageEntry,
-        mut prepared: bool,
+        mut content_prepared: bool,
+        mut take_initial_steer: bool,
+        mut pending_index: Option<usize>,
         mut cancel: watch::Receiver<Option<TurnCancellation>>,
     ) {
-        let mut pending_index = None;
         loop {
             let mut input_delivered = false;
             let result = self
                 .run_turn_with_cancel(
                     input.message.text.clone(),
-                    prepared.then_some(input.content.clone()),
-                    if prepared {
+                    content_prepared.then_some(input.content.clone()),
+                    if content_prepared {
                         &[]
                     } else {
                         &input.clipboard_images
                     },
                     InputDelivery {
-                        take_initial_guidance: !prepared,
+                        pending_id: input.persistent_id,
+                        take_initial_steer,
                         visible: input.visible,
                         task_notification_ids: &input.task_notification_ids,
                     },
@@ -584,7 +861,7 @@ impl AgentRuntime {
                 )
                 .await;
             if result.is_err() {
-                if prepared && !input_delivered && input.visible {
+                if content_prepared && !input_delivered && input.visible {
                     self.restore_pending_entry(pending_index.unwrap_or_default(), input)
                         .await;
                 }
@@ -596,7 +873,8 @@ impl AgentRuntime {
             };
             input = next;
             pending_index = Some(index);
-            prepared = true;
+            content_prepared = true;
+            take_initial_steer = false;
         }
     }
 
@@ -622,7 +900,7 @@ impl AgentRuntime {
             let _ = active.handle.await;
         }
         self.tasks.shutdown().await;
-        self.restore_pending_to_draft().await;
+        self.pending.lock().await.accepting = false;
     }
 
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
@@ -641,7 +919,8 @@ impl AgentRuntime {
             None,
             &images,
             InputDelivery {
-                take_initial_guidance: false,
+                pending_id: None,
+                take_initial_steer: false,
                 visible: true,
                 task_notification_ids: &[],
             },
@@ -710,8 +989,14 @@ impl AgentRuntime {
         };
         self.compact_with(backend.as_ref(), false, false, cancel)
             .await?;
-        self.append_user_input(prompt.to_string(), content, false, delivery.visible)
-            .await?;
+        self.append_user_input(
+            prompt.to_string(),
+            content,
+            false,
+            delivery.visible,
+            delivery.pending_id,
+        )
+        .await?;
         self.tasks
             .mark_terminal_notifications_delivered(delivery.task_notification_ids)
             .await;
@@ -720,7 +1005,7 @@ impl AgentRuntime {
         let result = self
             .run_tool_loop(
                 backend,
-                delivery.take_initial_guidance,
+                delivery.take_initial_steer,
                 !delivery.task_notification_ids.is_empty(),
                 cancel,
             )
@@ -765,6 +1050,7 @@ impl AgentRuntime {
         content: Vec<UserContent>,
         finish_previous: bool,
         visible: bool,
+        pending_id: Option<i64>,
     ) -> Result<()> {
         let mut events = Vec::with_capacity(3);
         if finish_previous {
@@ -776,19 +1062,26 @@ impl AgentRuntime {
         events.push(EventKind::ModelMessage {
             message: Message::User { content },
         });
-        self.session
-            .append_batch(events)
-            .await
-            .context("cannot persist user turn boundary")?;
+        if let Some(pending_id) = pending_id {
+            self.session
+                .append_batch_consuming_pending(pending_id, events)
+                .await
+                .context("cannot persist pending user turn boundary")?;
+        } else {
+            self.session
+                .append_batch(events)
+                .await
+                .context("cannot persist user turn boundary")?;
+        }
         Ok(())
     }
 
-    async fn take_guidance(&self) -> Option<(usize, PendingMessageEntry)> {
+    async fn take_steer(&self) -> Option<(usize, PendingMessageEntry)> {
         let mut pending = self.pending.lock().await;
         let index = pending
             .messages
             .iter()
-            .position(|entry| entry.message.kind == PendingMessageKind::Guidance)?;
+            .position(|entry| entry.message.kind == PendingMessageKind::Steer)?;
         let entry = pending.messages.remove(index)?;
         self.publish_pending(&pending);
         Some((index, entry))
@@ -799,7 +1092,7 @@ impl AgentRuntime {
         let index = pending
             .messages
             .iter()
-            .position(|entry| entry.message.kind == PendingMessageKind::Guidance)
+            .position(|entry| entry.message.kind == PendingMessageKind::Steer)
             .or_else(|| (!pending.messages.is_empty()).then_some(0));
         let Some(index) = index else {
             pending.accepting = false;
@@ -822,6 +1115,7 @@ impl AgentRuntime {
                 entry.content.clone(),
                 finish_previous,
                 entry.visible,
+                entry.persistent_id,
             )
             .await
         {
@@ -863,45 +1157,21 @@ impl AgentRuntime {
         self.pending.lock().await.accepting = false;
     }
 
-    async fn restore_pending_to_draft(&self) {
-        let messages = {
-            let mut pending = self.pending.lock().await;
-            pending.accepting = false;
-            let messages = pending
-                .messages
-                .drain(..)
-                .map(|entry| entry.message.text)
-                .collect::<Vec<_>>();
-            self.publish_pending(&pending);
-            messages
-        };
-        if messages.is_empty() {
-            return;
-        }
-        let draft = self.session.draft().await;
-        let restored = messages
-            .into_iter()
-            .chain((!draft.trim().is_empty()).then_some(draft))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let _ = self.session.save_draft(&restored).await;
-    }
-
     async fn run_tool_loop(
         &self,
         backend: Arc<dyn ModelBackend>,
-        take_initial_guidance: bool,
+        take_initial_steer: bool,
         skip_initial_task_notifications: bool,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<()> {
         let mut overflow_retried = false;
         let mut has_model_response = false;
-        let mut guidance_ready = false;
+        let mut steer_ready = false;
         let mut skip_task_notifications = skip_initial_task_notifications;
         let mut loop_guard = ToolCallLoopGuard::default();
-        if take_initial_guidance && let Some((index, guidance)) = self.take_guidance().await {
-            self.append_pending_input(index, guidance, false).await?;
-            guidance_ready = true;
+        if take_initial_steer && let Some((index, steer)) = self.take_steer().await {
+            self.append_pending_input(index, steer, false).await?;
+            steer_ready = true;
         }
         loop {
             if skip_task_notifications {
@@ -911,8 +1181,8 @@ impl AgentRuntime {
             }
             self.compact_with(backend.as_ref(), false, false, cancel)
                 .await?;
-            if !guidance_ready && let Some((index, guidance)) = self.take_guidance().await {
-                self.append_pending_input(index, guidance, has_model_response)
+            if !steer_ready && let Some((index, steer)) = self.take_steer().await {
+                self.append_pending_input(index, steer, has_model_response)
                     .await?;
             }
             let mut model_retries = HashMap::new();
@@ -964,7 +1234,7 @@ impl AgentRuntime {
                     }
                 }
             };
-            guidance_ready = false;
+            steer_ready = false;
             let assistant_message = Message::Assistant {
                 id: None,
                 content: response.content.clone(),
@@ -1015,9 +1285,9 @@ impl AgentRuntime {
                     .context("cannot persist tool-call loop redirect")?;
                 self.refresh_context_estimate().await;
             }
-            if let Some((index, guidance)) = self.take_guidance().await {
-                self.append_pending_input(index, guidance, true).await?;
-                guidance_ready = true;
+            if let Some((index, steer)) = self.take_steer().await {
+                self.append_pending_input(index, steer, true).await?;
+                steer_ready = true;
                 continue;
             }
             if self.append_task_notifications().await? {
@@ -1066,7 +1336,7 @@ impl AgentRuntime {
         // message boundary. URI Agent additionally preserves tool-call/result
         // pairing when selecting that boundary.
         let preparation = compaction::prepare_with_settings(
-            self.system_prompt().await?,
+            &self.system_prompt().await?,
             &history,
             context_window,
             force,
@@ -1148,12 +1418,94 @@ impl AgentRuntime {
                 }
             }
         };
+        let mut updated = None;
+        if let Some(callback) = self.compaction_callback.read().await.clone() {
+            let current = self.session.spec().await;
+            if let Some(patch) = callback
+                .compacted(CompactionContext {
+                    session_id: self.session.id().to_string(),
+                    summary: summary.clone(),
+                    manual,
+                    spec: current.clone(),
+                })
+                .await?
+            {
+                let prompt_update = patch.system_prompt.clone();
+                if let Some(CapabilitySelection::Only(names)) = patch.tools.as_ref() {
+                    self.model_tools.validate_selection(names)?;
+                }
+                if let Some(CapabilitySelection::Only(names)) = patch.protocols.as_ref() {
+                    self.protocols.validate_selection(names)?;
+                }
+                let mut next = current;
+                if let Some(update) = patch.system_prompt {
+                    next.system_prompt = match update {
+                        SystemPromptUpdate::Append(fragment) => {
+                            validate_prompt_update(&fragment)?;
+                            match next.system_prompt {
+                                crate::agent::SystemPromptSelection::Inherit => {
+                                    crate::agent::SystemPromptSelection::Append(fragment)
+                                }
+                                crate::agent::SystemPromptSelection::Append(existing) => {
+                                    crate::agent::SystemPromptSelection::Append(format!(
+                                        "{existing}\n\n{fragment}"
+                                    ))
+                                }
+                                crate::agent::SystemPromptSelection::Replace(existing) => {
+                                    crate::agent::SystemPromptSelection::Replace(format!(
+                                        "{existing}\n\n{fragment}"
+                                    ))
+                                }
+                            }
+                        }
+                        SystemPromptUpdate::Replace(prompt) => {
+                            validate_prompt_update(&prompt)?;
+                            crate::agent::SystemPromptSelection::Replace(prompt)
+                        }
+                    };
+                }
+                if let Some(tools) = patch.tools {
+                    next.tools = tools;
+                }
+                if let Some(protocols) = patch.protocols {
+                    next.protocols = protocols;
+                }
+                let next_prompt = if let Some(initializer) = &self.initializer
+                    && let Some(prompt) = initializer.render_system_prompt(&next).await?
+                {
+                    prompt
+                } else {
+                    let current_prompt = self.system_prompt().await?;
+                    match prompt_update {
+                        Some(SystemPromptUpdate::Append(fragment)) => {
+                            format!("{current_prompt}\n\n{fragment}")
+                        }
+                        Some(SystemPromptUpdate::Replace(prompt)) => prompt,
+                        None => current_prompt,
+                    }
+                };
+                let mut context = self.session.context().await;
+                context.system_prompt = next_prompt;
+                updated = Some((next, context));
+            }
+        }
         self.record_usage(response.usage, response.context_tokens, false)
             .await?;
         let replacement = compaction::replacement_history(&summary, &preparation.retained);
         self.session
-            .append_compaction(summary, preparation.tokens_before, replacement, manual)
+            .append_compaction_with_spec(
+                summary,
+                preparation.tokens_before,
+                replacement,
+                manual,
+                updated.clone(),
+            )
             .await?;
+        if let Some((spec, context)) = updated {
+            self.model_tools.select(capability_names(&spec.tools))?;
+            self.protocols.select(capability_names(&spec.protocols))?;
+            *self.system_prompt_override.write().await = Some(context.system_prompt);
+        }
         self.refresh_context_estimate().await;
         Ok(true)
     }
@@ -1215,11 +1567,11 @@ impl AgentRuntime {
         self.refresh_context_estimate().await;
         let history = self.session.model_history().await;
         let request = ModelRequest {
-            system: self.system_prompt().await?.to_string(),
+            system: self.system_prompt().await?,
             history,
             tools: self.model_tools.definitions(),
             estimated_context: self.context_usage().tokens,
-            max_output_tokens: None,
+            max_output_tokens: *self.max_output_tokens.read().await,
         };
         let (deltas, mut receiver) = mpsc::unbounded_channel();
         let completion = backend.complete(request, deltas);
@@ -1735,6 +2087,24 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
+    struct TestCompactionCallback {
+        patch: Option<crate::agent::AgentSpecPatch>,
+        failure: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl CompactionCallback for TestCompactionCallback {
+        async fn compacted(
+            &self,
+            _context: CompactionContext,
+        ) -> Result<Option<crate::agent::AgentSpecPatch>> {
+            if let Some(failure) = self.failure {
+                bail!("{failure}");
+            }
+            Ok(self.patch.clone())
+        }
+    }
+
     fn protocol_model_tools() -> Arc<ModelToolRegistry> {
         let mut tools = ModelToolRegistry::new();
         crate::builtins::model_tools::register_protocol_tools(&mut tools).unwrap();
@@ -2029,12 +2399,18 @@ mod tests {
         };
         entered.notified().await;
 
-        let queued = runtime
-            .enqueue_message("queued follow-up".into(), PendingMessageKind::Queued)
-            .await
-            .unwrap();
-        assert_eq!(queued.text, "queued follow-up");
+        let enqueueing = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .enqueue_message("queued follow-up".into(), PendingMessageKind::Queued)
+                    .await
+            })
+        };
+        assert!(!enqueueing.is_finished());
         release.notify_one();
+        let queued = enqueueing.await.unwrap().unwrap();
+        assert_eq!(queued.text, "queued follow-up");
 
         starting.await.unwrap().unwrap();
         wait_for_turn(runtime.as_ref()).await;
@@ -2050,6 +2426,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(user_texts, vec!["initial request", "queued follow-up"]);
         runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_start_a_prompt_accepted_during_deferred_initialization() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("unreachable")],
+                None,
+            )])),
+            requests: Mutex::new(Vec::new()),
+            accepts_images: false,
+        });
+        let (runtime, session, output_directory, entered, release) =
+            deferred_test_runtime(workspace.path(), backend.clone(), None).await;
+        let submitting = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .submit("accepted concurrently".into(), SubmitKind::Prompt)
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        runtime.shutdown().await;
+        release.notify_one();
+        let accepted = submitting.await.unwrap().unwrap();
+
+        assert_eq!(accepted.text, "accepted concurrently");
+        assert_eq!(session.pending_inputs().await.unwrap().len(), 1);
+        assert!(backend.requests.lock().await.is_empty());
+        assert!(!runtime.turn_running().await);
+        let error = runtime
+            .submit("too late".into(), SubmitKind::Prompt)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("runtime is shutting down"));
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -2479,7 +2894,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guidance_reaches_the_next_model_boundary_before_queued_follow_up() {
+    async fn steer_submitted_while_idle_becomes_prompt_and_starts_a_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([text_response("started from steer")])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        let accepted = runtime
+            .submit("start this work".into(), SubmitKind::Steer)
+            .await
+            .unwrap();
+
+        assert_eq!(accepted.kind, PendingMessageKind::Queued);
+        requests_started.recv().await.unwrap();
+        assert_eq!(
+            backend.requests.lock().await[0].history.last(),
+            Some(&Message::user("start this work"))
+        );
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn tui_steer_delivery_that_finds_an_idle_agent_becomes_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("started from TUI steer")],
+                None,
+            )])),
+            ..FakeBackend::default()
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend, ModelLimits::default()).await;
+
+        let accepted = runtime
+            .enqueue_message(
+                "start from delivery float".into(),
+                PendingMessageKind::Steer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(accepted.kind, PendingMessageKind::Queued);
+        wait_for_turn(runtime.as_ref()).await;
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+        assert!(session.snapshot().await.unwrap().iter().any(|event| {
+            matches!(&event.kind, EventKind::User { text } if text == "start from delivery float")
+        }));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn restored_lone_steer_is_promoted_to_prompt_and_resumed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([text_response("resumed steer")])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        session
+            .add_pending_input(
+                SubmitKind::Steer,
+                "resume this work",
+                &[UserContent::text("resume this work")],
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(runtime.resume_pending().await.unwrap());
+        requests_started.recv().await.unwrap();
+        assert_eq!(
+            backend.requests.lock().await[0].history.last(),
+            Some(&Message::user("resume this work"))
+        );
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn steer_reaches_the_next_model_boundary_before_queued_follow_up() {
         let workspace = tempfile::tempdir().unwrap();
         let (started, mut requests_started) = mpsc::unbounded_channel();
         let backend = Arc::new(GatedBackend {
@@ -2501,11 +3013,12 @@ mod tests {
             .enqueue_message("follow up".into(), PendingMessageKind::Queued)
             .await
             .unwrap();
-        let guidance = runtime
-            .enqueue_message("change direction".into(), PendingMessageKind::Guidance)
+        let steer = runtime
+            .submit("change direction".into(), SubmitKind::Steer)
             .await
             .unwrap();
-        assert_eq!(runtime.pending_messages().await, [queued.clone(), guidance]);
+        assert_eq!(steer.kind, PendingMessageKind::Steer);
+        assert_eq!(runtime.pending_messages().await, [queued.clone(), steer]);
 
         backend.release.add_permits(1);
         requests_started.recv().await.unwrap();
@@ -2548,7 +3061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guidance_queued_during_compaction_reaches_the_following_model_request() {
+    async fn steer_queued_during_compaction_reaches_the_following_model_request() {
         let workspace = tempfile::tempdir().unwrap();
         let (started, mut requests_started) = mpsc::unbounded_channel();
         let backend = Arc::new(GatedBackend {
@@ -2593,7 +3106,7 @@ mod tests {
         requests_started.recv().await.unwrap();
         assert!(backend.requests.lock().await[0].tools.is_empty());
         runtime
-            .enqueue_message("new constraint".into(), PendingMessageKind::Guidance)
+            .enqueue_message("new constraint".into(), PendingMessageKind::Steer)
             .await
             .unwrap();
 
@@ -2616,7 +3129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_message_can_be_upgraded_until_guidance_is_delivered() {
+    async fn queued_message_can_be_upgraded_until_steer_is_delivered() {
         let workspace = tempfile::tempdir().unwrap();
         let (started, mut requests_started) = mpsc::unbounded_channel();
         let backend = Arc::new(GatedBackend {
@@ -2639,7 +3152,7 @@ mod tests {
             .unwrap();
         let upgraded = runtime.upgrade_latest_queued().await.unwrap();
         assert_eq!(upgraded.id, queued.id);
-        assert_eq!(upgraded.kind, PendingMessageKind::Guidance);
+        assert_eq!(upgraded.kind, PendingMessageKind::Steer);
 
         backend.release.add_permits(1);
         requests_started.recv().await.unwrap();
@@ -2657,7 +3170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_and_guidance_messages_can_be_restored_before_delivery() {
+    async fn queued_and_steer_messages_can_be_restored_before_delivery() {
         let workspace = tempfile::tempdir().unwrap();
         let (started, mut requests_started) = mpsc::unbounded_channel();
         let backend = Arc::new(GatedBackend {
@@ -2676,13 +3189,13 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .enqueue_message("guidance".into(), PendingMessageKind::Guidance)
+            .enqueue_message("steer".into(), PendingMessageKind::Steer)
             .await
             .unwrap();
 
         assert_eq!(
             runtime.cancel_latest_pending().await.unwrap().0.text,
-            "guidance"
+            "steer"
         );
         assert_eq!(
             runtime.cancel_latest_pending().await.unwrap().0.text,
@@ -2764,7 +3277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_follow_up_delivery_returns_the_message_to_the_pending_queue() {
+    async fn failed_follow_up_delivery_preserves_the_durable_pending_input() {
         let workspace = tempfile::tempdir().unwrap();
         let (started, mut requests_started) = mpsc::unbounded_channel();
         let backend = Arc::new(GatedBackend {
@@ -2789,8 +3302,55 @@ mod tests {
 
         assert_eq!(runtime.pending_messages().await[0].text, "not delivered");
         runtime.shutdown().await;
-        assert!(runtime.pending_messages().await.is_empty());
-        assert_eq!(session.draft().await, "not delivered\n\nexisting draft");
+        assert_eq!(runtime.pending_messages().await[0].text, "not delivered");
+        assert_eq!(session.draft().await, "existing draft");
+        let pending = session.pending_inputs().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "not delivered");
+        assert_eq!(pending[0].kind, SubmitKind::Prompt);
+        let session_id = session.id().to_string();
+        drop(runtime);
+        drop(session);
+
+        let reopened = crate::session::Session::open_at(
+            workspace.path().join("sessions.db"),
+            Some(&session_id),
+            workspace.path(),
+            "ignored",
+            "ignored",
+            SessionContext {
+                system_prompt: "ignored".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let recovered = Arc::new(AgentRuntime::new(
+            Some(Arc::new(FakeBackend {
+                responses: Mutex::new(VecDeque::from([(
+                    vec![AssistantContent::text("recovered")],
+                    None,
+                )])),
+                ..FakeBackend::default()
+            })),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
+            reopened.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        ));
+        assert!(recovered.resume_pending().await.unwrap());
+        wait_for_turn(recovered.as_ref()).await;
+        assert!(reopened.pending_inputs().await.unwrap().is_empty());
+        assert!(reopened.snapshot().await.unwrap().iter().any(|event| {
+            matches!(&event.kind, EventKind::User { text } if text == "not delivered")
+        }));
+        recovered.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -3156,6 +3716,18 @@ mod tests {
         )
         .await
         .unwrap();
+        let host = crate::agent::AgentHost::new(
+            manager.clone(),
+            environment.clone(),
+            Arc::new(
+                crate::catalog::ModelCatalog::load(&workspace.path().join("config"), true)
+                    .await
+                    .unwrap(),
+            ),
+            workspace.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
         crate::builtins::plugins(workspace.path())
             .install(
                 &mut crate::plugin::PluginHost::new(
@@ -3166,7 +3738,10 @@ mod tests {
                     environment,
                 )
                 .with_credentials(manager.clone())
-                .with_subagents(crate::subagent::SubagentService::new(manager)),
+                .with_agents(crate::plugin::PluginAgents::new(
+                    host,
+                    Some(session_id.clone()),
+                )),
             )
             .unwrap();
         let call = ToolCall::new(
@@ -3379,6 +3954,12 @@ mod tests {
         )
         .await
         .unwrap();
+        session
+            .append(EventKind::User {
+                text: "persist the session".to_string(),
+            })
+            .await
+            .unwrap();
         for message in [
             Message::user("first task"),
             Message::assistant("first answer"),
@@ -3456,6 +4037,141 @@ mod tests {
             compaction::ContextAccuracy::Unknown
         );
 
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn compaction_callback_failure_is_atomic_and_success_updates_the_spec() {
+        let workspace = tempfile::tempdir().unwrap();
+        let database = workspace.path().join("sessions.db");
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let session = crate::session::Session::open_at(
+            database.clone(),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "frozen system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        session
+            .append(EventKind::User {
+                text: "persist the session".to_string(),
+            })
+            .await
+            .unwrap();
+        for message in [
+            Message::user("first task"),
+            Message::assistant("first answer"),
+            Message::user("current task"),
+            Message::assistant("current answer"),
+        ] {
+            session
+                .append(EventKind::ModelMessage { message })
+                .await
+                .unwrap();
+        }
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([
+                (vec![AssistantContent::text("failed summary")], None),
+                (vec![AssistantContent::text("saved summary")], None),
+            ])),
+            ..FakeBackend::default()
+        });
+        let runtime = AgentRuntime::new(
+            Some(backend),
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            protocol_model_tools(),
+            session.clone(),
+            "frozen system".to_string(),
+            ModelLimits {
+                context_window: 64,
+                ..ModelLimits::default()
+            },
+        );
+        runtime
+            .set_compaction_callback(Some(Arc::new(TestCompactionCallback {
+                patch: None,
+                failure: Some("callback failed"),
+            })))
+            .await;
+        let before = session.snapshot().await.unwrap().len();
+
+        let error = runtime.compact().await.unwrap_err();
+        assert!(error.to_string().contains("callback failed"));
+        assert_eq!(session.snapshot().await.unwrap().len(), before);
+        assert_eq!(session.context().await.system_prompt, "frozen system");
+
+        runtime
+            .set_compaction_callback(Some(Arc::new(TestCompactionCallback {
+                patch: Some(crate::agent::AgentSpecPatch {
+                    system_prompt: Some(SystemPromptUpdate::Append(
+                        "post-compaction instruction".to_string(),
+                    )),
+                    tools: Some(CapabilitySelection::Only(vec!["read".to_string()])),
+                    protocols: Some(CapabilitySelection::Only(Vec::new())),
+                }),
+                failure: None,
+            })))
+            .await;
+        runtime.compact().await.unwrap();
+
+        let events = session.snapshot().await.unwrap();
+        let updated = events
+            .iter()
+            .position(|event| matches!(event.kind, EventKind::AgentSpecUpdated { .. }))
+            .unwrap();
+        assert!(matches!(
+            events.get(updated + 1).map(|event| &event.kind),
+            Some(EventKind::Compaction { summary, .. }) if summary == "saved summary"
+        ));
+        let spec = session.spec().await;
+        assert_eq!(
+            spec.system_prompt,
+            crate::agent::SystemPromptSelection::Append("post-compaction instruction".to_string())
+        );
+        assert_eq!(
+            spec.tools,
+            CapabilitySelection::Only(vec!["read".to_string()])
+        );
+        assert_eq!(spec.protocols, CapabilitySelection::Only(Vec::new()));
+        assert_eq!(
+            session.context().await.system_prompt,
+            "frozen system\n\npost-compaction instruction"
+        );
+        assert_eq!(runtime.model_tools.definitions().len(), 1);
+        assert!(runtime.protocols.descriptors().is_empty());
+
+        drop(runtime);
+        drop(session);
+        let reopened = crate::session::Session::open_at(
+            database,
+            Some(&session_id),
+            workspace.path(),
+            "ignored",
+            "ignored",
+            SessionContext {
+                system_prompt: "ignored".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.spec().await, spec);
+        assert_eq!(
+            reopened.context().await.system_prompt,
+            "frozen system\n\npost-compaction instruction"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 

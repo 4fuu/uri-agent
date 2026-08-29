@@ -2728,7 +2728,7 @@ pub(super) fn render_pending_messages(frame: &mut Frame<'_>, app: &App, area: Re
     for message in app.pending_messages.iter().skip(hidden) {
         let label = match message.kind {
             PendingMessageKind::Queued => "QUEUE",
-            PendingMessageKind::Guidance => "GUIDE",
+            PendingMessageKind::Steer => "STEER",
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -2791,7 +2791,7 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
     );
     let choices = [
         ("Queue", "Run after the current turn finishes"),
-        ("Guidance", "Add before the next model request"),
+        ("Steer", "Add before the next model request"),
     ];
     let items = choices
         .iter()
@@ -3729,7 +3729,7 @@ pub(super) fn style_input(input: &mut TextArea<'static>, busy: bool, keymap: &Ke
             .style(Style::default().bg(SURFACE)),
     );
     input.set_placeholder_text(if busy {
-        "Add guidance or queue a follow-up…"
+        "Add Steer or queue a follow-up…"
     } else {
         "Ask URI Agent to build, explain, or fix…"
     });
