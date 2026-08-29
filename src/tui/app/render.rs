@@ -2085,6 +2085,11 @@ pub(super) fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
     }
 }
 
+/// A float never renders narrower than this while the terminal has more room:
+/// when its laid-out width would fall below this value, the float spans the
+/// full terminal width without side borders or inner horizontal padding.
+pub(super) const FLOAT_MIN_WIDTH: u16 = 60;
+
 pub(super) fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
@@ -2094,12 +2099,15 @@ pub(super) fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
             8 + pending_preview_height(app) + completion_preview_height(app),
         ),
         Overlay::Delivery => bottom_float(frame, 9),
-        Overlay::Text | Overlay::Oauth => Rect::new(
-            2,
-            frame.height.saturating_sub(12).max(2),
-            frame.width.saturating_sub(4),
-            10,
-        ),
+        Overlay::Text | Overlay::Oauth => {
+            let horizontal_margin = float_horizontal_margin(frame.width);
+            Rect::new(
+                horizontal_margin,
+                frame.height.saturating_sub(12).max(2),
+                frame.width.saturating_sub(horizontal_margin * 2),
+                10,
+            )
+        }
         Overlay::Terminal => centered(frame, 92, 88),
         Overlay::Models | Overlay::Settings | Overlay::Selector => centered(frame, 82, 78),
         _ => centered(frame, 78, 72),
@@ -2107,7 +2115,7 @@ pub(super) fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
 }
 
 pub(super) fn bottom_float(frame: Rect, desired_height: u16) -> Rect {
-    let horizontal_margin = u16::from(frame.width > 4) * 2;
+    let horizontal_margin = float_horizontal_margin(frame.width);
     let width = frame.width.saturating_sub(horizontal_margin * 2);
     let height = desired_height.min(frame.height).max(1);
     Rect::new(
@@ -2116,6 +2124,13 @@ pub(super) fn bottom_float(frame: Rect, desired_height: u16) -> Rect {
         width,
         height,
     )
+}
+
+/// Bottom floats keep a two-column margin only when doing so still leaves at
+/// least `FLOAT_MIN_WIDTH` columns for the float itself.
+fn float_horizontal_margin(frame_width: u16) -> u16 {
+    const MARGIN: u16 = 2;
+    u16::from(frame_width.saturating_sub(MARGIN * 2) >= FLOAT_MIN_WIDTH) * MARGIN
 }
 
 pub(super) fn active_protocols(app: &App) -> Vec<ProtocolDescriptor> {
@@ -2127,12 +2142,18 @@ pub(super) fn active_protocols(app: &App) -> Vec<ProtocolDescriptor> {
 pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Overlay) {
     let area = overlay_area(frame.area(), app, overlay);
     frame.render_widget(Clear, area);
+    let edge_to_edge = area.width == frame.area().width;
+    let (borders, padding) = if edge_to_edge {
+        (Borders::TOP | Borders::BOTTOM, Padding::vertical(1))
+    } else {
+        (Borders::ALL, Padding::uniform(1))
+    };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(borders)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(SURFACE).fg(TEXT))
-        .padding(Padding::uniform(1));
+        .padding(padding);
     app.overlay_viewport_rows = block.inner(area).height as usize;
     match overlay {
         Overlay::Composer => {
@@ -2161,6 +2182,10 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             }
             let composer_area = sections[section];
             app.sync_composer_chrome();
+            if edge_to_edge && let Some(block) = app.input.block().cloned() {
+                app.input
+                    .set_block(block.borders(Borders::TOP | Borders::BOTTOM));
+            }
             frame.render_widget(&app.input, composer_area);
             if let Some(position) = composer_cursor_position(frame, &app.input, composer_area) {
                 frame.set_cursor_position(position);
@@ -2343,8 +2368,9 @@ pub(super) fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             return;
         };
         pty.area = area;
+        let edge_to_edge = area.width == frame.area().width;
         let inner = area.inner(Margin {
-            horizontal: 1,
+            horizontal: u16::from(!edge_to_edge),
             vertical: 1,
         });
         let resize_error = pty.terminal.resize(inner.height, inner.width).err();
@@ -2352,7 +2378,11 @@ pub(super) fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         frame.render_widget(
             PseudoTerminal::new(parser.screen()).block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(if edge_to_edge {
+                        Borders::TOP | Borders::BOTTOM
+                    } else {
+                        Borders::ALL
+                    })
                     .border_style(Style::default().fg(ACCENT))
                     .style(Style::default().bg(SURFACE))
                     .title(fit_panel_title(&title, area.width)),
@@ -3925,14 +3955,17 @@ pub(super) fn centered(area: Rect, width_percent: u16, height_percent: u16) -> R
             Constraint::Percentage((100 - height_percent) / 2),
         ])
         .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_percent) / 2),
-            Constraint::Percentage(width_percent),
-            Constraint::Percentage((100 - width_percent) / 2),
-        ])
-        .split(vertical[1])[1]
+    let band = vertical[1];
+    if band.width <= FLOAT_MIN_WIDTH {
+        return band;
+    }
+    let share = (u32::from(band.width) * u32::from(width_percent) / 100) as u16;
+    // Keep only half of the side margins the percentage split would leave so
+    // wide terminals do not waste columns on empty padding.
+    let margin = (band.width - share) / 4;
+    let width = (band.width - margin * 2).clamp(FLOAT_MIN_WIDTH, band.width);
+    let margin = (band.width - width) / 2;
+    Rect::new(band.x + margin, band.y, width, band.height)
 }
 
 pub(super) fn capture_surface(

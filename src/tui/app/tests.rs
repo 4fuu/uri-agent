@@ -2025,6 +2025,92 @@ fn selection_releases_command_and_global_panel_shortcuts() {
 }
 
 #[test]
+fn floats_hug_the_edges_without_side_borders_below_their_minimum_width() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        false,
+    );
+
+    // Bottom floats keep a two-column margin only when the remaining width
+    // still leaves at least sixty columns for the float itself.
+    assert_eq!(
+        overlay_area(Rect::new(0, 0, 64, 24), &app, Overlay::Status),
+        Rect::new(2, 10, 60, 14)
+    );
+    assert_eq!(
+        overlay_area(Rect::new(0, 0, 63, 24), &app, Overlay::Status),
+        Rect::new(0, 10, 63, 14)
+    );
+    assert_eq!(
+        overlay_area(Rect::new(0, 0, 63, 24), &app, Overlay::Text),
+        Rect::new(0, 12, 63, 10)
+    );
+
+    // Centered floats hug the edges only when the terminal itself cannot fit
+    // the sixty-column minimum; above it they stay centered, keeping half of
+    // the side margins the percentage split would otherwise leave empty.
+    let command = overlay_area(Rect::new(0, 0, 80, 24), &app, Overlay::Command);
+    assert_eq!((command.x, command.width), (5, 70));
+    let command = overlay_area(Rect::new(0, 0, 100, 24), &app, Overlay::Command);
+    assert_eq!((command.x, command.width), (7, 86));
+    let command = overlay_area(Rect::new(0, 0, 61, 24), &app, Overlay::Command);
+    assert_eq!((command.x, command.width), (0, 60));
+    let command = overlay_area(Rect::new(0, 0, 60, 24), &app, Overlay::Command);
+    assert_eq!((command.x, command.width), (0, 60));
+
+    app.overlay = Some(Overlay::Composer);
+    let rendered = render_to_string(&mut app, 60, 24);
+    let rows = rendered.lines().collect::<Vec<_>>();
+    // Without side borders the title hugs the left edge and the border runs
+    // to the right edge; the placeholder starts right after tui-textarea's
+    // one-column caret slot instead of a padded column.
+    assert!(
+        rows[16].starts_with(" MESSAGE "),
+        "unexpected row: {:?}",
+        rows[16]
+    );
+    assert!(rows[16].ends_with('─'));
+    assert!(rows[17].starts_with(" Ask URI Agent"));
+    assert!(rows[23].starts_with('─'));
+
+    app.overlay = Some(Overlay::Command);
+    let rendered = render_to_string(&mut app, 60, 24);
+    let title_row = rendered
+        .lines()
+        .find(|line| line.contains("COMMAND"))
+        .expect("command panel title row");
+    // The panel title hugs the left edge and the border still reaches the
+    // right edge.
+    assert!(
+        title_row.starts_with(" COMMAND "),
+        "unexpected row: {title_row:?}"
+    );
+    assert!(title_row.ends_with('─'), "unexpected row: {title_row:?}");
+
+    // Float content also drops its side padding: status rows start right
+    // at the left edge instead of one padded column in.
+    app.overlay = Some(Overlay::Status);
+    let narrow = render_to_string(&mut app, 60, 24);
+    let row = narrow
+        .lines()
+        .find(|line| line.contains("PROJECT"))
+        .expect("narrow status project row");
+    assert!(row.starts_with("PROJECT"), "unexpected row: {row:?}");
+
+    let wide = render_to_string(&mut app, 80, 24);
+    let row = wide
+        .lines()
+        .find(|line| line.contains("PROJECT"))
+        .expect("wide status project row");
+    assert!(row.starts_with("  │ PROJECT"), "unexpected row: {row:?}");
+}
+
+#[test]
 fn composer_mouse_click_moves_the_caret_and_drag_selects_editable_text() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);

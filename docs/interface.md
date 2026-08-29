@@ -27,7 +27,7 @@ and reasoning/tool jump actions reveal a folded parent automatically.
 If the model calls a protocol before reading that protocol's help, the blocked
 tool row uses a purple header. Its error detail keeps the normal error color.
 
-A click outside dismisses read-only and navigational floats, including the composer, command panel, selectors, status, help, protocols, tasks, and documents. The composer preserves its draft. Model Hub, Settings, text prompts, OAuth, and the embedded terminal require an explicit close so an outside click cannot discard a staged choice or stop work.
+A click outside dismisses read-only and navigational floats, including the composer, command panel, selectors, status, help, protocols, tasks, and documents. The composer preserves its draft. Model Hub, Settings, text prompts, OAuth, and the embedded terminal require an explicit close so an outside click cannot discard a staged choice or stop work. A float never renders narrower than 60 columns while the terminal is wider; below that, it spans the full width without left and right borders or inner horizontal padding. Centered floats above that minimum keep half of the side margins their percentage split would otherwise leave empty.
 
 ## Composer and commands
 
