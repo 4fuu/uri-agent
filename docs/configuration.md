@@ -21,7 +21,7 @@ to the current session without restarting the application.
 
 ## Model catalog
 
-URI Agent downloads provider and model records from pi.dev, supplements them from supported providers' model-list APIs, and merges them with the local `models.json`. The Rust/Rig backend currently runs these API families:
+URI Agent downloads provider and model records from pi.dev, supplements them from supported providers' model-list APIs and built-in provider catalogs, and merges them with the local `models.json`. The Rust/Rig backend currently runs these API families:
 
 - `openai-responses`
 - `openai-codex-responses`
@@ -29,7 +29,7 @@ URI Agent downloads provider and model records from pi.dev, supplements them fro
 - `anthropic-messages`
 - `google-generative-ai`
 
-URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol). It is not part of the pi.dev coverage count.
+URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol) and authenticated [`codebuddy` cloud discovery](#codebuddy). Neither is part of the pi.dev coverage count.
 
 The model selector shows only models using a supported API family whose provider has a configured credential from `models.json`, `auth.json`, or a recognized provider environment variable. The generic `URI_AGENT_API_KEY` and `--api-key` overrides expose only the current provider rather than every catalog provider. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
 
@@ -108,6 +108,7 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 | `cloudflare-ai-gateway` | Cloudflare API token, account ID, and AI Gateway ID |
 | `antigravity` | Experimental Google browser OAuth for the private Antigravity protocol |
 | `anthropic` | Claude Pro/Max browser OAuth |
+| `codebuddy` | Chinese Site (WeChat), International Site (Google or GitHub), or an Enterprise Domain |
 | `openrouter` | Browser PKCE |
 | `openai-codex` | Browser or device-code login |
 | `github-copilot` | Device-code login, including an optional Enterprise domain |
@@ -121,6 +122,47 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent resolves the active credential before each model request and refreshes it within five minutes of expiry rather than refreshing every stored provider during startup. Credential writes and refreshes use a cross-process transaction lock, so concurrent URI Agent processes re-read and merge the current file instead of overwriting each other's updates. The refreshed access token, new expiry, and rotated refresh token are persisted before the request continues; when a provider omits the refresh token, URI Agent retains the previous one rather than replacing it with an empty value. Kimi refresh retries connection failures, HTTP 429, and server errors up to three times with 1-, 2-, and 4-second delays; authentication failures are not retried. On Unix, URI Agent creates `auth.json` and its lock with mode `0600` and the configuration directory with mode `0700`.
 
 Models using `openai-codex-responses` require the `openai-codex` OAuth entry created by the OpenAI browser or device-code login. An OpenAI Platform API key—including `OPENAI_API_KEY`, `URI_AGENT_API_KEY`, or `--api-key`—is not accepted for this subscription endpoint. Model availability is determined by the signed-in ChatGPT account and its subscription.
+
+### CodeBuddy
+
+Run `:login`, choose **CodeBuddy**, then choose the site that owns the account:
+
+| Login choice | Identity provider | Endpoint |
+| --- | --- | --- |
+| Chinese Site | WeChat | `https://copilot.tencent.com` |
+| International Site | Google or GitHub | `https://www.codebuddy.ai` |
+| Enterprise Domain | Enterprise-configured login | HTTP(S) endpoint entered at login |
+
+The Tencent-internal iOA route is not supported. A CodeBuddy login has a five-minute deadline. It creates browser state through `POST /v2/plugin/auth/state?platform=CLI`, opens the returned URL with the client version, and polls the token and account routes once per second. Token code `11217` and account code `12151` mean the browser flow is still pending; account polling retries HTTP 401 or 403 up to five times. The resulting access token, refresh token, endpoint, selected environment, domain, authentication method, and account identity are saved in `auth.json`; access and refresh secrets are not duplicated in metadata.
+
+CodeBuddy refresh sends the old bearer token and `X-Refresh-Token` to `POST /v2/plugin/auth/token/refresh`, then requires a successful `GET /v2/plugin/accounts`. URI Agent saves a rotated refresh token when returned and selects the account marked `lastLogin`, or the first account when none is marked. License failures and disallowed-IP failures are returned as login or refresh errors. A request-phase HTTP 401 refreshes a stored OAuth credential and retries once before any streamed event; API keys and custom bearer tokens are never refreshed.
+
+Model requests use OpenAI Chat Completions streaming at `{endpoint}/v2/chat/completions` and always send `Authorization: Bearer ...` and `X-Requested-With: XMLHttpRequest`. An API key is also sent as `X-API-Key`, matching CodeBuddy. A signed-in account adds CodeBuddy's domain, user, enterprise, department, tenant, authentication-method, identity-source, and base64-encoded `X-Userinfo` headers. If an API key overrides a stored login, the stored account identity is retained; `CODEBUDDY_AUTH_TOKEN` instead supplies a complete custom bearer session without refresh. The CodeBuddy backend owns the endpoint and authentication headers, so catalog and `models.json` transport fields cannot redirect these credentials or replace their identity headers.
+
+CodeBuddy does not expose a generic `/models` API. Instead, after credentials are configured, URI Agent follows the reference client and sends an authenticated `GET {endpoint}/v3/config` request with the CodeBuddy account identity and product headers. It converts the runnable chat records from the response's `data.models` and merges them by model ID with the current pi.dev catalog. The cloud record is authoritative for a CodeBuddy model ID; an explicit user `modelOverrides` entry remains the final metadata layer.
+
+CodeBuddy cloud configuration is cached for eight minutes and scoped to the credential, account identity, and endpoint. Up to 20 account configurations are retained in `models-store.json`. A failed or empty response keeps the last successful configuration for that scope. A new login refreshes the cloud catalog immediately; on first use, login and network access must succeed before CodeBuddy models appear. No hand-written `models.json` or bundled CodeBuddy model snapshot is required.
+
+The reference process variables are supported:
+
+```bash
+export CODEBUDDY_INTERNET_ENVIRONMENT='external' # external, internal, or selfhosted
+export CODEBUDDY_BASE_URL='https://enterprise.example' # generation endpoint override
+export CODEBUDDY_API_KEY='<codebuddy-api-key>'
+export CODEBUDDY_AUTH_TOKEN='<custom-bearer-token>'
+export CODEBUDDY_REMOTE_CONFIG_DISABLED='true' # optional: do not refresh /v3/config
+```
+
+`CODEBUDDY_BASE_URL` is required with `selfhosted` when no saved Enterprise login supplies an endpoint; it also overrides the cloud-configuration and generation endpoint of a saved login. `CODEBUDDY_REMOTE_CONFIG_DISABLED=1|true` disables cloud refresh while leaving a matching cached configuration available. The existing `models.json apiKey` field, including a leading `!command`, is an optional equivalent of CodeBuddy's `apiKeyHelper`; it is not a model-catalog requirement. CodeBuddy credential precedence from lowest to highest is:
+
+```text
+auth.json
+< CODEBUDDY_API_KEY
+< models.json apiKey
+< CODEBUDDY_AUTH_TOKEN
+< URI_AGENT_API_KEY
+< --api-key
+```
 
 ### Experimental Antigravity private protocol
 
@@ -179,7 +221,7 @@ Requests use the private `v1internal:streamGenerateContent` SSE operation. URI A
 
 URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 
-Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. Cloudflare AI Gateway's structured variables and compatibility alias are documented [above](#cloudflare-ai-gateway). The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
+Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. Cloudflare AI Gateway's structured variables and compatibility alias are documented [above](#cloudflare-ai-gateway), and CodeBuddy's variables and provider-specific precedence are documented in the [CodeBuddy section](#codebuddy). The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
 
 ### Credential precedence
 
@@ -194,6 +236,8 @@ models.json apiKey
 ```
 
 The command-line API key is process-only and is not written to `auth.json`.
+
+CodeBuddy follows the provider-specific order in the [CodeBuddy section](#codebuddy), which places the optional `models.json apiKey` helper above its stored credential and `CODEBUDDY_API_KEY` to match the reference client.
 
 Web-provider credentials are independent of the active model. Parallel, Exa,
 and TinyFish resolve a key from `auth.json`, overridden by that provider's

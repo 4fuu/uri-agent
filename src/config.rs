@@ -1,6 +1,12 @@
 use crate::catalog::{
-    CatalogCredential, CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel,
-    api_key_environments, supports_live_discovery,
+    CatalogCredential, CatalogModel, CatalogRefreshReport, CodeBuddyCatalogCredential,
+    ModelCatalog, ThinkingLevel, api_key_environments, supports_live_discovery,
+};
+use crate::codebuddy::{
+    AUTH_TOKEN_VARIABLE as CODEBUDDY_AUTH_TOKEN_VARIABLE,
+    BASE_URL_VARIABLE as CODEBUDDY_BASE_URL_VARIABLE,
+    ENVIRONMENT_VARIABLE as CODEBUDDY_ENVIRONMENT_VARIABLE, process_session_from,
+    session_from_oauth,
 };
 use crate::compaction;
 use crate::keymap::KeyDisplayStyle;
@@ -445,6 +451,7 @@ struct DiscoveryCredentialCandidate {
     value: String,
     oauth: bool,
     environment: BTreeMap<String, String>,
+    codebuddy: Option<CodeBuddyCatalogCredential>,
 }
 
 pub struct ConfigManager {
@@ -795,6 +802,29 @@ impl ConfigManager {
     }
 
     pub async fn refresh_catalog(&self, force: bool) -> Result<CatalogRefreshReport> {
+        let refresh_codebuddy = {
+            let files = self.files.lock().await;
+            let current_provider = selected_provider(&files, &self.invocation).0;
+            let credential = resolve_model_credential(
+                &files,
+                &self.catalog,
+                &self.invocation,
+                "codebuddy",
+                current_provider == "codebuddy",
+            )
+            .await;
+            credential.kind == AuthKind::Oauth
+                && credential.source == ValueSource::Global
+                && files.auth.0.get("codebuddy").is_some_and(|entry| {
+                    entry.kind == "oauth"
+                        && entry
+                            .expires
+                            .is_some_and(|expires| expires <= chrono::Utc::now().timestamp_millis())
+                })
+        };
+        if refresh_codebuddy {
+            self.refresh_oauth("codebuddy", false).await?;
+        }
         let candidates = {
             let files = self.files.lock().await;
             discovery_credential_candidates(&files, &self.catalog, &self.invocation).await
@@ -1236,7 +1266,10 @@ async fn discovery_credential_candidates(
     invocation: &InvocationOverrides,
 ) -> Vec<DiscoveryCredentialCandidate> {
     let current_provider = selected_provider(files, invocation).0;
-    let providers = catalog.providers().await;
+    let mut providers = catalog.providers().await;
+    if !providers.iter().any(|provider| provider == "codebuddy") {
+        providers.push("codebuddy".to_string());
+    }
     let mut candidates = Vec::new();
     for provider in providers {
         if !supports_live_discovery(&provider) {
@@ -1253,11 +1286,46 @@ async fn discovery_credential_candidates(
         let Some(value) = credential.api_key else {
             continue;
         };
+        let codebuddy = if provider == "codebuddy" {
+            let custom_token = matches!(
+                &credential.source,
+                ValueSource::Environment(name) if name == CODEBUDDY_AUTH_TOKEN_VARIABLE
+            );
+            let stored = if custom_token {
+                None
+            } else {
+                files
+                    .auth
+                    .0
+                    .get("codebuddy")
+                    .filter(|entry| entry.kind == "oauth")
+                    .and_then(|entry| oauth_token_from_entry("codebuddy", entry).ok())
+            };
+            let base_url = env::var(CODEBUDDY_BASE_URL_VARIABLE)
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            let session = match stored.as_ref() {
+                Some(token) => session_from_oauth(token, base_url.as_deref()),
+                None => {
+                    process_session_from(base_url, env::var(CODEBUDDY_ENVIRONMENT_VARIABLE).ok())
+                }
+            };
+            let Ok(session) = session else {
+                continue;
+            };
+            Some(CodeBuddyCatalogCredential {
+                session,
+                api_key: credential.kind == AuthKind::ApiKey,
+            })
+        } else {
+            None
+        };
         candidates.push(DiscoveryCredentialCandidate {
             provider,
             value,
             oauth: credential.kind == AuthKind::Oauth,
             environment: credential.environment,
+            codebuddy,
         });
     }
     candidates
@@ -1294,6 +1362,7 @@ async fn resolve_discovery_credentials(
                 CatalogCredential {
                     secret,
                     oauth: candidate.oauth,
+                    codebuddy: candidate.codebuddy,
                 },
             );
         }
@@ -1454,12 +1523,48 @@ async fn resolve_model_credential(
         Some(entry) if !private_oauth && entry.kind == "api_key" && entry.key.is_some() => {
             (entry.key.clone(), ValueSource::Global, AuthKind::ApiKey)
         }
-        _ => (models_key, ValueSource::ModelsFile, AuthKind::None),
+        _ => (models_key.clone(), ValueSource::ModelsFile, AuthKind::None),
     };
     if kind == AuthKind::None && api_key.is_some() {
         kind = AuthKind::ApiKey;
     }
-    if !private_oauth {
+    if provider == "codebuddy" {
+        if let Ok(value) = env::var("CODEBUDDY_API_KEY")
+            && !value.trim().is_empty()
+        {
+            api_key = Some(value);
+            source = ValueSource::Environment("CODEBUDDY_API_KEY".to_string());
+            kind = AuthKind::ApiKey;
+        }
+        // models.json supports `apiKey: "!command"`, which is URI Agent's
+        // equivalent of CodeBuddy's apiKeyHelper and has the same precedence.
+        if let Some(value) = models_key {
+            api_key = Some(value);
+            source = ValueSource::ModelsFile;
+            kind = AuthKind::ApiKey;
+        }
+        if let Ok(value) = env::var("CODEBUDDY_AUTH_TOKEN")
+            && !value.trim().is_empty()
+        {
+            api_key = Some(value);
+            source = ValueSource::Environment("CODEBUDDY_AUTH_TOKEN".to_string());
+            kind = AuthKind::Oauth;
+        }
+        if include_generic_overrides {
+            if let Ok(value) = env::var("URI_AGENT_API_KEY")
+                && !value.trim().is_empty()
+            {
+                api_key = Some(value);
+                source = ValueSource::Environment("URI_AGENT_API_KEY".to_string());
+                kind = AuthKind::ApiKey;
+            }
+            if let Some(value) = &invocation.api_key {
+                api_key = Some(value.clone());
+                source = ValueSource::CommandLine;
+                kind = AuthKind::ApiKey;
+            }
+        }
+    } else if !private_oauth {
         let mut environments = api_key_environments(provider);
         if provider == "anthropic" {
             environments.insert(0, "ANTHROPIC_OAUTH_TOKEN".to_string());
@@ -3034,6 +3139,7 @@ mod tests {
             value: command.clone(),
             oauth: false,
             environment: BTreeMap::new(),
+            codebuddy: None,
         };
 
         let credentials = resolve_discovery_credentials(vec![candidate()], false).await;
@@ -3059,6 +3165,7 @@ mod tests {
             value,
             oauth: false,
             environment: BTreeMap::new(),
+            codebuddy: None,
         };
 
         let credentials = resolve_discovery_credentials(
@@ -3101,6 +3208,37 @@ mod tests {
 
         assert_eq!(selected.api_key.as_deref(), Some("invocation-key"));
         assert_eq!(unrelated.api_key, None);
+    }
+
+    #[tokio::test]
+    async fn codebuddy_invocation_key_overrides_stored_oauth() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = ModelCatalog::load(root.path(), true).await.unwrap();
+        let files = ConfigFiles {
+            global: SettingsFile::default(),
+            project: SettingsFile::default(),
+            auth: serde_json::from_value(serde_json::json!({
+                "codebuddy": {
+                    "type": "oauth",
+                    "refresh": "expired-refresh",
+                    "access": "expired-access",
+                    "expires": 0
+                }
+            }))
+            .unwrap(),
+        };
+        let invocation = InvocationOverrides {
+            provider: Some("codebuddy".to_string()),
+            api_key: Some("invocation-key".to_string()),
+            ..InvocationOverrides::default()
+        };
+
+        let credential =
+            resolve_model_credential(&files, &catalog, &invocation, "codebuddy", true).await;
+
+        assert_eq!(credential.api_key.as_deref(), Some("invocation-key"));
+        assert_eq!(credential.kind, AuthKind::ApiKey);
+        assert_eq!(credential.source, ValueSource::CommandLine);
     }
 
     #[test]

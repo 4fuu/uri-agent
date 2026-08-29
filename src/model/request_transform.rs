@@ -552,9 +552,21 @@ impl ModelRequestTransform {
             body.insert("reasoning_effort".to_string(), mapped);
         } else if !enabled
             && self.supports_reasoning_effort()
+            && self.compat_bool("sendReasoningEffortWhenOff", true)
             && let Some(off @ Value::String(_)) = self.off_mapping()
         {
             body.insert("reasoning_effort".to_string(), off);
+        }
+        if enabled
+            && let Some(summary) = self
+                .model
+                .compat("reasoningSummary")
+                .and_then(Value::as_str)
+        {
+            body.insert(
+                "reasoning_summary".to_string(),
+                Value::String(summary.to_string()),
+            );
         }
         self.apply_chat_template(body, "chatTemplateKwargs", "chat_template_kwargs");
         self.apply_chat_template(body, "chatTemplateArgs", "chat_template_args");

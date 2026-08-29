@@ -7330,3 +7330,32 @@ fn cloudflare_login_collects_all_credentials_before_saving() {
             && gateway_id == CLOUDFLARE_DEFAULT_GATEWAY_ID
     ));
 }
+
+#[test]
+fn codebuddy_enterprise_login_requires_an_http_endpoint() {
+    let mut app = test_app();
+    open_codebuddy_endpoint_prompt(&mut app);
+    let prompt = app.text_prompt.as_mut().unwrap();
+    assert!(!prompt.secret);
+    assert!(matches!(prompt.purpose, TextPurpose::CodeBuddyEndpoint));
+    prompt.value = "enterprise.example.com".to_string();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    assert!(matches!(
+        handle_text_key(&mut app, enter, &key_name(enter)),
+        Action::Continue
+    ));
+    assert!(app.text_prompt.is_some());
+
+    app.text_prompt.as_mut().unwrap().value = "https://enterprise.example.com/".to_string();
+    assert!(matches!(
+        handle_text_key(&mut app, enter, &key_name(enter)),
+        Action::StartOauth {
+            provider,
+            method,
+            extra,
+        } if provider == "codebuddy"
+            && method == "selfhosted"
+            && extra.get("endpoint").map(String::as_str)
+                == Some("https://enterprise.example.com")
+    ));
+}

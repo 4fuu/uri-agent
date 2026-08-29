@@ -7,6 +7,7 @@
 
 mod antigravity;
 mod cloudflare;
+mod codebuddy;
 mod codex_websocket;
 mod failure;
 mod request_transform;
@@ -97,6 +98,13 @@ pub async fn configured_backend(
     let limits = model.limits();
     let backend: Arc<dyn ModelBackend> = if model.provider == cloudflare::PROVIDER {
         Arc::new(cloudflare::CloudflareBackend::new(
+            model,
+            settings.clone(),
+            session_id,
+            manager,
+        ))
+    } else if model.provider == codebuddy::PROVIDER {
+        Arc::new(codebuddy::CodeBuddyBackend::new(
             model,
             settings.clone(),
             session_id,

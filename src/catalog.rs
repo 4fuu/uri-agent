@@ -1,5 +1,7 @@
+mod codebuddy;
 mod discovery;
 
+use crate::codebuddy::Session as CodeBuddySession;
 use crate::config::display_path;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -23,6 +25,13 @@ const REQUEST_CONCURRENCY: usize = 8;
 pub(crate) struct CatalogCredential {
     pub secret: String,
     pub oauth: bool,
+    pub codebuddy: Option<CodeBuddyCatalogCredential>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CodeBuddyCatalogCredential {
+    pub session: CodeBuddySession,
+    pub api_key: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -500,7 +509,10 @@ impl ModelCatalog {
         let discovery_requests = credentials
             .iter()
             .filter_map(|(provider, credential)| {
-                if !discovery::supports_provider(provider) || !base_models.contains_key(provider) {
+                if !discovery::supports_provider(provider)
+                    || !discovery::refresh_enabled(provider)
+                    || (provider != codebuddy::PROVIDER && !base_models.contains_key(provider))
+                {
                     return None;
                 }
                 let fingerprint = discovery::credential_fingerprint(provider, credential);
@@ -510,7 +522,7 @@ impl ModelCatalog {
                     .cloned();
                 if !force
                     && cached.as_ref().is_some_and(|entry| {
-                        now - entry.checked_at < discovery::REFRESH_INTERVAL_MS
+                        now - entry.checked_at < discovery::refresh_interval(provider)
                     })
                 {
                     return None;
@@ -535,9 +547,11 @@ impl ModelCatalog {
         let mut state = self.inner.write().await;
         for (provider, fingerprint, cached, result) in discovery_results {
             let entry = state.store.entry(provider.clone()).or_default();
-            entry
-                .discoveries
-                .retain(|existing, _| existing == &fingerprint);
+            if provider != codebuddy::PROVIDER {
+                entry
+                    .discoveries
+                    .retain(|existing, _| existing == &fingerprint);
+            }
             match result {
                 Ok(models) => {
                     entry.discoveries.insert(
@@ -558,6 +572,19 @@ impl ModelCatalog {
                         },
                     );
                 }
+            }
+            while provider == codebuddy::PROVIDER
+                && entry.discoveries.len() > codebuddy::MAX_CACHED_CONFIGS
+            {
+                let Some(oldest) = entry
+                    .discoveries
+                    .iter()
+                    .min_by_key(|(_, discovery)| discovery.checked_at)
+                    .map(|(fingerprint, _)| fingerprint.clone())
+                else {
+                    break;
+                };
+                entry.discoveries.remove(&oldest);
             }
         }
         write_json(&self.store_path, &state.store).await?;
@@ -756,7 +783,11 @@ fn merge_catalog(
             let Ok(value) = serde_json::to_value(model) else {
                 continue;
             };
-            models.entry(model.id.clone()).or_insert(value);
+            if provider == codebuddy::PROVIDER {
+                models.insert(model.id.clone(), value);
+            } else {
+                models.entry(model.id.clone()).or_insert(value);
+            }
         }
     }
     let mut warnings = Vec::new();
@@ -1062,6 +1093,7 @@ pub fn api_key_environment(provider: &str) -> String {
         "cerebras" => "CEREBRAS_API_KEY",
         "cloudflare-ai-gateway" => "CLOUDFLARE_API_TOKEN",
         "cloudflare-workers-ai" => "CLOUDFLARE_API_KEY",
+        "codebuddy" => "CODEBUDDY_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
         "github-copilot" => "COPILOT_GITHUB_TOKEN",
@@ -1223,6 +1255,7 @@ mod tests {
             CatalogCredential {
                 secret: "configured-key".to_string(),
                 oauth: false,
+                codebuddy: None,
             },
         )]);
 
@@ -1235,6 +1268,63 @@ mod tests {
         assert_eq!(report.discovered_models, 0);
         assert!(catalog.warnings().await.is_empty());
         assert!(catalog.model("xai", "grok-4").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn codebuddy_cloud_failure_keeps_the_credential_scoped_last_good_models() {
+        let root = tempfile::tempdir().unwrap();
+        let cloud = serde_json::json!({
+            "code": 0,
+            "data": {"models": [{
+                "id": "cloud-chat",
+                "name": "Cloud Chat",
+                "maxInputTokens": 128000,
+                "maxOutputTokens": 16000,
+                "supportsToolCall": true
+            }]}
+        })
+        .to_string();
+        let responses = vec![
+            (200, "[]".to_string()),
+            (200, cloud),
+            (200, "[]".to_string()),
+            (403, "{}".to_string()),
+        ];
+        let (base_url, server) = catalog_server(responses).await;
+        let mut catalog = ModelCatalog::load(root.path(), false).await.unwrap();
+        catalog.providers_url = base_url.clone();
+        let credentials = BTreeMap::from([(
+            "codebuddy".to_string(),
+            CatalogCredential {
+                secret: "oauth-access".to_string(),
+                oauth: true,
+                codebuddy: Some(CodeBuddyCatalogCredential {
+                    session: CodeBuddySession {
+                        endpoint: base_url,
+                        domain: Some("enterprise.example".to_string()),
+                        method: Some("github".to_string()),
+                        account: Some(serde_json::json!({
+                            "uid": "user-1",
+                            "enterpriseId": "enterprise-1"
+                        })),
+                    },
+                    api_key: false,
+                }),
+            },
+        )]);
+
+        let first = catalog.refresh(true, &credentials).await.unwrap();
+        assert_eq!(first.discovery_failures, 0);
+        assert_eq!(first.discovered_models, 1);
+        assert_eq!(catalog.models("codebuddy").await[0].id, "cloud-chat");
+
+        let second = catalog.refresh(true, &credentials).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(second.discovery_failures, 1);
+        assert_eq!(catalog.models("codebuddy").await[0].id, "cloud-chat");
+        assert!(requests[1].starts_with("GET /v3/config "));
+        assert!(requests[3].starts_with("GET /v3/config "));
     }
 
     #[test]
@@ -1407,6 +1497,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("only-a", "Only A"), ("shared", "Pi Shared")]
         );
+    }
+
+    #[test]
+    fn codebuddy_cloud_models_overlay_pi_and_user_metadata() {
+        let model = |name: &str| {
+            serde_json::from_value::<CatalogModel>(serde_json::json!({
+                "id": "shared", "name": name, "api": "openai-completions",
+                "provider": "codebuddy", "baseUrl": "https://example.test/v2",
+                "contextWindow": 128000, "maxTokens": 16000
+            }))
+            .unwrap()
+        };
+        let store = BTreeMap::from([(
+            "codebuddy".to_string(),
+            StoreEntry {
+                models: vec![model("Pi Name")],
+                discoveries: BTreeMap::from([(
+                    "account-a".to_string(),
+                    DiscoveryStoreEntry {
+                        models: vec![model("Cloud Name")],
+                        checked_at: 1,
+                    },
+                )]),
+                ..StoreEntry::default()
+            },
+        )]);
+        let user: ModelsFile = serde_json::from_value(serde_json::json!({
+            "providers": {"codebuddy": {"modelOverrides": {"shared": {"name": "User Name"}}}}
+        }))
+        .unwrap();
+        let scopes = BTreeMap::from([("codebuddy".to_string(), "account-a".to_string())]);
+
+        let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &scopes);
+        let (overridden, override_warnings) = merge_catalog(&store, &user, &scopes);
+
+        assert!(warnings.is_empty());
+        assert!(override_warnings.is_empty());
+        assert_eq!(merged["codebuddy"][0].name, "Cloud Name");
+        assert_eq!(overridden["codebuddy"][0].name, "User Name");
     }
 
     #[test]

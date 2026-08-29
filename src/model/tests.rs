@@ -1183,6 +1183,29 @@ fn completions_compat_renames_output_cap_and_controls_reasoning() {
 }
 
 #[test]
+fn completions_compat_controls_off_effort_and_reasoning_summary() {
+    let model = catalog_model(
+        "openai-completions",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"off": "off", "high": "high"},
+            "compat": {
+                "supportsReasoningEffort": true,
+                "sendReasoningEffortWhenOff": false,
+                "reasoningSummary": "auto"
+            }
+        }),
+    );
+    let off = transformed(model.clone(), ThinkingLevel::Off, json!({}));
+    assert!(off.get("reasoning_effort").is_none());
+    assert!(off.get("reasoning_summary").is_none());
+
+    let enabled = transformed(model, ThinkingLevel::High, json!({}));
+    assert_eq!(enabled["reasoning_effort"], "high");
+    assert_eq!(enabled["reasoning_summary"], "auto");
+}
+
+#[test]
 fn completions_cache_control_and_session_affinity_match_pi() {
     let model = catalog_model(
         "openai-completions",

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod builtins;
 pub mod catalog;
 pub mod clipboard;
+mod codebuddy;
 pub mod compaction;
 pub mod config;
 pub mod keymap;

@@ -14,6 +14,7 @@ enum DiscoveryKind {
     Anthropic,
     Gemini,
     OpenCode,
+    CodeBuddy,
 }
 
 const PROVIDERS: &[(&str, DiscoveryKind)] = &[
@@ -21,6 +22,7 @@ const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("anthropic", DiscoveryKind::Anthropic),
     ("baseten", DiscoveryKind::OpenAi),
     ("cerebras", DiscoveryKind::OpenAi),
+    ("codebuddy", DiscoveryKind::CodeBuddy),
     ("deepseek", DiscoveryKind::OpenAi),
     ("google", DiscoveryKind::Gemini),
     ("groq", DiscoveryKind::OpenAi),
@@ -58,6 +60,18 @@ pub(super) fn supports_provider(provider: &str) -> bool {
     discovery_kind(provider).is_some()
 }
 
+pub(super) fn refresh_enabled(provider: &str) -> bool {
+    provider != super::codebuddy::PROVIDER || super::codebuddy::remote_config_enabled()
+}
+
+pub(super) fn refresh_interval(provider: &str) -> i64 {
+    if provider == super::codebuddy::PROVIDER {
+        super::codebuddy::REFRESH_INTERVAL_MS
+    } else {
+        REFRESH_INTERVAL_MS
+    }
+}
+
 #[cfg(test)]
 pub(super) fn provider_ids() -> impl Iterator<Item = &'static str> {
     PROVIDERS.iter().map(|(provider, _)| *provider)
@@ -68,7 +82,42 @@ pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredent
     hash.update(b"uri-agent-model-discovery\0");
     hash.update(provider.as_bytes());
     hash.update([u8::from(credential.oauth)]);
-    hash.update(credential.secret.as_bytes());
+    if let Some(codebuddy) = &credential.codebuddy {
+        hash.update(codebuddy.session.endpoint.as_bytes());
+        hash.update([u8::from(codebuddy.api_key)]);
+        for value in [
+            codebuddy.session.domain.as_deref(),
+            codebuddy.session.method.as_deref(),
+        ] {
+            hash.update(value.unwrap_or_default().as_bytes());
+            hash.update([0]);
+        }
+        let account_id = codebuddy
+            .session
+            .account
+            .as_ref()
+            .and_then(|account| account.get("uid"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if codebuddy.api_key {
+            hash.update(credential.secret.as_bytes());
+        } else if let Some(account_id) = account_id {
+            hash.update(account_id.as_bytes());
+            hash.update([0]);
+            let enterprise_id = codebuddy
+                .session
+                .account
+                .as_ref()
+                .and_then(|account| account.get("enterpriseId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            hash.update(enterprise_id.as_bytes());
+        } else {
+            hash.update(credential.secret.as_bytes());
+        }
+    } else {
+        hash.update(credential.secret.as_bytes());
+    }
     format!("sha256-{:x}", hash.finalize())
 }
 
@@ -80,6 +129,9 @@ pub(super) async fn discover(
 ) -> Result<Vec<CatalogModel>> {
     let kind = discovery_kind(provider)
         .ok_or_else(|| anyhow!("provider {provider} has no model discovery contract"))?;
+    if kind == DiscoveryKind::CodeBuddy {
+        return super::codebuddy::discover(client, credential).await;
+    }
     let references = catalog
         .get(provider)
         .ok_or_else(|| anyhow!("provider {provider} has no catalog models"))?;
@@ -90,6 +142,7 @@ pub(super) async fn discover(
         }
         DiscoveryKind::Anthropic => fetch_anthropic(client, endpoint, credential).await?,
         DiscoveryKind::Gemini => fetch_gemini(client, endpoint, credential).await?,
+        DiscoveryKind::CodeBuddy => unreachable!("CodeBuddy discovery returned above"),
     };
     Ok(materialize(provider, kind, records, catalog))
 }
@@ -110,6 +163,7 @@ fn discovery_endpoint(
             .iter()
             .find(|model| model.base_url.trim_end_matches('/').ends_with("/v1"))
             .or_else(|| references.first()),
+        DiscoveryKind::CodeBuddy => unreachable!("CodeBuddy has a provider-owned endpoint"),
         _ => references.first(),
     }
     .map(|model| model.base_url.trim_end_matches('/'))
@@ -126,6 +180,7 @@ fn discovery_endpoint(
                 format!("{base_url}/v1/models")
             }
         }
+        DiscoveryKind::CodeBuddy => unreachable!("CodeBuddy has a provider-owned endpoint"),
     };
     Url::parse(&endpoint).with_context(|| format!("invalid discovery URL for {provider}"))
 }
@@ -510,6 +565,8 @@ fn is_generation_model(provider: &str, model: &DiscoveredModel) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::CodeBuddyCatalogCredential;
+    use crate::codebuddy::Session;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -563,11 +620,48 @@ mod tests {
 
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
-        assert_eq!(provider_ids().count(), 28);
+        assert_eq!(provider_ids().count(), 29);
+        assert!(supports_provider("codebuddy"));
         assert!(supports_provider("opencode-go"));
         assert!(supports_provider("google"));
         assert!(!supports_provider("amazon-bedrock"));
         assert!(!supports_provider("openai-codex"));
+    }
+
+    #[test]
+    fn codebuddy_cache_scope_survives_token_rotation_but_isolates_accounts_and_api_keys() {
+        let credential = |secret: &str, uid: &str| CatalogCredential {
+            secret: secret.to_string(),
+            oauth: true,
+            codebuddy: Some(CodeBuddyCatalogCredential {
+                session: Session {
+                    endpoint: "https://www.codebuddy.ai".to_string(),
+                    domain: Some("www.codebuddy.ai".to_string()),
+                    method: Some("github".to_string()),
+                    account: Some(serde_json::json!({
+                        "uid": uid,
+                        "enterpriseId": "enterprise-1"
+                    })),
+                },
+                api_key: false,
+            }),
+        };
+
+        let original = credential_fingerprint("codebuddy", &credential("old-access", "user-1"));
+        let rotated = credential_fingerprint("codebuddy", &credential("new-access", "user-1"));
+        let other = credential_fingerprint("codebuddy", &credential("new-access", "user-2"));
+        let mut first_api_key = credential("api-key-one", "user-1");
+        first_api_key.oauth = false;
+        first_api_key.codebuddy.as_mut().unwrap().api_key = true;
+        let mut second_api_key = first_api_key.clone();
+        second_api_key.secret = "api-key-two".to_string();
+
+        assert_eq!(original, rotated);
+        assert_ne!(original, other);
+        assert_ne!(
+            credential_fingerprint("codebuddy", &first_api_key),
+            credential_fingerprint("codebuddy", &second_api_key)
+        );
     }
 
     #[test]
@@ -679,6 +773,7 @@ mod tests {
             &CatalogCredential {
                 secret: "go-test-key".to_string(),
                 oauth: false,
+                codebuddy: None,
             },
             &catalog,
         )
@@ -719,6 +814,7 @@ mod tests {
             &CatalogCredential {
                 secret: "anthropic-test-key".to_string(),
                 oauth: false,
+                codebuddy: None,
             },
             &catalog,
         )
@@ -761,6 +857,7 @@ mod tests {
             &CatalogCredential {
                 secret: "google-test-key".to_string(),
                 oauth: false,
+                codebuddy: None,
             },
             &catalog,
         )

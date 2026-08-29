@@ -122,6 +122,8 @@ URI Agent 不会自动选择默认模型。在 TUI 中：
 2. 运行 `:model` 并选择一个可运行模型。
 3. 按空格键，输入一个小型只读请求，例如 `读取顶层文件并说明这个项目的用途，不要修改文件。`，再按 `Enter` 发送。
 
+如需使用 CodeBuddy，请在 `:login` 下选择 **Chinese Site**、**International Site** 或 **Enterprise Domain**。鉴权成功后，URI Agent 会从 CodeBuddy 云端产品配置拉取当前账号的模型并合并到模型目录，无需配置 `models.json`；暂不支持腾讯内部 iOA 登录。端点、环境变量和凭据优先级见英文文档 [CodeBuddy authentication](docs/configuration.md#codebuddy)。
+
 当界面出现协议活动，并且 assistant 根据项目内容返回答案时，第一个会话就已正常工作。按 `F1` 或运行 `:help` 可查看当前生效的命令和快捷键。
 
 运行 `:set-env` 可保存 `NPM_TOKEN` 等变量；后续 Agent Shell 命令会自动收到这些变量。设置界面只列出变量名，不显示变量值。全局作用域、私密文件存储、与 `:terminal` 的隔离以及插件访问规则见英文文档 [Agent environment](docs/configuration.md#agent-environment)。
