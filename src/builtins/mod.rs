@@ -11,6 +11,7 @@ mod tasks;
 mod title;
 mod uri_agent_docs;
 
+use crate::config::display_path;
 use crate::plugin::PluginRegistry;
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
@@ -114,10 +115,10 @@ fn add_subagent_plugins(plugins: &mut PluginRegistry, cwd: &Path) {
 async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("file has no parent directory: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("file has no parent directory: {}", display_path(path)))?;
     fs::create_dir_all(parent)
         .await
-        .with_context(|| format!("cannot create {}", parent.display()))?;
+        .with_context(|| format!("cannot create {}", display_path(parent)))?;
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -125,13 +126,13 @@ async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let temporary = parent.join(format!(".{filename}.{}.tmp", Uuid::now_v7().simple()));
     fs::write(&temporary, content)
         .await
-        .with_context(|| format!("cannot write {}", temporary.display()))?;
+        .with_context(|| format!("cannot write {}", display_path(&temporary)))?;
     if let Ok(metadata) = fs::metadata(path).await {
         fs::set_permissions(&temporary, metadata.permissions()).await?;
     }
     if let Err(error) = fs::rename(&temporary, path).await {
         let _ = fs::remove_file(&temporary).await;
-        return Err(error).with_context(|| format!("cannot replace {}", path.display()));
+        return Err(error).with_context(|| format!("cannot replace {}", display_path(path)));
     }
     Ok(())
 }

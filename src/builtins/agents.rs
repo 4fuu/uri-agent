@@ -1,3 +1,4 @@
+use crate::config::display_path;
 use crate::plugin::{Plugin, PluginHost};
 use anyhow::{Context, Result};
 use std::fs;
@@ -23,7 +24,7 @@ impl Plugin for AgentsPlugin {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error).with_context(|| format!("cannot read {}", path.display()));
+                return Err(error).with_context(|| format!("cannot read {}", display_path(&path)));
             }
         };
 

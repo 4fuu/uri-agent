@@ -28,7 +28,7 @@ fn tool_document(block: &DisplayBlock, tool: &ToolDisplay, level: usize) -> Stri
     });
 
     if let Some(target) = tool_target(tool) {
-        document.push_str(&format!("\n**Target:** {}\n", inline_code(target)));
+        document.push_str(&format!("\n**Target:** {}\n", inline_code(target.as_ref())));
     }
     append_tool_input(&mut document, tool, section_level);
 
@@ -49,15 +49,36 @@ fn tool_document(block: &DisplayBlock, tool: &ToolDisplay, level: usize) -> Stri
     document
 }
 
-fn tool_target(tool: &ToolDisplay) -> Option<&str> {
-    tool.arguments
+fn tool_target(tool: &ToolDisplay) -> Option<Cow<'_, str>> {
+    if let Some(uri) = tool
+        .arguments
         .get("uri")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            (tool.name == "replace")
-                .then(|| tool.arguments.get("path")?.as_str())
-                .flatten()
-        })
+    {
+        return Some(display_tool_uri(uri));
+    }
+    if tool.name == "replace" {
+        let path = tool.arguments.get("path")?.as_str()?;
+        return Some(Cow::Owned(display_path(Path::new(path))));
+    }
+    None
+}
+
+fn display_tool_uri(uri: &str) -> Cow<'_, str> {
+    let Some(target) = uri.strip_prefix("file://") else {
+        return Cow::Borrowed(uri);
+    };
+    let query_search_start = if target.starts_with(r"\\?\") { 4 } else { 0 };
+    let path_end = target[query_search_start..]
+        .find('?')
+        .map(|index| query_search_start + index)
+        .unwrap_or(target.len());
+    let path = &target[..path_end];
+    let displayed = display_path(Path::new(path));
+    if displayed == path {
+        return Cow::Borrowed(uri);
+    }
+    Cow::Owned(format!("file://{displayed}{}", &target[path_end..]))
 }
 
 fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
@@ -260,7 +281,10 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             .get("path")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        return format!("Edited {}", single_line_preview(path, 72));
+        return format!(
+            "Edited {}",
+            single_line_preview(&display_path(Path::new(path)), 72)
+        );
     }
     let action = match name {
         "read" => "Read",
@@ -270,6 +294,8 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     let Some(uri) = arguments.get("uri").and_then(serde_json::Value::as_str) else {
         return action.to_string();
     };
+    let uri = display_tool_uri(uri);
+    let uri = uri.as_ref();
     let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
     if name == "exec"
         && matches!(protocol, "bash" | "pwsh")
@@ -295,10 +321,11 @@ pub(super) fn patch_targets(patch: &str) -> Vec<String> {
         let path = ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
             .iter()
             .find_map(|prefix| line.strip_prefix(prefix));
-        if let Some(path) = path
-            && !targets.iter().any(|target| target == path)
-        {
-            targets.push(path.to_string());
+        if let Some(path) = path {
+            let path = display_path(Path::new(path));
+            if !targets.contains(&path) {
+                targets.push(path);
+            }
         }
     }
     targets
@@ -412,6 +439,10 @@ pub(super) fn tool_argument_details(
 fn argument_summary(name: &str, value: &serde_json::Value) -> String {
     if sensitive_argument_name(name) {
         "[redacted]".to_string()
+    } else if name == "path"
+        && let Some(path) = value.as_str()
+    {
+        single_line_preview(&display_path(Path::new(path)), 72)
     } else {
         json_value_summary(value)
     }

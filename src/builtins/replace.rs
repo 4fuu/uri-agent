@@ -1,5 +1,6 @@
 use super::file::resolve_path;
 use super::{EditableText, atomic_write, normalize_line_endings};
+use crate::config::display_path;
 use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
 use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
@@ -67,7 +68,7 @@ impl ModelTool for ReplaceTool {
         }
         let path = resolve_path(&self.cwd, &arguments.path)?;
         replace_exact(&path, &arguments.old_text, &arguments.new_text).await?;
-        Ok(format!("Updated {}", path.display()))
+        Ok(format!("Updated {}", display_path(&path)))
     }
 }
 
@@ -78,7 +79,7 @@ async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()
 
     let original = fs::read_to_string(path)
         .await
-        .with_context(|| format!("cannot read {}", path.display()))?;
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
     let original = EditableText::new(&original);
     let old_text = normalize_line_endings(old_text.strip_prefix('\u{feff}').unwrap_or(old_text));
     let new_text = normalize_line_endings(new_text.strip_prefix('\u{feff}').unwrap_or(new_text));
@@ -88,10 +89,10 @@ async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()
     let content = original.normalized();
     let first = content
         .find(&old_text)
-        .ok_or_else(|| anyhow!("old_text was not found in {}", path.display()))?;
+        .ok_or_else(|| anyhow!("old_text was not found in {}", display_path(path)))?;
     let next_start = first + old_text.chars().next().map_or(0, char::len_utf8);
     if content[next_start..].contains(&old_text) {
-        bail!("old_text appears more than once in {}", path.display());
+        bail!("old_text appears more than once in {}", display_path(path));
     }
 
     let mut updated = String::with_capacity(content.len() - old_text.len() + new_text.len());

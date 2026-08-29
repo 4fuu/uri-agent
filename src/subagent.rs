@@ -1,6 +1,6 @@
 use crate::catalog::{ModelLimits, ThinkingLevel};
 use crate::compaction;
-use crate::config::{AgentEnvironment, ConfigManager, ModelRole};
+use crate::config::{AgentEnvironment, ConfigManager, ModelRole, display_path};
 use crate::model::{
     ModelBackend, ModelFailure, ModelFailureKind, ModelRequest, configured_backend,
     model_retry_delay, model_retry_policy,
@@ -350,7 +350,7 @@ impl SubagentService {
             .with_context(|| {
                 format!(
                     "cannot resolve subagent working directory {}",
-                    requested_cwd.display()
+                    display_path(requested_cwd)
                 )
             })?;
         if cwd == runtime.cwd {

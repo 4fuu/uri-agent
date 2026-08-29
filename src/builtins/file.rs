@@ -130,7 +130,8 @@ fn file_suggestions(cwd: &Path, query: &str) -> Result<Vec<TuiCompletionItem>> {
         .filter_entry(move |entry| include_completion_entry(&root_for_filter, entry));
     let mut candidates = Vec::new();
     for entry in walker.build().take(MAX_SCANNED_FILES) {
-        let entry = entry.with_context(|| format!("cannot scan files under {}", cwd.display()))?;
+        let entry =
+            entry.with_context(|| format!("cannot scan files under {}", display_path(cwd)))?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
@@ -164,10 +165,7 @@ fn file_suggestions(cwd: &Path, query: &str) -> Result<Vec<TuiCompletionItem>> {
             let description = Path::new(&path)
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                .map_or_else(
-                    || "project file".to_string(),
-                    |parent| parent.display().to_string(),
-                );
+                .map_or_else(|| "project file".to_string(), display_path);
             TuiCompletionItem {
                 insert_text: insert_path,
                 label: path,
@@ -406,7 +404,8 @@ fn glob_entries(cwd: &Path, root: &Path, pattern: &str) -> Result<Vec<String>> {
     let mut entries = Vec::new();
     let mut scanned_files = 0usize;
     for entry in walker.build() {
-        let entry = entry.with_context(|| format!("cannot scan files under {}", root.display()))?;
+        let entry =
+            entry.with_context(|| format!("cannot scan files under {}", display_path(root)))?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }

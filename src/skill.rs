@@ -81,9 +81,9 @@ struct Frontmatter {
 impl SkillProtocol {
     fn load(skill_md_path: &Path) -> Result<Self> {
         let skill_md = fs::read_to_string(skill_md_path)
-            .with_context(|| format!("cannot read {}", skill_md_path.display()))?;
+            .with_context(|| format!("cannot read {}", display_path(skill_md_path)))?;
         let frontmatter = parse_frontmatter(&skill_md)
-            .with_context(|| format!("invalid metadata in {}", skill_md_path.display()))?;
+            .with_context(|| format!("invalid metadata in {}", display_path(skill_md_path)))?;
         let name = frontmatter.name.trim().to_string();
         let description = frontmatter.description.trim().to_string();
         if name.is_empty() || description.is_empty() {
@@ -106,7 +106,10 @@ impl SkillProtocol {
             bail!("skill description cannot be empty");
         }
         if !snapshot.path.is_absolute() {
-            bail!("skill path must be absolute: {}", snapshot.path.display());
+            bail!(
+                "skill path must be absolute: {}",
+                display_path(&snapshot.path)
+            );
         }
         Ok(Self { protocol, snapshot })
     }
@@ -167,7 +170,7 @@ impl Protocol for SkillProtocol {
                 format!(
                     "skill {} is no longer available at {}",
                     self.snapshot.name,
-                    self.snapshot.path.display()
+                    display_path(&self.snapshot.path)
                 )
             })?;
             return Ok(help(&skill_md, root, &self.protocol).into_bytes());
@@ -185,7 +188,7 @@ impl Protocol for SkillProtocol {
         let candidate = root.join(relative).canonicalize().with_context(|| {
             format!(
                 "skill resource is no longer available at {}",
-                root.join(relative).display()
+                display_path(&root.join(relative))
             )
         })?;
         if !path_is_within(&candidate, root) {
@@ -195,7 +198,7 @@ impl Protocol for SkillProtocol {
         if !metadata.is_file() {
             bail!("skill resource is not a file: {}", request.target);
         }
-        fs::read(&candidate).with_context(|| format!("cannot read {}", candidate.display()))
+        fs::read(&candidate).with_context(|| format!("cannot read {}", display_path(&candidate)))
     }
 }
 
@@ -238,9 +241,11 @@ fn discover_in(roots: Vec<PathBuf>) -> (Vec<SkillProtocol>, Vec<String>) {
             Ok(skill) => warnings.push(format!(
                 "skipped duplicate skill protocol {}:// from {}",
                 skill.protocol_name(),
-                path.display()
+                display_path(&path)
             )),
-            Err(error) => warnings.push(format!("skipped skill {}: {error:#}", path.display())),
+            Err(error) => {
+                warnings.push(format!("skipped skill {}: {error:#}", display_path(&path)))
+            }
         }
     }
     (skills, warnings)

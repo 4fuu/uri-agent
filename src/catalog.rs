@@ -1,5 +1,6 @@
 mod discovery;
 
+use crate::config::display_path;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
@@ -1110,9 +1111,9 @@ where
 {
     match fs::read(path).await {
         Ok(content) => serde_json::from_slice(&content)
-            .with_context(|| format!("cannot parse {}", path.display())),
+            .with_context(|| format!("cannot parse {}", display_path(path))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", display_path(path))),
     }
 }
 
@@ -1122,7 +1123,7 @@ where
 {
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("catalog path has no parent: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("catalog path has no parent: {}", display_path(path)))?;
     fs::create_dir_all(parent).await?;
     let filename = path
         .file_name()
@@ -1138,7 +1139,7 @@ where
     }
     if let Err(error) = fs::rename(&temporary, path).await {
         let _ = fs::remove_file(&temporary).await;
-        return Err(error).with_context(|| format!("cannot replace {}", path.display()));
+        return Err(error).with_context(|| format!("cannot replace {}", display_path(path)));
     }
     Ok(())
 }

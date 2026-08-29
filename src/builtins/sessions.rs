@@ -442,7 +442,7 @@ fn format_recent_sessions(
             ("limit", limit.to_string()),
         ];
         if let Some(cwd) = cwd {
-            parameters.push(("cwd", cwd.to_string_lossy().into_owned()));
+            parameters.push(("cwd", display_path(cwd)));
         }
         let uri = sessions_uri("recent", &parameters);
         let _ = writeln!(output, "Next: read({}, \"\")", json!(uri));
@@ -487,7 +487,7 @@ fn format_search_results(
             ("limit", limit.to_string()),
         ];
         if let Some(cwd) = cwd {
-            parameters.push(("cwd", cwd.to_string_lossy().into_owned()));
+            parameters.push(("cwd", display_path(cwd)));
         }
         let uri = sessions_uri("search", &parameters);
         let _ = writeln!(output, "Next: read({}, {})", json!(uri), json!(query));
@@ -549,9 +549,10 @@ fn format_summary(
 
 fn metadata_matches(summary: &ArchivedSessionSummary, query: &str) -> Vec<SearchMatch> {
     let query_lower = query.to_lowercase();
+    let cwd = display_path(&summary.cwd);
     [
         ("session_id", summary.id.as_str()),
-        ("cwd", summary.cwd.to_str().unwrap_or_default()),
+        ("cwd", cwd.as_str()),
         ("first_message", summary.first_message.as_str()),
     ]
     .into_iter()

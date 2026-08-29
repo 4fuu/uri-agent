@@ -1,3 +1,4 @@
+use crate::config::display_path;
 use crate::prompts;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
@@ -52,7 +53,7 @@ impl OutputStore {
                 fs::create_dir_all(&self.directory).await.with_context(|| {
                     format!(
                         "failed to create output directory: {}",
-                        self.directory.display()
+                        display_path(&self.directory)
                     )
                 })?;
                 Ok::<_, anyhow::Error>(AtomicU64::new(next_sequence(&self.directory).await?))
@@ -61,9 +62,12 @@ impl OutputStore {
             .fetch_add(1, Ordering::Relaxed);
         let filename = format!("{:06}-{}.txt", sequence, sanitize(hint));
         let path = self.directory.join(filename);
-        fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to preserve complete output: {}", path.display()))?;
+        fs::write(&path, content).await.with_context(|| {
+            format!(
+                "failed to preserve complete output: {}",
+                display_path(&path)
+            )
+        })?;
         Ok(path)
     }
 
@@ -101,7 +105,7 @@ impl OutputStore {
         fs::create_dir_all(&self.directory).await.with_context(|| {
             format!(
                 "failed to create diagnostic directory: {}",
-                self.directory.display()
+                display_path(&self.directory)
             )
         })?;
         let mut record = Map::new();
@@ -130,13 +134,13 @@ impl OutputStore {
         let mut file = options
             .open(&path)
             .await
-            .with_context(|| format!("failed to open diagnostic log: {}", path.display()))?;
+            .with_context(|| format!("failed to open diagnostic log: {}", display_path(&path)))?;
         file.write_all(&line)
             .await
-            .with_context(|| format!("failed to write diagnostic log: {}", path.display()))?;
+            .with_context(|| format!("failed to write diagnostic log: {}", display_path(&path)))?;
         file.flush()
             .await
-            .with_context(|| format!("failed to flush diagnostic log: {}", path.display()))
+            .with_context(|| format!("failed to flush diagnostic log: {}", display_path(&path)))
     }
 }
 

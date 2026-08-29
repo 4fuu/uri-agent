@@ -1,5 +1,6 @@
 use super::file::resolve_path;
 use super::{EditableText, atomic_write};
+use crate::config::display_path;
 use crate::plugin::{ModelTool, ModelToolDescriptor, Plugin, PluginHost};
 use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
@@ -283,7 +284,7 @@ fn parse_update(
     if chunks.is_empty() {
         bail!(
             "invalid patch hunk on line {header_line}: Update File for {} is empty",
-            path.display()
+            display_path(path)
         );
     }
     ensure_last_chunk_has_lines(&chunks, index + 1)?;
@@ -333,7 +334,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 if file.final_content.is_none() {
                     bail!(
                         "failed to delete file {}: file not found",
-                        resolved.display()
+                        display_path(&resolved)
                     );
                 }
                 file.final_content = None;
@@ -349,9 +350,11 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                     .await?
                     .final_content
                     .clone()
-                    .ok_or_else(|| anyhow!("failed to read file to update {}", source.display()))?;
+                    .ok_or_else(|| {
+                        anyhow!("failed to read file to update {}", display_path(&source))
+                    })?;
                 let source_text = String::from_utf8(source_content).with_context(|| {
-                    format!("file to update is not UTF-8: {}", source.display())
+                    format!("file to update is not UTF-8: {}", display_path(&source))
                 })?;
                 let updated = derive_updated_content(&source, &source_text, &chunks)?;
                 if let Some(destination) = move_to {
@@ -387,13 +390,13 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
 
     let mut output = String::from("Applied patch:\n");
     for path in added {
-        output.push_str(&format!("A {}\n", path.display()));
+        output.push_str(&format!("A {}\n", display_path(&path)));
     }
     for path in modified {
-        output.push_str(&format!("M {}\n", path.display()));
+        output.push_str(&format!("M {}\n", display_path(&path)));
     }
     for path in deleted {
-        output.push_str(&format!("D {}\n", path.display()));
+        output.push_str(&format!("D {}\n", display_path(&path)));
     }
     Ok(output)
 }
@@ -417,21 +420,25 @@ async fn load_planned_file<'a>(
         let original = match fs::symlink_metadata(path).await {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    bail!("patch paths cannot be symbolic links: {}", path.display());
+                    bail!(
+                        "patch paths cannot be symbolic links: {}",
+                        display_path(path)
+                    );
                 }
                 if !metadata.is_file() {
-                    bail!("patch path is not a regular file: {}", path.display());
+                    bail!("patch path is not a regular file: {}", display_path(path));
                 }
                 Some(OriginalFile {
                     content: fs::read(path)
                         .await
-                        .with_context(|| format!("failed to read {}", path.display()))?,
+                        .with_context(|| format!("failed to read {}", display_path(path)))?,
                     permissions: metadata.permissions(),
                 })
             }
             Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", display_path(path)));
             }
         };
         files.insert(
@@ -482,7 +489,7 @@ async fn commit_plan(files: &BTreeMap<PathBuf, PlannedFile>) -> Result<()> {
         {
             fs::remove_file(path)
                 .await
-                .with_context(|| format!("failed to delete file {}", path.display()))?;
+                .with_context(|| format!("failed to delete file {}", display_path(path)))?;
             applied.push(path.clone());
         }
         Ok::<_, anyhow::Error>(())
@@ -512,7 +519,7 @@ async fn collect_missing_parent_directories(
             Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => bail!(
                 "cannot create patch file because parent is not a directory: {}",
-                directory.display()
+                display_path(directory)
             ),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 directories.insert(directory.to_path_buf());
@@ -520,7 +527,7 @@ async fn collect_missing_parent_directories(
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("failed to inspect {}", directory.display()));
+                    .with_context(|| format!("failed to inspect {}", display_path(directory)));
             }
         }
     }
@@ -550,7 +557,7 @@ async fn rollback_plan(
             },
         };
         if let Err(error) = result {
-            errors.push(format!("{}: {error:#}", path.display()));
+            errors.push(format!("{}: {error:#}", display_path(path)));
         }
     }
     let mut directories = created_directories.iter().collect::<Vec<_>>();
@@ -563,7 +570,7 @@ async fn rollback_plan(
                     error.kind(),
                     ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
                 ) => {}
-            Err(error) => errors.push(format!("{}: {error}", directory.display())),
+            Err(error) => errors.push(format!("{}: {error}", display_path(directory))),
         }
     }
     errors
@@ -595,7 +602,7 @@ fn derive_updated_content(path: &Path, original: &str, chunks: &[UpdateChunk]) -
                 bail!(
                     "failed to find context '{}' in {}",
                     context[0],
-                    path.display()
+                    display_path(path)
                 );
             };
             cursor = found + 1;
@@ -619,7 +626,7 @@ fn derive_updated_content(path: &Path, original: &str, chunks: &[UpdateChunk]) -
         let Some(start) = found else {
             bail!(
                 "failed to find expected lines in {}:\n{}",
-                path.display(),
+                display_path(path),
                 chunk.old_lines.join("\n")
             );
         };
@@ -866,6 +873,25 @@ mod tests {
         apply_patch(directory.path(), patch).await.unwrap();
 
         assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn update_errors_hide_windows_verbatim_path_prefixes() {
+        let chunk = UpdateChunk {
+            old_lines: vec!["missing".to_string()],
+            ..UpdateChunk::default()
+        };
+
+        let error = derive_updated_content(
+            Path::new(r"\\?\C:\Users\4fu\project\src\builtins\https.rs"),
+            "present\n",
+            &[chunk],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(r"in C:\Users\4fu\project\src\builtins\https.rs:"));
+        assert!(!error.contains(r"\\?\"));
     }
 
     #[tokio::test]

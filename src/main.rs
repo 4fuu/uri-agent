@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uri_agent::catalog::ModelLimits;
-use uri_agent::config::{Cli, Config};
+use uri_agent::config::{Cli, Config, display_path};
 use uri_agent::model::configured_backend;
 use uri_agent::output::OutputStore;
 use uri_agent::plugin::{
@@ -62,7 +62,7 @@ impl RuntimeInitializer for SessionInitializer {
                     if !protocol_names.insert(protocol.clone()) {
                         notices.push(format!(
                             "skipped skill {} because protocol {}:// is already registered",
-                            snapshot.path.display(),
+                            display_path(&snapshot.path),
                             protocol
                         ));
                         continue;
@@ -91,7 +91,11 @@ impl RuntimeInitializer for SessionInitializer {
             let mut skills = Vec::new();
             let mut notices = Vec::new();
             for snapshot in context.skills.clone() {
-                let description = format!("skill {} at {}", snapshot.name, snapshot.path.display());
+                let description = format!(
+                    "skill {} at {}",
+                    snapshot.name,
+                    display_path(&snapshot.path)
+                );
                 match SkillProtocol::from_snapshot(snapshot) {
                     Ok(skill) => skills.push(skill),
                     Err(error) => notices.push(format!("skipped {description}: {error:#}")),

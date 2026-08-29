@@ -5835,6 +5835,28 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
         ),
         "Patched src/tui.rs +1"
     );
+    assert_eq!(
+        tool_title(
+            "replace",
+            &serde_json::json!({"path": r"\\?\C:\Users\4fu\project\src\main.rs"})
+        ),
+        r"Edited C:\Users\4fu\project\src\main.rs"
+    );
+    assert_eq!(
+        tool_title(
+            "read",
+            &serde_json::json!({
+                "uri": r"file://\\?\C:\Users\4fu\project\src\main.rs?offset=1"
+            })
+        ),
+        r"Read C:\Users\4fu\project\src\main.rs?offset=1"
+    );
+    assert_eq!(
+        patch_targets(
+            "*** Update File: \\\\?\\C:\\Users\\4fu\\project\\src\\main.rs\n*** Delete File: \\\\?\\C:\\Users\\4fu\\project\\src\\main.rs"
+        ),
+        [r"C:\Users\4fu\project\src\main.rs"]
+    );
 
     let mut lines = Vec::new();
     tool_argument_details(

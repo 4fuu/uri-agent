@@ -399,6 +399,7 @@ fn append_event(output: &mut String, event: &Value, is_match: bool) -> Result<()
         .and_then(Value::as_str)
         .unwrap_or("<non-UTF-8 path>")
         .trim_start_matches("./");
+    let path = display_path(Path::new(path));
     let line = data
         .get("line_number")
         .and_then(Value::as_u64)
@@ -409,7 +410,7 @@ fn append_event(output: &mut String, event: &Value, is_match: bool) -> Result<()
         .and_then(Value::as_str)
         .unwrap_or("<non-UTF-8 line>")
         .trim_end_matches(['\r', '\n']);
-    output.push_str(path);
+    output.push_str(&path);
     output.push(if is_match { ':' } else { '-' });
     output.push_str(&line.to_string());
     output.push(if is_match { ':' } else { '-' });

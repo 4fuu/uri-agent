@@ -1,4 +1,4 @@
-use crate::config::config_directory;
+use crate::config::{config_directory, display_path};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rhai::{Engine, ImmutableString};
@@ -513,10 +513,10 @@ impl Keymap {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
-                return Err(error).with_context(|| format!("cannot read {}", path.display()));
+                return Err(error).with_context(|| format!("cannot read {}", display_path(path)));
             }
         };
-        self.evaluate(&source, &path.display().to_string())
+        self.evaluate(&source, &display_path(path))
     }
 
     fn evaluate(&self, source: &str, label: &str) -> Result<()> {

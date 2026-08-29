@@ -683,10 +683,10 @@ impl WasmPluginManager {
         let directory = config_directory.join("wasm-plugins");
         tokio::fs::create_dir_all(&directory)
             .await
-            .with_context(|| format!("cannot create {}", directory.display()))?;
+            .with_context(|| format!("cannot create {}", display_path(&directory)))?;
         let directory = tokio::fs::canonicalize(&directory)
             .await
-            .with_context(|| format!("cannot resolve {}", directory.display()))?;
+            .with_context(|| format!("cannot resolve {}", display_path(&directory)))?;
         set_private_permissions(&directory).await?;
         Ok(Self {
             directory,
@@ -941,12 +941,12 @@ async fn load_plugin_set(
 ) -> Result<(PluginSet, ReloadReport)> {
     let mut entries = tokio::fs::read_dir(directory)
         .await
-        .with_context(|| format!("cannot read {}", directory.display()))?;
+        .with_context(|| format!("cannot read {}", display_path(directory)))?;
     let mut paths = Vec::new();
     while let Some(entry) = entries
         .next_entry()
         .await
-        .with_context(|| format!("cannot read an entry in {}", directory.display()))?
+        .with_context(|| format!("cannot read an entry in {}", display_path(directory)))?
     {
         let path = entry.path();
         if is_plugin_file(&path)
@@ -972,7 +972,7 @@ async fn load_plugin_set(
             .ok_or_else(|| {
                 anyhow!(
                     "WASM plugin filename is not valid Unicode: {}",
-                    path.display()
+                    display_path(&path)
                 )
             })?;
         let module = match WasmModule::load(
@@ -1059,9 +1059,9 @@ impl WasmModule {
     ) -> Result<Self> {
         let path = path
             .canonicalize()
-            .with_context(|| format!("cannot resolve WASM plugin {}", path.display()))?;
+            .with_context(|| format!("cannot resolve WASM plugin {}", display_path(path)))?;
         let bytes = read_module(&path).await?;
-        let display = path.display().to_string();
+        let display = display_path(&path);
         let working_directory = working_directory.to_path_buf();
         let plugin_directory = plugin_directory.to_path_buf();
         let permission_bridge = bridge.clone();
@@ -1188,7 +1188,7 @@ async fn call_wasm_handler(
     input: Vec<u8>,
 ) -> Result<Vec<u8>> {
     let runtime = runtime.clone();
-    let display = plugin_path.display().to_string();
+    let display = display_path(plugin_path);
     let subagent_depth = crate::subagent::capture_subagent_depth();
     tokio::task::spawn_blocking(move || {
         crate::subagent::with_blocking_subagent_depth(subagent_depth, || {
@@ -1211,23 +1211,23 @@ async fn call_wasm_handler(
 async fn read_module(path: &Path) -> Result<Vec<u8>> {
     let metadata = tokio::fs::metadata(path)
         .await
-        .with_context(|| format!("cannot inspect {}", path.display()))?;
+        .with_context(|| format!("cannot inspect {}", display_path(path)))?;
     if !metadata.is_file() {
-        bail!("WASM plugin is not a file: {}", path.display());
+        bail!("WASM plugin is not a file: {}", display_path(path));
     }
     if metadata.len() > MAX_MODULE_BYTES {
         bail!(
             "WASM plugin exceeds {MAX_MODULE_BYTES} bytes: {}",
-            path.display()
+            display_path(path)
         );
     }
     let bytes = tokio::fs::read(path)
         .await
-        .with_context(|| format!("cannot read {}", path.display()))?;
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
     if bytes.len() as u64 > MAX_MODULE_BYTES {
         bail!(
             "WASM plugin exceeds {MAX_MODULE_BYTES} bytes: {}",
-            path.display()
+            display_path(path)
         );
     }
     Ok(bytes)
@@ -1400,7 +1400,7 @@ async fn set_private_permissions(directory: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
             .await
-            .with_context(|| format!("cannot secure {}", directory.display()))?;
+            .with_context(|| format!("cannot secure {}", display_path(directory)))?;
     }
     #[cfg(not(unix))]
     let _ = directory;

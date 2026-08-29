@@ -320,7 +320,7 @@ impl AgentEnvironment {
         let values: EnvironmentFile = read_json(&path).await?;
         values
             .validate()
-            .with_context(|| format!("invalid Agent environment in {}", path.display()))?;
+            .with_context(|| format!("invalid Agent environment in {}", display_path(&path)))?;
         if !path.exists() {
             write_json(&path, &values, true).await?;
         }
@@ -329,7 +329,7 @@ impl AgentEnvironment {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .await
-                .with_context(|| format!("cannot secure {}", path.display()))?;
+                .with_context(|| format!("cannot secure {}", display_path(&path)))?;
         }
         Ok(Self {
             path,
@@ -1815,8 +1815,8 @@ async fn migrate_legacy_macos_config(new_directory: &Path) -> Result<()> {
         .with_context(|| {
             format!(
                 "cannot migrate macOS data from {} to {}",
-                old_directory.display(),
-                new_directory.display()
+                display_path(&old_directory),
+                display_path(new_directory)
             )
         })
 }
@@ -1841,7 +1841,7 @@ fn migrate_legacy_directory_sync(old_directory: &Path, new_directory: &Path) -> 
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
                     "cannot create configuration directory: {}",
-                    parent.display()
+                    display_path(parent)
                 )
             })?;
         }
@@ -1853,7 +1853,7 @@ fn migrate_legacy_directory_sync(old_directory: &Path, new_directory: &Path) -> 
     std::fs::create_dir_all(new_directory).with_context(|| {
         format!(
             "cannot create configuration directory: {}",
-            new_directory.display()
+            display_path(new_directory)
         )
     })?;
     merge_directory(old_directory, new_directory)?;
@@ -1862,9 +1862,9 @@ fn migrate_legacy_directory_sync(old_directory: &Path, new_directory: &Path) -> 
 
 fn merge_directory(from: &Path, to: &Path) -> Result<()> {
     for entry in
-        std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
+        std::fs::read_dir(from).with_context(|| format!("cannot read {}", display_path(from)))?
     {
-        let entry = entry.with_context(|| format!("cannot read {}", from.display()))?;
+        let entry = entry.with_context(|| format!("cannot read {}", display_path(from)))?;
         let name = entry.file_name();
         let source = from.join(&name);
         let dest = to.join(name);
@@ -1904,14 +1904,15 @@ fn move_config_entry(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn copy_config_entry(from: &Path, to: &Path) -> Result<()> {
-    let metadata =
-        std::fs::metadata(from).with_context(|| format!("cannot inspect {}", from.display()))?;
+    let metadata = std::fs::metadata(from)
+        .with_context(|| format!("cannot inspect {}", display_path(from)))?;
     if metadata.is_dir() {
-        std::fs::create_dir_all(to).with_context(|| format!("cannot create {}", to.display()))?;
-        for entry in
-            std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
+        std::fs::create_dir_all(to)
+            .with_context(|| format!("cannot create {}", display_path(to)))?;
+        for entry in std::fs::read_dir(from)
+            .with_context(|| format!("cannot read {}", display_path(from)))?
         {
-            let entry = entry.with_context(|| format!("cannot read {}", from.display()))?;
+            let entry = entry.with_context(|| format!("cannot read {}", display_path(from)))?;
             let name = entry.file_name();
             copy_config_entry(&from.join(&name), &to.join(name))?;
         }
@@ -1919,11 +1920,11 @@ fn copy_config_entry(from: &Path, to: &Path) -> Result<()> {
     }
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+            .with_context(|| format!("cannot create {}", display_path(parent)))?;
     }
     std::fs::copy(from, to)
         .map(|_| ())
-        .with_context(|| format!("cannot copy {} to {}", from.display(), to.display()))
+        .with_context(|| format!("cannot copy {} to {}", display_path(from), display_path(to)))
 }
 
 fn remove_config_entry(path: &Path) -> Result<()> {
@@ -1931,7 +1932,7 @@ fn remove_config_entry(path: &Path) -> Result<()> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+            return Err(error).with_context(|| format!("cannot inspect {}", display_path(path)));
         }
     };
     if metadata.is_dir() {
@@ -1939,7 +1940,7 @@ fn remove_config_entry(path: &Path) -> Result<()> {
     } else {
         std::fs::remove_file(path)
     }
-    .with_context(|| format!("cannot remove {}", path.display()))
+    .with_context(|| format!("cannot remove {}", display_path(path)))
 }
 
 async fn lock_auth_file(directory: &Path) -> Result<std::fs::File> {
@@ -1953,11 +1954,11 @@ async fn lock_auth_file(directory: &Path) -> Result<std::fs::File> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options
-            .open(&path)
-            .with_context(|| format!("cannot open OAuth credential lock {}", path.display()))?;
+        let file = options.open(&path).with_context(|| {
+            format!("cannot open OAuth credential lock {}", display_path(&path))
+        })?;
         file.lock_exclusive()
-            .with_context(|| format!("cannot lock OAuth credentials {}", path.display()))?;
+            .with_context(|| format!("cannot lock OAuth credentials {}", display_path(&path)))?;
         Ok(file)
     })
     .await
@@ -1970,9 +1971,9 @@ where
 {
     match fs::read(path).await {
         Ok(content) => serde_json::from_slice(&content)
-            .with_context(|| format!("cannot parse {}", path.display())),
+            .with_context(|| format!("cannot parse {}", display_path(path))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", display_path(path))),
     }
 }
 
@@ -1984,7 +1985,7 @@ where
     let _ = private;
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("configuration path has no parent: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("configuration path has no parent: {}", display_path(path)))?;
     fs::create_dir_all(parent).await?;
     let filename = path
         .file_name()
@@ -2013,7 +2014,7 @@ where
     }
     if let Err(error) = fs::rename(&temporary, path).await {
         let _ = fs::remove_file(&temporary).await;
-        return Err(error).with_context(|| format!("cannot replace {}", path.display()));
+        return Err(error).with_context(|| format!("cannot replace {}", display_path(path)));
     }
     #[cfg(unix)]
     if private {

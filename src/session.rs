@@ -1,4 +1,5 @@
 use crate::catalog::ThinkingLevel;
+use crate::config::display_path;
 use crate::skill::SkillSnapshot;
 use crate::task::{TaskReport, TaskStatus};
 use anyhow::{Context, Result, anyhow, bail};
@@ -1809,14 +1810,14 @@ fn session_database_path_from(
 async fn open_archive_database(path: &Path) -> Result<Option<Connection>> {
     if !fs::try_exists(path)
         .await
-        .with_context(|| format!("cannot inspect session database: {}", path.display()))?
+        .with_context(|| format!("cannot inspect session database: {}", display_path(path)))?
     {
         return Ok(None);
     }
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .await
         .map(Some)
-        .with_context(|| format!("cannot open session archive: {}", path.display()))
+        .with_context(|| format!("cannot open session archive: {}", display_path(path)))
 }
 
 async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> {
@@ -1827,7 +1828,7 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
     fs::create_dir_all(&directory).await.with_context(|| {
         format!(
             "cannot create session data directory: {}",
-            directory.display()
+            display_path(&directory)
         )
     })?;
     #[cfg(unix)]
@@ -1835,9 +1836,12 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
     }
-    let connection = Connection::open(&database_path)
-        .await
-        .with_context(|| format!("cannot open session database: {}", database_path.display()))?;
+    let connection = Connection::open(&database_path).await.with_context(|| {
+        format!(
+            "cannot open session database: {}",
+            display_path(&database_path)
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
