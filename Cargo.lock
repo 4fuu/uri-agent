@@ -5206,7 +5206,7 @@ dependencies = [
 
 [[package]]
 name = "uri-agent"
-version = "2026.829.1"
+version = "2026.830.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "uri-agent-plugin-sdk"
-version = "2026.829.1"
+version = "2026.830.0"
 dependencies = [
  "extism-pdk",
  "serde",
