@@ -1239,7 +1239,7 @@ fn expanded_status_is_bottom_anchored_and_includes_plugin_rows() {
 
     assert_eq!(
         overlay_area(Rect::new(0, 0, 100, 24), &app, Overlay::Status),
-        Rect::new(2, 10, 96, 14)
+        Rect::new(2, 8, 96, 16)
     );
     app.overlay = Some(Overlay::Status);
     app.overlay_scroll = 6;
@@ -2052,11 +2052,11 @@ fn floats_hug_the_edges_without_side_borders_below_their_minimum_width() {
     // still leaves at least sixty columns for the float itself.
     assert_eq!(
         overlay_area(Rect::new(0, 0, 64, 24), &app, Overlay::Status),
-        Rect::new(2, 10, 60, 14)
+        Rect::new(2, 8, 60, 16)
     );
     assert_eq!(
         overlay_area(Rect::new(0, 0, 63, 24), &app, Overlay::Status),
-        Rect::new(0, 10, 63, 14)
+        Rect::new(0, 8, 63, 16)
     );
     assert_eq!(
         overlay_area(Rect::new(0, 0, 63, 24), &app, Overlay::Text),
@@ -3033,13 +3033,18 @@ fn transcript_text_selection_survives_scrolling_off_screen() {
         row: area.y + 3,
         modifiers: KeyModifiers::NONE,
     };
-    let up = MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
         column: area.x + 12,
         row: area.y + 4,
         ..down
     };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
     assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, drag, false));
     assert!(update_mouse_selection(&mut app, up, false));
     let selection = app.selection.expect("selection after drag");
     assert!(selection.anchors.is_some());
@@ -3149,12 +3154,17 @@ fn anchored_selection_survives_transcript_appends() {
         row,
         modifiers: KeyModifiers::NONE,
     };
-    let up = MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
         column: area.x + 6,
         ..down
     };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
     assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, drag, false));
     assert!(update_mouse_selection(&mut app, up, false));
     let selection = app.selection.expect("selection before appends");
     assert_eq!(transcript_selection_text(&mut app, selection), "first");
@@ -3197,12 +3207,17 @@ fn anchored_selection_clears_when_the_transcript_rewraps() {
         row: area.y,
         modifiers: KeyModifiers::NONE,
     };
-    let up = MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
         column: area.x + 8,
         ..down
     };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
     assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, drag, false));
     assert!(update_mouse_selection(&mut app, up, false));
     assert!(app.selection.is_some());
 
@@ -3231,19 +3246,172 @@ fn anchored_selection_copy_matches_the_rendered_snapshot() {
         row: area.y + 1,
         modifiers: KeyModifiers::NONE,
     };
-    let up = MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
         column: area.x + 7,
         row: area.y + 4,
         ..down
     };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
     assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, drag, false));
     assert!(update_mouse_selection(&mut app, up, false));
     let selection = app.selection.expect("in-viewport selection");
     assert!(selection.anchors.is_some());
     let snapshot = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
     assert!(!snapshot.trim().is_empty());
     assert_eq!(transcript_selection_text(&mut app, selection), snapshot);
+}
+
+#[test]
+fn click_without_drag_does_not_select_even_when_the_transcript_scrolls() {
+    let mut app = test_app();
+    for index in 0..30 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 4,
+        row: area.y + 3,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    // The transcript scrolls under the stationary cursor before the release,
+    // so the release lands on a different content row than the press.
+    app.scroll_transcript(-2);
+    render_to_string(&mut app, 80, 12);
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..down
+    };
+    assert!(update_mouse_selection(&mut app, up, false));
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn anchored_selection_clears_when_its_block_is_mutated() {
+    let mut app = test_app();
+    for index in 0..5 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let row_of = |app: &App, index: usize| {
+        app.hit_regions
+            .iter()
+            .find_map(|region| {
+                (region.target == AppHit::Transcript(index)).then_some(region.area.y)
+            })
+            .expect("block is visible")
+    };
+    let select_block = |app: &mut App, index: usize| {
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: row_of(app, index),
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: area.x + 6,
+            ..down
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..drag
+        };
+        assert!(update_mouse_selection(app, down, false));
+        assert!(update_mouse_selection(app, drag, false));
+        assert!(update_mouse_selection(app, up, false));
+        assert!(app.selection.is_some());
+    };
+
+    // A mutation below the selection keeps it alive.
+    select_block(&mut app, 1);
+    app.invalidate_transcript_layout_from(4);
+    render_to_string(&mut app, 80, 12);
+    assert!(app.selection.is_some());
+
+    // A mutation reaching the selected block clears it.
+    app.invalidate_transcript_layout_from(1);
+    assert!(app.selection.is_none());
+
+    // A full relayout (session switch, hydration) clears it too.
+    select_block(&mut app, 1);
+    app.invalidate_transcript_layout_from(0);
+    assert!(app.selection.is_none());
+}
+
+#[test]
+fn anchored_selection_survives_same_block_streaming_appends() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "first".to_string(),
+        None,
+        false,
+        true,
+    );
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+        .unwrap();
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x + 5,
+        ..down
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, drag, false));
+    assert!(update_mouse_selection(&mut app, up, false));
+    let selection = app.selection.expect("selection before streaming");
+
+    app.append_or_push(
+        BlockKind::Assistant,
+        "AGENT",
+        " and more streamed text".to_string(),
+        true,
+    );
+    render_to_string(&mut app, 80, 12);
+    let persisted = app
+        .selection
+        .expect("selection survives same-block streaming appends");
+    assert_eq!(persisted.start, selection.start);
+    assert_eq!(persisted.end, selection.end);
+    assert_eq!(transcript_selection_text(&mut app, persisted), "first");
 }
 
 #[test]
@@ -4566,6 +4734,91 @@ fn token_rate_follows_the_activity_animation_and_moves_to_the_ready_footer() {
 }
 
 #[test]
+fn status_lists_model_run_time_and_average_rate() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        true,
+    );
+    app.overlay = Some(Overlay::Status);
+    let rendered = render_to_string(&mut app, 100, 24);
+    let model_time = rendered
+        .lines()
+        .find(|line| line.contains("MODEL TIME"))
+        .unwrap();
+    assert!(model_time.contains('—'));
+    let average_rate = rendered
+        .lines()
+        .find(|line| line.contains("AVG RATE"))
+        .unwrap();
+    assert!(average_rate.contains('—'));
+
+    let now = Instant::now();
+    app.token_rate.start_turn();
+    app.token_rate
+        .observe_stream_text("hello world", false, now - Duration::from_secs(2));
+    app.token_rate.observe_usage(10, 0, now);
+    app.token_rate.observe_response_text("hello world", false);
+    app.token_rate.finish_response(now);
+    app.token_rate.finish_turn();
+    let rendered = render_to_string(&mut app, 100, 24);
+    let model_time = rendered
+        .lines()
+        .find(|line| line.contains("MODEL TIME"))
+        .unwrap();
+    assert!(model_time.contains("2.0s · last turn 2.0s"));
+    let average_rate = rendered
+        .lines()
+        .find(|line| line.contains("AVG RATE"))
+        .unwrap();
+    assert!(average_rate.contains("5.00 tok/s · last turn 5.00 tok/s"));
+}
+
+#[test]
+fn format_elapsed_scales_from_seconds_to_days() {
+    assert_eq!(format_elapsed(Duration::ZERO), "0.0s");
+    assert_eq!(format_elapsed(Duration::from_millis(12_340)), "12.3s");
+    assert_eq!(format_elapsed(Duration::from_secs(59)), "59.0s");
+    assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s");
+    assert_eq!(format_elapsed(Duration::from_secs(92)), "1m 32s");
+    assert_eq!(format_elapsed(Duration::from_secs(3_599)), "59m 59s");
+    assert_eq!(format_elapsed(Duration::from_secs(3_600)), "1h 0m");
+    assert_eq!(format_elapsed(Duration::from_secs(5_400)), "1h 30m");
+    assert_eq!(format_elapsed(Duration::from_secs(86_399)), "23h 59m");
+    assert_eq!(format_elapsed(Duration::from_secs(86_400)), "1d 0h");
+    assert_eq!(format_elapsed(Duration::from_secs(216_000)), "2d 12h");
+}
+
+#[test]
+fn busy_footer_scales_the_elapsed_unit() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        true,
+    );
+    let now = Instant::now();
+    app.busy = true;
+    app.activity = Some(Activity::Thinking);
+
+    app.busy_since = Some(now - Duration::from_secs(90));
+    let rendered = render_to_string(&mut app, 100, 24);
+    let activity = rendered
+        .lines()
+        .find(|line| line.contains("thinking"))
+        .unwrap();
+    assert!(activity.contains(" 1m 30s"));
+    assert!(!activity.contains("90.0s"));
+}
+
+#[test]
 fn hydration_restores_rate_calibration_without_inventing_a_final_average() {
     let mut app = test_app();
     apply_event(
@@ -5294,12 +5547,17 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
         row: area.y + row,
         modifiers: KeyModifiers::NONE,
     };
-    let up = MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
         column: area.x + 6,
         ..down
     };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
     assert!(update_mouse_selection(&mut lazy, down, false));
+    assert!(update_mouse_selection(&mut lazy, drag, false));
     assert!(update_mouse_selection(&mut lazy, up, false));
     assert!(lazy.selection.unwrap().anchors.is_some());
     let copied_before =

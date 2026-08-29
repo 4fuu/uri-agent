@@ -1,8 +1,6 @@
 use crate::text_metrics::{count_visible_units, visible_units};
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-const STREAM_RATE_WINDOW: Duration = Duration::from_secs(3);
 const DEFAULT_VISIBLE_UNITS_PER_SECOND: f64 = 100.0;
 const DISPLAY_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 const DISPLAY_SMOOTHING_TIME: Duration = Duration::from_secs(3);
@@ -12,7 +10,6 @@ const MIN_DISPLAY_RATE: f64 = 0.05;
 struct StreamRateEstimator {
     first_output_at: Option<Instant>,
     total_units: usize,
-    samples: VecDeque<(Instant, usize)>,
     in_visible_word: bool,
 }
 
@@ -25,53 +22,22 @@ impl StreamRateEstimator {
         self.in_visible_word = in_visible_word;
         self.first_output_at.get_or_insert(now);
         self.total_units = self.total_units.saturating_add(units);
-        self.samples.push_back((now, self.total_units));
-        self.trim(now);
     }
 
-    fn current_units_per_second(&mut self, now: Instant) -> Option<f64> {
+    /// Average visible units per second since the response's first output.
+    /// Stall time stays in the denominator, so pauses decay the rate instead
+    /// of clearing it.
+    fn current_units_per_second(&self, now: Instant) -> Option<f64> {
         let first_output_at = self.first_output_at?;
-        self.trim(now);
-        if self.samples.len() < 2 {
-            let elapsed = now.saturating_duration_since(first_output_at);
-            if self.samples.back().is_some_and(|(sampled_at, _)| {
-                now.saturating_duration_since(*sampled_at) >= STREAM_RATE_WINDOW
-            }) {
-                return Some(0.0);
-            }
-            let seconds = elapsed.as_secs_f64();
-            return (seconds > 0.0)
-                .then(|| DEFAULT_VISIBLE_UNITS_PER_SECOND.min(self.total_units as f64 / seconds));
-        }
-        let window_start = now
-            .checked_sub(STREAM_RATE_WINDOW)
-            .unwrap_or(first_output_at);
-        let start = first_output_at.max(window_start);
-        let baseline = if start <= first_output_at {
-            0
-        } else {
-            self.samples
-                .iter()
-                .take_while(|(sampled_at, _)| *sampled_at <= start)
-                .map(|(_, units)| *units)
-                .last()
-                .unwrap_or_default()
-        };
-        let seconds = now.saturating_duration_since(start).as_secs_f64();
-        (seconds > 0.0).then(|| self.total_units.saturating_sub(baseline) as f64 / seconds)
+        let seconds = now.saturating_duration_since(first_output_at).as_secs_f64();
+        (seconds > 0.0 && self.total_units > 0)
+            .then(|| DEFAULT_VISIBLE_UNITS_PER_SECOND.min(self.total_units as f64 / seconds))
     }
 
     fn elapsed(&self, completed_at: Instant) -> Option<Duration> {
         self.first_output_at
             .map(|started_at| completed_at.saturating_duration_since(started_at))
             .filter(|elapsed| !elapsed.is_zero())
-    }
-
-    fn trim(&mut self, now: Instant) {
-        let boundary = now.checked_sub(STREAM_RATE_WINDOW).unwrap_or(now);
-        while self.samples.len() > 1 && self.samples.get(1).is_some_and(|(at, _)| *at <= boundary) {
-            self.samples.pop_front();
-        }
     }
 }
 
@@ -126,6 +92,9 @@ pub(super) struct TokenRateState {
     turn_output_tokens: u64,
     turn_generation_time: Duration,
     final_average: Option<f64>,
+    last_turn_generation_time: Option<Duration>,
+    session_output_tokens: u64,
+    session_generation_time: Duration,
 }
 
 impl TokenRateState {
@@ -147,6 +116,7 @@ impl TokenRateState {
         self.turn_output_tokens = 0;
         self.turn_generation_time = Duration::ZERO;
         self.final_average = None;
+        self.last_turn_generation_time = None;
     }
 
     pub(super) fn ensure_turn(&mut self) {
@@ -207,10 +177,14 @@ impl TokenRateState {
             (Some(usage), Some(output_tokens))
                 if output_tokens > 0 && usage.generation_time.is_some() =>
             {
+                let generation_time = usage.generation_time.unwrap_or_default();
                 self.turn_output_tokens = self.turn_output_tokens.saturating_add(output_tokens);
-                self.turn_generation_time = self
-                    .turn_generation_time
-                    .saturating_add(usage.generation_time.unwrap_or_default());
+                self.turn_generation_time =
+                    self.turn_generation_time.saturating_add(generation_time);
+                self.session_output_tokens =
+                    self.session_output_tokens.saturating_add(output_tokens);
+                self.session_generation_time =
+                    self.session_generation_time.saturating_add(generation_time);
             }
             _ => self.turn_complete = false,
         }
@@ -229,11 +203,13 @@ impl TokenRateState {
     }
 
     pub(super) fn finish_turn(&mut self) {
-        self.final_average = (self.turn_active
+        let complete = self.turn_active
             && self.turn_complete
             && self.turn_output_tokens > 0
-            && !self.turn_generation_time.is_zero())
-        .then(|| self.turn_output_tokens as f64 / self.turn_generation_time.as_secs_f64());
+            && !self.turn_generation_time.is_zero();
+        self.final_average = complete
+            .then(|| self.turn_output_tokens as f64 / self.turn_generation_time.as_secs_f64());
+        self.last_turn_generation_time = complete.then_some(self.turn_generation_time);
         self.turn_active = false;
         self.stream = StreamRateEstimator::default();
         self.response = ResponseObservation::default();
@@ -245,6 +221,7 @@ impl TokenRateState {
     pub(super) fn fail_turn(&mut self) {
         self.finish_turn();
         self.final_average = None;
+        self.last_turn_generation_time = None;
     }
 
     pub(super) fn finish_hydration(&mut self) {
@@ -253,6 +230,9 @@ impl TokenRateState {
         self.turn_output_tokens = 0;
         self.turn_generation_time = Duration::ZERO;
         self.final_average = None;
+        self.last_turn_generation_time = None;
+        self.session_output_tokens = 0;
+        self.session_generation_time = Duration::ZERO;
         self.stream = StreamRateEstimator::default();
         self.response = ResponseObservation::default();
         self.displayed_rate = None;
@@ -262,6 +242,7 @@ impl TokenRateState {
 
     pub(super) fn clear_final(&mut self) {
         self.final_average = None;
+        self.last_turn_generation_time = None;
     }
 
     pub(super) fn display_rate(&mut self, now: Instant) -> Option<f64> {
@@ -298,6 +279,23 @@ impl TokenRateState {
     pub(super) fn final_average(&self) -> Option<f64> {
         self.final_average
     }
+
+    /// Cumulative measured model generation time in this session, including
+    /// the in-flight response while one streams.
+    pub(super) fn model_time(&self, now: Instant) -> Duration {
+        self.session_generation_time
+            .saturating_add(self.stream.elapsed(now).unwrap_or_default())
+    }
+
+    /// Average output rate across every measured response in this session.
+    pub(super) fn average_rate(&self) -> Option<f64> {
+        (self.session_output_tokens > 0 && !self.session_generation_time.is_zero())
+            .then(|| self.session_output_tokens as f64 / self.session_generation_time.as_secs_f64())
+    }
+
+    pub(super) fn last_turn_generation_time(&self) -> Option<Duration> {
+        self.last_turn_generation_time
+    }
 }
 
 pub(super) fn format_token_rate(rate: f64) -> String {
@@ -324,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn estimator_uses_a_three_second_window_and_single_sample_cap() {
+    fn estimator_averages_since_first_output_and_caps_the_first_sample() {
         let start = Instant::now();
         let mut estimator = StreamRateEstimator::default();
         estimator.observe("one two", start);
@@ -336,7 +334,24 @@ mod tests {
         estimator.observe(" five six", start + Duration::from_secs(4));
         assert_eq!(
             estimator.current_units_per_second(start + Duration::from_secs(4)),
-            Some(2.0 / 3.0)
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn estimator_keeps_stall_time_in_the_average() {
+        let start = Instant::now();
+        let mut estimator = StreamRateEstimator::default();
+        estimator.observe("one two", start);
+        estimator.observe(" three four", start + Duration::from_secs(1));
+        // Three seconds without output decay the average instead of clearing it.
+        assert_eq!(
+            estimator.current_units_per_second(start + Duration::from_secs(4)),
+            Some(1.0)
+        );
+        assert_eq!(
+            estimator.current_units_per_second(start + Duration::from_secs(8)),
+            Some(0.5)
         );
     }
 
@@ -385,5 +400,92 @@ mod tests {
         state.finish_response(start + Duration::from_secs(7));
         state.finish_turn();
         assert_eq!(state.final_average(), Some(5.0));
+    }
+
+    #[test]
+    fn session_stats_accumulate_measured_responses_across_turns() {
+        let start = Instant::now();
+        let mut state = TokenRateState::default();
+        state.start_turn();
+        state.observe_stream_text("answer", false, start);
+        state.observe_usage(20, 0, start + Duration::from_secs(2));
+        state.observe_response_text("answer", false);
+        state.finish_response(start + Duration::from_secs(2));
+        state.finish_turn();
+        assert_eq!(state.average_rate(), Some(10.0));
+        assert_eq!(
+            state.last_turn_generation_time(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            state.model_time(start + Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+
+        // The next turn adds to the session totals, including in-flight time.
+        state.start_turn();
+        assert_eq!(state.last_turn_generation_time(), None);
+        state.observe_stream_text("again", false, start + Duration::from_secs(10));
+        assert_eq!(
+            state.model_time(start + Duration::from_secs(11)),
+            Duration::from_secs(3)
+        );
+        state.observe_usage(10, 0, start + Duration::from_secs(12));
+        state.observe_response_text("again", false);
+        state.finish_response(start + Duration::from_secs(12));
+        // Tool execution after the response ended adds no model time.
+        assert_eq!(
+            state.model_time(start + Duration::from_secs(30)),
+            Duration::from_secs(4)
+        );
+        state.finish_turn();
+        assert_eq!(state.average_rate(), Some(7.5));
+        assert_eq!(
+            state.model_time(start + Duration::from_secs(12)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            state.last_turn_generation_time(),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn failed_turn_keeps_session_stats_but_drops_the_last_turn() {
+        let start = Instant::now();
+        let mut state = TokenRateState::default();
+        state.start_turn();
+        state.observe_stream_text("answer", false, start);
+        state.observe_usage(20, 0, start + Duration::from_secs(2));
+        state.observe_response_text("answer", false);
+        state.finish_response(start + Duration::from_secs(2));
+        state.fail_turn();
+        assert_eq!(state.final_average(), None);
+        assert_eq!(state.last_turn_generation_time(), None);
+        assert_eq!(state.average_rate(), Some(10.0));
+        assert_eq!(
+            state.model_time(start + Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn hydration_clears_session_stats() {
+        let start = Instant::now();
+        let mut state = TokenRateState::default();
+        state.start_turn();
+        state.observe_stream_text("answer", false, start);
+        state.observe_usage(20, 0, start + Duration::from_secs(2));
+        state.observe_response_text("answer", false);
+        state.finish_response(start + Duration::from_secs(2));
+        state.finish_turn();
+        state.finish_hydration();
+        assert_eq!(state.final_average(), None);
+        assert_eq!(state.last_turn_generation_time(), None);
+        assert_eq!(state.average_rate(), None);
+        assert_eq!(
+            state.model_time(start + Duration::from_secs(2)),
+            Duration::ZERO
+        );
     }
 }

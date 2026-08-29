@@ -844,7 +844,7 @@ pub(super) fn footer_activity(app: &mut App) -> Option<String> {
         .unwrap_or_else(|| "working".to_string());
     let elapsed = app
         .busy_since
-        .map(|since| format!(" {:.1}s", since.elapsed().as_secs_f32()))
+        .map(|since| format!(" {}", format_elapsed(since.elapsed())))
         .unwrap_or_default();
     let token_rate = app
         .token_rate
@@ -856,6 +856,22 @@ pub(super) fn footer_activity(app: &mut App) -> Option<String> {
         animation::spinner(app.animation_phase),
         animation::activity(app.animation_phase, 8)
     ))
+}
+
+pub(super) fn format_elapsed(duration: Duration) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let seconds = duration.as_secs();
+    if seconds < MINUTE {
+        format!("{:.1}s", duration.as_secs_f32())
+    } else if seconds < HOUR {
+        format!("{}m {}s", seconds / MINUTE, seconds % MINUTE)
+    } else if seconds < DAY {
+        format!("{}h {}m", seconds / HOUR, seconds % HOUR / MINUTE)
+    } else {
+        format!("{}d {}h", seconds / DAY, seconds % DAY / HOUR)
+    }
 }
 
 pub(super) fn compact_model(app: &App) -> String {
@@ -2104,7 +2120,7 @@ pub(super) const FLOAT_MIN_WIDTH: u16 = 60;
 pub(super) fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
-        Overlay::Status => bottom_float(frame, 14),
+        Overlay::Status => bottom_float(frame, 16),
         Overlay::Composer => bottom_float(
             frame,
             8 + pending_preview_height(app) + completion_preview_height(app),
@@ -2424,6 +2440,8 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
         .map(|rate| format!("{rate:.1}%"))
         .unwrap_or_else(|| "—".to_string());
     let subscription = app.info.provider == "kimi-coding";
+    let model_time = model_time_status(app);
+    let average_rate = average_rate_status(app);
     let mut lines = vec![
         status_row("PROJECT", project, Style::default().fg(ACCENT)),
         status_row(
@@ -2484,6 +2502,8 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             ),
             Style::default().fg(if subscription { ACCENT } else { TEXT }),
         ),
+        status_row("MODEL TIME", model_time, Style::default().fg(TEXT)),
+        status_row("AVG RATE", average_rate, Style::default().fg(TEXT)),
         status_row(
             "PROTOCOLS",
             format!("{} registered", active_protocols(app).len()),
@@ -2512,6 +2532,39 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             .scroll((app.overlay_scroll, 0)),
         area,
     );
+}
+
+/// Cumulative measured model generation time for the session, including any
+/// in-flight response, plus the most recent complete turn when available.
+pub(super) fn model_time_status(app: &App) -> String {
+    let total = app.token_rate.model_time(Instant::now());
+    let last_turn = app.token_rate.last_turn_generation_time();
+    if total.is_zero() && last_turn.is_none() {
+        return "—".to_string();
+    }
+    let mut status = format_elapsed(total);
+    if let Some(last_turn) = last_turn {
+        status.push_str(&format!(" · last turn {}", format_elapsed(last_turn)));
+    }
+    status
+}
+
+/// Session average output rate over measured model time, plus the most recent
+/// complete turn's average when available.
+pub(super) fn average_rate_status(app: &App) -> String {
+    match (
+        app.token_rate.average_rate(),
+        app.token_rate.final_average(),
+    ) {
+        (Some(average), Some(last_turn)) => format!(
+            "{} · last turn {}",
+            format_token_rate(average),
+            format_token_rate(last_turn)
+        ),
+        (Some(average), None) => format_token_rate(average),
+        (None, Some(last_turn)) => format!("last turn {}", format_token_rate(last_turn)),
+        (None, None) => "—".to_string(),
+    }
 }
 
 pub(super) fn status_row(
@@ -4219,6 +4272,7 @@ pub(super) fn update_mouse_selection(
                 &mut app.last_text_click,
                 TextClickTarget::Surface(app.overlay, screen),
             );
+            app.text_selection_dragged = false;
             if double_click
                 && let Some(selection) = app
                     .selectable
@@ -4236,6 +4290,7 @@ pub(super) fn update_mouse_selection(
         MouseEventKind::Drag(MouseButton::Left) if app.selection.is_some() => {
             app.last_text_click = None;
             app.mouse_word_selecting = false;
+            app.text_selection_dragged = true;
             let end_anchor = selection_row_anchor(app, point.1);
             if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
@@ -4250,6 +4305,7 @@ pub(super) fn update_mouse_selection(
                 app.mouse_word_selecting = false;
                 return true;
             }
+            let dragged = app.text_selection_dragged;
             let end_anchor = selection_row_anchor(app, point.1);
             let empty = if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
@@ -4260,7 +4316,10 @@ pub(super) fn update_mouse_selection(
             } else {
                 false
             };
-            if empty {
+            // A click without a drag never selects: during auto-scroll the
+            // content row under a stationary cursor moves between press and
+            // release, which would otherwise invent a spanned selection.
+            if empty || !dragged {
                 app.selection = None;
             }
             true

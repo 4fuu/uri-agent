@@ -872,6 +872,7 @@ struct App {
     last_click: Option<(AppHit, Instant)>,
     last_text_click: Option<(TextClickTarget, Instant)>,
     mouse_word_selecting: bool,
+    text_selection_dragged: bool,
     overlay_bounds: Option<Rect>,
     copy_click_release_pending: bool,
     selectable: Option<SelectableSurface>,
@@ -968,6 +969,7 @@ impl App {
             last_click: None,
             last_text_click: None,
             mouse_word_selecting: false,
+            text_selection_dragged: false,
             overlay_bounds: None,
             copy_click_release_pending: false,
             selectable: None,
@@ -1626,7 +1628,7 @@ impl App {
             render_revision: 0,
             render_cache: RefCell::new(None),
         });
-        self.invalidate_transcript_layout_from(index);
+        self.invalidate_transcript_layout_appended(index);
     }
 
     fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String, expanded: bool) {
@@ -1638,13 +1640,39 @@ impl App {
             block.text.push_str(&text);
             block.invalidate_render();
             let index = self.blocks.len().saturating_sub(1);
-            self.invalidate_transcript_layout_from(index);
+            self.invalidate_transcript_layout_appended(index);
         } else {
             self.push(kind, title, text, None, false, expanded);
         }
     }
 
     fn invalidate_transcript_layout_from(&mut self, index: usize) {
+        self.mark_transcript_layout_dirty(index);
+        // Mutating or removing blocks re-renders their rows in place, so an
+        // anchored selection that reaches the changed region can no longer
+        // trust its rows; selections fully above it keep resolving.
+        if let Some(selection) = self.selection
+            && selection.anchors.is_some()
+        {
+            let changed_start = self
+                .transcript_layout
+                .blocks
+                .iter()
+                .find(|entry| entry.index >= index)
+                .map_or(self.transcript_layout.rows, |entry| entry.start);
+            if selection.start.1.max(selection.end.1) >= changed_start {
+                self.selection = None;
+            }
+        }
+    }
+
+    // Pure tail growth (a new block or text appended to the last block) never
+    // moves existing rows, so selections stay valid.
+    fn invalidate_transcript_layout_appended(&mut self, index: usize) {
+        self.mark_transcript_layout_dirty(index);
+    }
+
+    fn mark_transcript_layout_dirty(&mut self, index: usize) {
         self.transcript_layout.dirty_from = Some(
             self.transcript_layout
                 .dirty_from
