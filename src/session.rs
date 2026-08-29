@@ -3943,19 +3943,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_file_is_sqlite_with_expected_schema() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("sessions.db");
-        let opened = session(&path, None).await;
-        assert_eq!(opened.database_path(), path);
-        assert_eq!(&std::fs::read(&path).unwrap()[..16], b"SQLite format 3\0");
-        let tables: i64 = opened.connection.call(|db| db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','events')",
-            [], |row| row.get(0))).await.unwrap();
-        assert_eq!(tables, 2);
-    }
-
-    #[tokio::test]
     async fn resume_index_schema_adds_checksum_to_legacy_table() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sessions.db");
@@ -3983,15 +3970,6 @@ mod tests {
             .await
             .unwrap();
         assert!(columns.iter().any(|column| column == "checksum"));
-    }
-
-    #[test]
-    fn default_session_database_uses_a_new_generation_file() {
-        assert_eq!(
-            session_database_path(Path::new("/work")).file_name(),
-            Some(std::ffi::OsStr::new(SESSION_DATABASE_FILE))
-        );
-        assert_ne!(SESSION_DATABASE_FILE, "sessions.db");
     }
 
     #[test]

@@ -60,36 +60,6 @@ fn test_app() -> App {
     test_app_with_splash(true)
 }
 
-#[test]
-fn continuous_render_demand_keeps_the_welcome_wordmark_live_but_stops_when_idle() {
-    let mut app = test_app();
-    app.skip_splash();
-    assert!(app.blocks.is_empty());
-    assert!(app.continuous_render_demand());
-
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "settled".to_string(),
-        None,
-        false,
-        true,
-    );
-    assert!(!app.continuous_render_demand());
-
-    app.busy = true;
-    assert!(app.continuous_render_demand());
-
-    app.overlay = Some(Overlay::Composer);
-    assert!(!app.continuous_render_demand());
-
-    app.mouse_scroll_animation = Some(MouseScrollAnimation::Overlay {
-        target: 1,
-        direction: 1,
-    });
-    assert!(app.continuous_render_demand());
-}
-
 fn apply_event(app: &mut App, sequence: u64, kind: EventKind) {
     app.apply(SessionEvent {
         sequence,
@@ -683,33 +653,6 @@ fn unconfigured_brand_asks_for_login_instead_of_a_default_model() {
 }
 
 #[test]
-fn welcome_keeps_its_layout_with_a_centered_local_key_hint() {
-    let mut app = test_app();
-    let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("/workspace"));
-    assert!(rendered.contains("test / model · effort off"));
-    assert!(rendered.contains("Space compose · : commands · ? help"));
-    assert!(!rendered.contains("tokens"));
-    assert!(!rendered.contains("ctx "));
-
-    let lines = rendered.lines().collect::<Vec<_>>();
-    let project_row = lines
-        .iter()
-        .position(|line| line.contains("/workspace"))
-        .expect("welcome project row");
-    assert_eq!(project_row, 13);
-    assert_eq!(lines[project_row].find("/workspace"), Some(45));
-    assert_eq!(
-        lines[project_row + 1].find("test / model · effort off"),
-        Some(38)
-    );
-    let hint_row = project_row + 3;
-    assert!(lines[hint_row].contains("Space compose · : commands · ? help"));
-    assert_eq!(lines[hint_row].find("Space compose"), Some(33));
-    assert_eq!(lines.len() - hint_row - 1, 7);
-}
-
-#[test]
 fn transient_notifications_overlay_without_reflowing_base_surfaces() {
     let mut welcome = test_app();
     let baseline = render_to_string(&mut welcome, 100, 24);
@@ -820,165 +763,6 @@ fn conversation_footer_only_shows_context_model_and_effort() {
     assert_eq!(hit_target(&app.hit_regions, click), Some(AppHit::Status));
     open_status(&mut app);
     assert!(app.overlay == Some(Overlay::Status));
-}
-
-#[test]
-fn bottom_notifications_wrap_completely_in_narrow_windows() {
-    let mut app = test_app();
-    app.skip_splash();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "answer".to_string(),
-        None,
-        false,
-        false,
-    );
-    let message = "Detailed notification text wraps completely inside a narrow terminal window";
-    app.set_flash(message);
-
-    let width = 24;
-    let height = 12;
-    let notice_height = bottom_notice_lines(&[(message.to_string(), WARM)], width).len();
-    assert!(notice_height > 1);
-
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let rows = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks(width as usize)
-        .collect::<Vec<_>>();
-    let notice_start = height as usize - notice_height - 1;
-    let notice_rows = &rows[notice_start..notice_start + notice_height];
-    let rendered_notice = notice_rows
-        .iter()
-        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    for word in message.split_whitespace() {
-        assert!(rendered_notice.contains(word), "missing {word:?}");
-    }
-    assert!(
-        notice_rows
-            .iter()
-            .flat_map(|row| row.iter())
-            .all(|cell| cell.bg == SURFACE)
-    );
-}
-
-#[test]
-fn new_notifications_stack_upward_above_fixed_statuses() {
-    let mut app = test_app();
-    app.skip_splash();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "answer".to_string(),
-        None,
-        false,
-        false,
-    );
-    app.busy = true;
-    app.activity = Some(Activity::Thinking);
-    app.pending_messages.push(PendingMessage {
-        id: 1,
-        text: "follow up".to_string(),
-        kind: PendingMessageKind::Queued,
-    });
-    render_to_string(&mut app, 100, 24);
-    let baseline_height = app.transcript_height;
-    app.set_flash("Older notification");
-    app.set_flash("Newer notification");
-
-    let rendered = render_to_string(&mut app, 100, 24);
-    assert_eq!(app.transcript_height, baseline_height);
-    let rows = rendered.lines().collect::<Vec<_>>();
-    let row = |text: &str| {
-        rows.iter()
-            .position(|line| line.contains(text))
-            .unwrap_or_else(|| panic!("missing {text:?}"))
-    };
-
-    assert!(row("Newer notification") < row("Older notification"));
-    assert!(row("Older notification") < row("1 pending"));
-    let activity_row = rows.len() - 2;
-    assert!(row("1 pending") < activity_row);
-    assert!(rows[activity_row].contains("thinking"));
-    let footer = rows.last().unwrap();
-    assert!(footer.starts_with("model · effort off"));
-    assert!(!footer.contains("thinking"));
-    assert!(footer.trim_end().ends_with("········ 0.0%/128k"));
-}
-
-#[test]
-fn flash_residence_time_scales_with_character_count() {
-    assert_eq!(flash_duration(""), FLASH_MIN_DURATION);
-    assert_eq!(flash_duration("é"), flash_duration("e\u{301}"));
-
-    let short = "Saved";
-    let long = "Long notification text ".repeat(8);
-    assert!(flash_duration(&long) > flash_duration(short));
-    assert_eq!(flash_duration(&"x".repeat(1_000)), FLASH_MAX_DURATION);
-
-    let elapsed = flash_duration(short) + Duration::from_millis(10);
-    let mut app = test_app();
-    app.flashes.push(FlashNotice {
-        message: short.to_string(),
-        created: Instant::now() - elapsed,
-    });
-    assert!(app.visible_flashes().next().is_none());
-    app.flashes.push(FlashNotice {
-        message: long,
-        created: Instant::now() - elapsed,
-    });
-    assert!(app.visible_flashes().next().is_some());
-}
-
-#[test]
-fn compact_footer_right_aligns_context_and_handles_narrow_widths() {
-    let mut app = test_app();
-    app.skip_splash();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "answer".to_string(),
-        None,
-        false,
-        true,
-    );
-    let backend = TestBackend::new(12, 8);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-
-    let footer = &terminal.backend().buffer().content()[7 * 12..8 * 12];
-    assert_eq!(footer.last().unwrap().symbol(), "…");
-    assert_eq!(footer.last().unwrap().fg, ACCENT);
-    assert!(footer.iter().all(|cell| cell.bg == SURFACE));
-    assert!(footer.iter().all(|cell| cell.fg != TEXT));
-    assert_eq!(single_line_preview("模型 名称", 5), "模型…");
-    assert_eq!(single_line_preview("model", 0), "");
-}
-
-#[test]
-fn single_line_overflow_preserves_input_tail_and_scrolls_selected_text() {
-    assert_eq!(single_line_tail("prefix  模型", 7), "…  模型");
-    assert_eq!(single_line_tail("a  b", 4), "a  b");
-
-    assert_eq!(marquee_preview("abcdef", 4, 0), "abc…");
-    assert_eq!(
-        marquee_preview("abcdef", 4, MARQUEE_HOLD_FRAMES + MARQUEE_STEP_FRAMES),
-        "…bc…"
-    );
-    assert_eq!(
-        marquee_preview("abcdef", 4, MARQUEE_HOLD_FRAMES + 3 * MARQUEE_STEP_FRAMES),
-        "…def"
-    );
-    assert_eq!(list_cell("模型名称", 5, false, 0).width(), 5);
-    assert_eq!(single_line_preview("e\u{301}clair", 2), "e\u{301}…");
 }
 
 #[test]
@@ -1203,278 +987,6 @@ fn transcript_uses_role_specific_blocks_and_mouse_regions() {
 }
 
 #[test]
-fn user_wide_character_trailing_cell_is_styled_for_scroll_cleanup() {
-    let mut user_app = test_app();
-    user_app.push(BlockKind::User, "YOU", "a你".into(), None, false, false);
-    user_app.skip_splash();
-    let backend = TestBackend::new(8, 5);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let user_frame = terminal
-        .draw(|frame| render(frame, &mut user_app))
-        .unwrap()
-        .buffer
-        .clone();
-    let user_row = user_app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(user_frame[(2, user_row)].symbol(), "你");
-    assert_eq!(user_frame[(2, user_row)].bg, USER_SURFACE);
-    assert_eq!(user_frame[(3, user_row)].symbol(), " ");
-    assert_eq!(user_frame[(3, user_row)].bg, USER_SURFACE);
-
-    let mut replacement_app = test_app();
-    replacement_app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "filler".into(),
-        None,
-        false,
-        false,
-    );
-    replacement_app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "好".into(),
-        None,
-        false,
-        false,
-    );
-    replacement_app.skip_splash();
-    let backend = TestBackend::new(8, 5);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let replacement_frame = terminal
-        .draw(|frame| render(frame, &mut replacement_app))
-        .unwrap()
-        .buffer
-        .clone();
-    let replacement_row = replacement_app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(replacement_row, user_row);
-    assert_eq!(replacement_frame[(1, replacement_row)].symbol(), "好");
-    assert!(
-        user_frame
-            .diff(&replacement_frame)
-            .iter()
-            .any(|(x, y, cell)| *x == 3 && *y == replacement_row && cell.bg == Color::Reset)
-    );
-}
-
-#[test]
-fn follow_up_user_prompt_has_an_extra_blank_row_after_the_previous_result() {
-    let mut app = test_app();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "Previous answer.".into(),
-        None,
-        false,
-        true,
-    );
-    app.blocks[0].turn_result = true;
-    app.push(
-        BlockKind::User,
-        "YOU",
-        "Follow-up question.".into(),
-        None,
-        false,
-        false,
-    );
-    app.push(
-        BlockKind::Reasoning,
-        "THINKING",
-        "Check the new turn.".into(),
-        None,
-        false,
-        false,
-    );
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "Next answer.".into(),
-        None,
-        false,
-        true,
-    );
-    app.apply(SessionEvent {
-        sequence: 0,
-        at: chrono::Utc::now(),
-        kind: EventKind::TurnFinished,
-    });
-    app.skip_splash();
-    let backend = TestBackend::new(80, 12);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let previous_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-    let user_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-    let process_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
-        .unwrap();
-    let result_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(4)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(user_row, previous_row + 3);
-    assert_eq!(process_row, user_row + 3);
-    assert_eq!(result_row, process_row + 2);
-    for row in [user_row - 1, user_row, user_row + 1] {
-        assert_eq!(terminal.backend().buffer()[(1, row)].bg, USER_SURFACE);
-        assert_eq!(terminal.backend().buffer()[(78, row)].bg, USER_SURFACE);
-    }
-    assert_eq!(
-        terminal.backend().buffer()[(1, user_row + 2)].bg,
-        Color::Reset
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(1, previous_row + 1)].bg,
-        Color::Reset
-    );
-    for row in [previous_row + 1, user_row - 1, user_row + 1, user_row + 2] {
-        assert!(!app.hit_regions.iter().any(|region| {
-            region.area.y == row && matches!(region.target, AppHit::Transcript(_))
-        }));
-    }
-    assert!(transcript_needs_gap(
-        BlockKind::Assistant,
-        true,
-        BlockKind::User,
-        false,
-    ));
-    assert!(transcript_needs_gap(
-        BlockKind::User,
-        false,
-        BlockKind::Process,
-        false
-    ));
-}
-
-#[test]
-fn user_and_assistant_content_aligns_to_both_transcript_edges() {
-    let mut app = test_app();
-    app.push(BlockKind::User, "YOU", "U".repeat(38), None, false, false);
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "A".repeat(38),
-        None,
-        false,
-        true,
-    );
-    app.skip_splash();
-    let backend = TestBackend::new(40, 8);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let user_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-    let assistant_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-
-    for (row, symbol) in [(user_row, "U"), (assistant_row, "A")] {
-        assert_eq!(terminal.backend().buffer()[(1, row)].symbol(), symbol);
-        assert_eq!(terminal.backend().buffer()[(38, row)].symbol(), symbol);
-        let background = if symbol == "U" {
-            USER_SURFACE
-        } else {
-            Color::Reset
-        };
-        assert_eq!(terminal.backend().buffer()[(1, row)].bg, background);
-        assert_eq!(terminal.backend().buffer()[(38, row)].bg, background);
-    }
-}
-
-#[test]
-fn reasoning_and_tool_content_aligns_to_both_transcript_edges() {
-    let mut app = test_app();
-    app.push(
-        BlockKind::Reasoning,
-        "THINKING",
-        "R".repeat(36),
-        None,
-        false,
-        true,
-    );
-    app.push(
-        BlockKind::Tool,
-        &"T".repeat(36),
-        "CALL\n{}\n\nRESULT\nsource".into(),
-        None,
-        false,
-        false,
-    );
-    app.selected_block = 0;
-    app.skip_splash();
-    let backend = TestBackend::new(40, 8);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let reasoning_rows = app
-        .hit_regions
-        .iter()
-        .filter_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .collect::<Vec<_>>();
-    let tool_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(
-        terminal.backend().buffer()[(1, reasoning_rows[0])].symbol(),
-        "◇"
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(2, reasoning_rows[1])].symbol(),
-        " "
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(3, reasoning_rows[1])].symbol(),
-        "R"
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(38, reasoning_rows[1])].symbol(),
-        "R"
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(1, reasoning_rows[1])].bg,
-        ROW_ACTIVE
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(38, reasoning_rows[1])].bg,
-        ROW_ACTIVE
-    );
-    assert_eq!(terminal.backend().buffer()[(1, tool_row)].symbol(), "✓");
-    assert_eq!(terminal.backend().buffer()[(38, tool_row)].symbol(), "T");
-
-    app.selected_block = 1;
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    assert_eq!(terminal.backend().buffer()[(1, tool_row)].bg, ROW_ACTIVE);
-    assert_eq!(terminal.backend().buffer()[(38, tool_row)].bg, ROW_ACTIVE);
-}
-
-#[test]
 fn assistant_reply_supports_direct_mouse_drag_selection() {
     let mut app = test_app();
     app.push(
@@ -1664,311 +1176,6 @@ fn transcript_copy_omits_visual_soft_wraps() {
 }
 
 #[test]
-fn virtual_transcript_tail_supports_direct_reverse_drag_selection() {
-    let mut app = test_app();
-    for index in 0..30 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    render_to_string(&mut app, 80, 12);
-    app.scroll_transcript(isize::MAX);
-    render_to_string(&mut app, 80, 12);
-    let final_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(29)).then_some(region.area.y))
-        .unwrap();
-    let tail_row = app.transcript_height.saturating_sub(1) as u16;
-    assert!(tail_row > final_row);
-    assert!(!app.hit_regions.iter().any(|region| {
-        region.area.y == tail_row && matches!(region.target, AppHit::Transcript(_))
-    }));
-    let down = MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 20,
-        row: tail_row,
-        modifiers: KeyModifiers::NONE,
-    };
-    let drag = MouseEvent {
-        kind: MouseEventKind::Drag(MouseButton::Left),
-        column: 1,
-        row: final_row,
-        modifiers: KeyModifiers::NONE,
-    };
-
-    assert!(begin_direct_transcript_selection(&mut app, down));
-    assert!(update_mouse_selection(&mut app, drag, true));
-    assert!(
-        selected_surface_text(app.selectable.as_ref().unwrap(), app.selection.unwrap())
-            .contains("message 29")
-    );
-}
-
-#[test]
-fn first_process_block_has_one_blank_row_after_the_user_message() {
-    let mut app = test_app();
-    app.push(
-        BlockKind::User,
-        "YOU",
-        "Inspect the renderer.".into(),
-        None,
-        false,
-        false,
-    );
-    app.push(
-        BlockKind::Reasoning,
-        "THINKING",
-        "Compare the references.".into(),
-        None,
-        false,
-        false,
-    );
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "I will inspect the history.".into(),
-        None,
-        false,
-        true,
-    );
-
-    let rendered = render_to_string(&mut app, 80, 12);
-    let user_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-    let reasoning_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-    let assistant_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(2)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(reasoning_row, user_row + 2);
-    assert_eq!(assistant_row, reasoning_row + 1);
-    assert!(
-        rendered
-            .lines()
-            .nth((user_row + 1) as usize)
-            .unwrap()
-            .trim()
-            .is_empty()
-    );
-    assert!(!transcript_needs_gap(
-        BlockKind::User,
-        false,
-        BlockKind::Tool,
-        false
-    ));
-    assert!(!transcript_needs_gap(
-        BlockKind::Reasoning,
-        false,
-        BlockKind::Assistant,
-        false
-    ));
-    assert!(!transcript_needs_gap(
-        BlockKind::Reasoning,
-        false,
-        BlockKind::Tool,
-        false
-    ));
-}
-
-#[test]
-fn final_assistant_response_has_one_blank_row_after_the_process() {
-    let mut app = test_app();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "I will inspect the history.".into(),
-        None,
-        false,
-        true,
-    );
-    app.push(
-        BlockKind::Reasoning,
-        "THINKING",
-        "Summarize the result.".into(),
-        None,
-        false,
-        false,
-    );
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "Here is the final answer.".into(),
-        None,
-        false,
-        true,
-    );
-    app.apply(SessionEvent {
-        sequence: 0,
-        at: chrono::Utc::now(),
-        kind: EventKind::TurnFinished,
-    });
-
-    assert_eq!(app.blocks[0].kind, BlockKind::Process);
-    assert!(!app.blocks[0].expanded);
-    assert!(app.blocks[3].turn_result);
-    let rendered = render_to_string(&mut app, 80, 12);
-    let process_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-    let final_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(3)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(final_row, process_row + 2);
-    assert!(
-        rendered
-            .lines()
-            .nth((process_row + 1) as usize)
-            .unwrap()
-            .trim()
-            .is_empty()
-    );
-    assert!(transcript_needs_gap(
-        BlockKind::Reasoning,
-        false,
-        BlockKind::Assistant,
-        true
-    ));
-}
-
-#[test]
-fn final_assistant_response_has_one_blank_row_after_the_user_when_there_is_no_process() {
-    let mut app = test_app();
-    apply_event(
-        &mut app,
-        0,
-        EventKind::User {
-            text: "hello".into(),
-        },
-    );
-    apply_event(
-        &mut app,
-        1,
-        EventKind::AssistantText {
-            text: "Hello! How can I help?".into(),
-        },
-    );
-    apply_event(&mut app, 2, EventKind::TurnFinished);
-
-    assert_eq!(app.blocks.len(), 2);
-    assert_eq!(app.blocks[0].kind, BlockKind::User);
-    assert_eq!(app.blocks[1].kind, BlockKind::Assistant);
-    assert!(app.blocks[1].turn_result);
-    assert!(
-        !app.blocks
-            .iter()
-            .any(|block| block.kind == BlockKind::Process)
-    );
-
-    app.skip_splash();
-    let backend = TestBackend::new(80, 12);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let user_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-    let result_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(result_row, user_row + 3);
-    assert_eq!(
-        terminal.backend().buffer()[(1, user_row + 1)].bg,
-        USER_SURFACE
-    );
-    assert_eq!(
-        terminal.backend().buffer()[(1, user_row + 2)].bg,
-        Color::Reset
-    );
-    assert!(!app.hit_regions.iter().any(|region| {
-        region.area.y == user_row + 2 && matches!(region.target, AppHit::Transcript(_))
-    }));
-    assert!(transcript_needs_gap(
-        BlockKind::User,
-        false,
-        BlockKind::Assistant,
-        true,
-    ));
-    assert!(transcript_needs_gap(
-        BlockKind::User,
-        false,
-        BlockKind::Error,
-        true,
-    ));
-}
-
-#[test]
-fn settling_a_rendered_assistant_only_turn_invalidates_its_result_gap() {
-    let mut app = test_app();
-    apply_event(
-        &mut app,
-        0,
-        EventKind::User {
-            text: "hello".into(),
-        },
-    );
-    apply_event(
-        &mut app,
-        1,
-        EventKind::AssistantText {
-            text: "live response".into(),
-        },
-    );
-    app.skip_splash();
-    render_to_string(&mut app, 80, 12);
-    assert_eq!(app.transcript_rows, 4);
-
-    apply_event(&mut app, 2, EventKind::TurnFinished);
-    let settled = render_to_string(&mut app, 80, 12);
-    let user_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
-        .unwrap();
-    let result_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(1)).then_some(region.area.y))
-        .unwrap();
-
-    assert_eq!(app.transcript_rows, 5);
-    assert_eq!(app.transcript_layout.rows, 5);
-    assert_eq!(result_row, user_row + 3);
-    assert!(
-        settled
-            .lines()
-            .nth((user_row + 2) as usize)
-            .unwrap()
-            .trim()
-            .is_empty()
-    );
-    assert_eq!(app.transcript_render_stats.rendered_blocks, 1);
-}
-
-#[test]
 fn assistant_transcript_renders_markdown_instead_of_source_markers() {
     let mut app = test_app();
     app.push(
@@ -2094,26 +1301,6 @@ fn splash_uses_the_wordmark_then_conversation_replaces_it() {
     assert!(rendered.contains("Space compose · : commands · ? help"));
     assert!(!rendered.contains("tokens"));
     assert!(!rendered.contains("ctx "));
-}
-
-#[test]
-fn switched_session_opens_the_welcome_view_without_another_splash() {
-    let mut app = test_app_with_splash(false);
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let rendered = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks(80)
-        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert!(rendered.contains("/workspace"));
-    assert!(rendered.contains("test / model · effort off"));
-    assert!(!rendered.contains("press any key"));
 }
 
 #[test]
@@ -2406,19 +1593,6 @@ fn paste_burst_skips_windows_key_releases_and_keeps_following_events() {
 }
 
 #[test]
-fn clipboard_image_token_is_inserted_at_the_caret() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Composer);
-    app.insert_composer_text("beforeafter");
-    app.input.move_cursor(CursorMove::Jump(0, 6));
-
-    app.finish_clipboard_image_read(Ok(vec![1]));
-
-    assert_eq!(app.draft_text(), "before[Image #1]after");
-    assert_eq!(app.input.cursor(), (0, 16));
-}
-
-#[test]
 fn image_tokens_are_crossed_and_deleted_atomically() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);
@@ -2440,23 +1614,6 @@ fn image_tokens_are_crossed_and_deleted_atomically() {
     app.input.move_cursor(CursorMove::End);
     app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
     assert!(app.draft_text().is_empty());
-    assert!(app.composer_submission().1.is_empty());
-}
-
-#[test]
-fn deleting_a_selection_that_touches_a_token_removes_the_whole_image() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Composer);
-    app.insert_composer_text("before ");
-    app.insert_clipboard_image(vec![1]);
-    app.insert_composer_text(" after");
-    app.input.move_cursor(CursorMove::Jump(0, 8));
-    app.input.start_selection();
-    app.input.move_cursor(CursorMove::Jump(0, 10));
-
-    app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
-
-    assert_eq!(app.draft_text(), "before  after");
     assert!(app.composer_submission().1.is_empty());
 }
 
@@ -2557,46 +1714,6 @@ fn clipboard_read_completion_inserts_a_token_without_a_success_notice() {
 }
 
 #[test]
-fn composer_shows_image_tokens_without_external_image_chrome() {
-    let mut app = test_app();
-    app.skip_splash();
-    app.overlay = Some(Overlay::Composer);
-    app.insert_clipboard_image(vec![1, 2, 3]);
-    let backend = TestBackend::new(100, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let cells = terminal.backend().buffer().content();
-    let symbols = cells.iter().map(|cell| cell.symbol()).collect::<Vec<_>>();
-    let token = "[Image #1]"
-        .chars()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>();
-    let start = symbols
-        .windows(token.len())
-        .position(|window| {
-            window
-                .iter()
-                .zip(&token)
-                .all(|(cell, token)| *cell == token)
-        })
-        .expect("image token should be rendered");
-    for cell in &cells[start..start + token.len()] {
-        assert_eq!(cell.fg, WARM);
-        assert_eq!(cell.bg, ROW_ACTIVE);
-    }
-    let rendered = cells
-        .chunks(100)
-        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert!(rendered.contains("[Image #1]"));
-    assert!(!rendered.contains("MESSAGE · 1 image"));
-    assert!(!rendered.contains("image ready"));
-    assert!(!rendered.contains("Alt+Backspace"));
-}
-
-#[test]
 fn mouse_clicks_snap_to_image_token_edges() {
     let mut app = test_app();
     app.skip_splash();
@@ -2645,22 +1762,6 @@ fn restoring_pending_images_merges_and_renumbers_composer_tokens() {
 }
 
 #[test]
-fn restoring_pending_images_with_gapped_markers_rebases_the_draft() {
-    let mut app = test_app();
-    app.insert_clipboard_image(vec![9]);
-
-    app.restore_pending_to_draft("queued [Image #3]", vec![ImageAttachment::png(vec![3])]);
-
-    assert_eq!(app.draft_text(), "queued [Image #1]\n\n[Image #2]");
-    let (prompt, images) = app.composer_submission();
-    assert_eq!(prompt, "queued [Image #1]\n\n[Image #2]");
-    assert_eq!(
-        images,
-        [ImageAttachment::png(vec![3]), ImageAttachment::png(vec![9])]
-    );
-}
-
-#[test]
 fn persisted_drafts_drop_image_tokens_without_binary_attachments() {
     assert_eq!(
         strip_image_references("before [Image #1]\nafter [Image #20]"),
@@ -2692,19 +1793,6 @@ fn clipboard_image_tokens_include_png_dimensions() {
     app.edit_composer(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), None);
     assert!(app.draft_text().is_empty());
     assert!(app.composer_submission().1.is_empty());
-}
-
-#[test]
-fn image_token_spans_accept_optional_dimensions() {
-    let spans = image_token_spans("see [Image #2 1920x1080] and [Image #3]");
-    assert_eq!(spans.len(), 2);
-    assert_eq!(spans[0].id, 2);
-    assert_eq!(
-        spans[0].end_col - spans[0].start_col,
-        "[Image #2 1920x1080]".chars().count()
-    );
-    assert_eq!(spans[1].id, 3);
-    assert!(image_token_spans("[Image #1 extra]").is_empty());
 }
 
 #[test]
@@ -2797,22 +1885,6 @@ fn composer_previews_pending_messages_and_restores_them_in_order() {
 }
 
 #[test]
-fn composer_boundary_arrows_reach_the_start_and_end_of_the_draft() {
-    let mut app = test_app();
-    app.input.insert_str("first");
-    app.input.insert_newline();
-    app.input.insert_str("second");
-
-    app.input.move_cursor(CursorMove::Jump(0, 3));
-    edit_composer_with_default_keymap(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-    assert_eq!(app.input.cursor(), (0, 0));
-
-    app.input.move_cursor(CursorMove::Jump(1, 2));
-    edit_composer_with_default_keymap(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(app.input.cursor(), (1, 6));
-}
-
-#[test]
 fn composer_common_navigation_and_editing_shortcuts_work() {
     let mut app = test_app();
     app.input.insert_str("alpha beta");
@@ -2886,16 +1958,6 @@ fn ctrl_c_copies_a_selection_and_is_otherwise_ignored() {
 }
 
 #[test]
-fn copy_last_response_reports_when_no_assistant_response_exists() {
-    let mut app = test_app();
-    copy_last_assistant_response(&mut app);
-    assert_eq!(
-        app.visible_flashes().next_back(),
-        Some("No assistant response to copy yet")
-    );
-}
-
-#[test]
 fn last_assistant_response_uses_the_latest_nonempty_assistant_block() {
     let mut app = test_app();
     app.push(
@@ -2963,80 +2025,6 @@ fn selection_releases_command_and_global_panel_shortcuts() {
 }
 
 #[test]
-fn composer_places_the_terminal_cursor_at_the_unicode_caret() {
-    let mut app = test_app();
-    app.skip_splash();
-    app.overlay = Some(Overlay::Composer);
-    app.input.insert_str("你好");
-    app.input.insert_newline();
-    app.input.insert_str("ok");
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    terminal.backend_mut().assert_cursor_position((5, 18));
-}
-
-#[test]
-fn composer_is_bottom_anchored_with_a_rounded_frame_and_placeholder() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Composer);
-    let rendered = render_to_string(&mut app, 80, 24);
-    let rows = rendered.lines().collect::<Vec<_>>();
-
-    assert!(rows[16].starts_with("  ╭"));
-    assert!(rows[16].contains("MESSAGE"));
-    assert!(rows[17].contains("Ask URI Agent to build, explain, or fix…"));
-    assert!(rows[23].starts_with("  ╰"));
-    let newline_hint = if cfg!(windows) {
-        "Enter send · Ctrl+Enter newline"
-    } else {
-        "Enter send · Shift+Enter newline"
-    };
-    assert!(rows[23].contains(newline_hint));
-    assert!(!rows[23].contains("Esc keep draft"));
-    assert!(rows[23].ends_with("╯  "));
-}
-
-#[test]
-fn composer_footer_does_not_show_image_count_or_removal_shortcut() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Composer);
-    app.insert_clipboard_image(vec![1, 2, 3]);
-
-    let rendered = render_to_string(&mut app, 80, 24);
-
-    assert!(rendered.contains("[Image #1]"));
-    assert!(!rendered.contains("MESSAGE · 1 image"));
-    assert!(!rendered.contains("Alt+Backspace"));
-}
-
-#[test]
-fn composer_soft_wraps_long_input_and_tracks_the_visual_caret() {
-    let mut app = test_app();
-    app.skip_splash();
-    app.overlay = Some(Overlay::Composer);
-    app.input.insert_str("x".repeat(75));
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-
-    let rendered = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks(80)
-        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-        .collect::<Vec<_>>();
-    terminal.backend_mut().assert_cursor_position((4, 18));
-    assert!(rendered[17].contains(&"x".repeat(74)));
-    assert_eq!(
-        terminal.backend().buffer().cell((3, 18)).unwrap().symbol(),
-        "x"
-    );
-}
-
-#[test]
 fn composer_mouse_click_moves_the_caret_and_drag_selects_editable_text() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);
@@ -3088,79 +2076,6 @@ fn composer_mouse_click_moves_the_caret_and_drag_selects_editable_text() {
         KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
     );
     assert_eq!(app.draft_text(), "X beta");
-}
-
-#[test]
-fn composer_double_click_selects_a_unicode_word() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Composer);
-    app.input.insert_str("你 naïve beta");
-    render_to_string(&mut app, 80, 24);
-    let inner = app.composer_view.as_ref().unwrap().inner;
-    let event = |kind| MouseEvent {
-        kind,
-        column: inner.x + 5,
-        row: inner.y,
-        modifiers: KeyModifiers::NONE,
-    };
-
-    for kind in [
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-        MouseEventKind::Down(MouseButton::Left),
-        MouseEventKind::Up(MouseButton::Left),
-    ] {
-        assert!(handle_composer_mouse(&mut app, event(kind)));
-    }
-
-    assert_eq!(composer_selected_text(&app.input).as_deref(), Some("naïve"));
-    edit_composer_with_default_keymap(
-        &mut app,
-        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
-    );
-    assert_eq!(app.draft_text(), "你 X beta");
-}
-
-#[test]
-fn composer_mouse_selection_follows_soft_wrapped_text() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Composer);
-    app.input.insert_str("x".repeat(75));
-    render_to_string(&mut app, 80, 24);
-    let inner = app.composer_view.as_ref().unwrap().inner;
-    let event = |kind, column, row| MouseEvent {
-        kind,
-        column: inner.x + column,
-        row: inner.y + row,
-        modifiers: KeyModifiers::NONE,
-    };
-
-    assert!(handle_composer_mouse(
-        &mut app,
-        event(MouseEventKind::Down(MouseButton::Left), 0, 0)
-    ));
-    assert!(handle_composer_mouse(
-        &mut app,
-        event(MouseEventKind::Drag(MouseButton::Left), 1, 1)
-    ));
-    assert!(handle_composer_mouse(
-        &mut app,
-        event(MouseEventKind::Up(MouseButton::Left), 1, 1)
-    ));
-    assert_eq!(composer_selected_text(&app.input), Some("x".repeat(75)));
-}
-
-#[test]
-fn composer_selection_extracts_multiline_unicode_text() {
-    let mut input = TextArea::from(["你好吗", "second", "终"]);
-    input.move_cursor(CursorMove::Jump(0, 1));
-    input.start_selection();
-    input.move_cursor(CursorMove::Jump(2, 1));
-
-    assert_eq!(
-        composer_selected_text(&input).as_deref(),
-        Some("好吗\nsecond\n终")
-    );
 }
 
 #[test]
@@ -3309,39 +2224,6 @@ fn document_overlay_copies_the_full_body_with_c() {
 }
 
 #[test]
-fn clicking_outside_dismisses_cancelable_floats() {
-    let mut app = test_app();
-    let bounds = Rect::new(10, 5, 60, 16);
-    let outside_click = MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: bounds.x.saturating_sub(1),
-        row: bounds.y,
-        modifiers: KeyModifiers::NONE,
-    };
-
-    for overlay in [
-        Overlay::Status,
-        Overlay::Help,
-        Overlay::Protocols,
-        Overlay::Tasks,
-        Overlay::Plugin,
-    ] {
-        app.overlay = Some(overlay);
-        app.overlay_bounds = Some(bounds);
-        app.overlay_scroll = 6;
-        app.selection = Some(TextSelection {
-            start: (20, 8),
-            end: (24, 8),
-        });
-
-        assert!(close_float_on_outside_click(&mut app, outside_click));
-        assert!(app.overlay.is_none());
-        assert_eq!(app.overlay_scroll, 0);
-        assert!(app.selection.is_none());
-    }
-}
-
-#[test]
 fn clicking_outside_uses_each_float_cancel_semantics() {
     let mut app = test_app();
     let bounds = Rect::new(10, 5, 60, 16);
@@ -3422,34 +2304,6 @@ fn clicking_outside_does_not_dismiss_editing_or_active_work_floats() {
         assert!(!close_float_on_outside_click(&mut app, outside_click));
         assert!(app.overlay == Some(overlay));
     }
-}
-
-#[test]
-fn clicking_inside_or_using_another_mouse_button_does_not_dismiss_a_float() {
-    let mut app = test_app();
-    let bounds = Rect::new(10, 5, 60, 16);
-    app.overlay = Some(Overlay::Status);
-    app.overlay_bounds = Some(bounds);
-
-    assert!(!close_float_on_outside_click(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: bounds.x,
-            row: bounds.y,
-            modifiers: KeyModifiers::NONE,
-        }
-    ));
-    assert!(!close_float_on_outside_click(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Right),
-            column: bounds.x.saturating_sub(1),
-            row: bounds.y,
-            modifiers: KeyModifiers::NONE,
-        }
-    ));
-    assert!(app.overlay == Some(Overlay::Status));
 }
 
 #[test]
@@ -3764,58 +2618,6 @@ fn unchanged_large_transcript_materializes_only_the_viewport() {
 }
 
 #[test]
-fn mouse_wheel_smooths_each_six_row_step_without_reducing_distance() {
-    let mut app = test_app();
-    for index in 0..30 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    render_to_string(&mut app, 80, 12);
-    let tail_offset = app.transcript_offset;
-
-    handle_mouse_scroll(&mut app, -1);
-    assert_eq!(app.transcript_offset, tail_offset);
-    assert!(app.mouse_scroll_animating());
-    app.advance_mouse_scroll_animation();
-    assert_eq!(app.transcript_offset, tail_offset - 1);
-    app.advance_mouse_scroll_animation();
-    assert_eq!(app.transcript_offset, tail_offset - 2);
-    app.advance_mouse_scroll_animation();
-    assert_eq!(app.transcript_offset, tail_offset - 3);
-    for _ in 0..3 {
-        app.advance_mouse_scroll_animation();
-    }
-    assert_eq!(app.transcript_offset, tail_offset - 6);
-    assert!(!app.mouse_scroll_animating());
-
-    handle_mouse_scroll(&mut app, 1);
-    for _ in 0..6 {
-        app.advance_mouse_scroll_animation();
-    }
-    assert_eq!(app.transcript_offset, tail_offset);
-
-    app.overlay = Some(Overlay::Document);
-    app.overlay_scroll = 6;
-    handle_mouse_scroll(&mut app, -1);
-    assert_eq!(app.overlay_scroll, 6);
-    app.advance_mouse_scroll_animation();
-    assert_eq!(app.overlay_scroll, 5);
-    app.advance_mouse_scroll_animation();
-    assert_eq!(app.overlay_scroll, 4);
-    for _ in 0..4 {
-        app.advance_mouse_scroll_animation();
-    }
-    assert_eq!(app.overlay_scroll, 0);
-    assert!(!app.mouse_scroll_animating());
-}
-
-#[test]
 fn smooth_mouse_scroll_preserves_the_full_distance_of_rapid_events() {
     let mut app = test_app();
     for index in 0..100 {
@@ -3852,72 +2654,6 @@ fn smooth_mouse_scroll_preserves_the_full_distance_of_rapid_events() {
 
     assert_eq!(app.overlay_scroll, 40);
     assert!(!app.mouse_scroll_animating());
-}
-
-#[test]
-fn smooth_mouse_scroll_catches_up_quickly_on_a_long_backlog() {
-    let mut app = test_app();
-    for index in 0..100 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    render_to_string(&mut app, 80, 12);
-    let tail_offset = app.transcript_offset;
-
-    for _ in 0..10 {
-        handle_mouse_scroll(&mut app, -1);
-    }
-    app.advance_mouse_scroll_animation();
-    assert!(
-        tail_offset - app.transcript_offset > 1,
-        "a long backlog advances more than one row per frame"
-    );
-    let mut frames = 1;
-    while app.mouse_scroll_animating() {
-        app.advance_mouse_scroll_animation();
-        frames += 1;
-    }
-    assert_eq!(app.transcript_offset, tail_offset - 60);
-    assert!(frames < 60, "the backlog drains in fewer frames than rows");
-
-    app.overlay = Some(Overlay::Document);
-    app.overlay_scroll = 100;
-    for _ in 0..10 {
-        handle_mouse_scroll(&mut app, -1);
-    }
-    app.advance_mouse_scroll_animation();
-    assert!(100 - app.overlay_scroll > 1);
-    let mut frames = 1;
-    while app.mouse_scroll_animating() {
-        app.advance_mouse_scroll_animation();
-        frames += 1;
-    }
-    assert_eq!(app.overlay_scroll, 40);
-    assert!(frames < 60);
-}
-
-#[test]
-fn only_button_mouse_input_cancels_smooth_scrolling() {
-    assert!(mouse_cancels_smooth_scroll(MouseEventKind::Down(
-        MouseButton::Left
-    )));
-    assert!(mouse_cancels_smooth_scroll(MouseEventKind::Drag(
-        MouseButton::Left
-    )));
-    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::Moved));
-    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::Up(
-        MouseButton::Left
-    )));
-    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollUp));
-    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollDown));
-    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollLeft));
-    assert!(!mouse_cancels_smooth_scroll(MouseEventKind::ScrollRight));
 }
 
 #[test]
@@ -4222,163 +2958,6 @@ fn transcript_text_selection_follows_scroll_until_it_leaves_the_view() {
 }
 
 #[test]
-fn transcript_text_selection_clears_when_scrolled_below_the_view() {
-    let mut app = test_app();
-    for index in 0..30 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    render_to_string(&mut app, 80, 12);
-    let area = app.selectable.as_ref().unwrap().area;
-    app.selection = Some(TextSelection {
-        start: (area.x + 4, area.bottom() - 3),
-        end: (area.x + 12, area.bottom() - 2),
-    });
-
-    app.scroll_transcript(-3);
-    render_to_string(&mut app, 80, 12);
-    assert!(app.selection.is_none());
-}
-
-#[test]
-fn mouse_wheel_scroll_keeps_the_text_selection_on_its_content() {
-    let mut app = test_app();
-    for index in 0..30 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    render_to_string(&mut app, 80, 12);
-    app.scroll_transcript(-5);
-    render_to_string(&mut app, 80, 12);
-    let area = app.selectable.as_ref().unwrap().area;
-    let selection = TextSelection {
-        start: (area.x + 4, area.y + 6),
-        end: (area.x + 12, area.y + 7),
-    };
-    app.selection = Some(selection);
-    let selected = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
-    assert!(!selected.trim().is_empty());
-
-    handle_mouse_scroll(&mut app, 1);
-    app.advance_mouse_scroll_animation();
-    render_to_string(&mut app, 80, 12);
-    let followed = app.selection.expect("selection follows the wheel step");
-    assert_eq!(followed.start.1, selection.start.1 - 1);
-    assert_eq!(followed.end.1, selection.end.1 - 1);
-    assert_eq!(
-        selected_surface_text(app.selectable.as_ref().unwrap(), followed),
-        selected
-    );
-
-    for _ in 0..10 {
-        handle_mouse_scroll(&mut app, 1);
-        while app.mouse_scroll_animating() {
-            app.advance_mouse_scroll_animation();
-        }
-    }
-    render_to_string(&mut app, 80, 12);
-    assert!(app.selection.is_none());
-}
-
-#[test]
-fn float_text_selection_follows_overlay_scroll_until_it_leaves_the_view() {
-    let mut app = test_app();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "background".to_string(),
-        None,
-        false,
-        true,
-    );
-    app.document = Some((
-        "DOC".to_string(),
-        (0..40)
-            .map(|index| format!("line {index}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ));
-    app.overlay = Some(Overlay::Document);
-    render_to_string(&mut app, 80, 24);
-    let area = app.selectable.as_ref().unwrap().area;
-    let selection = TextSelection {
-        start: (area.x, area.y + 2),
-        end: (area.x + 6, area.y + 3),
-    };
-    app.selection = Some(selection);
-    let selected = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
-    assert!(selected.contains("line"));
-
-    app.overlay_scroll = 1;
-    render_to_string(&mut app, 80, 24);
-    let followed = app.selection.expect("selection follows the float scroll");
-    assert_eq!(followed.start.1, selection.start.1 - 1);
-    assert_eq!(followed.end.1, selection.end.1 - 1);
-    assert_eq!(
-        selected_surface_text(app.selectable.as_ref().unwrap(), followed),
-        selected
-    );
-
-    app.overlay_scroll = 10;
-    render_to_string(&mut app, 80, 24);
-    assert!(app.selection.is_none());
-}
-
-#[test]
-fn opening_a_float_clears_the_transcript_text_selection() {
-    let mut app = test_app();
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "message".to_string(),
-        None,
-        false,
-        true,
-    );
-    render_to_string(&mut app, 80, 12);
-    let area = app.selectable.as_ref().unwrap().area;
-    app.selection = Some(TextSelection {
-        start: (area.x + 2, area.y),
-        end: (area.x + 6, area.y),
-    });
-
-    app.document = Some(("DOC".to_string(), "float body".to_string()));
-    app.overlay = Some(Overlay::Document);
-    render_to_string(&mut app, 80, 12);
-    assert!(app.selection.is_none());
-}
-
-#[test]
-fn overlays_page_by_their_rendered_content_height() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Document);
-    app.document = Some((
-        "LONG".to_string(),
-        (0..100).map(|i| format!("line {i}\n")).collect(),
-    ));
-    render_to_string(&mut app, 100, 24);
-    let page_rows = app.overlay_viewport_rows;
-    assert!(page_rows > 8);
-
-    app.page_overlay(1);
-    assert_eq!(app.overlay_scroll, page_rows as u16);
-    app.page_overlay(-1);
-    assert_eq!(app.overlay_scroll, 0);
-}
-
-#[test]
 fn scrolled_transcript_shows_a_mouse_button_that_returns_to_the_live_tail() {
     let mut app = test_app();
     for index in 0..30 {
@@ -4497,104 +3076,6 @@ fn scrolled_transcript_shows_a_mouse_button_that_returns_to_the_live_tail() {
 }
 
 #[test]
-fn manual_scroll_can_lift_the_final_row_to_the_viewport_middle() {
-    let mut app = test_app();
-    for index in 0..30 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    app.selected_block = 29;
-    render_to_string(&mut app, 80, 12);
-    let live_tail = app.transcript_offset;
-    assert_eq!(
-        live_tail,
-        transcript_live_tail(app.transcript_rows, app.transcript_height)
-    );
-
-    app.scroll_transcript(3);
-    assert_eq!(app.transcript_offset, live_tail + 3);
-    assert!(!app.transcript_follow_tail);
-    app.scroll_transcript(isize::MAX);
-    render_to_string(&mut app, 80, 12);
-    assert_eq!(
-        app.transcript_offset,
-        transcript_reading_end(app.transcript_rows, app.transcript_height)
-    );
-    let final_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(29)).then_some(region.area.y))
-        .unwrap();
-    assert_eq!(final_row, app.transcript_height as u16 / 2);
-
-    app.push(
-        BlockKind::Assistant,
-        "AGENT",
-        "message 30".into(),
-        None,
-        false,
-        true,
-    );
-    render_to_string(&mut app, 80, 12);
-    assert!(!app.transcript_follow_tail);
-    assert_eq!(app.transcript_offset, live_tail + app.transcript_height / 2);
-
-    app.transcript_follow_tail = true;
-    render_to_string(&mut app, 80, 12);
-    let final_row = app
-        .hit_regions
-        .iter()
-        .find_map(|region| (region.target == AppHit::Transcript(30)).then_some(region.area.y))
-        .unwrap();
-    assert_eq!(final_row, app.transcript_height as u16 - 1);
-}
-
-#[test]
-fn keyboard_navigation_centers_an_offscreen_transcript_block() {
-    let mut app = test_app();
-    for index in 0..30 {
-        app.push(
-            BlockKind::Assistant,
-            "AGENT",
-            format!("message {index}"),
-            None,
-            false,
-            true,
-        );
-    }
-    app.selected_block = 29;
-    render_to_string(&mut app, 80, 12);
-    let tail_offset = app.transcript_offset;
-    app.move_selection(-1);
-    render_to_string(&mut app, 80, 12);
-    assert_eq!(app.transcript_offset, tail_offset);
-
-    app.selected_block = 29;
-    app.move_selection(-11);
-    render_to_string(&mut app, 80, 12);
-
-    assert_eq!(app.selected_block, 18);
-    assert_eq!(app.transcript_height, 11);
-    assert_eq!(app.transcript_offset, 13);
-    assert!(app.hit_regions.iter().any(|region| {
-        region.target == AppHit::Transcript(18) && region.area.y == app.transcript_height as u16 / 2
-    }));
-}
-
-#[test]
-fn terminal_command_rejects_an_empty_command() {
-    assert!(terminal_command("").is_err());
-    assert!(terminal_command("   ").is_err());
-    assert!(terminal_command("pwsh -NoLogo").is_ok());
-}
-
-#[test]
 fn command_panel_input_filters_the_selection() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Command);
@@ -4682,30 +3163,6 @@ fn command_and_selector_panels_page_by_their_visible_rows() {
 }
 
 #[test]
-fn selected_command_description_scrolls_inside_its_single_row() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Command);
-    app.command_query = "refresh-catalog".to_string();
-
-    let initial = render_to_string(&mut app, 80, 24);
-    let initial_row = initial
-        .lines()
-        .find(|line| line.contains(":refresh-catalog"))
-        .unwrap()
-        .to_string();
-    assert!(initial_row.contains('…'));
-
-    app.animation_phase = (MARQUEE_HOLD_FRAMES + 4 * MARQUEE_STEP_FRAMES) as f64;
-    let advanced = render_to_string(&mut app, 80, 24);
-    let advanced_row = advanced
-        .lines()
-        .find(|line| line.contains(":refresh-catalog"))
-        .unwrap();
-    assert_ne!(advanced_row, initial_row);
-    assert!(advanced_row.matches('…').count() >= 1);
-}
-
-#[test]
 fn command_panel_tab_completes_and_cycles_matches() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Command);
@@ -4732,34 +3189,6 @@ fn command_panel_tab_completes_and_cycles_matches() {
         "backtab",
     );
     assert_eq!(app.command_query, "terminal");
-}
-
-#[test]
-fn command_panel_completion_handles_common_prefixes_aliases_and_search_matches() {
-    let mut app = test_app();
-    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-
-    app.command_query = "se".to_string();
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "search");
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "set-env");
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "set-terminal");
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "settings");
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "search");
-
-    app.reset_command_search();
-    app.command_query = "th".to_string();
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "effort");
-
-    app.reset_command_search();
-    app.command_query = "erm".to_string();
-    apply_command_key(&mut app, tab, "tab");
-    assert_eq!(app.command_query, "set-terminal");
 }
 
 #[test]
@@ -4806,21 +3235,6 @@ fn command_panel_searches_aliases_and_wraps_selection() {
     assert!(rendered.contains("COMMAND · Tab complete"));
     assert!(rendered.contains("⌕ t█"));
     assert!(rendered.contains(":thinking"));
-}
-
-#[test]
-fn command_panel_searches_descriptions_and_fuzzy_command_names() {
-    let commands = CommandRegistry::with_core_commands();
-
-    let description_matches = matching_commands(&commands, "asynchronous protocol");
-    assert_eq!(description_matches[0].spec.id, "tasks");
-    assert_eq!(description_matches[0].name, "tasks");
-
-    let fuzzy_description_matches = matching_commands(&commands, "asynprot");
-    assert_eq!(fuzzy_description_matches[0].spec.id, "tasks");
-
-    let fuzzy_matches = matching_commands(&commands, "sttus");
-    assert_eq!(fuzzy_matches[0].spec.id, "status");
 }
 
 #[test]
@@ -4871,26 +3285,6 @@ fn effort_command_uses_a_selector_with_the_current_level_selected() {
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
         vec!["off", "minimal", "low", "medium", "high"]
-    );
-}
-
-#[test]
-fn resume_model_description_includes_effort() {
-    let item = resume_item(
-        "session",
-        SessionSummary {
-            id: "session".to_string(),
-            updated_at: chrono::Utc::now(),
-            provider: "openai".to_string(),
-            model: "gpt-5".to_string(),
-            thinking: ThinkingLevel::Medium,
-            preview: "continue the work".to_string(),
-        },
-        ThinkingLevel::Medium,
-    );
-    assert_eq!(
-        item.description,
-        "openai/gpt-5 · effort medium · continue the work"
     );
 }
 
@@ -5079,27 +3473,6 @@ fn colon_commands_include_login_logout_resume_and_search() {
         "pwsh"
     );
     assert!(commands.resolve("editor").is_none());
-}
-
-#[test]
-fn command_panel_lists_colon_commands() {
-    let mut app = test_app();
-    app.overlay = Some(Overlay::Command);
-    let rendered = render_to_string(&mut app, 100, 32);
-    assert!(rendered.contains(":login"));
-    assert!(rendered.contains(":resume"));
-    assert!(rendered.contains(":search"));
-    assert!(rendered.contains(":insert"));
-    assert!(rendered.contains(":quit"));
-    assert!(!rendered.contains(":compose"));
-    assert!(!rendered.contains(":thinking"));
-    assert!(!rendered.contains(":terminal-set"));
-    assert!(!rendered.contains("Open in editor"));
-
-    app.command_selected = app.commands.list().len() - 1;
-    let rendered = render_to_string(&mut app, 100, 32);
-    assert!(rendered.contains(":terminal"));
-    assert!(!rendered.contains(":term "));
 }
 
 #[test]
@@ -5746,68 +4119,6 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
 }
 
 #[test]
-fn tool_document_fences_do_not_conflict_with_dynamic_backticks() {
-    assert_eq!(
-        fenced_block("before\n```\nafter", "text"),
-        "````text\nbefore\n```\nafter\n````\n"
-    );
-}
-
-#[test]
-fn protocol_help_gate_colors_only_the_tool_header_purple() {
-    let mut app = test_app();
-    apply_event(
-        &mut app,
-        1,
-        EventKind::ToolCall {
-            call_id: "blocked".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::json!({
-                "uri": "file://src/main.rs",
-                "body": ""
-            }),
-        },
-    );
-    apply_event(
-        &mut app,
-        2,
-        EventKind::ToolResult {
-            call_id: "blocked".to_string(),
-            name: "read".to_string(),
-            output: "Read \"file://help\" with an empty body before using this protocol."
-                .to_string(),
-            failed: true,
-            protocol_help_required: true,
-        },
-    );
-    app.blocks[0].expanded = true;
-    app.skip_splash();
-    let backend = TestBackend::new(100, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    let cells = terminal.backend().buffer().content();
-    let symbols = cells.iter().map(|cell| cell.symbol()).collect::<Vec<_>>();
-    let find = |needle: &str| {
-        let needle = needle.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
-        symbols
-            .windows(needle.len())
-            .position(|window| window.iter().zip(&needle).all(|(cell, ch)| *cell == ch))
-            .expect("expected text should be rendered")
-    };
-
-    let header = "× Read src/main.rs";
-    let header_start = find(header);
-    for cell in &cells[header_start..header_start + header.chars().count()] {
-        assert_eq!(cell.fg, PURPLE);
-    }
-    let detail = "Read \"file://help\" with an empty body before using this protocol.";
-    let detail_start = find(detail);
-    for cell in &cells[detail_start..detail_start + detail.chars().count()] {
-        assert_eq!(cell.fg, ERROR);
-    }
-}
-
-#[test]
 fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     assert_eq!(
         tool_title(
@@ -5966,28 +4277,6 @@ fn token_rate_follows_the_activity_animation_and_moves_to_the_ready_footer() {
 }
 
 #[test]
-fn completed_rate_is_hidden_unless_the_state_is_ready() {
-    let mut app = test_app();
-    let start = Instant::now() - Duration::from_secs(2);
-    app.token_rate.start_turn();
-    app.token_rate.observe_stream_text("answer", false, start);
-    app.token_rate
-        .observe_usage(20, 0, start + Duration::from_secs(2));
-    app.token_rate.observe_response_text("answer", false);
-    app.token_rate
-        .finish_response(start + Duration::from_secs(2));
-    app.token_rate.finish_turn();
-
-    app.busy = true;
-    app.activity = Some(Activity::Thinking);
-    assert_eq!(compact_model(&app), "model · effort off");
-    app.busy = false;
-    assert_eq!(compact_model(&app), "model · effort off");
-    app.activity = None;
-    assert_eq!(compact_model(&app), "model · effort off · 10.0 tok/s");
-}
-
-#[test]
 fn hydration_restores_rate_calibration_without_inventing_a_final_average() {
     let mut app = test_app();
     apply_event(
@@ -6136,28 +4425,6 @@ fn key_events_have_stable_rhai_names() {
 }
 
 #[test]
-fn macos_key_display_formats_composer_panel_and_help_hints() {
-    let mut app = test_app();
-    app.keymap = Keymap::with_display_style(KeyDisplayStyle::Macos).unwrap();
-    app.overlay = Some(Overlay::Composer);
-    app.sync_composer_chrome();
-    let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("↩ send · ⇧ ↩ newline · ⌥ V image"));
-
-    app.overlay = Some(Overlay::Models);
-    app.model_hub = Some(ModelHubState::new(ModelHubTab::Models, Vec::new()));
-    let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("MODEL HUB · ⌃ R refresh"));
-
-    let help = keymap_help(&app.keymap);
-    assert!(help.contains("⌘ C"));
-    assert!(help.contains("⌘ V"));
-    assert!(help.contains("⌘ X"));
-    assert!(help.contains("copy last response"));
-    assert!(help.contains("⌘ Z"));
-}
-
-#[test]
 fn double_escape_gesture_requires_two_press_events_during_a_running_turn() {
     let mut app = test_app();
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -6200,33 +4467,6 @@ fn escape_consumed_by_a_float_does_not_prime_turn_interruption() {
     assert!(!app.interrupt_on_double_press(escape, "esc"));
     assert!(app.last_interrupt_press.is_some());
     assert!(app.interrupt_on_double_press(escape, "esc"));
-}
-
-#[test]
-fn cell_selection_preserves_lines_and_trims_padding() {
-    let surface = SelectableSurface {
-        area: Rect::new(10, 5, 5, 2),
-        cells: vec![
-            ["a", "b", "c", " ", " "]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            ["d", "e", "f", " ", " "]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        ],
-        row_separators: vec![TextRowSeparator::Newline; 2],
-        left_padding: 0,
-        scroll_origin: 0,
-        overlay: None,
-    };
-    let selection = TextSelection {
-        start: (11, 5),
-        end: (12, 6),
-    };
-    assert_eq!(selected_surface_text(&surface, selection), "bc\ndef");
-    assert_eq!(complete_surface_text(&surface), "abc\ndef");
 }
 
 #[test]

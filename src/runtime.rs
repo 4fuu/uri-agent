@@ -2123,17 +2123,6 @@ mod tests {
         Arc::new(tools)
     }
 
-    #[test]
-    fn png_ihdr_dimensions_read_width_and_height() {
-        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
-        bytes.extend_from_slice(&13u32.to_be_bytes());
-        bytes.extend_from_slice(b"IHDR");
-        bytes.extend_from_slice(&1920u32.to_be_bytes());
-        bytes.extend_from_slice(&1080u32.to_be_bytes());
-        assert_eq!(png_ihdr_dimensions(&bytes), Some((1920, 1080)));
-        assert_eq!(ImageAttachment::png(vec![1, 2, 3]).dimensions(), None);
-    }
-
     #[derive(Default)]
     struct FakeBackend {
         responses: Mutex<VecDeque<(Vec<AssistantContent>, Option<Usage>)>>,

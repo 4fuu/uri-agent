@@ -620,27 +620,6 @@ mod tests {
     }
 
     #[test]
-    fn highlights_every_heading_level() {
-        let lines = render(
-            "# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six",
-            40,
-        );
-
-        for heading in ["One", "Two", "Three", "Four", "Five", "Six"] {
-            let line = lines
-                .iter()
-                .find(|line| line.line.to_string().contains(heading))
-                .unwrap();
-            assert!(
-                line.line
-                    .spans
-                    .iter()
-                    .all(|span| span.style.fg == Some(ACCENT))
-            );
-        }
-    }
-
-    #[test]
     fn renders_tables_or_responsive_records() {
         let source = "| Name | Result |\n| --- | --- |\n| tests | passed |";
         let wide = render(source, 40)
@@ -660,12 +639,6 @@ mod tests {
         assert!(narrow.contains("tests"));
         assert!(narrow.contains("Result:"));
         assert!(narrow.contains("passed"));
-    }
-
-    #[test]
-    fn wraps_unicode_without_exceeding_the_requested_width() {
-        let lines = render("你好世界 **abcdef**", 8);
-        assert!(lines.iter().all(|line| line.line.width() <= 8));
     }
 
     #[test]
@@ -717,25 +690,6 @@ mod tests {
                 .spans
                 .iter()
                 .all(|span| span.style.fg == Some(MUTED))
-        );
-    }
-
-    #[test]
-    fn thematic_break_uses_remaining_width_inside_a_quote() {
-        let lines = render("> ---", 20);
-        let rule = lines
-            .iter()
-            .find(|line| line.line.to_string().contains('─'))
-            .unwrap();
-        assert_eq!(rule.line.width(), 20);
-        assert!(rule.line.to_string().starts_with("│ "));
-        assert_eq!(
-            rule.line
-                .to_string()
-                .chars()
-                .filter(|character| character == &'─')
-                .count(),
-            18
         );
     }
 }

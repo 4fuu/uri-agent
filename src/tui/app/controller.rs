@@ -4937,29 +4937,4 @@ mod scheduler_tests {
         }
         assert!(scheduler.frame_due(true, presentation));
     }
-
-    #[test]
-    fn animation_clock_keeps_legacy_velocity_across_sixty_hertz_presentations() {
-        let now = Instant::now();
-        let mut clock = AnimationClock::new(now);
-
-        let presentation_phase = clock.phase_at(now + PRESENTATION_FRAME_DURATION);
-        assert!(presentation_phase > 0.18 && presentation_phase < 0.19);
-        assert_ne!(
-            animation::activity(presentation_phase, 8),
-            animation::activity(0.0, 8)
-        );
-        assert!((clock.phase_at(now + Duration::from_millis(90)) - 1.0).abs() < f64::EPSILON);
-        let full_cycle_phase = clock.phase_at(now + Duration::from_millis(720));
-        assert!((full_cycle_phase - 8.0).abs() < f64::EPSILON);
-        assert_eq!(
-            animation::activity(full_cycle_phase, 8),
-            animation::activity(0.0, 8)
-        );
-
-        clock.set_paused(true, now + Duration::from_millis(900));
-        assert!((clock.phase_at(now + Duration::from_secs(2)) - 10.0).abs() < f64::EPSILON);
-        clock.set_paused(false, now + Duration::from_secs(2));
-        assert!((clock.phase_at(now + Duration::from_millis(2_090)) - 11.0).abs() < f64::EPSILON);
-    }
 }

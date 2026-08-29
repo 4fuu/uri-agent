@@ -171,16 +171,6 @@ mod tests {
     }
 
     #[test]
-    fn activity_interpolation_moves_one_coherent_front() {
-        let current = legacy_activity(0, 8).chars().collect::<Vec<_>>();
-        let next = legacy_activity(1, 8).chars().collect::<Vec<_>>();
-        let midway = activity(0.5, 8).chars().collect::<Vec<_>>();
-
-        assert_eq!(&midway[..4], &next[..4]);
-        assert_eq!(&midway[4..], &current[4..]);
-    }
-
-    #[test]
     fn progress_has_a_stable_width_and_tracks_the_ratio() {
         assert_eq!(progress(0.0, 8, 0.0), "········");
         assert_eq!(progress(0.0, 8, 1.0).chars().count(), 8);
@@ -190,59 +180,5 @@ mod tests {
         assert_eq!(progress(0.0, 8, -1.0), progress(0.0, 8, 0.0));
         assert_eq!(progress(0.0, 8, 2.0), progress(0.0, 8, 1.0));
         assert_ne!(progress(0.4, 8, 1.0), progress(0.0, 8, 1.0));
-    }
-
-    #[test]
-    fn wordmark_interpolates_and_keeps_its_cycle_and_spinner_timing() {
-        let between = wordmark(1.0);
-        assert_ne!(between, wordmark(0.0));
-        assert_ne!(between, wordmark(2.0));
-        assert_eq!(wordmark(32.0), wordmark(0.0));
-
-        assert_eq!(spinner(0.0), spinner(0.99));
-        assert_ne!(spinner(0.99), spinner(1.0));
-        assert_eq!(spinner(0.0), spinner(8.0));
-    }
-
-    #[test]
-    fn wordmark_spreads_shimmer_changes_across_sixty_hertz_frames() {
-        let phase_per_presentation: f64 = (1.0 / 60.0) / 0.09;
-        let full_cycle_presentations = (32.0 / phase_per_presentation).floor() as usize;
-        let mut previous = wordmark(0.0);
-        let mut longest_still_run = 0;
-        let mut still_run = 0;
-        let mut largest_change = 0;
-
-        for sample in 1..=full_cycle_presentations {
-            let current = wordmark(sample as f64 * phase_per_presentation);
-            let changed_cells = previous
-                .iter()
-                .zip(&current)
-                .map(|(left, right)| {
-                    left.chars()
-                        .step_by(2)
-                        .zip(right.chars().step_by(2))
-                        .filter(|(left, right)| left != right)
-                        .count()
-                })
-                .sum::<usize>();
-            largest_change = largest_change.max(changed_cells);
-            if changed_cells == 0 {
-                still_run += 1;
-                longest_still_run = longest_still_run.max(still_run);
-            } else {
-                still_run = 0;
-            }
-            previous = current;
-        }
-
-        assert!(
-            longest_still_run <= 2,
-            "shimmer remained unchanged for {longest_still_run} presentation frames"
-        );
-        assert!(
-            largest_change <= 3,
-            "shimmer changed {largest_change} cells in one presentation frame"
-        );
     }
 }

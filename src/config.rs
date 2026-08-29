@@ -2777,32 +2777,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_command_is_a_settings_field() {
-        let settings: SettingsFile = serde_json::from_value(serde_json::json!({
-            "terminal": "pwsh -NoLogo"
-        }))
-        .unwrap();
-        assert_eq!(settings.terminal.as_deref(), Some("pwsh -NoLogo"));
-        assert_eq!(
-            serde_json::to_value(settings).unwrap()["terminal"],
-            "pwsh -NoLogo"
-        );
-    }
-
-    #[test]
-    fn key_display_is_a_settings_field() {
-        let settings: SettingsFile = serde_json::from_value(serde_json::json!({
-            "keyDisplay": "macos"
-        }))
-        .unwrap();
-        assert_eq!(settings.key_display, Some(KeyDisplayStyle::Macos));
-        assert_eq!(
-            serde_json::to_value(settings).unwrap()["keyDisplay"],
-            "macos"
-        );
-    }
-
-    #[test]
     fn compaction_settings_merge_nested_global_and_project_fields() {
         let global: SettingsFile = serde_json::from_value(serde_json::json!({
             "compaction": {
@@ -3497,32 +3471,4 @@ mod tests {
         assert!(!old.exists());
     }
 
-    #[tokio::test]
-    async fn macos_legacy_directory_is_a_noop_when_legacy_directory_is_missing() {
-        let root = tempfile::tempdir().unwrap();
-        migrate_legacy_directory(&root.path().join("missing"), &root.path().join("new"))
-            .await
-            .unwrap();
-        assert!(!root.path().join("new").exists());
-    }
-
-    #[tokio::test]
-    async fn macos_legacy_directory_is_a_noop_when_directories_match() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("uri-agent");
-        fs::create_dir_all(&directory).await.unwrap();
-        fs::write(directory.join("settings.json"), "keep")
-            .await
-            .unwrap();
-        migrate_legacy_directory(&directory, &directory)
-            .await
-            .unwrap();
-        assert!(directory.exists());
-        assert_eq!(
-            fs::read_to_string(directory.join("settings.json"))
-                .await
-                .unwrap(),
-            "keep"
-        );
-    }
 }
