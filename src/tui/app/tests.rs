@@ -7286,3 +7286,47 @@ fn web_search_providers_use_api_key_login_prompts() {
             .contains("agent.tinyfish.ai")
     );
 }
+
+#[test]
+fn cloudflare_login_collects_all_credentials_before_saving() {
+    let item = login_provider_item(CLOUDFLARE_PROVIDER, "openai");
+    assert_eq!(item.description, "API token · account and gateway IDs");
+
+    let mut app = test_app();
+    open_api_key_prompt(&mut app, CLOUDFLARE_PROVIDER.to_string());
+    let prompt = app.text_prompt.as_mut().unwrap();
+    assert!(prompt.secret);
+    assert!(matches!(prompt.purpose, TextPurpose::CloudflareToken));
+    prompt.value = "token-1".to_string();
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+    assert!(matches!(
+        handle_text_key(&mut app, enter, &key_name(enter)),
+        Action::Continue
+    ));
+
+    let prompt = app.text_prompt.as_mut().unwrap();
+    assert!(!prompt.secret);
+    assert!(matches!(
+        prompt.purpose,
+        TextPurpose::CloudflareAccountId { .. }
+    ));
+    prompt.value = "account-1".to_string();
+    assert!(matches!(
+        handle_text_key(&mut app, enter, &key_name(enter)),
+        Action::Continue
+    ));
+
+    let prompt = app.text_prompt.as_ref().unwrap();
+    assert!(!prompt.secret);
+    assert!(prompt.message.contains(CLOUDFLARE_DEFAULT_GATEWAY_ID));
+    assert!(matches!(
+        handle_text_key(&mut app, enter, &key_name(enter)),
+        Action::StoreCloudflareCredentials {
+            token,
+            account_id,
+            gateway_id,
+        } if token == "token-1"
+            && account_id == "account-1"
+            && gateway_id == CLOUDFLARE_DEFAULT_GATEWAY_ID
+    ));
+}

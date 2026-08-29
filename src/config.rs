@@ -1,6 +1,6 @@
 use crate::catalog::{
     CatalogCredential, CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel,
-    api_key_environment, supports_live_discovery,
+    api_key_environments, supports_live_discovery,
 };
 use crate::compaction;
 use crate::keymap::KeyDisplayStyle;
@@ -716,11 +716,12 @@ impl ConfigManager {
         let mut api_key = entry
             .filter(|entry| entry.kind == "api_key")
             .and_then(|entry| entry.key.clone());
-        let environment = api_key_environment(provider);
-        if let Ok(value) = env::var(environment)
-            && !value.trim().is_empty()
-        {
-            api_key = Some(value);
+        for environment in api_key_environments(provider) {
+            if let Ok(value) = env::var(environment)
+                && !value.trim().is_empty()
+            {
+                api_key = Some(value);
+            }
         }
         match api_key {
             Some(value) => Ok(Some(
@@ -1005,6 +1006,12 @@ impl ConfigManager {
         }
         let provider = provider.to_string();
         self.update_auth(move |auth| {
+            let (env, extra) = auth
+                .0
+                .get(&provider)
+                .filter(|entry| entry.kind == "api_key")
+                .map(|entry| (entry.env.clone(), entry.extra.clone()))
+                .unwrap_or_default();
             auth.0.insert(
                 provider,
                 AuthEntry {
@@ -1013,13 +1020,69 @@ impl ConfigManager {
                     refresh: None,
                     access: None,
                     expires: None,
-                    env: BTreeMap::new(),
-                    extra: BTreeMap::new(),
+                    env,
+                    extra,
                 },
             );
             Ok(())
         })
         .await
+    }
+
+    /// Atomically replace an API-key credential and its provider-owned
+    /// metadata. Generic configuration persists opaque metadata; the provider
+    /// module owns its keys and interpretation.
+    pub async fn set_api_key_with_metadata(
+        &self,
+        provider: &str,
+        key: String,
+        metadata: BTreeMap<String, Value>,
+    ) -> Result<ActiveSettings> {
+        if key.trim().is_empty() {
+            bail!("API key cannot be empty");
+        }
+        const RESERVED: [&str; 7] = ["type", "key", "refresh", "access", "expires", "env", "kind"];
+        if let Some(name) = metadata
+            .keys()
+            .find(|name| RESERVED.contains(&name.as_str()))
+        {
+            bail!("credential metadata key {name:?} is reserved");
+        }
+        let provider = provider.to_string();
+        self.update_auth(move |auth| {
+            let env = auth
+                .0
+                .get(&provider)
+                .filter(|entry| entry.kind == "api_key")
+                .map(|entry| entry.env.clone())
+                .unwrap_or_default();
+            auth.0.insert(
+                provider,
+                AuthEntry {
+                    kind: api_key_type(),
+                    key: Some(key),
+                    refresh: None,
+                    access: None,
+                    expires: None,
+                    env,
+                    extra: metadata,
+                },
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn credential_metadata(&self, provider: &str) -> BTreeMap<String, Value> {
+        self.files
+            .lock()
+            .await
+            .auth
+            .0
+            .get(provider)
+            .filter(|entry| entry.kind == "api_key")
+            .map(|entry| entry.extra.clone())
+            .unwrap_or_default()
     }
 
     pub async fn set_oauth(&self, provider: &str, token: OauthToken) -> Result<ActiveSettings> {
@@ -1429,7 +1492,7 @@ async fn resolve_model_credential(
         kind = AuthKind::ApiKey;
     }
     if !private_oauth {
-        let mut environments = vec![api_key_environment(provider)];
+        let mut environments = api_key_environments(provider);
         if provider == "anthropic" {
             environments.insert(0, "ANTHROPIC_OAUTH_TOKEN".to_string());
             environments.insert(1, "ANTHROPIC_AUTH_TOKEN".to_string());
@@ -2791,9 +2854,15 @@ mod tests {
             .await
             .unwrap();
         let provider = "uri-agent-credential-test";
-        let environment = api_key_environment(provider);
-        assert_eq!(api_key_environment("parallel"), "PARALLEL_API_KEY");
-        assert_eq!(api_key_environment("tinyfish"), "TINYFISH_API_KEY");
+        let environment = crate::catalog::api_key_environment(provider);
+        assert_eq!(
+            crate::catalog::api_key_environment("parallel"),
+            "PARALLEL_API_KEY"
+        );
+        assert_eq!(
+            crate::catalog::api_key_environment("tinyfish"),
+            "TINYFISH_API_KEY"
+        );
 
         manager
             .set_api_key(provider, "saved-key".to_string())
@@ -2812,6 +2881,43 @@ mod tests {
         );
         // SAFETY: this process-unique variable is no longer used.
         unsafe { env::remove_var(environment) };
+    }
+
+    #[tokio::test]
+    async fn structured_api_key_metadata_persists_across_key_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::load_for_test(root.path(), root.path())
+            .await
+            .unwrap();
+        let provider = "cloudflare-ai-gateway";
+        let metadata = BTreeMap::from([
+            (
+                "accountId".to_string(),
+                Value::String("account-1".to_string()),
+            ),
+            (
+                "gatewayId".to_string(),
+                Value::String("gateway-1".to_string()),
+            ),
+        ]);
+
+        manager
+            .set_api_key_with_metadata(provider, "token-1".to_string(), metadata.clone())
+            .await
+            .unwrap();
+        manager
+            .set_api_key(provider, "token-2".to_string())
+            .await
+            .unwrap();
+        manager.reload().await.unwrap();
+
+        assert_eq!(manager.credential_metadata(provider).await, metadata);
+        let saved: Value =
+            serde_json::from_slice(&fs::read(manager.auth_path()).await.unwrap()).unwrap();
+        assert_eq!(saved[provider]["type"], "api_key");
+        assert_eq!(saved[provider]["key"], "token-2");
+        assert_eq!(saved[provider]["accountId"], "account-1");
+        assert_eq!(saved[provider]["gatewayId"], "gateway-1");
     }
 
     #[tokio::test]

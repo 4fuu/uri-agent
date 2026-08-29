@@ -1060,7 +1060,8 @@ pub fn api_key_environment(provider: &str) -> String {
         "azure-openai-responses" => "AZURE_OPENAI_API_KEY",
         "baseten" => "BASETEN_API_KEY",
         "cerebras" => "CEREBRAS_API_KEY",
-        "cloudflare-ai-gateway" | "cloudflare-workers-ai" => "CLOUDFLARE_API_KEY",
+        "cloudflare-ai-gateway" => "CLOUDFLARE_API_TOKEN",
+        "cloudflare-workers-ai" => "CLOUDFLARE_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
         "github-copilot" => "COPILOT_GITHUB_TOKEN",
@@ -1103,6 +1104,19 @@ pub fn api_key_environment(provider: &str) -> String {
         }
     }
     .to_string()
+}
+
+pub(crate) fn api_key_environments(provider: &str) -> Vec<String> {
+    if provider == "cloudflare-ai-gateway" {
+        // API_TOKEN names the credential according to Cloudflare's current
+        // contract. Keep API_KEY at lower precedence for existing installs.
+        vec![
+            "CLOUDFLARE_API_KEY".to_string(),
+            api_key_environment(provider),
+        ]
+    } else {
+        vec![api_key_environment(provider)]
+    }
 }
 
 async fn read_json<T>(path: &Path) -> Result<T>
@@ -1317,6 +1331,10 @@ mod tests {
         .unwrap();
         assert!(!model.supported());
         assert_eq!(api_key_environment("openrouter"), "OPENROUTER_API_KEY");
+        assert_eq!(
+            api_key_environments("cloudflare-ai-gateway"),
+            vec!["CLOUDFLARE_API_KEY", "CLOUDFLARE_API_TOKEN"]
+        );
         assert_eq!(api_key_environment("my-provider"), "MY_PROVIDER_API_KEY");
 
         let incomplete: CatalogModel = serde_json::from_value(serde_json::json!({

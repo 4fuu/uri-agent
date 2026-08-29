@@ -275,7 +275,6 @@ impl ModelRequestTransform {
                 | "moonshotai-cn"
                 | "opencode"
                 | "cloudflare-workers-ai"
-                | "cloudflare-ai-gateway"
                 | "ant-ling"
         ) || [
             "integrate.api.nvidia.com",
@@ -307,7 +306,6 @@ impl ModelRequestTransform {
             "deepseek"
                 | "moonshotai"
                 | "moonshotai-cn"
-                | "cloudflare-ai-gateway"
                 | "together"
                 | "nvidia"
                 | "ant-ling"
@@ -371,7 +369,7 @@ impl ModelRequestTransform {
         }
         let strict_default = !matches!(
             self.model.provider.as_str(),
-            "moonshotai" | "moonshotai-cn" | "together" | "cloudflare-ai-gateway" | "nvidia"
+            "moonshotai" | "moonshotai-cn" | "together" | "nvidia"
         );
         self.apply_tool_strictness(body, strict_default, Value::Bool(false));
         self.apply_developer_role(body);
@@ -486,7 +484,6 @@ impl ModelRequestTransform {
                     | "moonshotai"
                     | "moonshotai-cn"
                     | "together"
-                    | "cloudflare-ai-gateway"
                     | "nvidia"
                     | "ant-ling"
             ),

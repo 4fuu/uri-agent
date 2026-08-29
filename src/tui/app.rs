@@ -16,7 +16,10 @@ use crate::config::{
     display_path, validate_environment_name, validate_model_role_name,
 };
 use crate::keymap::{KeyDisplayStyle, KeyStroke, Keymap};
-use crate::model::{clamp_thinking_level, configured_backend};
+use crate::model::{
+    CLOUDFLARE_ACCOUNT_ID_METADATA, CLOUDFLARE_DEFAULT_GATEWAY_ID, CLOUDFLARE_GATEWAY_ID_METADATA,
+    CLOUDFLARE_PROVIDER, clamp_thinking_level, configured_backend,
+};
 use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
@@ -717,6 +720,14 @@ impl SelectorState {
 enum TextPurpose {
     ApiKey {
         provider: String,
+    },
+    CloudflareToken,
+    CloudflareAccountId {
+        token: String,
+    },
+    CloudflareGatewayId {
+        token: String,
+        account_id: String,
     },
     CopilotDomain,
     EnvironmentName {

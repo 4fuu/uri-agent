@@ -813,6 +813,11 @@ pub(super) enum Action {
         provider: String,
         key: String,
     },
+    StoreCloudflareCredentials {
+        token: String,
+        account_id: String,
+        gateway_id: String,
+    },
     Logout {
         provider: String,
     },
@@ -1088,6 +1093,14 @@ pub(super) async fn apply_action(
         }
         Action::StoreApiKey { provider, key } => {
             store_api_key(app, services, &provider, key).await;
+            Ok(None)
+        }
+        Action::StoreCloudflareCredentials {
+            token,
+            account_id,
+            gateway_id,
+        } => {
+            store_cloudflare_credentials(app, services, token, account_id, gateway_id).await;
             Ok(None)
         }
         Action::Logout { provider } => {
@@ -2472,6 +2485,38 @@ pub(super) fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> A
                     provider,
                     key: prompt.value,
                 },
+                TextPurpose::CloudflareToken => {
+                    let token = prompt.value.trim().to_string();
+                    if token.is_empty() {
+                        open_cloudflare_token_prompt(app);
+                        app.set_flash("Cloudflare API token cannot be empty");
+                    } else {
+                        open_cloudflare_account_prompt(app, token);
+                    }
+                    Action::Continue
+                }
+                TextPurpose::CloudflareAccountId { token } => {
+                    let account_id = prompt.value.trim().to_string();
+                    if account_id.is_empty() {
+                        open_cloudflare_account_prompt(app, token);
+                        app.set_flash("Cloudflare account ID cannot be empty");
+                    } else {
+                        open_cloudflare_gateway_prompt(app, token, account_id);
+                    }
+                    Action::Continue
+                }
+                TextPurpose::CloudflareGatewayId { token, account_id } => {
+                    let gateway_id = prompt.value.trim().to_string();
+                    Action::StoreCloudflareCredentials {
+                        token,
+                        account_id,
+                        gateway_id: if gateway_id.is_empty() {
+                            CLOUDFLARE_DEFAULT_GATEWAY_ID.to_string()
+                        } else {
+                            gateway_id
+                        },
+                    }
+                }
                 TextPurpose::CopilotDomain => Action::StartOauth {
                     provider: "github-copilot".to_string(),
                     method: "oauth".to_string(),
@@ -3344,7 +3389,9 @@ pub(super) async fn open_login(app: &mut App, catalog: &ModelCatalog) -> Action 
 }
 
 pub(super) fn login_provider_item(provider: &str, current: &str) -> SelectorItem {
-    let description = if WEB_SEARCH_LOGIN_PROVIDERS.contains(&provider) {
+    let description = if provider == CLOUDFLARE_PROVIDER {
+        "API token · account and gateway IDs".to_string()
+    } else if WEB_SEARCH_LOGIN_PROVIDERS.contains(&provider) {
         "Web search · API key".to_string()
     } else {
         match OauthProvider::from_id(provider) {
@@ -3406,6 +3453,10 @@ pub(super) fn open_login_method(app: &mut App, provider: String) -> Action {
 }
 
 pub(super) fn open_api_key_prompt(app: &mut App, provider: String) {
+    if provider == CLOUDFLARE_PROVIDER {
+        open_cloudflare_token_prompt(app);
+        return;
+    }
     let instructions = match provider.as_str() {
         "parallel" => concat!(
             "Create or copy a key at https://platform.parallel.ai/settings?tab=api-keys, ",
@@ -3435,6 +3486,41 @@ pub(super) fn open_api_key_prompt(app: &mut App, provider: String) {
         value: String::new(),
         secret: true,
         purpose: TextPurpose::ApiKey { provider },
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+fn open_cloudflare_token_prompt(app: &mut App) {
+    app.text_prompt = Some(TextPrompt {
+        title: "CLOUDFLARE API TOKEN".to_string(),
+        message: "Paste a Cloudflare API token with AI Gateway access. Nothing is saved until the account and gateway steps are complete.".to_string(),
+        value: String::new(),
+        secret: true,
+        purpose: TextPurpose::CloudflareToken,
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+fn open_cloudflare_account_prompt(app: &mut App, token: String) {
+    app.text_prompt = Some(TextPrompt {
+        title: "CLOUDFLARE ACCOUNT".to_string(),
+        message: "Enter the Cloudflare account ID that owns the AI Gateway.".to_string(),
+        value: String::new(),
+        secret: false,
+        purpose: TextPurpose::CloudflareAccountId { token },
+    });
+    app.overlay = Some(Overlay::Text);
+}
+
+fn open_cloudflare_gateway_prompt(app: &mut App, token: String, account_id: String) {
+    app.text_prompt = Some(TextPrompt {
+        title: "CLOUDFLARE AI GATEWAY".to_string(),
+        message: format!(
+            "Enter the AI Gateway ID, or leave blank to use {CLOUDFLARE_DEFAULT_GATEWAY_ID}."
+        ),
+        value: String::new(),
+        secret: false,
+        purpose: TextPurpose::CloudflareGatewayId { token, account_id },
     });
     app.overlay = Some(Overlay::Text);
 }
@@ -3872,6 +3958,47 @@ pub(super) async fn store_api_key(
     app.set_flash(match result {
         Ok(()) => format!("Saved API key for {provider}"),
         Err(error) => format!("Could not save API key: {error:#}"),
+    });
+}
+
+pub(super) async fn store_cloudflare_credentials(
+    app: &mut App,
+    services: &LoopServices,
+    token: String,
+    account_id: String,
+    gateway_id: String,
+) {
+    let metadata = BTreeMap::from([
+        (
+            CLOUDFLARE_ACCOUNT_ID_METADATA.to_string(),
+            serde_json::Value::String(account_id),
+        ),
+        (
+            CLOUDFLARE_GATEWAY_ID_METADATA.to_string(),
+            serde_json::Value::String(gateway_id),
+        ),
+    ]);
+    let result = async {
+        services
+            .manager
+            .set_api_key_with_metadata(CLOUDFLARE_PROVIDER, token, metadata)
+            .await?;
+        let active = active_for_runtime(&services.manager, &services.runtime).await?;
+        apply_active(
+            app,
+            &services.runtime,
+            &services.manager,
+            &services.catalog,
+            &services.output,
+            &active,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    app.set_flash(match result {
+        Ok(()) => "Saved Cloudflare AI Gateway credentials".to_string(),
+        Err(error) => format!("Could not save Cloudflare credentials: {error:#}"),
     });
 }
 

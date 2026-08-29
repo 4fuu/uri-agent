@@ -59,6 +59,30 @@ The active backend applies catalog data relevant to requests and accounting, inc
 - `reasoning`, `thinkingLevelMap`, and `samplingParams`;
 - request-relevant `compat` values such as token-field names, adaptive thinking, strict role or tool handling, and provider-specific thinking formats.
 
+### Cloudflare AI Gateway
+
+`cloudflare-ai-gateway` has an explicit half-dependent catalog boundary. The merged pi.dev and `models.json` catalog remains authoritative for model identity and capability metadata: API family, modalities, context and output limits, reasoning and thinking compatibility, request `compat` fields, and pricing. URI Agent deliberately ignores that provider record's `baseUrl`, `headers`, and `authHeader` fields. This prevents a catalog change from redirecting a Cloudflare account token or presenting it as an upstream OpenAI or Anthropic key.
+
+The dedicated backend follows Cloudflare's [REST API contract](https://developers.cloudflare.com/ai-gateway/usage/rest-api/) and constructs its base locally:
+
+```text
+https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
+```
+
+It supports catalog families `openai-responses`, `openai-completions`, and `anthropic-messages`, producing `/responses`, `/chat/completions`, and `/messages` requests respectively. Other API families are rejected before network I/O. Every request sends `Authorization: Bearer <Cloudflare API token>` and `cf-aig-gateway-id: <gateway ID>`. Anthropic's normal `x-api-key` header is removed so the Cloudflare account token cannot become an upstream provider credential.
+
+Catalog IDs are converted to Cloudflare REST wire IDs: unqualified OpenAI and Anthropic IDs gain `openai/` or `anthropic/`; `workers-ai/@cf/...` becomes `@cf/...`; already namespaced IDs remain unchanged. Because Cloudflare does not expose a portable complete listing for third-party models, URI Agent continues to get identity and capability records from the merged catalog rather than hard-coding or scraping a second model catalog.
+
+Run `:login` and select `cloudflare-ai-gateway`. The three-step prompt collects the API token, account ID, and gateway ID, then saves all three atomically; cancelling any step saves nothing. The `auth.json` entry remains `type: "api_key"` and stores the routing values as `accountId` and `gatewayId` metadata. A blank gateway ID uses `default`. Existing token-only entries must run `:login` once to add the account and gateway metadata. The same values can be supplied as process environment variables:
+
+```bash
+export CLOUDFLARE_API_TOKEN='<cloudflare-api-token>'
+export CLOUDFLARE_ACCOUNT_ID='<cloudflare-account-id>'
+export CLOUDFLARE_GATEWAY_ID='<gateway-id>' # optional; defaults to default
+```
+
+`CLOUDFLARE_API_KEY` remains a lower-precedence compatibility alias for the token. `CLOUDFLARE_API_TOKEN` takes precedence when both are set. Process account and gateway variables override the values saved by `:login`. `URI_AGENT_API_KEY` and `--api-key` can still override the token for the current provider, but they do not supply an account or gateway ID; provide those through `:login` or the Cloudflare-specific variables. A missing account ID fails locally before a provider request.
+
 ### Refresh and offline mode
 
 Startup loads the local catalog immediately, then refreshes pi.dev and eligible configured providers in the background after the TUI is available. Pi entries are considered fresh for four hours; provider listings are considered fresh for five minutes. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to bypass both freshness windows and immediately apply the resulting model configurations. Refreshes are serialized and provider requests run concurrently, so one slow or failing provider does not block cached results from the others.
@@ -81,6 +105,7 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 
 | Provider ID | Login |
 | --- | --- |
+| `cloudflare-ai-gateway` | Cloudflare API token, account ID, and AI Gateway ID |
 | `antigravity` | Experimental Google browser OAuth for the private Antigravity protocol |
 | `anthropic` | Claude Pro/Max browser OAuth |
 | `openrouter` | Browser PKCE |
@@ -154,7 +179,7 @@ Requests use the private `v1internal:streamGenerateContent` SSE operation. URI A
 
 URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 
-Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
+Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. Cloudflare AI Gateway's structured variables and compatibility alias are documented [above](#cloudflare-ai-gateway). The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
 
 ### Credential precedence
 

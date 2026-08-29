@@ -3,7 +3,7 @@ use super::codex_websocket::CodexWebSocketTransport;
 use super::failure::{ModelFailure, ModelFailurePhase};
 use super::request_transform::ModelRequestTransform;
 use super::{ModelBackend, ModelDelta, ModelRequest, ModelResponse, clamp_thinking_level};
-use crate::catalog::{CatalogModel, ModelCatalog, ModelLimits, ThinkingLevel};
+use crate::catalog::{CatalogModel, ModelLimits, ThinkingLevel};
 use crate::config::{ActiveSettings, AuthKind, ConfigManager, resolve_config_value};
 use crate::oauth;
 use anyhow::{Context, Result, bail};
@@ -132,6 +132,20 @@ pub(crate) struct RigBackend {
     pub(super) accepts_images: bool,
 }
 
+#[derive(Default)]
+pub(super) struct RigRequestOptions {
+    pub(super) extra_headers: HeaderMap,
+    pub(super) strip_x_api_key: bool,
+}
+
+struct RigBuildContext<'a> {
+    environment: &'a std::collections::BTreeMap<String, String>,
+    auth_kind: AuthKind,
+    thinking: ThinkingLevel,
+    session_id: Option<&'a str>,
+    manager: Option<Arc<ConfigManager>>,
+}
+
 pub(crate) enum RigClient {
     OpenAiResponses(openai::responses_api::ResponsesCompletionModel<AuthClient>),
     OpenAiCodexResponses(chatgpt::ResponsesCompletionModel<AuthClient>),
@@ -209,6 +223,58 @@ impl RigBackend {
         session_id: Option<&str>,
         manager: Option<Arc<ConfigManager>>,
     ) -> Result<Self> {
+        Self::new_inner(
+            model,
+            api_key,
+            RigBuildContext {
+                environment,
+                auth_kind,
+                thinking,
+                session_id,
+                manager,
+            },
+            RigRequestOptions::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn new_with_options(
+        model: &CatalogModel,
+        api_key: &str,
+        environment: &std::collections::BTreeMap<String, String>,
+        auth_kind: AuthKind,
+        thinking: ThinkingLevel,
+        session_id: Option<&str>,
+        options: RigRequestOptions,
+    ) -> Result<Self> {
+        Self::new_inner(
+            model,
+            api_key,
+            RigBuildContext {
+                environment,
+                auth_kind,
+                thinking,
+                session_id,
+                manager: None,
+            },
+            options,
+        )
+        .await
+    }
+
+    async fn new_inner(
+        model: &CatalogModel,
+        api_key: &str,
+        context: RigBuildContext<'_>,
+        options: RigRequestOptions,
+    ) -> Result<Self> {
+        let RigBuildContext {
+            environment,
+            auth_kind,
+            thinking,
+            session_id,
+            manager,
+        } = context;
         if model.api == "openai-codex-responses" {
             if model.provider != "openai-codex" {
                 bail!("openai-codex-responses is only supported for the openai-codex provider");
@@ -222,7 +288,12 @@ impl RigBackend {
         if model.api == "antigravity" && auth_kind != AuthKind::Oauth {
             bail!("Antigravity requires Google OAuth; run :login and select Antigravity");
         }
+        let RigRequestOptions {
+            extra_headers,
+            strip_x_api_key,
+        } = options;
         let mut headers = resolved_headers(model, environment).await?;
+        headers.extend(extra_headers);
         if model
             .metadata
             .get("authHeader")
@@ -270,7 +341,7 @@ impl RigBackend {
             .transpose()?;
         let request_client = AuthClient {
             inner: reqwest::Client::new(),
-            strip_x_api_key: anthropic_oauth,
+            strip_x_api_key: anthropic_oauth || strip_x_api_key,
             transform: Some(ModelRequestTransform {
                 model: model.clone(),
                 thinking,
@@ -339,7 +410,7 @@ impl RigBackend {
                         }),
                         codex_websocket: None,
                         antigravity: None,
-                        strip_x_api_key: anthropic_oauth,
+                        strip_x_api_key: anthropic_oauth || strip_x_api_key,
                     });
                 if anthropic_oauth {
                     builder = builder
@@ -375,34 +446,20 @@ impl RigBackend {
     }
 }
 
-pub async fn configured_backend(
-    settings: &ActiveSettings,
-    catalog: &ModelCatalog,
+pub(super) fn deferred_backend(
+    model: CatalogModel,
+    settings: ActiveSettings,
     session_id: Option<&str>,
     manager: Arc<ConfigManager>,
-) -> Result<Option<(Arc<dyn ModelBackend>, ModelLimits)>> {
-    if !settings.model_configured() {
-        return Ok(None);
-    }
-    if settings.api_key.is_none() {
-        return Ok(None);
-    }
-    let model = settings.catalog_model(catalog).await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "model {}/{} is not available in the runnable Pi catalog",
-            settings.provider,
-            settings.model
-        )
-    })?;
-    let limits = model.limits();
+) -> Arc<dyn ModelBackend> {
     let backend = DeferredRigBackend {
         model,
-        settings: settings.clone(),
+        settings,
         session_id: session_id.map(str::to_string),
         manager,
         backend: Mutex::new(None),
     };
-    Ok(Some((Arc::new(backend), limits)))
+    Arc::new(backend)
 }
 
 async fn resolved_headers(

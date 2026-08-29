@@ -41,7 +41,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/main.rs` | Application assembly, plugin installation, Skill registration, and runtime/TUI wiring |
 | `src/catalog.rs` | pi.dev model catalog, cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
-| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, Codex WebSocket and experimental Antigravity transports, and multimodal support |
+| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, dedicated Cloudflare AI Gateway boundary, Codex WebSocket and experimental Antigravity transports, and multimodal support |
 | `src/subagent.rs` | Ephemeral role-based model/tool loops, capability restriction, working-directory toolboxes, and usage aggregation |
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
@@ -158,6 +158,7 @@ Conversation behavior is owned by [Terminal interface](interface.md); keymaps, t
 ### Models and configuration
 
 - Keep provider adapters thin; catalog metadata and explicit compatibility values should drive provider-specific request shape.
+- When endpoint or authentication security cannot trust catalog transport fields, isolate that provider in its own `src/model/<provider>.rs` module. Document which catalog fields remain authoritative and which local values replace them. Future exceptions must not add provider branches to generic Rig construction or request transformation.
 - Keep fake-backend tests provider-independent. Tests must not require live credentials or network access.
 - Preserve unknown downloaded model fields in the catalog cache.
 - Keep global/project/environment/CLI precedence and credential precedence consistent with [Models and configuration](configuration.md).
