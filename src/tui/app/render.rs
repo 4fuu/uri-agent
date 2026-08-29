@@ -1138,19 +1138,25 @@ type MaterializedTranscript = (
     Vec<bool>,
 );
 
-fn materialize_transcript_viewport(
+/// One rendered transcript row: its line content plus the metadata the
+/// viewport needs for styling, hit regions, and copy separators.
+struct MaterializedTranscriptRow {
+    line: Line<'static>,
+    separator: TextRowSeparator,
+    block: Option<usize>,
+    user_surface: bool,
+}
+
+fn materialize_transcript_rows(
     app: &mut App,
     offset: usize,
     height: usize,
     message_width: usize,
     process_width: usize,
     active_block: Option<usize>,
-) -> MaterializedTranscript {
+) -> Vec<MaterializedTranscriptRow> {
     let end = offset.saturating_add(height);
-    let mut items = Vec::with_capacity(height);
-    let mut separators = Vec::with_capacity(height);
-    let mut block_for_row = Vec::with_capacity(height);
-    let mut user_surface_for_row = Vec::with_capacity(height);
+    let mut rows = Vec::with_capacity(height);
     let first = app.transcript_layout.blocks.partition_point(|entry| {
         entry.block_start + entry.block_rows + usize::from(entry.user_padding) <= offset
     });
@@ -1170,10 +1176,7 @@ fn materialize_transcript_viewport(
             offset,
             end,
             false,
-            &mut items,
-            &mut separators,
-            &mut block_for_row,
-            &mut user_surface_for_row,
+            &mut rows,
         );
         append_blank_transcript_rows(
             top_padding_start,
@@ -1181,17 +1184,14 @@ fn materialize_transcript_viewport(
             offset,
             end,
             true,
-            &mut items,
-            &mut separators,
-            &mut block_for_row,
-            &mut user_surface_for_row,
+            &mut rows,
         );
         let visible_start = offset
             .saturating_sub(entry.block_start)
             .min(entry.block_rows);
         let visible_end = end.saturating_sub(entry.block_start).min(entry.block_rows);
         if visible_start < visible_end {
-            let (rows, rendered) = {
+            let (block_rows, rendered) = {
                 let block = &app.blocks[entry.index];
                 cached_transcript_block_rows(
                     block,
@@ -1209,11 +1209,13 @@ fn materialize_transcript_viewport(
             }
             #[cfg(not(test))]
             let _ = rendered;
-            for (item, separator) in rows {
-                items.push(item);
-                separators.push(separator);
-                block_for_row.push(Some(entry.index));
-                user_surface_for_row.push(entry.user_padding);
+            for (line, separator) in block_rows {
+                rows.push(MaterializedTranscriptRow {
+                    line,
+                    separator,
+                    block: Some(entry.index),
+                    user_surface: entry.user_padding,
+                });
             }
         }
         append_blank_transcript_rows(
@@ -1222,45 +1224,73 @@ fn materialize_transcript_viewport(
             offset,
             end,
             true,
-            &mut items,
-            &mut separators,
-            &mut block_for_row,
-            &mut user_surface_for_row,
+            &mut rows,
         );
     }
     #[cfg(test)]
     {
-        app.transcript_render_stats.materialized_rows = items.len();
+        app.transcript_render_stats.materialized_rows = rows.len();
+    }
+    rows
+}
+
+fn materialize_transcript_viewport(
+    app: &mut App,
+    offset: usize,
+    height: usize,
+    message_width: usize,
+    process_width: usize,
+    active_block: Option<usize>,
+) -> MaterializedTranscript {
+    let rows = materialize_transcript_rows(
+        app,
+        offset,
+        height,
+        message_width,
+        process_width,
+        active_block,
+    );
+    let mut items = Vec::with_capacity(rows.len());
+    let mut separators = Vec::with_capacity(rows.len());
+    let mut block_for_row = Vec::with_capacity(rows.len());
+    let mut user_surface_for_row = Vec::with_capacity(rows.len());
+    for row in rows {
+        let background = match row.block {
+            Some(index) => match app.blocks[index].kind {
+                BlockKind::User => USER_SURFACE,
+                BlockKind::Assistant => BG,
+                _ if index == app.selected_block => ROW_ACTIVE,
+                _ => BG,
+            },
+            None if row.user_surface => USER_SURFACE,
+            None => BG,
+        };
+        items.push(ListItem::new(row.line).style(Style::default().bg(background)));
+        separators.push(row.separator);
+        block_for_row.push(row.block);
+        user_surface_for_row.push(row.user_surface);
     }
     (items, separators, block_for_row, user_surface_for_row)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn append_blank_transcript_rows(
     start: usize,
     end: usize,
     viewport_start: usize,
     viewport_end: usize,
     user_surface: bool,
-    items: &mut Vec<ListItem<'static>>,
-    separators: &mut Vec<TextRowSeparator>,
-    block_for_row: &mut Vec<Option<usize>>,
-    user_surface_for_row: &mut Vec<bool>,
+    rows: &mut Vec<MaterializedTranscriptRow>,
 ) {
     let count = end
         .min(viewport_end)
         .saturating_sub(start.max(viewport_start));
     for _ in 0..count {
-        items.push(
-            ListItem::new(Line::default()).style(Style::default().bg(if user_surface {
-                USER_SURFACE
-            } else {
-                BG
-            })),
-        );
-        separators.push(TextRowSeparator::Newline);
-        block_for_row.push(None);
-        user_surface_for_row.push(user_surface);
+        rows.push(MaterializedTranscriptRow {
+            line: Line::default(),
+            separator: TextRowSeparator::Newline,
+            block: None,
+            user_surface,
+        });
     }
 }
 
@@ -1443,7 +1473,7 @@ fn cached_transcript_block_rows(
     process_width: usize,
     app: &App,
     range: std::ops::Range<usize>,
-) -> (Vec<(ListItem<'static>, TextRowSeparator)>, bool) {
+) -> (Vec<(Line<'static>, TextRowSeparator)>, bool) {
     let rendered =
         ensure_transcript_block_cache(block, selected, live, message_width, process_width, app);
     let rows = block
@@ -1462,17 +1492,11 @@ pub(super) fn transcript_block_items(
     mut message_width: usize,
     mut process_width: usize,
     app: &App,
-) -> Vec<(ListItem<'static>, TextRowSeparator)> {
+) -> Vec<(Line<'static>, TextRowSeparator)> {
     if block.parent_process.is_some() {
         message_width = message_width.saturating_sub(2).max(1);
         process_width = process_width.saturating_sub(2).max(1);
     }
-    let background = match block.kind {
-        BlockKind::User => USER_SURFACE,
-        BlockKind::Assistant => BG,
-        _ if selected => ROW_ACTIVE,
-        _ => BG,
-    };
     let open_hint = app.keymap.key_hint("main", "open").map_or_else(
         || "right-click opens full".to_string(),
         |key| format!("{key} or right-click opens full"),
@@ -1492,7 +1516,6 @@ pub(super) fn transcript_block_items(
                 rows.push(transcript_block_item(
                     block,
                     vec![Span::styled(line.text, Style::default().fg(TEXT))],
-                    background,
                 ));
             }
         }
@@ -1502,7 +1525,7 @@ pub(super) fn transcript_block_items(
                 if block.parent_process.is_some() {
                     line.spans.insert(0, Span::raw("  "));
                 }
-                rows.push(ListItem::new(line).style(Style::default().bg(background)));
+                rows.push(line);
                 row_separators.push(rendered.separator);
             }
         }
@@ -1528,7 +1551,6 @@ pub(super) fn transcript_block_items(
                         Style::default().fg(MUTED),
                     ),
                 ],
-                background,
             ));
         }
         BlockKind::Reasoning => {
@@ -1551,7 +1573,6 @@ pub(super) fn transcript_block_items(
                         Style::default().fg(MUTED),
                     ),
                 ],
-                background,
             ));
             if block.expanded {
                 let (lines, extra) =
@@ -1563,7 +1584,6 @@ pub(super) fn transcript_block_items(
                         true,
                         &open_hint,
                         &expand_hint,
-                        background,
                         block.parent_process.is_some(),
                     ));
                 }
@@ -1577,7 +1597,6 @@ pub(super) fn transcript_block_items(
                                 Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                             ),
                         ],
-                        background,
                     ));
                 }
                 if !live && extra > 0 {
@@ -1587,7 +1606,6 @@ pub(super) fn transcript_block_items(
                         true,
                         &open_hint,
                         &expand_hint,
-                        background,
                         block.parent_process.is_some(),
                     ));
                 }
@@ -1629,7 +1647,6 @@ pub(super) fn transcript_block_items(
                         Style::default().fg(MUTED),
                     ),
                 ],
-                background,
             ));
             if block.expanded {
                 let (lines, extra) = tool_detail_lines(block, process_width, 8);
@@ -1640,7 +1657,6 @@ pub(super) fn transcript_block_items(
                             Span::raw("  "),
                             Span::styled(line, Style::default().fg(color)),
                         ],
-                        background,
                     ));
                 }
                 if extra > 0 {
@@ -1650,7 +1666,6 @@ pub(super) fn transcript_block_items(
                         true,
                         &open_hint,
                         &expand_hint,
-                        background,
                         block.parent_process.is_some(),
                     ));
                 }
@@ -1692,7 +1707,6 @@ pub(super) fn transcript_block_items(
                             Style::default().fg(if selected { TEXT } else { MUTED }),
                         ),
                     ],
-                    background,
                 ));
             }
             if extra > 0 {
@@ -1702,7 +1716,6 @@ pub(super) fn transcript_block_items(
                     block.expanded,
                     &open_hint,
                     &expand_hint,
-                    background,
                     block.parent_process.is_some(),
                 ));
             }
@@ -1713,19 +1726,18 @@ pub(super) fn transcript_block_items(
     rows.into_iter().zip(row_separators).collect()
 }
 
-pub(super) fn transcript_item(spans: Vec<Span<'static>>, background: Color) -> ListItem<'static> {
-    ListItem::new(Line::from(spans)).style(Style::default().bg(background))
+pub(super) fn transcript_item(spans: Vec<Span<'static>>) -> Line<'static> {
+    Line::from(spans)
 }
 
 pub(super) fn transcript_block_item(
     block: &DisplayBlock,
     mut spans: Vec<Span<'static>>,
-    background: Color,
-) -> ListItem<'static> {
+) -> Line<'static> {
     if block.parent_process.is_some() {
         spans.insert(0, Span::raw("  "));
     }
-    transcript_item(spans, background)
+    transcript_item(spans)
 }
 
 pub(super) fn transcript_hint(
@@ -1734,9 +1746,8 @@ pub(super) fn transcript_hint(
     expanded: bool,
     open_hint: &str,
     expand_hint: &str,
-    background: Color,
     nested: bool,
-) -> ListItem<'static> {
+) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
@@ -1750,7 +1761,7 @@ pub(super) fn transcript_hint(
     if nested {
         spans.insert(0, Span::raw("  "));
     }
-    transcript_item(spans, background)
+    transcript_item(spans)
 }
 
 pub(super) fn visible_block_lines(
@@ -3980,7 +3991,7 @@ pub(super) fn capture_surface(
     } else {
         app.transcript_offset
     };
-    follow_scrolled_selection(app, area, scroll_origin);
+    revalidate_selection(app, area, scroll_origin);
     let cells = (area.y..area.bottom())
         .map(|row| {
             let mut hidden_cells = 0;
@@ -4013,66 +4024,169 @@ pub(super) fn capture_surface(
     });
 }
 
-// A selection anchors to the scrolled content rather than the screen: shift it
-// by the surface's row movement, and clear it as soon as either end leaves the
-// visible area or the captured surface changes.
-fn follow_scrolled_selection(app: &mut App, area: Rect, scroll_origin: usize) {
-    let (Some(mut selection), Some(previous)) = (app.selection, app.selectable.as_ref()) else {
+// A transcript selection anchors to its blocks rather than the viewport, so
+// scrolling, streaming appends, and history prepends leave it attached to the
+// same content; re-resolve the anchored rows against the latest layout before
+// each capture, and clear the selection once its content is gone (rewrap,
+// collapse, or a session change). Selections on other surfaces keep the
+// visible-window rule: they are cleared as soon as either end scrolls out of
+// view or the surface width changes.
+fn revalidate_selection(app: &mut App, area: Rect, scroll_origin: usize) {
+    let Some(mut selection) = app.selection else {
         return;
     };
-    if previous.overlay != app.overlay {
+    if selection.overlay != app.overlay {
         app.selection = None;
         return;
     }
-    let delta = area.y as isize - previous.area.y as isize + previous.scroll_origin as isize
-        - scroll_origin as isize;
-    let start_row = selection.start.1 as isize + delta;
-    let end_row = selection.end.1 as isize + delta;
-    let top = area.y as isize;
-    let bottom = area.bottom() as isize;
-    if start_row < top || start_row >= bottom || end_row < top || end_row >= bottom {
-        app.selection = None;
-        return;
+    match selection.anchors {
+        Some(anchors) => {
+            if anchors.message_width != app.transcript_layout.message_width
+                || anchors.process_width != app.transcript_layout.process_width
+            {
+                app.selection = None;
+                return;
+            }
+            let Some(start_row) = resolve_selection_row_anchor(app, anchors.start) else {
+                app.selection = None;
+                return;
+            };
+            let Some(end_row) = resolve_selection_row_anchor(app, anchors.end) else {
+                app.selection = None;
+                return;
+            };
+            selection.start.1 = start_row;
+            selection.end.1 = end_row;
+            app.selection = Some(selection);
+        }
+        None => {
+            let bottom = scroll_origin.saturating_add(usize::from(area.height));
+            if selection.surface_width != area.width
+                || [selection.start.1, selection.end.1]
+                    .into_iter()
+                    .any(|row| row < scroll_origin || row >= bottom)
+            {
+                app.selection = None;
+            }
+        }
     }
-    selection.start.1 = start_row as u16;
-    selection.end.1 = end_row as u16;
-    app.selection = Some(selection);
+}
+
+// Anchor a transcript content row to the block that contains or follows it, so
+// later layout shifts can resolve the row back to the same content.
+fn selection_row_anchor(app: &App, row: usize) -> Option<SelectionRowAnchor> {
+    if app.overlay.is_some() || app.blocks.is_empty() {
+        return None;
+    }
+    let entries = &app.transcript_layout.blocks;
+    let index = entries.partition_point(|entry| entry.start <= row);
+    let entry = entries.get(index.saturating_sub(1))?;
+    let block = app.blocks.get(entry.index)?;
+    Some(SelectionRowAnchor {
+        block_id: block.id,
+        block_index: entry.index,
+        offset_from_block: row as isize - entry.block_start as isize,
+        in_content: row >= entry.block_start && row < entry.block_start + entry.block_rows,
+    })
+}
+
+fn resolve_selection_row_anchor(app: &App, anchor: SelectionRowAnchor) -> Option<usize> {
+    let layout_entry = |entry: &&TranscriptLayoutBlock| {
+        app.blocks
+            .get(entry.index)
+            .is_some_and(|block| block.id == anchor.block_id)
+    };
+    // Prefer the creation-time index; fall back to an id scan for blocks that
+    // moved (history prepends shift every index).
+    let entry = app
+        .transcript_layout
+        .blocks
+        .iter()
+        .find(|entry| entry.index == anchor.block_index && layout_entry(entry))
+        .or_else(|| {
+            app.transcript_layout
+                .blocks
+                .iter()
+                .find(|entry| entry.index != anchor.block_index && layout_entry(entry))
+        })?;
+    if anchor.in_content && anchor.offset_from_block >= entry.block_rows as isize {
+        // The anchored content rows are gone (for example after a collapse).
+        return None;
+    }
+    let top = entry.start as isize;
+    let bottom = (entry.block_start + entry.block_rows + usize::from(entry.user_padding)) as isize;
+    let row = entry.block_start as isize + anchor.offset_from_block;
+    Some(row.clamp(top, bottom.saturating_sub(1).max(top)).max(0) as usize)
+}
+
+fn new_surface_selection(app: &App, start: (u16, usize), end: (u16, usize)) -> TextSelection {
+    let surface_width = app
+        .selectable
+        .as_ref()
+        .map_or(0, |surface| surface.area.width);
+    let anchors = match (
+        selection_row_anchor(app, start.1),
+        selection_row_anchor(app, end.1),
+    ) {
+        (Some(start), Some(end)) => Some(SelectionRowAnchors {
+            start,
+            end,
+            message_width: app.transcript_layout.message_width,
+            process_width: app.transcript_layout.process_width,
+        }),
+        _ => None,
+    };
+    TextSelection {
+        start,
+        end,
+        overlay: app.overlay,
+        surface_width,
+        anchors,
+    }
+}
+
+fn ordered_selection_points(selection: TextSelection) -> ((u16, usize), (u16, usize)) {
+    if (selection.start.1, selection.start.0) <= (selection.end.1, selection.end.0) {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    }
 }
 
 pub(super) fn render_selection(frame: &mut Frame<'_>, app: &App) {
     let (Some(surface), Some(selection)) = (&app.selectable, app.selection) else {
         return;
     };
-    let clamp = |point: (u16, u16)| {
-        (
-            point
-                .0
-                .clamp(surface.area.x, surface.area.right().saturating_sub(1)),
-            point
-                .1
-                .clamp(surface.area.y, surface.area.bottom().saturating_sub(1)),
-        )
-    };
-    let first = clamp(selection.start);
-    let second = clamp(selection.end);
-    let (start, end) = if (first.1, first.0) <= (second.1, second.0) {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    for row in start.1..=end.1 {
-        let from = if row == start.1 {
-            start.0
+    if surface.cells.is_empty() {
+        return;
+    }
+    let (start, end) = ordered_selection_points(selection);
+    let left = surface.area.x;
+    let right = surface.area.right().saturating_sub(1);
+    // Map content rows back to screen rows; rows scrolled out of the viewport
+    // stay selected and copyable but are not highlighted.
+    let first_visible = start.1.max(surface.scroll_origin);
+    let last_visible = end.1.min(surface.scroll_origin + surface.cells.len() - 1);
+    if first_visible > last_visible {
+        return;
+    }
+    for content_row in first_visible..=last_visible {
+        let screen_row = surface.area.y + (content_row - surface.scroll_origin) as u16;
+        let from = if content_row == start.1 {
+            start.0.clamp(left, right)
         } else {
-            surface.area.x
+            left
         };
-        let to = if row == end.1 {
-            end.0
+        let to = if content_row == end.1 {
+            end.0.clamp(left, right)
         } else {
-            surface.area.right().saturating_sub(1)
+            right
         };
+        if from > to {
+            continue;
+        }
         for column in from..=to {
-            if let Some(cell) = frame.buffer_mut().cell_mut((column, row)) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((column, screen_row)) {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
         }
@@ -4084,44 +4198,50 @@ pub(super) fn update_mouse_selection(
     mouse: MouseEvent,
     require_shift: bool,
 ) -> bool {
-    let Some(area) = app.selectable.as_ref().map(|surface| surface.area) else {
+    let Some((area, scroll_origin)) = app
+        .selectable
+        .as_ref()
+        .map(|surface| (surface.area, surface.scroll_origin))
+    else {
         return false;
     };
-    let point = (
+    let screen = (
         mouse.column.clamp(area.x, area.right().saturating_sub(1)),
         mouse.row.clamp(area.y, area.bottom().saturating_sub(1)),
     );
+    let point = (screen.0, scroll_origin + usize::from(screen.1 - area.y));
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left)
             if (!require_shift || mouse.modifiers.contains(KeyModifiers::SHIFT))
-                && area.contains(point.into()) =>
+                && area.contains(screen.into()) =>
         {
             let double_click = is_double_click(
                 &mut app.last_text_click,
-                TextClickTarget::Surface(app.overlay, point),
+                TextClickTarget::Surface(app.overlay, screen),
             );
             if double_click
                 && let Some(selection) = app
                     .selectable
                     .as_ref()
-                    .and_then(|surface| surface_word_selection(surface, point))
+                    .and_then(|surface| surface_word_selection(app, surface, screen))
             {
                 app.selection = Some(selection);
                 app.mouse_word_selecting = true;
                 return true;
             }
-            app.selection = Some(TextSelection {
-                start: point,
-                end: point,
-            });
+            app.selection = Some(new_surface_selection(app, point, point));
             app.mouse_word_selecting = false;
             true
         }
         MouseEventKind::Drag(MouseButton::Left) if app.selection.is_some() => {
             app.last_text_click = None;
             app.mouse_word_selecting = false;
+            let end_anchor = selection_row_anchor(app, point.1);
             if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
+                if let (Some(anchors), Some(end)) = (selection.anchors.as_mut(), end_anchor) {
+                    anchors.end = end;
+                }
             }
             true
         }
@@ -4130,8 +4250,12 @@ pub(super) fn update_mouse_selection(
                 app.mouse_word_selecting = false;
                 return true;
             }
+            let end_anchor = selection_row_anchor(app, point.1);
             let empty = if let Some(selection) = app.selection.as_mut() {
                 selection.end = point;
+                if let (Some(anchors), Some(end)) = (selection.anchors.as_mut(), end_anchor) {
+                    anchors.end = end;
+                }
                 selection.start == selection.end
             } else {
                 false
@@ -4146,6 +4270,7 @@ pub(super) fn update_mouse_selection(
 }
 
 pub(super) fn surface_word_selection(
+    app: &App,
     surface: &SelectableSurface,
     point: (u16, u16),
 ) -> Option<TextSelection> {
@@ -4179,21 +4304,31 @@ pub(super) fn surface_word_selection(
     while end + 1 < cells.len() && cells[end + 1].is_empty() {
         end += 1;
     }
-    Some(TextSelection {
-        start: (surface.area.x + start as u16, point.1),
-        end: (surface.area.x + end as u16, point.1),
-    })
+    let row = point.1.saturating_sub(surface.area.y) as usize + surface.scroll_origin;
+    Some(new_surface_selection(
+        app,
+        (surface.area.x + start as u16, row),
+        (surface.area.x + end as u16, row),
+    ))
 }
 
 pub(super) fn copy_current_surface(app: &mut App) {
-    let Some(surface) = app.selectable.as_ref() else {
+    let Some(surface_overlay) = app.selectable.as_ref().map(|surface| surface.overlay) else {
         app.set_flash("Nothing visible can be copied");
         return;
     };
     let text = if let Some(selection) = app.selection {
-        selected_surface_text(surface, selection)
+        if surface_overlay.is_none() && selection.anchors.is_some() {
+            transcript_selection_text(app, selection)
+        } else {
+            app.selectable.as_ref().map_or_else(String::new, |surface| {
+                selected_surface_text(surface, selection)
+            })
+        }
     } else {
-        complete_surface_text(surface)
+        app.selectable
+            .as_ref()
+            .map_or_else(String::new, complete_surface_text)
     };
     if text.trim().is_empty() {
         app.set_flash("The selection is empty");
@@ -4289,19 +4424,15 @@ pub(super) fn selected_surface_text(
     if surface.cells.is_empty() {
         return String::new();
     }
-    let relative = |point: (u16, u16)| {
+    let relative = |point: (u16, usize)| {
         (
             point.0.saturating_sub(surface.area.x) as usize,
-            point.1.saturating_sub(surface.area.y) as usize,
+            point.1.saturating_sub(surface.scroll_origin),
         )
     };
-    let first = relative(selection.start);
-    let second = relative(selection.end);
-    let ((start_x, start_y), (end_x, end_y)) = if (first.1, first.0) <= (second.1, second.0) {
-        (first, second)
-    } else {
-        (second, first)
-    };
+    let (start, end) = ordered_selection_points(selection);
+    let (start_x, start_y) = relative(start);
+    let (end_x, end_y) = relative(end);
     let mut text = String::new();
     let last_row = end_y.min(surface.cells.len().saturating_sub(1));
     for row in start_y..=last_row {
@@ -4351,6 +4482,104 @@ fn first_content_cell(cells: &[String]) -> usize {
         .iter()
         .position(|cell| !cell.chars().all(char::is_whitespace))
         .unwrap_or(cells.len())
+}
+
+/// Extract the selected transcript text by materializing rows straight from
+/// the layout cache, so the selection may extend far beyond the visible
+/// viewport. Row slicing mirrors `selected_surface_text` on the rendered
+/// surface: column 0 is the list padding, soft-wrapped continuation rows skip
+/// leading whitespace, and row separators follow the wrapped layout.
+pub(super) fn transcript_selection_text(app: &mut App, selection: TextSelection) -> String {
+    const CHUNK_ROWS: usize = 8192;
+    let Some(surface_x) = app.selectable.as_ref().map(|surface| surface.area.x) else {
+        return String::new();
+    };
+    let (start, end) = ordered_selection_points(selection);
+    let message_width = app.transcript_layout.message_width;
+    let process_width = app.transcript_layout.process_width;
+    if message_width == 0 || process_width == 0 || end.1 < start.1 {
+        return String::new();
+    }
+    let start_column = start.0.saturating_sub(surface_x) as usize;
+    let end_column = end.0.saturating_sub(surface_x) as usize;
+    let active_block = app.active_transcript_block();
+    let mut text = String::new();
+    let mut previous_separator = TextRowSeparator::Newline;
+    let mut row = start.1;
+    while row <= end.1 {
+        let chunk_end = end.1.min(row.saturating_add(CHUNK_ROWS - 1));
+        let rows = materialize_transcript_rows(
+            app,
+            row,
+            chunk_end - row + 1,
+            message_width,
+            process_width,
+            active_block,
+        );
+        if rows.is_empty() {
+            break;
+        }
+        for (offset, materialized) in rows.into_iter().enumerate() {
+            let row_index = row + offset;
+            let line_text: String = materialized
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let from = if row_index == start.1 {
+                start_column
+            } else if previous_separator != TextRowSeparator::Newline {
+                first_content_column(&line_text) + 1
+            } else {
+                1
+            };
+            let to = if row_index == end.1 {
+                end_column + 1
+            } else {
+                usize::MAX
+            };
+            // The list's horizontal padding shifts line text one column right.
+            text.push_str(
+                slice_display_columns(&line_text, from.saturating_sub(1), to.saturating_sub(1))
+                    .trim_end(),
+            );
+            if row_index < end.1 {
+                push_row_separator(&mut text, materialized.separator);
+            }
+            previous_separator = materialized.separator;
+        }
+        row = chunk_end + 1;
+    }
+    text
+}
+
+/// Slice `text` to the display column range `[from, to)`, matching the buffer
+/// cell model: a grapheme is included when the column of its first cell falls
+/// inside the range.
+fn slice_display_columns(text: &str, from: usize, to: usize) -> &str {
+    let mut column = 0usize;
+    let mut slice_start = None;
+    let mut slice_end = 0usize;
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        if from <= column && column < to {
+            slice_start.get_or_insert(byte);
+            slice_end = byte + grapheme.len();
+        }
+        column += UnicodeWidthStr::width(grapheme);
+    }
+    slice_start.map_or("", |start| &text[start..slice_end.max(start)])
+}
+
+fn first_content_column(text: &str) -> usize {
+    let mut column = 0;
+    for grapheme in text.graphemes(true) {
+        if !grapheme.chars().all(char::is_whitespace) {
+            return column;
+        }
+        column += UnicodeWidthStr::width(grapheme);
+    }
+    column
 }
 
 fn push_row_separator(text: &mut String, separator: TextRowSeparator) {

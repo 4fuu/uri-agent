@@ -1163,8 +1163,17 @@ fn transcript_copy_omits_visual_soft_wraps() {
         assert_eq!(last, first + 1);
         let surface = app.selectable.as_ref().unwrap();
         let selection = TextSelection {
-            start: (surface.area.x + 1, first),
-            end: (surface.area.right().saturating_sub(1), last),
+            start: (
+                surface.area.x + 1,
+                usize::from(first - surface.area.y) + surface.scroll_origin,
+            ),
+            end: (
+                surface.area.right().saturating_sub(1),
+                usize::from(last - surface.area.y) + surface.scroll_origin,
+            ),
+            overlay: None,
+            surface_width: surface.area.width,
+            anchors: None,
         };
 
         assert_eq!(
@@ -2002,6 +2011,9 @@ fn selection_releases_command_and_global_panel_shortcuts() {
     let selection = TextSelection {
         start: (0, 0),
         end: (1, 0),
+        overlay: None,
+        surface_width: 0,
+        anchors: None,
     };
 
     for (key, expected_action) in [
@@ -2874,8 +2886,11 @@ fn transcript_scrollbar_handles_track_clicks_and_thumb_drags() {
     assert!(reading_end > live_tail);
     assert_eq!(app.transcript_offset, live_tail);
     app.selection = Some(TextSelection {
-        start: (1, area.y),
-        end: (2, area.y),
+        start: (1, usize::from(area.y)),
+        end: (2, usize::from(area.y)),
+        overlay: None,
+        surface_width: 0,
+        anchors: None,
     });
 
     let thumb_row = area.y + metrics.thumb_start as u16;
@@ -2998,7 +3013,7 @@ fn transcript_text_selection_stops_before_the_scrollbar_column() {
 }
 
 #[test]
-fn transcript_text_selection_follows_scroll_until_it_leaves_the_view() {
+fn transcript_text_selection_survives_scrolling_off_screen() {
     let mut app = test_app();
     for index in 0..30 {
         app.push(
@@ -3012,35 +3027,223 @@ fn transcript_text_selection_follows_scroll_until_it_leaves_the_view() {
     }
     render_to_string(&mut app, 80, 12);
     let area = app.selectable.as_ref().unwrap().area;
-    let selection = TextSelection {
-        start: (area.x + 4, area.y + 3),
-        end: (area.x + 12, area.y + 4),
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 4,
+        row: area.y + 3,
+        modifiers: KeyModifiers::NONE,
     };
-    app.selection = Some(selection);
-    let selected = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 12,
+        row: area.y + 4,
+        ..down
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, up, false));
+    let selection = app.selection.expect("selection after drag");
+    assert!(selection.anchors.is_some());
+    let selected = transcript_selection_text(&mut app, selection);
     assert!(!selected.trim().is_empty());
 
-    app.scroll_transcript(-2);
+    app.scroll_transcript(-20);
     render_to_string(&mut app, 80, 12);
-    let followed = app.selection.expect("selection follows while visible");
-    assert_eq!(followed.start.1, selection.start.1 + 2);
-    assert_eq!(followed.end.1, selection.end.1 + 2);
-    assert_eq!(followed.start.0, selection.start.0);
-    assert_eq!(followed.end.0, selection.end.0);
-    assert_eq!(
-        selected_surface_text(app.selectable.as_ref().unwrap(), followed),
-        selected
+    let persisted = app
+        .selection
+        .expect("selection survives scrolling out of view");
+    assert_eq!(persisted.start, selection.start);
+    assert_eq!(persisted.end, selection.end);
+    assert_eq!(transcript_selection_text(&mut app, persisted), selected);
+
+    app.scroll_transcript(20);
+    render_to_string(&mut app, 80, 12);
+    let returned = app.selection.expect("selection survives scrolling back");
+    assert_eq!(returned.start, selection.start);
+    assert_eq!(returned.end, selection.end);
+    assert_eq!(transcript_selection_text(&mut app, returned), selected);
+}
+
+#[test]
+fn transcript_selection_extends_across_scroll_positions() {
+    let mut app = test_app();
+    for index in 0..30 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    app.scroll_transcript(isize::MIN);
+    render_to_string(&mut app, 80, 12);
+    let transcript_row = |app: &App, index: usize| {
+        app.hit_regions
+            .iter()
+            .find_map(|region| {
+                (region.target == AppHit::Transcript(index)).then_some(region.area.y)
+            })
+            .expect("block is visible")
+    };
+    let area = app.selectable.as_ref().unwrap().area;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: transcript_row(&app, 2),
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+
+    // Scroll with the drag still open, then extend the selection to a block
+    // that was off screen when the drag started.
+    app.scroll_transcript(6);
+    render_to_string(&mut app, 80, 12);
+    let drag = MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x + 30,
+        row: transcript_row(&app, 8),
+        ..down
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..drag
+    };
+    assert!(update_mouse_selection(&mut app, drag, false));
+    assert!(update_mouse_selection(&mut app, up, false));
+
+    let selection = app.selection.expect("cross-scroll selection");
+    let text = transcript_selection_text(&mut app, selection);
+    let lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let expected = (2..=8)
+        .map(|index| format!("message {index}"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines, expected);
+}
+
+#[test]
+fn anchored_selection_survives_transcript_appends() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "first".to_string(),
+        None,
+        false,
+        true,
     );
-
-    app.scroll_transcript(2);
     render_to_string(&mut app, 80, 12);
-    let followed = app.selection.expect("selection follows back to the tail");
-    assert_eq!(followed.start.1, selection.start.1);
-    assert_eq!(followed.end.1, selection.end.1);
+    let area = app.selectable.as_ref().unwrap().area;
+    let row = app
+        .hit_regions
+        .iter()
+        .find_map(|region| (region.target == AppHit::Transcript(0)).then_some(region.area.y))
+        .unwrap();
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 6,
+        ..down
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, up, false));
+    let selection = app.selection.expect("selection before appends");
+    assert_eq!(transcript_selection_text(&mut app, selection), "first");
 
-    app.scroll_transcript(4);
+    for index in 0..5 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("later {index}"),
+            None,
+            false,
+            true,
+        );
+    }
     render_to_string(&mut app, 80, 12);
+    let persisted = app.selection.expect("selection survives appended blocks");
+    assert_eq!(persisted.start, selection.start);
+    assert_eq!(persisted.end, selection.end);
+    assert_eq!(transcript_selection_text(&mut app, persisted), "first");
+}
+
+#[test]
+fn anchored_selection_clears_when_the_transcript_rewraps() {
+    let mut app = test_app();
+    for index in 0..5 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 8,
+        ..down
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, up, false));
+    assert!(app.selection.is_some());
+
+    render_to_string(&mut app, 60, 12);
     assert!(app.selection.is_none());
+}
+
+#[test]
+fn anchored_selection_copy_matches_the_rendered_snapshot() {
+    let mut app = test_app();
+    for index in 0..5 {
+        app.push(
+            BlockKind::Assistant,
+            "AGENT",
+            format!("message {index}"),
+            None,
+            false,
+            true,
+        );
+    }
+    render_to_string(&mut app, 80, 12);
+    let area = app.selectable.as_ref().unwrap().area;
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 3,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 7,
+        row: area.y + 4,
+        ..down
+    };
+    assert!(update_mouse_selection(&mut app, down, false));
+    assert!(update_mouse_selection(&mut app, up, false));
+    let selection = app.selection.expect("in-viewport selection");
+    assert!(selection.anchors.is_some());
+    let snapshot = selected_surface_text(app.selectable.as_ref().unwrap(), selection);
+    assert!(!snapshot.trim().is_empty());
+    assert_eq!(transcript_selection_text(&mut app, selection), snapshot);
 }
 
 #[test]
@@ -4628,6 +4831,9 @@ fn cell_selection_omits_soft_wraps_but_preserves_source_separators() {
     let selection = TextSelection {
         start: (0, 0),
         end: (0, 3),
+        overlay: None,
+        surface_width: 5,
+        anchors: None,
     };
 
     assert_eq!(selected_surface_text(&surface, selection), "abcdef ghi\nj");
@@ -4648,7 +4854,7 @@ fn captured_wide_characters_do_not_include_their_hidden_cells() {
         .unwrap();
 
     let surface = app.selectable.as_ref().unwrap();
-    let word = surface_word_selection(surface, (1, 0)).unwrap();
+    let word = surface_word_selection(&app, surface, (1, 0)).unwrap();
     assert_eq!(selected_surface_text(surface, word), "复");
     assert_eq!(
         selected_surface_text(
@@ -4656,6 +4862,9 @@ fn captured_wide_characters_do_not_include_their_hidden_cells() {
             TextSelection {
                 start: (0, 0),
                 end: (7, 0),
+                overlay: None,
+                surface_width: 12,
+                anchors: None,
             },
         ),
         "复制内容"
@@ -5079,10 +5288,20 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
         .position(|row| !row.concat().trim().is_empty())
         .unwrap() as u16;
     let area = lazy.selectable.as_ref().unwrap().area;
-    lazy.selection = Some(TextSelection {
-        start: (area.x, area.y + row),
-        end: (area.x + 6, area.y + row),
-    });
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x,
+        row: area.y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let up = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 6,
+        ..down
+    };
+    assert!(update_mouse_selection(&mut lazy, down, false));
+    assert!(update_mouse_selection(&mut lazy, up, false));
+    assert!(lazy.selection.unwrap().anchors.is_some());
     let copied_before =
         selected_surface_text(lazy.selectable.as_ref().unwrap(), lazy.selection.unwrap());
     lazy.mouse_scroll_animation = Some(MouseScrollAnimation::Transcript {

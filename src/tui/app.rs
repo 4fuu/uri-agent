@@ -173,7 +173,7 @@ struct TranscriptBlockRenderKey {
 
 struct TranscriptBlockRenderCache {
     key: TranscriptBlockRenderKey,
-    rows: Vec<(ListItem<'static>, TextRowSeparator)>,
+    rows: Vec<(Line<'static>, TextRowSeparator)>,
 }
 
 #[derive(Clone, Copy)]
@@ -391,8 +391,41 @@ enum TextRowSeparator {
 
 #[derive(Clone, Copy)]
 struct TextSelection {
-    start: (u16, u16),
-    end: (u16, u16),
+    /// (column, content row). Content rows are absolute transcript layout rows
+    /// on the conversation surface, or `scroll_origin`-relative rows elsewhere.
+    start: (u16, usize),
+    end: (u16, usize),
+    /// The overlay that owned the surface when the selection was made.
+    overlay: Option<Overlay>,
+    /// Surface width at creation; a change means the content reflowed.
+    surface_width: u16,
+    /// Block anchoring for transcript selections; `None` on other surfaces.
+    anchors: Option<SelectionRowAnchors>,
+}
+
+/// Keeps a transcript selection attached to its content while the layout
+/// shifts (scrolling, streaming appends, history prepends, collapses).
+#[derive(Clone, Copy)]
+struct SelectionRowAnchors {
+    start: SelectionRowAnchor,
+    end: SelectionRowAnchor,
+    /// Layout widths at creation; a change means the transcript rewrapped.
+    message_width: usize,
+    process_width: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SelectionRowAnchor {
+    block_id: u64,
+    /// Block index when the anchor was created; block ids are only unique per
+    /// session event sequence, so the index disambiguates repeated ids until
+    /// history prepends shift it.
+    block_index: usize,
+    /// Selected row minus the block's first content row; negative or beyond
+    /// `block_rows` for the surrounding gap and padding rows.
+    offset_from_block: isize,
+    /// Whether the row was inside the block's rendered content rows.
+    in_content: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
