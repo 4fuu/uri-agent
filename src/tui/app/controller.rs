@@ -3414,6 +3414,10 @@ pub(super) fn open_api_key_prompt(app: &mut App, provider: String) {
         .to_string(),
         "exa" => "Create or copy a key at https://dashboard.exa.ai/api-keys, then paste it here."
             .to_string(),
+        "tinyfish" => {
+            "Create or copy a key at https://agent.tinyfish.ai/api-keys, then paste it here."
+                .to_string()
+        }
         _ => format!("Paste the API key for {provider}."),
     };
     let controls = action_hints(

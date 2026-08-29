@@ -2792,6 +2792,7 @@ mod tests {
         let provider = "uri-agent-credential-test";
         let environment = api_key_environment(provider);
         assert_eq!(api_key_environment("parallel"), "PARALLEL_API_KEY");
+        assert_eq!(api_key_environment("tinyfish"), "TINYFISH_API_KEY");
 
         manager
             .set_api_key(provider, "saved-key".to_string())

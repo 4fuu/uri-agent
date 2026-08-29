@@ -91,6 +91,7 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 | `radius` | Browser or device-code login |
 | `parallel` | API key for built-in web search and page extraction |
 | `exa` | API key for built-in web search and page extraction |
+| `tinyfish` | API key for built-in web search and page extraction |
 
 Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent resolves the active credential before each model request and refreshes it within five minutes of expiry rather than refreshing every stored provider during startup. Credential writes and refreshes use a cross-process transaction lock, so concurrent URI Agent processes re-read and merge the current file instead of overwriting each other's updates. The refreshed access token, new expiry, and rotated refresh token are persisted before the request continues; when a provider omits the refresh token, URI Agent retains the previous one rather than replacing it with an empty value. Kimi refresh retries connection failures, HTTP 429, and server errors up to three times with 1-, 2-, and 4-second delays; authentication failures are not retried. On Unix, URI Agent creates `auth.json` and its lock with mode `0600` and the configuration directory with mode `0700`.
 
@@ -153,7 +154,7 @@ Requests use the private `v1internal:streamGenerateContent` SSE operation. URI A
 
 URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 
-Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` protocol recognizes `PARALLEL_API_KEY` and `EXA_API_KEY` for web search and page extraction.
+Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
 
 ### Credential precedence
 
@@ -169,9 +170,9 @@ models.json apiKey
 
 The command-line API key is process-only and is not written to `auth.json`.
 
-Web-provider credentials are independent of the active model. Parallel and Exa
-resolve a key from `auth.json`, overridden by that provider's process
-environment variable. `models.json apiKey`, `URI_AGENT_API_KEY`, and
+Web-provider credentials are independent of the active model. Parallel, Exa,
+and TinyFish resolve a key from `auth.json`, overridden by that provider's
+process environment variable. `models.json apiKey`, `URI_AGENT_API_KEY`, and
 `--api-key` configure model requests and are not web-provider credentials.
 
 ## Configuration locations

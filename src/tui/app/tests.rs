@@ -7254,4 +7254,13 @@ fn web_search_providers_use_api_key_login_prompts() {
             .message
             .contains("dashboard.exa.ai")
     );
+
+    open_api_key_prompt(&mut app, "tinyfish".to_string());
+    assert!(
+        app.text_prompt
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("agent.tinyfish.ai")
+    );
 }

@@ -59,11 +59,11 @@ impl ParallelSearchOptions {
                     location = Some(value);
                 }
                 "include_domain" => {
-                    validate_parallel_domain(value, name)?;
+                    validate_domain(value, name)?;
                     include_domains.push(value.clone());
                 }
                 "exclude_domain" => {
-                    validate_parallel_domain(value, name)?;
+                    validate_domain(value, name)?;
                     exclude_domains.push(value.clone());
                 }
                 "after_date" => {

@@ -93,7 +93,7 @@ Core commands are registered through `CommandRegistry`:
 | `:help` | Show the active commands and keymap |
 | `:quit` or `:q` | Exit URI Agent |
 
-`:login` includes model providers plus the Parallel and Exa web providers. Selecting Parallel or Exa opens a masked API-key prompt with that provider's key-management URL. Saved credentials take effect immediately for search and page extraction in the built-in `https` protocol and appear in `:logout` like other stored credentials.
+`:login` includes model providers plus the Parallel, Exa, and TinyFish web providers. Selecting one of these web providers opens a masked API-key prompt with that provider's key-management URL. Saved credentials take effect immediately for search and page extraction in the built-in `https` protocol and appear in `:logout` like other stored credentials.
 
 `:model`, `F3`, and the Settings Model action open Model Hub. Its **Models** tab
 lists models only for providers with a configured model credential source, and
