@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent 是一个以协议为核心的终端 coding agent。它不会在启动时预载每项能力的完整手册，而是先提供精简索引，仅在需要时加载协议契约、Skills、文档和完整输出。
+URI Agent 是一个以协议为核心的终端 coding agent。通过 URI 协议，它可以让任意工具像其他 Agent 中的 Skills 一样按需加载：模型起初只看到精简的名称和描述，选中工具后才读取完整契约、指令和资源。
 
 内置插件向模型注册一组精简接口：
 

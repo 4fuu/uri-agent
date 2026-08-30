@@ -8,9 +8,10 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is a protocol-oriented terminal coding agent. Instead of preloading a
-manual for every capability, it starts with a compact index and loads protocol
-contracts, Skills, documentation, and complete output only when needed.
+URI Agent is a protocol-oriented terminal coding agent. Through URI protocols,
+it lets any tool load the way Skills do in other agents: the model sees only a
+compact name and description at first, then reads the full contract,
+instructions, and resources when it selects that tool.
 
 Its built-in plugins register a small model-facing interface:
 
