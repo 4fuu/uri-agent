@@ -712,10 +712,49 @@ pub(super) fn render_footer(
         available,
     );
     let context_width = context.width();
-    let model_limit = available.saturating_sub(context_width + 2);
+    let task_count = app.active_task_count;
+    let task = if task_count == 0 {
+        None
+    } else {
+        let full = format!(
+            "● {task_count} {}",
+            if task_count == 1 { "task" } else { "tasks" }
+        );
+        let compact = format!("●{task_count}");
+        let minimum_model_width = 12;
+        if available
+            >= context_width
+                .saturating_add(full.width())
+                .saturating_add(minimum_model_width)
+                .saturating_add(4)
+        {
+            Some(full)
+        } else if available
+            >= context_width
+                .saturating_add(compact.width())
+                .saturating_add(3)
+        {
+            Some(compact)
+        } else {
+            None
+        }
+    };
+    let task_width = task.as_deref().map_or(0, UnicodeWidthStr::width);
+    let task_context_gap = usize::from(task.is_some()) * 2;
+    let model_limit = available.saturating_sub(
+        context_width
+            .saturating_add(task_width)
+            .saturating_add(task_context_gap)
+            .saturating_add(2),
+    );
     let model = single_line_preview(&compact_model(app), model_limit);
     let model_width = model.width();
-    let gap = available.saturating_sub(model_width + context_width);
+    let gap = available.saturating_sub(
+        model_width
+            .saturating_add(task_width)
+            .saturating_add(task_context_gap)
+            .saturating_add(context_width),
+    );
     let mut base = Vec::new();
     if !model.is_empty() {
         base.push(Span::styled(
@@ -725,6 +764,25 @@ pub(super) fn render_footer(
     }
     if gap > 0 {
         base.push(Span::raw(" ".repeat(gap)));
+    }
+    if let Some(task) = task {
+        let task_x = area
+            .x
+            .saturating_add(u16::try_from(model_width.saturating_add(gap)).unwrap_or(u16::MAX));
+        base.push(Span::styled(
+            task,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        base.push(Span::raw(" ".repeat(task_context_gap)));
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(
+                task_x,
+                area.bottom().saturating_sub(1),
+                u16::try_from(task_width).unwrap_or(u16::MAX),
+                1,
+            ),
+            target: AppHit::TaskStatus,
+        });
     }
     base.push(Span::styled(
         context,

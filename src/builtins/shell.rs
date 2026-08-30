@@ -19,7 +19,7 @@ const PWSH_UTF8_PREFIX: &str = "$OutputEncoding = [Console]::OutputEncoding = [S
 const PWSH_EXIT_EPILOGUE: &str = "\n; $__uri_agent_ok = $?; $__uri_agent_native = $global:LASTEXITCODE; if ($__uri_agent_ok) { $global:__uri_agent_exit_code = 0 } elseif ($null -ne $__uri_agent_native -and $__uri_agent_native -ne 0) { $global:__uri_agent_exit_code = $__uri_agent_native } else { $global:__uri_agent_exit_code = 1 }";
 const PWSH_WINDOWS_WARNING: &str =
     "PowerShell 7 or newer was not found on Windows; pwsh:// is disabled.";
-const EXIT_OUTPUT_IDLE_GRACE: Duration = Duration::from_millis(100);
+const EXIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BASH_HELP: &str = r#"# bash
@@ -660,18 +660,19 @@ async fn execute_with_cancellation(
     let mut status = None;
     let mut timed_out = false;
     let mut cancelled = false;
-    let output_idle = time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
+    let exit_output_drain = time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
     let deadline = time::sleep_until(
         deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
     );
-    tokio::pin!(output_idle);
+    tokio::pin!(exit_output_drain);
     tokio::pin!(deadline);
 
     loop {
         if status.is_some() && stdout.is_none() && stderr.is_none() {
             break;
         }
-        // After the parent exits, drain ready pipe data before treating inherited handles as idle.
+        // After the parent exits, drain ready pipe data for a bounded period
+        // before terminating descendants that retained inherited handles.
         tokio::select! {
             biased;
             _ = &mut deadline, if timeout.is_some() => {
@@ -682,9 +683,10 @@ async fn execute_with_cancellation(
                 cancelled = true;
                 break;
             }
+            _ = &mut exit_output_drain, if status.is_some() => break,
             result = child.wait(), if status.is_none() => {
                 status = Some(result?);
-                output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
+                exit_output_drain.as_mut().reset(Instant::now() + EXIT_OUTPUT_DRAIN_GRACE);
             }
             (is_stdout, result) = async {
                 tokio::select! {
@@ -725,12 +727,8 @@ async fn execute_with_cancellation(
                     if let Some((tasks, id)) = progress {
                         tasks.append_latest_output(id, content).await;
                     }
-                    if status.is_some() {
-                        output_idle.as_mut().reset(Instant::now() + EXIT_OUTPUT_IDLE_GRACE);
-                    }
                 }
             }
-            _ = &mut output_idle, if status.is_some() => break,
         }
     }
 
@@ -1355,6 +1353,30 @@ mod tests {
         .unwrap();
 
         assert!(String::from_utf8(output).unwrap().contains("tail4"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_completion_bounds_continuous_descendant_output_after_parent_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = find_executable("bash").unwrap();
+        let output = time::timeout(
+            Duration::from_secs(1),
+            execute(
+                "bash",
+                &executable,
+                directory.path(),
+                "(while :; do printf x; sleep 0.05; done) &",
+                &BTreeMap::new(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("shell cleanup must not wait indefinitely for descendant output")
+        .unwrap();
+
+        assert!(!output.is_empty());
     }
 
     #[cfg(unix)]

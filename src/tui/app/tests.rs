@@ -775,7 +775,7 @@ fn transient_notifications_overlay_without_reflowing_base_surfaces() {
 }
 
 #[test]
-fn conversation_footer_only_shows_context_model_and_effort() {
+fn conversation_footer_keeps_inactive_task_status_hidden() {
     let mut app = test_app();
     app.push(
         BlockKind::Assistant,
@@ -837,6 +837,109 @@ fn conversation_footer_only_shows_context_model_and_effort() {
     assert_eq!(hit_target(&app.hit_regions, click), Some(AppHit::Status));
     open_status(&mut app);
     assert!(app.overlay == Some(Overlay::Status));
+}
+
+#[test]
+fn conversation_footer_shows_active_tasks_and_compacts_the_badge() {
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        false,
+    );
+    app.active_task_count = 2;
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.lines().last().unwrap().contains("● 2 tasks"));
+    let task_region = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == AppHit::TaskStatus)
+        .copied()
+        .expect("task badge mouse target");
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: task_region.area.x,
+        row: task_region.area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(
+        hit_target(&app.hit_regions, click),
+        Some(AppHit::TaskStatus)
+    );
+
+    let rendered = render_to_string(&mut app, 36, 24);
+    assert!(rendered.lines().last().unwrap().contains("●2"));
+    assert!(!rendered.lines().last().unwrap().contains("● 2 tasks"));
+
+    app.active_task_count = 1;
+    assert!(render_to_string(&mut app, 100, 24).contains("● 1 task"));
+
+    app.active_task_count = 0;
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(!rendered.contains("● 1 task"));
+    assert!(
+        app.hit_regions
+            .iter()
+            .all(|region| region.target != AppHit::TaskStatus)
+    );
+}
+
+#[tokio::test]
+async fn task_state_refresh_follows_the_manager_and_preserves_panel_selection() {
+    let tasks = TaskManager::new();
+    let first = tasks.allocate_background("bash", "first").await.unwrap();
+    let first_id = first.id.clone();
+    tasks
+        .spawn(first, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(Vec::new())
+        })
+        .await;
+    let second = tasks.allocate_background("bash", "second").await.unwrap();
+    let second_id = second.id.clone();
+    tasks.spawn(second, async { Ok(b"done".to_vec()) }).await;
+    let foreground = tasks.allocate("bash", "foreground").await;
+    tasks
+        .spawn(foreground, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(Vec::new())
+        })
+        .await;
+
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Tasks);
+    refresh_task_state(&mut app, &tasks).await;
+    app.selected_task = app
+        .task_records
+        .iter()
+        .position(|task| task.id == first_id)
+        .unwrap();
+    tasks
+        .wait(&second_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    refresh_task_state(&mut app, &tasks).await;
+
+    assert_eq!(
+        app.task_records[app.selected_task].id, first_id,
+        "a completion must not move the selected task"
+    );
+    assert_eq!(
+        app.task_records
+            .iter()
+            .find(|task| task.id == second_id)
+            .unwrap()
+            .status,
+        crate::task::TaskStatus::Completed
+    );
+    assert_eq!(app.active_task_count, 1);
+
+    tasks.cancel(&first_id).await;
+    tasks.shutdown().await;
 }
 
 #[test]

@@ -310,6 +310,7 @@ enum AppHit {
     Setting(usize),
     SettingsTab(usize),
     Selector(usize),
+    TaskStatus,
     Status,
 }
 
@@ -822,6 +823,7 @@ struct App {
     blocks: Vec<DisplayBlock>,
     protocols: Vec<ProtocolDescriptor>,
     protocol_source: Option<Arc<ProtocolRegistry>>,
+    active_task_count: usize,
     task_records: Vec<TaskRecord>,
     selected_task: usize,
     selected_block: usize,
@@ -920,6 +922,7 @@ impl App {
             blocks: Vec::new(),
             protocols,
             protocol_source: None,
+            active_task_count: 0,
             task_records: Vec::new(),
             selected_task: 0,
             selected_block: 0,

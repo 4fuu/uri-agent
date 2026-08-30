@@ -482,6 +482,7 @@ impl TuiTerminal {
             effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
         let session = runtime.session().clone();
         let mut receiver = session.subscribe();
+        let mut task_receiver = tasks.subscribe();
         let mut pending_receiver = runtime.subscribe_pending_messages();
         let keymap = Keymap::load(Some(&info.cwd), info.key_display).await?;
         let show_splash = std::mem::take(&mut self.first_session);
@@ -498,6 +499,7 @@ impl TuiTerminal {
         app.pending_messages = pending_receiver.borrow().clone();
         app.protocol_source = Some(protocols);
         hydrate_session_history(&mut app, &session).await?;
+        refresh_task_state(&mut app, &tasks).await;
         if runtime.turn_running().await {
             app.busy = true;
             app.busy_since = Some(Instant::now());
@@ -518,6 +520,7 @@ impl TuiTerminal {
             &mut app,
             services,
             &mut receiver,
+            &mut task_receiver,
             &mut pending_receiver,
             refresh_catalog_on_start,
         )
@@ -549,6 +552,7 @@ pub(super) async fn run_loop(
     app: &mut App,
     services: LoopServices,
     receiver: &mut tokio::sync::broadcast::Receiver<SessionUpdate>,
+    task_receiver: &mut tokio::sync::broadcast::Receiver<crate::task::TaskNotice>,
     pending_receiver: &mut watch::Receiver<Vec<PendingMessage>>,
     refresh_catalog_on_start: bool,
 ) -> Result<TuiOutcome> {
@@ -561,6 +565,7 @@ pub(super) async fn run_loop(
     let mut animation_clock = AnimationClock::new(now);
     let mut scheduler = RenderScheduler::new(now);
     let mut redraw = true;
+    let mut task_updates_open = true;
     loop {
         let now = Instant::now();
         animation_clock.set_paused(app.animations_paused(), now);
@@ -707,6 +712,17 @@ pub(super) async fn run_loop(
                     return persist_and_exit(app, &services, TuiOutcome::Quit).await;
                 }
             },
+            task = task_receiver.recv(), if task_updates_open => {
+                match task {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        refresh_task_state(app, &services.tasks).await;
+                        scheduler.request_coalesced();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        task_updates_open = false;
+                    }
+                }
+            },
             changed = pending_receiver.changed() => {
                 if changed.is_ok() {
                     app.pending_messages = pending_receiver.borrow().clone();
@@ -723,6 +739,28 @@ pub(super) async fn run_loop(
             redraw = true;
         }
     }
+}
+
+pub(super) async fn refresh_task_state(app: &mut App, tasks: &TaskManager) {
+    let selected_id = app
+        .task_records
+        .get(app.selected_task)
+        .map(|task| task.id.clone());
+    let records = tasks.list().await;
+    app.active_task_count = records
+        .iter()
+        .filter(|task| task.background && !task.status.terminal())
+        .count();
+    if app.overlay != Some(Overlay::Tasks) {
+        return;
+    }
+    app.task_records = records;
+    app.selected_task = selected_id
+        .and_then(|id| app.task_records.iter().position(|task| task.id == id))
+        .unwrap_or_else(|| {
+            app.selected_task
+                .min(app.task_records.len().saturating_sub(1))
+        });
 }
 
 pub(super) async fn persist_and_exit(
@@ -1411,10 +1449,10 @@ async fn dispatch_ui_command_with_arguments(
             Action::Continue
         }
         CoreCommand::Tasks => {
-            app.task_records = services.tasks.list().await;
             app.selected_task = 0;
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Tasks);
+            refresh_task_state(app, &services.tasks).await;
             Action::Continue
         }
         CoreCommand::Protocols => {
@@ -1750,7 +1788,7 @@ pub(super) async fn handle_overlay_key(
                     .map(|task| task.id.clone())
                 {
                     let _ = services.tasks.cancel(&id).await;
-                    app.task_records = services.tasks.list().await;
+                    refresh_task_state(app, &services.tasks).await;
                 }
                 Action::Continue
             }
@@ -2885,6 +2923,14 @@ pub(super) async fn handle_mouse(
                     if confirm {
                         return confirm_selector(app, services).await;
                     }
+                }
+                AppHit::TaskStatus => {
+                    return dispatch_ui_command(
+                        app,
+                        CommandTarget::Core(CoreCommand::Tasks),
+                        services,
+                    )
+                    .await;
                 }
                 AppHit::Status => open_status(app),
             }
