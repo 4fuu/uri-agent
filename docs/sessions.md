@@ -17,10 +17,12 @@ migration into `sessions-v3.db`.
 
 ## AgentHost and Agent specifications
 
-One process-wide `AgentHost` gives the TUI, linked and WASM plugins, child
-Agents, and resident plugins the same full `AgentRuntime` behavior and normal
-session persistence. The former subagent API, SDK, and ABI have been removed
-without a compatibility path.
+A project runtime owns one `AgentHost`, giving the TUI, linked and WASM plugins,
+child Agents, and resident plugins the same full `AgentRuntime` behavior and
+normal session persistence. A normal TUI process has one such runtime; an ACP
+process may keep one isolated `AgentHost` for each canonical project directory.
+The former subagent API, SDK, and ABI have been removed without a compatibility
+path.
 
 An `AgentSpec` selects provider, model, thinking effort, working directory,
 required parent session, system-prompt mode (`inherit`, `append`, or `replace`),
@@ -45,8 +47,11 @@ background. On the first submit, the TUI leaves the welcome view and presents
 the user message immediately while that preparation continues. Persistence
 still waits for the context, then URI Agent writes the frozen context, queued
 startup events, and message in one transaction. Opening and closing an empty
-TUI session creates no session record. ACP explicitly persists a newly created
-empty session so the client can list, close, and later reopen its assigned ID.
+TUI session creates no session record. ACP follows the same persistence
+boundary: `session/new` reserves an in-memory ID and session setup, and the
+first durably accepted prompt creates the native session with that ID. Pending
+ACP sessions can be listed and closed by their owning process but do not
+survive its exit.
 
 The canonical startup directory is the project boundary recorded with every session:
 
@@ -55,10 +60,13 @@ The canonical startup directory is the project boundary recorded with every sess
 - `--session <id>` resumes that ID only when it belongs to the project;
 - `:resume` lists project sessions with their model and thinking effort.
 
-ACP-created depth-1 sessions use the same project-scoped database and can be
-opened through these normal TUI paths after the ACP owner releases them. Their
-private frontend records restore reconstructible capability state, such as an
-ACP-provided MCP profile, without placing secret values in append-only events.
+Materialized ACP-created depth-1 sessions use the same project-scoped database
+and can be opened through these normal TUI paths after the ACP owner releases
+them. Their private frontend records restore reconstructible capability state,
+such as an ACP-provided MCP profile, without placing secret values in
+append-only events. One ACP process may own sessions from multiple projects,
+but each session remains bound to exactly one canonical project and its
+project-local configuration, plugins, MCP runtime, and Skills.
 See [ACP v1](acp.md#project-and-session-lifecycle).
 
 The read-only `sessions` protocol can search archives across projects when explicitly requested. `@@` completion remains project-scoped. Archive reads never resume or modify a session; see [`sessions`](protocols.md#sessions).

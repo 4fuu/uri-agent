@@ -48,7 +48,8 @@ supported providers.
   exposing each one as an on-demand `<name>-mcp://` protocol with query-first
   arguments and a complete-JSON fallback for complex schemas.
 - **ACP editor integration:** `uri-agent --acpv1` serves stable ACP v1 over
-  stdio, with durable sessions that can later reopen through the normal TUI.
+  stdio, with per-session model setup and conversations that can later reopen
+  through the normal TUI.
 - **Broad model access:** the pi.dev catalog, provider-specific sign-in, and
   credential-scoped live discovery bring a wide provider ecosystem into one
   model selector.
@@ -146,17 +147,20 @@ authentication, offline mode, environment variables, and custom endpoints.
 
 ### Connect an ACP client
 
-After configuring authentication and a default model in the TUI, configure an
-ACP client to launch:
+After configuring model authentication in the TUI, configure an ACP client to
+launch:
 
 ```text
 uri-agent --acpv1
 ```
 
-The client supplies each session's absolute project directory. ACP-created
-sessions use the normal durable session store and can reopen in the TUI after
-the client releases them. See [ACP v1](docs/acp.md) for supported content, MCP
-servers, lifecycle operations, and ownership constraints.
+The client supplies each session's absolute project directory; one ACP process
+can host independent sessions for multiple projects. Compatible ACP clients can
+select an authenticated model and thinking level before the first prompt
+without changing URI Agent's defaults. The first prompt makes the session
+durable under its already assigned ID; it can reopen in the TUI after the client
+releases it. See [ACP v1](docs/acp.md) for supported content, MCP servers,
+lifecycle operations, and ownership constraints.
 
 ## Documentation
 

@@ -797,6 +797,10 @@ pub(crate) struct SessionEventReadAudit {
 }
 
 impl Session {
+    pub(crate) fn new_id() -> String {
+        new_session_id()
+    }
+
     pub async fn list_for(cwd: &Path) -> Result<Vec<SessionSummary>> {
         list_project_sessions(session_database_path(cwd), cwd).await
     }

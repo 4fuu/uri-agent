@@ -4,19 +4,23 @@ use crate::builtins::{
     SessionMcpProfile, SessionMcpServer, SessionMcpTransport, session_profile_owner,
     session_profile_record,
 };
+use crate::catalog::{CatalogModel, ModelCatalog, ThinkingLevel};
 use crate::config::{Cli, Config, ConfigManager};
+use crate::model::clamp_thinking_level;
 use crate::protocol::{ProtocolImage, ProtocolImageMediaType};
 use crate::runtime::TurnOutcome;
 use crate::session::{EventKind, Session, SessionEvent, SessionUpdate as NativeSessionUpdate};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
-    ContentChunk, Cost, ImageContent, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionCloseCapabilities, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, StopReason, TextContent,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, ImageContent, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
     ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     UsageUpdate,
 };
@@ -25,9 +29,10 @@ use agent_client_protocol::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chrono::{DateTime, Utc};
 use http::HeaderName;
 use rig::message::{DocumentSourceKind, ImageMediaType, Message, UserContent};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -41,13 +46,20 @@ pub async fn serve(cli: Cli) -> Result<()> {
 
 async fn serve_on(cli: Cli, transport: impl ConnectTo<AcpAgent> + 'static) -> Result<()> {
     let state = Arc::new(AcpV1State::new(cli));
+    serve_state_on(state, transport).await
+}
 
+async fn serve_state_on(
+    state: Arc<AcpV1State>,
+    transport: impl ConnectTo<AcpAgent> + 'static,
+) -> Result<()> {
     let initialize = state.clone();
     let new_session = state.clone();
     let load_session = state.clone();
     let resume_session = state.clone();
     let list_sessions = state.clone();
     let close_session = state.clone();
+    let set_config_option = state.clone();
     let prompt = state.clone();
     let cancel = state.clone();
     let result = AcpAgent
@@ -60,11 +72,8 @@ async fn serve_on(cli: Cli, transport: impl ConnectTo<AcpAgent> + 'static) -> Re
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: NewSessionRequest, responder, connection| {
-                respond(
-                    responder,
-                    new_session.new_session(request, &connection).await,
-                )
+            async move |request: NewSessionRequest, responder, _connection| {
+                respond(responder, new_session.new_session(request).await)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -99,16 +108,28 @@ async fn serve_on(cli: Cli, transport: impl ConnectTo<AcpAgent> + 'static) -> Re
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |request: SetSessionConfigOptionRequest, responder, _connection| {
+                respond(
+                    responder,
+                    set_config_option.set_config_option(request).await,
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async move |request: PromptRequest, responder, connection| {
                 let session = match prompt.begin_prompt(&request.session_id.to_string()).await {
                     Ok(session) => session,
                     Err(error) => return responder.respond_with_error(error),
                 };
                 let task_session = session.clone();
+                let task_connection = connection.clone();
                 let spawn = connection.spawn({
                     let prompt = prompt.clone();
                     async move {
-                        let result = prompt.prompt(request, &task_session).await;
+                        let result = prompt
+                            .prompt(request, &task_session, &task_connection)
+                            .await;
                         prompt.finish_prompt(&task_session).await;
                         respond(responder, result)
                     }
@@ -158,12 +179,33 @@ fn respond<T: agent_client_protocol::JsonRpcResponse>(
 struct AcpProject {
     cwd: PathBuf,
     manager: Arc<ConfigManager>,
+    catalog: Arc<ModelCatalog>,
     host: AgentHost,
 }
 
 struct AcpSession {
-    agent: AgentHandle,
+    id: String,
+    cwd: PathBuf,
+    created_at: DateTime<Utc>,
+    state: Mutex<AcpSessionState>,
     prompt: Mutex<AcpPromptState>,
+}
+
+enum AcpSessionState {
+    Pending(Box<AcpPendingSession>),
+    Active(Arc<AcpActiveSession>),
+    Closed,
+}
+
+struct AcpPendingSession {
+    project: Arc<AcpProject>,
+    spec: AgentSpec,
+    options: AgentOpenOptions,
+}
+
+struct AcpActiveSession {
+    agent: AgentHandle,
+    spec: AgentSpec,
     projection: ProjectionHandle,
 }
 
@@ -212,7 +254,7 @@ impl AcpPromptState {
 
 struct AcpV1State {
     cli: Cli,
-    project: Mutex<Option<Arc<AcpProject>>>,
+    projects: Mutex<HashMap<PathBuf, Arc<AcpProject>>>,
     sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
 }
 
@@ -220,7 +262,7 @@ impl AcpV1State {
     fn new(cli: Cli) -> Self {
         Self {
             cli,
-            project: Mutex::new(None),
+            projects: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -247,14 +289,8 @@ impl AcpV1State {
         let cwd = tokio::fs::canonicalize(cwd)
             .await
             .with_context(|| format!("cannot resolve ACP session cwd {}", cwd.display()))?;
-        let mut project = self.project.lock().await;
-        if let Some(project) = project.as_ref() {
-            if project.cwd != cwd {
-                bail!(
-                    "this ACP process is already bound to project {}",
-                    project.cwd.display()
-                );
-            }
+        let mut projects = self.projects.lock().await;
+        if let Some(project) = projects.get(&cwd) {
             return Ok(project.clone());
         }
 
@@ -266,6 +302,7 @@ impl AcpV1State {
         cli.background = false;
         let config = Config::load(cli).await?;
         let manager = config.manager.clone();
+        let catalog = config.catalog.clone();
         let host = AgentHost::new(
             config.manager,
             config.environment,
@@ -273,15 +310,19 @@ impl AcpV1State {
             config.cwd,
         )
         .await?;
-        let initialized = Arc::new(AcpProject { cwd, manager, host });
-        *project = Some(initialized.clone());
+        let initialized = Arc::new(AcpProject {
+            cwd,
+            manager,
+            catalog,
+            host,
+        });
+        projects.insert(initialized.cwd.clone(), initialized.clone());
         Ok(initialized)
     }
 
     async fn new_session(
         &self,
         request: NewSessionRequest,
-        connection: &ConnectionTo<AcpClient>,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         reject_additional_directories(&request.additional_directories)?;
         let project = self.project(&request.cwd).await.map_err(invalid_params)?;
@@ -290,27 +331,32 @@ impl AcpV1State {
         let mut options = AgentOpenOptions::default();
         options.private_records.insert(owner, payload);
         let initial = project.manager.current().await;
-        let agent = project
-            .host
-            .open_root_with_options(
-                None,
-                AgentSpec::root(
-                    &initial.provider,
-                    &initial.model,
-                    initial.thinking,
-                    &project.cwd,
-                ),
+        let spec = AgentSpec::root(
+            &initial.provider,
+            &initial.model,
+            initial.thinking,
+            &project.cwd,
+        );
+        let config_options = pending_config_options(&project, &spec).await;
+        let session_id = Session::new_id();
+        let session = Arc::new(AcpSession {
+            id: session_id.clone(),
+            cwd: project.cwd.clone(),
+            created_at: Utc::now(),
+            state: Mutex::new(AcpSessionState::Pending(Box::new(AcpPendingSession {
+                project,
+                spec,
                 options,
-            )
-            .await
-            .map_err(invalid_params)?;
-        if let Err(error) = prepare_and_persist(&agent).await {
-            agent.close().await;
-            return Err(invalid_params(error));
+            }))),
+            prompt: Mutex::new(AcpPromptState::default()),
+        });
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&session_id) {
+            return Err(internal_error("generated a duplicate ACP session ID"));
         }
-        let session_id = agent.session_id().to_string();
-        self.insert_session(agent, connection, false).await?;
-        Ok(NewSessionResponse::new(session_id))
+        sessions.insert(session_id.clone(), session);
+        drop(sessions);
+        Ok(NewSessionResponse::new(session_id).config_options(config_options))
     }
 
     async fn load_session(
@@ -320,15 +366,16 @@ impl AcpV1State {
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
         reject_additional_directories(&request.additional_directories)?;
         let session_id = request.session_id.to_string();
-        self.open_existing(
-            &request.cwd,
-            &session_id,
-            request.mcp_servers,
-            connection,
-            true,
-        )
-        .await?;
-        Ok(LoadSessionResponse::new())
+        let active = self
+            .open_existing(
+                &request.cwd,
+                &session_id,
+                request.mcp_servers,
+                connection,
+                true,
+            )
+            .await?;
+        Ok(LoadSessionResponse::new().config_options(frozen_config_options(&active.spec)))
     }
 
     async fn resume_session(
@@ -338,15 +385,16 @@ impl AcpV1State {
     ) -> agent_client_protocol::Result<ResumeSessionResponse> {
         reject_additional_directories(&request.additional_directories)?;
         let session_id = request.session_id.to_string();
-        self.open_existing(
-            &request.cwd,
-            &session_id,
-            request.mcp_servers,
-            connection,
-            false,
-        )
-        .await?;
-        Ok(ResumeSessionResponse::new())
+        let active = self
+            .open_existing(
+                &request.cwd,
+                &session_id,
+                request.mcp_servers,
+                connection,
+                false,
+            )
+            .await?;
+        Ok(ResumeSessionResponse::new().config_options(frozen_config_options(&active.spec)))
     }
 
     async fn open_existing(
@@ -356,7 +404,7 @@ impl AcpV1State {
         mcp_servers: Vec<McpServer>,
         connection: &ConnectionTo<AcpClient>,
         replay: bool,
-    ) -> agent_client_protocol::Result<Arc<AcpSession>> {
+    ) -> agent_client_protocol::Result<Arc<AcpActiveSession>> {
         if self.sessions.lock().await.contains_key(session_id) {
             return Err(invalid_params("ACP session is already active"));
         }
@@ -393,20 +441,22 @@ impl AcpV1State {
         }
         let agent = project
             .host
-            .open_root_with_deferred_resume(Some(session_id), spec, options)
+            .open_root_with_deferred_resume(Some(session_id), spec.clone(), options)
             .await
             .map_err(invalid_params)?;
         if let Err(error) = agent.services().runtime.prepare_context().await {
             agent.close().await;
             return Err(invalid_params(error));
         }
-        let session = self.insert_session(agent, connection, replay).await?;
-        if let Err(error) = session.agent.services().runtime.resume_pending().await {
+        let active = self
+            .insert_active_session(agent, spec, connection, replay)
+            .await?;
+        if let Err(error) = active.agent.services().runtime.resume_pending().await {
             self.sessions.lock().await.remove(session_id);
-            close_acp_session(&session, false).await;
+            close_active_session(&active, false).await;
             return Err(invalid_params(error));
         }
-        Ok(session)
+        Ok(active)
     }
 
     async fn list_sessions(
@@ -416,24 +466,72 @@ impl AcpV1State {
         if request.cursor.is_some() {
             return Err(invalid_params("session/list cursor is not supported"));
         }
-        let project = match request.cwd {
-            Some(cwd) => Some(self.project(&cwd).await.map_err(invalid_params)?),
-            None => self.project.lock().await.clone(),
+        let filtered_by_project = request.cwd.is_some();
+        let projects = match request.cwd {
+            Some(cwd) => vec![self.project(&cwd).await.map_err(invalid_params)?],
+            None => self.projects.lock().await.values().cloned().collect(),
         };
-        let Some(project) = project else {
+        if projects.is_empty() {
             return Ok(ListSessionsResponse::new(Vec::new()));
-        };
-        let sessions = Session::list_for(&project.cwd)
+        }
+        let project_filter = filtered_by_project.then(|| projects[0].cwd.as_path());
+        let active_sessions = self
+            .sessions
+            .lock()
             .await
-            .map_err(internal_error)?
-            .into_iter()
-            .map(|session| {
-                SessionInfo::new(session.id, project.cwd.clone())
-                    .title(session.preview)
-                    .updated_at(session.updated_at.to_rfc3339())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for session in active_sessions {
+            if project_filter.is_none_or(|cwd| cwd == session.cwd)
+                && matches!(*session.state.lock().await, AcpSessionState::Pending(_))
+            {
+                pending.push((
+                    session.created_at,
+                    SessionInfo::new(session.id.clone(), session.cwd.clone())
+                        .title("empty session")
+                        .updated_at(session.created_at.to_rfc3339()),
+                ));
+            }
+        }
+        let mut sessions = Vec::new();
+        for project in projects {
+            sessions.extend(
+                Session::list_for(&project.cwd)
+                    .await
+                    .map_err(internal_error)?
+                    .into_iter()
+                    .map(|session| {
+                        (
+                            session.updated_at,
+                            SessionInfo::new(session.id, project.cwd.clone())
+                                .title(session.preview)
+                                .updated_at(session.updated_at.to_rfc3339()),
+                        )
+                    }),
+            );
+        }
+        let mut listed = sessions
+            .iter()
+            .map(|(_, session)| session.session_id.to_string())
+            .collect::<HashSet<_>>();
+        sessions.extend(
+            pending
+                .into_iter()
+                .filter(|(_, session)| listed.insert(session.session_id.to_string())),
+        );
+        sessions.sort_by(|(left_at, left), (right_at, right)| {
+            right_at.cmp(left_at).then_with(|| {
+                right
+                    .session_id
+                    .to_string()
+                    .cmp(&left.session_id.to_string())
             })
-            .collect();
-        Ok(ListSessionsResponse::new(sessions))
+        });
+        Ok(ListSessionsResponse::new(
+            sessions.into_iter().map(|(_, session)| session).collect(),
+        ))
     }
 
     async fn close_session(
@@ -451,21 +549,93 @@ impl AcpV1State {
         Ok(CloseSessionResponse::new())
     }
 
+    async fn set_config_option(
+        &self,
+        request: SetSessionConfigOptionRequest,
+    ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
+        let session = self.session(&request.session_id.to_string()).await?;
+        let prompt = session.prompt.lock().await;
+        if prompt.active {
+            return Err(invalid_params(
+                "session configuration freezes when the first prompt starts",
+            ));
+        }
+        let config_id = request.config_id.0.as_ref();
+        let value = request.value.0.as_ref();
+        let mut state = session.state.lock().await;
+        let config_options = match &mut *state {
+            AcpSessionState::Pending(pending) => {
+                match config_id {
+                    MODEL_CONFIG_ID => {
+                        let (provider, model) = decode_model_value(value)?;
+                        if provider != pending.spec.provider || model != pending.spec.model {
+                            let selected = selectable_model(pending, &provider, &model)
+                                .await
+                                .ok_or_else(|| invalid_params("unknown ACP model option"))?;
+                            let requested = pending
+                                .project
+                                .manager
+                                .thinking_for_model(&provider, &model)
+                                .await;
+                            pending.spec.provider = provider;
+                            pending.spec.model = model;
+                            pending.spec.thinking = clamp_thinking_level(&selected, requested);
+                        }
+                    }
+                    THINKING_CONFIG_ID => {
+                        let requested = value.parse::<ThinkingLevel>().map_err(invalid_params)?;
+                        let model = pending
+                            .project
+                            .catalog
+                            .model(&pending.spec.provider, &pending.spec.model)
+                            .await;
+                        if requested != pending.spec.thinking
+                            && !model
+                                .as_ref()
+                                .is_some_and(|model| model.supports_thinking_level(requested))
+                        {
+                            return Err(invalid_params(
+                                "thinking level is not supported by the selected model",
+                            ));
+                        }
+                        pending.spec.thinking = requested;
+                    }
+                    _ => return Err(invalid_params("unknown ACP session configuration option")),
+                }
+                pending_config_options(&pending.project, &pending.spec).await
+            }
+            AcpSessionState::Active(active) => {
+                validate_frozen_config_value(&active.spec, config_id, value)?;
+                frozen_config_options(&active.spec)
+            }
+            AcpSessionState::Closed => return Err(invalid_params("ACP session is closed")),
+        };
+        drop(state);
+        drop(prompt);
+        Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
+
     async fn prompt(
         &self,
         request: PromptRequest,
         session: &Arc<AcpSession>,
+        connection: &ConnectionTo<AcpClient>,
     ) -> agent_client_protocol::Result<PromptResponse> {
         let prompt = convert_prompt(request.prompt)?;
-        let runtime = session.agent.services().runtime.clone();
-        let mut completions = runtime.subscribe_turn_completions();
-        let submission_id = session
-            .agent
-            .submit_prompt_exclusive(prompt)
-            .await
-            .map_err(prompt_error)?;
+        let (active, mut completions, submission_id, froze) =
+            self.submit_prompt(session, prompt, connection).await?;
+        if froze {
+            connection
+                .send_notification(SessionNotification::new(
+                    session.id.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                        frozen_config_options(&active.spec),
+                    )),
+                ))
+                .map_err(internal_error)?;
+        }
         if session.prompt.lock().await.submitted(submission_id) {
-            session.agent.cancel_submission(submission_id).await;
+            active.agent.cancel_submission(submission_id).await;
         }
 
         let completion = loop {
@@ -480,8 +650,9 @@ impl AcpV1State {
                 }
             }
         };
+        let runtime = active.agent.services().runtime.clone();
         let through_sequence = runtime.session().head_sequence().await;
-        session
+        active
             .projection
             .wait_through(through_sequence)
             .await
@@ -493,12 +664,76 @@ impl AcpV1State {
         }
     }
 
+    async fn submit_prompt(
+        &self,
+        session: &AcpSession,
+        prompt: AgentPrompt,
+        connection: &ConnectionTo<AcpClient>,
+    ) -> agent_client_protocol::Result<(
+        Arc<AcpActiveSession>,
+        broadcast::Receiver<crate::runtime::TurnCompletion>,
+        u64,
+        bool,
+    )> {
+        let mut state = session.state.lock().await;
+        match &*state {
+            AcpSessionState::Active(active) => {
+                let active = active.clone();
+                let completions = active.agent.services().runtime.subscribe_turn_completions();
+                let submission_id = active
+                    .agent
+                    .submit_prompt_exclusive(prompt)
+                    .await
+                    .map_err(prompt_error)?;
+                Ok((active, completions, submission_id, false))
+            }
+            AcpSessionState::Pending(pending) => {
+                let spec = pending.spec.clone();
+                let agent = pending
+                    .project
+                    .host
+                    .open_root_with_options(
+                        Some(&session.id),
+                        spec.clone(),
+                        pending.options.clone(),
+                    )
+                    .await
+                    .map_err(invalid_params)?;
+                let projection =
+                    match ProjectionHandle::start(&agent, connection.clone(), false).await {
+                        Ok(projection) => projection,
+                        Err(error) => {
+                            agent.close().await;
+                            return Err(internal_error(error));
+                        }
+                    };
+                let active = Arc::new(AcpActiveSession {
+                    agent,
+                    spec,
+                    projection,
+                });
+                let completions = active.agent.services().runtime.subscribe_turn_completions();
+                let submission_id = match active.agent.submit_prompt_exclusive(prompt).await {
+                    Ok(submission_id) => submission_id,
+                    Err(error) => {
+                        close_active_session(&active, false).await;
+                        return Err(prompt_error(error));
+                    }
+                };
+                *state = AcpSessionState::Active(active.clone());
+                Ok((active, completions, submission_id, true))
+            }
+            AcpSessionState::Closed => Err(invalid_params("ACP session is closed")),
+        }
+    }
+
     async fn cancel(&self, notification: CancelNotification) {
         let session_id = notification.session_id.to_string();
         if let Some(session) = self.sessions.lock().await.get(&session_id).cloned()
             && let Some(submission_id) = Self::request_prompt_cancellation(&session).await
+            && let Some(active) = active_session(&session).await
         {
-            session.agent.cancel_submission(submission_id).await;
+            active.agent.cancel_submission(submission_id).await;
         }
     }
 
@@ -530,12 +765,13 @@ impl AcpV1State {
             .ok_or_else(|| invalid_params(format!("unknown active session {session_id}")))
     }
 
-    async fn insert_session(
+    async fn insert_active_session(
         &self,
         agent: AgentHandle,
+        spec: AgentSpec,
         connection: &ConnectionTo<AcpClient>,
         replay: bool,
-    ) -> agent_client_protocol::Result<Arc<AcpSession>> {
+    ) -> agent_client_protocol::Result<Arc<AcpActiveSession>> {
         let session_id = agent.session_id().to_string();
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(&session_id) {
@@ -551,13 +787,20 @@ impl AcpV1State {
                 return Err(internal_error(error));
             }
         };
-        let session = Arc::new(AcpSession {
+        let active = Arc::new(AcpActiveSession {
             agent,
-            prompt: Mutex::new(AcpPromptState::default()),
+            spec,
             projection,
         });
-        sessions.insert(session_id, session.clone());
-        Ok(session)
+        let session = Arc::new(AcpSession {
+            id: session_id.clone(),
+            cwd: active.spec.working_directory.clone(),
+            created_at: Utc::now(),
+            state: Mutex::new(AcpSessionState::Active(active.clone())),
+            prompt: Mutex::new(AcpPromptState::default()),
+        });
+        sessions.insert(session_id, session);
+        Ok(active)
     }
 
     async fn shutdown(&self) {
@@ -574,10 +817,220 @@ impl AcpV1State {
     }
 }
 
-async fn prepare_and_persist(agent: &AgentHandle) -> Result<()> {
-    let runtime = &agent.services().runtime;
-    runtime.prepare_context().await?;
-    runtime.session().persist().await
+const MODEL_CONFIG_ID: &str = "model";
+const THINKING_CONFIG_ID: &str = "thought_level";
+
+async fn pending_config_options(
+    project: &AcpProject,
+    spec: &AgentSpec,
+) -> Vec<SessionConfigOption> {
+    let models = selectable_models(project, spec).await;
+    let selected_model = model_value(&spec.provider, &spec.model);
+    let mut grouped = BTreeMap::<String, Vec<SessionConfigSelectOption>>::new();
+    for model in &models {
+        let name = if model.name.trim().is_empty() {
+            model.id.clone()
+        } else {
+            model.name.clone()
+        };
+        let mut option =
+            SessionConfigSelectOption::new(model_value(&model.provider, &model.id), name);
+        if model.name.trim().is_empty() || model.name == model.id {
+            option = option.description(format!("{}/{}", model.provider, model.id));
+        } else {
+            option = option.description(model.id.clone());
+        }
+        grouped
+            .entry(model.provider.clone())
+            .or_default()
+            .push(option);
+    }
+    if !models
+        .iter()
+        .any(|model| model.provider == spec.provider && model.id == spec.model)
+    {
+        let provider = if spec.provider.is_empty() {
+            "URI Agent".to_string()
+        } else {
+            spec.provider.clone()
+        };
+        let name = if spec.model.is_empty() {
+            "Not configured".to_string()
+        } else {
+            spec.model.clone()
+        };
+        grouped.entry(provider).or_default().push(
+            SessionConfigSelectOption::new(selected_model.clone(), name)
+                .description("Current default; select an authenticated model before prompting"),
+        );
+    }
+    let model_groups = grouped
+        .into_iter()
+        .map(|(provider, mut options)| {
+            options.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.value.0.cmp(&right.value.0))
+            });
+            SessionConfigSelectGroup::new(format!("provider:{provider}"), provider, options)
+        })
+        .collect::<Vec<_>>();
+    let model = project.catalog.model(&spec.provider, &spec.model).await;
+    vec![
+        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", selected_model, model_groups)
+            .category(SessionConfigOptionCategory::Model),
+        thinking_config_option(spec.thinking, model.as_ref(), false),
+    ]
+}
+
+async fn selectable_models(project: &AcpProject, spec: &AgentSpec) -> Vec<CatalogModel> {
+    let providers = project
+        .manager
+        .model_providers_with_credentials(&spec.provider)
+        .await;
+    let mut models = Vec::new();
+    for provider in providers {
+        models.extend(project.catalog.models(&provider).await);
+    }
+    if !spec.provider.is_empty()
+        && !spec.model.is_empty()
+        && !models
+            .iter()
+            .any(|model| model.provider == spec.provider && model.id == spec.model)
+        && let Some(current) = project.catalog.model(&spec.provider, &spec.model).await
+    {
+        models.push(current);
+    }
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    models
+}
+
+async fn selectable_model(
+    pending: &AcpPendingSession,
+    provider: &str,
+    model: &str,
+) -> Option<CatalogModel> {
+    let providers = pending
+        .project
+        .manager
+        .model_providers_with_credentials(&pending.spec.provider)
+        .await;
+    if !providers.contains(provider) {
+        return None;
+    }
+    pending
+        .project
+        .catalog
+        .models(provider)
+        .await
+        .into_iter()
+        .find(|candidate| candidate.id == model)
+}
+
+fn frozen_config_options(spec: &AgentSpec) -> Vec<SessionConfigOption> {
+    let model_name = if spec.model.is_empty() {
+        "Not configured".to_string()
+    } else {
+        spec.model.clone()
+    };
+    let selected_model = model_value(&spec.provider, &spec.model);
+    vec![
+        SessionConfigOption::select(
+            MODEL_CONFIG_ID,
+            "Model",
+            selected_model.clone(),
+            vec![SessionConfigSelectOption::new(selected_model, model_name)],
+        )
+        .category(SessionConfigOptionCategory::Model),
+        thinking_config_option(spec.thinking, None, true),
+    ]
+}
+
+fn thinking_config_option(
+    current: ThinkingLevel,
+    model: Option<&CatalogModel>,
+    frozen: bool,
+) -> SessionConfigOption {
+    let levels = if frozen {
+        vec![current]
+    } else if let Some(model) = model {
+        let mut levels = ThinkingLevel::ALL
+            .into_iter()
+            .filter(|level| model.supports_thinking_level(*level))
+            .collect::<Vec<_>>();
+        if !levels.contains(&current) {
+            levels.push(current);
+            levels.sort_by_key(|level| {
+                ThinkingLevel::ALL
+                    .iter()
+                    .position(|candidate| candidate == level)
+                    .unwrap_or_default()
+            });
+        }
+        levels
+    } else {
+        vec![current]
+    };
+    let options = levels
+        .into_iter()
+        .map(|level| {
+            let value = level.to_string();
+            SessionConfigSelectOption::new(value.clone(), value)
+        })
+        .collect::<Vec<_>>();
+    SessionConfigOption::select(
+        THINKING_CONFIG_ID,
+        "Thinking level",
+        current.to_string(),
+        options,
+    )
+    .category(SessionConfigOptionCategory::ThoughtLevel)
+}
+
+fn model_value(provider: &str, model: &str) -> String {
+    serde_json::to_string(&[provider, model]).expect("model IDs are serializable")
+}
+
+fn decode_model_value(value: &str) -> agent_client_protocol::Result<(String, String)> {
+    let [provider, model] = serde_json::from_str::<[String; 2]>(value)
+        .map_err(|_| invalid_params("invalid ACP model option value"))?;
+    Ok((provider, model))
+}
+
+fn validate_frozen_config_value(
+    spec: &AgentSpec,
+    config_id: &str,
+    value: &str,
+) -> agent_client_protocol::Result<()> {
+    let unchanged = match config_id {
+        MODEL_CONFIG_ID => {
+            let (provider, model) = decode_model_value(value)?;
+            provider == spec.provider && model == spec.model
+        }
+        THINKING_CONFIG_ID => value
+            .parse::<ThinkingLevel>()
+            .is_ok_and(|thinking| thinking == spec.thinking),
+        _ => return Err(invalid_params("unknown ACP session configuration option")),
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(invalid_params(
+            "session configuration is frozen after the first prompt",
+        ))
+    }
+}
+
+async fn active_session(session: &AcpSession) -> Option<Arc<AcpActiveSession>> {
+    match &*session.state.lock().await {
+        AcpSessionState::Active(active) => Some(active.clone()),
+        AcpSessionState::Pending(_) | AcpSessionState::Closed => None,
+    }
 }
 
 fn reject_additional_directories(directories: &[PathBuf]) -> agent_client_protocol::Result<()> {
@@ -859,6 +1312,19 @@ impl ProjectionHandle {
 }
 
 async fn close_acp_session(session: &AcpSession, cancel: bool) {
+    let active = {
+        let mut state = session.state.lock().await;
+        match std::mem::replace(&mut *state, AcpSessionState::Closed) {
+            AcpSessionState::Active(active) => Some(active),
+            AcpSessionState::Pending(_) | AcpSessionState::Closed => None,
+        }
+    };
+    if let Some(active) = active {
+        close_active_session(&active, cancel).await;
+    }
+}
+
+async fn close_active_session(session: &AcpActiveSession, cancel: bool) {
     if cancel {
         session.agent.cancel().await;
     }
@@ -1120,10 +1586,64 @@ mod tests {
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::{
         ProtocolVersion,
-        v1::{EnvVariable, McpServerStdio, ResourceLink},
+        v1::{
+            EnvVariable, McpServerStdio, ResourceLink, SessionConfigKind,
+            SessionConfigSelectOptions,
+        },
     };
     use clap::Parser;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn model_project(config_directory: &Path, project_directory: &Path) -> Arc<AcpProject> {
+        let manager = ConfigManager::load_for_test(config_directory, project_directory)
+            .await
+            .unwrap();
+        let catalog = Arc::new(ModelCatalog::load(config_directory, true).await.unwrap());
+        let environment = Arc::new(
+            crate::config::AgentEnvironment::load(config_directory)
+                .await
+                .unwrap(),
+        );
+        let cwd = tokio::fs::canonicalize(project_directory).await.unwrap();
+        let host = AgentHost::new(manager.clone(), environment, catalog.clone(), cwd.clone())
+            .await
+            .unwrap();
+        Arc::new(AcpProject {
+            cwd,
+            manager,
+            catalog,
+            host,
+        })
+    }
+
+    async fn model_state() -> (tempfile::TempDir, Arc<AcpV1State>, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let config_directory = root.path().join("config");
+        let project_directory = root.path().join("project");
+        tokio::fs::create_dir_all(&config_directory).await.unwrap();
+        tokio::fs::create_dir_all(&project_directory).await.unwrap();
+        tokio::fs::write(
+            config_directory.join("models.json"),
+            br#"{"providers":{"acp-alpha":{"baseUrl":"http://127.0.0.1:9/v1","api":"openai-responses","apiKey":"alpha-test-key","models":[{"id":"alpha-model","name":"Alpha","reasoning":true}]},"acp-beta":{"baseUrl":"http://127.0.0.1:9/v1","api":"openai-responses","apiKey":"beta-test-key","models":[{"id":"beta/model","name":"Beta"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            config_directory.join("settings.json"),
+            br#"{"defaultProvider":"acp-alpha","defaultModel":"alpha-model","defaultThinkingLevel":"high"}"#,
+        )
+        .await
+        .unwrap();
+        let project = model_project(&config_directory, &project_directory).await;
+        let cli = Cli::try_parse_from(["uri-agent", "--acpv1", "--offline"]).unwrap();
+        let state = Arc::new(AcpV1State::new(cli));
+        state
+            .projects
+            .lock()
+            .await
+            .insert(project_directory.clone(), project);
+        (root, state, project_directory)
+    }
 
     #[tokio::test]
     async fn line_transport_dispatches_and_stops_on_input_eof() {
@@ -1213,6 +1733,324 @@ mod tests {
                     .await?;
                 assert!(listed.sessions.is_empty());
                 assert!(listed.next_cursor.is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        agent.abort();
+        assert!(agent.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn one_process_keeps_multiple_projects_independent() {
+        let (root, state, first_directory) = model_state().await;
+        let config_directory = root.path().join("config");
+        let second_directory = root.path().join("second-project");
+        tokio::fs::create_dir_all(second_directory.join(".uri-agent"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            second_directory.join(".uri-agent/settings.json"),
+            br#"{"defaultProvider":"acp-beta","defaultModel":"beta/model","defaultThinkingLevel":"off"}"#,
+        )
+        .await
+        .unwrap();
+        let second_project = model_project(&config_directory, &second_directory).await;
+        state
+            .projects
+            .lock()
+            .await
+            .insert(second_directory.clone(), second_project.clone());
+
+        let first_project = state.project(&first_directory).await.unwrap();
+        assert!(!Arc::ptr_eq(&first_project, &second_project));
+        assert!(!Arc::ptr_eq(
+            &first_project.manager,
+            &second_project.manager
+        ));
+        let (first, second) = tokio::join!(
+            state.new_session(NewSessionRequest::new(&first_directory)),
+            state.new_session(NewSessionRequest::new(&second_directory)),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let first_id = first.session_id.to_string();
+        let second_id = second.session_id.to_string();
+        {
+            let first = state.session(&first_id).await.unwrap();
+            let state = first.state.lock().await;
+            let AcpSessionState::Pending(pending) = &*state else {
+                panic!("first project session was unexpectedly materialized");
+            };
+            assert_eq!(pending.spec.provider, "acp-alpha");
+            assert_eq!(pending.spec.model, "alpha-model");
+            assert_eq!(pending.spec.working_directory, first_directory);
+        }
+        {
+            let second = state.session(&second_id).await.unwrap();
+            let state = second.state.lock().await;
+            let AcpSessionState::Pending(pending) = &*state else {
+                panic!("second project session was unexpectedly materialized");
+            };
+            assert_eq!(pending.spec.provider, "acp-beta");
+            assert_eq!(pending.spec.model, "beta/model");
+            assert_eq!(pending.spec.working_directory, second_directory);
+        }
+
+        let first_list = state
+            .list_sessions(ListSessionsRequest::new().cwd(&first_directory))
+            .await
+            .unwrap();
+        assert_eq!(first_list.sessions.len(), 1);
+        assert_eq!(first_list.sessions[0].session_id.to_string(), first_id);
+        assert_eq!(first_list.sessions[0].cwd, first_directory);
+        let second_list = state
+            .list_sessions(ListSessionsRequest::new().cwd(&second_directory))
+            .await
+            .unwrap();
+        assert_eq!(second_list.sessions.len(), 1);
+        assert_eq!(second_list.sessions[0].session_id.to_string(), second_id);
+        assert_eq!(second_list.sessions[0].cwd, second_directory);
+        let all = state
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            all.sessions
+                .into_iter()
+                .map(|session| (session.session_id.to_string(), session.cwd))
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                (first_id.clone(), first_directory),
+                (second_id.clone(), second_directory),
+            ])
+        );
+
+        state
+            .close_session(CloseSessionRequest::new(first_id))
+            .await
+            .unwrap();
+        state
+            .close_session(CloseSessionRequest::new(second_id))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_sessions_select_models_in_memory_until_the_first_prompt() {
+        let (_root, state, project_directory) = model_state().await;
+        let project = state
+            .projects
+            .lock()
+            .await
+            .get(&project_directory)
+            .cloned()
+            .unwrap();
+        let defaults = project.manager.current().await;
+        let settings_path = project.manager.directory().join("settings.json");
+        let original_settings = tokio::fs::read(&settings_path).await.unwrap();
+
+        let first = state
+            .new_session(NewSessionRequest::new(&project_directory))
+            .await
+            .unwrap();
+        let second = state
+            .new_session(NewSessionRequest::new(&project_directory))
+            .await
+            .unwrap();
+        let first_id = first.session_id.to_string();
+        let second_id = second.session_id.to_string();
+        let options = first.config_options.as_ref().unwrap();
+        assert_eq!(options.len(), 2);
+        assert!(matches!(options[0].kind, SessionConfigKind::Select(_)));
+        assert!(
+            Session::persisted_spec(&project_directory, &first_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Session::list_for(&project_directory)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let listed = state
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .sessions
+                .iter()
+                .map(|session| session.session_id.to_string())
+                .collect::<HashSet<_>>(),
+            HashSet::from([first_id.clone(), second_id.clone()])
+        );
+
+        let selected = state
+            .set_config_option(SetSessionConfigOptionRequest::new(
+                first_id.clone(),
+                MODEL_CONFIG_ID,
+                model_value("acp-beta", "beta/model"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(selected.config_options.len(), 2);
+        let first_session = state.session(&first_id).await.unwrap();
+        let second_session = state.session(&second_id).await.unwrap();
+        {
+            let first_state = first_session.state.lock().await;
+            let AcpSessionState::Pending(first_pending) = &*first_state else {
+                panic!("first ACP session was materialized before prompting");
+            };
+            assert_eq!(first_pending.spec.provider, "acp-beta");
+            assert_eq!(first_pending.spec.model, "beta/model");
+            assert_eq!(first_pending.spec.thinking, ThinkingLevel::Off);
+        }
+        {
+            let second_state = second_session.state.lock().await;
+            let AcpSessionState::Pending(second_pending) = &*second_state else {
+                panic!("second ACP session was materialized before prompting");
+            };
+            assert_eq!(second_pending.spec.provider, defaults.provider);
+            assert_eq!(second_pending.spec.model, defaults.model);
+        }
+        assert_eq!(project.manager.current().await.provider, defaults.provider);
+        assert_eq!(project.manager.current().await.model, defaults.model);
+        assert_eq!(
+            tokio::fs::read(&settings_path).await.unwrap(),
+            original_settings
+        );
+
+        first_session.prompt.lock().await.begin().unwrap();
+        assert!(
+            state
+                .set_config_option(SetSessionConfigOptionRequest::new(
+                    first_id.clone(),
+                    MODEL_CONFIG_ID,
+                    model_value("acp-beta", "beta/model"),
+                ))
+                .await
+                .is_err()
+        );
+        first_session.prompt.lock().await.finish();
+
+        state
+            .close_session(CloseSessionRequest::new(first_id.clone()))
+            .await
+            .unwrap();
+        state
+            .close_session(CloseSessionRequest::new(second_id))
+            .await
+            .unwrap();
+        assert!(
+            Session::persisted_spec(&project_directory, &first_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .list_sessions(ListSessionsRequest::new())
+                .await
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_prompt_materializes_the_reserved_session_and_freezes_its_model() {
+        let (_root, state, project_directory) = model_state().await;
+        let (client_transport, agent_transport) = Channel::duplex();
+        let agent = tokio::spawn(serve_state_on(state, agent_transport));
+
+        AcpClient
+            .builder()
+            .on_receive_notification(
+                async move |_notification: SessionNotification, _connection| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let created = connection
+                    .send_request(NewSessionRequest::new(&project_directory))
+                    .block_task()
+                    .await?;
+                let session_id = created.session_id.to_string();
+                connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        MODEL_CONFIG_ID,
+                        model_value("acp-beta", "beta/model"),
+                    ))
+                    .block_task()
+                    .await?;
+
+                let prompt = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("persist this"))],
+                    ))
+                    .block_task();
+                tokio::pin!(prompt);
+                let _ = tokio::select! {
+                    result = &mut prompt => result,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                        prompt.await
+                    }
+                };
+
+                let spec = Session::persisted_spec(&project_directory, &session_id)
+                    .await
+                    .unwrap()
+                    .expect("first ACP prompt did not persist its reserved session");
+                assert_eq!(spec.provider, "acp-beta");
+                assert_eq!(spec.model, "beta/model");
+                assert_eq!(spec.thinking, ThinkingLevel::Off);
+                assert!(
+                    connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            MODEL_CONFIG_ID,
+                            model_value("acp-alpha", "alpha-model"),
+                        ))
+                        .block_task()
+                        .await
+                        .is_err()
+                );
+                connection
+                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                let loaded = connection
+                    .send_request(LoadSessionRequest::new(
+                        session_id.clone(),
+                        &project_directory,
+                    ))
+                    .block_task()
+                    .await?;
+                let loaded_options = loaded.config_options.unwrap();
+                let SessionConfigKind::Select(model) = &loaded_options[0].kind else {
+                    panic!("model configuration must be a select option");
+                };
+                let SessionConfigSelectOptions::Ungrouped(options) = &model.options else {
+                    panic!("frozen model options must be ungrouped");
+                };
+                assert_eq!(options.len(), 1);
+                assert_eq!(
+                    model.current_value.0.as_ref(),
+                    model_value("acp-beta", "beta/model")
+                );
+                connection
+                    .send_request(CloseSessionRequest::new(session_id))
+                    .block_task()
+                    .await?;
                 Ok(())
             })
             .await

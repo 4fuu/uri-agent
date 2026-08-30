@@ -7,9 +7,11 @@ startup context, and durable sessions.
 
 ## Start the agent
 
-Configure a provider, model, and credentials in the TUI before using ACP, or
-provide the normal provider and model command-line overrides. ACP mode has no
-interactive login or model selector.
+Configure model credentials in the TUI before using ACP. The configured default
+model and thinking level initialize each new ACP session; clients that support
+ACP session configuration can choose another authenticated model and thinking
+level before sending the first prompt. Normal command-line model overrides can
+also supply the initial selection. ACP mode has no interactive login.
 
 Configure the ACP client to launch:
 
@@ -28,20 +30,35 @@ Agent closes the ACP transport if a client exceeds that limit.
 
 ## Project and session lifecycle
 
-Every new, loaded, or resumed ACP session supplies an absolute `cwd`. The first
-such request binds the process to that canonical project directory. Later
-requests in the same process must resolve to the same directory. Start one URI
-Agent process per project.
+Every new, loaded, or resumed ACP session supplies an absolute `cwd`. URI Agent
+canonicalizes it and keeps a separate project runtime for each directory. One
+ACP process can therefore own sessions from multiple independent projects;
+configuration, plugins, MCP connections, Skills, and Agent state remain
+isolated by project.
 
-ACP mode supports session creation, load with history replay, resume, project
-listing, close, prompt, and cancellation. Additional working directories and
-list pagination are not supported. A list request without `cwd` returns an
-empty list until the process is project-bound.
+ACP mode supports session creation, load with history replay, resume,
+project-filtered or process-wide listing, close, prompt, and cancellation.
+Additional working directories and list pagination are not supported. A list
+request without `cwd` merges sessions from every project runtime initialized by
+that process and returns an empty list before the first project is initialized.
 
-An ACP-created session is an ordinary persisted depth-1 URI Agent session,
-including when it has no prompts. `session/close` releases the in-process Agent
-but does not delete its history. After the ACP client closes the session or the
-ACP process exits, open it in the TUI with:
+`session/new` reserves an ID and keeps the working directory, MCP profile,
+provider, model, and thinking level in process memory. The pending session is
+visible to that process's `session/list` and can be released with
+`session/close`, but it does not yet exist in the native session database and
+does not survive process exit.
+
+The first `session/prompt` creates the depth-1 URI Agent session with the same
+reserved ID and persists its frozen setup together with the accepted input. A
+startup or persistence failure before input acceptance leaves the pending ACP
+session available for correction or retry. Once input is accepted, provider,
+model, and thinking level are frozen; `session/set_config_option` cannot switch
+them during the conversation. ACP selections are session-local and never
+change User, Project, command-line, or process defaults.
+
+`session/close` releases process ownership but does not delete a materialized
+session's history. After the ACP client closes that session or the ACP process
+exits, open it in the TUI with:
 
 ```bash
 uri-agent --cwd /absolute/project/path --session <session-id>
@@ -82,12 +99,13 @@ protocol set. Load and resume must provide the same names, but may rotate
 commands, arguments, URLs, headers, and credential values. ACP cannot inject an
 MCP profile into an existing native session that uses configured MCP.
 
-Session MCP values are stored in a private SQLite session record so a later TUI
-open can reconstruct the capabilities. Literal environment and header values
-do not enter append-only events or frozen protocol records. The TUI's `:mcp`
-panel lists these servers without displaying literal values; it permits test
-and reconnect operations but not edits. Connection errors omit session MCP
-transport details so literals do not enter diagnostics or transcript errors.
+When the first prompt materializes the session, MCP values are stored in a
+private SQLite session record so a later TUI open can reconstruct the
+capabilities. Literal environment and header values do not enter append-only
+events or frozen protocol records. The TUI's `:mcp` panel lists these servers
+without displaying literal values; it permits test and reconnect operations
+but not edits. Connection errors omit session MCP transport details so literals
+do not enter diagnostics or transcript errors.
 The ACP client remains the owner of that profile. Private session records are
 plaintext in the session database, not encrypted; filesystem permissions are
 their protection boundary.

@@ -515,9 +515,13 @@ jobs, or provide a trigger or gateway service. See [Resident plugins](plugins.md
 
 `--acpv1` serves stable ACP v1 over stdin/stdout instead of starting the TUI.
 The ACP client supplies each session's absolute working directory, so this flag
-conflicts with `--cwd`, native session selection, and `--background`. Configure
-authentication and a default model before starting ACP, or pass the usual
-model overrides. See [ACP v1](acp.md) for the client and session contract.
+conflicts with `--cwd`, native session selection, and `--background`. A single
+ACP process may host independent sessions for multiple project directories,
+with separate project configuration and Agent runtimes. Configure
+authentication before starting ACP. The default model or usual command-line
+overrides initialize each pending session; compatible clients may select an
+authenticated model and thinking level before the first prompt without changing
+those defaults. See [ACP v1](acp.md) for the client and session contract.
 
 ## Custom providers and model overrides
 
