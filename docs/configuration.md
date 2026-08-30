@@ -321,7 +321,9 @@ A Project entry completely replaces the same User name; fields are not merged.
 Enable/Disable edits the effective entry, so disabling an effective User entry
 changes User scope rather than creating a Project override. Removing a Project
 entry removes only that scope and warns when the same User name will become
-effective again.
+effective again. Configuration updates use per-file cross-process locks and
+re-read the current files before writing, so simultaneous URI Agent processes
+do not overwrite one another's unrelated MCP server changes.
 
 Every server requires a nonempty `description`. `stdio` requires `command` and
 keeps `args` as an exact string list rather than splitting a shell command.
@@ -343,7 +345,9 @@ New sessions record enabled server identities and required descriptions without
 connecting or fully validating transports. Newly saved servers therefore join
 only new sessions. Calls from an existing session keep its recorded protocol
 set but resolve the latest transport, URL, and Agent Environment values; a
-removed or disabled recorded server fails on its next call. See [MCP
+configuration change or successful Agent Environment update reconnects an
+existing server before its next operation. A removed or disabled recorded
+server fails on its next call. See [MCP
 protocols](protocols.md#mcp-servers) for routes and argument encoding.
 
 ## Settings fields and precedence

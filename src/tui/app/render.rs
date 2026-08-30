@@ -3725,7 +3725,7 @@ pub(super) fn render_plugin_panel(
     area: Rect,
     block: Block<'_>,
 ) {
-    let Some(panel) = app.tui_panel.as_ref() else {
+    let Some(panel) = app.tui_panel.as_mut() else {
         frame.render_widget(
             Paragraph::new("Plugin panel is unavailable.")
                 .block(block.title(" PLUGIN PANEL "))
@@ -3838,6 +3838,23 @@ pub(super) fn render_plugin_panel(
                 .style(Style::default().fg(MUTED)),
             sections[2],
         );
+        let mut x = sections[2].x;
+        for (index, hint) in view.hints.iter().enumerate() {
+            if x >= sections[2].right() {
+                break;
+            }
+            let text = format!("{} {}", hint.key, hint.label);
+            let width = text
+                .width()
+                .min(sections[2].right().saturating_sub(x) as usize) as u16;
+            if hint.action.is_some() && width > 0 {
+                app.hit_regions.push(HitRegion {
+                    area: Rect::new(x, sections[2].y, width, 1),
+                    target: AppHit::PluginHint(index),
+                });
+            }
+            x = x.saturating_add(width).saturating_add(3);
+        }
     }
 }
 

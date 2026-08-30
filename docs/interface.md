@@ -154,7 +154,11 @@ Add row to insert one, and `Delete` to remove a selected dynamic row. `Enter`
 advances or toggles the selected value, `Tab` and `Shift+Tab` navigate, and
 `Ctrl+S` proceeds to automatic connection testing and review. Text fields
 support cursor movement, backspace, and paste. Existing names are read-only;
-scope, transport, and enabled state remain editable.
+scope, transport, and enabled state remain editable. Test, automatic test, and
+Reconnect run in the background, keep input and rendering responsive, and can
+be cancelled by leaving their workflow. Footer actions are clickable as well
+as keyboard-accessible, including Add on an empty list, review actions, and
+remove confirmation.
 
 The review screen can be saved with `Enter` even after a failed connection
 test; press `T` to test again or `E`/`Esc` to return to editing. `Esc` otherwise

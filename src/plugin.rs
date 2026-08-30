@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 const RESIDENT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -392,6 +393,7 @@ impl TuiPanelRow {
 pub struct TuiPanelHint {
     pub key: String,
     pub label: String,
+    pub action: Option<String>,
 }
 
 impl TuiPanelHint {
@@ -399,7 +401,13 @@ impl TuiPanelHint {
         Self {
             key: key.into(),
             label: label.into(),
+            action: None,
         }
+    }
+
+    pub fn action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
+        self
     }
 }
 
@@ -427,16 +435,38 @@ pub enum TuiPanelControl {
     Close,
 }
 
+#[derive(Clone, Default)]
+pub struct TuiPanelWake {
+    notify: Arc<Notify>,
+}
+
+impl std::fmt::Debug for TuiPanelWake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("TuiPanelWake").finish()
+    }
+}
+
+impl TuiPanelWake {
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
+
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TuiPanelContext {
     pub cwd: PathBuf,
     pub session_id: String,
     pub arguments: String,
+    pub wake: TuiPanelWake,
 }
 
 #[async_trait]
 pub trait TuiPanelSession: Send {
-    fn view(&self) -> TuiPanelView;
+    fn view(&mut self) -> TuiPanelView;
 
     async fn handle(&mut self, event: TuiPanelEvent) -> Result<TuiPanelControl>;
 
@@ -990,6 +1020,14 @@ impl PluginEnvironment {
 
     pub async fn snapshot(&self) -> BTreeMap<String, String> {
         self.environment.snapshot().await
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.environment.revision()
+    }
+
+    pub async fn snapshot_with_revision(&self) -> (BTreeMap<String, String>, u64) {
+        self.environment.snapshot_with_revision().await
     }
 }
 
@@ -1830,7 +1868,7 @@ mod tests {
 
     #[async_trait]
     impl TuiPanelSession for StaticPanelSession {
-        fn view(&self) -> TuiPanelView {
+        fn view(&mut self) -> TuiPanelView {
             TuiPanelView {
                 title: "Plugin panel".to_string(),
                 rows: vec![TuiPanelRow::item("body", "Context", &self.body)],
@@ -2011,10 +2049,12 @@ mod tests {
                     cwd: PathBuf::from("/work"),
                     session_id: "session".to_string(),
                     arguments: "argument".to_string(),
+                    wake: TuiPanelWake::default(),
                 },
             )
             .await
             .unwrap();
+        let mut panel = panel;
         let view = panel.view();
         assert_eq!(view.title, "Plugin panel");
         assert_eq!(view.rows[0].value, "session argument");

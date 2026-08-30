@@ -594,6 +594,10 @@ pub(super) async fn run_loop(
                 None => pending().await,
             }
         };
+        let panel_wake = app.tui_panel_wake.clone();
+        let panel_update = async move {
+            panel_wake.notified().await;
+        };
         tokio::select! {
             _ = scheduled_wake => {
                 // Reaching a scheduled deadline always gets a final draw,
@@ -601,6 +605,9 @@ pub(super) async fn run_loop(
                 redraw = true;
             },
             _ = pty_wake => {
+                scheduler.request_coalesced();
+            },
+            _ = panel_update => {
                 scheduler.request_coalesced();
             },
             event = terminal_events.next() => {
@@ -1371,6 +1378,7 @@ async fn dispatch_ui_command_with_arguments(
                 cwd: app.info.cwd.clone(),
                 session_id: app.info.session_id.clone(),
                 arguments,
+                wake: app.tui_panel_wake.clone(),
             };
             match app.tui.open_panel(&panel, context).await {
                 Ok(session) => {
@@ -2849,6 +2857,18 @@ pub(super) async fn handle_mouse(
                         TuiPanelEvent::Select(index)
                     };
                     handle_plugin_panel_event(app, event).await;
+                }
+                AppHit::PluginHint(index) => {
+                    let action = app.tui_panel.as_mut().and_then(|panel| {
+                        panel
+                            .view()
+                            .hints
+                            .get(index)
+                            .and_then(|hint| hint.action.clone())
+                    });
+                    if let Some(action) = action {
+                        handle_plugin_panel_event(app, TuiPanelEvent::Action(action)).await;
+                    }
                 }
                 AppHit::Task(index) => app.selected_task = index,
                 AppHit::Model(_)

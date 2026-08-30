@@ -34,7 +34,7 @@ struct RenderPanel;
 
 #[async_trait::async_trait]
 impl TuiPanelSession for RenderPanel {
-    fn view(&self) -> TuiPanelView {
+    fn view(&mut self) -> TuiPanelView {
         TuiPanelView {
             title: "MCP servers".to_string(),
             rows: vec![
@@ -45,7 +45,7 @@ impl TuiPanelSession for RenderPanel {
             selected: Some(0),
             message: Some(("Connection test passed".to_string(), TuiPanelTone::Accent)),
             hints: vec![
-                TuiPanelHint::new("Ctrl+N", "add"),
+                TuiPanelHint::new("Ctrl+N", "add").action("add"),
                 TuiPanelHint::new("Enter", "edit"),
                 TuiPanelHint::new("T", "test"),
                 TuiPanelHint::new("R", "reconnect"),
@@ -158,6 +158,11 @@ fn plugin_panel_renders_semantic_rows_status_and_mouse_targets() {
         app.hit_regions
             .iter()
             .any(|region| matches!(region.target, AppHit::PluginRow(0)))
+    );
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| matches!(region.target, AppHit::PluginHint(0)))
     );
 }
 

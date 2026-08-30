@@ -25,8 +25,8 @@ use crate::output::OutputStore;
 use crate::plugin::{
     CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiCompletionContext, TuiCompletions,
     TuiEffect, TuiPanelContext, TuiPanelControl, TuiPanelEvent, TuiPanelSession, TuiPanelTone,
-    TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone, TuiSubmissionContext,
-    TuiTextPosition, TuiTextRange,
+    TuiPanelWake, TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
+    TuiSubmissionContext, TuiTextPosition, TuiTextRange,
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
@@ -300,6 +300,7 @@ enum AppHit {
     Completion(usize),
     Delivery(usize),
     Palette(usize),
+    PluginHint(usize),
     PluginRow(usize),
     Task(usize),
     Model(usize),
@@ -861,6 +862,7 @@ struct App {
     pending_messages: Vec<PendingMessage>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
+    tui_panel_wake: TuiPanelWake,
     tui_panel: Option<Box<dyn TuiPanelSession>>,
 }
 
@@ -957,6 +959,7 @@ impl App {
             pending_messages: Vec::new(),
             commands,
             tui,
+            tui_panel_wake: TuiPanelWake::default(),
             tui_panel: None,
         }
     }

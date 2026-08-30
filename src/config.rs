@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::fs;
@@ -321,6 +322,7 @@ impl EnvironmentFile {
 pub struct AgentEnvironment {
     path: PathBuf,
     values: RwLock<EnvironmentFile>,
+    revision: AtomicU64,
 }
 
 impl AgentEnvironment {
@@ -343,6 +345,7 @@ impl AgentEnvironment {
         Ok(Self {
             path,
             values: RwLock::new(values),
+            revision: AtomicU64::new(0),
         })
     }
 
@@ -359,6 +362,16 @@ impl AgentEnvironment {
         self.values.read().await.0.clone()
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    pub async fn snapshot_with_revision(&self) -> (BTreeMap<String, String>, u64) {
+        let values = self.values.read().await;
+        let revision = self.revision.load(Ordering::Acquire);
+        (values.0.clone(), revision)
+    }
+
     pub async fn set(&self, name: &str, value: String) -> Result<()> {
         validate_environment_name(name)?;
         validate_environment_value(&value)?;
@@ -367,6 +380,7 @@ impl AgentEnvironment {
         next.0.insert(name.to_string(), value);
         write_json(&self.path, &next, true).await?;
         *values = next;
+        self.revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -378,6 +392,7 @@ impl AgentEnvironment {
         if removed {
             write_json(&self.path, &next, true).await?;
             *values = next;
+            self.revision.fetch_add(1, Ordering::Release);
         }
         Ok(removed)
     }
@@ -2216,6 +2231,7 @@ mod tests {
     async fn agent_environment_persists_private_values_and_validates_names() {
         let directory = tempfile::tempdir().unwrap();
         let environment = AgentEnvironment::load(directory.path()).await.unwrap();
+        assert_eq!(environment.revision(), 0);
         #[cfg(unix)]
         let path = directory.path().join("environment.json");
 
@@ -2223,10 +2239,12 @@ mod tests {
             .set("NPM_TOKEN", "managed-secret".to_string())
             .await
             .unwrap();
+        assert_eq!(environment.revision(), 1);
         environment
             .set("SECOND_TOKEN", "second-secret".to_string())
             .await
             .unwrap();
+        assert_eq!(environment.revision(), 2);
         assert_eq!(
             environment.names().await,
             vec!["NPM_TOKEN".to_string(), "SECOND_TOKEN".to_string()]
@@ -2235,9 +2253,13 @@ mod tests {
             environment.get("NPM_TOKEN").await.unwrap().as_deref(),
             Some("managed-secret")
         );
-        assert_eq!(environment.snapshot().await.len(), 2);
+        let (snapshot, revision) = environment.snapshot_with_revision().await;
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(revision, 2);
         assert!(environment.remove("NPM_TOKEN").await.unwrap());
+        assert_eq!(environment.revision(), 3);
         assert!(!environment.remove("NPM_TOKEN").await.unwrap());
+        assert_eq!(environment.revision(), 3);
 
         #[cfg(unix)]
         {

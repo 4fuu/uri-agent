@@ -111,20 +111,24 @@ read("github-mcp://resource-templates", "")
 read("github-mcp://prompts", "")
 ```
 
-Tool and prompt arguments use their current JSON Schema without requiring the
-model to serialize JSON into the body. Put scalar values in the URI query,
-repeat one key for an array, and use `/` between nested object property names.
-Names and values use form URL encoding:
+Tool and prompt arguments use their current JSON Schema. Put scalar values in
+the URI query, repeat one key for an array, and use `/` between nested object
+property names. Names and values use form URL encoding:
 
 ```text
 exec("github-mcp://tools/search?query=uri-agent&limit=10&labels=rust&labels=agent", "")
 exec("postgres-mcp://tools/query?options%2FreadOnly=true&_body=sql", "SELECT 1")
+exec("workflow-mcp://tools/run?_json=true", "{\"steps\":[{\"kind\":\"build\"}]}")
 ```
 
 `_body=<schema/path>` may bind exactly one string field to the raw string body.
-Without `_body`, the body must be empty. Unknown paths, duplicate scalar keys,
-missing required values, malformed encoding, and values that cannot be coerced
-to the schema's string, boolean, integer, or number type fail directly.
+For schemas that cannot be represented by scalar query paths, including
+compositions, references, and arrays of objects, `_json=true` passes a complete
+JSON argument object from the body and cannot be combined with another query
+argument for validation by the server. Otherwise, the body must be empty. In
+query mode, unknown paths, duplicate scalar keys, missing required values,
+malformed encoding, and values that cannot be coerced to the schema's string,
+boolean, integer, or number type fail directly.
 
 Resources are read with
 `read("<name>-mcp://resources/read?uri=<percent-encoded-resource-uri>", "")`;
@@ -136,12 +140,14 @@ session's MCP connection.
 
 Connections belong to one Agent session and are created only by a
 server-specific help read, a server protocol operation, Test, or Reconnect.
-Every operation resolves the server's current configuration before reusing a
-connection. A changed configuration is reconnected; a removed, disabled,
+Every operation resolves the server's current configuration and Agent
+Environment revision before reusing a connection. A change to either reconnects
+the server; a removed, disabled,
 invalid, or unavailable server returns its error without automatic retry or
-fallback. Configuration and the `:mcp` panel are documented in
-[Models and configuration](configuration.md#mcp-servers) and [Terminal
-interface](interface.md#mcp-server-manager).
+fallback. Connection initialization times out after 30 seconds, and a stalled
+server does not block initialization of other servers. Configuration and the
+`:mcp` panel are documented in [Models and
+configuration](configuration.md#mcp-servers) and [Terminal interface](interface.md#mcp-server-manager).
 
 ### `uri-agent-docs`
 

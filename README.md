@@ -67,7 +67,7 @@ separate manual.
 
 - **URI-native progressive context:** one address space covers every resource and action, while Skills-style loading keeps contracts, instructions, resources, and complete output out of context until needed.
 - **Reliable and extensible:** the stable string-based `read` / `exec` contract handles simple protocols, while typed direct tools avoid nested escaping and both paths remain plugin-registered.
-- **Built-in MCP bridge:** `:mcp` manages stdio and Streamable HTTP servers, exposing each one as a progressive `<name>-mcp://` protocol without model-written JSON arguments.
+- **Built-in MCP bridge:** `:mcp` manages stdio and Streamable HTTP servers, exposing each one as a progressive, query-first `<name>-mcp://` protocol with a complete-JSON fallback for complex schemas.
 - **Current models and sign-in:** URI Agent combines pi.dev's cloud catalog and provider login methods with credential-scoped live discovery, exposing runnable new provider models before the shared catalog catches up.
 - **Durable, observable work:** managed tasks expose status and final output, automatically notify the model on completion, and restore settled reports with their session; append-only sessions, drafts, frozen context, and compaction checkpoints survive restarts.
 - **One controllable terminal workflow:** built-in web access, live Queue and Steer, keyboard-complete controls, and `@` file or `@@` session references stay in one interface.

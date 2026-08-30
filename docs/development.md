@@ -93,6 +93,10 @@ key-hint state; semantic status items; text replacement candidates for the
 composer; or failure-isolated effects for an accepted submission. The generic
 TUI renders panel state and forwards keyboard, paste, page, selection, and
 activation events while the provider owns its workflow and data. Completion
+of provider-owned background work calls the panel context's wake handle; the
+next mutable `view` call consumes that completed state without blocking input.
+Hints with actions receive generic mouse hit regions and are forwarded as the
+same action events as key bindings. Composer completion
 providers receive the current lines and character-based cursor position, then
 return a replacement range and labeled candidates; the TUI owns popup
 rendering, stale-result rejection, selection, and insertion. Status providers
