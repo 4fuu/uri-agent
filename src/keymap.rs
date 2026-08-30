@@ -94,6 +94,24 @@ map("selector", "backspace", "backspace");
 map("environment", "ctrl+n", "add");
 map("environment", "delete", "remove");
 
+map("plugin_panel", "down", "next");
+map("plugin_panel", "up", "previous");
+map("plugin_panel", "pagedown", "page_down");
+map("plugin_panel", "pageup", "page_up");
+map("plugin_panel", "enter", "confirm");
+map("plugin_panel", "ctrl+n", "add");
+map("plugin_panel", "ctrl+s", "save");
+map("plugin_panel", "tab", "next");
+map("plugin_panel", "backtab", "previous");
+map("plugin_panel", "shift+tab", "previous");
+map("plugin_panel", "delete", "remove");
+map("plugin_panel", "backspace", "backspace");
+map("plugin_panel", "left", "left");
+map("plugin_panel", "right", "right");
+map("plugin_panel", "home", "home");
+map("plugin_panel", "end", "end");
+map("plugin_panel", "esc", "close");
+
 map("model_roles", "ctrl+n", "add");
 map("model_roles", "delete", "remove");
 

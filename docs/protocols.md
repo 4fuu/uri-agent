@@ -21,9 +21,11 @@ JSON text when a protocol requires structured input. Protocols receive that
 string unchanged, including an empty string.
 
 Before any other call to a protocol in a session, the model must successfully
-call `read("<protocol>://help", "")`. The runtime blocks calls that skip this
-first help read and returns the exact help address required. Each protocol is
-tracked independently.
+call `read("<protocol>://help", "")`. A protocol may declare shared help
+prerequisites; those help pages must be read first, in the declared order, and
+its own help remains mandatory afterward. The runtime blocks calls that skip
+the next required help read and returns its exact address. Successful help
+reads are tracked for the session.
 
 `read` is used for resources, help, task snapshots, and completed output. A
 linked protocol read may return supported images alongside its textual result;
@@ -67,12 +69,79 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | `pwsh` | `read`, `exec` | Run PowerShell 7 commands in the foreground or as managed background tasks when `pwsh` is enabled |
 | `wasm_plugin` | `read`, `exec` | Reload trusted WASM protocols and direct tools and return the completed reload report |
 | `<name>-skill` | `read` | Load one [discovered Skill](context.md#skills) and its bundled files |
+| `mcp` | `read` | Provide shared help for configured MCP protocols; registered only when at least one MCP server is frozen into a new session |
+| `<name>-mcp` | `read`, `exec` | Access one configured MCP server's tools, resources, templates, and prompts |
 
 Shell plugins detect their own executables at startup. On Windows, the `pwsh`
 plugin also verifies that PowerShell 7 or newer can start. A valid `pwsh`
 plugin suppresses `bash`; otherwise `pwsh` remains disabled, a startup warning
 is shown, and `bash` remains available when installed. On non-Windows
 platforms, only the `bash` plugin is considered; `pwsh` is not started.
+
+### MCP servers
+
+The linked MCP plugin turns each enabled server recorded for a new session into
+one protocol. Names use the Skill normalization rule—lowercase ASCII letters
+and numbers with other runs replaced by `-`—and gain `-mcp` when absent. A
+server named `GitHub` therefore becomes `github-mcp://`. A normalized collision
+is an error rather than an implicit replacement.
+
+When at least one MCP server is frozen into a new session, `mcp://` is
+registered alongside the server protocols. Read its shared route and argument
+contract once, then read each server's generated help before using that server:
+
+```text
+read("mcp://help", "")
+read("github-mcp://help", "")
+```
+
+The runtime enforces that order. `mcp://` exposes no route other than `help`
+and does not connect to a server. Each `<name>-mcp://help` connects lazily and
+contains only that record's frozen description plus current handshake metadata
+and server instructions, marked as untrusted external content; it does not
+repeat the shared routes or argument rules.
+
+Catalogs and individual schemas remain behind separate reads:
+
+```text
+read("github-mcp://tools", "")
+read("github-mcp://tools/search_repositories", "")
+read("github-mcp://resources", "")
+read("github-mcp://resource-templates", "")
+read("github-mcp://prompts", "")
+```
+
+Tool and prompt arguments use their current JSON Schema without requiring the
+model to serialize JSON into the body. Put scalar values in the URI query,
+repeat one key for an array, and use `/` between nested object property names.
+Names and values use form URL encoding:
+
+```text
+exec("github-mcp://tools/search?query=uri-agent&limit=10&labels=rust&labels=agent", "")
+exec("postgres-mcp://tools/query?options%2FreadOnly=true&_body=sql", "SELECT 1")
+```
+
+`_body=<schema/path>` may bind exactly one string field to the raw string body.
+Without `_body`, the body must be empty. Unknown paths, duplicate scalar keys,
+missing required values, malformed encoding, and values that cannot be coerced
+to the schema's string, boolean, integer, or number type fail directly.
+
+Resources are read with
+`read("<name>-mcp://resources/read?uri=<percent-encoded-resource-uri>", "")`;
+prompts are obtained from `read("<name>-mcp://prompts/<name>?<arguments>",
+"")`. Text is returned normally. MCP image, audio, and blob content is
+preserved and returned as a `file://` address. Calls that remain active for
+about 60 seconds become ordinary managed tasks; cancelling one closes that
+session's MCP connection.
+
+Connections belong to one Agent session and are created only by a
+server-specific help read, a server protocol operation, Test, or Reconnect.
+Every operation resolves the server's current configuration before reusing a
+connection. A changed configuration is reconnected; a removed, disabled,
+invalid, or unavailable server returns its error without automatic retry or
+fallback. Configuration and the `:mcp` panel are documented in
+[Models and configuration](configuration.md#mcp-servers) and [Terminal
+interface](interface.md#mcp-server-manager).
 
 ### `uri-agent-docs`
 

@@ -32,7 +32,9 @@ protocol / model-tool / command / TUI registries <------------+
 generic tool dispatch ----> protocol or direct tool ----> bounded or preserved output
 ```
 
-For a resumed session, the stored `SessionContext` replaces newly generated prompt and Skill context. Current startup discovery must not reinterpret historical sessions.
+For a resumed session, the stored `SessionContext` and session-scoped protocol
+records replace newly generated prompt, protocol, and Skill context. Current
+startup discovery must not reinterpret historical sessions.
 
 ## Repository map
 
@@ -47,7 +49,7 @@ For a resumed session, the stored `SessionContext` replaces newly generated prom
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, text and image read output, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, embedded-documentation, file, grep, session archive, HTTPS, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific HTTPS internals |
+| `src/builtins/` | Built-in project-instruction, embedded-documentation, file, grep, session archive, HTTPS, MCP, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific internals |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, persistent settings, and model-tool, protocol, command, generic panel, status, composer completion, and submission-effect registration |
 | `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
 | `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
@@ -72,8 +74,8 @@ Put behavior in the module that owns the corresponding state and contract. Befor
 
 First-party capabilities use the plugin path exposed to linked Rust extensions:
 
-1. A [`Plugin`](../src/plugin.rs) may declare protocol and direct model-tool descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen.
-2. `PluginRegistry` validates descriptor names and tool schemas, rejects duplicates, requires declarations to match installed capabilities, collects notices, and preserves registration order for prompt fragments.
+1. A [`Plugin`](../src/plugin.rs) may declare protocol and direct model-tool descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen. A plugin with configuration-derived protocols may instead own stable session protocol records whose descriptors are restored before a resumed session installs capabilities.
+2. `PluginRegistry` validates descriptor names, session-record ownership, and tool schemas, rejects duplicates, requires declarations to match installed capabilities, collects notices, and preserves registration order for prompt fragments.
 3. Plugins install model tools, protocols, commands, panel providers, status providers, composer completion providers, and submission effects through `PluginHost`; they may resolve model roles, use plugin settings or separately permissioned state, create child Agents through the process-wide `AgentHost`, and opt into resident callbacks, while prompt-only plugins need no runtime registration.
 4. Simple string-input capabilities remain behind `read` and `exec`; typed or escape-heavy operations should register a direct model tool, while commands join the searchable panel and key-bindable command registry.
 
@@ -86,7 +88,18 @@ selection is an ordinary value under `pluginSettings`, separate from the
 exact named tool/protocol sets in `AgentSpec`; no generic model-facing Agent
 creation protocol or tool is registered.
 
-TUI extensions return generic documents, semantic status items, text replacement candidates for the composer, or failure-isolated effects for an accepted submission. Completion providers receive the current lines and character-based cursor position, then return a replacement range and labeled candidates; the TUI owns popup rendering, stale-result rejection, selection, and insertion. Status providers run while frames are drawn, so they must be fast and non-blocking. Keep operational behavior inside registered protocols, commands, panel providers, or submission providers; reserve prompt fragments for context required before the first tool call.
+TUI extensions return stateful semantic panel rows, tones, selection, cursor and
+key-hint state; semantic status items; text replacement candidates for the
+composer; or failure-isolated effects for an accepted submission. The generic
+TUI renders panel state and forwards keyboard, paste, page, selection, and
+activation events while the provider owns its workflow and data. Completion
+providers receive the current lines and character-based cursor position, then
+return a replacement range and labeled candidates; the TUI owns popup
+rendering, stale-result rejection, selection, and insertion. Status providers
+run while frames are drawn, so they must be fast and non-blocking. Keep
+operational behavior inside registered protocols, commands, panel providers,
+or submission providers; reserve prompt fragments for context required before
+the first tool call.
 
 URI Agent does not load native dynamic libraries. Third-party runtime protocols
 and direct tools use the trusted [WASM plugin](plugins.md) path instead.
@@ -106,6 +119,10 @@ and direct tools use the trusted [WASM plugin](plugins.md) path instead.
   the selected protocol unchanged.
 - Protocol names are unique. Every protocol implements `read` so its mandatory
   `<protocol>://help` route is available; it may additionally implement `exec`.
+- A protocol may declare ordered shared-help dependencies through the generic
+  protocol contract. Dependencies must be registered and selected with the
+  dependent protocol; the runtime requires their help reads before the
+  dependent protocol's still-mandatory own help read.
 - Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
 - Linked protocols that return images use `Protocol::read_output` and retain a
   textual result for transcript presentation. The runtime carries images as

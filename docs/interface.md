@@ -77,6 +77,7 @@ Core commands are registered through `CommandRegistry`:
 | `:copy` | Copy the current selection or visible panel through OSC52 |
 | `:tasks` | Inspect and cancel managed protocol work |
 | `:protocols` | List registered read and exec routes |
+| `:mcp` | Add, edit, test, enable, reconnect, or remove MCP servers |
 | `:status` | Show project, model, usage, and extension status |
 | `:model` | Search runnable models |
 | `:model-roles` or `:roles` | Assign models to built-in and custom plugin roles |
@@ -138,6 +139,29 @@ conversation.
 Conversation search includes user, assistant, reasoning, tool, notice, compaction, and error text across the complete persisted transcript. It loads any older lazy pages before opening. Type to filter the results, use the arrow keys to choose one and press `Enter`, or click a result to return to that block. It is unavailable before the conversation has any text and while the `:resume` session selector is open.
 
 Extensions register commands through the same registry, so they appear in the panel, help, and key-bindable action set without TUI-specific routing.
+
+### MCP server manager
+
+`:mcp` opens the linked MCP plugin's settings workflow. Its root list shows
+scope, transport, enabled state, and the latest known connection state without
+connecting every server. Use arrows, the mouse wheel, or a click to select;
+`Enter` or a double-click edits; `Ctrl+N` adds; `T` tests; `R` reconnects;
+`Space` toggles enabled state; and `Delete` opens removal confirmation.
+
+The add/edit form exposes one row per stdio argument, environment mapping, or
+HTTP header so spaces and special characters are preserved. Use `Ctrl+N` or an
+Add row to insert one, and `Delete` to remove a selected dynamic row. `Enter`
+advances or toggles the selected value, `Tab` and `Shift+Tab` navigate, and
+`Ctrl+S` proceeds to automatic connection testing and review. Text fields
+support cursor movement, backspace, and paste. Existing names are read-only;
+scope, transport, and enabled state remain editable.
+
+The review screen can be saved with `Enter` even after a failed connection
+test; press `T` to test again or `E`/`Esc` to return to editing. `Esc` otherwise
+backs out one workflow level before closing the panel. Removing a Project
+entry warns when a same-named User definition will reappear. Detailed file,
+credential, and layering behavior is in [MCP server
+configuration](configuration.md#mcp-servers).
 
 ### Agent environment manager
 

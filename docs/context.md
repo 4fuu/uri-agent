@@ -1,6 +1,6 @@
 # Startup context and Skills
 
-URI Agent builds startup context for each new session from its core prompt, prompt-only plugins, and discovered Skills. Preparation begins in the background after the TUI opens; the first user message waits for the complete result. URI Agent then freezes the system prompt and Skill selection so later filesystem or environment changes do not reinterpret an existing session.
+URI Agent builds startup context for each new session from its core prompt, prompt-only plugins, configured protocol descriptors, and discovered Skills. Preparation begins in the background after the TUI opens; the first user message waits for the complete result. URI Agent then freezes the system prompt, session-scoped protocol records, and Skill selection so later filesystem or environment changes do not reinterpret an existing session.
 
 ## Project instructions
 
@@ -67,3 +67,11 @@ A new session stores:
 - each selected Skill's canonical `SKILL.md` path.
 
 Resume reuses this snapshot and does not scan current project instructions, `PATH`, or Skill roots. Resources continue to load from the frozen location, so removing it produces an explicit error; a same-named Skill elsewhere cannot replace it. A stored session without frozen context is invalid rather than being reinterpreted with current startup state.
+
+Linked plugins may also contribute session-scoped protocol records. The built-in
+MCP plugin records only each enabled server's stable configuration identity and
+the protocol name and description placed in the generated prompt; it does not
+snapshot commands, URLs, headers, environment values, or server metadata.
+Resume and compaction retain those exact records and the already generated
+prompt. Calls resolve mutable MCP configuration when used, so a new server does
+not join an existing session and a removed recorded server fails directly.

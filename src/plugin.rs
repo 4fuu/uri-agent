@@ -1,12 +1,16 @@
 use crate::agent::{AgentHandle, AgentHost, AgentSpec, CompactionCallback};
 use crate::config::{AgentEnvironment, ConfigManager, ModelRole};
 use crate::plugin_state::{PluginState, PluginStateScope, PluginStateStore};
-use crate::protocol::{ProtocolDescriptor, ProtocolImage, ProtocolRegistry, validate_descriptor};
+use crate::protocol::{
+    ProtocolDescriptor, ProtocolImage, ProtocolRegistry, validate_descriptor,
+    validate_help_dependencies,
+};
 use crate::tool_download::BinaryDownloader;
 pub use crate::tool_download::{BinaryDownload, DownloadArchive};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rig::completion::ToolDefinition;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -327,10 +331,100 @@ fn core_commands() -> Vec<CommandSpec> {
     ]
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TuiPanelTone {
+    #[default]
+    Default,
+    Accent,
+    Muted,
+    Warning,
+    Error,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiDocument {
+pub struct TuiPanelRow {
+    pub id: String,
+    pub label: String,
+    pub value: String,
+    pub description: String,
+    pub tone: TuiPanelTone,
+    pub selectable: bool,
+    /// Character cursor rendered within `value` while the provider is editing
+    /// this row. Providers retain the authoritative value and cursor state.
+    pub cursor: Option<usize>,
+}
+
+impl TuiPanelRow {
+    pub fn item(id: impl Into<String>, label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            value: value.into(),
+            description: String::new(),
+            tone: TuiPanelTone::Default,
+            selectable: true,
+            cursor: None,
+        }
+    }
+
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn tone(mut self, tone: TuiPanelTone) -> Self {
+        self.tone = tone;
+        self
+    }
+
+    pub fn selectable(mut self, selectable: bool) -> Self {
+        self.selectable = selectable;
+        self
+    }
+
+    pub fn cursor(mut self, cursor: Option<usize>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiPanelHint {
+    pub key: String,
+    pub label: String,
+}
+
+impl TuiPanelHint {
+    pub fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiPanelView {
     pub title: String,
-    pub body: String,
+    pub rows: Vec<TuiPanelRow>,
+    pub selected: Option<usize>,
+    pub message: Option<(String, TuiPanelTone)>,
+    pub hints: Vec<TuiPanelHint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiPanelEvent {
+    Action(String),
+    Page(isize),
+    Text(char),
+    Select(usize),
+    Activate(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiPanelControl {
+    Continue,
+    Close,
 }
 
 #[derive(Clone, Debug)]
@@ -341,8 +435,19 @@ pub struct TuiPanelContext {
 }
 
 #[async_trait]
+pub trait TuiPanelSession: Send {
+    fn view(&self) -> TuiPanelView;
+
+    async fn handle(&mut self, event: TuiPanelEvent) -> Result<TuiPanelControl>;
+
+    fn paste(&mut self, _text: String) -> Result<TuiPanelControl> {
+        Ok(TuiPanelControl::Continue)
+    }
+}
+
+#[async_trait]
 pub trait TuiPanelProvider: Send + Sync {
-    async fn open(&self, context: TuiPanelContext) -> Result<TuiDocument>;
+    async fn open(&self, context: TuiPanelContext) -> Result<Box<dyn TuiPanelSession>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,7 +596,11 @@ impl TuiRegistry {
         Ok(())
     }
 
-    pub async fn open_panel(&self, id: &str, context: TuiPanelContext) -> Result<TuiDocument> {
+    pub async fn open_panel(
+        &self,
+        id: &str,
+        context: TuiPanelContext,
+    ) -> Result<Box<dyn TuiPanelSession>> {
         let Some(panel) = self.panels.get(id) else {
             bail!("unknown TUI panel: {id}");
         };
@@ -1125,11 +1234,43 @@ impl<'a> PluginHost<'a> {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionProtocolRecord {
+    pub owner: String,
+    pub identity: String,
+    pub descriptor: ProtocolDescriptor,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub help_dependencies: Vec<String>,
+}
+
+#[async_trait]
 pub trait Plugin: Send + Sync {
     /// Protocols contributed by this plugin. These declarations are used to
     /// freeze a new session's system prompt before the runtime registries exist.
     fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
         Vec::new()
+    }
+
+    /// Stable owner for protocols whose descriptor set is frozen per session.
+    /// Static plugins should leave this unset.
+    fn session_protocol_owner(&self) -> Option<&str> {
+        None
+    }
+
+    /// Records discovered for a new session. The record keeps only stable
+    /// identity and prompt metadata; mutable operational configuration remains
+    /// owned by the plugin and is resolved when the protocol is called.
+    fn session_protocol_records(&self) -> Result<Vec<SessionProtocolRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Restore the exact records frozen by an existing session before protocol
+    /// declarations and registrations are evaluated.
+    fn restore_session_protocol_records(&self, records: &[SessionProtocolRecord]) -> Result<()> {
+        if !records.is_empty() {
+            bail!("plugin does not restore session-scoped protocols");
+        }
+        Ok(())
     }
 
     /// Direct model tools contributed by this plugin. Prefer a direct tool
@@ -1162,6 +1303,12 @@ pub trait Plugin: Send + Sync {
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
+
+    /// Release request-driven resources such as remote connections when the
+    /// owning Agent session closes.
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1203,6 +1350,86 @@ impl PluginRegistry {
 
     pub fn add(&mut self, plugin: impl Plugin + 'static) {
         self.plugins.push(Box::new(plugin));
+    }
+
+    pub fn session_protocol_records(&self) -> Result<Vec<SessionProtocolRecord>> {
+        let mut records = Vec::new();
+        let mut owners = HashSet::new();
+        let mut identities = HashSet::new();
+        let mut protocols = HashSet::new();
+        for plugin in &self.plugins {
+            let Some(owner) = plugin.session_protocol_owner() else {
+                continue;
+            };
+            validate_name(owner)?;
+            if !owners.insert(owner.to_string()) {
+                bail!("session protocol owner is declared more than once: {owner}");
+            }
+            for record in plugin.session_protocol_records()? {
+                if record.owner != owner {
+                    bail!(
+                        "session protocol record owner {} does not match plugin owner {owner}",
+                        record.owner
+                    );
+                }
+                if record.identity.trim().is_empty() {
+                    bail!("session protocol record identity cannot be empty");
+                }
+                validate_descriptor(&record.descriptor)?;
+                validate_help_dependencies(&record.descriptor.name, &record.help_dependencies)?;
+                if !identities.insert((record.owner.clone(), record.identity.clone())) {
+                    bail!(
+                        "session protocol identity is declared more than once: {}/{}",
+                        record.owner,
+                        record.identity
+                    );
+                }
+                if !protocols.insert(record.descriptor.name.clone()) {
+                    bail!(
+                        "session protocol name is declared more than once: {}",
+                        record.descriptor.name
+                    );
+                }
+                records.push(record);
+            }
+        }
+        records.sort_by(|left, right| left.descriptor.name.cmp(&right.descriptor.name));
+        Ok(records)
+    }
+
+    pub fn restore_session_protocol_records(
+        &self,
+        records: &[SessionProtocolRecord],
+    ) -> Result<()> {
+        for record in records {
+            if record.identity.trim().is_empty() {
+                bail!("session protocol record identity cannot be empty");
+            }
+            validate_descriptor(&record.descriptor)?;
+            validate_help_dependencies(&record.descriptor.name, &record.help_dependencies)?;
+        }
+        let mut remaining = records.iter().collect::<Vec<_>>();
+        let mut owners = HashSet::new();
+        for plugin in &self.plugins {
+            let Some(owner) = plugin.session_protocol_owner() else {
+                continue;
+            };
+            validate_name(owner)?;
+            if !owners.insert(owner.to_string()) {
+                bail!("session protocol owner is declared more than once: {owner}");
+            }
+            let owned = records
+                .iter()
+                .filter(|record| record.owner == owner)
+                .cloned()
+                .collect::<Vec<_>>();
+            plugin.restore_session_protocol_records(&owned)?;
+            remaining.retain(|record| record.owner != owner);
+        }
+        if let Some(record) = remaining.first() {
+            bail!("session protocol owner is not available: {}", record.owner);
+        }
+        Ok(())
     }
 
     pub fn protocol_descriptors(&self) -> Result<Vec<ProtocolDescriptor>> {
@@ -1415,6 +1642,18 @@ impl PluginRegistry {
         }
         Ok(())
     }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut failure = None;
+        for plugin in self.plugins.iter().rev() {
+            if let Err(error) = plugin.shutdown().await
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 
 async fn resident_call(
@@ -1585,13 +1824,36 @@ mod tests {
 
     struct StaticPanel;
 
+    struct StaticPanelSession {
+        body: String,
+    }
+
+    #[async_trait]
+    impl TuiPanelSession for StaticPanelSession {
+        fn view(&self) -> TuiPanelView {
+            TuiPanelView {
+                title: "Plugin panel".to_string(),
+                rows: vec![TuiPanelRow::item("body", "Context", &self.body)],
+                selected: Some(0),
+                message: None,
+                hints: Vec::new(),
+            }
+        }
+
+        async fn handle(&mut self, event: TuiPanelEvent) -> Result<TuiPanelControl> {
+            Ok(match event {
+                TuiPanelEvent::Action(action) if action == "close" => TuiPanelControl::Close,
+                _ => TuiPanelControl::Continue,
+            })
+        }
+    }
+
     #[async_trait]
     impl TuiPanelProvider for StaticPanel {
-        async fn open(&self, context: TuiPanelContext) -> Result<TuiDocument> {
-            Ok(TuiDocument {
-                title: "Plugin panel".to_string(),
+        async fn open(&self, context: TuiPanelContext) -> Result<Box<dyn TuiPanelSession>> {
+            Ok(Box::new(StaticPanelSession {
                 body: format!("{} {}", context.session_id, context.arguments),
-            })
+            }))
         }
     }
 
@@ -1742,7 +2004,7 @@ mod tests {
     async fn registered_tui_panels_receive_session_context_and_arguments() {
         let mut registry = TuiRegistry::default();
         registry.register_panel("demo", StaticPanel).unwrap();
-        let document = registry
+        let panel = registry
             .open_panel(
                 "demo",
                 TuiPanelContext {
@@ -1753,8 +2015,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(document.title, "Plugin panel");
-        assert_eq!(document.body, "session argument");
+        let view = panel.view();
+        assert_eq!(view.title, "Plugin panel");
+        assert_eq!(view.rows[0].value, "session argument");
     }
 
     #[test]

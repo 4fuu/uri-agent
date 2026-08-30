@@ -1271,6 +1271,21 @@ pub(super) fn handle_paste(app: &mut App, text: String) {
             app.command_selected = 0;
             app.command_stem = None;
         }
+        Some(Overlay::Plugin) => {
+            let result = app
+                .tui_panel
+                .as_mut()
+                .map(|panel| panel.paste(text))
+                .transpose();
+            match result {
+                Ok(Some(TuiPanelControl::Close)) => {
+                    app.tui_panel = None;
+                    app.overlay = None;
+                }
+                Ok(_) => {}
+                Err(error) => app.set_flash(format!("Plugin panel failed: {error:#}")),
+            }
+        }
         Some(Overlay::Selector) => {
             if let Some(selector) = app.selector.as_mut() {
                 selector.query.push_str(text.trim());
@@ -1338,6 +1353,15 @@ pub(super) async fn dispatch_ui_command(
     target: CommandTarget,
     services: &LoopServices,
 ) -> Action {
+    dispatch_ui_command_with_arguments(app, target, String::new(), services).await
+}
+
+async fn dispatch_ui_command_with_arguments(
+    app: &mut App,
+    target: CommandTarget,
+    arguments: String,
+    services: &LoopServices,
+) -> Action {
     let previous_overlay = app.overlay;
     app.overlay = None;
     let command = match target {
@@ -1346,11 +1370,11 @@ pub(super) async fn dispatch_ui_command(
             let context = TuiPanelContext {
                 cwd: app.info.cwd.clone(),
                 session_id: app.info.session_id.clone(),
-                arguments: String::new(),
+                arguments,
             };
             match app.tui.open_panel(&panel, context).await {
-                Ok(document) => {
-                    app.tui_document = Some(document);
+                Ok(session) => {
+                    app.tui_panel = Some(session);
                     app.overlay_scroll = 0;
                     app.overlay = Some(Overlay::Plugin);
                 }
@@ -1772,7 +1796,29 @@ pub(super) async fn handle_overlay_key(
             _ => Action::Continue,
         },
         Overlay::Terminal => Action::Continue,
-        Overlay::Status | Overlay::Help | Overlay::Protocols | Overlay::Plugin => {
+        Overlay::Plugin => {
+            let action = app.keymap.action("plugin_panel", key_name);
+            let event = match action.as_deref() {
+                Some("page_up") => Some(TuiPanelEvent::Page(app.overlay_page_distance(-1))),
+                Some("page_down") => Some(TuiPanelEvent::Page(app.overlay_page_distance(1))),
+                Some(action) => Some(TuiPanelEvent::Action(action.to_string())),
+                None if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+                {
+                    match key.code {
+                        KeyCode::Char(character) => Some(TuiPanelEvent::Text(character)),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            if let Some(event) = event {
+                handle_plugin_panel_event(app, event).await;
+            }
+            Action::Continue
+        }
+        Overlay::Status | Overlay::Help | Overlay::Protocols => {
             match app.keymap.action("list", key_name).as_deref() {
                 Some("quit") => Action::Quit,
                 Some("close") => {
@@ -1801,6 +1847,24 @@ pub(super) async fn handle_overlay_key(
     }
 }
 
+async fn handle_plugin_panel_event(app: &mut App, event: TuiPanelEvent) {
+    let result = match app.tui_panel.as_mut() {
+        Some(panel) => panel.handle(event).await,
+        None => {
+            app.overlay = None;
+            return;
+        }
+    };
+    match result {
+        Ok(TuiPanelControl::Continue) => {}
+        Ok(TuiPanelControl::Close) => {
+            app.tui_panel = None;
+            app.overlay = None;
+        }
+        Err(error) => app.set_flash(format!("Plugin panel failed: {error:#}")),
+    }
+}
+
 pub(super) fn confirm_delivery(app: &App) -> Action {
     let Some(delivery) = app.delivery.as_ref() else {
         return Action::Continue;
@@ -1821,9 +1885,19 @@ pub(super) fn confirm_delivery(app: &App) -> Action {
 }
 
 pub(super) async fn confirm_command(app: &mut App, services: &LoopServices) -> Action {
+    let resolved = app.commands.resolve(&app.command_query);
     let command = app.matching_commands().get(app.command_selected).cloned();
     app.overlay = None;
     app.reset_command_search();
+    if let Some(command) = resolved {
+        return dispatch_ui_command_with_arguments(
+            app,
+            command.spec.target,
+            command.arguments,
+            services,
+        )
+        .await;
+    }
     if let Some(command) = command {
         return dispatch_ui_command(app, command.spec.target, services).await;
     }
@@ -2732,6 +2806,12 @@ pub(super) async fn handle_mouse(
         }
     }
     match mouse.kind {
+        MouseEventKind::ScrollUp if app.overlay == Some(Overlay::Plugin) => {
+            handle_plugin_panel_event(app, TuiPanelEvent::Action("previous".to_string())).await;
+        }
+        MouseEventKind::ScrollDown if app.overlay == Some(Overlay::Plugin) => {
+            handle_plugin_panel_event(app, TuiPanelEvent::Action("next".to_string())).await;
+        }
         MouseEventKind::ScrollUp => handle_mouse_scroll(app, -1),
         MouseEventKind::ScrollDown => handle_mouse_scroll(app, 1),
         MouseEventKind::Down(MouseButton::Left) => {
@@ -2761,6 +2841,14 @@ pub(super) async fn handle_mouse(
                 AppHit::Palette(index) => {
                     app.command_selected = index;
                     return confirm_command(app, services).await;
+                }
+                AppHit::PluginRow(index) => {
+                    let event = if activate {
+                        TuiPanelEvent::Activate(index)
+                    } else {
+                        TuiPanelEvent::Select(index)
+                    };
+                    handle_plugin_panel_event(app, event).await;
                 }
                 AppHit::Task(index) => app.selected_task = index,
                 AppHit::Model(_)
@@ -3282,9 +3370,10 @@ pub(super) fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> 
             app.reset_command_search();
             app.overlay = None;
         }
-        Some(
-            Overlay::Status | Overlay::Help | Overlay::Protocols | Overlay::Tasks | Overlay::Plugin,
-        ) => app.overlay = None,
+        Some(Overlay::Status | Overlay::Help | Overlay::Protocols | Overlay::Tasks) => {
+            app.overlay = None;
+        }
+        Some(Overlay::Plugin) => return true,
         Some(Overlay::Document) => {
             app.document = None;
             app.overlay = None;

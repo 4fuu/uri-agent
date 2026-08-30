@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::ValueSource;
+use crate::plugin::{TuiPanelHint, TuiPanelRow, TuiPanelView};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolRequest};
 use crate::session::{SessionContext, SessionModelSettings};
 use ratatui::Terminal;
@@ -26,6 +27,37 @@ impl Protocol for LiveProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         Ok(Vec::new())
+    }
+}
+
+struct RenderPanel;
+
+#[async_trait::async_trait]
+impl TuiPanelSession for RenderPanel {
+    fn view(&self) -> TuiPanelView {
+        TuiPanelView {
+            title: "MCP servers".to_string(),
+            rows: vec![
+                TuiPanelRow::item("github", "GitHub", "Project · connected")
+                    .description("Repository operations")
+                    .tone(TuiPanelTone::Accent),
+            ],
+            selected: Some(0),
+            message: Some(("Connection test passed".to_string(), TuiPanelTone::Accent)),
+            hints: vec![
+                TuiPanelHint::new("Ctrl+N", "add"),
+                TuiPanelHint::new("Enter", "edit"),
+                TuiPanelHint::new("T", "test"),
+                TuiPanelHint::new("R", "reconnect"),
+                TuiPanelHint::new("Space", "enable/disable"),
+                TuiPanelHint::new("Delete", "remove"),
+                TuiPanelHint::new("Esc", "close"),
+            ],
+        }
+    }
+
+    async fn handle(&mut self, _event: TuiPanelEvent) -> Result<TuiPanelControl> {
+        Ok(TuiPanelControl::Continue)
     }
 }
 
@@ -106,6 +138,43 @@ fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn plugin_panel_renders_semantic_rows_status_and_mouse_targets() {
+    let mut app = test_app();
+    app.tui_panel = Some(Box::new(RenderPanel));
+    app.overlay = Some(Overlay::Plugin);
+
+    let rendered = render_to_string(&mut app, 100, 24);
+
+    assert!(rendered.contains("MCP servers"));
+    assert!(rendered.contains("GitHub"));
+    assert!(rendered.contains("Project · connected"));
+    assert!(rendered.contains("Repository operations"));
+    assert!(rendered.contains("Connection test passed"));
+    assert!(rendered.contains("Ctrl+N add"));
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| matches!(region.target, AppHit::PluginRow(0)))
+    );
+}
+
+#[test]
+fn plugin_panel_keeps_narrow_titles_compact_and_moves_actions_to_the_footer() {
+    let mut app = test_app();
+    app.tui_panel = Some(Box::new(RenderPanel));
+    app.overlay = Some(Overlay::Plugin);
+
+    let rendered = render_to_string(&mut app, 64, 18);
+    let title = rendered
+        .lines()
+        .find(|line| line.contains("MCP servers"))
+        .expect("plugin panel title");
+
+    assert!(!title.contains("Ctrl+N"));
+    assert!(rendered.lines().any(|line| line.contains("Ctrl+N add")));
 }
 
 async fn persisted_tui_session(path: &Path, id: &str) -> Session {

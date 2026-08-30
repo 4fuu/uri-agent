@@ -3,6 +3,7 @@ mod apply_patch;
 mod file;
 mod grep;
 mod https;
+mod mcp;
 pub(crate) mod model_tools;
 mod replace;
 mod sessions;
@@ -85,16 +86,17 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-pub fn plugins(cwd: &Path) -> PluginRegistry {
+pub fn plugins(cwd: &Path, config_directory: &Path) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
-    add_agent_plugins(&mut plugins, cwd);
+    add_agent_plugins(&mut plugins, cwd, config_directory);
     plugins.add(title::TerminalTitlePlugin);
     plugins
 }
 
-fn add_agent_plugins(plugins: &mut PluginRegistry, cwd: &Path) {
+fn add_agent_plugins(plugins: &mut PluginRegistry, cwd: &Path, config_directory: &Path) {
     plugins.add(model_tools::ProtocolToolsPlugin);
     plugins.add(agents::AgentsPlugin::new(cwd));
+    plugins.add(mcp::McpPlugin::new(cwd, config_directory));
     plugins.add(uri_agent_docs::UriAgentDocsProtocol);
     plugins.add(file::FileProtocol::new(cwd));
     plugins.add(grep::GrepProtocol::new(cwd));
@@ -160,7 +162,7 @@ mod tests {
     #[test]
     fn built_in_distribution_separates_protocols_from_direct_edit_tools() {
         let directory = tempfile::tempdir().unwrap();
-        let plugins = plugins(directory.path());
+        let plugins = plugins(directory.path(), directory.path());
         let names = plugins
             .protocol_descriptors()
             .unwrap()

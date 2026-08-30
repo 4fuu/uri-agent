@@ -190,6 +190,7 @@ pub struct AgentServices {
     pub output: Arc<OutputStore>,
     pub context_window: usize,
     pub model_ready: bool,
+    plugins: Arc<PluginRegistry>,
     wasm_plugins: WasmPluginManager,
 }
 
@@ -278,6 +279,7 @@ impl AgentHandle {
         }
         let _ = self.instance.services.wasm_plugins.shutdown().await;
         self.instance.services.runtime.shutdown().await;
+        let _ = self.instance.services.plugins.shutdown().await;
         self.host
             .remove(self.session_id(), Arc::as_ptr(&self.instance) as usize)
             .await;
@@ -462,7 +464,7 @@ impl AgentHost {
     }
 
     pub async fn run_background(&self) -> Result<()> {
-        let mut plugins = crate::builtins::plugins(&self.inner.cwd);
+        let mut plugins = crate::builtins::plugins(&self.inner.cwd, self.inner.manager.directory());
         let wasm_plugins =
             WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
         plugins.add(wasm_plugins.clone());
@@ -554,11 +556,13 @@ fn validate_plugin_open(spec: &AgentSpec, bound_parent: Option<&str>) -> Result<
 }
 
 fn validate_spec(spec: &AgentSpec) -> Result<()> {
-    if spec.provider.trim().is_empty() {
-        anyhow::bail!("Agent provider cannot be empty");
-    }
-    if spec.model.trim().is_empty() {
-        anyhow::bail!("Agent model cannot be empty");
+    if spec.parent_session_id.is_some() {
+        if spec.provider.trim().is_empty() {
+            anyhow::bail!("Agent provider cannot be empty");
+        }
+        if spec.model.trim().is_empty() {
+            anyhow::bail!("Agent model cannot be empty");
+        }
     }
     if spec.max_output_tokens == Some(0) {
         anyhow::bail!("Agent output-token limit must be greater than zero");
@@ -593,10 +597,13 @@ impl AgentHost {
         session: Session,
         callback: Option<Arc<dyn CompactionCallback>>,
     ) -> Result<AgentServices> {
-        let mut plugins = crate::builtins::plugins(&self.inner.cwd);
+        let mut plugins = crate::builtins::plugins(&self.inner.cwd, self.inner.manager.directory());
         let wasm_plugins =
             WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
         plugins.add(wasm_plugins.clone());
+        if !session.is_new() {
+            plugins.restore_session_protocol_records(&session.session_protocol_records().await)?;
+        }
         let startup_notices = plugins.startup_notices();
         let reserved_protocols = plugins
             .protocol_descriptors()?
@@ -679,7 +686,7 @@ impl AgentHost {
         let context_window = limits.context_window;
         let initializer = Arc::new(AgentInitializer {
             session: session.clone(),
-            plugins,
+            plugins: plugins.clone(),
             cwd: self.inner.cwd.clone(),
             reserved_protocols,
             protocols: protocols.clone(),
@@ -713,6 +720,7 @@ impl AgentHost {
             output,
             context_window,
             model_ready,
+            plugins,
             wasm_plugins,
         })
     }
@@ -843,10 +851,13 @@ impl RuntimeInitializer for AgentInitializer {
         let prompt = if new_session {
             let prompt = self.render_system_prompt(&spec)?;
             self.session
-                .initialize_context(SessionContext {
-                    system_prompt: prompt.clone(),
-                    skills: snapshots,
-                })
+                .initialize_context_with_protocols(
+                    SessionContext {
+                        system_prompt: prompt.clone(),
+                        skills: snapshots,
+                    },
+                    self.plugins.session_protocol_records()?,
+                )
                 .await?;
             prompt
         } else {
@@ -927,6 +938,24 @@ mod tests {
                 .with_protocols(["file"])
                 .with_max_output_tokens(128),
         )
+        .unwrap();
+    }
+
+    #[test]
+    fn root_agent_can_open_before_a_model_is_configured() {
+        validate_spec(&AgentSpec::root(
+            "",
+            "",
+            ThinkingLevel::Off,
+            Path::new("/work"),
+        ))
+        .unwrap();
+        validate_spec(&AgentSpec::root(
+            "provider",
+            "",
+            ThinkingLevel::Off,
+            Path::new("/work"),
+        ))
         .unwrap();
     }
 

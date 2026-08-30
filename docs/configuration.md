@@ -256,7 +256,9 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 | `<config>/models.json` | Custom providers, models, headers, and model overrides |
 | `<config>/models-store.json` | Generated pi and credential-scoped provider catalog cache |
 | `<config>/keymap.rhai` | Global keymap overrides |
+| `<config>/mcp.json` | User-scoped MCP server definitions |
 | `<config>/wasm-plugins/` | Trusted WASM modules loaded at startup and on reload |
+| `<project>/.agents/mcp.json` | Project-scoped MCP server definitions |
 | `<project>/.uri-agent/settings.json` | Optional project settings |
 | `<project>/.uri-agent/keymap.rhai` | Optional project keymap overrides |
 
@@ -273,6 +275,76 @@ Variables are global rather than project- or session-specific. URI Agent stores 
 Each future Agent `bash` or `pwsh` command receives the latest saved values. A saved value overrides an inherited process variable with the same name; other process variables remain inherited normally. The manager does not modify URI Agent's own process environment, and variables are deliberately not injected into the user-controlled `:terminal` PTY.
 
 The dedicated linked Rust and WASM host interface requires an explicitly requested whole-environment capability. The request names no individual variables and has no interactive approval flow; it exists as a sensitive-access marker for source review. See [WASM plugin environment access](plugins.md#agent-environment-access).
+
+## MCP servers
+
+Run `:mcp` to manage URI Agent's own MCP configuration. The panel lists known
+status without connecting every server and supports Add, Edit, Test, Reconnect,
+Enable/Disable, and Remove. Add defaults to Project scope. Editing can move a
+server between User and Project scope; the destination is written before the
+source is removed, and a failed removal is rolled back. Existing names are
+immutable. The add/edit workflow validates the form, automatically tests the
+connection, then shows a review screen; a failed test reports the complete
+error but does not prevent saving.
+
+User definitions live in `<config>/mcp.json`; Project definitions live in
+`<project>/.agents/mcp.json`. Both files use an independent `servers` object:
+
+```json
+{
+  "servers": {
+    "github": {
+      "description": "Search and manage GitHub repositories",
+      "enabled": true,
+      "transport": "stdio",
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "cwd": ".",
+      "environment": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "GITHUB_TOKEN"
+      }
+    },
+    "postgres": {
+      "description": "Read the application database",
+      "enabled": true,
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/postgres",
+      "headers": {
+        "Authorization": "Bearer ${POSTGRES_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+A Project entry completely replaces the same User name; fields are not merged.
+Enable/Disable edits the effective entry, so disabling an effective User entry
+changes User scope rather than creating a Project override. Removing a Project
+entry removes only that scope and warns when the same User name will become
+effective again.
+
+Every server requires a nonempty `description`. `stdio` requires `command` and
+keeps `args` as an exact string list rather than splitting a shell command.
+`cwd` may be absolute or project-relative and defaults to the project. The
+child inherits URI Agent's process environment. Each `environment` entry maps a
+child variable name to the name of a global [Agent environment](#agent-environment)
+value, which overrides the inherited value; missing references fail when
+connecting.
+
+Streamable HTTP requires HTTPS except for loopback HTTP addresses, and URLs
+cannot contain username/password credentials. Header templates expand
+`${NAME}` from Agent Environment at connection time, and a missing value fails
+directly. Credential-bearing headers such as
+`Authorization`, `Cookie`, and `X-API-Key` must use such a reference instead of
+storing plaintext credentials. MCP OAuth and the deprecated HTTP+SSE transport
+are not supported.
+
+New sessions record enabled server identities and required descriptions without
+connecting or fully validating transports. Newly saved servers therefore join
+only new sessions. Calls from an existing session keep its recorded protocol
+set but resolve the latest transport, URL, and Agent Environment values; a
+removed or disabled recorded server fails on its next call. See [MCP
+protocols](protocols.md#mcp-servers) for routes and argument encoding.
 
 ## Settings fields and precedence
 

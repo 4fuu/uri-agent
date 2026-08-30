@@ -1,6 +1,7 @@
 use crate::agent::{AgentSpec, SubmitKind};
 use crate::catalog::ThinkingLevel;
 use crate::config::display_path;
+use crate::plugin::SessionProtocolRecord;
 use crate::skill::SkillSnapshot;
 use crate::task::{TaskReport, TaskStatus};
 use anyhow::{Context, Result, anyhow, bail};
@@ -345,6 +346,8 @@ pub enum EventKind {
     },
     SessionContext {
         context: SessionContext,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        protocols: Vec<SessionProtocolRecord>,
     },
     User {
         text: String,
@@ -379,6 +382,8 @@ pub enum EventKind {
     AgentSpecUpdated {
         spec: AgentSpec,
         context: SessionContext,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        protocols: Vec<SessionProtocolRecord>,
     },
     Task {
         id: String,
@@ -443,6 +448,8 @@ struct State {
 struct ResumeState {
     through_sequence: Option<u64>,
     context_sequence: Option<u64>,
+    #[serde(default)]
+    session_protocols: Vec<SessionProtocolRecord>,
     #[serde(default)]
     latest_compaction_sequence: Option<u64>,
     spec: Option<AgentSpec>,
@@ -529,7 +536,7 @@ fn restore_persisted_state(
     let context_sequence = context_event
         .as_ref()
         .and_then(|(sequence, _)| u64::try_from(*sequence).ok());
-    let context = context_event
+    let context_and_protocols = context_event
         .map(|(_, payload)| {
             let kind = serde_json::from_str::<EventKind>(&payload).map_err(|error| {
                 tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
@@ -539,12 +546,18 @@ fn restore_persisted_state(
                 )
             })?;
             match kind {
-                EventKind::SessionContext { context }
-                | EventKind::AgentSpecUpdated { context, .. } => Ok(context),
+                EventKind::SessionContext { context, protocols } => Ok((context, protocols)),
+                EventKind::AgentSpecUpdated {
+                    context, protocols, ..
+                } => Ok((context, protocols)),
                 _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             }
         })
         .transpose()?;
+    let (context, session_protocols) = context_and_protocols
+        .map_or((None, Vec::new()), |(context, protocols)| {
+            (Some(context), protocols)
+        });
     let has_creation = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM events
          WHERE session_id = ?1 AND kind = 'session_created')",
@@ -635,6 +648,9 @@ fn restore_persisted_state(
     let tail = query_events(db, id, cursor, None, Some(RESUME_EVENT_KINDS))?;
     for event in &tail {
         apply_resume_event(&mut derived, event);
+    }
+    if !session_protocols.is_empty() {
+        derived.session_protocols = session_protocols;
     }
     derived.context_sequence = derived.context_sequence.or(context_sequence);
     derived.through_sequence = Some(authoritative_head);
@@ -997,13 +1013,16 @@ impl Session {
                 existing.push(SessionEvent {
                     sequence: 1,
                     at,
-                    kind: EventKind::SessionContext { context },
+                    kind: EventKind::SessionContext {
+                        context,
+                        protocols: Vec::new(),
+                    },
                 });
             }
             for event in &existing {
                 apply_resume_event(&mut derived, event);
                 apply_replay_event(&mut replay, &event.kind);
-                if let EventKind::SessionContext { context } = &event.kind {
+                if let EventKind::SessionContext { context, .. } = &event.kind {
                     frozen_context = Some(context.clone());
                 }
             }
@@ -1253,6 +1272,15 @@ impl Session {
     }
 
     pub async fn initialize_context(&self, context: SessionContext) -> Result<()> {
+        self.initialize_context_with_protocols(context, Vec::new())
+            .await
+    }
+
+    pub async fn initialize_context_with_protocols(
+        &self,
+        context: SessionContext,
+        protocols: Vec<SessionProtocolRecord>,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
         if state.context.is_some() {
             return Ok(());
@@ -1265,9 +1293,9 @@ impl Session {
                 .head_sequence
                 .map_or(0, |sequence| sequence.saturating_add(1)),
             at: Utc::now(),
-            kind: EventKind::SessionContext { context },
+            kind: EventKind::SessionContext { context, protocols },
         };
-        if let EventKind::SessionContext { context } = &event.kind {
+        if let EventKind::SessionContext { context, .. } = &event.kind {
             state.context = Some(context.clone());
         }
         state.head_sequence = Some(event.sequence);
@@ -1469,6 +1497,10 @@ impl Session {
             .expect("session context is validated when the session opens")
     }
 
+    pub async fn session_protocol_records(&self) -> Vec<SessionProtocolRecord> {
+        self.state.lock().await.derived.session_protocols.clone()
+    }
+
     pub async fn has_user_message(&self) -> bool {
         self.state.lock().await.derived.has_user
     }
@@ -1635,7 +1667,11 @@ impl Session {
     ) -> Result<SessionEvent> {
         let mut events = Vec::with_capacity(2);
         if let Some((spec, context)) = updated {
-            events.push(EventKind::AgentSpecUpdated { spec, context });
+            events.push(EventKind::AgentSpecUpdated {
+                spec,
+                context,
+                protocols: self.session_protocol_records().await,
+            });
         }
         events.push(EventKind::Compaction {
             summary,
@@ -2267,7 +2303,8 @@ fn apply_committed_events(
         apply_resume_event(&mut state.derived, event);
         apply_replay_event(&mut state.replay, &event.kind);
         match &event.kind {
-            EventKind::SessionContext { context } | EventKind::AgentSpecUpdated { context, .. } => {
+            EventKind::SessionContext { context, .. }
+            | EventKind::AgentSpecUpdated { context, .. } => {
                 state.context = Some(context.clone());
             }
             _ => {}
@@ -2330,10 +2367,16 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
         EventKind::SessionCreated { spec } => {
             state.spec = Some(spec.clone());
         }
-        EventKind::SessionContext { .. } => state.context_sequence = Some(event.sequence),
-        EventKind::AgentSpecUpdated { spec, .. } => {
+        EventKind::SessionContext { protocols, .. } => {
+            state.context_sequence = Some(event.sequence);
+            state.session_protocols.clone_from(protocols);
+        }
+        EventKind::AgentSpecUpdated {
+            spec, protocols, ..
+        } => {
             state.spec = Some(spec.clone());
             state.context_sequence = Some(event.sequence);
+            state.session_protocols.clone_from(protocols);
         }
         EventKind::User { .. } => state.has_user = true,
         EventKind::ToolCall {
@@ -3056,6 +3099,72 @@ mod tests {
         let frozen = resumed.context().await;
         assert_eq!(frozen.system_prompt, "system deferred");
         assert_eq!(frozen.skills[0].description, "description deferred");
+    }
+
+    #[tokio::test]
+    async fn session_protocol_records_survive_resume_and_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = Session::open_at_with_thinking(
+            path.clone(),
+            Some("frozen-protocols"),
+            Path::new("/work"),
+            "test",
+            "model",
+            ThinkingLevel::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let records = vec![SessionProtocolRecord {
+            owner: "mcp".to_string(),
+            identity: "GitHub".to_string(),
+            descriptor: crate::protocol::ProtocolDescriptor {
+                name: "github-mcp".to_string(),
+                description: "Frozen GitHub MCP description".to_string(),
+                can_read: true,
+                can_exec: true,
+            },
+            help_dependencies: vec!["mcp".to_string()],
+        }];
+        opened
+            .initialize_context_with_protocols(context("protocols"), records.clone())
+            .await
+            .unwrap();
+        opened
+            .append(EventKind::User {
+                text: "persist protocols".into(),
+            })
+            .await
+            .unwrap();
+        opened
+            .append_compaction_with_spec(
+                "summary".to_string(),
+                10,
+                Vec::new(),
+                false,
+                Some((opened.spec().await, context("compacted-protocols"))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(opened.session_protocol_records().await, records);
+        drop(opened);
+
+        let resumed = Session::open_at(
+            path,
+            Some("frozen-protocols"),
+            Path::new("/work"),
+            "test",
+            "model",
+            context("changed"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.session_protocol_records().await, records);
+        assert_eq!(
+            resumed.context().await.system_prompt,
+            "system compacted-protocols"
+        );
     }
 
     #[tokio::test]
