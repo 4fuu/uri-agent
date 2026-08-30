@@ -1635,6 +1635,7 @@ mod tests {
         .await
         .unwrap();
         let project = model_project(&config_directory, &project_directory).await;
+        let project_directory = project.cwd.clone();
         let cli = Cli::try_parse_from(["uri-agent", "--acpv1", "--offline"]).unwrap();
         let state = Arc::new(AcpV1State::new(cli));
         state
@@ -1756,6 +1757,7 @@ mod tests {
         .await
         .unwrap();
         let second_project = model_project(&config_directory, &second_directory).await;
+        let second_directory = second_project.cwd.clone();
         state
             .projects
             .lock()
