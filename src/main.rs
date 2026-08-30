@@ -9,7 +9,11 @@ use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut config = Config::load(Cli::parse()).await?;
+    let cli = Cli::parse();
+    if cli.acpv1 {
+        return uri_agent::acp::v1::serve(cli).await;
+    }
+    let mut config = Config::load(cli).await?;
     let host = AgentHost::new(
         config.manager.clone(),
         config.environment.clone(),

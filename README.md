@@ -47,6 +47,8 @@ supported providers.
 - **Built-in MCP bridge:** `:mcp` manages stdio and Streamable HTTP servers,
   exposing each one as an on-demand `<name>-mcp://` protocol with query-first
   arguments and a complete-JSON fallback for complex schemas.
+- **ACP editor integration:** `uri-agent --acpv1` serves stable ACP v1 over
+  stdio, with durable sessions that can later reopen through the normal TUI.
 - **Broad model access:** the pi.dev catalog, provider-specific sign-in, and
   credential-scoped live discovery bring a wide provider ecosystem into one
   model selector.
@@ -142,10 +144,25 @@ The first session is working when protocol activity appears and the assistant re
 See [Models and configuration](docs/configuration.md) for provider support,
 authentication, offline mode, environment variables, and custom endpoints.
 
+### Connect an ACP client
+
+After configuring authentication and a default model in the TUI, configure an
+ACP client to launch:
+
+```text
+uri-agent --acpv1
+```
+
+The client supplies each session's absolute project directory. ACP-created
+sessions use the normal durable session store and can reopen in the TUI after
+the client releases them. See [ACP v1](docs/acp.md) for supported content, MCP
+servers, lifecycle operations, and ownership constraints.
+
 ## Documentation
 
 | Goal | Guide |
 | --- | --- |
+| Connect an editor or other ACP client | [ACP v1](docs/acp.md) |
 | Choose providers, authenticate, or change settings | [Models and configuration](docs/configuration.md) |
 | Use the conversation, commands, keymap, terminal, or attachments | [Terminal interface](docs/interface.md) and [terminal features](docs/terminal.md) |
 | Understand tools, protocols, tasks, and complete output | [Protocols, tasks, and output](docs/protocols.md) |

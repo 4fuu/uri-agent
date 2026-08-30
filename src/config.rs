@@ -103,6 +103,13 @@ pub struct Cli {
     /// Run resident plugin callbacks without starting the terminal interface.
     #[arg(long, conflicts_with_all = ["continue_session", "session"])]
     pub background: bool,
+
+    /// Serve stable Agent Client Protocol v1 over stdin/stdout.
+    #[arg(
+        long,
+        conflicts_with_all = ["continue_session", "session", "cwd", "background"]
+    )]
+    pub acpv1: bool,
 }
 
 pub struct Config {
@@ -2178,6 +2185,32 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn acpv1_cli_path_preserves_model_overrides_and_rejects_ui_session_modes() {
+        let cli = Cli::try_parse_from([
+            "uri-agent",
+            "--acpv1",
+            "--offline",
+            "--provider",
+            "example",
+            "--model",
+            "model",
+        ])
+        .unwrap();
+        assert!(cli.acpv1);
+        assert!(cli.offline);
+        assert_eq!(cli.provider.as_deref(), Some("example"));
+        assert_eq!(cli.model.as_deref(), Some("model"));
+
+        for conflicting in ["--continue-session", "--session", "--cwd", "--background"] {
+            let mut arguments = vec!["uri-agent", "--acpv1", conflicting];
+            if matches!(conflicting, "--session" | "--cwd") {
+                arguments.push("value");
+            }
+            assert!(Cli::try_parse_from(arguments).is_err(), "{conflicting}");
+        }
+    }
 
     async fn read_http_request(socket: &mut TcpStream) -> String {
         let mut request = Vec::new();

@@ -7,7 +7,7 @@ use crate::plugin::{
 };
 use crate::plugin_state::{PLUGIN_STATE_DATABASE, PluginStateStore};
 use crate::prompts::PromptEntry;
-use crate::protocol::ProtocolRegistry;
+use crate::protocol::{ProtocolImage, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, RuntimeInitializer, forward_task_notices};
 use crate::session::{EventKind, Session, SessionContext};
 use crate::skill::{SkillProtocol, SkillProtocolSource};
@@ -17,7 +17,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rig::message::{AssistantContent, Message};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -26,11 +27,31 @@ use tokio::sync::Mutex;
 pub const ROOT_AGENT_DEPTH: u8 = 1;
 pub const MAX_AGENT_DEPTH: u8 = 2;
 
+#[derive(Clone, Debug, Default)]
+pub struct AgentOpenOptions {
+    pub private_records: BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmitKind {
     Prompt,
     Steer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentPrompt {
+    pub text: String,
+    pub images: Vec<ProtocolImage>,
+}
+
+impl AgentPrompt {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -219,6 +240,10 @@ impl AgentHandle {
     }
 
     pub async fn submit(&self, text: impl Into<String>, kind: SubmitKind) -> Result<u64> {
+        self.submit_prompt(AgentPrompt::text(text), kind).await
+    }
+
+    pub async fn submit_prompt(&self, prompt: AgentPrompt, kind: SubmitKind) -> Result<u64> {
         if self.instance.closed.load(Ordering::Acquire) {
             anyhow::bail!("Agent handle is closed");
         }
@@ -226,7 +251,20 @@ impl AgentHandle {
             .instance
             .services
             .runtime
-            .submit(text.into(), kind)
+            .submit_with_images(prompt.text, prompt.images, kind)
+            .await?
+            .id)
+    }
+
+    pub async fn submit_prompt_exclusive(&self, prompt: AgentPrompt) -> Result<u64> {
+        if self.instance.closed.load(Ordering::Acquire) {
+            anyhow::bail!("Agent handle is closed");
+        }
+        Ok(self
+            .instance
+            .services
+            .runtime
+            .submit_exclusive_with_images(prompt.text, prompt.images)
             .await?
             .id)
     }
@@ -271,6 +309,14 @@ impl AgentHandle {
 
     pub async fn cancel(&self) -> bool {
         self.instance.services.runtime.interrupt_turn().await
+    }
+
+    pub(crate) async fn cancel_submission(&self, submission_id: u64) -> bool {
+        self.instance
+            .services
+            .runtime
+            .interrupt_submission(submission_id)
+            .await
     }
 
     pub async fn close(&self) {
@@ -353,7 +399,15 @@ impl AgentHost {
         }
         spec.working_directory.clone_from(&self.inner.cwd);
         spec.assign_depth(MAX_AGENT_DEPTH);
-        self.open_inner(None, spec, callback, false).await
+        self.open_inner(
+            None,
+            spec,
+            callback,
+            false,
+            AgentOpenOptions::default(),
+            true,
+        )
+        .await
     }
 
     pub async fn open_plugin(
@@ -378,17 +432,57 @@ impl AgentHost {
             .ok_or_else(|| anyhow::anyhow!("Agent session {session_id} does not exist"))?;
         validate_spec(&spec)?;
         validate_plugin_open(&spec, bound_parent)?;
-        self.open_inner(Some(session_id), spec, callback, false)
-            .await
+        self.open_inner(
+            Some(session_id),
+            spec,
+            callback,
+            false,
+            AgentOpenOptions::default(),
+            true,
+        )
+        .await
     }
 
     #[doc(hidden)]
     pub async fn open_root(&self, requested: Option<&str>, spec: AgentSpec) -> Result<AgentHandle> {
+        self.open_root_with_options(requested, spec, AgentOpenOptions::default())
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn open_root_with_options(
+        &self,
+        requested: Option<&str>,
+        spec: AgentSpec,
+        options: AgentOpenOptions,
+    ) -> Result<AgentHandle> {
+        self.open_root_with_resume(requested, spec, options, true)
+            .await
+    }
+
+    pub(crate) async fn open_root_with_deferred_resume(
+        &self,
+        requested: Option<&str>,
+        spec: AgentSpec,
+        options: AgentOpenOptions,
+    ) -> Result<AgentHandle> {
+        self.open_root_with_resume(requested, spec, options, false)
+            .await
+    }
+
+    async fn open_root_with_resume(
+        &self,
+        requested: Option<&str>,
+        spec: AgentSpec,
+        options: AgentOpenOptions,
+        resume_pending: bool,
+    ) -> Result<AgentHandle> {
         validate_spec(&spec)?;
         if spec.parent_session_id.is_some() || spec.depth() != ROOT_AGENT_DEPTH {
             anyhow::bail!("root Agent spec must have depth 1 and no parent");
         }
-        self.open_inner(requested, spec, None, true).await
+        self.open_inner(requested, spec, None, true, options, resume_pending)
+            .await
     }
 
     async fn open_inner(
@@ -397,6 +491,8 @@ impl AgentHost {
         spec: AgentSpec,
         callback: Option<Arc<dyn CompactionCallback>>,
         root: bool,
+        options: AgentOpenOptions,
+        resume_pending: bool,
     ) -> Result<AgentHandle> {
         let _open = self.inner.open_lock.lock().await;
         let session = Session::open_deferred(requested, &self.inner.cwd, spec).await?;
@@ -410,6 +506,9 @@ impl AgentHost {
             anyhow::bail!("plugins may only create or open depth-2 Agent sessions");
         }
         if let Some(handle) = self.active(session.id()).await {
+            if !options.private_records.is_empty() {
+                anyhow::bail!("cannot replace private records of an active Agent session");
+            }
             handle
                 .services()
                 .runtime
@@ -417,8 +516,29 @@ impl AgentHost {
                 .await;
             return Ok(handle);
         }
-        let resume_pending = !session.pending_inputs().await?.is_empty();
-        let services = self.build_services(session, callback).await?;
+        let private_record_owners = options.private_records.keys().cloned().collect::<Vec<_>>();
+        for (owner, payload) in options.private_records {
+            session.stage_private_record(&owner, payload).await?;
+        }
+        let resume_pending = resume_pending && !session.pending_inputs().await?.is_empty();
+        let services = self.build_services(session.clone(), callback).await?;
+        if !private_record_owners.is_empty()
+            && let Err(error) = services.runtime.prepare_context().await
+        {
+            let _ = services.wasm_plugins.shutdown().await;
+            services.runtime.shutdown().await;
+            let _ = services.plugins.shutdown().await;
+            return Err(error);
+        }
+        if let Err(error) = session
+            .persist_private_records(&private_record_owners)
+            .await
+        {
+            let _ = services.wasm_plugins.shutdown().await;
+            services.runtime.shutdown().await;
+            let _ = services.plugins.shutdown().await;
+            return Err(error);
+        }
         let instance = Arc::new(AgentInstance {
             services,
             closed: AtomicBool::new(false),
@@ -597,7 +717,14 @@ impl AgentHost {
         session: Session,
         callback: Option<Arc<dyn CompactionCallback>>,
     ) -> Result<AgentServices> {
-        let mut plugins = crate::builtins::plugins(&self.inner.cwd, self.inner.manager.directory());
+        let mcp_profile = session
+            .private_record(crate::builtins::MCP_SESSION_PROFILE_OWNER)
+            .await;
+        let mut plugins = crate::builtins::plugins_with_session_profile(
+            &self.inner.cwd,
+            self.inner.manager.directory(),
+            mcp_profile,
+        );
         let wasm_plugins =
             WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
         plugins.add(wasm_plugins.clone());
@@ -896,6 +1023,7 @@ impl RuntimeInitializer for AgentInitializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::{SessionMcpProfile, SessionMcpServer, SessionMcpTransport};
     use crate::catalog::ThinkingLevel;
     use std::path::Path;
 
@@ -969,5 +1097,120 @@ mod tests {
         validate_plugin_open(&child, None).unwrap();
         validate_plugin_open(&child, Some("parent")).unwrap();
         assert!(validate_plugin_open(&child, Some("other-parent")).is_err());
+    }
+
+    #[tokio::test]
+    async fn frontend_private_mcp_profile_reopens_through_the_normal_root_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_directory = workspace.path().join("config");
+        tokio::fs::create_dir_all(&config_directory).await.unwrap();
+        let manager = ConfigManager::load_for_test(&config_directory, workspace.path())
+            .await
+            .unwrap();
+        let environment = Arc::new(
+            crate::config::AgentEnvironment::load(&config_directory)
+                .await
+                .unwrap(),
+        );
+        let catalog = Arc::new(ModelCatalog::load(&config_directory, true).await.unwrap());
+        let host = AgentHost::new(
+            manager.clone(),
+            environment,
+            catalog,
+            workspace.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let profile = SessionMcpProfile::new(BTreeMap::from([(
+            "private server".to_string(),
+            SessionMcpServer {
+                transport: SessionMcpTransport::Stdio {
+                    command: "missing-test-server".to_string(),
+                    args: Vec::new(),
+                    environment: BTreeMap::from([(
+                        "TOKEN".to_string(),
+                        "private-test-value".to_string(),
+                    )]),
+                },
+            },
+        )]));
+        let private_payload = serde_json::to_value(&profile).unwrap();
+        let mut options = AgentOpenOptions::default();
+        options.private_records.insert(
+            crate::builtins::MCP_SESSION_PROFILE_OWNER.to_string(),
+            private_payload.clone(),
+        );
+        let initial = manager.current().await;
+        let spec = AgentSpec::root(
+            &initial.provider,
+            &initial.model,
+            initial.thinking,
+            workspace.path(),
+        );
+        let created = host
+            .open_root_with_options(None, spec.clone(), options)
+            .await
+            .unwrap();
+        created.services().runtime.prepare_context().await.unwrap();
+        created
+            .services()
+            .runtime
+            .session()
+            .persist()
+            .await
+            .unwrap();
+        let session_id = created.session_id().to_string();
+        let frozen_context = created.services().runtime.session().context().await;
+        let protocol_names = created
+            .services()
+            .protocols
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        assert!(
+            protocol_names
+                .iter()
+                .any(|name| name == "private-server-mcp")
+        );
+        let transcript = serde_json::to_string(
+            &created
+                .services()
+                .runtime
+                .session()
+                .snapshot()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!transcript.contains("private-test-value"));
+        created.close().await;
+
+        let reopened = host.open_root(Some(&session_id), spec).await.unwrap();
+        reopened.services().runtime.prepare_context().await.unwrap();
+        assert_eq!(
+            reopened
+                .services()
+                .runtime
+                .session()
+                .private_record(crate::builtins::MCP_SESSION_PROFILE_OWNER)
+                .await,
+            Some(private_payload)
+        );
+        assert_eq!(
+            reopened.services().runtime.session().context().await,
+            frozen_context
+        );
+        assert_eq!(
+            reopened
+                .services()
+                .protocols
+                .descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>(),
+            protocol_names
+        );
+        reopened.close().await;
     }
 }

@@ -42,12 +42,105 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 const OWNER: &str = "mcp";
+pub(super) const SESSION_PROFILE_OWNER: &str = OWNER;
 const SHARED_PROTOCOL: &str = "mcp";
 const PROJECT_CONFIG: &str = ".agents/mcp.json";
 const GLOBAL_CONFIG: &str = "mcp.json";
 const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 const MCP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_PROFILE_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionMcpProfile {
+    version: u8,
+    pub servers: BTreeMap<String, SessionMcpServer>,
+}
+
+impl SessionMcpProfile {
+    pub fn new(servers: BTreeMap<String, SessionMcpServer>) -> Self {
+        Self {
+            version: SESSION_PROFILE_VERSION,
+            servers,
+        }
+    }
+
+    fn into_configs(self) -> Result<BTreeMap<String, McpServerConfig>> {
+        if self.version != SESSION_PROFILE_VERSION {
+            bail!("unsupported private MCP session profile version");
+        }
+        self.servers
+            .into_iter()
+            .map(|(name, server)| {
+                let config = McpServerConfig {
+                    description: format!("MCP server {name} provided by the session frontend"),
+                    enabled: true,
+                    transport: match server.transport {
+                        SessionMcpTransport::Stdio {
+                            command,
+                            args,
+                            environment,
+                        } => McpTransportConfig::Stdio {
+                            command,
+                            args,
+                            cwd: None,
+                            environment,
+                        },
+                        SessionMcpTransport::StreamableHttp { url, headers } => {
+                            McpTransportConfig::StreamableHttp { url, headers }
+                        }
+                    },
+                };
+                config.validate_session(&name)?;
+                Ok((name, config))
+            })
+            .collect()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let configs = self.clone().into_configs()?;
+        let mut protocols = HashSet::new();
+        for name in configs.keys() {
+            let protocol = protocol_name(name)?;
+            if !protocols.insert(protocol.clone()) {
+                bail!("MCP server protocol name collides: {protocol}://");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionMcpServer {
+    #[serde(flatten)]
+    pub transport: SessionMcpTransport,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "transport", rename_all = "kebab-case")]
+pub enum SessionMcpTransport {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        environment: BTreeMap<String, String>,
+    },
+    StreamableHttp {
+        url: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+    },
+}
+
+pub fn session_profile_record(profile: SessionMcpProfile) -> Result<(String, Value)> {
+    profile.validate()?;
+    Ok((OWNER.to_string(), serde_json::to_value(profile)?))
+}
+
+pub fn session_profile_owner() -> &'static str {
+    OWNER
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum McpScope {
@@ -143,6 +236,41 @@ impl McpServerConfig {
         Ok(())
     }
 
+    fn validate_session(&self, name: &str) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("MCP server name cannot be empty");
+        }
+        match &self.transport {
+            McpTransportConfig::Stdio {
+                command,
+                environment,
+                ..
+            } => {
+                if command.trim().is_empty() {
+                    bail!("MCP server {name:?} requires a stdio command");
+                }
+                for target in environment.keys() {
+                    validate_environment_name(target).with_context(|| {
+                        format!("invalid MCP server {name:?} process environment name")
+                    })?;
+                }
+            }
+            McpTransportConfig::StreamableHttp { url, headers } => {
+                validate_http_url(url)
+                    .with_context(|| format!("invalid MCP server {name:?} URL"))?;
+                for (header, value) in headers {
+                    header.parse::<HeaderName>().with_context(|| {
+                        format!("invalid MCP server {name:?} HTTP header {header:?}")
+                    })?;
+                    HeaderValue::from_str(value).with_context(|| {
+                        format!("invalid MCP server {name:?} HTTP header {header:?}")
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn transport_label(&self) -> &'static str {
         match self.transport {
             McpTransportConfig::Stdio { .. } => "stdio",
@@ -160,13 +288,17 @@ struct EffectiveServer {
     name: String,
     scope: McpScope,
     raw: Value,
+    value_mode: McpValueMode,
 }
 
 impl EffectiveServer {
     fn parse(&self) -> Result<McpServerConfig> {
         let config: McpServerConfig = serde_json::from_value(self.raw.clone())
             .with_context(|| format!("invalid MCP server configuration for {:?}", self.name))?;
-        config.validate(&self.name)?;
+        match self.value_mode {
+            McpValueMode::EnvironmentReferences => config.validate(&self.name)?,
+            McpValueMode::Literal => config.validate_session(&self.name)?,
+        }
         Ok(config)
     }
 }
@@ -280,6 +412,92 @@ impl McpConfigStore {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum McpValueMode {
+    EnvironmentReferences,
+    Literal,
+}
+
+#[derive(Clone)]
+enum McpResolver {
+    Configured(McpConfigStore),
+    Session {
+        project: PathBuf,
+        servers: Arc<BTreeMap<String, McpServerConfig>>,
+    },
+}
+
+impl McpResolver {
+    fn new(cwd: &Path, store: McpConfigStore, profile: Option<Value>) -> Result<Self> {
+        let Some(profile) = profile else {
+            return Ok(Self::Configured(store));
+        };
+        let profile: SessionMcpProfile =
+            serde_json::from_value(profile).context("invalid private MCP session profile")?;
+        Ok(Self::Session {
+            project: cwd.to_path_buf(),
+            servers: Arc::new(profile.into_configs()?),
+        })
+    }
+
+    fn effective_sync(&self) -> Result<BTreeMap<String, EffectiveServer>> {
+        match self {
+            Self::Configured(store) => store.effective_sync(),
+            Self::Session { servers, .. } => servers
+                .iter()
+                .map(|(name, config)| {
+                    Ok((
+                        name.clone(),
+                        EffectiveServer {
+                            name: name.clone(),
+                            scope: McpScope::Project,
+                            raw: serde_json::to_value(config)?,
+                            value_mode: McpValueMode::Literal,
+                        },
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    async fn resolve(&self, name: &str) -> Result<(McpServerConfig, McpValueMode)> {
+        match self {
+            Self::Configured(store) => Ok((
+                store.resolve(name).await?.parse()?,
+                McpValueMode::EnvironmentReferences,
+            )),
+            Self::Session { servers, .. } => servers
+                .get(name)
+                .cloned()
+                .map(|config| (config, McpValueMode::Literal))
+                .ok_or_else(|| anyhow!("MCP server {name:?} is not part of this session")),
+        }
+    }
+
+    fn project_directory(&self) -> PathBuf {
+        match self {
+            Self::Configured(store) => store
+                .project
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            Self::Session { project, .. } => project.clone(),
+        }
+    }
+
+    fn environment_revision(&self, environment: &PluginEnvironment) -> u64 {
+        match self {
+            Self::Configured(_) => environment.revision(),
+            Self::Session { .. } => 0,
+        }
+    }
+
+    fn session_scoped(&self) -> bool {
+        matches!(self, Self::Session { .. })
+    }
+}
+
 async fn lock_config_files<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
 ) -> Result<Vec<std::fs::File>> {
@@ -345,6 +563,7 @@ fn layer_servers(
                     name,
                     scope: McpScope::User,
                     raw,
+                    value_mode: McpValueMode::EnvironmentReferences,
                 },
             )
         })
@@ -356,6 +575,7 @@ fn layer_servers(
                 name,
                 scope: McpScope::Project,
                 raw,
+                value_mode: McpValueMode::EnvironmentReferences,
             },
         );
     }
@@ -470,10 +690,15 @@ fn protocol_name(name: &str) -> Result<String> {
     Ok(protocol)
 }
 
+#[cfg(test)]
 fn discover_records(store: &McpConfigStore) -> Result<Vec<SessionProtocolRecord>> {
+    discover_resolver_records(&McpResolver::Configured(store.clone()))
+}
+
+fn discover_resolver_records(resolver: &McpResolver) -> Result<Vec<SessionProtocolRecord>> {
     let mut records = Vec::new();
     let mut protocols = HashSet::new();
-    for (name, server) in store.effective_sync()? {
+    for (name, server) in resolver.effective_sync()? {
         let object = server
             .raw
             .as_object()
@@ -523,19 +748,43 @@ struct McpPluginState {
 
 pub(super) struct McpPlugin {
     store: McpConfigStore,
+    resolver: McpResolver,
     state: Arc<SyncMutex<McpPluginState>>,
     runtime: Arc<SyncMutex<Option<Arc<McpRuntime>>>>,
 }
 
 impl McpPlugin {
+    #[cfg(test)]
     pub(super) fn new(cwd: &Path, config_directory: &Path) -> Self {
+        Self::with_session_profile(cwd, config_directory, None)
+    }
+
+    pub(super) fn with_session_profile(
+        cwd: &Path,
+        config_directory: &Path,
+        profile: Option<Value>,
+    ) -> Self {
         let store = McpConfigStore::new(cwd, config_directory);
-        let (records, discovery_error) = match discover_records(&store) {
-            Ok(records) => (records, None),
-            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        let (resolver, resolver_error) = match McpResolver::new(cwd, store.clone(), profile) {
+            Ok(resolver) => (resolver, None),
+            Err(error) => (
+                McpResolver::Session {
+                    project: cwd.to_path_buf(),
+                    servers: Arc::default(),
+                },
+                Some(format!("{error:#}")),
+            ),
+        };
+        let (records, discovery_error) = match resolver_error {
+            Some(error) => (Vec::new(), Some(error)),
+            None => match discover_resolver_records(&resolver) {
+                Ok(records) => (records, None),
+                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+            },
         };
         Self {
             store,
+            resolver,
             state: Arc::new(SyncMutex::new(McpPluginState {
                 records,
                 discovery_error,
@@ -616,8 +865,9 @@ impl Plugin for McpPlugin {
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        let runtime = Arc::new(McpRuntime::new(
+        let runtime = Arc::new(McpRuntime::new_with_resolver(
             self.store.clone(),
+            self.resolver.clone(),
             host.environment()?,
             host.protocols.output_store(),
         ));
@@ -732,6 +982,7 @@ impl McpConnection {
 
 struct McpRuntime {
     store: McpConfigStore,
+    resolver: McpResolver,
     environment: PluginEnvironment,
     output: Arc<OutputStore>,
     connections: Mutex<HashMap<String, Arc<McpConnection>>>,
@@ -741,17 +992,29 @@ struct McpRuntime {
 }
 
 impl McpRuntime {
+    #[cfg(test)]
     fn new(
         store: McpConfigStore,
         environment: PluginEnvironment,
         output: Arc<OutputStore>,
     ) -> Self {
-        let configured = store
+        let resolver = McpResolver::Configured(store.clone());
+        Self::new_with_resolver(store, resolver, environment, output)
+    }
+
+    fn new_with_resolver(
+        store: McpConfigStore,
+        resolver: McpResolver,
+        environment: PluginEnvironment,
+        output: Arc<OutputStore>,
+    ) -> Self {
+        let configured = resolver
             .effective_sync()
             .map(|servers| servers.len())
             .unwrap_or_default();
         Self {
             store,
+            resolver,
             environment,
             output,
             connections: Mutex::new(HashMap::new()),
@@ -804,12 +1067,12 @@ impl McpRuntime {
     async fn connection(&self, name: &str) -> Result<Arc<McpConnection>> {
         let gate = self.connection_gate(name);
         let _connecting = gate.lock().await;
-        let config = match async {
-            let config = self.store.resolve(name).await?.parse()?;
+        let (config, value_mode) = match async {
+            let (config, value_mode) = self.resolver.resolve(name).await?;
             if !config.enabled {
                 bail!("MCP server {name:?} is disabled");
             }
-            Ok::<_, anyhow::Error>(config)
+            Ok::<_, anyhow::Error>((config, value_mode))
         }
         .await
         {
@@ -820,7 +1083,7 @@ impl McpRuntime {
                 return Err(error);
             }
         };
-        let environment_revision = self.environment.revision();
+        let environment_revision = self.resolver.environment_revision(&self.environment);
         let connection = self.connections.lock().await.get(name).cloned();
         if let Some(connection) = connection
             && connection.config == config
@@ -834,7 +1097,7 @@ impl McpRuntime {
             connection.close().await;
         }
         match self
-            .connect_with_timeout(name, config.clone(), MCP_CONNECTION_TIMEOUT)
+            .connect_with_timeout_mode(name, config.clone(), value_mode, MCP_CONNECTION_TIMEOUT)
             .await
         {
             Ok(connection) => {
@@ -853,22 +1116,50 @@ impl McpRuntime {
         }
     }
 
+    #[cfg(test)]
     async fn connect_with_timeout(
         &self,
         name: &str,
         config: McpServerConfig,
         timeout: Duration,
     ) -> Result<McpConnection> {
-        tokio::time::timeout(timeout, self.connect(name, config))
+        self.connect_with_timeout_mode(name, config, McpValueMode::EnvironmentReferences, timeout)
+            .await
+    }
+
+    async fn connect_with_timeout_mode(
+        &self,
+        name: &str,
+        config: McpServerConfig,
+        value_mode: McpValueMode,
+        timeout: Duration,
+    ) -> Result<McpConnection> {
+        let result = tokio::time::timeout(timeout, self.connect(name, config, value_mode))
             .await
             .map_err(|_| {
                 anyhow!("MCP server {name:?} initialization timed out after {timeout:?}")
-            })?
+            })?;
+        if value_mode == McpValueMode::Literal {
+            result.map_err(|_| {
+                anyhow!(
+                    "could not initialize session MCP server {name:?}; connection details are hidden because the session configuration may contain credentials"
+                )
+            })
+        } else {
+            result
+        }
     }
 
-    async fn connect(&self, name: &str, config: McpServerConfig) -> Result<McpConnection> {
-        let (environment_values, environment_revision) =
-            self.environment.snapshot_with_revision().await;
+    async fn connect(
+        &self,
+        name: &str,
+        config: McpServerConfig,
+        value_mode: McpValueMode,
+    ) -> Result<McpConnection> {
+        let (environment_values, environment_revision) = match value_mode {
+            McpValueMode::EnvironmentReferences => self.environment.snapshot_with_revision().await,
+            McpValueMode::Literal => (BTreeMap::new(), 0),
+        };
         let client = mcp_client_info();
         let lifecycle = ClientLifecycleMode::Auto {
             preferred_versions: vec![ProtocolVersion::V_2026_07_28],
@@ -881,23 +1172,32 @@ impl McpRuntime {
                 cwd,
                 environment,
             } => {
+                let process_environment = environment
+                    .iter()
+                    .map(|(target, source_or_value)| {
+                        let value = match value_mode {
+                            McpValueMode::EnvironmentReferences => environment_values
+                                .get(source_or_value)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "MCP server {name:?} requires missing Agent environment variable {source_or_value:?}"
+                                    )
+                                })?,
+                            McpValueMode::Literal => source_or_value,
+                        };
+                        Ok((target.clone(), value.clone()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
                 let transport = self
-                    .stdio_transport(
-                        name,
-                        command,
-                        args,
-                        cwd.as_deref(),
-                        environment,
-                        &environment_values,
-                    )
+                    .stdio_transport(name, command, args, cwd.as_deref(), &process_environment)
                     .await?;
-                client
-                    .serve_with_lifecycle(transport, lifecycle)
+                Box::pin(client.serve_with_lifecycle(transport, lifecycle))
                     .await
                     .with_context(|| format!("could not initialize MCP server {name:?}"))?
             }
             McpTransportConfig::StreamableHttp { url, headers } => {
-                let headers = self.expand_headers(name, headers, &environment_values)?;
+                let headers =
+                    self.expand_headers(name, headers, &environment_values, value_mode)?;
                 // TODO: Add OAuth when URI Agent has an MCP OAuth credential flow.
                 let mut transport_config =
                     StreamableHttpClientTransportConfig::with_uri(url.clone())
@@ -905,8 +1205,7 @@ impl McpRuntime {
                         .reinit_on_expired_session(false);
                 transport_config.retry_config = Arc::new(NeverRetry::default());
                 let transport = StreamableHttpClientTransport::from_config(transport_config);
-                client
-                    .serve_with_lifecycle(transport, lifecycle)
+                Box::pin(client.serve_with_lifecycle(transport, lifecycle))
                     .await
                     .with_context(|| format!("could not initialize MCP server {name:?}"))?
             }
@@ -926,7 +1225,6 @@ impl McpRuntime {
         executable: &str,
         args: &[String],
         cwd: Option<&Path>,
-        mappings: &BTreeMap<String, String>,
         environment: &BTreeMap<String, String>,
     ) -> Result<ProcessTreeTransport> {
         let mut command = Command::new(executable);
@@ -945,12 +1243,7 @@ impl McpRuntime {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (target, source) in mappings {
-            let value = environment.get(source).ok_or_else(|| {
-                anyhow!(
-                    "MCP server {name:?} requires missing Agent environment variable {source:?}"
-                )
-            })?;
+        for (target, value) in environment {
             command.env(target, value);
         }
         let (mut child, tree) = ProcessTree::spawn(&mut command)
@@ -976,12 +1269,15 @@ impl McpRuntime {
     }
 
     fn project_directory(&self) -> PathBuf {
-        self.store
-            .project
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
+        self.resolver.project_directory()
+    }
+
+    async fn effective_servers(&self) -> Result<Vec<EffectiveServer>> {
+        let servers = match &self.resolver {
+            McpResolver::Configured(_) => self.store.effective().await?,
+            McpResolver::Session { .. } => self.resolver.effective_sync()?,
+        };
+        Ok(servers.into_values().collect())
     }
 
     fn expand_headers(
@@ -989,14 +1285,20 @@ impl McpRuntime {
         name: &str,
         templates: &BTreeMap<String, String>,
         environment: &BTreeMap<String, String>,
+        value_mode: McpValueMode,
     ) -> Result<HashMap<HeaderName, HeaderValue>> {
         let mut headers = HashMap::new();
         for (header, template) in templates {
             let header_name = header
                 .parse::<HeaderName>()
                 .with_context(|| format!("invalid MCP server {name:?} header {header:?}"))?;
-            let value = expand_template(template, environment)
-                .with_context(|| format!("cannot resolve MCP server {name:?} header {header:?}"))?;
+            let value = match value_mode {
+                McpValueMode::EnvironmentReferences => expand_template(template, environment)
+                    .with_context(|| {
+                        format!("cannot resolve MCP server {name:?} header {header:?}")
+                    })?,
+                McpValueMode::Literal => template.clone(),
+            };
             let value = HeaderValue::from_str(&value)
                 .with_context(|| format!("invalid MCP server {name:?} header {header:?}"))?;
             headers.insert(header_name, value);
@@ -1035,9 +1337,15 @@ impl McpRuntime {
     }
 
     async fn test_config(&self, name: &str, config: &McpServerConfig) -> Result<()> {
-        config.validate(name)?;
+        let value_mode = if self.resolver.session_scoped() {
+            config.validate_session(name)?;
+            McpValueMode::Literal
+        } else {
+            config.validate(name)?;
+            McpValueMode::EnvironmentReferences
+        };
         let connection = self
-            .connect_with_timeout(name, config.clone(), MCP_CONNECTION_TIMEOUT)
+            .connect_with_timeout_mode(name, config.clone(), value_mode, MCP_CONNECTION_TIMEOUT)
             .await?;
         connection.close().await;
         Ok(())
@@ -2896,6 +3204,7 @@ struct McpPanelPending {
 
 struct McpPanel {
     runtime: Arc<McpRuntime>,
+    session_scoped: bool,
     servers: Vec<EffectiveServer>,
     selected: usize,
     mode: McpPanelMode,
@@ -2909,12 +3218,13 @@ struct McpPanel {
 
 impl McpPanel {
     async fn load(runtime: Arc<McpRuntime>, wake: TuiPanelWake) -> Result<Self> {
-        let servers: Vec<EffectiveServer> =
-            runtime.store.effective().await?.into_values().collect();
+        let session_scoped = runtime.resolver.session_scoped();
+        let servers = runtime.effective_servers().await?;
         runtime.refresh_configured(servers.len());
         let (updates_tx, updates_rx) = mpsc::unbounded_channel();
         Ok(Self {
             runtime,
+            session_scoped,
             servers,
             selected: 0,
             mode: McpPanelMode::List,
@@ -3005,13 +3315,7 @@ impl McpPanel {
     }
 
     async fn reload(&mut self) -> Result<()> {
-        self.servers = self
-            .runtime
-            .store
-            .effective()
-            .await?
-            .into_values()
-            .collect();
+        self.servers = self.runtime.effective_servers().await?;
         self.runtime.refresh_configured(self.servers.len());
         self.selected = self.selected.min(self.servers.len().saturating_sub(1));
         Ok(())
@@ -3020,9 +3324,21 @@ impl McpPanel {
     fn list_view(&self) -> TuiPanelView {
         let rows = if self.servers.is_empty() {
             vec![
-                TuiPanelRow::item("empty", "No MCP servers", "Ctrl+N to add one")
-                    .selectable(false)
-                    .tone(TuiPanelTone::Muted),
+                TuiPanelRow::item(
+                    "empty",
+                    if self.session_scoped {
+                        "No session MCP servers"
+                    } else {
+                        "No MCP servers"
+                    },
+                    if self.session_scoped {
+                        "Managed by the ACP client"
+                    } else {
+                        "Ctrl+N to add one"
+                    },
+                )
+                .selectable(false)
+                .tone(TuiPanelTone::Muted),
             ]
         } else {
             self.servers
@@ -3047,7 +3363,11 @@ impl McpPanel {
                             &server.name,
                             format!(
                                 "{} · {} · {} · {connection}",
-                                server.scope.label(),
+                                if self.session_scoped {
+                                    "Session"
+                                } else {
+                                    server.scope.label()
+                                },
                                 config.transport_label(),
                                 if config.enabled {
                                     "enabled"
@@ -3078,16 +3398,31 @@ impl McpPanel {
             selected: (!self.servers.is_empty()).then_some(self.selected),
             rows,
             message: self.message.clone(),
-            hints: vec![
-                TuiPanelHint::new("Ctrl+N", "add").action("add"),
-                TuiPanelHint::new("Enter", "edit").action("confirm"),
-                TuiPanelHint::new("T", "test").action("test"),
-                TuiPanelHint::new("R", "reconnect").action("reconnect"),
-                TuiPanelHint::new("Space", "enable/disable").action("toggle"),
-                TuiPanelHint::new("Delete", "remove").action("remove"),
-                TuiPanelHint::new("Esc", "close").action("close"),
-            ],
+            hints: if self.session_scoped {
+                vec![
+                    TuiPanelHint::new("T", "test").action("test"),
+                    TuiPanelHint::new("R", "reconnect").action("reconnect"),
+                    TuiPanelHint::new("Esc", "close").action("close"),
+                ]
+            } else {
+                vec![
+                    TuiPanelHint::new("Ctrl+N", "add").action("add"),
+                    TuiPanelHint::new("Enter", "edit").action("confirm"),
+                    TuiPanelHint::new("T", "test").action("test"),
+                    TuiPanelHint::new("R", "reconnect").action("reconnect"),
+                    TuiPanelHint::new("Space", "enable/disable").action("toggle"),
+                    TuiPanelHint::new("Delete", "remove").action("remove"),
+                    TuiPanelHint::new("Esc", "close").action("close"),
+                ]
+            },
         }
+    }
+
+    fn explain_session_scope(&mut self) {
+        self.message = Some((
+            "This session's MCP servers are managed by its ACP client".to_string(),
+            TuiPanelTone::Muted,
+        ));
     }
 
     async fn handle_list(&mut self, event: TuiPanelEvent) -> Result<TuiPanelControl> {
@@ -3112,6 +3447,17 @@ impl McpPanel {
             TuiPanelEvent::Select(index) => {
                 self.selected = index.min(self.servers.len().saturating_sub(1));
             }
+            TuiPanelEvent::Action(action)
+                if self.session_scoped
+                    && matches!(action.as_str(), "add" | "confirm" | "remove" | "toggle") =>
+            {
+                self.explain_session_scope();
+            }
+            TuiPanelEvent::Activate(index) if self.session_scoped => {
+                self.selected = index.min(self.servers.len().saturating_sub(1));
+                self.explain_session_scope();
+            }
+            TuiPanelEvent::Text(' ') if self.session_scoped => self.explain_session_scope(),
             TuiPanelEvent::Action(action) if action == "add" => {
                 self.cancel_pending();
                 self.message = None;
@@ -4470,6 +4816,106 @@ mod tests {
 
         let error = panel.validate_unique(&draft, "shared").await.unwrap_err();
         assert!(error.to_string().contains("already exists in User scope"));
+
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn session_scoped_panel_and_errors_do_not_display_literal_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let global = root.path().join("global");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        let store = McpConfigStore::new(&project, &global);
+        let profile = SessionMcpProfile::new(BTreeMap::from([(
+            "Session Server".to_string(),
+            SessionMcpServer {
+                transport: SessionMcpTransport::Stdio {
+                    command: "missing-test-server".to_string(),
+                    args: Vec::new(),
+                    environment: BTreeMap::from([(
+                        "TOKEN".to_string(),
+                        "literal-session-secret".to_string(),
+                    )]),
+                },
+            },
+        )]));
+        let resolver = McpResolver::new(
+            &project,
+            store.clone(),
+            Some(serde_json::to_value(profile).unwrap()),
+        )
+        .unwrap();
+        let environment = Arc::new(AgentEnvironment::load(&global).await.unwrap());
+        let output = Arc::new(
+            OutputStore::new(
+                &format!("mcp-session-panel-test-{}", uuid::Uuid::now_v7().simple()),
+                1024,
+            )
+            .await
+            .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let runtime = Arc::new(McpRuntime::new_with_resolver(
+            store,
+            resolver,
+            PluginEnvironment::new(environment),
+            output,
+        ));
+        let mut panel = McpPanel::load(runtime.clone(), TuiPanelWake::default())
+            .await
+            .unwrap();
+
+        let view = panel.view();
+        assert!(panel.session_scoped);
+        assert_eq!(panel.servers.len(), 1);
+        assert!(view.rows[0].value.starts_with("Session · stdio"));
+        assert!(
+            view.hints
+                .iter()
+                .all(|hint| hint.action.as_deref() != Some("add"))
+        );
+        assert!(!format!("{view:?}").contains("literal-session-secret"));
+        panel
+            .handle(TuiPanelEvent::Action("add".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(panel.mode, McpPanelMode::List));
+        assert!(
+            panel
+                .message
+                .as_ref()
+                .is_some_and(|message| message.0.contains("managed by its ACP client"))
+        );
+        assert!(!global.join(GLOBAL_CONFIG).exists());
+        assert!(!project.join(PROJECT_CONFIG).exists());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let result = runtime
+            .connect_with_timeout_mode(
+                "Session Server",
+                McpServerConfig {
+                    description: "session server".to_string(),
+                    enabled: true,
+                    transport: McpTransportConfig::StreamableHttp {
+                        url: format!("http://{address}/mcp?token=literal-session-secret"),
+                        headers: BTreeMap::new(),
+                    },
+                },
+                McpValueMode::Literal,
+                Duration::from_secs(1),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("an unavailable session MCP endpoint should fail");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains("connection details are hidden"));
+        assert!(!error.contains("literal-session-secret"));
 
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;

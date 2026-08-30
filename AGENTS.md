@@ -28,6 +28,7 @@ Before changing code, read the applicable repository map, change rules, and veri
 
 | Area | Authoritative detail |
 | --- | --- |
+| ACP v1 transport, session lifecycle, content mapping, MCP handoff | [`docs/acp.md`](docs/acp.md) |
 | Protocol routing, built-ins, tasks, output | [`docs/protocols.md`](docs/protocols.md) |
 | Project instructions, Skills, frozen startup context | [`docs/context.md`](docs/context.md) |
 | WASM installation, reload, ABI, permissions, SDK | [`docs/plugins.md`](docs/plugins.md) |

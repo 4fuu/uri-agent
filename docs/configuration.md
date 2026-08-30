@@ -350,6 +350,11 @@ existing server before its next operation. A removed or disabled recorded
 server fails on its next call. See [MCP
 protocols](protocols.md#mcp-servers) for routes and argument encoding.
 
+An [ACP v1](acp.md) client may instead provide a complete session-scoped MCP
+profile. That profile does not read or change User or Project `mcp.json` and is
+read-only in the TUI. ACP environment and header values are literal rather than
+Agent Environment references.
+
 ## Settings fields and precedence
 
 `settings.json` and project settings use camel-case JSON fields:
@@ -507,6 +512,12 @@ foreground-blocking for an external supervisor. It does not daemonize, schedule
 jobs, or provide a trigger or gateway service. See [Resident plugins](plugins.md#resident-plugins).
 
 `--continue-session` and `--session` conflict. Session selection remains scoped to the canonical `--cwd`; see [Sessions and context](sessions.md).
+
+`--acpv1` serves stable ACP v1 over stdin/stdout instead of starting the TUI.
+The ACP client supplies each session's absolute working directory, so this flag
+conflicts with `--cwd`, native session selection, and `--background`. Configure
+authentication and a default model before starting ACP, or pass the usual
+model overrides. See [ACP v1](acp.md) for the client and session contract.
 
 ## Custom providers and model overrides
 

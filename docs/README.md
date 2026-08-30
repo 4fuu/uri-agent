@@ -6,6 +6,7 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 
 | Goal | Document |
 | --- | --- |
+| Connect an editor or other ACP client, manage ACP sessions, or supply session-scoped MCP servers | [ACP v1](acp.md) |
 | Understand `read`, `exec`, direct tools, protocol routing, MCP operations, built-ins, tasks, or output preservation | [Protocols, tasks, and output](protocols.md) |
 | Understand project instructions, or create and troubleshoot a Skill | [Startup context and Skills](context.md) |
 | Build, install, reload, or audit a trusted WASM plugin | [WASM plugins](plugins.md) |

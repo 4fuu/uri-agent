@@ -32,7 +32,7 @@ use std::sync::{Arc, Weak};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::{Mutex, OnceCell, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, OnceCell, RwLock, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 const TOOL_CALL_LOOP_THRESHOLD: usize = 5;
@@ -62,15 +62,28 @@ fn validate_prompt_update(prompt: &str) -> Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImageAttachment {
     bytes: Vec<u8>,
+    media_type: ProtocolImageMediaType,
 }
 
 impl ImageAttachment {
     pub(crate) fn png(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            media_type: ProtocolImageMediaType::Png,
+        }
+    }
+
+    fn from_protocol(image: ProtocolImage) -> Self {
+        Self {
+            bytes: image.bytes().to_vec(),
+            media_type: image.media_type(),
+        }
     }
 
     pub(crate) fn dimensions(&self) -> Option<(u32, u32)> {
-        png_ihdr_dimensions(&self.bytes)
+        (self.media_type == ProtocolImageMediaType::Png)
+            .then(|| png_ihdr_dimensions(&self.bytes))
+            .flatten()
     }
 }
 
@@ -151,6 +164,7 @@ impl TurnCancellation {
 }
 
 struct ActiveTurn {
+    submission_id: u64,
     cancel: watch::Sender<Option<TurnCancellation>>,
     handle: JoinHandle<()>,
 }
@@ -166,6 +180,19 @@ pub struct PendingMessage {
     pub id: u64,
     pub text: String,
     pub kind: PendingMessageKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnCompletion {
+    pub submission_id: u64,
+    pub outcome: TurnOutcome,
 }
 
 #[derive(Clone)]
@@ -228,6 +255,7 @@ pub struct AgentRuntime {
     shutting_down: AtomicBool,
     pending: Mutex<PendingState>,
     pending_updates: watch::Sender<Vec<PendingMessage>>,
+    turn_completions: broadcast::Sender<TurnCompletion>,
     pending_restored: OnceCell<()>,
 }
 
@@ -253,6 +281,7 @@ impl AgentRuntime {
         limits: ModelLimits,
     ) -> Self {
         let (pending_updates, _) = watch::channel(Vec::new());
+        let (turn_completions, _) = broadcast::channel(128);
         let tasks = protocols.tasks();
         let system_prompt_cell = OnceCell::new();
         system_prompt_cell
@@ -280,6 +309,7 @@ impl AgentRuntime {
             shutting_down: AtomicBool::new(false),
             pending: Mutex::new(PendingState::default()),
             pending_updates,
+            turn_completions,
             pending_restored: OnceCell::new(),
         }
     }
@@ -416,6 +446,10 @@ impl AgentRuntime {
         self.pending_updates.subscribe()
     }
 
+    pub fn subscribe_turn_completions(&self) -> broadcast::Receiver<TurnCompletion> {
+        self.turn_completions.subscribe()
+    }
+
     pub async fn pending_messages(&self) -> Vec<PendingMessage> {
         self.pending
             .lock()
@@ -442,6 +476,15 @@ impl AgentRuntime {
         prompt: String,
         kind: SubmitKind,
     ) -> Result<PendingMessage> {
+        self.submit_with_images(prompt, Vec::new(), kind).await
+    }
+
+    pub async fn submit_with_images(
+        self: &Arc<Self>,
+        prompt: String,
+        images: Vec<ProtocolImage>,
+        kind: SubmitKind,
+    ) -> Result<PendingMessage> {
         if self.shutting_down.load(Ordering::Acquire) {
             bail!("Agent runtime is shutting down")
         }
@@ -450,7 +493,12 @@ impl AgentRuntime {
             bail!("message is empty")
         }
         self.prepare_context().await?;
-        let content = vec![UserContent::text(prompt)];
+        let images = images
+            .into_iter()
+            .map(ImageAttachment::from_protocol)
+            .collect::<Vec<_>>();
+        let mut content = vec![UserContent::text(prompt)];
+        content.extend(memory_image_attachments(&images));
         let (message, kind) = {
             let mut pending = self.pending.lock().await;
             let kind = match kind {
@@ -473,7 +521,7 @@ impl AgentRuntime {
                 persistent_id: Some(persistent_id),
                 message: message.clone(),
                 content,
-                clipboard_images: Vec::new(),
+                clipboard_images: images,
                 visible: true,
                 task_notification_ids: Vec::new(),
             });
@@ -483,6 +531,82 @@ impl AgentRuntime {
         if kind == SubmitKind::Prompt {
             self.start_accepted_prompt().await?;
         }
+        Ok(message)
+    }
+
+    /// Durably accept and immediately start one prompt only when no other
+    /// native turn or queued input owns the session. Frontends with a
+    /// request/response prompt contract use this to keep cancellation and
+    /// completion tied to the accepted submission rather than an earlier turn.
+    pub async fn submit_exclusive_with_images(
+        self: &Arc<Self>,
+        prompt: String,
+        images: Vec<ProtocolImage>,
+    ) -> Result<PendingMessage> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("Agent runtime is shutting down")
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            bail!("message is empty")
+        }
+        self.prepare_context().await?;
+        let images = images
+            .into_iter()
+            .map(ImageAttachment::from_protocol)
+            .collect::<Vec<_>>();
+        let mut content = vec![UserContent::text(prompt)];
+        content.extend(memory_image_attachments(&images));
+
+        let mut active = self.active_turn.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("Agent runtime is shutting down")
+        }
+        if let Some(previous) = active.take() {
+            if !previous.handle.is_finished() {
+                *active = Some(previous);
+                bail!("the session is busy with another turn")
+            }
+            let _ = previous.handle.await;
+        }
+        let input = {
+            let mut pending = self.pending.lock().await;
+            if pending.accepting || !pending.messages.is_empty() {
+                bail!("the session has pending native input")
+            }
+            let persistent_id = self
+                .session
+                .add_pending_input(SubmitKind::Prompt, prompt, &content, true)
+                .await?;
+            let message = PendingMessage {
+                id: u64::try_from(persistent_id).unwrap_or_default(),
+                text: prompt.to_string(),
+                kind: PendingMessageKind::Queued,
+            };
+            pending.accepting = true;
+            self.publish_pending(&pending);
+            PendingMessageEntry {
+                persistent_id: Some(persistent_id),
+                message,
+                content,
+                clipboard_images: images,
+                visible: true,
+                task_notification_ids: Vec::new(),
+            }
+        };
+        let message = input.message.clone();
+        let (cancel, receiver) = watch::channel(None);
+        let runtime = self.clone();
+        let handle = tokio::spawn(async move {
+            runtime
+                .run_active_turn(input, true, true, false, None, receiver)
+                .await;
+        });
+        *active = Some(ActiveTurn {
+            submission_id: message.id,
+            cancel,
+            handle,
+        });
         Ok(message)
     }
 
@@ -552,13 +676,18 @@ impl AgentRuntime {
             (index, input)
         };
         let (cancel, receiver) = watch::channel(None);
+        let submission_id = input.message.id;
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, true, Some(index), receiver)
+                .run_active_turn(input, true, true, true, Some(index), receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id,
+            cancel,
+            handle,
+        });
         Ok(true)
     }
 
@@ -771,13 +900,18 @@ impl AgentRuntime {
             task_notification_ids: Vec::new(),
         };
         let (cancel, receiver) = watch::channel(None);
+        let submission_id = input.message.id;
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, true, None, receiver)
+                .run_active_turn(input, true, true, true, None, receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id,
+            cancel,
+            handle,
+        });
         Ok(())
     }
 
@@ -827,10 +961,14 @@ impl AgentRuntime {
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, false, None, receiver)
+                .run_active_turn(input, true, false, true, None, receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id: u64::MAX,
+            cancel,
+            handle,
+        });
     }
 
     async fn run_active_turn(
@@ -838,6 +976,7 @@ impl AgentRuntime {
         mut input: PendingMessageEntry,
         mut content_prepared: bool,
         mut take_initial_steer: bool,
+        retain_undelivered_input: bool,
         mut pending_index: Option<usize>,
         mut cancel: watch::Receiver<Option<TurnCancellation>>,
     ) {
@@ -862,14 +1001,42 @@ impl AgentRuntime {
                     &mut cancel,
                 )
                 .await;
-            if result.is_err() {
+            let submission_id = input.message.id;
+            if let Err(error) = result {
+                let mut cleanup_error = None;
                 if content_prepared && !input_delivered && input.visible {
-                    self.restore_pending_entry(pending_index.unwrap_or_default(), input)
-                        .await;
+                    if retain_undelivered_input {
+                        self.restore_pending_entry(pending_index.unwrap_or_default(), input)
+                            .await;
+                    } else if let Some(persistent_id) = input.persistent_id
+                        && let Err(remove_error) =
+                            self.session.remove_pending_input(persistent_id).await
+                    {
+                        self.restore_pending_entry(pending_index.unwrap_or_default(), input)
+                            .await;
+                        cleanup_error = Some(format!(
+                            "cannot discard failed exclusive input: {remove_error:#}"
+                        ));
+                    }
                 }
                 self.stop_accepting_pending().await;
+                let outcome = if let Some(cleanup_error) = cleanup_error {
+                    TurnOutcome::Failed(format!("{error:#}; {cleanup_error}"))
+                } else if matches!(*cancel.borrow(), Some(TurnCancellation::User)) {
+                    TurnOutcome::Cancelled
+                } else {
+                    TurnOutcome::Failed(format!("{error:#}"))
+                };
+                let _ = self.turn_completions.send(TurnCompletion {
+                    submission_id,
+                    outcome,
+                });
                 return;
             }
+            let _ = self.turn_completions.send(TurnCompletion {
+                submission_id,
+                outcome: TurnOutcome::Completed,
+            });
             let Some((index, next)) = self.take_next_pending_or_stop().await else {
                 return;
             };
@@ -893,12 +1060,28 @@ impl AgentRuntime {
         active.cancel.send(Some(TurnCancellation::User)).is_ok()
     }
 
+    /// Request cancellation only when the named submission still owns the
+    /// active turn. Frontends use this to avoid interrupting recovered or
+    /// native work that happens to run in the same session.
+    pub(crate) async fn interrupt_submission(&self, submission_id: u64) -> bool {
+        let active = self.active_turn.lock().await;
+        let Some(active) = active
+            .as_ref()
+            .filter(|active| active.submission_id == submission_id && !active.handle.is_finished())
+        else {
+            return false;
+        };
+        active.cancel.send(Some(TurnCancellation::User)).is_ok()
+    }
+
     /// Cancel the active request/tool operation, then wait until the worker has
     /// durably recorded its interrupted terminal boundary.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         if let Some(active) = self.active_turn.lock().await.take() {
-            let _ = active.cancel.send(Some(TurnCancellation::Shutdown));
+            if active.cancel.borrow().is_none() {
+                let _ = active.cancel.send(Some(TurnCancellation::Shutdown));
+            }
             let _ = active.handle.await;
         }
         self.tasks.shutdown().await;
@@ -1875,7 +2058,7 @@ fn memory_image_attachments(images: &[ImageAttachment]) -> Vec<UserContent> {
         .map(|image| {
             UserContent::image_base64(
                 base64::engine::general_purpose::STANDARD.encode(&image.bytes),
-                Some(ImageMediaType::PNG),
+                Some(rig_image_media_type(image.media_type)),
                 None,
             )
         })
@@ -5209,6 +5392,161 @@ mod tests {
             &event.kind,
             EventKind::Error { text } if text == TURN_INTERRUPTED_BY_USER
         )));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_submission_reports_completion_after_its_durable_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("complete")],
+                Some(fake_usage()),
+            )])),
+            ..FakeBackend::default()
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend, ModelLimits::default()).await;
+        let mut completions = runtime.subscribe_turn_completions();
+
+        let submission = runtime
+            .submit_exclusive_with_images("finish this".to_string(), Vec::new())
+            .await
+            .unwrap();
+        let completion = tokio::time::timeout(Duration::from_secs(1), completions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            TurnCompletion {
+                submission_id: submission.id,
+                outcome: TurnOutcome::Completed,
+            }
+        );
+        assert!(matches!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .last()
+                .map(|event| &event.kind),
+            Some(EventKind::TurnFinished)
+        ));
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn exclusive_submission_rejects_an_unrelated_active_turn_without_queuing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime
+            .submit("native turn".to_string(), SubmitKind::Prompt)
+            .await
+            .unwrap();
+        backend.started.notified().await;
+
+        let error = runtime
+            .submit_exclusive_with_images("frontend prompt".to_string(), Vec::new())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("busy with another turn"));
+        assert!(runtime.pending_messages().await.is_empty());
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+        assert!(runtime.interrupt_turn().await);
+        wait_for_turn(runtime.as_ref()).await;
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn failed_exclusive_submission_discards_undelivered_native_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("second prompt ran")],
+                Some(fake_usage()),
+            )])),
+            ..FakeBackend::default()
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime.set_backend(None, None).await;
+        let mut completions = runtime.subscribe_turn_completions();
+
+        let failed = runtime
+            .submit_exclusive_with_images("first prompt".to_string(), Vec::new())
+            .await
+            .unwrap();
+        let completion = completions.recv().await.unwrap();
+        assert_eq!(completion.submission_id, failed.id);
+        assert!(matches!(completion.outcome, TurnOutcome::Failed(_)));
+        assert!(runtime.pending_messages().await.is_empty());
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+
+        runtime.set_backend(Some(backend), None).await;
+        let second = runtime
+            .submit_exclusive_with_images("second prompt".to_string(), Vec::new())
+            .await
+            .unwrap();
+        let completion = completions.recv().await.unwrap();
+        assert_eq!(completion.submission_id, second.id);
+        assert_eq!(completion.outcome, TurnOutcome::Completed);
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_submission_reports_user_cancellation_after_settlement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        let mut completions = runtime.subscribe_turn_completions();
+        let submission = runtime
+            .submit_exclusive_with_images("wait".to_string(), Vec::new())
+            .await
+            .unwrap();
+        backend.started.notified().await;
+
+        assert!(!runtime.interrupt_submission(submission.id + 1).await);
+        assert!(runtime.turn_running().await);
+        assert!(runtime.interrupt_submission(submission.id).await);
+        let completion = tokio::time::timeout(Duration::from_secs(1), completions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            completion,
+            TurnCompletion {
+                submission_id: submission.id,
+                outcome: TurnOutcome::Cancelled,
+            }
+        );
+        assert!(matches!(
+            session
+                .snapshot()
+                .await
+                .unwrap()
+                .last()
+                .map(|event| &event.kind),
+            Some(EventKind::TurnFinished)
+        ));
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

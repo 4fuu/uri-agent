@@ -41,6 +41,7 @@ startup discovery must not reinterpret historical sessions.
 | Path | Ownership |
 | --- | --- |
 | `src/main.rs` | Application assembly, plugin installation, Skill registration, and runtime/TUI wiring |
+| `src/acp/` | Stable ACP v1 transport, schema mapping, session ownership, and native-event projection |
 | `src/catalog.rs`, `src/catalog/` | pi.dev, built-in, and provider cloud model catalogs, including WorkBuddy cloud discovery, credential-scoped cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
 | `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, dedicated Cloudflare AI Gateway and WorkBuddy boundaries, Codex WebSocket and experimental Antigravity transports, and multimodal support |
@@ -267,6 +268,7 @@ For documentation-only changes, the full Rust suite is unnecessary unless code o
 ## Documentation ownership
 
 - Root READMEs own project fit, critical warnings, the shortest successful setup, and navigation.
+- [`docs/acp.md`](acp.md) owns the ACP v1 transport, capability mapping, session lifecycle, and frontend MCP handoff.
 - [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, and output detail.
 - [`docs/context.md`](context.md) owns project instructions, Skill discovery and resources, and frozen startup context.
 - [`docs/plugins.md`](plugins.md) owns WASM installation, reload, ABI, trust boundaries, and runtime limits; [`sdk/README.md`](../sdk/README.md) owns Rust guest SDK usage.
