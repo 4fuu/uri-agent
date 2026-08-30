@@ -47,6 +47,15 @@ impl OutputStore {
     }
 
     pub(crate) async fn preserve(&self, content: &[u8], hint: &str) -> Result<PathBuf> {
+        self.preserve_with_extension(content, hint, "txt").await
+    }
+
+    pub(crate) async fn preserve_with_extension(
+        &self,
+        content: &[u8],
+        hint: &str,
+        extension: &str,
+    ) -> Result<PathBuf> {
         let sequence = self
             .sequence
             .get_or_try_init(|| async {
@@ -60,7 +69,12 @@ impl OutputStore {
             })
             .await?
             .fetch_add(1, Ordering::Relaxed);
-        let filename = format!("{:06}-{}.txt", sequence, sanitize(hint));
+        let filename = format!(
+            "{:06}-{}.{}",
+            sequence,
+            sanitize(hint),
+            sanitize_extension(extension)
+        );
         let path = self.directory.join(filename);
         fs::write(&path, content).await.with_context(|| {
             format!(
@@ -180,6 +194,18 @@ fn sanitize(value: &str) -> String {
     }
 }
 
+fn sanitize_extension(value: &str) -> &str {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        value
+    } else {
+        "bin"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +256,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_sequence(directory.path()).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn preserved_binary_output_keeps_a_safe_requested_extension() {
+        let store = OutputStore {
+            directory: tempfile::tempdir().unwrap().keep(),
+            limit: AtomicUsize::new(16),
+            sequence: OnceCell::new(),
+            diagnostic_write: Mutex::new(()),
+        };
+        let image = store
+            .preserve_with_extension(b"image", "mcp-image", "png")
+            .await
+            .unwrap();
+        let fallback = store
+            .preserve_with_extension(b"blob", "mcp-blob", "../raw")
+            .await
+            .unwrap();
+
+        assert_eq!(image.file_name().unwrap(), "000000-mcp-image.png");
+        assert_eq!(fallback.file_name().unwrap(), "000001-mcp-blob.bin");
     }
 
     #[tokio::test]

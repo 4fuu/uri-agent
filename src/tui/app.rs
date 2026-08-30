@@ -24,8 +24,9 @@ use crate::oauth::{self, OauthLogin, OauthProvider, OauthToken};
 use crate::output::OutputStore;
 use crate::plugin::{
     CommandRegistry, CommandSpec, CommandTarget, CoreCommand, TuiCompletionContext, TuiCompletions,
-    TuiDocument, TuiEffect, TuiPanelContext, TuiRegistry, TuiStatusContext, TuiStatusItem,
-    TuiStatusTone, TuiSubmissionContext, TuiTextPosition, TuiTextRange,
+    TuiEffect, TuiPanelContext, TuiPanelControl, TuiPanelEvent, TuiPanelSession, TuiPanelTone,
+    TuiPanelWake, TuiRegistry, TuiStatusContext, TuiStatusItem, TuiStatusTone,
+    TuiSubmissionContext, TuiTextPosition, TuiTextRange,
 };
 use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessageKind};
@@ -299,6 +300,8 @@ enum AppHit {
     Completion(usize),
     Delivery(usize),
     Palette(usize),
+    PluginHint(usize),
+    PluginRow(usize),
     Task(usize),
     Model(usize),
     ModelHubTab(usize),
@@ -893,7 +896,8 @@ struct App {
     pending_messages: Vec<PendingMessage>,
     commands: Arc<CommandRegistry>,
     tui: Arc<TuiRegistry>,
-    tui_document: Option<TuiDocument>,
+    tui_panel_wake: TuiPanelWake,
+    tui_panel: Option<Box<dyn TuiPanelSession>>,
 }
 
 impl App {
@@ -990,7 +994,8 @@ impl App {
             pending_messages: Vec::new(),
             commands,
             tui,
-            tui_document: None,
+            tui_panel_wake: TuiPanelWake::default(),
+            tui_panel: None,
         }
     }
 
@@ -2556,7 +2561,7 @@ impl App {
         self.model_selector = None;
         self.model_selection_target = ModelSelectionTarget::Conversation;
         self.model_hub = None;
-        self.tui_document = None;
+        self.tui_panel = None;
         self.delivery = None;
         self.dismiss_completions();
         self.overlay = None;

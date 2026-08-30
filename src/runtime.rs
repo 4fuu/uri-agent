@@ -3776,7 +3776,7 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::builtins::plugins(workspace.path())
+        crate::builtins::plugins(workspace.path(), manager.directory())
             .install(
                 &mut crate::plugin::PluginHost::new(
                     &mut protocols,

@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use rig::message::{ImageMediaType, ToolResultContent};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -14,24 +15,41 @@ use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug)]
 pub(crate) struct ProtocolHelpRequired {
-    protocol: String,
+    required: String,
+    requested: String,
 }
 
 impl ProtocolHelpRequired {
     fn new(protocol: &str) -> Self {
         Self {
-            protocol: protocol.to_string(),
+            required: protocol.to_string(),
+            requested: protocol.to_string(),
+        }
+    }
+
+    fn dependency(required: &str, requested: &str) -> Self {
+        Self {
+            required: required.to_string(),
+            requested: requested.to_string(),
         }
     }
 }
 
 impl fmt::Display for ProtocolHelpRequired {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "Read \"{}://help\" with an empty body before using this protocol.",
-            self.protocol
-        )
+        if self.required == self.requested {
+            write!(
+                formatter,
+                "Read \"{}://help\" with an empty body before using this protocol.",
+                self.required
+            )
+        } else {
+            write!(
+                formatter,
+                "Read \"{}://help\" with an empty body before using {}://.",
+                self.required, self.requested
+            )
+        }
     }
 }
 
@@ -42,7 +60,7 @@ pub struct ProtocolContext {
     pub tasks: TaskManager,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolDescriptor {
     pub name: String,
     pub description: String,
@@ -162,6 +180,13 @@ pub(crate) struct PresentedProtocolRead {
 pub trait Protocol: Send + Sync {
     fn descriptor(&self) -> ProtocolDescriptor;
 
+    /// Additional protocol help pages that must be read before this protocol's
+    /// own help or operations. The protocol's own `<name>://help` remains
+    /// mandatory and is read after these shared prerequisites.
+    fn help_dependencies(&self) -> &[String] {
+        &[]
+    }
+
     async fn read(
         &self,
         _request: ProtocolRequest<'_>,
@@ -242,6 +267,20 @@ impl ProtocolRegistry {
         if let Some(name) = selected.iter().find(|name| !available.contains(*name)) {
             bail!("unknown Agent protocol: {name}");
         }
+        for name in &selected {
+            let Some(protocol) = self.protocols.get(name) else {
+                continue;
+            };
+            validate_help_dependencies(name, protocol.help_dependencies())?;
+            for dependency in protocol.help_dependencies() {
+                if !available.contains(dependency) {
+                    bail!("Agent protocol {name} requires unavailable help protocol {dependency}");
+                }
+                if !selected.contains(dependency) {
+                    bail!("Agent protocol {name} also requires selecting protocol {dependency}");
+                }
+            }
+        }
         Ok(selected)
     }
 
@@ -249,6 +288,7 @@ impl ProtocolRegistry {
         let protocol: Arc<dyn Protocol> = Arc::new(protocol);
         let descriptor = protocol.descriptor();
         validate_descriptor(&descriptor)?;
+        validate_help_dependencies(&descriptor.name, protocol.help_dependencies())?;
         if self.protocols.contains_key(&descriptor.name) {
             bail!("protocol name is already registered: {}", descriptor.name);
         }
@@ -435,8 +475,18 @@ impl ProtocolRegistry {
         if !descriptor.can_read {
             bail!("protocol does not support read: {name}");
         }
-        if require_help && target != "help" && !self.help_read.lock().await.contains(name) {
-            return Err(ProtocolHelpRequired::new(name).into());
+        if require_help {
+            let help_read = self.help_read.lock().await;
+            if let Some(dependency) = protocol
+                .help_dependencies()
+                .iter()
+                .find(|dependency| !help_read.contains(*dependency))
+            {
+                return Err(ProtocolHelpRequired::dependency(dependency, name).into());
+            }
+            if target != "help" && !help_read.contains(name) {
+                return Err(ProtocolHelpRequired::new(name).into());
+            }
         }
         let response = protocol
             .read_output(ProtocolRequest { uri, target, body }, self.context.clone())
@@ -461,8 +511,18 @@ impl ProtocolRegistry {
             .find_protocol(name, include_dynamic)
             .await
             .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
-        if require_help && !self.help_read.lock().await.contains(name) {
-            return Err(ProtocolHelpRequired::new(name).into());
+        if require_help {
+            let help_read = self.help_read.lock().await;
+            if let Some(dependency) = protocol
+                .help_dependencies()
+                .iter()
+                .find(|dependency| !help_read.contains(*dependency))
+            {
+                return Err(ProtocolHelpRequired::dependency(dependency, name).into());
+            }
+            if !help_read.contains(name) {
+                return Err(ProtocolHelpRequired::new(name).into());
+            }
         }
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
@@ -521,6 +581,22 @@ pub(crate) fn validate_descriptor(descriptor: &ProtocolDescriptor) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn validate_help_dependencies(protocol: &str, dependencies: &[String]) -> Result<()> {
+    let mut unique = HashSet::new();
+    for dependency in dependencies {
+        if dependency.is_empty() || dependency.contains("://") {
+            bail!("invalid help dependency for protocol {protocol}: {dependency:?}");
+        }
+        if dependency == protocol {
+            bail!("protocol {protocol} cannot depend on its own help");
+        }
+        if !unique.insert(dependency) {
+            bail!("protocol {protocol} repeats help dependency {dependency}");
+        }
+    }
+    Ok(())
+}
+
 pub fn split_address(uri: &str) -> Result<(&str, &str)> {
     let (name, target) = uri
         .split_once("://")
@@ -549,6 +625,11 @@ mod tests {
     }
 
     struct NamedProtocol(String);
+
+    struct DependentProtocol {
+        name: String,
+        help_dependencies: Vec<String>,
+    }
 
     #[async_trait]
     impl Protocol for NamedProtocol {
@@ -638,6 +719,30 @@ mod tests {
                 body: request.body.to_string(),
             });
             Ok(b"ok".to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl Protocol for DependentProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: self.name.clone(),
+                description: "dependent test protocol".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+
+        fn help_dependencies(&self) -> &[String] {
+            &self.help_dependencies
+        }
+
+        async fn read(
+            &self,
+            _request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            Ok(self.name.as_bytes().to_vec())
         }
     }
 
@@ -849,6 +954,57 @@ mod tests {
         registry.read("capture://help", "").await.unwrap();
         assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
         assert_eq!(registry.exec("capture://run", "").await.unwrap(), "ok");
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn shared_help_is_required_before_a_dependent_protocols_own_help() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(NamedProtocol("shared".to_string()))
+            .unwrap();
+        registry
+            .register(DependentProtocol {
+                name: "dependent".to_string(),
+                help_dependencies: vec!["shared".to_string()],
+            })
+            .unwrap();
+
+        assert!(
+            registry
+                .select(Some(&["dependent".to_string()]))
+                .unwrap_err()
+                .to_string()
+                .contains("also requires selecting protocol shared")
+        );
+        registry
+            .select(Some(&["shared".to_string(), "dependent".to_string()]))
+            .unwrap();
+
+        let error = registry.read("dependent://help", "").await.unwrap_err();
+        assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
+        assert_eq!(
+            error.to_string(),
+            "Read \"shared://help\" with an empty body before using dependent://."
+        );
+
+        registry.read("shared://help", "").await.unwrap();
+        assert_eq!(
+            registry
+                .read("dependent://value", "")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Read \"dependent://help\" with an empty body before using this protocol."
+        );
+        registry.read("dependent://help", "").await.unwrap();
+        assert_eq!(
+            registry.read("dependent://value", "").await.unwrap(),
+            "dependent"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 

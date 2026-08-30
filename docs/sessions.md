@@ -57,7 +57,7 @@ URI Agent saves the composer draft when the TUI exits or switches sessions. Befo
 
 ## Frozen startup context
 
-A new session freezes a `SessionContext` event containing the complete generated system prompt and selected Skill snapshots before accepting its first user message. Resume reuses it instead of regenerating the prompt or rebinding Skills from the current filesystem. See [Startup context and Skills](context.md) for the inputs and Skill rules.
+A new session freezes a `SessionContext` event containing the complete generated system prompt, session-scoped protocol records, and selected Skill snapshots before accepting its first user message. Resume reuses it instead of regenerating the prompt, rediscovering that protocol set, or rebinding Skills from the current filesystem. MCP records preserve only stable identity and prompt metadata; each operation still resolves mutable server configuration and fails if that recorded server was removed or disabled. See [Startup context and Skills](context.md) for the inputs and Skill rules.
 
 ## Append-only events
 
@@ -130,9 +130,11 @@ Each retry becomes a visible session event with its reason, delay, and count. Pr
 A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
 
 The first model-facing call to each protocol must successfully read its exact
-`<protocol>://help` route with an empty body. This state belongs to the session;
-resuming reconstructs it from successful persisted tool results. Internal
-protocol calls made by a WASM plugin are not model-facing and bypass this gate.
+`<protocol>://help` route with an empty body. Protocol-declared shared-help
+dependencies must be read first, in order; the protocol's own help remains
+mandatory. This state belongs to the session, and resuming reconstructs it from
+successful persisted tool results. Internal protocol calls made by a WASM
+plugin are not model-facing and bypass this gate.
 
 If a turn is interrupted while tool calls from one model response are pending, URI Agent appends a failed result with the original correlation identity for every unfinished call before settling the turn. Later requests therefore never replay a tool call without its corresponding result.
 

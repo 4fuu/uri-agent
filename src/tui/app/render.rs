@@ -2271,22 +2271,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
         Overlay::Tasks => render_tasks(frame, app, area, block),
         Overlay::Models => render_models(frame, app, area, block),
         Overlay::Settings => render_settings(frame, app, area, block),
-        Overlay::Plugin => {
-            let document = app.tui_document.as_ref();
-            let title = document
-                .map(|document| format!(" {} ", document.title))
-                .unwrap_or_else(|| " PLUGIN PANEL ".to_string());
-            let body = document
-                .map(|document| document.body.as_str())
-                .unwrap_or("Plugin panel did not return content.");
-            frame.render_widget(
-                Paragraph::new(body)
-                    .block(block.title(fit_panel_title(&title, area.width)))
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.overlay_scroll, 0)),
-                area,
-            );
-        }
+        Overlay::Plugin => render_plugin_panel(frame, app, area, block),
         Overlay::Document => {
             let hints = action_hints(&app.keymap, &[("document", "copy", "copy")]);
             let (name, body) = app
@@ -3785,6 +3770,155 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
             area: Rect::new(inner.x, y, inner.width, 1),
             target: AppHit::Task(index),
         });
+    }
+}
+
+pub(super) fn panel_tone_style(tone: TuiPanelTone) -> Style {
+    Style::default().fg(match tone {
+        TuiPanelTone::Default => TEXT,
+        TuiPanelTone::Accent => ACCENT,
+        TuiPanelTone::Muted => MUTED,
+        TuiPanelTone::Warning => WARM,
+        TuiPanelTone::Error => ERROR,
+    })
+}
+
+pub(super) fn render_plugin_panel(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    block: Block<'_>,
+) {
+    let Some(panel) = app.tui_panel.as_mut() else {
+        frame.render_widget(
+            Paragraph::new("Plugin panel is unavailable.")
+                .block(block.title(" PLUGIN PANEL "))
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    };
+    let view = panel.view();
+    let hints = view
+        .hints
+        .iter()
+        .map(|hint| format!("{} {}", hint.key, hint.label))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let title = panel_title(&view.title, String::new());
+    let inner = block.inner(area);
+    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    let message_height = u16::from(view.message.is_some());
+    let hints_height = u16::from(!hints.is_empty());
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(message_height),
+            Constraint::Length(hints_height),
+        ])
+        .split(inner);
+    app.overlay_viewport_rows = sections[0].height as usize;
+    let row_width = sections[0].width as usize;
+    let label_width = 20.min(row_width.saturating_sub(2));
+    let value_width = row_width.saturating_sub(label_width + 2);
+    let items = view.rows.iter().enumerate().map(|(index, row)| {
+        let selected = view.selected == Some(index);
+        let mut value = row.value.clone();
+        if let Some(cursor) = row.cursor {
+            let mut characters = value.chars().collect::<Vec<_>>();
+            characters.insert(cursor.min(characters.len()), '█');
+            value = characters.into_iter().collect();
+        }
+        let value_limit = if row.description.is_empty() {
+            value_width
+        } else {
+            (value_width * 3 / 5).max(8).min(value_width)
+        };
+        let value_preview = single_line_preview(&value, value_limit);
+        let description_width = value_width.saturating_sub(value_preview.chars().count());
+        let mut spans = vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "{:<width$}",
+                    single_line_preview(&row.label, label_width),
+                    width = label_width
+                ),
+                panel_tone_style(row.tone).add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(value_preview, panel_tone_style(row.tone)),
+        ];
+        if !row.description.is_empty() && description_width > 3 {
+            spans.push(Span::styled(
+                format!(
+                    " · {}",
+                    single_line_preview(&row.description, description_width.saturating_sub(3))
+                ),
+                Style::default().fg(MUTED),
+            ));
+        }
+        ListItem::new(Line::from(spans)).style(Style::default().bg(if selected {
+            ROW_ACTIVE
+        } else {
+            SURFACE
+        }))
+    });
+    let selected = view.selected.filter(|index| *index < view.rows.len());
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(List::new(items), sections[0], &mut state);
+    for index in state.offset()..view.rows.len() {
+        let y = sections[0]
+            .y
+            .saturating_add((index - state.offset()) as u16);
+        if y >= sections[0].bottom() {
+            break;
+        }
+        if !view.rows[index].selectable {
+            continue;
+        }
+        app.hit_regions.push(HitRegion {
+            area: Rect::new(sections[0].x, y, sections[0].width, 1),
+            target: AppHit::PluginRow(index),
+        });
+    }
+    if let Some((message, tone)) = view.message {
+        frame.render_widget(
+            Paragraph::new(single_line_preview(&message, sections[1].width as usize))
+                .style(panel_tone_style(tone)),
+            sections[1],
+        );
+    }
+    if !hints.is_empty() {
+        frame.render_widget(
+            Paragraph::new(single_line_preview(&hints, sections[2].width as usize))
+                .style(Style::default().fg(MUTED)),
+            sections[2],
+        );
+        let mut x = sections[2].x;
+        for (index, hint) in view.hints.iter().enumerate() {
+            if x >= sections[2].right() {
+                break;
+            }
+            let text = format!("{} {}", hint.key, hint.label);
+            let width = text
+                .width()
+                .min(sections[2].right().saturating_sub(x) as usize) as u16;
+            if hint.action.is_some() && width > 0 {
+                app.hit_regions.push(HitRegion {
+                    area: Rect::new(x, sections[2].y, width, 1),
+                    target: AppHit::PluginHint(index),
+                });
+            }
+            x = x.saturating_add(width).saturating_add(3);
+        }
     }
 }
 

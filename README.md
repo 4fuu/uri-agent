@@ -44,6 +44,9 @@ supported providers.
   are needed.
 - **Extensible tools:** linked and trusted WASM plugins can add protocols or
   typed tools without changing the runtime dispatch path.
+- **Built-in MCP bridge:** `:mcp` manages stdio and Streamable HTTP servers,
+  exposing each one as an on-demand `<name>-mcp://` protocol with query-first
+  arguments and a complete-JSON fallback for complex schemas.
 - **Broad model access:** the pi.dev catalog, provider-specific sign-in, and
   credential-scoped live discovery bring a wide provider ecosystem into one
   model selector.
