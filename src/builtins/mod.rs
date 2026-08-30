@@ -12,6 +12,12 @@ mod tasks;
 mod title;
 mod uri_agent_docs;
 
+pub use mcp::{
+    SessionMcpProfile, SessionMcpServer, SessionMcpTransport, session_profile_owner,
+    session_profile_record,
+};
+pub(crate) const MCP_SESSION_PROFILE_OWNER: &str = mcp::SESSION_PROFILE_OWNER;
+
 use crate::config::display_path;
 use crate::plugin::PluginRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -87,16 +93,33 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
 }
 
 pub fn plugins(cwd: &Path, config_directory: &Path) -> PluginRegistry {
+    plugins_with_session_profile(cwd, config_directory, None)
+}
+
+pub(crate) fn plugins_with_session_profile(
+    cwd: &Path,
+    config_directory: &Path,
+    mcp_profile: Option<serde_json::Value>,
+) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
-    add_agent_plugins(&mut plugins, cwd, config_directory);
+    add_agent_plugins(&mut plugins, cwd, config_directory, mcp_profile);
     plugins.add(title::TerminalTitlePlugin);
     plugins
 }
 
-fn add_agent_plugins(plugins: &mut PluginRegistry, cwd: &Path, config_directory: &Path) {
+fn add_agent_plugins(
+    plugins: &mut PluginRegistry,
+    cwd: &Path,
+    config_directory: &Path,
+    mcp_profile: Option<serde_json::Value>,
+) {
     plugins.add(model_tools::ProtocolToolsPlugin);
     plugins.add(agents::AgentsPlugin::new(cwd));
-    plugins.add(mcp::McpPlugin::new(cwd, config_directory));
+    plugins.add(mcp::McpPlugin::with_session_profile(
+        cwd,
+        config_directory,
+        mcp_profile,
+    ));
     plugins.add(uri_agent_docs::UriAgentDocsProtocol);
     plugins.add(file::FileProtocol::new(cwd));
     plugins.add(grep::GrepProtocol::new(cwd));

@@ -40,7 +40,13 @@ targets the next boundary while work is active; when the Agent is idle it is
 accepted as Prompt and starts a new turn. Acceptance and undelivered input are
 durable.
 
-A new session remains in memory while its startup context prepares in the background. On the first submit, the TUI leaves the welcome view and presents the user message immediately while that preparation continues. Persistence still waits for the context, then URI Agent writes the frozen context, queued startup events, and message in one transaction. Opening and closing an empty session creates no session record.
+A new TUI session remains in memory while its startup context prepares in the
+background. On the first submit, the TUI leaves the welcome view and presents
+the user message immediately while that preparation continues. Persistence
+still waits for the context, then URI Agent writes the frozen context, queued
+startup events, and message in one transaction. Opening and closing an empty
+TUI session creates no session record. ACP explicitly persists a newly created
+empty session so the client can list, close, and later reopen its assigned ID.
 
 The canonical startup directory is the project boundary recorded with every session:
 
@@ -48,6 +54,12 @@ The canonical startup directory is the project boundary recorded with every sess
 - `--continue-session` and `--session latest` select the latest session for the project;
 - `--session <id>` resumes that ID only when it belongs to the project;
 - `:resume` lists project sessions with their model and thinking effort.
+
+ACP-created depth-1 sessions use the same project-scoped database and can be
+opened through these normal TUI paths after the ACP owner releases them. Their
+private frontend records restore reconstructible capability state, such as an
+ACP-provided MCP profile, without placing secret values in append-only events.
+See [ACP v1](acp.md#project-and-session-lifecycle).
 
 The read-only `sessions` protocol can search archives across projects when explicitly requested. `@@` completion remains project-scoped. Archive reads never resume or modify a session; see [`sessions`](protocols.md#sessions).
 

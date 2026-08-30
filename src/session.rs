@@ -440,6 +440,7 @@ struct State {
     head_sequence: Option<u64>,
     spec: AgentSpec,
     context: Option<SessionContext>,
+    private_records: HashMap<String, Value>,
     derived: ResumeState,
     replay: ReplayState,
 }
@@ -796,6 +797,10 @@ pub(crate) struct SessionEventReadAudit {
 }
 
 impl Session {
+    pub async fn list_for(cwd: &Path) -> Result<Vec<SessionSummary>> {
+        list_project_sessions(session_database_path(cwd), cwd).await
+    }
+
     pub async fn persisted_spec(cwd: &Path, id: &str) -> Result<Option<AgentSpec>> {
         validate_session_id(id)?;
         let project = cwd
@@ -837,6 +842,50 @@ impl Session {
             })
             .await
             .context("cannot read persisted Agent spec")
+    }
+
+    pub async fn persisted_private_record(
+        cwd: &Path,
+        id: &str,
+        owner: &str,
+    ) -> Result<Option<Value>> {
+        validate_session_id(id)?;
+        let project = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let (_, connection) = open_database(session_database_path(cwd)).await?;
+        let id = id.to_string();
+        let owner = owner.to_string();
+        connection
+            .call(move |db| {
+                let payload = db
+                    .query_row(
+                        "SELECT session_private_records.payload_json
+                         FROM session_private_records
+                         JOIN sessions ON sessions.id = session_private_records.session_id
+                         WHERE session_private_records.session_id = ?1
+                           AND session_private_records.owner = ?2
+                           AND sessions.cwd = ?3",
+                        params![id, owner, project],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                payload
+                    .map(|payload| {
+                        serde_json::from_str(&payload).map_err(|error| {
+                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                tokio_rusqlite::rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()
+            })
+            .await
+            .context("cannot read private session record")
     }
 
     pub async fn open(
@@ -999,6 +1048,7 @@ impl Session {
         let mut frozen_context = None;
         let mut head_sequence = None;
         let mut restored_spec = None;
+        let mut private_records = HashMap::new();
 
         if created_session {
             spec.working_directory.clone_from(&project_directory);
@@ -1042,6 +1092,31 @@ impl Session {
             derived = restored.derived;
             replay = restored.replay;
             existing = restored.tail;
+            let lookup_id = id.clone();
+            private_records = connection
+                .call(move |db| {
+                    let mut statement = db.prepare(
+                        "SELECT owner, payload_json FROM session_private_records
+                         WHERE session_id = ?1",
+                    )?;
+                    statement
+                        .query_map([lookup_id], |row| {
+                            let owner = row.get::<_, String>(0)?;
+                            let payload = serde_json::from_str(&row.get::<_, String>(1)?).map_err(
+                                |error| {
+                                    tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                                        1,
+                                        tokio_rusqlite::rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?;
+                            Ok((owner, payload))
+                        })?
+                        .collect::<Result<HashMap<_, _>, _>>()
+                })
+                .await
+                .context("cannot restore private session records")?;
         }
         let spec = restored_spec
             .ok_or_else(|| anyhow!("session {id} has no creation event and cannot be resumed"))?;
@@ -1065,6 +1140,7 @@ impl Session {
                 head_sequence,
                 spec,
                 context: frozen_context,
+                private_records,
                 derived,
                 replay,
             })),
@@ -1137,6 +1213,18 @@ impl Session {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let private_records = state
+            .private_records
+            .iter()
+            .map(|(owner, payload)| {
+                Ok::<_, anyhow::Error>((
+                    owner.clone(),
+                    serde_json::to_string(payload).with_context(|| {
+                        format!("cannot serialize private session record {owner}")
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let pending_id = self
             .connection
             .call(move |db| {
@@ -1173,6 +1261,13 @@ impl Session {
                          (session_id, sequence, at, kind, payload_json)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
                         params![session_id, sequence, event_at, event_kind, payload],
+                    )?;
+                }
+                for (owner, payload) in private_records {
+                    transaction.execute(
+                        "INSERT INTO session_private_records
+                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
+                        params![session_id, owner, payload],
                     )?;
                 }
                 transaction.execute(
@@ -1306,6 +1401,133 @@ impl Session {
         self.publish_persisted(&[event]);
         Ok(())
     }
+
+    /// Persist a prepared session without adding a user-visible transcript event.
+    pub async fn persist(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.persisted {
+            return Ok(());
+        }
+        if state.context.is_none() {
+            bail!("cannot persist a session before its startup context is ready");
+        }
+        let at = Utc::now().to_rfc3339();
+        let id = self.id.clone();
+        let project = self.project.clone();
+        let spec = state.spec.clone();
+        let head_sequence = state.head_sequence.map_or(-1, |sequence| sequence as i64);
+        let stored_events = state
+            .events
+            .iter()
+            .map(|event| {
+                Ok::<_, anyhow::Error>((
+                    event.sequence as i64,
+                    event.at.to_rfc3339(),
+                    payload_kind(&event.kind).to_string(),
+                    serde_json::to_string(&event.kind).context("cannot serialize session event")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let private_records = state
+            .private_records
+            .iter()
+            .map(|(owner, payload)| {
+                Ok::<_, anyhow::Error>((
+                    owner.clone(),
+                    serde_json::to_string(payload).with_context(|| {
+                        format!("cannot serialize private session record {owner}")
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.connection
+            .call(move |db| {
+                let transaction = db.transaction()?;
+                let draft = transaction
+                    .query_row(
+                        "SELECT draft FROM pending_drafts WHERE cwd = ?1",
+                        [&project],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default();
+                transaction.execute(
+                    "INSERT INTO sessions
+                     (id, created_at, updated_at, cwd, provider, model, thinking,
+                      parent_session_id, depth, head_sequence, draft)
+                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        id,
+                        at,
+                        project,
+                        spec.provider,
+                        spec.model,
+                        spec.thinking.to_string(),
+                        spec.parent_session_id,
+                        i64::from(spec.depth()),
+                        head_sequence,
+                        draft,
+                    ],
+                )?;
+                for (sequence, event_at, kind, payload) in stored_events {
+                    transaction.execute(
+                        "INSERT INTO events
+                         (session_id, sequence, at, kind, payload_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![id, sequence, event_at, kind, payload],
+                    )?;
+                }
+                for (owner, payload) in private_records {
+                    transaction.execute(
+                        "INSERT INTO session_private_records
+                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
+                        params![id, owner, payload],
+                    )?;
+                }
+                transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .context("cannot persist prepared session")?;
+        state.persisted = true;
+        Ok(())
+    }
+
+    /// Store frontend- or plugin-owned state outside the append-only transcript.
+    pub async fn set_private_record(&self, owner: &str, payload: Value) -> Result<()> {
+        let owner = owner.trim();
+        if owner.is_empty() {
+            bail!("private session record owner cannot be empty");
+        }
+        let serialized = serde_json::to_string(&payload)
+            .with_context(|| format!("cannot serialize private session record {owner}"))?;
+        let mut state = self.state.lock().await;
+        if state.persisted {
+            let session_id = self.id.clone();
+            let stored_owner = owner.to_string();
+            self.connection
+                .call(move |db| {
+                    db.execute(
+                        "INSERT INTO session_private_records
+                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(session_id, owner)
+                         DO UPDATE SET payload_json = excluded.payload_json",
+                        params![session_id, stored_owner, serialized],
+                    )?;
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                })
+                .await
+                .with_context(|| format!("cannot persist private session record {owner}"))?;
+        }
+        state.private_records.insert(owner.to_string(), payload);
+        Ok(())
+    }
+
+    pub async fn private_record(&self, owner: &str) -> Option<Value> {
+        self.state.lock().await.private_records.get(owner).cloned()
+    }
+
     pub fn project_directory(&self) -> &Path {
         &self.project_directory
     }
@@ -1805,6 +2027,18 @@ impl Session {
                         .context("cannot serialize session event")?,
                 ));
             }
+            let private_records = state
+                .private_records
+                .iter()
+                .map(|(owner, payload)| {
+                    Ok::<_, anyhow::Error>((
+                        owner.clone(),
+                        serde_json::to_string(payload).with_context(|| {
+                            format!("cannot serialize private session record {owner}")
+                        })?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let id = self.id.clone();
             let project = self.project.clone();
             let provider = next_spec.provider.clone();
@@ -1851,6 +2085,13 @@ impl Session {
                              (session_id, sequence, at, kind, payload_json)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
                             params![id, sequence, event_at, kind_name, payload],
+                        )?;
+                    }
+                    for (owner, payload) in private_records {
+                        transaction.execute(
+                            "INSERT INTO session_private_records
+                             (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
+                            params![id, owner, payload],
                         )?;
                     }
                     transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
@@ -2227,6 +2468,13 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
                    through_sequence INTEGER NOT NULL,
                    payload_json TEXT NOT NULL,
                    checksum TEXT NOT NULL,
+                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE IF NOT EXISTS session_private_records (
+                   session_id TEXT NOT NULL,
+                   owner TEXT NOT NULL,
+                   payload_json TEXT NOT NULL,
+                   PRIMARY KEY(session_id, owner),
                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                  );
                  CREATE TABLE IF NOT EXISTS pending_inputs (
@@ -2902,6 +3150,79 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("cannot restore session state"));
+    }
+
+    #[tokio::test]
+    async fn prepared_session_private_records_persist_outside_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = Session::open_at_deferred(
+            path.clone(),
+            Some("prepared-private-record"),
+            Path::new("/work"),
+            "test",
+            "model",
+        )
+        .await
+        .unwrap();
+        opened
+            .set_private_record("frontend", serde_json::json!({"token": "private-value"}))
+            .await
+            .unwrap();
+        assert!(opened.persist().await.is_err());
+        opened
+            .initialize_context(context("prepared"))
+            .await
+            .unwrap();
+        opened.persist().await.unwrap();
+        assert_eq!(opened.snapshot().await.unwrap().len(), 2);
+        assert!(
+            opened
+                .list_for_project()
+                .await
+                .unwrap()
+                .iter()
+                .any(|session| { session.id == "prepared-private-record" })
+        );
+        drop(opened);
+
+        let reopened = Session::open_at(
+            path.clone(),
+            Some("prepared-private-record"),
+            Path::new("/work"),
+            "ignored",
+            "ignored",
+            context("ignored"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.private_record("frontend").await,
+            Some(serde_json::json!({"token": "private-value"}))
+        );
+        reopened
+            .set_private_record("frontend", serde_json::json!({"token": "replacement"}))
+            .await
+            .unwrap();
+        drop(reopened);
+
+        let reopened = Session::open_at(
+            path,
+            Some("prepared-private-record"),
+            Path::new("/work"),
+            "ignored",
+            "ignored",
+            context("ignored"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.private_record("frontend").await,
+            Some(serde_json::json!({"token": "replacement"}))
+        );
+        let transcript = serde_json::to_string(&reopened.snapshot().await.unwrap()).unwrap();
+        assert!(!transcript.contains("private-value"));
+        assert!(!transcript.contains("replacement"));
     }
 
     #[test]
