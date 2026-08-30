@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 serde_json = "1"
-uri-agent-plugin-sdk = "2026.830.0"
+uri-agent-plugin-sdk = "2026.830.1"
 ```
 
 Define a manifest and handler, then use `define_plugin!` to generate `uri_agent_manifest` and `uri_agent_handle`:
