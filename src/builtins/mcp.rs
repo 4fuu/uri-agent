@@ -4539,9 +4539,16 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hanging_address = listener.local_addr().unwrap();
-        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_address = closed_listener.local_addr().unwrap();
-        drop(closed_listener);
+        // A connection that is accepted and immediately closed fails fast on
+        // every platform. A port with no listener is not equivalent: Windows
+        // can take seconds before reporting the refusal.
+        let closing_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closing_address = closing_listener.local_addr().unwrap();
+        let closing_server = tokio::spawn(async move {
+            while let Ok((stream, _)) = closing_listener.accept().await {
+                drop(stream);
+            }
+        });
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (_stream, _) = listener.accept().await.unwrap();
@@ -4551,7 +4558,7 @@ mod tests {
         let store = McpConfigStore::new(&project, &global);
         for (name, description, address) in [
             ("hanging", "Hanging server", hanging_address),
-            ("fast", "Fast failure", closed_address),
+            ("fast", "Fast failure", closing_address),
         ] {
             store
                 .write(
@@ -4601,6 +4608,8 @@ mod tests {
         let _ = hanging.await;
         server.abort();
         let _ = server.await;
+        closing_server.abort();
+        let _ = closing_server.await;
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
@@ -4894,7 +4903,13 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        drop(listener);
+        // An accepted-then-closed connection fails fast on every platform;
+        // a listenerless port may take seconds to refuse on Windows.
+        let closing_server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
         let result = runtime
             .connect_with_timeout_mode(
                 "Session Server",
@@ -4917,6 +4932,8 @@ mod tests {
         assert!(error.contains("connection details are hidden"));
         assert!(!error.contains("literal-session-secret"));
 
+        closing_server.abort();
+        let _ = closing_server.await;
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
