@@ -164,6 +164,7 @@ impl TurnCancellation {
 }
 
 struct ActiveTurn {
+    submission_id: u64,
     cancel: watch::Sender<Option<TurnCancellation>>,
     handle: JoinHandle<()>,
 }
@@ -598,10 +599,14 @@ impl AgentRuntime {
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, true, None, receiver)
+                .run_active_turn(input, true, true, false, None, receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id: message.id,
+            cancel,
+            handle,
+        });
         Ok(message)
     }
 
@@ -671,13 +676,18 @@ impl AgentRuntime {
             (index, input)
         };
         let (cancel, receiver) = watch::channel(None);
+        let submission_id = input.message.id;
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, true, Some(index), receiver)
+                .run_active_turn(input, true, true, true, Some(index), receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id,
+            cancel,
+            handle,
+        });
         Ok(true)
     }
 
@@ -890,13 +900,18 @@ impl AgentRuntime {
             task_notification_ids: Vec::new(),
         };
         let (cancel, receiver) = watch::channel(None);
+        let submission_id = input.message.id;
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, true, None, receiver)
+                .run_active_turn(input, true, true, true, None, receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id,
+            cancel,
+            handle,
+        });
         Ok(())
     }
 
@@ -946,10 +961,14 @@ impl AgentRuntime {
         let runtime = self.clone();
         let handle = tokio::spawn(async move {
             runtime
-                .run_active_turn(input, true, false, None, receiver)
+                .run_active_turn(input, true, false, true, None, receiver)
                 .await;
         });
-        *active = Some(ActiveTurn { cancel, handle });
+        *active = Some(ActiveTurn {
+            submission_id: u64::MAX,
+            cancel,
+            handle,
+        });
     }
 
     async fn run_active_turn(
@@ -957,6 +976,7 @@ impl AgentRuntime {
         mut input: PendingMessageEntry,
         mut content_prepared: bool,
         mut take_initial_steer: bool,
+        retain_undelivered_input: bool,
         mut pending_index: Option<usize>,
         mut cancel: watch::Receiver<Option<TurnCancellation>>,
     ) {
@@ -983,12 +1003,26 @@ impl AgentRuntime {
                 .await;
             let submission_id = input.message.id;
             if let Err(error) = result {
+                let mut cleanup_error = None;
                 if content_prepared && !input_delivered && input.visible {
-                    self.restore_pending_entry(pending_index.unwrap_or_default(), input)
-                        .await;
+                    if retain_undelivered_input {
+                        self.restore_pending_entry(pending_index.unwrap_or_default(), input)
+                            .await;
+                    } else if let Some(persistent_id) = input.persistent_id
+                        && let Err(remove_error) =
+                            self.session.remove_pending_input(persistent_id).await
+                    {
+                        self.restore_pending_entry(pending_index.unwrap_or_default(), input)
+                            .await;
+                        cleanup_error = Some(format!(
+                            "cannot discard failed exclusive input: {remove_error:#}"
+                        ));
+                    }
                 }
                 self.stop_accepting_pending().await;
-                let outcome = if matches!(*cancel.borrow(), Some(TurnCancellation::User)) {
+                let outcome = if let Some(cleanup_error) = cleanup_error {
+                    TurnOutcome::Failed(format!("{error:#}; {cleanup_error}"))
+                } else if matches!(*cancel.borrow(), Some(TurnCancellation::User)) {
                     TurnOutcome::Cancelled
                 } else {
                     TurnOutcome::Failed(format!("{error:#}"))
@@ -1020,6 +1054,20 @@ impl AgentRuntime {
         let Some(active) = active
             .as_ref()
             .filter(|active| !active.handle.is_finished())
+        else {
+            return false;
+        };
+        active.cancel.send(Some(TurnCancellation::User)).is_ok()
+    }
+
+    /// Request cancellation only when the named submission still owns the
+    /// active turn. Frontends use this to avoid interrupting recovered or
+    /// native work that happens to run in the same session.
+    pub(crate) async fn interrupt_submission(&self, submission_id: u64) -> bool {
+        let active = self.active_turn.lock().await;
+        let Some(active) = active
+            .as_ref()
+            .filter(|active| active.submission_id == submission_id && !active.handle.is_finished())
         else {
             return false;
         };
@@ -5421,6 +5469,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_exclusive_submission_discards_undelivered_native_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend {
+            responses: Mutex::new(VecDeque::from([(
+                vec![AssistantContent::text("second prompt ran")],
+                Some(fake_usage()),
+            )])),
+            ..FakeBackend::default()
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        runtime.set_backend(None, None).await;
+        let mut completions = runtime.subscribe_turn_completions();
+
+        let failed = runtime
+            .submit_exclusive_with_images("first prompt".to_string(), Vec::new())
+            .await
+            .unwrap();
+        let completion = completions.recv().await.unwrap();
+        assert_eq!(completion.submission_id, failed.id);
+        assert!(matches!(completion.outcome, TurnOutcome::Failed(_)));
+        assert!(runtime.pending_messages().await.is_empty());
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+
+        runtime.set_backend(Some(backend), None).await;
+        let second = runtime
+            .submit_exclusive_with_images("second prompt".to_string(), Vec::new())
+            .await
+            .unwrap();
+        let completion = completions.recv().await.unwrap();
+        assert_eq!(completion.submission_id, second.id);
+        assert_eq!(completion.outcome, TurnOutcome::Completed);
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
     async fn accepted_submission_reports_user_cancellation_after_settlement() {
         let workspace = tempfile::tempdir().unwrap();
         let backend = Arc::new(BlockingBackend {
@@ -5436,7 +5523,9 @@ mod tests {
             .unwrap();
         backend.started.notified().await;
 
-        assert!(runtime.interrupt_turn().await);
+        assert!(!runtime.interrupt_submission(submission.id + 1).await);
+        assert!(runtime.turn_running().await);
+        assert!(runtime.interrupt_submission(submission.id).await);
         let completion = tokio::time::timeout(Duration::from_secs(1), completions.recv())
             .await
             .unwrap()

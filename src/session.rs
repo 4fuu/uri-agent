@@ -1443,19 +1443,11 @@ impl Session {
         self.connection
             .call(move |db| {
                 let transaction = db.transaction()?;
-                let draft = transaction
-                    .query_row(
-                        "SELECT draft FROM pending_drafts WHERE cwd = ?1",
-                        [&project],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .unwrap_or_default();
                 transaction.execute(
                     "INSERT INTO sessions
                      (id, created_at, updated_at, cwd, provider, model, thinking,
                       parent_session_id, depth, head_sequence, draft)
-                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '')",
                     params![
                         id,
                         at,
@@ -1466,7 +1458,6 @@ impl Session {
                         spec.parent_session_id,
                         i64::from(spec.depth()),
                         head_sequence,
-                        draft,
                     ],
                 )?;
                 for (sequence, event_at, kind, payload) in stored_events {
@@ -1484,7 +1475,6 @@ impl Session {
                         params![id, owner, payload],
                     )?;
                 }
-                transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
                 transaction.commit()?;
                 Ok::<_, tokio_rusqlite::rusqlite::Error>(())
             })
@@ -1522,6 +1512,64 @@ impl Session {
         }
         state.private_records.insert(owner.to_string(), payload);
         Ok(())
+    }
+
+    pub(crate) async fn stage_private_record(&self, owner: &str, payload: Value) -> Result<()> {
+        let owner = owner.trim();
+        if owner.is_empty() {
+            bail!("private session record owner cannot be empty");
+        }
+        serde_json::to_string(&payload)
+            .with_context(|| format!("cannot serialize private session record {owner}"))?;
+        self.state
+            .lock()
+            .await
+            .private_records
+            .insert(owner.to_string(), payload);
+        Ok(())
+    }
+
+    pub(crate) async fn persist_private_records(&self, owners: &[String]) -> Result<()> {
+        if owners.is_empty() {
+            return Ok(());
+        }
+        let state = self.state.lock().await;
+        if !state.persisted {
+            return Ok(());
+        }
+        let records = owners
+            .iter()
+            .map(|owner| {
+                let payload = state
+                    .private_records
+                    .get(owner)
+                    .ok_or_else(|| anyhow!("missing staged private session record {owner}"))?;
+                Ok::<_, anyhow::Error>((
+                    owner.clone(),
+                    serde_json::to_string(payload).with_context(|| {
+                        format!("cannot serialize private session record {owner}")
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let session_id = self.id.clone();
+        self.connection
+            .call(move |db| {
+                let transaction = db.transaction()?;
+                for (owner, payload) in records {
+                    transaction.execute(
+                        "INSERT INTO session_private_records
+                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(session_id, owner)
+                         DO UPDATE SET payload_json = excluded.payload_json",
+                        params![session_id, owner, payload],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .context("cannot persist staged private session records")
     }
 
     pub async fn private_record(&self, owner: &str) -> Option<Value> {
@@ -1595,6 +1643,10 @@ impl Session {
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionUpdate> {
         self.events.subscribe()
+    }
+
+    pub(crate) async fn head_sequence(&self) -> Option<u64> {
+        self.state.lock().await.head_sequence
     }
 
     /// Publish provisional UI state without adding it to durable replay. The
@@ -4593,6 +4645,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn persisting_a_prepared_session_does_not_consume_the_project_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let draft = session(&path, Some("draft-owner")).await;
+        draft.save_draft("unsent TUI text").await.unwrap();
+        drop(draft);
+
+        let prepared = Session::open_at_deferred(
+            path.clone(),
+            Some("prepared-session"),
+            Path::new("/work"),
+            "test",
+            "model",
+        )
+        .await
+        .unwrap();
+        prepared
+            .initialize_context(context("prepared"))
+            .await
+            .unwrap();
+        prepared.persist().await.unwrap();
+
+        assert_eq!(prepared.draft().await, "");
+        drop(prepared);
+        let next_tui_session = session(&path, Some("next-tui-session")).await;
+        assert_eq!(next_tui_session.draft().await, "unsent TUI text");
     }
 
     #[tokio::test]

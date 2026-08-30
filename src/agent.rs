@@ -311,6 +311,14 @@ impl AgentHandle {
         self.instance.services.runtime.interrupt_turn().await
     }
 
+    pub(crate) async fn cancel_submission(&self, submission_id: u64) -> bool {
+        self.instance
+            .services
+            .runtime
+            .interrupt_submission(submission_id)
+            .await
+    }
+
     pub async fn close(&self) {
         if self.instance.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -391,8 +399,15 @@ impl AgentHost {
         }
         spec.working_directory.clone_from(&self.inner.cwd);
         spec.assign_depth(MAX_AGENT_DEPTH);
-        self.open_inner(None, spec, callback, false, AgentOpenOptions::default())
-            .await
+        self.open_inner(
+            None,
+            spec,
+            callback,
+            false,
+            AgentOpenOptions::default(),
+            true,
+        )
+        .await
     }
 
     pub async fn open_plugin(
@@ -423,6 +438,7 @@ impl AgentHost {
             callback,
             false,
             AgentOpenOptions::default(),
+            true,
         )
         .await
     }
@@ -440,11 +456,33 @@ impl AgentHost {
         spec: AgentSpec,
         options: AgentOpenOptions,
     ) -> Result<AgentHandle> {
+        self.open_root_with_resume(requested, spec, options, true)
+            .await
+    }
+
+    pub(crate) async fn open_root_with_deferred_resume(
+        &self,
+        requested: Option<&str>,
+        spec: AgentSpec,
+        options: AgentOpenOptions,
+    ) -> Result<AgentHandle> {
+        self.open_root_with_resume(requested, spec, options, false)
+            .await
+    }
+
+    async fn open_root_with_resume(
+        &self,
+        requested: Option<&str>,
+        spec: AgentSpec,
+        options: AgentOpenOptions,
+        resume_pending: bool,
+    ) -> Result<AgentHandle> {
         validate_spec(&spec)?;
         if spec.parent_session_id.is_some() || spec.depth() != ROOT_AGENT_DEPTH {
             anyhow::bail!("root Agent spec must have depth 1 and no parent");
         }
-        self.open_inner(requested, spec, None, true, options).await
+        self.open_inner(requested, spec, None, true, options, resume_pending)
+            .await
     }
 
     async fn open_inner(
@@ -454,6 +492,7 @@ impl AgentHost {
         callback: Option<Arc<dyn CompactionCallback>>,
         root: bool,
         options: AgentOpenOptions,
+        resume_pending: bool,
     ) -> Result<AgentHandle> {
         let _open = self.inner.open_lock.lock().await;
         let session = Session::open_deferred(requested, &self.inner.cwd, spec).await?;
@@ -477,11 +516,29 @@ impl AgentHost {
                 .await;
             return Ok(handle);
         }
+        let private_record_owners = options.private_records.keys().cloned().collect::<Vec<_>>();
         for (owner, payload) in options.private_records {
-            session.set_private_record(&owner, payload).await?;
+            session.stage_private_record(&owner, payload).await?;
         }
-        let resume_pending = !session.pending_inputs().await?.is_empty();
-        let services = self.build_services(session, callback).await?;
+        let resume_pending = resume_pending && !session.pending_inputs().await?.is_empty();
+        let services = self.build_services(session.clone(), callback).await?;
+        if !private_record_owners.is_empty()
+            && let Err(error) = services.runtime.prepare_context().await
+        {
+            let _ = services.wasm_plugins.shutdown().await;
+            services.runtime.shutdown().await;
+            let _ = services.plugins.shutdown().await;
+            return Err(error);
+        }
+        if let Err(error) = session
+            .persist_private_records(&private_record_owners)
+            .await
+        {
+            let _ = services.wasm_plugins.shutdown().await;
+            services.runtime.shutdown().await;
+            let _ = services.plugins.shutdown().await;
+            return Err(error);
+        }
         let instance = Arc::new(AgentInstance {
             services,
             closed: AtomicBool::new(false),

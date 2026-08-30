@@ -23,6 +23,9 @@ interface or background resident mode. It conflicts with `--cwd`,
 the session working directory. Model, provider, thinking, credential, catalog,
 offline, and output-limit overrides remain available.
 
+Each newline-delimited JSON-RPC message on stdin is limited to 16 MiB. URI
+Agent closes the ACP transport if a client exceeds that limit.
+
 ## Project and session lifecycle
 
 Every new, loaded, or resumed ACP session supplies an absolute `cwd`. The first

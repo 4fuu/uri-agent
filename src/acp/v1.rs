@@ -8,25 +8,31 @@ use crate::config::{Cli, Config, ConfigManager};
 use crate::protocol::{ProtocolImage, ProtocolImageMediaType};
 use crate::runtime::TurnOutcome;
 use crate::session::{EventKind, Session, SessionEvent, SessionUpdate as NativeSessionUpdate};
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
-    ContentChunk, Cost, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
-    SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ContentChunk, Cost, ImageContent, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PromptCapabilities,
+    PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionCloseCapabilities, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, StopReason, TextContent,
+    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgent, Client as AcpClient, ConnectTo, ConnectionTo, Dispatch, Error as AcpError,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use http::HeaderName;
+use rig::message::{DocumentSourceKind, ImageMediaType, Message, UserContent};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Serve stable ACP v1 over stdin/stdout.
 pub async fn serve(cli: Cli) -> Result<()> {
@@ -54,8 +60,11 @@ async fn serve_on(cli: Cli, transport: impl ConnectTo<AcpAgent> + 'static) -> Re
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: NewSessionRequest, responder, _connection| {
-                respond(responder, new_session.new_session(request).await)
+            async move |request: NewSessionRequest, responder, connection| {
+                respond(
+                    responder,
+                    new_session.new_session(request, &connection).await,
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -69,8 +78,11 @@ async fn serve_on(cli: Cli, transport: impl ConnectTo<AcpAgent> + 'static) -> Re
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: ResumeSessionRequest, responder, _connection| {
-                respond(responder, resume_session.resume_session(request).await)
+            async move |request: ResumeSessionRequest, responder, connection| {
+                respond(
+                    responder,
+                    resume_session.resume_session(request, &connection).await,
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -92,14 +104,11 @@ async fn serve_on(cli: Cli, transport: impl ConnectTo<AcpAgent> + 'static) -> Re
                     Ok(session) => session,
                     Err(error) => return responder.respond_with_error(error),
                 };
-                let task_connection = connection.clone();
                 let task_session = session.clone();
                 let spawn = connection.spawn({
                     let prompt = prompt.clone();
                     async move {
-                        let result = prompt
-                            .prompt(request, &task_connection, &task_session)
-                            .await;
+                        let result = prompt.prompt(request, &task_session).await;
                         prompt.finish_prompt(&task_session).await;
                         respond(responder, result)
                     }
@@ -155,12 +164,14 @@ struct AcpProject {
 struct AcpSession {
     agent: AgentHandle,
     prompt: Mutex<AcpPromptState>,
+    projection: ProjectionHandle,
 }
 
 #[derive(Default)]
 struct AcpPromptState {
     active: bool,
     cancellation_requested: bool,
+    submission_id: Option<u64>,
 }
 
 impl AcpPromptState {
@@ -172,20 +183,30 @@ impl AcpPromptState {
         }
         self.active = true;
         self.cancellation_requested = false;
+        self.submission_id = None;
         Ok(())
     }
 
-    fn request_cancellation(&mut self) -> bool {
+    fn request_cancellation(&mut self) -> Option<u64> {
+        if !self.active {
+            return None;
+        }
+        self.cancellation_requested = true;
+        self.submission_id
+    }
+
+    fn submitted(&mut self, submission_id: u64) -> bool {
         if !self.active {
             return false;
         }
-        self.cancellation_requested = true;
-        true
+        self.submission_id = Some(submission_id);
+        self.cancellation_requested
     }
 
     fn finish(&mut self) {
         self.active = false;
         self.cancellation_requested = false;
+        self.submission_id = None;
     }
 }
 
@@ -204,7 +225,7 @@ impl AcpV1State {
         }
     }
 
-    fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+    fn initialize(&self, _request: InitializeRequest) -> InitializeResponse {
         let sessions = SessionCapabilities::new()
             .list(SessionListCapabilities::new())
             .resume(SessionResumeCapabilities::new())
@@ -214,7 +235,7 @@ impl AcpV1State {
             .prompt_capabilities(PromptCapabilities::new().image(true))
             .mcp_capabilities(McpCapabilities::new().http(true))
             .session_capabilities(sessions);
-        InitializeResponse::new(request.protocol_version)
+        InitializeResponse::new(ProtocolVersion::V1)
             .agent_capabilities(capabilities)
             .agent_info(Implementation::new("uri-agent", env!("CARGO_PKG_VERSION")))
     }
@@ -260,6 +281,7 @@ impl AcpV1State {
     async fn new_session(
         &self,
         request: NewSessionRequest,
+        connection: &ConnectionTo<AcpClient>,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         reject_additional_directories(&request.additional_directories)?;
         let project = self.project(&request.cwd).await.map_err(invalid_params)?;
@@ -287,7 +309,7 @@ impl AcpV1State {
             return Err(invalid_params(error));
         }
         let session_id = agent.session_id().to_string();
-        self.insert_session(agent).await?;
+        self.insert_session(agent, connection, false).await?;
         Ok(NewSessionResponse::new(session_id))
     }
 
@@ -298,35 +320,32 @@ impl AcpV1State {
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
         reject_additional_directories(&request.additional_directories)?;
         let session_id = request.session_id.to_string();
-        let agent = self
-            .open_existing(&request.cwd, &session_id, request.mcp_servers)
-            .await?;
-        let events = agent
-            .services()
-            .runtime
-            .session()
-            .snapshot()
-            .await
-            .map_err(internal_error)?;
-        let mut projector = EventProjector::replay(
-            session_id,
-            connection.clone(),
-            agent.services().context_window,
-        );
-        for event in events {
-            projector.persisted(&event).map_err(internal_error)?;
-        }
+        self.open_existing(
+            &request.cwd,
+            &session_id,
+            request.mcp_servers,
+            connection,
+            true,
+        )
+        .await?;
         Ok(LoadSessionResponse::new())
     }
 
     async fn resume_session(
         &self,
         request: ResumeSessionRequest,
+        connection: &ConnectionTo<AcpClient>,
     ) -> agent_client_protocol::Result<ResumeSessionResponse> {
         reject_additional_directories(&request.additional_directories)?;
         let session_id = request.session_id.to_string();
-        self.open_existing(&request.cwd, &session_id, request.mcp_servers)
-            .await?;
+        self.open_existing(
+            &request.cwd,
+            &session_id,
+            request.mcp_servers,
+            connection,
+            false,
+        )
+        .await?;
         Ok(ResumeSessionResponse::new())
     }
 
@@ -335,7 +354,9 @@ impl AcpV1State {
         cwd: &Path,
         session_id: &str,
         mcp_servers: Vec<McpServer>,
-    ) -> agent_client_protocol::Result<AgentHandle> {
+        connection: &ConnectionTo<AcpClient>,
+        replay: bool,
+    ) -> agent_client_protocol::Result<Arc<AcpSession>> {
         if self.sessions.lock().await.contains_key(session_id) {
             return Err(invalid_params("ACP session is already active"));
         }
@@ -372,15 +393,20 @@ impl AcpV1State {
         }
         let agent = project
             .host
-            .open_root_with_options(Some(session_id), spec, options)
+            .open_root_with_deferred_resume(Some(session_id), spec, options)
             .await
             .map_err(invalid_params)?;
         if let Err(error) = agent.services().runtime.prepare_context().await {
             agent.close().await;
             return Err(invalid_params(error));
         }
-        self.insert_session(agent.clone()).await?;
-        Ok(agent)
+        let session = self.insert_session(agent, connection, replay).await?;
+        if let Err(error) = session.agent.services().runtime.resume_pending().await {
+            self.sessions.lock().await.remove(session_id);
+            close_acp_session(&session, false).await;
+            return Err(invalid_params(error));
+        }
+        Ok(session)
     }
 
     async fn list_sessions(
@@ -421,62 +447,45 @@ impl AcpV1State {
             .await
             .remove(&session_id)
             .ok_or_else(|| invalid_params(format!("unknown active session {session_id}")))?;
-        session.agent.cancel().await;
-        session.agent.close().await;
+        close_acp_session(&session, true).await;
         Ok(CloseSessionResponse::new())
     }
 
     async fn prompt(
         &self,
         request: PromptRequest,
-        connection: &ConnectionTo<AcpClient>,
         session: &Arc<AcpSession>,
     ) -> agent_client_protocol::Result<PromptResponse> {
-        let session_id = request.session_id.to_string();
         let prompt = convert_prompt(request.prompt)?;
         let runtime = session.agent.services().runtime.clone();
-        let mut updates = runtime.session().subscribe();
         let mut completions = runtime.subscribe_turn_completions();
-        let events = runtime.session().snapshot().await.map_err(internal_error)?;
-        let mut projector = EventProjector::live(
-            session_id,
-            connection.clone(),
-            session.agent.services().context_window,
-            cumulative_cost(&events),
-        );
         let submission_id = session
             .agent
             .submit_prompt_exclusive(prompt)
             .await
             .map_err(prompt_error)?;
-        if session.prompt.lock().await.cancellation_requested {
-            session.agent.cancel().await;
+        if session.prompt.lock().await.submitted(submission_id) {
+            session.agent.cancel_submission(submission_id).await;
         }
 
         let completion = loop {
-            tokio::select! {
-                update = updates.recv() => match update {
-                    Ok(update) => projector.update(update).map_err(internal_error)?,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        return Err(internal_error("ACP session update stream lagged"));
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(internal_error("native session update stream closed"));
-                    }
-                },
-                completion = completions.recv() => match completion {
-                    Ok(completion) if completion.submission_id == submission_id => break completion,
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        return Err(internal_error("turn completion stream lagged"));
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(internal_error("turn completion stream closed"));
-                    }
-                },
+            match completions.recv().await {
+                Ok(completion) if completion.submission_id == submission_id => break completion,
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(internal_error("turn completion stream lagged"));
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(internal_error("turn completion stream closed"));
+                }
             }
         };
-        drain_updates(&mut updates, &mut projector)?;
+        let through_sequence = runtime.session().head_sequence().await;
+        session
+            .projection
+            .wait_through(through_sequence)
+            .await
+            .map_err(internal_error)?;
         match completion.outcome {
             TurnOutcome::Completed => Ok(PromptResponse::new(StopReason::EndTurn)),
             TurnOutcome::Cancelled => Ok(PromptResponse::new(StopReason::Cancelled)),
@@ -487,9 +496,9 @@ impl AcpV1State {
     async fn cancel(&self, notification: CancelNotification) {
         let session_id = notification.session_id.to_string();
         if let Some(session) = self.sessions.lock().await.get(&session_id).cloned()
-            && Self::request_prompt_cancellation(&session).await
+            && let Some(submission_id) = Self::request_prompt_cancellation(&session).await
         {
-            session.agent.cancel().await;
+            session.agent.cancel_submission(submission_id).await;
         }
     }
 
@@ -504,7 +513,7 @@ impl AcpV1State {
         Ok(session)
     }
 
-    async fn request_prompt_cancellation(session: &AcpSession) -> bool {
+    async fn request_prompt_cancellation(session: &AcpSession) -> Option<u64> {
         session.prompt.lock().await.request_cancellation()
     }
 
@@ -521,7 +530,12 @@ impl AcpV1State {
             .ok_or_else(|| invalid_params(format!("unknown active session {session_id}")))
     }
 
-    async fn insert_session(&self, agent: AgentHandle) -> agent_client_protocol::Result<()> {
+    async fn insert_session(
+        &self,
+        agent: AgentHandle,
+        connection: &ConnectionTo<AcpClient>,
+        replay: bool,
+    ) -> agent_client_protocol::Result<Arc<AcpSession>> {
         let session_id = agent.session_id().to_string();
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(&session_id) {
@@ -529,14 +543,21 @@ impl AcpV1State {
                 "ACP session {session_id} is already active"
             )));
         }
-        sessions.insert(
-            session_id,
-            Arc::new(AcpSession {
-                agent,
-                prompt: Mutex::new(AcpPromptState::default()),
-            }),
-        );
-        Ok(())
+        let projection = match ProjectionHandle::start(&agent, connection.clone(), replay).await {
+            Ok(projection) => projection,
+            Err(error) => {
+                drop(sessions);
+                agent.close().await;
+                return Err(internal_error(error));
+            }
+        };
+        let session = Arc::new(AcpSession {
+            agent,
+            prompt: Mutex::new(AcpPromptState::default()),
+            projection,
+        });
+        sessions.insert(session_id, session.clone());
+        Ok(session)
     }
 
     async fn shutdown(&self) {
@@ -548,7 +569,7 @@ impl AcpV1State {
             .map(|(_, session)| session)
             .collect::<Vec<_>>();
         for session in sessions {
-            session.agent.close().await;
+            close_acp_session(&session, false).await;
         }
     }
 }
@@ -596,12 +617,11 @@ fn mcp_profile(servers: Vec<McpServer>) -> agent_client_protocol::Result<Session
                 )
             }
             McpServer::Http(server) => {
-                let headers = unique_pairs(
+                let headers = unique_http_headers(
                     server
                         .headers
                         .into_iter()
                         .map(|header| (header.name, header.value)),
-                    "MCP HTTP header",
                 )?;
                 (
                     server.name,
@@ -636,6 +656,23 @@ fn unique_pairs(
     for (name, value) in pairs {
         if mapped.insert(name.clone(), value).is_some() {
             return Err(invalid_params(format!("{label} {name:?} is duplicated")));
+        }
+    }
+    Ok(mapped)
+}
+
+fn unique_http_headers(
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> agent_client_protocol::Result<BTreeMap<String, String>> {
+    let mut mapped = BTreeMap::new();
+    for (name, value) in pairs {
+        let header = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid_params(format!("invalid MCP HTTP header name {name:?}")))?;
+        let canonical = header.as_str().to_string();
+        if mapped.insert(canonical, value).is_some() {
+            return Err(invalid_params(format!(
+                "MCP HTTP header {name:?} is duplicated"
+            )));
         }
     }
     Ok(mapped)
@@ -697,20 +734,144 @@ fn cumulative_cost(events: &[SessionEvent]) -> f64 {
         .sum()
 }
 
-fn drain_updates(
-    updates: &mut broadcast::Receiver<NativeSessionUpdate>,
-    projector: &mut EventProjector,
-) -> agent_client_protocol::Result<()> {
-    loop {
-        match updates.try_recv() {
-            Ok(update) => projector.update(update).map_err(internal_error)?,
-            Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
-            Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                return Err(internal_error("ACP session update stream lagged"));
+#[derive(Clone, Debug)]
+enum ProjectionProgress {
+    Through(Option<u64>),
+    Failed(String),
+}
+
+struct ProjectionHandle {
+    cancel: CancellationToken,
+    progress: watch::Receiver<ProjectionProgress>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ProjectionHandle {
+    async fn start(
+        agent: &AgentHandle,
+        connection: ConnectionTo<AcpClient>,
+        replay: bool,
+    ) -> Result<Self> {
+        let native_session = agent.services().runtime.session().clone();
+        let mut updates = native_session.subscribe();
+        let events = native_session.snapshot().await?;
+        let through = events.last().map(|event| event.sequence);
+        let mut projector = if replay {
+            let mut projector = EventProjector::replay(
+                agent.session_id().to_string(),
+                connection,
+                agent.services().context_window,
+            );
+            for event in &events {
+                projector.persisted(event)?;
             }
+            projector.finish_replay();
+            projector
+        } else {
+            EventProjector::live(
+                agent.session_id().to_string(),
+                connection,
+                agent.services().context_window,
+                cumulative_cost(&events),
+                through,
+            )
+        };
+        let (progress_tx, progress) = watch::channel(ProjectionProgress::Through(through));
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let update = tokio::select! {
+                    _ = task_cancel.cancelled() => return,
+                    update = updates.recv() => update,
+                };
+                match update {
+                    Ok(update) => {
+                        let persisted = matches!(update, NativeSessionUpdate::Persisted(_));
+                        if let Err(error) = projector.update(update) {
+                            progress_tx.send_replace(ProjectionProgress::Failed(format!(
+                                "cannot project ACP session update: {error:#}"
+                            )));
+                            return;
+                        }
+                        if persisted {
+                            progress_tx.send_replace(ProjectionProgress::Through(
+                                projector.through_sequence,
+                            ));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let events = match native_session.snapshot().await {
+                            Ok(events) => events,
+                            Err(error) => {
+                                progress_tx.send_replace(ProjectionProgress::Failed(format!(
+                                    "cannot recover lagged ACP session updates: {error:#}"
+                                )));
+                                return;
+                            }
+                        };
+                        for event in &events {
+                            if let Err(error) = projector.persisted(event) {
+                                progress_tx.send_replace(ProjectionProgress::Failed(format!(
+                                    "cannot recover lagged ACP session updates: {error:#}"
+                                )));
+                                return;
+                            }
+                        }
+                        progress_tx
+                            .send_replace(ProjectionProgress::Through(projector.through_sequence));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Self {
+            cancel,
+            progress,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    async fn wait_through(&self, target: Option<u64>) -> Result<()> {
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let mut progress = self.progress.clone();
+        loop {
+            match progress.borrow().clone() {
+                ProjectionProgress::Through(Some(through)) if through >= target => return Ok(()),
+                ProjectionProgress::Through(_) => {}
+                ProjectionProgress::Failed(error) => bail!(error),
+            }
+            progress
+                .changed()
+                .await
+                .context("ACP session projection stopped before the turn settled")?;
         }
     }
+
+    async fn stop(&self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+async fn close_acp_session(session: &AcpSession, cancel: bool) {
+    if cancel {
+        session.agent.cancel().await;
+    }
+    session.agent.close().await;
+    let through = session
+        .agent
+        .services()
+        .runtime
+        .session()
+        .head_sequence()
+        .await;
+    let _ = session.projection.wait_through(through).await;
+    session.projection.stop().await;
 }
 
 enum ProjectionMode {
@@ -724,6 +885,7 @@ struct EventProjector {
     mode: ProjectionMode,
     context_window: u64,
     cost: f64,
+    through_sequence: Option<u64>,
 }
 
 impl EventProjector {
@@ -732,6 +894,7 @@ impl EventProjector {
         connection: ConnectionTo<AcpClient>,
         context_window: usize,
         cost: f64,
+        through_sequence: Option<u64>,
     ) -> Self {
         Self::new(
             session_id,
@@ -739,6 +902,7 @@ impl EventProjector {
             ProjectionMode::Live,
             context_window,
             cost,
+            through_sequence,
         )
     }
 
@@ -753,6 +917,7 @@ impl EventProjector {
             ProjectionMode::Replay,
             context_window,
             0.0,
+            None,
         )
     }
 
@@ -762,6 +927,7 @@ impl EventProjector {
         mode: ProjectionMode,
         context_window: usize,
         cost: f64,
+        through_sequence: Option<u64>,
     ) -> Self {
         Self {
             session_id,
@@ -769,7 +935,12 @@ impl EventProjector {
             mode,
             context_window: context_window as u64,
             cost,
+            through_sequence,
         }
+    }
+
+    fn finish_replay(&mut self) {
+        self.mode = ProjectionMode::Live;
     }
 
     fn update(&mut self, update: NativeSessionUpdate) -> Result<()> {
@@ -782,11 +953,20 @@ impl EventProjector {
     }
 
     fn persisted(&mut self, event: &SessionEvent) -> Result<()> {
-        match &event.kind {
+        if self
+            .through_sequence
+            .is_some_and(|through| event.sequence <= through)
+        {
+            return Ok(());
+        }
+        let projected = match &event.kind {
             EventKind::User { text } if matches!(self.mode, ProjectionMode::Replay) => {
                 self.send(SessionUpdate::UserMessageChunk(ContentChunk::new(
                     ContentBlock::Text(TextContent::new(text)),
                 )))
+            }
+            EventKind::ModelMessage { message } if matches!(self.mode, ProjectionMode::Replay) => {
+                self.user_images(message)
             }
             EventKind::AssistantText { text } => self.agent_text(text.clone()),
             EventKind::AssistantReasoning { text } => self.thought(text.clone()),
@@ -829,7 +1009,28 @@ impl EventProjector {
                 ))
             }
             _ => Ok(()),
+        };
+        if projected.is_ok() {
+            self.through_sequence = Some(event.sequence);
         }
+        projected
+    }
+
+    fn user_images(&self, message: &Message) -> Result<()> {
+        let Message::User { content } = message else {
+            return Ok(());
+        };
+        for content in content {
+            let UserContent::Image(image) = content else {
+                continue;
+            };
+            if let Some(image) = acp_image_content(image) {
+                self.send(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                    ContentBlock::Image(image),
+                )))?;
+            }
+        }
+        Ok(())
     }
 
     fn agent_text(&self, text: String) -> Result<()> {
@@ -849,6 +1050,33 @@ impl EventProjector {
             .send_notification(SessionNotification::new(self.session_id.clone(), update))
             .map_err(|error| anyhow!(error))
     }
+}
+
+fn acp_image_content(image: &rig::message::Image) -> Option<ImageContent> {
+    let data = match &image.data {
+        DocumentSourceKind::Base64(data) => data.clone(),
+        DocumentSourceKind::Raw(data) => BASE64.encode(data),
+        _ => return None,
+    };
+    let mime_type = match image.media_type.as_ref() {
+        Some(ImageMediaType::JPEG) => "image/jpeg",
+        Some(ImageMediaType::PNG) => "image/png",
+        Some(ImageMediaType::GIF) => "image/gif",
+        Some(ImageMediaType::WEBP) => "image/webp",
+        Some(ImageMediaType::HEIC) => "image/heic",
+        Some(ImageMediaType::HEIF) => "image/heif",
+        Some(ImageMediaType::SVG) => "image/svg+xml",
+        None => {
+            let bytes = BASE64.decode(&data).ok()?;
+            match ProtocolImageMediaType::detect(&bytes)? {
+                ProtocolImageMediaType::Jpeg => "image/jpeg",
+                ProtocolImageMediaType::Png => "image/png",
+                ProtocolImageMediaType::Gif => "image/gif",
+                ProtocolImageMediaType::Webp => "image/webp",
+            }
+        }
+    };
+    Some(ImageContent::new(data, mime_type))
 }
 
 fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
@@ -996,14 +1224,32 @@ mod tests {
     #[test]
     fn prompt_state_retains_early_cancellation_until_submission() {
         let mut prompt = AcpPromptState::default();
-        assert!(!prompt.request_cancellation());
+        assert_eq!(prompt.request_cancellation(), None);
         prompt.begin().unwrap();
         assert!(prompt.begin().is_err());
-        assert!(prompt.request_cancellation());
+        assert_eq!(prompt.request_cancellation(), None);
         assert!(prompt.cancellation_requested);
+        assert!(prompt.submitted(42));
+        assert_eq!(prompt.request_cancellation(), Some(42));
         prompt.finish();
         assert!(!prompt.active);
         assert!(!prompt.cancellation_requested);
+        assert_eq!(prompt.submission_id, None);
+    }
+
+    #[test]
+    fn initialize_falls_back_to_the_latest_supported_protocol_version() {
+        let cli = Cli::try_parse_from(["uri-agent", "--acpv1", "--offline"]).unwrap();
+        let request: InitializeRequest = serde_json::from_value(serde_json::json!({
+            "protocolVersion": 2,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "future-client", "version": "1"},
+        }))
+        .unwrap();
+
+        let response = AcpV1State::new(cli).initialize(request);
+
+        assert_eq!(response.protocol_version, ProtocolVersion::V1);
     }
 
     #[test]
@@ -1023,6 +1269,32 @@ mod tests {
             "inspect\n\n[Resource source](file:///tmp/source.rs)"
         );
         assert_eq!(prompt.images.len(), 1);
+    }
+
+    #[test]
+    fn persisted_user_images_map_back_to_acp_image_content() {
+        let encoded = BASE64.encode(b"\x89PNG\r\n\x1a\npersisted-image");
+        let UserContent::Image(image) =
+            UserContent::image_base64(encoded.clone(), Some(ImageMediaType::PNG), None)
+        else {
+            unreachable!();
+        };
+
+        let mapped = acp_image_content(&image).unwrap();
+
+        assert_eq!(mapped.data, encoded);
+        assert_eq!(mapped.mime_type, "image/png");
+    }
+
+    #[test]
+    fn http_header_mapping_rejects_case_insensitive_duplicates() {
+        let error = unique_http_headers([
+            ("Authorization".to_string(), "first".to_string()),
+            ("authorization".to_string(), "second".to_string()),
+        ])
+        .unwrap_err();
+
+        assert!(format!("{error:?}").contains("duplicated"));
     }
 
     #[test]
