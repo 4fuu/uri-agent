@@ -406,32 +406,38 @@ The shared `tasks` protocol covers work from every protocol:
 ```text
 read("tasks://summary", "")
 read("tasks://<id>", "")
+read("tasks://<id>?wait=30", "")
 exec("tasks://<id>/cancel", "")
 ```
 
 Task acceptance is not success. A model-facing task record exposes `pending`,
 `running`, `completed`, `failed`, or `cancelled` state, its originating
 protocol, label, bounded latest output while active, and complete terminal
-output. Internal timestamps and duration do not enter the model result. Task
-IDs increase within their session as lowercase hexadecimal values: they start
-at `001`, remain at least three digits wide, expand after `fff`, and continue
-after the highest restored ID. Completed, failed, and cancelled reports remain
-available when their session is resumed, including after an application
-restart. A task process itself never resumes; work interrupted by process exit
-is restored as cancelled. At most 16 background tasks may be pending or
-running at once; an explicit background request fails at capacity, while
-automatic conversion keeps waiting in the foreground.
+output. A read without `wait` returns immediately. `wait` accepts an integer
+from 1 through 300 seconds. If the task finishes during the wait, the read
+returns its complete terminal output. If the wait expires, it returns current
+status and bounded latest output while the task keeps running. Internal
+timestamps and duration do not enter the model result. Task IDs increase within
+their session as lowercase hexadecimal values: they start at `001`, remain at
+least three digits wide, expand after `fff`, and continue after the highest
+restored ID. Completed, failed, and cancelled reports remain available when
+their session is resumed, including after an application restart. A task
+process itself never resumes; work interrupted by process exit is restored as
+cancelled. At most 16 background tasks may be pending or running at once; an
+explicit background request fails at capacity, while automatic conversion
+keeps waiting in the foreground.
 
 When a background task reaches `completed`, `failed`, or `cancelled`, URI Agent
 sends the model an automatic hidden plain-text notification containing the
 `tasks://` URI, status, and at most the latest 20 lines and 4,000 characters of
 output. A complete-record read instruction appears only when that output was
 truncated. The notification continues the active turn at its next model
-boundary or starts a model turn when idle, so the model must not poll. Task
-output is identified as untrusted data. Reading an individual terminal task or
-a summary that already presents it suppresses the duplicate notification.
-Notifications are delivered in batches of at most 10 and approximately 16,000
-output characters.
+boundary or starts a model turn when idle. When the result is needed before
+continuing, the model may use one bounded wait instead of repeatedly polling.
+Task output is identified as untrusted data. Reading an individual terminal
+task or a summary that already presents it suppresses the duplicate
+notification. Notifications are delivered in batches of at most 10 and
+approximately 16,000 output characters.
 
 Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree and reap the root process before the task reaches its terminal state, rather than only dropping the Rust future that waits for it.
 

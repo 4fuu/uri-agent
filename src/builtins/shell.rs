@@ -850,6 +850,7 @@ fn supports_pwsh_7(executable: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::tasks::TasksProtocol;
     use crate::config::AgentEnvironment;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use std::sync::Arc;
@@ -1135,6 +1136,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pwsh_background_task_preserves_complete_large_utf8_output() {
+        let Some(executable) = find_executable("pwsh") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut shell = ShellProtocol::new("pwsh", executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
+        let context = ProtocolContext {
+            tasks: TaskManager::new(),
+        };
+        let line_count = 10_000;
+        let script =
+            format!("1..{line_count} | ForEach-Object {{ Write-Output \"line-$($_):中文-✓\" }}");
+
+        shell
+            .exec(
+                ProtocolRequest {
+                    uri: "pwsh://run?background=true",
+                    target: "run?background=true",
+                    body: &script,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let record = context
+            .tasks
+            .wait("001", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Completed);
+        let detail = TasksProtocol
+            .read(
+                ProtocolRequest {
+                    uri: "tasks://001",
+                    target: "001",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let detail = String::from_utf8(detail).unwrap();
+        let output = detail
+            .lines()
+            .filter(|line| line.starts_with("line-"))
+            .collect::<Vec<_>>();
+
+        assert!(detail.len() > 64 * 1024);
+        assert_eq!(output.len(), line_count);
+        assert_eq!(output.first(), Some(&"line-1:中文-✓"));
+        assert_eq!(output.last(), Some(&"line-10000:中文-✓"));
+        context.tasks.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn shell_returns_short_commands_and_backgrounds_long_or_explicit_commands() {
         let directory = tempfile::tempdir().unwrap();
         let (protocol, executable, short, delayed, explicit) = if cfg!(windows) {
@@ -1201,7 +1260,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(150));
         let accepted = String::from_utf8(accepted).unwrap();
         assert!(accepted.contains("Background task accepted: tasks://002"));
-        assert!(accepted.contains("current status or output is explicitly needed"));
+        assert!(accepted.contains("use its bounded wait; do not repeatedly poll"));
 
         let background_uri = format!("{protocol}://run?background=true");
         let started = Instant::now();

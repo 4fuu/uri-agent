@@ -63,7 +63,7 @@ fn write_entries(prompt: &mut String, entries: &[PromptEntry]) {
 
 pub fn task_accepted(id: &str) -> String {
     format!(
-        "Background task accepted: tasks://{id}\nCompletion will be delivered automatically. Read that URI only when current status or output is explicitly needed."
+        "Background task accepted: tasks://{id}\nCompletion will be delivered automatically. If the result is needed before continuing, read tasks://help and use its bounded wait; do not repeatedly poll."
     )
 }
 
@@ -136,10 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn task_acceptance_returns_the_unified_uri_without_inviting_polling() {
+    fn task_acceptance_points_to_bounded_wait_without_inviting_polling() {
         assert_eq!(
             task_accepted("001"),
-            "Background task accepted: tasks://001\nCompletion will be delivered automatically. Read that URI only when current status or output is explicitly needed."
+            "Background task accepted: tasks://001\nCompletion will be delivered automatically. If the result is needed before continuing, read tasks://help and use its bounded wait; do not repeatedly poll."
         );
     }
 }
