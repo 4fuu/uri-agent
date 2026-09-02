@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod agent;
+mod atomic_file;
 pub mod builtins;
 pub mod catalog;
 pub mod clipboard;

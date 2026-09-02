@@ -264,6 +264,15 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 
 Sessions live in this configuration directory on macOS after the Application Support cutover. On other platforms, sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Session storage and project boundaries](sessions.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
 
+Atomic updates to `settings.json`, project settings, `auth.json`,
+`environment.json`, and user or project `mcp.json` preserve symbolic links at
+those paths. URI Agent resolves complete and dangling multi-hop chains, writes a
+temporary file beside the final target, and leaves the links intact. Auth and
+MCP transaction locks are also based on the final target so different links to
+the same file coordinate. Cyclic chains, chains longer than 40 links, and a
+target that tries to traverse `..` after a missing component are rejected
+without replacing the original link.
+
 The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings field. See [WASM plugins](plugins.md) for loading, installation, and reload behavior.
 
 ## Agent environment
@@ -550,6 +559,33 @@ Add a provider to `models.json` for a local or custom OpenAI-compatible endpoint
 ```
 
 Provider entries may also define headers, compatibility values, authentication-header behavior, or model overrides. Local definitions are merged with downloaded catalog records. After editing `models.json`, refresh or reload Settings before selecting the new model.
+
+`openai-responses` sends `max_output_tokens` by default. For a compatible
+gateway that rejects that field, disable it through provider or model
+compatibility metadata:
+
+```json
+{
+  "providers": {
+    "responses-proxy": {
+      "baseUrl": "https://gateway.example/v1",
+      "api": "openai-responses",
+      "apiKey": "${RESPONSES_PROXY_API_KEY}",
+      "compat": {
+        "supportsMaxOutputTokens": false
+      },
+      "models": [
+        {
+          "id": "gateway-model",
+          "name": "Gateway Model",
+          "contextWindow": 131072,
+          "maxTokens": 16384
+        }
+      ]
+    }
+  }
+}
+```
 
 Only models whose final `api` belongs to a supported API family are runnable.
 

@@ -1155,6 +1155,26 @@ fn responses_uses_catalog_thinking_map_and_sampling_params() {
 }
 
 #[test]
+fn responses_compat_can_omit_max_output_tokens() {
+    let default_body = transformed(
+        catalog_model("openai-responses", json!({})),
+        ThinkingLevel::Off,
+        json!({"max_output_tokens": 4096}),
+    );
+    assert_eq!(default_body["max_output_tokens"], 4096);
+
+    let compatible_body = transformed(
+        catalog_model(
+            "openai-responses",
+            json!({"compat": {"supportsMaxOutputTokens": false}}),
+        ),
+        ThinkingLevel::Off,
+        json!({"max_output_tokens": 4096}),
+    );
+    assert!(compatible_body.get("max_output_tokens").is_none());
+}
+
+#[test]
 fn completions_compat_renames_output_cap_and_controls_reasoning() {
     let model = catalog_model(
         "openai-completions",

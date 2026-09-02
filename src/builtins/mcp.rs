@@ -1,4 +1,5 @@
 use super::atomic_write;
+use crate::atomic_file::resolve_write_path;
 use crate::config::{display_path, validate_environment_name};
 use crate::output::OutputStore;
 use crate::plugin::{
@@ -350,22 +351,22 @@ impl McpConfigStore {
     }
 
     async fn write(&self, scope: McpScope, name: &str, value: Value) -> Result<()> {
-        let path = self.path(scope);
+        let path = resolve_mcp_write_path(self.path(scope)).await?;
         let _update = self.updates.lock().await;
-        let _file = lock_config_files([path]).await?;
-        let mut document = read_document(path).await?;
-        servers_object_mut(&mut document, path)?.insert(name.to_string(), value);
-        write_document(path, &document).await
+        let _file = lock_config_files([path.as_path()]).await?;
+        let mut document = read_document(&path).await?;
+        servers_object_mut(&mut document, &path)?.insert(name.to_string(), value);
+        write_document(&path, &document).await
     }
 
     async fn remove(&self, scope: McpScope, name: &str) -> Result<Option<Value>> {
-        let path = self.path(scope);
+        let path = resolve_mcp_write_path(self.path(scope)).await?;
         let _update = self.updates.lock().await;
-        let _file = lock_config_files([path]).await?;
-        let mut document = read_document(path).await?;
-        let removed = servers_object_mut(&mut document, path)?.remove(name);
+        let _file = lock_config_files([path.as_path()]).await?;
+        let mut document = read_document(&path).await?;
+        let removed = servers_object_mut(&mut document, &path)?.remove(name);
         if removed.is_some() {
-            write_document(path, &document).await?;
+            write_document(&path, &document).await?;
         }
         Ok(removed)
     }
@@ -380,27 +381,27 @@ impl McpConfigStore {
         if from == to {
             return self.write(to, name, value).await;
         }
-        let from_path = self.path(from);
-        let to_path = self.path(to);
+        let from_path = resolve_mcp_write_path(self.path(from)).await?;
+        let to_path = resolve_mcp_write_path(self.path(to)).await?;
         let _update = self.updates.lock().await;
-        let _files = lock_config_files([from_path, to_path]).await?;
-        let mut from_document = read_document(from_path).await?;
-        let mut to_document = read_document(to_path).await?;
-        if servers_object_mut(&mut to_document, to_path)?.contains_key(name) {
+        let _files = lock_config_files([from_path.as_path(), to_path.as_path()]).await?;
+        let mut from_document = read_document(&from_path).await?;
+        let mut to_document = read_document(&to_path).await?;
+        if servers_object_mut(&mut to_document, &to_path)?.contains_key(name) {
             bail!("MCP server {name:?} already exists in {} scope", to.label());
         }
-        if !servers_object_mut(&mut from_document, from_path)?.contains_key(name) {
+        if !servers_object_mut(&mut from_document, &from_path)?.contains_key(name) {
             bail!(
                 "MCP server {name:?} no longer exists in {} scope",
                 from.label()
             );
         }
         let target_before = to_document.clone();
-        servers_object_mut(&mut to_document, to_path)?.insert(name.to_string(), value);
-        write_document(to_path, &to_document).await?;
-        servers_object_mut(&mut from_document, from_path)?.remove(name);
-        if let Err(error) = write_document(from_path, &from_document).await {
-            let rollback = write_document(to_path, &target_before).await;
+        servers_object_mut(&mut to_document, &to_path)?.insert(name.to_string(), value);
+        write_document(&to_path, &to_document).await?;
+        servers_object_mut(&mut from_document, &from_path)?.remove(name);
+        if let Err(error) = write_document(&from_path, &from_document).await {
+            let rollback = write_document(&to_path, &target_before).await;
             return match rollback {
                 Ok(()) => Err(error).context("could not remove the MCP server from its old scope"),
                 Err(rollback) => Err(error).context(format!(
@@ -410,6 +411,12 @@ impl McpConfigStore {
         }
         Ok(())
     }
+}
+
+async fn resolve_mcp_write_path(path: &Path) -> Result<PathBuf> {
+    resolve_write_path(path)
+        .await
+        .with_context(|| format!("cannot resolve MCP configuration {}", display_path(path)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4478,6 +4485,39 @@ mod tests {
         assert_eq!(
             servers.keys().cloned().collect::<Vec<_>>(),
             ["first", "second"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_updates_preserve_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let global = root.path().join("global");
+        let managed = root.path().join("managed");
+        std::fs::create_dir_all(project.join(".agents")).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        let logical = global.join(GLOBAL_CONFIG);
+        let target = managed.join(GLOBAL_CONFIG);
+        symlink("../managed/mcp.json", &logical).unwrap();
+        let store = McpConfigStore::new(&project, &global);
+
+        store
+            .write(
+                McpScope::User,
+                "linked",
+                json!({"description": "Linked server"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(std::fs::symlink_metadata(&logical).unwrap().is_symlink());
+        assert_eq!(
+            read_document(&target).await.unwrap()["servers"]["linked"]["description"],
+            "Linked server"
         );
     }
 

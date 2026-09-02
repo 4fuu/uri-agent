@@ -196,6 +196,11 @@ impl ModelRequestTransform {
     }
 
     fn openai_responses(&self, body: &mut Map<String, Value>) {
+        if self.model.api == "openai-responses"
+            && !self.compat_bool("supportsMaxOutputTokens", true)
+        {
+            body.remove("max_output_tokens");
+        }
         body.insert("store".to_string(), Value::Bool(false));
         if let Some(session_id) = &self.session_id {
             body.insert(

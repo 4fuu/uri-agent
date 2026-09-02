@@ -1,3 +1,4 @@
+use crate::atomic_file::resolve_write_path;
 use crate::catalog::{
     CatalogCredential, CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel,
     WorkBuddyCatalogCredential, api_key_environments, supports_live_discovery,
@@ -497,14 +498,17 @@ impl ConfigManager {
         let auth_path = directory.join("auth.json");
         let mut global: SettingsFile = read_json(&global_path).await?;
         let project = read_json(&project_path).await?;
-        let auth_lock = lock_auth_file(&directory).await?;
-        let auth = read_json(&auth_path).await?;
+        let auth_write_path = resolve_write_path(&auth_path)
+            .await
+            .with_context(|| format!("cannot resolve {}", display_path(&auth_path)))?;
+        let auth_lock = lock_auth_file(&auth_write_path).await?;
+        let auth = read_json(&auth_write_path).await?;
         if !global_path.exists() {
             global.output_limit = Some(DEFAULT_OUTPUT_LIMIT);
             write_json(&global_path, &global, false).await?;
         }
-        if !auth_path.exists() {
-            write_json(&auth_path, &auth, true).await?;
+        if !auth_write_path.exists() {
+            write_json(&auth_write_path, &auth, true).await?;
         }
         drop(auth_lock);
         let files = ConfigFiles {
@@ -660,7 +664,7 @@ impl ConfigManager {
             bail!("plugin setting value exceeds 1 MiB");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if self.project_path.exists() {
+        let (settings, path) = if path_entry_exists(&self.project_path) {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
@@ -861,7 +865,7 @@ impl ConfigManager {
             bail!("model {provider}/{model} is not runnable in the current catalog");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if self.project_path.exists() {
+        let (settings, path) = if path_entry_exists(&self.project_path) {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
@@ -887,7 +891,7 @@ impl ConfigManager {
             bail!("model {provider}/{model} does not support thinking effort {thinking}");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if self.project_path.exists() {
+        let (settings, path) = if path_entry_exists(&self.project_path) {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
@@ -975,7 +979,7 @@ impl ConfigManager {
             bail!("output limit must be at least 1024 bytes");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if self.project_path.exists() {
+        let (settings, path) = if path_entry_exists(&self.project_path) {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
@@ -995,7 +999,7 @@ impl ConfigManager {
             bail!("provider and model are required to save thinking effort");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if self.project_path.exists() {
+        let (settings, path) = if path_entry_exists(&self.project_path) {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
@@ -1013,7 +1017,7 @@ impl ConfigManager {
             (!value.is_empty()).then_some(value)
         });
         let mut files = self.files.lock().await;
-        let (settings, path) = if self.project_path.exists() {
+        let (settings, path) = if path_entry_exists(&self.project_path) {
             (&mut files.project, self.project_path.clone())
         } else {
             (&mut files.global, self.settings_path())
@@ -1172,8 +1176,11 @@ impl ConfigManager {
         }
 
         let _update = self.auth_update.lock().await;
-        let _file_lock = lock_auth_file(&self.directory).await?;
-        let mut auth: AuthFile = read_json(&self.auth_path()).await?;
+        let auth_path = resolve_write_path(&self.auth_path())
+            .await
+            .context("cannot resolve OAuth credential path")?;
+        let _file_lock = lock_auth_file(&auth_path).await?;
+        let mut auth: AuthFile = read_json(&auth_path).await?;
         let current = auth
             .0
             .get(provider)
@@ -1191,7 +1198,7 @@ impl ConfigManager {
         entry.refresh = Some(refreshed.refresh.clone());
         entry.expires = Some(refreshed.expires);
         entry.extra.clone_from(&refreshed.extra);
-        write_json(&self.auth_path(), &auth, true).await?;
+        write_json(&auth_path, &auth, true).await?;
         self.install_auth(auth).await?;
         Ok(refreshed)
     }
@@ -1251,10 +1258,13 @@ impl ConfigManager {
         update: impl FnOnce(&mut AuthFile) -> Result<()>,
     ) -> Result<ActiveSettings> {
         let _update = self.auth_update.lock().await;
-        let _file_lock = lock_auth_file(&self.directory).await?;
-        let mut auth = read_json(&self.auth_path()).await?;
+        let auth_path = resolve_write_path(&self.auth_path())
+            .await
+            .context("cannot resolve credential path")?;
+        let _file_lock = lock_auth_file(&auth_path).await?;
+        let mut auth = read_json(&auth_path).await?;
         update(&mut auth)?;
-        write_json(&self.auth_path(), &auth, true).await?;
+        write_json(&auth_path, &auth, true).await?;
         self.install_auth(auth).await
     }
 
@@ -2105,9 +2115,16 @@ fn remove_config_entry(path: &Path) -> Result<()> {
     .with_context(|| format!("cannot remove {}", display_path(path)))
 }
 
-async fn lock_auth_file(directory: &Path) -> Result<std::fs::File> {
+async fn lock_auth_file(auth_path: &Path) -> Result<std::fs::File> {
+    let directory = auth_path
+        .parent()
+        .ok_or_else(|| anyhow!("credential path has no parent: {}", display_path(auth_path)))?;
     fs::create_dir_all(directory).await?;
-    let path = directory.join("auth.json.lock");
+    let name = auth_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("auth.json");
+    let path = auth_path.with_file_name(format!("{name}.lock"));
     tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
@@ -2125,6 +2142,12 @@ async fn lock_auth_file(directory: &Path) -> Result<std::fs::File> {
     })
     .await
     .context("OAuth credential lock worker failed")?
+}
+
+fn path_entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|_| true)
+        .unwrap_or_else(|error| error.kind() != std::io::ErrorKind::NotFound)
 }
 
 async fn read_json<T>(path: &Path) -> Result<T>
@@ -2145,9 +2168,12 @@ where
 {
     #[cfg(not(unix))]
     let _ = private;
+    let path = resolve_write_path(path)
+        .await
+        .with_context(|| format!("cannot resolve configuration path {}", display_path(path)))?;
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("configuration path has no parent: {}", display_path(path)))?;
+        .ok_or_else(|| anyhow!("configuration path has no parent: {}", display_path(&path)))?;
     fs::create_dir_all(parent).await?;
     let filename = path
         .file_name()
@@ -2172,16 +2198,16 @@ where
 
     #[cfg(windows)]
     if path.exists() {
-        fs::remove_file(path).await?;
+        fs::remove_file(&path).await?;
     }
-    if let Err(error) = fs::rename(&temporary, path).await {
+    if let Err(error) = fs::rename(&temporary, &path).await {
         let _ = fs::remove_file(&temporary).await;
-        return Err(error).with_context(|| format!("cannot replace {}", display_path(path)));
+        return Err(error).with_context(|| format!("cannot replace {}", display_path(&path)));
     }
     #[cfg(unix)]
     if private {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     }
     Ok(())
 }
@@ -2216,6 +2242,122 @@ mod tests {
             }
             assert!(Cli::try_parse_from(arguments).is_err(), "{conflicting}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_writes_preserve_existing_and_dangling_symlink_chains() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+
+        let existing_target = managed.join("settings.json");
+        std::fs::write(&existing_target, "{}\n").unwrap();
+        let existing_middle = root.path().join("settings-link");
+        let existing_head = root.path().join("settings.json");
+        symlink("managed/settings.json", &existing_middle).unwrap();
+        symlink("settings-link", &existing_head).unwrap();
+
+        write_json(
+            &existing_head,
+            &serde_json::json!({"outputLimit": 4096}),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&existing_head)
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&existing_middle)
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&existing_target).unwrap()).unwrap(),
+            serde_json::json!({"outputLimit": 4096})
+        );
+
+        let dangling_target = managed.join("auth.json");
+        let dangling_middle = root.path().join("auth-link");
+        let dangling_head = root.path().join("auth.json");
+        symlink("managed/auth.json", &dangling_middle).unwrap();
+        symlink("auth-link", &dangling_head).unwrap();
+
+        write_json(
+            &dangling_head,
+            &serde_json::json!({"provider": "secret"}),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&dangling_head)
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&dangling_middle)
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&dangling_target).unwrap()).unwrap(),
+            serde_json::json!({"provider": "secret"})
+        );
+        assert_eq!(
+            std::fs::metadata(dangling_target).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert!(path_entry_exists(&dangling_head));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_config_updates_follow_links_and_lock_the_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        let managed = root.path().join("managed");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(project.join(".uri-agent")).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        let auth_link = directory.join("auth.json");
+        let project_link = project.join(".uri-agent/settings.json");
+        symlink("../managed/auth.json", &auth_link).unwrap();
+        symlink("../../managed/project-settings.json", &project_link).unwrap();
+
+        let manager = ConfigManager::load_for_test(&directory, &project)
+            .await
+            .unwrap();
+        manager
+            .set_api_key("linked-provider", "linked-key".to_string())
+            .await
+            .unwrap();
+        manager.set_output_limit(4096).await.unwrap();
+
+        assert!(std::fs::symlink_metadata(&auth_link).unwrap().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&project_link)
+                .unwrap()
+                .is_symlink()
+        );
+        let auth: AuthFile = read_json(&managed.join("auth.json")).await.unwrap();
+        assert_eq!(auth.0["linked-provider"].key.as_deref(), Some("linked-key"));
+        let project_settings: SettingsFile = read_json(&managed.join("project-settings.json"))
+            .await
+            .unwrap();
+        assert_eq!(project_settings.output_limit, Some(4096));
+        assert!(managed.join("auth.json.lock").exists());
+        assert!(!directory.join("auth.json.lock").exists());
     }
 
     async fn read_http_request(socket: &mut TcpStream) -> String {
@@ -3049,6 +3191,51 @@ mod tests {
         let saved: AuthFile = read_json(&directory.join("auth.json")).await.unwrap();
         assert_eq!(saved.0["provider-one"].key.as_deref(), Some("first-key"));
         assert_eq!(saved.0["provider-two"].key.as_deref(), Some("second-key"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_managers_coordinate_distinct_links_to_one_auth_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let first_directory = root.path().join("first-config");
+        let second_directory = root.path().join("second-config");
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&first_directory).unwrap();
+        std::fs::create_dir(&second_directory).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        symlink("../shared/auth.json", first_directory.join("auth.json")).unwrap();
+        symlink("../shared/auth.json", second_directory.join("auth.json")).unwrap();
+        let first =
+            ConfigManager::load_for_test(&first_directory, &root.path().join("first-project"))
+                .await
+                .unwrap();
+        let second =
+            ConfigManager::load_for_test(&second_directory, &root.path().join("second-project"))
+                .await
+                .unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.set_api_key("provider-one", "first-key".to_string()),
+            second.set_api_key("provider-two", "second-key".to_string()),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let saved: AuthFile = read_json(&shared.join("auth.json")).await.unwrap();
+        assert_eq!(saved.0["provider-one"].key.as_deref(), Some("first-key"));
+        assert_eq!(saved.0["provider-two"].key.as_deref(), Some("second-key"));
+        assert!(
+            std::fs::symlink_metadata(first_directory.join("auth.json"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(second_directory.join("auth.json"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ startup discovery must not reinterpret historical sessions.
 | `src/acp/` | Stable ACP v1 transport, schema mapping, session ownership, and native-event projection |
 | `src/catalog.rs`, `src/catalog/` | pi.dev, built-in, and provider cloud model catalogs, including WorkBuddy cloud discovery, credential-scoped cache, `models.json` overlays, model limits, and pricing |
 | `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
+| `src/atomic_file.rs` | Symlink-preserving target resolution shared by atomic configuration writes and their transaction locks |
 | `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, dedicated Cloudflare AI Gateway and WorkBuddy boundaries, Codex WebSocket and experimental Antigravity transports, and multimodal support |
 | `src/oauth/`, `src/oauth/providers/` | OAuth provider registration, browser and device flows, token refresh, and WorkBuddy session identity and authenticated headers |
 | `src/agent.rs` | Process-wide `AgentHost`, Agent specifications and handles, depth enforcement, child lifecycle, and background resident execution |
