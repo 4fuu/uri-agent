@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
@@ -22,6 +23,7 @@ use tokio_rusqlite::{
 use uuid::Uuid;
 
 const SESSION_DATABASE_FILE: &str = "sessions-v3.db";
+const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESUME_INDEX_VERSION: u32 = 3;
 const MAX_EVENT_PAGE: usize = 512;
 const RESUME_EVENT_KINDS: &[&str] = &[
@@ -2555,79 +2557,82 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
         fs::set_permissions(&database_path, std::fs::Permissions::from_mode(0o600)).await?;
     }
     connection
-        .call(|db| {
-            db.execute_batch(
-                "PRAGMA foreign_keys = ON;
-                 PRAGMA journal_mode = WAL;
-                 CREATE TABLE IF NOT EXISTS sessions (
-                   id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                   cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
-                   thinking TEXT NOT NULL,
-                   parent_session_id TEXT,
-                   depth INTEGER NOT NULL CHECK (depth BETWEEN 1 AND 2),
-                   head_sequence INTEGER NOT NULL,
-                   draft TEXT NOT NULL,
-                   FOREIGN KEY(parent_session_id) REFERENCES sessions(id)
-                 );
-                 CREATE TABLE IF NOT EXISTS events (
-                   session_id TEXT NOT NULL, sequence INTEGER NOT NULL, at TEXT NOT NULL,
-                   kind TEXT NOT NULL, payload_json TEXT NOT NULL,
-                   PRIMARY KEY(session_id, sequence),
-                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                 );
-                 CREATE INDEX IF NOT EXISTS events_session_kind_sequence
-                   ON events(session_id, kind, sequence);
-                 CREATE TABLE IF NOT EXISTS session_resume_index (
-                   session_id TEXT PRIMARY KEY,
-                   version INTEGER NOT NULL,
-                   through_sequence INTEGER NOT NULL,
-                   payload_json TEXT NOT NULL,
-                   checksum TEXT NOT NULL,
-                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS session_private_records (
-                   session_id TEXT NOT NULL,
-                   owner TEXT NOT NULL,
-                   payload_json TEXT NOT NULL,
-                   PRIMARY KEY(session_id, owner),
-                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                 );
-                 CREATE TABLE IF NOT EXISTS pending_inputs (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   session_id TEXT NOT NULL,
-                   kind TEXT NOT NULL CHECK (kind IN ('prompt', 'steer')),
-                   text TEXT NOT NULL,
-                   content_json TEXT NOT NULL,
-                   visible INTEGER NOT NULL,
-                   created_at TEXT NOT NULL,
-                   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                 );
-                 CREATE INDEX IF NOT EXISTS pending_inputs_session_id_id
-                   ON pending_inputs(session_id, id);
-                 CREATE TABLE IF NOT EXISTS pending_drafts (
-                   cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
-                 );",
-            )?;
-            let has_checksum = {
-                let mut statement = db.prepare("PRAGMA table_info(session_resume_index)")?;
-                statement
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?
-                    .iter()
-                    .any(|column| column == "checksum")
-            };
-            if !has_checksum {
-                db.execute(
-                    "ALTER TABLE session_resume_index
-                     ADD COLUMN checksum TEXT NOT NULL DEFAULT ''",
-                    [],
-                )?;
-            }
-            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-        })
+        .call(initialize_database)
         .await
         .context("cannot initialize session database")?;
     Ok((directory, connection))
+}
+
+fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::Result<()> {
+    db.busy_timeout(SESSION_DATABASE_BUSY_TIMEOUT)?;
+    db.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         CREATE TABLE IF NOT EXISTS sessions (
+           id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+           cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+           thinking TEXT NOT NULL,
+           parent_session_id TEXT,
+           depth INTEGER NOT NULL CHECK (depth BETWEEN 1 AND 2),
+           head_sequence INTEGER NOT NULL,
+           draft TEXT NOT NULL,
+           FOREIGN KEY(parent_session_id) REFERENCES sessions(id)
+         );
+         CREATE TABLE IF NOT EXISTS events (
+           session_id TEXT NOT NULL, sequence INTEGER NOT NULL, at TEXT NOT NULL,
+           kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+           PRIMARY KEY(session_id, sequence),
+           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS events_session_kind_sequence
+           ON events(session_id, kind, sequence);
+         CREATE TABLE IF NOT EXISTS session_resume_index (
+           session_id TEXT PRIMARY KEY,
+           version INTEGER NOT NULL,
+           through_sequence INTEGER NOT NULL,
+           payload_json TEXT NOT NULL,
+           checksum TEXT NOT NULL,
+           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS session_private_records (
+           session_id TEXT NOT NULL,
+           owner TEXT NOT NULL,
+           payload_json TEXT NOT NULL,
+           PRIMARY KEY(session_id, owner),
+           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS pending_inputs (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           session_id TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK (kind IN ('prompt', 'steer')),
+           text TEXT NOT NULL,
+           content_json TEXT NOT NULL,
+           visible INTEGER NOT NULL,
+           created_at TEXT NOT NULL,
+           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS pending_inputs_session_id_id
+           ON pending_inputs(session_id, id);
+         CREATE TABLE IF NOT EXISTS pending_drafts (
+           cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
+         );",
+    )?;
+    let has_checksum = {
+        let mut statement = db.prepare("PRAGMA table_info(session_resume_index)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "checksum")
+    };
+    if !has_checksum {
+        db.execute(
+            "ALTER TABLE session_resume_index
+             ADD COLUMN checksum TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn payload_kind(kind: &EventKind) -> &'static str {
@@ -4545,6 +4550,47 @@ mod tests {
             .await
             .unwrap();
         assert!(columns.iter().any(|column| column == "checksum"));
+    }
+
+    #[tokio::test]
+    async fn database_initialization_waits_for_a_concurrent_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first = Connection::open(&path).await.unwrap();
+        first
+            .call(|db| {
+                db.execute_batch("BEGIN EXCLUSIVE")?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let second = Connection::open(&path).await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let initializing = tokio::spawn(async move {
+            second
+                .call(move |db| {
+                    let _ = started_tx.send(());
+                    initialize_database(db)
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!initializing.is_finished());
+
+        first
+            .call(|db| {
+                db.execute_batch("COMMIT")?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), initializing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

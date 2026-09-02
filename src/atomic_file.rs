@@ -141,8 +141,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("settings.json");
         let second = root.path().join("managed-link");
-        let target = root.path().join("managed/settings.json");
-        std::fs::create_dir(root.path().join("managed")).unwrap();
+        let managed = root.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        let target = std::fs::canonicalize(managed)
+            .unwrap()
+            .join("settings.json");
         symlink("managed/settings.json", &second).unwrap();
         symlink("managed-link", &first).unwrap();
 
@@ -160,7 +163,9 @@ mod tests {
 
         assert_eq!(
             resolve_write_path(&config).await.unwrap(),
-            root.path().join("managed/settings.json")
+            std::fs::canonicalize(root.path().join("managed"))
+                .unwrap()
+                .join("settings.json")
         );
     }
 
