@@ -54,8 +54,8 @@ supported providers.
   credential-scoped live discovery bring a wide provider ecosystem into one
   model selector.
 - **Durable work:** long commands become managed tasks, while append-only
-  SQLite sessions preserve drafts, frozen startup context, and compaction
-  checkpoints across restarts.
+  SQLite sessions preserve drafts, frozen startup context, titled working
+  notes, and rollover or summary checkpoints across restarts.
 - **One terminal workflow:** Queue and Steer, built-in web access, keyboard and
   mouse controls, image input, and `@` file or `@@` session references share one
   conversation surface.
@@ -171,7 +171,7 @@ lifecycle operations, and ownership constraints.
 | Use the conversation, commands, keymap, terminal, or attachments | [Terminal interface](docs/interface.md) and [terminal features](docs/terminal.md) |
 | Understand tools, protocols, tasks, and complete output | [Protocols, tasks, and output](docs/protocols.md) |
 | Use project instructions or Skills | [Startup context and Skills](docs/context.md) |
-| Resume sessions or understand persistence and compaction | [Sessions and context](docs/sessions.md) |
+| Resume sessions or understand notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
 | Build or audit an extension | [WASM plugins](docs/plugins.md) |
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At

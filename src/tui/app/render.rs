@@ -967,9 +967,12 @@ pub(super) fn show_context_estimate(app: &App) -> bool {
 
 pub(super) fn context_status(app: &App, percent: f64) -> String {
     let compaction = if app.info.compaction_enabled {
-        "automatic compaction"
+        match app.info.context_strategy {
+            crate::compaction::Strategy::Rollover => "automatic rollover",
+            crate::compaction::Strategy::Summary => "automatic summary",
+        }
     } else {
-        "automatic compaction disabled"
+        "automatic context checkpoints disabled"
     };
     match app.info.context_accuracy {
         ContextAccuracy::Hybrid | ContextAccuracy::Estimated if show_context_estimate(app) => {

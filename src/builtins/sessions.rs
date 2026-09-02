@@ -8,6 +8,7 @@ use crate::session::{ArchivedSessionSummary, EventKind, SessionArchive, SessionE
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -643,6 +644,21 @@ async fn read_session(
 }
 
 fn visible_records(events: &[SessionEvent], include_tools: bool) -> Vec<HistoryRecord> {
+    let private_calls = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ToolCall {
+                call_id, arguments, ..
+            } if arguments
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|uri| uri.starts_with("context://")) =>
+            {
+                Some(call_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     events
         .iter()
         .filter_map(|event| {
@@ -651,19 +667,24 @@ fn visible_records(events: &[SessionEvent], include_tools: bool) -> Vec<HistoryR
                 EventKind::AssistantText { text } => ("assistant".to_string(), text.clone(), false),
                 EventKind::Error { text } => ("error".to_string(), text.clone(), true),
                 EventKind::ToolCall {
-                    name, arguments, ..
-                } if include_tools => (
+                    call_id,
+                    name,
+                    arguments,
+                } if include_tools && !private_calls.contains(call_id) => (
                     format!("tool_call:{name}"),
                     serde_json::to_string(arguments)
                         .unwrap_or_else(|_| "[unserializable arguments]".to_string()),
                     false,
                 ),
                 EventKind::ToolResult {
+                    call_id,
                     name,
                     output,
                     failed,
                     ..
-                } if include_tools => (format!("tool_result:{name}"), output.clone(), *failed),
+                } if include_tools && !private_calls.contains(call_id) => {
+                    (format!("tool_result:{name}"), output.clone(), *failed)
+                }
                 _ => return None,
             };
             let text = clean_text(&text);
@@ -843,6 +864,49 @@ mod tests {
             system_prompt: "system".to_string(),
             skills: Vec::<SkillSnapshot>::new(),
         }
+    }
+
+    #[test]
+    fn context_note_calls_are_private_even_when_tools_are_requested() {
+        let at = chrono::Utc::now();
+        let events = vec![
+            SessionEvent {
+                sequence: 1,
+                at,
+                kind: EventKind::ToolCall {
+                    call_id: "private".to_string(),
+                    name: "exec".to_string(),
+                    arguments: serde_json::json!({
+                        "uri": "context://notes/add?title=Secret",
+                        "body": "deleted note body"
+                    }),
+                },
+            },
+            SessionEvent {
+                sequence: 2,
+                at,
+                kind: EventKind::ToolResult {
+                    call_id: "private".to_string(),
+                    name: "exec".to_string(),
+                    output: "n001 · Secret".to_string(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+            },
+            SessionEvent {
+                sequence: 3,
+                at,
+                kind: EventKind::ToolCall {
+                    call_id: "public".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"uri": "file://README.md", "body": ""}),
+                },
+            },
+        ];
+        let records = visible_records(&events, true);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence, 3);
+        assert!(!records[0].text.contains("deleted note body"));
     }
 
     async fn fixture() -> (tempfile::TempDir, PathBuf, SessionArchive, SessionsPlugin) {

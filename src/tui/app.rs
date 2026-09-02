@@ -10,7 +10,7 @@ mod tests;
 
 use crate::catalog::{CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingLevel};
 use crate::clipboard;
-use crate::compaction::ContextAccuracy;
+use crate::compaction::{ContextAccuracy, Strategy};
 use crate::config::{
     ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, ModelRoleInfo, ValueSource,
     display_path, validate_environment_name, validate_model_role_name,
@@ -116,6 +116,7 @@ pub struct TuiInfo {
     pub context_tokens: usize,
     pub context_accuracy: ContextAccuracy,
     pub compaction_enabled: bool,
+    pub context_strategy: Strategy,
     pub diagnostics_path: PathBuf,
     pub terminal: Option<String>,
     pub key_display: KeyDisplayStyle,
@@ -1101,6 +1102,7 @@ impl App {
                     | EventKind::ModelMessage { .. }
                     | EventKind::ModelRetry { .. }
                     | EventKind::Compaction { .. }
+                    | EventKind::ContextRollover { .. }
                     | EventKind::Error { .. }
                     | EventKind::TurnFinished
             )
@@ -1134,7 +1136,10 @@ impl App {
         match event.kind {
             EventKind::SessionCreated { .. }
             | EventKind::SessionContext { .. }
-            | EventKind::Task { .. } => {}
+            | EventKind::Task { .. }
+            | EventKind::ContextReminder { .. }
+            | EventKind::ContextNote { .. }
+            | EventKind::ContextNoteDeleted { .. } => {}
             EventKind::AgentSpecUpdated { .. } => self.token_rate.clear_final(),
             EventKind::ModelMessage { message } => {
                 if matches!(message, rig::message::Message::Assistant { .. }) {
@@ -1334,6 +1339,32 @@ impl App {
                     BlockKind::Compaction,
                     "COMPACTION",
                     format!("Context before compaction: {tokens_before} tokens\n\n{summary}"),
+                    None,
+                    false,
+                    false,
+                );
+            }
+            EventKind::ContextRollover {
+                window_id,
+                tokens_before,
+                replacement_history: _,
+                manual,
+            } => {
+                self.token_rate.retry_response();
+                if manual {
+                    self.busy = false;
+                    self.activity = None;
+                    self.busy_since = None;
+                    self.set_flash("Fresh context window started; original events retained");
+                } else {
+                    self.activity = Some(Activity::Thinking);
+                }
+                self.push(
+                    BlockKind::Compaction,
+                    "CONTEXT ROLLOVER",
+                    format!(
+                        "Started context window {window_id}; previous context used {tokens_before} tokens. Notes and raw history remain available through context://."
+                    ),
                     None,
                     false,
                     false,

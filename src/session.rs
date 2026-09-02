@@ -22,7 +22,7 @@ use tokio_rusqlite::{
 use uuid::Uuid;
 
 const SESSION_DATABASE_FILE: &str = "sessions-v3.db";
-const RESUME_INDEX_VERSION: u32 = 2;
+const RESUME_INDEX_VERSION: u32 = 3;
 const MAX_EVENT_PAGE: usize = 512;
 const RESUME_EVENT_KINDS: &[&str] = &[
     "session_created",
@@ -38,6 +38,8 @@ const RESUME_EVENT_KINDS: &[&str] = &[
     "usage",
     "error",
     "compaction",
+    "context_rollover",
+    "context_reminder",
 ];
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -431,6 +433,30 @@ pub enum EventKind {
         replacement_history: Vec<Message>,
         manual: bool,
     },
+    ContextRollover {
+        window_id: u64,
+        tokens_before: usize,
+        replacement_history: Vec<Message>,
+        manual: bool,
+    },
+    ContextReminder {
+        window_id: u64,
+    },
+    ContextNote {
+        id: String,
+        revision: u64,
+        title: String,
+        content: String,
+        window_id: u64,
+        context_sequence: u64,
+    },
+    ContextNoteDeleted {
+        id: String,
+        revision: u64,
+        title: String,
+        window_id: u64,
+        context_sequence: u64,
+    },
     TurnFinished,
 }
 
@@ -453,6 +479,10 @@ struct ResumeState {
     session_protocols: Vec<SessionProtocolRecord>,
     #[serde(default)]
     latest_compaction_sequence: Option<u64>,
+    #[serde(default)]
+    latest_rollover_window_id: Option<u64>,
+    #[serde(default)]
+    reminded_context_window_id: Option<u64>,
     spec: Option<AgentSpec>,
     has_user: bool,
     successful_help_reads: HashSet<String>,
@@ -569,10 +599,10 @@ fn restore_persisted_state(
         return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
     }
 
-    let latest_compaction = db
+    let latest_checkpoint = db
         .query_row(
             "SELECT sequence, at, payload_json FROM events
-             WHERE session_id = ?1 AND kind = 'compaction'
+             WHERE session_id = ?1 AND kind IN ('compaction', 'context_rollover')
              ORDER BY sequence DESC LIMIT 1",
             [id],
             stored_event_from_row,
@@ -607,9 +637,9 @@ fn restore_persisted_state(
             if state.through_sequence != Some(through) {
                 return None;
             }
-            let is_compaction = db
+            let is_checkpoint = db
                 .query_row(
-                    "SELECT kind = 'compaction' FROM events
+                    "SELECT kind IN ('compaction', 'context_rollover') FROM events
                      WHERE session_id = ?1 AND sequence = ?2",
                     params![id, through as i64],
                     |row| row.get::<_, bool>(0),
@@ -618,30 +648,30 @@ fn restore_persisted_state(
                 .ok()
                 .flatten()
                 .unwrap_or(false);
-            if is_compaction {
+            if is_checkpoint {
                 state.latest_compaction_sequence = Some(through);
             }
-            is_compaction.then_some((through, std::mem::take(&mut state)))
+            is_checkpoint.then_some((through, std::mem::take(&mut state)))
         });
 
     let (mut derived, cursor) = if let Some((through, state)) = checkpoint {
         (state, Some(through))
-    } else if let Some(compaction) = &latest_compaction {
+    } else if let Some(checkpoint) = &latest_checkpoint {
         let mut state = ResumeState::default();
         for event in query_events(
             db,
             id,
             None,
-            Some(compaction.sequence),
+            Some(checkpoint.sequence),
             Some(RESUME_EVENT_KINDS),
         )? {
             apply_resume_event(&mut state, &event);
         }
         state.context_sequence = context_sequence;
         if let Ok(payload) = serde_json::to_string(&state) {
-            let _ = persist_rebuilt_resume_index(db, id, compaction.sequence, &payload);
+            let _ = persist_rebuilt_resume_index(db, id, checkpoint.sequence, &payload);
         }
-        (state, Some(compaction.sequence))
+        (state, Some(checkpoint.sequence))
     } else {
         (ResumeState::default(), None)
     };
@@ -657,9 +687,9 @@ fn restore_persisted_state(
     derived.through_sequence = Some(authoritative_head);
 
     let mut replay = ReplayState::default();
-    let replay_cursor = latest_compaction.as_ref().map(|event| event.sequence);
-    if let Some(compaction) = latest_compaction {
-        apply_replay_event(&mut replay, &compaction.kind);
+    let replay_cursor = latest_checkpoint.as_ref().map(|event| event.sequence);
+    if let Some(checkpoint) = latest_checkpoint {
+        apply_replay_event(&mut replay, &checkpoint.kind);
     }
     for event in query_events(
         db,
@@ -1792,6 +1822,19 @@ impl Session {
             .clone()
     }
 
+    pub(crate) async fn context_window_id(&self) -> u64 {
+        self.state
+            .lock()
+            .await
+            .derived
+            .latest_rollover_window_id
+            .unwrap_or(1)
+    }
+
+    pub(crate) async fn context_window_was_reminded(&self, window_id: u64) -> bool {
+        self.state.lock().await.derived.reminded_context_window_id == Some(window_id)
+    }
+
     pub async fn events_after(&self, sequence: u64, limit: usize) -> Result<Vec<SessionEvent>> {
         if sequence > i64::MAX as u64 {
             return Ok(Vec::new());
@@ -1962,6 +2005,22 @@ impl Session {
             .into_iter()
             .next_back()
             .ok_or_else(|| anyhow!("compaction append produced no event"))
+    }
+
+    pub(crate) async fn append_context_rollover(
+        &self,
+        window_id: u64,
+        tokens_before: usize,
+        replacement_history: Vec<Message>,
+        manual: bool,
+    ) -> Result<SessionEvent> {
+        self.append(EventKind::ContextRollover {
+            window_id,
+            tokens_before,
+            replacement_history,
+            manual,
+        })
+        .await
     }
 
     pub async fn update_new_model_settings(
@@ -2589,6 +2648,10 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::Usage { .. } => "usage",
         EventKind::Error { .. } => "error",
         EventKind::Compaction { .. } => "compaction",
+        EventKind::ContextRollover { .. } => "context_rollover",
+        EventKind::ContextReminder { .. } => "context_reminder",
+        EventKind::ContextNote { .. } => "context_note",
+        EventKind::ContextNoteDeleted { .. } => "context_note_deleted",
         EventKind::TurnFinished => "turn_finished",
     }
 }
@@ -2615,7 +2678,10 @@ fn apply_committed_events(
         }
         state.head_sequence = Some(event.sequence);
         state.events.push(event.clone());
-        if matches!(event.kind, EventKind::Compaction { .. }) {
+        if matches!(
+            event.kind,
+            EventKind::Compaction { .. } | EventKind::ContextRollover { .. }
+        ) {
             checkpoint = serde_json::to_string(&state.derived)
                 .ok()
                 .map(|payload| (event.sequence, payload));
@@ -2639,6 +2705,16 @@ fn apply_replay_event(replay: &mut ReplayState, kind: &EventKind) {
             replay.pending_usage = None;
             replay.after_compaction = true;
             replay.latest_compaction_summary = Some(summary.clone());
+        }
+        EventKind::ContextRollover {
+            replacement_history,
+            ..
+        } => {
+            replay.history.clone_from(replacement_history);
+            replay.usage_before_assistant = vec![None; replacement_history.len()];
+            replay.pending_usage = None;
+            replay.after_compaction = false;
+            replay.latest_compaction_summary = None;
         }
         EventKind::Usage {
             total,
@@ -2793,6 +2869,19 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.token_calibration.pending_visible_units = 0;
             state.token_calibration.pending_reasoning_visible = false;
             state.token_calibration.pending_usage = None;
+        }
+        EventKind::ContextRollover { window_id, .. } => {
+            state.latest_compaction_sequence = Some(event.sequence);
+            state.latest_rollover_window_id = Some(*window_id);
+            state.reminded_context_window_id = None;
+            state.successful_help_reads.clear();
+            state.pending_help_reads.clear();
+            state.token_calibration.pending_visible_units = 0;
+            state.token_calibration.pending_reasoning_visible = false;
+            state.token_calibration.pending_usage = None;
+        }
+        EventKind::ContextReminder { window_id } => {
+            state.reminded_context_window_id = Some(*window_id);
         }
         EventKind::ModelRetry { .. } | EventKind::Error { .. } => {
             state.token_calibration.pending_visible_units = 0;

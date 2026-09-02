@@ -72,6 +72,6 @@ Linked plugins may also contribute session-scoped protocol records. The built-in
 MCP plugin records only each enabled server's stable configuration identity and
 the protocol name and description placed in the generated prompt; it does not
 snapshot commands, URLs, headers, environment values, or server metadata.
-Resume and compaction retain those exact records and the already generated
+Resume and context checkpoints retain those exact records and the already generated
 prompt. Calls resolve mutable MCP configuration when used, so a new server does
 not join an existing session and a removed recorded server fails directly.

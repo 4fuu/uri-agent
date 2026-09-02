@@ -370,9 +370,10 @@ Agent Environment references.
 | `pluginSettings` | Plugin-owned JSON key/value settings grouped by namespace | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
 | `keyDisplay` | Key-hint style: `auto`, `macos`, or `text` | `auto` |
-| `compaction.enabled` | Run threshold and overflow compaction automatically | `true` |
-| `compaction.reserveTokens` | Context held back by the automatic-compaction threshold | `16384` |
-| `compaction.keepRecentTokens` | Approximate recent replay retained after compaction | `20000` |
+| `compaction.enabled` | Run threshold and overflow checkpoints automatically | `true` |
+| `compaction.strategy` | Checkpoint mode: `rollover` or `summary` | `rollover` |
+| `compaction.reserveTokens` | Context held back by the automatic-checkpoint threshold | `16384` |
+| `compaction.keepRecentTokens` | Approximate recent replay retained by `summary` | `20000` |
 
 Settings are resolved from lowest to highest priority:
 
@@ -397,7 +398,7 @@ Relevant environment variables are:
 
 When the project settings file already exists, changes made through model selection, model-role selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
 
-Compaction fields merge individually across global and project settings. Token values must be greater than zero. For models with small context windows, the effective reserve and recent-history budgets are each capped at one quarter of the model context window. Disabling automatic compaction also disables automatic provider-overflow recovery; `:compact` remains available.
+Compaction fields merge individually across global and project settings. Token values must be greater than zero. For models with small context windows, the effective reserve and recent-history budgets are each capped at one quarter of the model context window. `rollover` starts a fresh model window and recovers through titled notes and bounded history; `summary` generates and retains the legacy summary handoff. Agents without the `context` protocol and Agents with a legacy compaction callback use `summary` regardless of the configured strategy. Disabling automatic checkpoints also disables automatic provider-overflow recovery; `:compact` remains available. `:context-strategy` changes only the active runtime and does not rewrite settings.
 
 `keyDisplay: "auto"` uses macOS symbols when URI Agent itself runs on macOS and text labels elsewhere. Set it to `"macos"` when a macOS terminal is controlling URI Agent on a remote non-macOS host, or to `"text"` to force labels such as `Ctrl+R` and `Shift+Enter`. The resolved macOS style also adds Command aliases for Settings, paste, undo, and redo without removing the portable Control and Option bindings. A terminal may consume Command shortcuts before URI Agent receives them, so the portable bindings remain available. Keymaps and their display style are loaded when the TUI starts.
 
@@ -406,6 +407,7 @@ Compaction fields merge individually across global and project settings. Token v
   "keyDisplay": "macos",
   "compaction": {
     "enabled": true,
+    "strategy": "rollover",
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   }

@@ -301,6 +301,8 @@ struct CompactionFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    strategy: Option<compaction::Strategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reserve_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_recent_tokens: Option<usize>,
@@ -1690,6 +1692,10 @@ fn compaction_settings(
             .and_then(|settings| settings.enabled)
             .or_else(|| global.and_then(|settings| settings.enabled))
             .unwrap_or(true),
+        strategy: project
+            .and_then(|settings| settings.strategy)
+            .or_else(|| global.and_then(|settings| settings.strategy))
+            .unwrap_or_default(),
         reserve_tokens: project
             .and_then(|settings| settings.reserve_tokens)
             .or_else(|| global.and_then(|settings| settings.reserve_tokens))
@@ -2836,6 +2842,7 @@ mod tests {
         let global: SettingsFile = serde_json::from_value(serde_json::json!({
             "compaction": {
                 "enabled": false,
+                "strategy": "summary",
                 "reserveTokens": 12_000,
                 "keepRecentTokens": 18_000
             }
@@ -2853,6 +2860,7 @@ mod tests {
             compaction_settings(&global, &project).unwrap(),
             compaction::Settings {
                 enabled: true,
+                strategy: compaction::Strategy::Summary,
                 reserve_tokens: 12_000,
                 keep_recent_tokens: 9_000,
             }

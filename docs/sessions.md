@@ -1,6 +1,6 @@
 # Sessions and context
 
-URI Agent stores conversations as append-only sessions and preserves the exact startup context used by the model. This document covers persistence, project scoping, the model/tool loop, retries, and context compaction.
+URI Agent stores conversations as append-only sessions and preserves the exact startup context used by the model. This document covers persistence, project scoping, the model/tool loop, retries, and context-window checkpoints.
 
 ## Session storage and project boundaries
 
@@ -82,19 +82,19 @@ A new session freezes a `SessionContext` event containing the complete generated
 ## Append-only events
 
 User and model messages, model settings, tool calls and results, usage, notices,
-errors, task lifecycle notices and terminal reports, turn boundaries, and
-compaction checkpoints are appended as events. Resuming a session reconstructs
+errors, task lifecycle notices and terminal reports, turn boundaries, context
+notes, and rollover or summary checkpoints are appended as events. Resuming a session reconstructs
 its settled task reports; a task left pending or running when its process ended
-is restored as cancelled rather than restarted. Normal operation and compaction
+is restored as cancelled rather than restarted. Normal operation and checkpoints
 do not rewrite or delete earlier events.
 
-SQLite also keeps a versioned, rebuildable resume index at real compaction
+SQLite also keeps a versioned, rebuildable resume index at real checkpoint
 boundaries. The index contains only cumulative derived state needed at startup,
-such as the user-message flag, latest-compaction pointer, usage and cache
+such as the user-message flag, latest-checkpoint pointer, context-window ID, usage and cache
 totals, protocol-help correlations, frozen-context and task event pointers,
 model settings, and token-rate calibration inputs. It never contains model
-history or compaction replacement history. On resume, model replay is loaded
-from the highest-sequence authoritative compaction event and
+history or checkpoint replacement history. On resume, model replay is loaded
+from the highest-sequence authoritative rollover or summary event and
 the later usage and model-message events; other startup state is reduced from
 the index plus the authoritative event tail. Each row carries an integrity
 checksum over its version, session identity, sequence, and payload. Missing,
@@ -111,7 +111,7 @@ make the session unavailable.
 Session event range reads use exclusive sequence cursors. `after` and `before`
 pages and tail reads are bounded and returned in ascending sequence order, so
 adjacent pages concatenate without overlap or gaps, including across
-compactions and tool call/result pairs. A page is a committed view at the time
+checkpoints and tool call/result pairs. A page is a committed view at the time
 of its query. Appends between requests do not alter earlier sequence ranges;
 they become visible to a later `after` query when its cursor reaches them.
 Turn-aware grouping remains a presentation-layer policy.
@@ -160,13 +160,34 @@ If a turn is interrupted while tool calls from one model response are pending, U
 
 URI Agent detects consecutive model responses that each contain exactly one tool call with the same tool name and canonical JSON arguments. On the fifth identical call, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different call, no call, or multiple calls resets the sequence. Background task completion is delivered automatically, so repeated identical `tasks://` reads are polling and receive the same loop protection as other calls.
 
-## Context compaction
+## Context windows, notes, and checkpoints
 
-URI Agent measures replay against the selected model's context window. The latest valid ordinary API response supplies authoritative usage; later messages are estimated until another response arrives. Before the first response, the estimate includes the frozen prompt, tool definitions, messages, and images. It counts four ASCII characters or one non-ASCII character per token and assigns 1,200 tokens to each image regardless of payload size. A compaction invalidates the previous usage baseline until the next response.
+URI Agent measures replay against the selected model's context window. The latest valid ordinary API response supplies authoritative usage; later messages are estimated until another response arrives. Before the first response, the estimate includes the frozen prompt, tool definitions, messages, and images. It counts four ASCII characters or one non-ASCII character per token and assigns 1,200 tokens to each image regardless of payload size. A summary checkpoint invalidates the previous usage baseline until the next response; a rollover starts from a newly estimated bootstrap.
 
-Before each provider request, URI Agent caps the catalog output limit to estimated context room after a fixed 4,096-token safety margin, with a minimum request of one output token. This cap is separate from the configurable compaction reserve.
+Before each provider request, URI Agent caps the catalog output limit to estimated context room after a fixed 4,096-token safety margin, with a minimum request of one output token. This cap is separate from the configurable checkpoint reserve.
 
-Automatic compaction runs after an agent run and before the next prompt, with a final request-time check. At the configured threshold, URI Agent asks the model to summarize older history and appends a checkpoint. Replay then contains:
+### Rollover strategy
+
+`rollover` is the default strategy. Before the hard threshold, URI Agent adds one hidden low-context reminder per context window asking the model to review its notes. At the threshold it appends a rollover checkpoint without making a summary-model request. Replay becomes one hidden host bootstrap; the previous transcript remains in append-only storage but is no longer sent to the provider.
+
+The bootstrap identifies the old and new context-window IDs and requires the model to read `context://help`, inspect the note index and every active note, inspect the cross-window list of original user statements, then query bounded history from the previous window as needed. It explicitly tells the model to recover exact user requirements and continue without asking the user to repeat available information. Protocol-help state resets at each rollover, so the required `context://help` read is enforced again in the new window.
+
+The built-in `context` protocol provides durable working memory and recovery:
+
+- notes have host-generated stable IDs, required single-line titles of at most 120 characters, and revision metadata;
+- at most 20 notes are active; replacing a note preserves its ID and records the current window and sequence as a new anchor;
+- current titles and content share a hard budget of 20% of the model window remaining after the frozen prompt, tool definitions, and 4,096-token safety margin; writes warn at 15%;
+- a growth write above the hard budget fails, while shrinking replacements and deletes remain available;
+- deleting a note creates a tombstone that retains ID, title, revisions, and `已删除`; note content and anchored context are no longer exposed through `context` or `sessions` reads;
+- note reads, prior-window history, user-statement history, and search are bounded; note bodies and history pages are paginated. Dedicated user-history routes list and search only original user submissions across all windows. A note's `/context` route retrieves visible records immediately preceding a selected revision anchor.
+
+Notes, handoffs, and context-history results are marked as untrusted reference data. History excludes system messages, hidden reasoning, context-note calls, and their results. Deletion is not secure erasure: the append-only database still contains historical events, but model-facing note and session-history routes do not return the deleted body.
+
+If the model calls `exec("context://rollover", "<optional handoff>")`, the runtime waits until every tool call from that model response has a durable correlated result, then starts the new window. A handoff is bounded to approximately 4,096 tokens. A provider overflow can force one rollover and retry for the current turn.
+
+### Summary strategy and compatibility
+
+The `summary` strategy retains the previous compaction behavior. URI Agent asks the model to summarize older history and appends a checkpoint. Replay then contains:
 
 ```text
 frozen system prompt
@@ -186,8 +207,10 @@ checkpoint atomically. Provider, model, thinking, working directory, parent,
 depth, and output cap cannot change. WASM receives this callback as
 `PluginEvent::Compacted`.
 
-Compaction normally retains complete recent user turns. If one tool-heavy turn exceeds the budget, it may summarize the older prefix while keeping a suffix that never starts with a tool result. Original events remain in SQLite.
+Summary checkpoints normally retain complete recent user turns. If one tool-heavy turn exceeds the budget, they may summarize the older prefix while keeping a suffix that never starts with a tool result. Original events remain in SQLite.
 
-Provider overflow errors, responses reporting input beyond the context window, and recoverable `length` stops can trigger one forced compaction-and-retry for the current turn. A `length` stop is recoverable when reported output is below the catalog output limit, or when output usage is unavailable and reported input has reached 99% of the context window. A usable response is preserved before compaction; failed or truncated output does not enter replay. This recovery has a separate retry budget and cannot loop indefinitely.
+Agents with a legacy compaction callback always use `summary`, preserving the callback's summary and atomic spec-patch contract. An Agent whose capability selection omits `context` also falls back to `summary`, because it could not recover after a hard rollover.
 
-Run `:compact` to request a checkpoint manually; it fails when too little completed history is available. Automatic compaction and its reserve and retained-history budgets are configured in [`settings.json`](configuration.md#settings-fields-and-precedence).
+Provider overflow errors, responses reporting input beyond the context window, and recoverable `length` stops can trigger one forced checkpoint and retry for the current turn. A `length` stop is recoverable when reported output is below the catalog output limit, or when output usage is unavailable and reported input has reached 99% of the context window. A usable response is preserved before the checkpoint; failed or truncated output does not enter replay. This recovery has a separate retry budget and cannot loop indefinitely.
+
+Run `:compact` to request the active checkpoint strategy manually; it fails when model replay is empty. `:context-strategy` toggles the active session between `rollover` and `summary`; pass either name to select it explicitly. The switch lasts for the current runtime. Automatic checkpoints, their strategy, reserve, and summary-only retained-history budget are configured in [`settings.json`](configuration.md#settings-fields-and-precedence).
