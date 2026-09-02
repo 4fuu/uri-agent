@@ -164,7 +164,8 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - Resume from the frozen snapshot rather than regenerating current prompt or Skill state.
 - Session events are append-only. Rollover and summary change model replay by adding a checkpoint; they do not delete original events.
 - Rollover replay contains only its host bootstrap and subsequent model messages. The bootstrap must direct the model to `context://help`, active notes, and bounded prior-window history; protocol-help state resets at the boundary.
-- A model-requested rollover is committed only after every tool call from that response has a correlated durable result. Context-note calls and results must remain absent from every model-facing history protocol.
+- A model-requested rollover is committed only after every tool call from that response has a correlated durable result. Context-note persistence events are sidecar state and cannot change replay; the originating tool call and result remain in the active provider prefix.
+- Recoverable conversation records use session-local `r<sequence>` anchors and the same type projection in `context` and `sessions`. Every `context://` call and correlated result must remain absent from those recovery views.
 - Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
 - Preserve provider tool-call identity during replay.
 - Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
