@@ -1967,11 +1967,20 @@ mod tests {
         let (_root, state, project_directory) = model_state().await;
         let (client_transport, agent_transport) = Channel::duplex();
         let agent = tokio::spawn(serve_state_on(state, agent_transport));
+        let (frozen_tx, mut frozen_rx) = tokio::sync::mpsc::unbounded_channel();
 
         AcpClient
             .builder()
             .on_receive_notification(
-                async move |_notification: SessionNotification, _connection| Ok(()),
+                async move |notification: SessionNotification, _connection| {
+                    if matches!(
+                        notification.update,
+                        SessionUpdate::ConfigOptionUpdate(_)
+                    ) {
+                        let _ = frozen_tx.send(notification.session_id.to_string());
+                    }
+                    Ok(())
+                },
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(client_transport, async |connection| {
@@ -2000,13 +2009,15 @@ mod tests {
                     ))
                     .block_task();
                 tokio::pin!(prompt);
-                let _ = tokio::select! {
-                    result = &mut prompt => result,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                        connection.send_notification(CancelNotification::new(session_id.clone()))?;
-                        prompt.await
-                    }
+                let frozen_session = tokio::select! {
+                    frozen = frozen_rx.recv() => frozen.expect("configuration update stream closed"),
+                    result = &mut prompt => panic!(
+                        "first ACP prompt settled before materialization: {result:?}"
+                    ),
                 };
+                assert_eq!(frozen_session, session_id);
+                connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                let _ = prompt.await;
 
                 let spec = Session::persisted_spec(&project_directory, &session_id)
                     .await
