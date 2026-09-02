@@ -895,6 +895,11 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
             routes,
         )
     };
+    let gemini_38_routes = serde_json::json!({
+        "low": {"model": "gemini-3.8-flash-low", "thinkingBudget": 1000, "maxOutputTokens": 65536},
+        "medium": {"model": "gemini-3.8-flash-medium", "thinkingBudget": 4000, "maxOutputTokens": 65536},
+        "high": {"model": "gemini-3.8-flash-high", "thinkingBudget": 10000, "maxOutputTokens": 65536}
+    });
     let gemini_37_routes = serde_json::json!({
         "low": {"model": "gemini-3.7-flash-low", "thinkingBudget": 1000, "maxOutputTokens": 65536},
         "medium": {"model": "gemini-3.7-flash-medium", "thinkingBudget": 4000, "maxOutputTokens": 65536},
@@ -925,6 +930,16 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
     });
 
     let models = BTreeMap::from([
+        (
+            "gemini-3.8-flash".to_string(),
+            tiered(
+                "gemini-3.8-flash",
+                "Gemini 3.8 Flash",
+                1_000_000,
+                65_536,
+                gemini_38_routes.clone(),
+            ),
+        ),
         (
             "gemini-3.7-flash".to_string(),
             tiered(
@@ -1370,6 +1385,7 @@ mod tests {
                 "gemini-3.1-pro",
                 "gemini-3.5-flash",
                 "gemini-3.7-flash",
+                "gemini-3.8-flash",
             ]
         );
         assert!(models.iter().all(|model| !model.hidden()));

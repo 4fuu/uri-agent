@@ -182,6 +182,7 @@ The selector exposes canonical models rather than the private low/medium/high ro
 
 | Selector model | Effort routes |
 | --- | --- |
+| `gemini-3.8-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
 | `gemini-3.7-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
 | `gemini-3.5-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
 | `gemini-3.1-pro` | `low` 1,001; `medium` or `high` 10,001 |
