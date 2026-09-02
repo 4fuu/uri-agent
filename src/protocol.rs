@@ -459,6 +459,23 @@ impl ProtocolRegistry {
         self.help_read.lock().await.extend(protocols);
     }
 
+    pub(crate) async fn clear_help_reads(&self) {
+        self.help_read.lock().await.clear();
+    }
+
+    pub(crate) fn contains_selected(&self, name: &str) -> bool {
+        if self
+            .allowed
+            .read()
+            .expect("protocol selection lock poisoned")
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            return false;
+        }
+        self.protocols.contains_key(name)
+    }
+
     async fn dispatch_read(
         &self,
         uri: &str,

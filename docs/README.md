@@ -13,7 +13,7 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 | Configure a model, credentials, MCP server, Agent environment variables, reasoning effort, output limits, offline mode, or a custom endpoint | [Models and configuration](configuration.md) |
 | Use the conversation, composer, commands, MCP manager, and navigation | [Terminal interface](interface.md) |
 | Customize keys, use the embedded terminal, copy text, or attach images | [Keymaps, terminal, and attachments](terminal.md) |
-| Resume a session or understand persistence, the model/tool loop, retries, frozen context, and compaction | [Sessions and context](sessions.md) |
+| Resume a session or understand persistence, the model/tool loop, retries, notes, rollover, and summary checkpoints | [Sessions and context](sessions.md) |
 | Change the codebase, find module ownership, preserve product contracts, or run verification | [Architecture and development](development.md) |
 | Prepare or configure a release | [Release process](release.md) |
 

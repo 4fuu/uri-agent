@@ -42,6 +42,7 @@ pub enum CoreCommand {
     Search,
     NewSession,
     Compact,
+    ContextStrategy,
     Help,
     Quit,
     SetEnvironment,
@@ -289,10 +290,17 @@ fn core_commands() -> Vec<CommandSpec> {
         ),
         CommandSpec::new(
             "compact",
-            "Compact context",
-            "summarize older model context and keep raw history",
+            "Context checkpoint",
+            "start a fresh context window or summarize, using the active strategy",
             std::iter::empty::<&str>(),
             CommandTarget::Core(Compact),
+        ),
+        CommandSpec::new(
+            "context-strategy",
+            "Context strategy",
+            "toggle rollover/summary, or set one explicitly",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(ContextStrategy),
         ),
         CommandSpec::new(
             "help",
@@ -1968,6 +1976,12 @@ mod tests {
             CommandTarget::Core(CoreCommand::SetTerminal)
         );
         assert_eq!(registry.resolve(":effort high").unwrap().arguments, "high");
+        let strategy = registry.resolve(":context-strategy summary").unwrap();
+        assert_eq!(
+            strategy.spec.target,
+            CommandTarget::Core(CoreCommand::ContextStrategy)
+        );
+        assert_eq!(strategy.arguments, "summary");
     }
 
     #[test]

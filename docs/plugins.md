@@ -59,7 +59,8 @@ persisted same-project depth-1 parent and are always depth 2; no depth-2 Agent
 may create another. Provider/model and thinking freeze after the first durably
 accepted submission. Prompt, tools, and protocols are fixed at creation except
 through an optional compaction callback. Set the callback boolean on `create`
-or `open`; after summary generation the handler receives
+or `open`; an Agent with this legacy callback uses the `summary` context
+strategy even when rollover is configured. After summary generation the handler receives
 `PluginEvent::Compacted` and may return an optional `AgentSpecPatch`. Only
 prompt/tools/protocols may change, and the update and checkpoint commit
 atomically. Full lifecycle and delivery semantics are in

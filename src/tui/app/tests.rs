@@ -78,6 +78,7 @@ fn test_app_with_splash(show_splash: bool) -> App {
             context_tokens: 0,
             context_accuracy: ContextAccuracy::Api,
             compaction_enabled: true,
+            context_strategy: crate::compaction::Strategy::Rollover,
             diagnostics_path: PathBuf::from("/tmp/uri-agent/diagnostics.jsonl"),
             terminal: None,
             key_display: KeyDisplayStyle::Text,
@@ -305,6 +306,37 @@ fn durable_assistant_text_replaces_streaming_deltas() {
     assert_eq!(app.blocks[0].kind, BlockKind::Compaction);
     assert_eq!(app.blocks[1].text, "settled response");
     assert!(!app.blocks[1].transient);
+}
+
+#[test]
+fn rollover_checkpoint_renders_the_new_window_and_settles_manual_activity() {
+    let mut app = test_app();
+    app.busy = true;
+    app.activity = Some(Activity::Compacting);
+    apply_event(
+        &mut app,
+        0,
+        EventKind::ContextRollover {
+            window_id: 2,
+            tokens_before: 81_000,
+            replacement_history: vec![Message::user("hidden bootstrap")],
+            manual: true,
+        },
+    );
+
+    assert!(!app.busy);
+    assert!(app.activity.is_none());
+    assert_eq!(app.blocks.len(), 1);
+    assert_eq!(app.blocks[0].kind, BlockKind::Compaction);
+    assert_eq!(app.blocks[0].title, "CONTEXT ROLLOVER");
+    assert!(
+        app.blocks[0]
+            .text
+            .contains("previous context used 81000 tokens")
+    );
+    let rendered = render_to_string(&mut app, 80, 24);
+    assert!(rendered.contains("Started context window 2"));
+    assert!(!rendered.contains("hidden bootstrap"));
 }
 
 #[test]
@@ -1040,6 +1072,9 @@ fn context_status_distinguishes_api_estimates_and_unknown_usage() {
 
     app.info.context_accuracy = ContextAccuracy::Api;
     assert!(context_status(&app, 10.0).starts_with("12k /"));
+    assert!(context_status(&app, 10.0).contains("automatic rollover"));
+    app.info.context_strategy = crate::compaction::Strategy::Summary;
+    assert!(context_status(&app, 10.0).contains("automatic summary"));
     app.info.context_accuracy = ContextAccuracy::Estimated;
     assert!(context_status(&app, 10.0).starts_with("≈12k /"));
     app.busy = true;

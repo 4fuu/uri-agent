@@ -108,7 +108,11 @@ async fn read_older_history_page(session: &Session, cursor: u64) -> Result<Histo
 
 async fn complete_visible_unit_start(session: &Session, first: &SessionEvent) -> Result<u64> {
     if matches!(&first.kind, EventKind::User { .. })
-        || matches!(&first.kind, EventKind::Compaction { manual: true, .. })
+        || matches!(
+            &first.kind,
+            EventKind::Compaction { manual: true, .. }
+                | EventKind::ContextRollover { manual: true, .. }
+        )
     {
         return Ok(first.sequence);
     }
@@ -1502,6 +1506,33 @@ async fn dispatch_ui_command_with_arguments(
         CoreCommand::Search => Action::History(HistoryAction::Search),
         CoreCommand::NewSession => Action::NewSession,
         CoreCommand::Compact => Action::Compact,
+        CoreCommand::ContextStrategy => {
+            let current = services.runtime.context_strategy().await;
+            let requested = if arguments.is_empty() {
+                match current {
+                    crate::compaction::Strategy::Rollover => crate::compaction::Strategy::Summary,
+                    crate::compaction::Strategy::Summary => crate::compaction::Strategy::Rollover,
+                }
+            } else {
+                match arguments.parse::<crate::compaction::Strategy>() {
+                    Ok(strategy) => strategy,
+                    Err(error) => {
+                        app.set_flash(error.to_string());
+                        return Action::Continue;
+                    }
+                }
+            };
+            let effective = services.runtime.set_context_strategy(requested).await;
+            app.info.context_strategy = effective;
+            if effective == requested {
+                app.set_flash(format!("Context strategy: {effective}"));
+            } else {
+                app.set_flash(format!(
+                    "Context strategy remains {effective}; rollover requires the context protocol and no legacy compaction callback"
+                ));
+            }
+            Action::Continue
+        }
         CoreCommand::Help => {
             app.overlay_scroll = 0;
             app.overlay = Some(Overlay::Help);
@@ -1524,13 +1555,16 @@ pub(super) fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
     app.busy = true;
     app.busy_since = Some(Instant::now());
     app.activity = Some(Activity::Compacting);
-    app.set_flash("Compacting older model context…");
+    app.set_flash(match app.info.context_strategy {
+        crate::compaction::Strategy::Rollover => "Starting a fresh context window…",
+        crate::compaction::Strategy::Summary => "Summarizing older model context…",
+    });
     tokio::spawn(async move {
         if let Err(error) = runtime.compact().await {
             let _ = runtime
                 .session()
                 .append(EventKind::Error {
-                    text: format!("Context compaction failed: {error:#}"),
+                    text: format!("Context checkpoint failed: {error:#}"),
                 })
                 .await;
         }
@@ -5051,6 +5085,7 @@ pub(super) async fn apply_active(
     app.info.model_ready = model_ready;
     app.info.provider_count = catalog.providers().await.len();
     app.info.compaction_enabled = active.compaction.enabled;
+    app.info.context_strategy = runtime.context_strategy().await;
     app.info.terminal.clone_from(&active.terminal);
     Ok(())
 }

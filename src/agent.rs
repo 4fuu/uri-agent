@@ -1,3 +1,4 @@
+use crate::builtins::context::{ContextPlugin, ContextState};
 use crate::catalog::{ModelCatalog, ModelLimits, ThinkingLevel};
 use crate::config::{AgentEnvironment, ConfigManager, display_path};
 use crate::model::configured_backend;
@@ -717,6 +718,7 @@ impl AgentHost {
         session: Session,
         callback: Option<Arc<dyn CompactionCallback>>,
     ) -> Result<AgentServices> {
+        let context_state = ContextState::new(session.clone());
         let mcp_profile = session
             .private_record(crate::builtins::MCP_SESSION_PROFILE_OWNER)
             .await;
@@ -725,6 +727,7 @@ impl AgentHost {
             self.inner.manager.directory(),
             mcp_profile,
         );
+        plugins.add(ContextPlugin::new(context_state.clone()));
         let wasm_plugins =
             WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
         plugins.add(wasm_plugins.clone());
@@ -822,13 +825,14 @@ impl AgentHost {
             wasm_plugins: wasm_plugins.clone(),
             startup_notices,
         });
-        let runtime = Arc::new(AgentRuntime::new_deferred(
+        let runtime = Arc::new(AgentRuntime::new_deferred_with_context(
             backend,
             protocols.clone(),
             model_tools,
             session,
             initializer,
             limits,
+            context_state,
         ));
         forward_task_notices(
             runtime.session().clone(),

@@ -50,7 +50,7 @@ startup discovery must not reinterpret historical sessions.
 | `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, text and image read output, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, embedded-documentation, file, grep, session archive, HTTPS, MCP, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific internals |
+| `src/builtins/` | Built-in project-instruction, embedded-documentation, context notes/history, file, grep, session archive, HTTPS, MCP, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific internals |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, persistent settings, and model-tool, protocol, command, generic panel, status, composer completion, and submission-effect registration |
 | `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
 | `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
@@ -62,8 +62,8 @@ startup discovery must not reinterpret historical sessions.
 | `src/output.rs` | Inline output limits, previews, complete-output persistence, and per-session JSONL diagnostics |
 | `src/skill.rs` | Skill discovery, frontmatter, protocol naming and help, snapshots, and resource containment |
 | `src/session.rs` | SQLite schema, session boundaries, frozen context, events, drafts, checkpoints, and replay |
-| `src/compaction.rs` | Context estimation, complete-turn compaction boundaries, summaries, and retained history |
-| `src/runtime.rs` | User turns, image attachments, model/tool loop, tool-call correlation, and compaction triggers |
+| `src/compaction.rs` | Context estimation, checkpoint strategies, complete-turn summary boundaries, summaries, and retained history |
+| `src/runtime.rs` | User turns, image attachments, model/tool loop, tool-call correlation, low-context reminders, and checkpoint triggers |
 | `src/keymap.rs` | Built-in Rhai mappings and global/project overrides |
 | `src/terminal.rs` | Embedded PTY lifecycle, emulation, resize, and input encoding |
 | `src/oauth/` | OAuth orchestration, callbacks, device codes, shared token parsing, and provider-owned login and refresh flows |
@@ -162,13 +162,16 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
 - Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
 - Resume from the frozen snapshot rather than regenerating current prompt or Skill state.
-- Session events are append-only. Compaction changes model replay by adding a checkpoint; it does not delete original events.
+- Session events are append-only. Rollover and summary change model replay by adding a checkpoint; they do not delete original events.
+- Rollover replay contains only its host bootstrap and subsequent model messages. The bootstrap must direct the model to `context://help`, active notes, and bounded prior-window history; protocol-help state resets at the boundary.
+- A model-requested rollover is committed only after every tool call from that response has a correlated durable result. Context-note persistence events are sidecar state and cannot change replay; the originating tool call and result remain in the active provider prefix.
+- Recoverable conversation records use session-local `r<sequence>` anchors and the same type projection in `context` and `sessions`. Every `context://` call and correlated result must remain absent from those recovery views.
 - Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
 - Preserve provider tool-call identity during replay.
 - Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
 - Treat the canonical launch directory as the project boundary for attachments and session selection.
 
-The exact Skill rules are in [Startup context and Skills](context.md); persistence and compaction are in [Sessions and context](sessions.md).
+The exact Skill rules are in [Startup context and Skills](context.md); persistence and context checkpoints are in [Sessions and context](sessions.md).
 
 ### TUI and extensions
 
@@ -237,7 +240,7 @@ Keep `wasm_plugin://help` and its detailed help paths, [WASM plugin documentatio
 
 ### Agent, model, Skill, session, and runtime changes
 
-Preserve the single process-wide `AgentHost`, full `AgentRuntime` behavior for every caller, provider-independent model loops, append-only persistence, durable submissions, model/thinking freeze, and atomic compaction spec-update/checkpoint invariant. Shared changes to Agent, protocol, task, session, compaction, or runtime boundaries need both a normal-path test and the affected boundary-condition test. Session tests should verify persisted replay, not only in-memory state.
+Preserve the single process-wide `AgentHost`, full `AgentRuntime` behavior for every caller, provider-independent model loops, append-only persistence, durable submissions, model/thinking freeze, exact rollover replay, and the atomic legacy compaction spec-update/checkpoint invariant. Shared changes to Agent, protocol, task, session, compaction, or runtime boundaries need both a normal-path test and the affected boundary-condition test. Session tests should verify persisted replay, not only in-memory state.
 
 ### TUI changes
 
@@ -275,7 +278,7 @@ For documentation-only changes, the full Rust suite is unnecessary unless code o
 - [`docs/configuration.md`](configuration.md) owns models, authentication, files, precedence, CLI override semantics, and custom providers.
 - [`docs/interface.md`](interface.md) owns the conversation surface, composer, commands, and navigation.
 - [`docs/terminal.md`](terminal.md) owns keymaps, terminal interaction, selection, copying, and attachments.
-- [`docs/sessions.md`](sessions.md) owns persistence, project scoping, frozen session context, the model/tool loop, request retries, and compaction.
+- [`docs/sessions.md`](sessions.md) owns persistence, project scoping, frozen session context, the model/tool loop, request retries, notes, rollover, and summary checkpoints.
 - This document owns architecture, module boundaries, engineering invariants, change rules, and verification.
 - [`docs/release.md`](release.md) owns release versioning, preparation, automation, and first-release setup.
 - `uri-agent --help` owns the exact CLI contract.

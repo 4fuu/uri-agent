@@ -78,8 +78,9 @@ Provider/model and thinking freeze after the first durably accepted submission.
 When the callback boolean is true, handle
 `HandlerRequest::Event { event: PluginEvent::Compacted { .. } }`. Return JSON
 bytes encoding `Option<AgentSpecPatch>`; patches may alter only system prompt,
-tools, and protocols after summary generation. URI Agent atomically commits the
-patch with the compaction checkpoint.
+tools, and protocols after summary generation. Enabling the callback forces the
+Agent's context strategy to `summary`. URI Agent atomically commits the patch
+with the compaction checkpoint.
 
 ## State and resident lifecycle
 

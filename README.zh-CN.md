@@ -33,7 +33,7 @@ URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变�
 - **内置 MCP 桥接：**通过 `:mcp` 管理 stdio 与 Streamable HTTP 服务器，将每个服务器公开为按需加载的 `<name>-mcp://` 协议；参数优先使用查询字符串，复杂 schema 可回退到完整 JSON。
 - **ACP 编辑器集成：**`uri-agent --acpv1` 通过 stdio 提供稳定的 ACP v1 服务，支持按会话选择模型，并可在普通 TUI 中重新打开已有对话。
 - **广泛模型支持：**pi.dev 目录、Provider 专属登录和按凭据隔离的实时发现，把广泛的 Provider 生态集中在同一个模型选择器中。
-- **持久化工作：**长命令会转为受管任务；只追加 SQLite 会话会跨重启保留草稿、固化的启动上下文和压缩 checkpoint。
+- **持久化工作：**长命令会转为受管任务；只追加 SQLite 会话会跨重启保留草稿、固化的启动上下文、有标题的工作笔记，以及 rollover 或 summary checkpoint。
 - **单一终端工作流：**Queue 与 Steer、内置网络访问、键盘和鼠标控制、图片输入，以及 `@` 文件和 `@@` 会话引用都集中在同一个对话界面。
 
 ## 模型与 Provider 覆盖
@@ -127,7 +127,7 @@ uri-agent --acpv1
 | 使用对话、命令、keymap、终端或附件 | [Terminal interface](docs/interface.md) 和 [terminal features](docs/terminal.md) |
 | 了解工具、协议、任务和完整输出 | [Protocols, tasks, and output](docs/protocols.md) |
 | 使用项目指令或 Skills | [Startup context and Skills](docs/context.md) |
-| 恢复会话，或了解持久化与上下文压缩 | [Sessions and context](docs/sessions.md) |
+| 恢复会话，或了解笔记、rollover 与持久化 | [Sessions and context](docs/sessions.md) |
 | 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
 [`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和 body 格式以 `<protocol>://help` 为准；当前生效的界面说明以 `F1` 和 `:help` 为准。

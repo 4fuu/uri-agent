@@ -1,5 +1,6 @@
 use rig::completion::ToolDefinition;
 use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const DEFAULT_RESERVE_TOKENS: usize = 16_384;
@@ -23,9 +24,39 @@ behavior, agent hypotheses, and checks still pending. Preserve technical names, 
 blockers, and unresolved questions that matter. Use concise Markdown sections for current goal and
 constraints, progress and results, decisions, files, open questions, and exact next steps."#;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    #[default]
+    Rollover,
+    Summary,
+}
+
+impl std::fmt::Display for Strategy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rollover => formatter.write_str("rollover"),
+            Self::Summary => formatter.write_str("summary"),
+        }
+    }
+}
+
+impl std::str::FromStr for Strategy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rollover" => Ok(Self::Rollover),
+            "summary" => Ok(Self::Summary),
+            _ => anyhow::bail!("context strategy must be rollover or summary"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
     pub enabled: bool,
+    pub strategy: Strategy,
     pub reserve_tokens: usize,
     pub keep_recent_tokens: usize,
 }
@@ -34,6 +65,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: true,
+            strategy: Strategy::Rollover,
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
         }
@@ -135,6 +167,10 @@ fn text_tokens(text: &str) -> usize {
         }
     });
     ascii.div_ceil(4).saturating_add(non_ascii)
+}
+
+pub fn estimate_text_tokens(text: &str) -> usize {
+    text_tokens(text)
 }
 
 fn estimate_message_tokens(message: &Message) -> usize {

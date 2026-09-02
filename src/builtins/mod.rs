@@ -1,7 +1,9 @@
 mod agents;
 mod apply_patch;
+pub(crate) mod context;
 mod file;
 mod grep;
+mod history;
 mod https;
 mod mcp;
 pub(crate) mod model_tools;
