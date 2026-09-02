@@ -666,7 +666,7 @@ pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ("main", "help", "help"),
         ],
     );
-    vec![
+    let mut lines = vec![
         Line::styled(
             single_line_preview(&footer_cwd(&app.info.cwd), width.saturating_sub(1)),
             Style::default().fg(MUTED),
@@ -677,7 +677,17 @@ pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             single_line_preview(&hints, width.saturating_sub(1)),
             Style::default().fg(MUTED),
         ),
-    ]
+    ];
+    if let Some(version) = &app.available_update {
+        lines.push(Line::styled(
+            single_line_preview(
+                &format!("Update available: {version} · github.com/4fuu/uri-agent/releases/latest"),
+                width.saturating_sub(1),
+            ),
+            Style::default().fg(WARM),
+        ));
+    }
+    lines
 }
 
 /// Minimal conversation footer. Live activity follows the model while project,

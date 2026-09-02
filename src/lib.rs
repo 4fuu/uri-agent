@@ -22,4 +22,5 @@ pub mod terminal;
 mod text_metrics;
 mod tool_download;
 pub mod tui;
+mod update;
 pub mod wasm_plugin;

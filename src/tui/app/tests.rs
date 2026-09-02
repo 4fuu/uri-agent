@@ -1490,6 +1490,35 @@ fn splash_uses_the_wordmark_then_conversation_replaces_it() {
 }
 
 #[test]
+fn available_update_is_shown_at_the_bottom_of_the_welcome_only() {
+    let mut app = test_app();
+    app.available_update = Some("2026.901.0".to_string());
+
+    let welcome = render_to_string(&mut app, 80, 24);
+    let actions = welcome
+        .lines()
+        .position(|line| line.contains("Space compose · : commands · ? help"))
+        .unwrap();
+    let update = welcome
+        .lines()
+        .position(|line| line.contains("Update available: 2026.901.0"))
+        .unwrap();
+    assert!(update > actions);
+    assert!(welcome.contains("github.com/4fuu/uri-agent/releases/latest"));
+
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        false,
+    );
+    let conversation = render_to_string(&mut app, 80, 24);
+    assert!(!conversation.contains("Update available"));
+}
+
+#[test]
 fn composer_enter_sends_shift_enter_breaks_and_esc_keeps_draft() {
     let mut app = test_app();
     app.overlay = Some(Overlay::Composer);

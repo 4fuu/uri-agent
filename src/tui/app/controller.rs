@@ -431,6 +431,8 @@ pub struct TuiTerminal {
     terminal: DefaultTerminal,
     first_session: bool,
     keyboard_enhancement: bool,
+    available_update: Option<String>,
+    update_checked: bool,
 }
 
 impl TuiTerminal {
@@ -461,6 +463,8 @@ impl TuiTerminal {
             terminal,
             first_session: true,
             keyboard_enhancement,
+            available_update: None,
+            update_checked: false,
         })
     }
 
@@ -486,7 +490,10 @@ impl TuiTerminal {
         let mut pending_receiver = runtime.subscribe_pending_messages();
         let keymap = Keymap::load(Some(&info.cwd), info.key_display).await?;
         let show_splash = std::mem::take(&mut self.first_session);
-        let refresh_catalog_on_start = show_splash && catalog.networking_enabled();
+        let startup_tasks = StartupTasks {
+            refresh_catalog: show_splash && catalog.networking_enabled(),
+            check_updates: !self.update_checked && catalog.networking_enabled(),
+        };
         let mut app = App::new(
             protocols.descriptors(),
             commands,
@@ -496,6 +503,8 @@ impl TuiTerminal {
             draft,
             show_splash,
         );
+        app.available_update = self.available_update.clone();
+        app.update_check_complete = self.update_checked;
         app.pending_messages = pending_receiver.borrow().clone();
         app.protocol_source = Some(protocols);
         hydrate_session_history(&mut app, &session).await?;
@@ -515,16 +524,19 @@ impl TuiTerminal {
             catalog,
             output,
         };
-        run_loop(
+        let outcome = run_loop(
             &mut self.terminal,
             &mut app,
             services,
             &mut receiver,
             &mut task_receiver,
             &mut pending_receiver,
-            refresh_catalog_on_start,
+            startup_tasks,
         )
-        .await
+        .await;
+        self.available_update = app.available_update.clone();
+        self.update_checked = app.update_check_complete;
+        outcome
     }
 }
 
@@ -547,6 +559,12 @@ pub(super) struct LoopServices {
     output: Arc<OutputStore>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct StartupTasks {
+    refresh_catalog: bool,
+    check_updates: bool,
+}
+
 pub(super) async fn run_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
@@ -554,12 +572,15 @@ pub(super) async fn run_loop(
     receiver: &mut tokio::sync::broadcast::Receiver<SessionUpdate>,
     task_receiver: &mut tokio::sync::broadcast::Receiver<crate::task::TaskNotice>,
     pending_receiver: &mut watch::Receiver<Vec<PendingMessage>>,
-    refresh_catalog_on_start: bool,
+    startup_tasks: StartupTasks,
 ) -> Result<TuiOutcome> {
     let mut terminal_events = EventStream::new();
     let (background_tx, mut background_rx) = mpsc::unbounded_channel();
-    if refresh_catalog_on_start {
+    if startup_tasks.refresh_catalog {
         start_background_catalog_refresh(app, &services, background_tx.clone());
+    }
+    if startup_tasks.check_updates {
+        start_update_check(background_tx.clone());
     }
     let now = Instant::now();
     let mut animation_clock = AnimationClock::new(now);
@@ -785,6 +806,7 @@ pub(super) enum BackgroundEvent {
         result: Box<Result<CatalogRefreshReport>>,
         announced: bool,
     },
+    UpdateCheckFinished(Option<String>),
     TurnStarted {
         prompt: String,
         submitted_image_ids: Vec<u64>,
@@ -4811,6 +4833,13 @@ fn spawn_catalog_refresh(
     });
 }
 
+fn start_update_check(sender: mpsc::UnboundedSender<BackgroundEvent>) {
+    tokio::spawn(async move {
+        let version = crate::update::available_version().await.ok().flatten();
+        let _ = sender.send(BackgroundEvent::UpdateCheckFinished(version));
+    });
+}
+
 pub(super) async fn finish_background(
     app: &mut App,
     services: &LoopServices,
@@ -4921,6 +4950,10 @@ pub(super) async fn finish_background(
                 Ok(_) => {}
                 Err(error) => app.set_flash(format!("Catalog refresh failed: {error:#}")),
             }
+        }
+        BackgroundEvent::UpdateCheckFinished(version) => {
+            app.available_update = version;
+            app.update_check_complete = true;
         }
         BackgroundEvent::OauthFinished(result) => {
             let provider = app
