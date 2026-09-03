@@ -1,13 +1,13 @@
 {
-    "version": "2026.902.1",
+    "version": "2026.903.0",
     "description": "Protocol-oriented coding agent with a focused terminal interface",
     "homepage": "https://github.com/4fuu/uri-agent",
     "license": "MIT",
     "notes": "The native retrieval runtime, dictionaries, and embedding model are bundled in the installation directory.",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/4fuu/uri-agent/releases/download/v2026.902.1/uri-agent-2026.902.1-x86_64-pc-windows-msvc.zip",
-            "hash": "72c0a1ceb47a5ff0be4909f303e0199fb9852b8edc366dedd656da464cdaf6ea"
+            "url": "https://github.com/4fuu/uri-agent/releases/download/v2026.903.0/uri-agent-2026.903.0-x86_64-pc-windows-msvc.zip",
+            "hash": "8c90348079ce7bff53dd1a4a7c3cafdebe4a685b36b29da9d296efa361d7848d"
         }
     },
     "bin": "uri-agent.exe",
