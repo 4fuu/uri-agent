@@ -99,9 +99,11 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             format: tar
+            glibc: "2.27"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             format: tar
+            glibc: "2.38"
           - runner: macos-26
             target: aarch64-apple-darwin
             format: tar
@@ -141,13 +143,14 @@ jobs:
           ZVEC_LIB_DIR: ${{ runner.temp }}/stage
           LD_LIBRARY_PATH: ${{ runner.temp }}/stage
         run: cargo test --locked --package uri-agent --lib retrieval::tests::bundled_assets_rebuild_and_search -- --ignored --exact
-      - name: Build Linux binary against glibc 2.27
+      - name: Build Linux binary against target glibc ceiling
         if: runner.os == 'Linux'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
           ZVEC_LIB_DIR: ${{ runner.temp }}/stage
-        run: cargo zigbuild --locked --release --package uri-agent --target "$TARGET.2.27"
+        run: cargo zigbuild --locked --release --package uri-agent --target "$TARGET.$GLIBC"
       - name: Build binary on macOS and Windows
         if: runner.os != 'Linux'
         env:
@@ -158,6 +161,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
@@ -169,7 +173,7 @@ jobs:
             ldd "$STAGE/uri-agent" | grep -F 'libzvec_c_api.so =>'
             max_glibc=$(readelf --version-info "$STAGE/uri-agent" "$STAGE/libzvec_c_api.so" |
               grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
-            [[ "$(printf '%s\n' GLIBC_2.27 "$max_glibc" | sort -V | tail -1)" == GLIBC_2.27 ]]
+            [[ "$(printf '%s\n' "GLIBC_$GLIBC" "$max_glibc" | sort -V | tail -1)" == "GLIBC_$GLIBC" ]]
           else
             install_name_tool -add_rpath @executable_path "$STAGE/uri-agent" 2>/dev/null || true
             otool -l "$STAGE/uri-agent" | grep -A2 LC_RPATH | grep -F '@executable_path'

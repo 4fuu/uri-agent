@@ -54,11 +54,12 @@ retrieval/jieba/{jieba.dict.utf8,hmm_model.utf8,LICENSE}
 retrieval/licenses/{zvec-LICENSE,zvec-NOTICE}
 ```
 
-Linux releases use GNU targets and are built with a glibc 2.27 ceiling because
-the zvec library is dynamically linked. The workflow verifies the executable
-RPATH (`$ORIGIN` on Linux and `@executable_path` on macOS), dependency
-resolution, maximum required glibc version, staged executable version, and all
-asset checksums. The x86-64 Linux build also creates a real zvec collection and
-executes semantic and hybrid queries with the bundled model and Jieba files.
-Installer smoke tests verify that Linux, Homebrew, and Scoop retain the complete
-directory layout. The running application never downloads retrieval assets.
+Linux releases use GNU targets. The x86-64 bundle has a glibc 2.27 ceiling;
+the ARM64 bundle has a glibc 2.38 ceiling set by zvec's prebuilt native library.
+The workflow verifies the executable RPATH (`$ORIGIN` on Linux and
+`@executable_path` on macOS), dependency resolution, target-specific maximum
+required glibc version, staged executable version, and all asset checksums. The
+x86-64 Linux build also creates a real zvec collection and executes semantic
+and hybrid queries with the bundled model and Jieba files. Installer smoke
+tests verify that Linux, Homebrew, and Scoop retain the complete directory
+layout. The running application never downloads retrieval assets.
