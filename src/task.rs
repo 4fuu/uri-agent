@@ -382,7 +382,7 @@ impl TaskManager {
             let (status, content) = match result {
                 None => (TaskStatus::Cancelled, None),
                 Some(Ok(content)) => (TaskStatus::Completed, Some(content)),
-                Some(Err(error)) => (TaskStatus::Failed, Some(error.to_string().into_bytes())),
+                Some(Err(error)) => (TaskStatus::Failed, Some(format!("{error:#}").into_bytes())),
             };
             manager
                 .set_status_after_work(&record.id, status, content, &cancellation)
@@ -719,6 +719,27 @@ mod tests {
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.content, b"final result");
         assert!(tasks.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_tasks_preserve_the_full_error_chain() {
+        let tasks = TaskManager::new();
+        let record = tasks.allocate("test", "failing").await;
+        let id = record.id.clone();
+        tasks
+            .spawn(record, async {
+                Err::<Vec<u8>, _>(
+                    anyhow::anyhow!("root cause detail").context("outer operation context"),
+                )
+            })
+            .await;
+
+        let failed = tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            String::from_utf8(failed.content).unwrap(),
+            "outer operation context: root cause detail"
+        );
     }
 
     #[tokio::test]
