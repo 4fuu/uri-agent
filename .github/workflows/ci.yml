@@ -53,24 +53,15 @@ jobs:
       - name: Run platform-sensitive tests
         shell: bash
         run: |
-          set -euo pipefail
-          suites=(
-            'acp::'
-            'agent::tests'
-            'atomic_file::tests'
-            'builtins::'
-            'clipboard::tests'
-            'config::tests'
-            'output::tests'
-            'plugin_state::tests'
-            'retrieval::'
-            'session::tests'
-            'skill::tests'
-            'task::tests'
-            'terminal::tests'
-            'tool_download::tests'
-            'wasm_plugin::tests'
-          )
-          for suite in "${suites[@]}"; do
-            cargo test --lib "$suite"
-          done
+          cargo test --lib -- \
+            --skip 'catalog::' \
+            --skip 'compaction::tests' \
+            --skip 'keymap::tests' \
+            --skip 'model::' \
+            --skip 'oauth::' \
+            --skip 'plugin::tests' \
+            --skip 'prompts::tests' \
+            --skip 'protocol::tests' \
+            --skip 'runtime::tests' \
+            --skip 'tui::' \
+            --skip 'update::tests'
