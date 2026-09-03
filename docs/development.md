@@ -52,6 +52,7 @@ startup discovery must not reinterpret historical sessions.
 | `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
 | `src/protocol.rs` | `Protocol`, text and image read output, descriptors, registry, address splitting, dispatch, and output presentation |
 | `src/builtins/` | Built-in project-instruction, embedded-documentation, context notes/history, file, grep, session archive, HTTPS, MCP, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific internals |
+| `src/retrieval/` | Fixed Model2Vec embedding, zvec schema and lifecycle, atomic versioned semantic indexes, code scanning, and semantic/hybrid ranking shared by grep and conversation search |
 | `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, persistent settings, and model-tool, protocol, command, generic panel, status, composer completion, and submission-effect registration |
 | `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
 | `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
@@ -107,8 +108,45 @@ operational behavior inside registered protocols, commands, panel providers,
 or submission providers; reserve prompt fragments for context required before
 the first tool call.
 
-URI Agent does not load native dynamic libraries. Third-party runtime protocols
-and direct tools use the trusted [WASM plugin](plugins.md) path instead.
+URI Agent links one fixed native dynamic library: the bundled zvec core used by
+first-party semantic retrieval. This is not a general native plugin ABI.
+Third-party runtime protocols and direct tools continue to use the trusted
+[WASM plugin](plugins.md) path.
+
+## Native retrieval assets
+
+Each URI Agent release is matched to one exact `zvec-rust` crate, zvec native
+archive, Jieba dictionary revision, and Model2Vec model revision. The
+checksummed mapping and supported release targets live in
+[`scripts/prepare-retrieval-assets.py`](../scripts/prepare-retrieval-assets.py).
+Release archives place the dynamic library beside `uri-agent` and model and
+dictionary files under `retrieval/`; runtime resolution is relative to the
+actual executable. The application crate is not published independently
+because a standalone Cargo-installed executable would omit these assets.
+
+For a native Unix development build, prepare and stage the complete bundle:
+
+```bash
+target=x86_64-unknown-linux-gnu # or aarch64-unknown-linux-gnu / aarch64-apple-darwin
+stage="target/retrieval-assets/$target"
+python3 scripts/prepare-retrieval-assets.py --target "$target" --output "$stage"
+ZVEC_LIB_DIR="$stage" cargo build --locked --package uri-agent
+cp target/debug/uri-agent "$stage/"
+LD_LIBRARY_PATH="$stage${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$stage/uri-agent" --version # use DYLD_LIBRARY_PATH="$stage" on macOS
+```
+
+The Windows target is `x86_64-pc-windows-msvc` and uses `uri-agent.exe` plus
+`zvec_c_api.dll`. Retrieval assets are never fetched by the running
+application. To exercise the native collection, embedding, FTS, and hybrid
+path after preparing the host assets, run:
+
+```bash
+URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
+  LD_LIBRARY_PATH="$stage${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  cargo test --locked --package uri-agent --lib \
+  retrieval::tests::bundled_assets_rebuild_and_search -- --ignored --exact
+```
 
 ## Architectural contracts
 
@@ -166,7 +204,11 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - Session events are append-only. Rollover and summary change model replay by adding a checkpoint; they do not delete original events.
 - Rollover replay contains only its host bootstrap and subsequent model messages. The bootstrap must direct the model to `context://help`, active notes, and bounded prior-window history; protocol-help state resets at the boundary.
 - A model-requested rollover is committed only after every tool call from that response has a correlated durable result. Context-note persistence events are sidecar state and cannot change replay; the originating tool call and result remain in the active provider prefix.
-- Recoverable conversation records use session-local `r<sequence>` anchors and the same type projection in `context` and `sessions`. Every `context://` call and correlated result must remain absent from those recovery views.
+- Recoverable conversation records use session-local `r<sequence>` anchors and the same type projection in `context` and `sessions`. Every `context://` or `sessions://` call and correlated result must remain absent from those recovery views.
+- Semantic indexes are derived sidecars. Their manifest must bind source digest,
+  extractor, schema, zvec release, model revision and checksums, dimension, and
+  metric. Search rejects missing or stale state; rebuilds hold a cross-process
+  writer lock and activate a complete replacement atomically.
 - Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
 - Preserve provider tool-call identity during replay.
 - Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.

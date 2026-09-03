@@ -15,6 +15,16 @@ On macOS this path is `~/.config/uri-agent/sessions-v3.db`, colocated with confi
 Earlier session databases and their sidecars remain untouched. There is no
 migration into `sessions-v3.db`.
 
+Semantic conversation indexes are disposable sidecar caches under the platform
+cache directory at `uri-agent/retrieval/v1/`. The `context` index is keyed by
+session ID; the `sessions` index is keyed by the archive database path and
+covers every project in that archive. Each manifest pins the extractor,
+source digest, zvec release, embedding model revision, tensor checksums,
+dimension, and cosine metric. A mismatched or malformed manifest is stale.
+Rebuilds use a cross-process lock, create a complete replacement separately,
+and activate it by rename, so searches never open a partially written
+collection. Removing these directories loses no session data.
+
 ## AgentHost and Agent specifications
 
 A project runtime owns one `AgentHost`, giving the TUI, linked and WASM plugins,
@@ -69,7 +79,15 @@ but each session remains bound to exactly one canonical project and its
 project-local configuration, plugins, MCP runtime, and Skills.
 See [ACP v1](acp.md#project-and-session-lifecycle).
 
-The read-only `sessions` protocol can search archives across projects when explicitly requested. `@@` completion remains project-scoped. Archive reads never resume or modify a session; see [`sessions`](protocols.md#sessions).
+The `sessions` protocol can search archives across projects when explicitly
+requested. Exact metadata and substring search remain available without an
+index. `exec("sessions://index", "")` starts a managed full rebuild of the
+all-session semantic sidecar; `mode=semantic` performs vector ranking and
+`mode=hybrid` fuses vector and Jieba BM25 ranks. Both ranked modes preserve
+scope, working-directory, record-type, offset, and limit filtering and refuse
+a missing or stale index. `@@` completion remains project-scoped. Archive
+reads and indexing never resume or modify a session; see
+[`sessions`](protocols.md#sessions).
 
 Each session records its provider, model, and thinking effort. Changes append a settings event, and resume restores the latest session settings rather than defaults for a new session.
 
@@ -179,9 +197,10 @@ The built-in `context` protocol provides durable working memory and recovery:
 - current titles and content share a hard budget of 20% of the model window remaining after the frozen prompt, tool definitions, and 4,096-token safety margin; writes warn at 15%;
 - a growth write above the hard budget fails, while shrinking replacements and deletes remain available;
 - deleting a note creates a tombstone that retains ID, title, revisions, anchors, and `已删除`; note content is no longer exposed through `context` or `sessions` reads, while ordinary records around its anchors remain available;
-- note reads, prior-window history, user-statement history, search, and anchor neighborhoods are bounded; note bodies and history pages are paginated. Dedicated user-history routes list and search only original user submissions across all windows. History and neighborhood reads filter the shared `user`, `assistant`, `tool_call`, `tool_result`, and `error` record types.
+- note reads, prior-window history, user-statement history, search, and anchor neighborhoods are bounded; note bodies and history pages are paginated. Dedicated user-history routes list and search only original user submissions across all windows. History and neighborhood reads filter the shared `user`, `assistant`, `tool_call`, `tool_result`, and `error` record types;
+- exact history search remains the default and uses record-ID pagination. `exec("context://history/index", "")` builds a managed semantic sidecar for the current session; user-statement and per-window searches then accept `mode=semantic` or `mode=hybrid` with relevance-order `offset` pagination. Ranked reads refuse a missing or stale index.
 
-Note writes and deletes are sidecar persistence events: they do not modify model replay, and their model-issued tool calls and correlated results remain in the active provider prefix. Notes, handoffs, and context-history results are marked as untrusted reference data. Recovery history excludes system messages, hidden reasoning, all `context://` calls, and their results. Deletion is not secure erasure: the append-only database still contains historical events, but model-facing note and session-history routes do not return the deleted body.
+Note writes and deletes are sidecar persistence events: they do not modify model replay, and their model-issued tool calls and correlated results remain in the active provider prefix. Notes, handoffs, and context-history results are marked as untrusted reference data. Recovery history excludes system messages, hidden reasoning, all `context://` and `sessions://` calls, and their correlated results. Deletion is not secure erasure: the append-only database still contains historical events, but model-facing note and session-history routes do not return the deleted body.
 
 If the model calls `exec("context://rollover", "<optional handoff>")`, the runtime waits until every tool call from that model response has a durable correlated result, then starts the new window. A handoff is bounded to approximately 4,096 tokens. A provider overflow can force one rollover and retry for the current turn.
 

@@ -34,6 +34,7 @@ URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变�
 - **ACP 编辑器集成：**`uri-agent --acpv1` 通过 stdio 提供稳定的 ACP v1 服务，支持按会话选择模型，并可在普通 TUI 中重新打开已有对话。
 - **广泛模型支持：**pi.dev 目录、Provider 专属登录和按凭据隔离的实时发现，把广泛的 Provider 生态集中在同一个模型选择器中。
 - **持久化工作：**长命令会转为受管任务；只追加 SQLite 会话会跨重启保留草稿、固化的启动上下文、有标题的工作笔记，以及 rollover 或 summary checkpoint。
+- **本地语义检索：**随安装包提供固定版本的 zvec 与 Model2Vec 资产，为项目文件和已保存会话提供可选的语义与混合检索；精确 grep 仍是默认模式。
 - **单一终端工作流：**Queue 与 Steer、内置网络访问、键盘和鼠标控制、图片输入，以及 `@` 文件和 `@@` 会话引用都集中在同一个对话界面。
 
 ## 模型与 Provider 覆盖
@@ -76,17 +77,13 @@ scoop bucket add uri-agent https://github.com/4fuu/uri-agent
 scoop install uri-agent
 ```
 
-在 x86-64 或 ARM64 Linux 上，安装脚本会校验 Release checksum，并写入 `~/.local/bin`：
+在 x86-64 或 ARM64 Linux 上，安装脚本会校验 Release checksum，并将完整的版本化安装包写入 `~/.local/bin`：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/4fuu/uri-agent/main/scripts/install.sh | sh
 ```
 
-如需从 crates.io 构建，请先安装 stable Rust 工具链，再运行：
-
-```bash
-cargo install --locked uri-agent
-```
+以上安装方式都包含相匹配的 zvec 动态库、Jieba 词典和 embedding 模型。URI Agent 运行时不会下载语义检索资产。源码构建需要按[开发文档](docs/development.md#native-retrieval-assets)准备同一套资产。
 
 ### 启动第一个会话
 

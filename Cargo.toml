@@ -2,6 +2,7 @@
 name = "uri-agent"
 version = "2026.902.1"
 edition = "2024"
+publish = false
 license = "MIT"
 description = "A protocol-oriented coding agent with a focused terminal interface"
 repository = "https://github.com/4fuu/uri-agent"
@@ -31,6 +32,7 @@ form_urlencoded = "1"
 fs2 = "0.4"
 futures-util = "0.3"
 getrandom = "0.2"
+half = "=2.6.0"
 html-to-markdown-rs = { version = "3.9.2", default-features = false }
 http = "1"
 ignore = "0.4"
@@ -42,6 +44,7 @@ reqwest = { version = "0.13", default-features = false, features = ["brotli", "d
 rig = { package = "rig-core", version = "=0.42.0" }
 rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 rhai = { version = "1", features = ["sync"] }
+safetensors = "=0.6.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -49,6 +52,7 @@ sha2 = "0.10"
 shell-words = "1"
 tar = "0.4"
 textwrap = "0.16"
+tokenizers = { version = "=0.22.1", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -62,6 +66,7 @@ uri-agent-plugin-sdk = { version = "=2026.902.1", path = "sdk" }
 uuid = { version = "1", features = ["serde", "v7"] }
 vt100 = "0.16"
 zip = { version = "4", default-features = false, features = ["deflate"] }
+zvec-rust = "=0.7.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

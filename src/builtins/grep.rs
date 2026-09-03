@@ -3,7 +3,11 @@ use crate::config::display_path;
 use crate::plugin::{
     BinaryDownload, DownloadArchive, Plugin, PluginDownloads, PluginHost, PluginPermission,
 };
+use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::retrieval::{
+    SearchHit, SearchMode, code_corpus, index_status, rebuild_index, search_index,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -14,6 +18,7 @@ use tokio::process::Command;
 
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 2_000;
+const MAX_SEMANTIC_LIMIT: usize = 50;
 const MAX_CONTEXT: usize = 20;
 const RIPGREP_VERSION: &str = "14.1.1";
 
@@ -21,7 +26,7 @@ fn help(cwd: &Path) -> String {
     format!(
         r#"# grep
 
-Search file contents and return bounded `path:line:text` matches.
+Search file contents with exact ripgrep matching or a persistent zvec semantic index.
 
 Current working directory: `grep://{}`
 
@@ -33,6 +38,11 @@ and paths beginning with `~/` resolve from the current user's home directory;
 
 Optional query parameters:
 
+- `mode=exact` (the default) uses ripgrep and preserves the existing behavior.
+- `mode=semantic` ranks indexed code by vector similarity.
+- `mode=hybrid` combines vector and Jieba BM25 ranks with reciprocal-rank fusion.
+- `mode=status` reports whether the selected root's semantic index is current;
+  its body must be empty.
 - `glob=<pattern>` filters searched paths with a glob pattern.
 - Search patterns are regular expressions by default. If a pattern is not valid
   as a regular expression, the protocol retries it as literal text.
@@ -41,16 +51,30 @@ Optional query parameters:
 - `context=<0..20>` includes surrounding lines.
 - `limit=<1..2000>` bounds the number of matches; the default is 200.
 
+Semantic and hybrid reads accept only `mode`, `glob`, and `limit`; their
+default limit is 7 and maximum is 50. They fail rather than use a missing or
+stale index. Build or refresh that exact root/glob index first with:
+
+```text
+exec("grep://<root>?mode=index&glob=<pattern>", "")
+```
+
+Indexing follows standard ignore files, skips binary/non-UTF-8 files and files
+larger than 1 MiB, and chunks readable text into line-ranged groups. Index data
+is a rebuildable cache; source files are never changed.
+
 Examples:
 
 ```text
 read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
 read("grep://src/tui/app.rs", "fn push(")
 read("grep://?literal=true&ignore_case=true", "exact text")
+exec("grep://src?mode=index&glob=**/*.rs", "")
+read("grep://src?mode=hybrid&glob=**/*.rs&limit=10", "authentication flow")
 ```
 
-`grep://help` MUST use an empty string body. This protocol supports `read` only;
-it does not support `exec`.
+`grep://help` MUST use an empty string body. `exec` supports only
+`mode=index` with an empty body.
 "#,
         display_path(cwd)
     )
@@ -98,10 +122,9 @@ impl Protocol for GrepProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: "grep".to_string(),
-            description: "Search file contents with bounded results and optional glob filtering."
-                .to_string(),
+            description: "Search file contents with exact ripgrep matching or indexed semantic and hybrid retrieval.".to_string(),
             can_read: true,
-            can_exec: false,
+            can_exec: true,
         }
     }
 
@@ -116,61 +139,125 @@ impl Protocol for GrepProtocol {
             }
             return Ok(help(&self.cwd).into_bytes());
         }
-        if request.body.is_empty() {
-            bail!(
-                "grep requires a nonempty search pattern in the body; use read({:?}, \"<pattern>\")",
-                request.uri
-            );
-        }
         let (root, query) = request
             .target
             .split_once('?')
             .map_or((request.target, None), |(root, query)| (root, Some(query)));
         let options = GrepOptions::parse(query)?;
         let resolved = resolve_path(&self.cwd, root)?;
-        let metadata = tokio::fs::metadata(&resolved)
-            .await
-            .with_context(|| format!("cannot search {}", display_path(&resolved)))?;
-        if !metadata.is_dir() && !metadata.is_file() {
-            bail!(
-                "grep root is not a regular file or directory: {}",
-                display_path(&resolved)
-            );
+        validate_root(&resolved).await?;
+        match options.mode {
+            GrepMode::Exact => {
+                require_search_body(request.body, request.uri)?;
+                let downloads = self
+                    .downloads
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("grep binary download access is not attached"))?;
+                let rg = downloads.ensure(&ripgrep_download()?).await?;
+                run_grep(
+                    &rg,
+                    &self.cwd,
+                    &grep_root_argument(&self.cwd, root, &resolved),
+                    request.body,
+                    &options,
+                )
+                .await
+                .map(String::into_bytes)
+            }
+            GrepMode::Semantic(mode) => {
+                require_search_body(request.body, request.uri)?;
+                options.validate_semantic()?;
+                let corpus = code_corpus(&self.cwd, &resolved, options.glob.as_deref()).await?;
+                let hits = search_index(
+                    &corpus.spec,
+                    &corpus.snapshot,
+                    request.body,
+                    mode,
+                    options.semantic_limit(),
+                )
+                .await?;
+                Ok(format_semantic_results(&hits, mode).into_bytes())
+            }
+            GrepMode::Status => {
+                if !request.body.is_empty() {
+                    bail!("grep semantic index status requires an empty body");
+                }
+                options.validate_index_operation()?;
+                let corpus = code_corpus(&self.cwd, &resolved, options.glob.as_deref()).await?;
+                Ok(index_status(&corpus.spec, &corpus.snapshot)
+                    .await?
+                    .format("Code")
+                    .into_bytes())
+            }
         }
-        let downloads = self
-            .downloads
-            .as_ref()
-            .ok_or_else(|| anyhow!("grep binary download access is not attached"))?;
-        let rg = downloads.ensure(&ripgrep_download()?).await?;
-        run_grep(
-            &rg,
-            &self.cwd,
-            &grep_root_argument(&self.cwd, root, &resolved),
-            request.body,
-            &options,
-        )
-        .await
-        .map(String::into_bytes)
     }
+
+    async fn exec(
+        &self,
+        request: ProtocolRequest<'_>,
+        context: ProtocolContext,
+    ) -> Result<Vec<u8>> {
+        let (root, query) = request
+            .target
+            .split_once('?')
+            .map_or((request.target, None), |(root, query)| (root, Some(query)));
+        let options = GrepOptions::parse_exec(query)?;
+        if !request.body.is_empty() {
+            bail!("grep semantic indexing requires an empty body");
+        }
+        options.validate_index_operation()?;
+        let resolved = resolve_path(&self.cwd, root)?;
+        validate_root(&resolved).await?;
+        let label = format!("Index code under {}", display_path(&resolved));
+        let record = context.tasks.allocate_background("grep", label).await?;
+        let id = record.id.clone();
+        let cwd = self.cwd.clone();
+        let glob = options.glob.clone();
+        context
+            .tasks
+            .spawn_with_cancellation(record, move |cancellation| async move {
+                let corpus = code_corpus(&cwd, &resolved, glob.as_deref()).await?;
+                if cancellation.is_cancelled() {
+                    bail!("code indexing was cancelled before writing the index");
+                }
+                Ok(rebuild_index(&corpus.spec, corpus.snapshot)
+                    .await?
+                    .format("Code")
+                    .into_bytes())
+            })
+            .await;
+        Ok(prompts::task_accepted(&id).into_bytes())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GrepMode {
+    Exact,
+    Semantic(SearchMode),
+    Status,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct GrepOptions {
+    mode: GrepMode,
     glob: Option<String>,
     literal: bool,
     ignore_case: bool,
     context: usize,
     limit: usize,
+    limit_set: bool,
 }
 
 impl GrepOptions {
     fn parse(query: Option<&str>) -> Result<Self> {
         let mut options = Self {
+            mode: GrepMode::Exact,
             glob: None,
             literal: false,
             ignore_case: false,
             context: 0,
             limit: DEFAULT_LIMIT,
+            limit_set: false,
         };
         let mut seen = std::collections::HashSet::new();
         for pair in query
@@ -185,6 +272,19 @@ impl GrepOptions {
                 bail!("duplicate grep query parameter: {name}");
             }
             match name {
+                "mode" => {
+                    options.mode = match value {
+                        "exact" => GrepMode::Exact,
+                        "semantic" | "hybrid" => {
+                            GrepMode::Semantic(SearchMode::parse(value, "grep")?)
+                        }
+                        "status" => GrepMode::Status,
+                        "index" => bail!("grep mode=index is available only through exec"),
+                        _ => {
+                            bail!("grep mode must be exact, semantic, hybrid, or status for reads")
+                        }
+                    }
+                }
                 "glob" if !value.is_empty() => options.glob = Some(value.to_string()),
                 "glob" => bail!("grep glob cannot be empty"),
                 "literal" => options.literal = parse_bool(name, value)?,
@@ -204,12 +304,92 @@ impl GrepOptions {
                     if !(1..=MAX_LIMIT).contains(&options.limit) {
                         bail!("grep limit must be between 1 and {MAX_LIMIT}");
                     }
+                    options.limit_set = true;
                 }
                 _ => bail!("unknown grep query parameter: {name}"),
             }
         }
         Ok(options)
     }
+
+    fn parse_exec(query: Option<&str>) -> Result<Self> {
+        let Some(query) = query else {
+            bail!("grep exec requires mode=index");
+        };
+        let rewritten = query
+            .split('&')
+            .map(|pair| {
+                if pair == "mode=index" {
+                    "mode=status"
+                } else {
+                    pair
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        if !query.split('&').any(|pair| pair == "mode=index") {
+            bail!("grep exec requires mode=index");
+        }
+        let mut options = Self::parse(Some(&rewritten))?;
+        options.mode = GrepMode::Status;
+        Ok(options)
+    }
+
+    fn validate_semantic(&self) -> Result<()> {
+        if self.literal || self.ignore_case || self.context != 0 {
+            bail!("semantic grep accepts only mode, glob, and limit");
+        }
+        if self.limit_set && self.limit > MAX_SEMANTIC_LIMIT {
+            bail!("semantic grep limit cannot exceed {MAX_SEMANTIC_LIMIT}");
+        }
+        Ok(())
+    }
+
+    fn validate_index_operation(&self) -> Result<()> {
+        if self.literal || self.ignore_case || self.context != 0 || self.limit_set {
+            bail!("grep semantic index operations accept only mode and glob");
+        }
+        Ok(())
+    }
+
+    fn semantic_limit(&self) -> usize {
+        if self.limit_set { self.limit } else { 7 }
+    }
+}
+
+fn require_search_body(body: &str, uri: &str) -> Result<()> {
+    if body.is_empty() {
+        bail!(
+            "grep requires a nonempty search pattern in the body; use read({uri:?}, \"<pattern>\")"
+        );
+    }
+    Ok(())
+}
+
+async fn validate_root(resolved: &Path) -> Result<()> {
+    let metadata = tokio::fs::metadata(resolved)
+        .await
+        .with_context(|| format!("cannot search {}", display_path(resolved)))?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        bail!(
+            "grep root is not a regular file or directory: {}",
+            display_path(resolved)
+        );
+    }
+    Ok(())
+}
+
+fn format_semantic_results(hits: &[SearchHit], mode: SearchMode) -> String {
+    if hits.is_empty() {
+        return "No matches.\n".to_string();
+    }
+    let mut output = format!("Code {} search · ranked results\n", mode.label());
+    for hit in hits {
+        output.push_str(&format!("\n{} · score={:.6}\n", hit.label, hit.score));
+        output.push_str(hit.text.trim_end());
+        output.push('\n');
+    }
+    output
 }
 
 fn parse_bool(name: &str, value: &str) -> Result<bool> {
@@ -489,12 +669,34 @@ mod tests {
             ))
             .unwrap(),
             GrepOptions {
+                mode: GrepMode::Exact,
                 glob: Some("**/*.rs".to_string()),
                 literal: true,
                 ignore_case: true,
                 context: 2,
                 limit: 10,
+                limit_set: true,
             }
+        );
+        assert_eq!(
+            GrepOptions::parse(Some("mode=semantic"))
+                .unwrap()
+                .semantic_limit(),
+            7
+        );
+        assert!(
+            GrepOptions::parse(Some("mode=hybrid&limit=51"))
+                .unwrap()
+                .validate_semantic()
+                .is_err()
+        );
+        assert!(GrepOptions::parse_exec(Some("mode=index&glob=**/*.rs")).is_ok());
+        assert!(GrepOptions::parse_exec(Some("mode=semantic")).is_err());
+        assert!(
+            GrepOptions::parse_exec(Some("mode=index&limit=1"))
+                .unwrap()
+                .validate_index_operation()
+                .is_err()
         );
         assert!(GrepOptions::parse(Some("context=21")).is_err());
         assert!(GrepOptions::parse(Some("limit=0")).is_err());

@@ -296,6 +296,14 @@ Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path.
 
 Sessions live in this configuration directory on macOS after the Application Support cutover. On other platforms, sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Session storage and project boundaries](sessions.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
 
+Semantic indexes live under `<platform-cache-dir>/uri-agent/retrieval/v1/`,
+separated into code-root, current-session, and all-session namespaces. They are
+derived caches rather than settings or authoritative conversation data and may
+be deleted at any time. A later semantic search requires the corresponding
+index operation to rebuild them. The zvec runtime, Jieba dictionaries, and
+embedding model are installed beside the executable, not downloaded into the
+configuration or cache directory at runtime.
+
 Atomic updates to `settings.json`, project settings, `auth.json`,
 `environment.json`, and user or project `mcp.json` preserve symbolic links at
 those paths. URI Agent resolves complete and dangling multi-hop chains, writes a

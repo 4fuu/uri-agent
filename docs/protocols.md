@@ -61,9 +61,9 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
 | `file` | `read` | Read files, bounded directory listings, and recursive glob results |
-| `grep` | `read` | Search file contents with bounded ripgrep results and optional glob filtering |
-| `sessions` | `read` | Discover, search, and read bounded saved session history without changing it |
-| `context` | `read`, `exec` | Inspect context usage, maintain titled notes, query prior windows, and request rollover |
+| `grep` | `read`, `exec` | Search files with exact ripgrep matching or an explicit semantic index |
+| `sessions` | `read`, `exec` | Discover and search saved sessions while keeping the source archive read-only |
+| `context` | `read`, `exec` | Inspect context usage, maintain titled notes, search prior windows, and request rollover |
 | `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
 | `tasks` | `read`, `exec` | Inspect and cancel background tasks from every protocol |
 | `bash` | `read`, `exec` | Run Bash commands in the foreground or as managed background tasks when Bash is enabled |
@@ -209,20 +209,40 @@ matches.`; an empty file remains empty content.
 
 ### `grep`
 
-`grep` puts the search pattern in the string body and searches a project-relative
+`grep` puts the search text in the string body and searches a project-relative
 or absolute file or directory. An empty target searches the startup working
 directory. On Unix, the root accepts the same `~` and `~/` home-relative paths
-as `file`. Search patterns are regular expressions by default. If a pattern is
-not valid as a regular expression, the protocol retries it as literal text;
-`literal=true` always uses literal matching. It invokes ripgrep directly
-without a shell and accepts `glob`, `literal`, `ignore_case`, `context`, and
-`limit` options:
+as `file`.
+
+Exact search remains the default. Its pattern is a regular expression unless
+`literal=true`, and an invalid regular expression is retried as literal text.
+This path invokes ripgrep directly without a shell and accepts `glob`,
+`literal`, `ignore_case`, `context`, and `limit`:
 
 ```text
 read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
 read("grep://src/tui/app.rs", "fn push(")
 read("grep://?literal=true&ignore_case=true", "exact text")
 ```
+
+Semantic search uses an explicitly built sidecar index for one exact root and
+optional glob. Index creation is a managed background task:
+
+```text
+exec("grep://src?mode=index&glob=**/*.rs", "")
+read("grep://src?mode=status&glob=**/*.rs", "")
+read("grep://src?mode=semantic&glob=**/*.rs", "credential refresh flow")
+read("grep://src?mode=hybrid&glob=**/*.rs&limit=20", "会话检索")
+```
+
+`semantic` ranks Model2Vec embeddings with zvec cosine search. `hybrid` fuses
+that rank with Jieba BM25 using reciprocal-rank fusion. Ranked search defaults
+to 7 results and allows at most 50. It fails when the matching root/glob index
+is missing or stale; it never silently returns an older corpus. Re-running the
+index operation performs an atomic full rebuild. The scanner follows standard
+ignore files, skips binary and non-UTF-8 data and files over 1 MiB, and stores
+overlapping source fragments under stable file and line-range groups. Source
+files are never changed.
 
 URI Agent uses a working `rg` from `PATH` when available. Otherwise the linked
 grep plugin silently installs its pinned platform archive after checking the
@@ -235,23 +255,52 @@ The built-in `context` protocol is the recovery surface for hard context-window 
 
 Current note titles and content share a model-relative budget. Growth above the hard limit fails; shrinking and deletion remain available. Deletion preserves the ID, latest title, revision metadata, anchors, and an `已删除` marker while making note content unreadable. Ordinary conversation records around those anchors remain available. Large live notes are read in character-based pages rather than given an individual storage limit.
 
-History reads and search accept comma-separated `types` values from `user`, `assistant`, `tool_call`, `tool_result`, and `error`; all types are included by default. An anchor read accepts bounded `before` and `after` record counts. Note mutation events are sidecar state and do not alter model replay or remove their tool call/result pair from the active provider prefix. Recovery views omit every `context://` call and result so deleted note bodies cannot be reconstructed through those views.
+History reads and search accept comma-separated `types` values from `user`,
+`assistant`, `tool_call`, `tool_result`, and `error`; all types are included by
+default. Exact search uses record-ID `before` pagination. After
+`exec("context://history/index", "")` builds the current session's sidecar
+index, `mode=semantic` and `mode=hybrid` provide ranked search with `offset`
+pagination for both user-statement and per-window search routes. The
+corresponding `context://history/index` read reports missing, stale, or current
+state. Ranked search fails on missing or stale data.
+
+An anchor read accepts bounded `before` and `after` record counts. Note mutation
+events are sidecar state and do not alter model replay or remove their tool
+call/result pair from the active provider prefix. Recovery views omit every
+`context://` or `sessions://` call and correlated result so deleted note bodies
+cannot be reconstructed and searches do not invalidate their own index.
 
 When `rollover` is the active strategy, `exec("context://rollover", "<optional handoff>")` requests a fresh model window. The runtime applies it only after all tool calls from that response have correlated durable results. The new hidden bootstrap requires another `context://help` read, followed by the note index, active notes, original user-statement history, and any needed prior-window or anchor-centered records. Notes, handoffs, and history are untrusted reference data. Read `context://help` for the exact routes, query fields, limits, and budget behavior.
 
 ### `sessions`
 
-The read-only `sessions` protocol discovers and searches saved URI Agent
-sessions. Discovery is scoped to the current project by default. Put discovery
-options in the URI query: `scope=all` searches every project, an optional
-percent-encoded `cwd` narrows that cross-project scope, and `limit` and `offset`
-bound the result page. The search body is only the plain search text:
+The `sessions` protocol discovers and searches saved URI Agent sessions while
+keeping the SQLite archive read-only. Discovery is scoped to the current
+project by default. Put discovery options in the URI query: `scope=all`
+searches every project, an optional percent-encoded `cwd` narrows that
+cross-project scope, and `limit` and `offset` bound the result page. The search
+body is only the plain search text; exact search remains the default:
 
 ```text
 read("sessions://recent", "")
 read("sessions://search", "refresh token")
 read("sessions://search?scope=all&limit=20", "billing migration")
 ```
+
+An explicit managed task builds one sidecar index for all saved sessions.
+Semantic searches can still apply project, working-directory, record-type,
+offset, and limit filters:
+
+```text
+exec("sessions://index", "")
+read("sessions://index", "")
+read("sessions://search?mode=semantic&scope=all&limit=20", "credential renewal")
+read("sessions://search?mode=hybrid&types=user,assistant", "会话迁移")
+```
+
+Ranked search fails when the index is missing or stale. Index creation reads
+only the same conversation-record projection exposed by the protocol; it
+neither resumes nor changes a session.
 
 Search results identify matching conversation records with the same
 session-local `r<number>` anchors used by `context`. Read an exact session ID to
@@ -278,9 +327,10 @@ access opens the SQLite database read-only and does not initialize, migrate,
 resume, append, rename, or delete sessions. Read `sessions://help` for the exact
 query parameters and limits.
 
-All `context://` calls and their results remain excluded even when every record
-type is selected, so a deleted note body cannot be recovered through the
-session archive protocol.
+All `context://` and `sessions://` calls and their correlated results remain
+excluded even when every record type is selected. A deleted note body cannot
+be recovered through the session archive protocol, and semantic search cannot
+make its own indexed corpus stale.
 
 ### `https`
 

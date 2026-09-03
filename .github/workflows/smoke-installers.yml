@@ -43,6 +43,12 @@ jobs:
         run: |
           URI_AGENT_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh "$VERSION"
           "$RUNNER_TEMP/bin/uri-agent" --version | grep -F "uri-agent $VERSION"
+          root="$RUNNER_TEMP/bin/uri-agent-$VERSION"
+          test -f "$root/libzvec_c_api.so"
+          test -f "$root/retrieval/models/potion-code-16M-v2/model.safetensors"
+          test -f "$root/retrieval/models/potion-code-16M-v2/tokenizer.json"
+          test -f "$root/retrieval/jieba/jieba.dict.utf8"
+          test -f "$root/retrieval/jieba/hmm_model.utf8"
       - name: Test Homebrew formula
         if: matrix.installer == 'homebrew'
         shell: bash
@@ -53,6 +59,10 @@ jobs:
           brew tap 4fuu/uri-agent "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
           brew install 4fuu/uri-agent/uri-agent
           uri-agent --version | grep -F "uri-agent $VERSION"
+          root="$(brew --prefix uri-agent)/libexec"
+          test -f "$root/libzvec_c_api.dylib"
+          test -f "$root/retrieval/models/potion-code-16M-v2/model.safetensors"
+          test -f "$root/retrieval/jieba/jieba.dict.utf8"
       - name: Test Scoop manifest payload
         if: matrix.installer == 'scoop'
         shell: pwsh
@@ -69,3 +79,10 @@ jobs:
           Expand-Archive $archive $destination
           $output = & "$destination/uri-agent.exe" --version
           if ($output -ne "uri-agent $env:VERSION") { throw "Unexpected version: $output" }
+          @(
+            "$destination/zvec_c_api.dll",
+            "$destination/retrieval/models/potion-code-16M-v2/model.safetensors",
+            "$destination/retrieval/models/potion-code-16M-v2/tokenizer.json",
+            "$destination/retrieval/jieba/jieba.dict.utf8",
+            "$destination/retrieval/jieba/hmm_model.utf8"
+          ) | ForEach-Object { if (-not (Test-Path $_ -PathType Leaf)) { throw "Missing bundled asset: $_" } }

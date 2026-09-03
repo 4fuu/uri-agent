@@ -133,6 +133,10 @@ impl SessionArchive {
         Self::at(session_database_path(cwd), cwd)
     }
 
+    pub(crate) fn index_identity(&self) -> String {
+        self.database_path.to_string_lossy().into_owned()
+    }
+
     pub(crate) fn at(database_path: PathBuf, cwd: &Path) -> Self {
         Self {
             database_path,

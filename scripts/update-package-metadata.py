@@ -9,8 +9,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/4fuu/uri-agent"
 TARGETS = {
-    "linux_arm": ("aarch64-unknown-linux-musl", "tar.gz"),
-    "linux_intel": ("x86_64-unknown-linux-musl", "tar.gz"),
+    "linux_arm": ("aarch64-unknown-linux-gnu", "tar.gz"),
+    "linux_intel": ("x86_64-unknown-linux-gnu", "tar.gz"),
     "mac_arm": ("aarch64-apple-darwin", "tar.gz"),
     "windows_intel": ("x86_64-pc-windows-msvc", "zip"),
 }
@@ -67,7 +67,8 @@ def formula(version: str, checksums: dict[str, str]) -> str:
   end
 
   def install
-    bin.install "uri-agent"
+    libexec.install Dir["*"]
+    bin.install_symlink libexec/"uri-agent"
   end
 
   test do
@@ -85,6 +86,7 @@ def scoop_manifest(version: str, checksums: dict[str, str]) -> dict[str, object]
         "description": "Protocol-oriented coding agent with a focused terminal interface",
         "homepage": REPOSITORY,
         "license": "MIT",
+        "notes": "The native retrieval runtime, dictionaries, and embedding model are bundled in the installation directory.",
         "architecture": {
             "64bit": {
                 "url": release_url(version, target, extension),
