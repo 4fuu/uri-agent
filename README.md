@@ -8,12 +8,14 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is a protocol-oriented terminal coding agent. Through URI protocols,
-it lets any tool load the way Skills do in other agents: the model sees only a
-compact name and description at first, then reads the full contract,
-instructions, and resources when it selects that tool.
+URI Agent is an extensible terminal coding agent that keeps model context
+focused on the current task. Its tools use URI protocols to load their full
+contracts, instructions, and resources only when selected, much like Skills in
+other agents. At first, the model sees only each tool's compact name and
+description.
 
-Its built-in plugins register a small model-facing interface:
+Four built-in tools give the model a compact interface for reading, executing,
+and editing:
 
 ```text
 read(uri: string, body: string)
@@ -22,10 +24,10 @@ replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`read` and `exec` route simple string input through URI protocols; their body is
-always a string, including `""` when empty. Typed tools handle arguments that
-would be awkward or error-prone to encode as strings. Trusted WASM plugins can
-register more protocols and typed tools at runtime.
+`read` and `exec` always take string bodies and route them through URI
+protocols; use `""` when a body is empty. Typed tools handle structured or
+escape-heavy arguments. Trusted WASM plugins can add protocols and typed tools
+at runtime.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols, and enabled WASM
@@ -39,35 +41,31 @@ supported providers.
 
 ## Why URI Agent
 
-- **Progressive context:** protocol contracts, Skill resources, embedded
-  documentation, and oversized output stay out of the model context until they
-  are needed.
-- **Extensible tools:** linked and trusted WASM plugins can add protocols or
-  typed tools without changing the runtime dispatch path.
-- **Built-in MCP bridge:** `:mcp` manages stdio and Streamable HTTP servers,
-  exposing each one as an on-demand `<name>-mcp://` protocol with query-first
-  arguments and a complete-JSON fallback for complex schemas.
-- **ACP editor integration:** `uri-agent --acpv1` serves stable ACP v1 over
-  stdio, with per-session model setup and conversations that can later reopen
-  through the normal TUI.
-- **Broad model access:** the pi.dev catalog, provider-specific sign-in, and
-  credential-scoped live discovery bring a wide provider ecosystem into one
-  model selector.
-- **Durable work:** long commands become managed tasks, while append-only
-  SQLite sessions preserve drafts, frozen startup context, titled working
-  notes, and rollover or summary checkpoints across restarts.
-- **Local semantic retrieval:** fixed, bundled zvec and Model2Vec assets add
-  on-demand semantic and hybrid search to project files and saved
-  conversations. Ranked reads create or incrementally refresh private caches;
-  exact grep remains the default.
-- **One terminal workflow:** Queue and Steer, built-in web access, keyboard and
-  mouse controls, image input, and `@` file or `@@` session references share one
+- **Progressive context:** load protocol contracts, Skill resources, embedded
+  documentation, and oversized output only when they are needed.
+- **Extensible tools:** add protocols or typed tools through linked Rust plugins
+  and trusted WASM plugins without changing runtime dispatch.
+- **Built-in MCP bridge:** connect stdio and Streamable HTTP servers with
+  `:mcp`. Each server becomes an on-demand `<name>-mcp://` protocol, with
+  query-first arguments and a complete-JSON fallback for complex schemas.
+- **ACP editor integration:** use URI Agent from compatible editors through
+  stable ACP v1 over stdio. Each session can select its model, and its
+  conversation can later reopen in the normal TUI.
+- **Broad model access:** choose from the pi.dev catalog, use provider-specific
+  sign-in, and discover account models without leaving the model selector.
+- **Durable work:** let long commands continue as managed tasks and resume work
+  across restarts. Append-only SQLite sessions preserve drafts, frozen startup
+  context, titled working notes, and rollover or summary checkpoints.
+- **Local semantic retrieval:** run on-demand semantic and hybrid search across
+  project files and saved conversations with bundled zvec and Model2Vec assets.
+- **One terminal workflow:** use Queue and Steer, web access, keyboard and mouse
+  controls, image input, and `@` file or `@@` session references from one
   conversation surface.
 
 ## Model and provider coverage
 
-URI Agent deliberately targets broad pi.dev compatibility rather than a fixed
-handful of models. As of 2026-08-30, the current catalog coverage is:
+URI Agent targets broad compatibility with the pi.dev catalog rather than a
+fixed handful of models. As of 2026-08-30, the catalog coverage is:
 
 | Catalog measure | Supported |
 | --- | ---: |
@@ -81,14 +79,18 @@ OpenAI Chat Completions, Anthropic Messages, and Google Generative AI. Live
 provider results are cached per credential and supplement the shared catalog,
 so newly available account models can appear before pi.dev adds them.
 
-Dedicated integrations cover the places where generic catalog compatibility is
-not enough: ChatGPT Codex subscription OAuth and WebSocket transport,
-Cloudflare AI Gateway's credential-safe endpoint boundary, WorkBuddy China
-browser login and account model discovery, and the explicitly experimental
-Antigravity private protocol. A built-in Abliteration.ai catalog provides
-credential-scoped live discovery and static fallback models. URI Agent also
-supports provider-specific login flows for Anthropic, GitHub Copilot, Kimi
-Coding, xAI, Radius, and OpenRouter.
+Where generic catalog compatibility is not enough, URI Agent provides dedicated
+integrations for:
+
+- ChatGPT Codex subscription OAuth and WebSocket transport;
+- Cloudflare AI Gateway with credential-safe endpoint handling;
+- WorkBuddy China browser login and account model discovery;
+- the explicitly experimental Antigravity private protocol; and
+- Abliteration.ai credential-scoped live discovery with static fallback
+  models.
+
+URI Agent also supports provider-specific login flows for Anthropic, GitHub
+Copilot, Kimi Coding, xAI, Radius, and OpenRouter.
 
 Catalog contents and account entitlements change; a listed model still requires
 the matching credentials, region, and subscription. See [Models and
@@ -125,10 +127,11 @@ installs the complete versioned bundle under `~/.local/bin`:
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/4fuu/uri-agent/main/scripts/install.sh | sh
 ```
 
-These installation paths include the matching zvec dynamic library, Jieba
-dictionaries, and embedding model. URI Agent does not download semantic
-retrieval assets at runtime. Source builds must prepare the same assets as
-described in the [development guide](docs/development.md#native-retrieval-assets).
+Every installation method above includes the matching zvec dynamic library,
+Jieba dictionaries, and embedding model. URI Agent does not download these
+semantic retrieval assets at runtime. Source builds must prepare the same
+assets as described in the [development
+guide](docs/development.md#native-retrieval-assets).
 
 ### Start your first session
 
@@ -138,7 +141,10 @@ Launch URI Agent with the project directory it should use:
 uri-agent --cwd /path/to/project
 ```
 
-`--cwd` sets the project and default working directory; it is not a filesystem access boundary. If the project contains `AGENTS.md`, review it before launch: new sessions include those instructions and freeze their startup context.
+`--cwd` selects the project and default working directory; it does not restrict
+filesystem access. If the project contains `AGENTS.md`, review it before
+launch: new sessions include those instructions in their frozen startup
+context.
 
 URI Agent does not choose a default model. In the TUI:
 
@@ -146,26 +152,28 @@ URI Agent does not choose a default model. In the TUI:
 2. Run `:model` and select a runnable model.
 3. Press `Space`, enter a request, and press `Enter`.
 
-The first session is working when protocol activity appears and the assistant returns an answer based on the project. Press `F1` or run `:help` for the active commands and key bindings.
+The first session is working when protocol activity appears and the assistant
+returns an answer based on the project. Press `F1` or run `:help` for the active
+commands and key bindings.
 
 See [Models and configuration](docs/configuration.md) for provider support,
 authentication, offline mode, environment variables, and custom endpoints.
 
 ### Connect an ACP client
 
-After configuring model authentication in the TUI, configure an ACP client to
+After signing in to a model provider in the TUI, configure an ACP client to
 launch:
 
 ```text
 uri-agent --acpv1
 ```
 
-The client supplies each session's absolute project directory; one ACP process
-can host independent sessions for multiple projects. Compatible ACP clients can
-select an authenticated model and thinking level before the first prompt
-without changing URI Agent's defaults. The first prompt makes the session
-durable under its already assigned ID; it can reopen in the TUI after the client
-releases it. See [ACP v1](docs/acp.md) for supported content, MCP servers,
+The client supplies an absolute project directory for each session, and one ACP
+process can host independent sessions for multiple projects. Compatible ACP
+clients can select an authenticated model and thinking level before the first
+prompt without changing URI Agent's defaults. The first prompt persists the
+session under its assigned ID; after the client releases it, the session can
+reopen in the TUI. See [ACP v1](docs/acp.md) for supported content, MCP servers,
 lifecycle operations, and ownership constraints.
 
 ## Documentation
