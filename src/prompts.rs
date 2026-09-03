@@ -63,7 +63,7 @@ fn write_entries(prompt: &mut String, entries: &[PromptEntry]) {
 
 pub fn task_accepted(id: &str) -> String {
     format!(
-        "Background task accepted: tasks://{id}\nCompletion will be delivered automatically. If the result is needed before continuing, read tasks://help and use its bounded wait; do not repeatedly poll."
+        "Background task started: tasks://{id}\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, read(\"tasks://help\", \"\") if needed, then use one bounded wait. Do not poll or rerun the operation."
     )
 }
 
@@ -139,7 +139,7 @@ mod tests {
     fn task_acceptance_points_to_bounded_wait_without_inviting_polling() {
         assert_eq!(
             task_accepted("001"),
-            "Background task accepted: tasks://001\nCompletion will be delivered automatically. If the result is needed before continuing, read tasks://help and use its bounded wait; do not repeatedly poll."
+            "Background task started: tasks://001\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, read(\"tasks://help\", \"\") if needed, then use one bounded wait. Do not poll or rerun the operation."
         );
     }
 }

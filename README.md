@@ -56,6 +56,10 @@ supported providers.
 - **Durable work:** long commands become managed tasks, while append-only
   SQLite sessions preserve drafts, frozen startup context, titled working
   notes, and rollover or summary checkpoints across restarts.
+- **Local semantic retrieval:** fixed, bundled zvec and Model2Vec assets add
+  on-demand semantic and hybrid search to project files and saved
+  conversations. Ranked reads create or incrementally refresh private caches;
+  exact grep remains the default.
 - **One terminal workflow:** Queue and Steer, built-in web access, keyboard and
   mouse controls, image input, and `@` file or `@@` session references share one
   conversation surface.
@@ -114,17 +118,17 @@ scoop bucket add uri-agent https://github.com/4fuu/uri-agent
 scoop install uri-agent
 ```
 
-On x86-64 or ARM64 Linux, the installer verifies the release checksum and writes to `~/.local/bin`:
+On x86-64 or ARM64 Linux, the installer verifies the release checksum and
+installs the complete versioned bundle under `~/.local/bin`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/4fuu/uri-agent/main/scripts/install.sh | sh
 ```
 
-To build from crates.io, install a stable Rust toolchain and run:
-
-```bash
-cargo install --locked uri-agent
-```
+These installation paths include the matching zvec dynamic library, Jieba
+dictionaries, and embedding model. URI Agent does not download semantic
+retrieval assets at runtime. Source builds must prepare the same assets as
+described in the [development guide](docs/development.md#native-retrieval-assets).
 
 ### Start your first session
 

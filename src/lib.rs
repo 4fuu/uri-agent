@@ -15,6 +15,7 @@ pub mod plugin_state;
 mod process;
 pub mod prompts;
 pub mod protocol;
+mod retrieval;
 pub mod runtime;
 pub mod session;
 pub mod skill;

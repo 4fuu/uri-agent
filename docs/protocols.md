@@ -61,9 +61,9 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
 | `file` | `read` | Read files, bounded directory listings, and recursive glob results |
-| `grep` | `read` | Search file contents with bounded ripgrep results and optional glob filtering |
-| `sessions` | `read` | Discover, search, and read bounded saved session history without changing it |
-| `context` | `read`, `exec` | Inspect context usage, maintain titled notes, query prior windows, and request rollover |
+| `grep` | `read`, `exec` | Search files with exact ripgrep matching or on-demand semantic retrieval |
+| `sessions` | `read`, `exec` | Discover and search saved sessions while keeping the source archive read-only |
+| `context` | `read`, `exec` | Inspect context usage, maintain titled notes, search prior windows, and request rollover |
 | `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
 | `tasks` | `read`, `exec` | Inspect and cancel background tasks from every protocol |
 | `bash` | `read`, `exec` | Run Bash commands in the foreground or as managed background tasks when Bash is enabled |
@@ -209,20 +209,49 @@ matches.`; an empty file remains empty content.
 
 ### `grep`
 
-`grep` puts the search pattern in the string body and searches a project-relative
+`grep` puts the search text in the string body and searches a project-relative
 or absolute file or directory. An empty target searches the startup working
 directory. On Unix, the root accepts the same `~` and `~/` home-relative paths
-as `file`. Search patterns are regular expressions by default. If a pattern is
-not valid as a regular expression, the protocol retries it as literal text;
-`literal=true` always uses literal matching. It invokes ripgrep directly
-without a shell and accepts `glob`, `literal`, `ignore_case`, `context`, and
-`limit` options:
+as `file`.
+
+Exact search remains the default. Its pattern is a regular expression unless
+`literal=true`, and an invalid regular expression is retried as literal text.
+This path invokes ripgrep directly without a shell and accepts `glob`,
+`literal`, `ignore_case`, `context`, and `limit`:
 
 ```text
 read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
 read("grep://src/tui/app.rs", "fn push(")
 read("grep://?literal=true&ignore_case=true", "exact text")
 ```
+
+Semantic search uses a private sidecar index for one exact root and optional
+glob. A ranked read creates or incrementally refreshes that cache itself:
+
+```text
+read("grep://src?mode=semantic&glob=**/*.rs", "credential refresh flow")
+read("grep://src?mode=hybrid&glob=**/*.rs&limit=20", "会话检索")
+read("grep://src?mode=status&glob=**/*.rs", "")
+exec("grep://src?mode=index&glob=**/*.rs", "")
+```
+
+`semantic` ranks Model2Vec embeddings with zvec cosine search. `hybrid` fuses
+that rank with Jieba BM25 using reciprocal-rank fusion. Use exact search for
+known identifiers and literals, prefer hybrid for conceptual searches, and use
+semantic when relevant results are likely to use different wording. Ranked
+search defaults to 7 results and allows at most 50. It searches only after the
+source catalog and cache agree, and retries a bounded number of times if files
+change during indexing. Small operations return results directly; after about
+60 seconds the same operation continues as a managed task whose completion
+carries the search result. If the notification marks its output truncated,
+follow its `tasks://` instruction once instead of rerunning the search. Do not
+call `mode=status` or `mode=index` before a ranked search: status is diagnostic,
+while index is optional prewarming or forced recovery and performs an atomic
+full rebuild. Results remain in ranked order but omit backend scores because
+cosine and hybrid fusion scores are not comparable. The scanner follows
+standard ignore files, skips binary and non-UTF-8 data and files over 1 MiB,
+and stores overlapping source fragments under stable file groups with
+fragment-accurate line ranges. Source files are never changed.
 
 URI Agent uses a working `rg` from `PATH` when available. Otherwise the linked
 grep plugin silently installs its pinned platform archive after checking the
@@ -235,23 +264,68 @@ The built-in `context` protocol is the recovery surface for hard context-window 
 
 Current note titles and content share a model-relative budget. Growth above the hard limit fails; shrinking and deletion remain available. Deletion preserves the ID, latest title, revision metadata, anchors, and an `已删除` marker while making note content unreadable. Ordinary conversation records around those anchors remain available. Large live notes are read in character-based pages rather than given an individual storage limit.
 
-History reads and search accept comma-separated `types` values from `user`, `assistant`, `tool_call`, `tool_result`, and `error`; all types are included by default. An anchor read accepts bounded `before` and `after` record counts. Note mutation events are sidecar state and do not alter model replay or remove their tool call/result pair from the active provider prefix. Recovery views omit every `context://` call and result so deleted note bodies cannot be reconstructed through those views.
+History reads and search accept comma-separated `types` values from `user`,
+`assistant`, `tool_call`, `tool_result`, and `error`; all types are included by
+default. Exact search uses record-ID `before` pagination. History search spans
+all windows when `window` is omitted and narrows to one window when supplied.
+`mode=semantic` and `mode=hybrid` provide ranked search with `offset`
+pagination; they automatically create or incrementally refresh the current
+session's sidecar before searching. Record-type and window filters are applied
+inside both vector and keyword retrieval before ranking. Results contain the
+actual matching fragment in ranked order without exposing backend scores. A
+long refresh continues as a managed task whose completion carries the search
+result; if the notification is truncated, follow its `tasks://` instruction
+once rather than rerunning the search. Do not read or execute
+`context://history/index` before a ranked search: its read form is diagnostic,
+while its `exec` form is optional prewarming or a forced full rebuild.
+
+An anchor read accepts bounded `before` and `after` record counts. Note mutation
+events are sidecar state and do not alter model replay or remove their tool
+call/result pair from the active provider prefix. Recovery views omit every
+`context://` or `sessions://` call and correlated result so deleted note bodies
+cannot be reconstructed and searches do not invalidate their own index.
 
 When `rollover` is the active strategy, `exec("context://rollover", "<optional handoff>")` requests a fresh model window. The runtime applies it only after all tool calls from that response have correlated durable results. The new hidden bootstrap requires another `context://help` read, followed by the note index, active notes, original user-statement history, and any needed prior-window or anchor-centered records. Notes, handoffs, and history are untrusted reference data. Read `context://help` for the exact routes, query fields, limits, and budget behavior.
 
 ### `sessions`
 
-The read-only `sessions` protocol discovers and searches saved URI Agent
-sessions. Discovery is scoped to the current project by default. Put discovery
-options in the URI query: `scope=all` searches every project, an optional
-percent-encoded `cwd` narrows that cross-project scope, and `limit` and `offset`
-bound the result page. The search body is only the plain search text:
+The `sessions` protocol discovers and searches saved URI Agent sessions while
+keeping the SQLite archive read-only. Discovery is scoped to the current
+project by default. Put discovery options in the URI query: `scope=all`
+searches every project, an optional percent-encoded `cwd` narrows that
+cross-project scope, and `limit` and `offset` bound the result page. The search
+body is only the plain search text; exact search remains the default:
 
 ```text
 read("sessions://recent", "")
 read("sessions://search", "refresh token")
 read("sessions://search?scope=all&limit=20", "billing migration")
 ```
+
+Semantic search keeps separate sidecar indexes for the requested project,
+all-session, or narrowed working-directory scope. The default remains the
+current project. A ranked read automatically creates or incrementally refreshes
+its selected cache; explicit indexing is optional prewarming or forced repair:
+
+```text
+read("sessions://search?mode=semantic&scope=all&limit=20", "credential renewal")
+read("sessions://search?mode=hybrid&types=user,assistant", "会话迁移")
+read("sessions://index?scope=all", "")
+exec("sessions://index?scope=all", "")
+```
+
+Record-type filtering runs inside vector and keyword retrieval before ranking,
+and scope is fixed by the selected index rather than post-filtering a global
+top-k result. Only newly appended searchable records are loaded and embedded
+during a normal refresh; warm search does not load every archived transcript.
+Small operations return directly, while a long refresh continues as a managed
+task whose completion carries the search result. If the notification is
+truncated, follow its `tasks://` instruction once rather than rerunning the
+search. Do not read or execute `sessions://index` before a ranked search; those
+operations are diagnostic and optional forced rebuilding respectively. Results
+remain in ranked order but omit backend scores. Index creation reads only the
+same conversation-record projection exposed by the protocol; it neither
+resumes nor changes a session.
 
 Search results identify matching conversation records with the same
 session-local `r<number>` anchors used by `context`. Read an exact session ID to
@@ -278,9 +352,10 @@ access opens the SQLite database read-only and does not initialize, migrate,
 resume, append, rename, or delete sessions. Read `sessions://help` for the exact
 query parameters and limits.
 
-All `context://` calls and their results remain excluded even when every record
-type is selected, so a deleted note body cannot be recovered through the
-session archive protocol.
+All `context://` and `sessions://` calls and their correlated results remain
+excluded even when every record type is selected. A deleted note body cannot
+be recovered through the session archive protocol, and semantic search cannot
+make its own indexed corpus stale.
 
 ### `https`
 
@@ -397,14 +472,14 @@ all model providers distinguish failures from successful text.
 
 ## Managed tasks
 
-Protocol execution returns its final result directly by default. Bash and PowerShell commands therefore start in the foreground. If a command is still running after about 60 seconds, URI Agent converts that same process into a managed background task without restarting it:
+Protocol execution returns its final result directly by default. Ranked searches and shell commands therefore start in the foreground. If an operation is still running after about 60 seconds, URI Agent continues that same operation as a managed background task without restarting it:
 
 ```text
 exec("bash://run", "cargo test")
 → <stdout>
 
 # If it remains active past the foreground window:
-→ Background task accepted: tasks://<id>
+→ Background task started: tasks://<id>
 ```
 
 Use `background=true` when the command should become a task immediately:
@@ -453,11 +528,11 @@ sends the model an automatic hidden plain-text notification containing the
 output. A complete-record read instruction appears only when that output was
 truncated. The notification continues the active turn at its next model
 boundary or starts a model turn when idle. When the result is needed before
-continuing, the model may use one bounded wait instead of repeatedly polling.
-Task output is identified as untrusted data. Reading an individual terminal
-task or a summary that already presents it suppresses the duplicate
-notification. Notifications are delivered in batches of at most 10 and
-approximately 16,000 output characters.
+continuing, the model may use one bounded wait instead of polling or rerunning
+the operation. Task output is identified as untrusted data. Reading an
+individual terminal task or a summary that already presents it suppresses the
+duplicate notification. Notifications are delivered in batches of at most 10
+and approximately 16,000 output characters.
 
 Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree and reap the root process before the task reaches its terminal state, rather than only dropping the Rust future that waits for it.
 

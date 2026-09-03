@@ -11,7 +11,8 @@ class UriAgent < Formula
   end
 
   def install
-    bin.install "uri-agent"
+    libexec.install Dir["*"]
+    bin.install_symlink libexec/"uri-agent"
   end
 
   test do

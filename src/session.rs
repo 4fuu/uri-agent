@@ -121,6 +121,12 @@ pub struct ArchivedSession {
     pub events: Vec<SessionEvent>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SearchableSessionRecord {
+    pub(crate) session_id: String,
+    pub(crate) sequence: u64,
+}
+
 /// Read-only access to saved sessions for linked extensions.
 ///
 /// Archive reads never initialize, migrate, or otherwise write the database.
@@ -133,6 +139,14 @@ pub struct SessionArchive {
 impl SessionArchive {
     pub fn for_project(cwd: &Path) -> Self {
         Self::at(session_database_path(cwd), cwd)
+    }
+
+    pub(crate) fn index_identity(&self) -> String {
+        self.database_path.to_string_lossy().into_owned()
+    }
+
+    pub(crate) fn project_path(&self) -> &Path {
+        &self.project
     }
 
     pub(crate) fn at(database_path: PathBuf, cwd: &Path) -> Self {
@@ -218,6 +232,69 @@ impl SessionArchive {
             })
             .await
             .context("cannot list archived sessions")
+    }
+
+    pub(crate) async fn searchable_records(
+        &self,
+        cwd: Option<&Path>,
+    ) -> Result<Vec<SearchableSessionRecord>> {
+        let Some(connection) = open_archive_database(&self.database_path).await? else {
+            return Ok(Vec::new());
+        };
+        let cwd = cwd.map(|cwd| {
+            cwd.canonicalize()
+                .unwrap_or_else(|_| cwd.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        });
+        connection
+            .call(move |db| {
+                let mut statement = db.prepare(
+                    "SELECT events.session_id, events.sequence
+                     FROM events
+                     JOIN sessions ON sessions.id = events.session_id
+                     WHERE (?1 IS NULL OR sessions.cwd = ?1)
+                       AND events.kind IN ('user', 'assistant_text', 'tool_call', 'tool_result', 'error')
+                       AND NOT (
+                         events.kind = 'tool_call'
+                         AND (
+                           COALESCE(json_extract(events.payload_json, '$.arguments.uri'), '') LIKE 'context://%'
+                           OR COALESCE(json_extract(events.payload_json, '$.arguments.uri'), '') LIKE 'sessions://%'
+                         )
+                       )
+                       AND NOT (
+                         events.kind = 'tool_result'
+                         AND EXISTS (
+                           SELECT 1 FROM events AS calls
+                           WHERE calls.session_id = events.session_id
+                             AND calls.kind = 'tool_call'
+                             AND json_extract(calls.payload_json, '$.call_id') =
+                                 json_extract(events.payload_json, '$.call_id')
+                             AND (
+                               COALESCE(json_extract(calls.payload_json, '$.arguments.uri'), '') LIKE 'context://%'
+                               OR COALESCE(json_extract(calls.payload_json, '$.arguments.uri'), '') LIKE 'sessions://%'
+                             )
+                         )
+                       )
+                     ORDER BY events.session_id, events.sequence",
+                )?;
+                let rows = statement.query_map([cwd], |row| {
+                    let sequence = row.get::<_, i64>(1)?;
+                    Ok(SearchableSessionRecord {
+                        session_id: row.get(0)?,
+                        sequence: u64::try_from(sequence).map_err(|error| {
+                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                tokio_rusqlite::rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .context("cannot list searchable archived session records")
     }
 
     pub async fn load(&self, id: &str) -> Result<Option<ArchivedSession>> {
@@ -3109,6 +3186,94 @@ mod tests {
             vec![0, 1, 2, 3]
         );
         assert!(matches!(events[3].kind, EventKind::TurnFinished));
+    }
+
+    #[tokio::test]
+    async fn searchable_records_exclude_private_protocol_calls_and_cross_batch_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("searchable-records")).await;
+        let first = opened
+            .append_batch(vec![
+                EventKind::User {
+                    text: "find public evidence".into(),
+                },
+                EventKind::ToolCall {
+                    call_id: "public".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"uri": "file://README.md", "body": ""}),
+                },
+                EventKind::ToolResult {
+                    call_id: "public".into(),
+                    name: "read".into(),
+                    output: "public result".into(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+                EventKind::ToolCall {
+                    call_id: "private-context".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"uri": "context://history/search", "body": "secret"}),
+                },
+                EventKind::ToolCall {
+                    call_id: "private-sessions".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"uri": "sessions://search", "body": "secret"}),
+                },
+            ])
+            .await
+            .unwrap();
+        let second = opened
+            .append_batch(vec![
+                EventKind::ToolResult {
+                    call_id: "private-context".into(),
+                    name: "read".into(),
+                    output: "private context result".into(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+                EventKind::ToolResult {
+                    call_id: "private-sessions".into(),
+                    name: "read".into(),
+                    output: "private session result".into(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+                EventKind::AssistantText {
+                    text: "public conclusion".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        let archive = SessionArchive::at(path, Path::new("/work"));
+
+        let records = archive
+            .searchable_records(Some(Path::new("/work")))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            records,
+            [
+                first[0].sequence,
+                first[1].sequence,
+                first[2].sequence,
+                second[2].sequence,
+            ]
+            .into_iter()
+            .map(|sequence| SearchableSessionRecord {
+                session_id: "searchable-records".to_string(),
+                sequence,
+            })
+            .collect::<Vec<_>>()
+        );
+        assert!(
+            archive
+                .searchable_records(Some(Path::new("/other")))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

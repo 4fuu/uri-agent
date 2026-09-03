@@ -172,7 +172,9 @@ pub(super) fn conversation_records(
             } if arguments
                 .get("uri")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|uri| uri.starts_with("context://")) =>
+                .is_some_and(|uri| {
+                    uri.starts_with("context://") || uri.starts_with("sessions://")
+                }) =>
             {
                 Some(call_id.clone())
             }
@@ -321,6 +323,29 @@ mod tests {
             SessionEvent {
                 sequence: 5,
                 at,
+                kind: EventKind::ToolCall {
+                    call_id: "session-search".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({
+                        "uri": "sessions://search?mode=semantic",
+                        "body": "private search"
+                    }),
+                },
+            },
+            SessionEvent {
+                sequence: 6,
+                at,
+                kind: EventKind::ToolResult {
+                    call_id: "session-search".to_string(),
+                    name: "read".to_string(),
+                    output: "private session result".to_string(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+            },
+            SessionEvent {
+                sequence: 7,
+                at,
                 kind: EventKind::ToolResult {
                     call_id: "public".to_string(),
                     name: "read".to_string(),
@@ -336,9 +361,19 @@ mod tests {
         assert_eq!(records[0].header(), "[user id=r1 window=1]");
         assert_eq!(
             records[1].header(),
-            "[tool_result id=r5 window=2 name=read error=true]"
+            "[tool_result id=r7 window=2 name=read error=true]"
         );
         assert!(!records.iter().any(|record| record.text.contains("deleted")));
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.text.contains("private search"))
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.text.contains("private session"))
+        );
     }
 
     #[test]

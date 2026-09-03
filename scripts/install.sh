@@ -15,8 +15,8 @@ command -v tar >/dev/null 2>&1 || fail "tar is required"
 
 [ "$(uname -s)" = Linux ] || fail "this installer supports Linux; use Homebrew on macOS"
 case $(uname -m) in
-    x86_64 | amd64) target=x86_64-unknown-linux-musl ;;
-    aarch64 | arm64) target=aarch64-unknown-linux-musl ;;
+    x86_64 | amd64) target=x86_64-unknown-linux-gnu ;;
+    aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
     *) fail "unsupported Linux architecture: $(uname -m)" ;;
 esac
 
@@ -36,12 +36,14 @@ printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 asset="uri-agent-$version-$target.tar.gz"
 download_url="https://github.com/$REPOSITORY/releases/download/$tag"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/uri-agent-install.XXXXXX")
-tmp_binary=
+stage_dir=
+old_dir=
+link_tmp=
 cleanup() {
     rm -rf "$tmp_dir"
-    if [ -n "$tmp_binary" ]; then
-        rm -f "$tmp_binary"
-    fi
+    [ -z "$stage_dir" ] || rm -rf "$stage_dir"
+    [ -z "$old_dir" ] || rm -rf "$old_dir"
+    [ -z "$link_tmp" ] || rm -f "$link_tmp"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -67,15 +69,36 @@ fi
 mkdir "$tmp_dir/archive"
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir/archive"
 [ -f "$tmp_dir/archive/uri-agent" ] || fail "release archive does not contain uri-agent"
+[ -f "$tmp_dir/archive/libzvec_c_api.so" ] || fail "release archive does not contain libzvec_c_api.so"
+[ -f "$tmp_dir/archive/retrieval/models/potion-code-16M-v2/model.safetensors" ] \
+    || fail "release archive does not contain the embedding model"
+[ -f "$tmp_dir/archive/retrieval/jieba/jieba.dict.utf8" ] \
+    || fail "release archive does not contain the Jieba dictionary"
 
 mkdir -p "$INSTALL_DIR"
-tmp_binary=$(mktemp "$INSTALL_DIR/.uri-agent.tmp.XXXXXX")
-cp "$tmp_dir/archive/uri-agent" "$tmp_binary"
-chmod 0755 "$tmp_binary"
-mv -f "$tmp_binary" "$INSTALL_DIR/uri-agent"
-tmp_binary=
+version_dir="$INSTALL_DIR/uri-agent-$version"
+stage_dir=$(mktemp -d "$INSTALL_DIR/.uri-agent-$version.tmp.XXXXXX")
+cp -R "$tmp_dir/archive/." "$stage_dir/"
+chmod 0755 "$stage_dir/uri-agent"
+if [ -e "$version_dir" ] || [ -L "$version_dir" ]; then
+    old_dir="$INSTALL_DIR/.uri-agent-$version.old.$$"
+    mv "$version_dir" "$old_dir"
+fi
+if ! mv "$stage_dir" "$version_dir"; then
+    [ -z "$old_dir" ] || mv "$old_dir" "$version_dir"
+    fail "could not activate $version_dir"
+fi
+stage_dir=
+link_tmp="$INSTALL_DIR/.uri-agent-link.$$"
+ln -s "uri-agent-$version/uri-agent" "$link_tmp"
+mv -f "$link_tmp" "$INSTALL_DIR/uri-agent"
+link_tmp=
+if [ -n "$old_dir" ]; then
+    rm -rf "$old_dir"
+    old_dir=
+fi
 
-printf 'Installed uri-agent %s to %s/uri-agent\n' "$version" "$INSTALL_DIR"
+printf 'Installed uri-agent %s to %s (launcher: %s/uri-agent)\n' "$version" "$version_dir" "$INSTALL_DIR"
 case :${PATH:-}: in
     *:"$INSTALL_DIR":*) ;;
     *) printf 'Add %s to PATH to run uri-agent.\n' "$INSTALL_DIR" ;;

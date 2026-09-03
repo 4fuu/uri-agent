@@ -55,6 +55,21 @@ pub struct TaskRecord {
     terminal_notification: TerminalNotification,
 }
 
+impl TaskRecord {
+    pub fn terminal_result(self, operation: &str) -> anyhow::Result<Vec<u8>> {
+        match self.status {
+            TaskStatus::Completed => Ok(self.content),
+            TaskStatus::Failed => Err(anyhow::anyhow!(
+                String::from_utf8_lossy(&self.content).into_owned()
+            )),
+            TaskStatus::Cancelled => anyhow::bail!("{operation} was cancelled"),
+            TaskStatus::Pending | TaskStatus::Running => {
+                anyhow::bail!("{operation} did not reach a terminal state")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskReport {
     pub id: String,
@@ -82,6 +97,12 @@ pub enum PromoteBackground {
     AtCapacity,
 }
 
+#[derive(Clone, Debug)]
+pub enum AutoTask {
+    Background(String),
+    Terminal(TaskRecord),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalNotification {
     Disabled,
@@ -96,6 +117,47 @@ pub struct TaskManager {
     workers: Arc<SyncMutex<HashMap<String, JoinHandle<()>>>>,
     notices: broadcast::Sender<TaskNotice>,
     next_id: Arc<AtomicU64>,
+}
+
+struct ForegroundTaskGuard {
+    tasks: TaskManager,
+    id: String,
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl ForegroundTaskGuard {
+    fn new(tasks: TaskManager, record: &TaskRecord) -> Self {
+        Self {
+            tasks,
+            id: record.id.clone(),
+            cancellation: record.cancellation.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ForegroundTaskGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+            let tasks = self.tasks.clone();
+            let id = self.id.clone();
+            tokio::spawn(async move {
+                if tasks
+                    .wait_until_terminal(&id)
+                    .await
+                    .is_some_and(|record| !record.background)
+                {
+                    tasks.remove(&id).await;
+                }
+            });
+        }
+    }
 }
 
 impl Default for TaskManager {
@@ -260,6 +322,48 @@ impl TaskManager {
         let future = work(cancellation.clone());
         self.spawn_worker(record, async move { Some(future.await) })
             .await;
+    }
+
+    pub async fn run_with_auto_background<W, F>(
+        &self,
+        record: TaskRecord,
+        foreground_duration: Duration,
+        work: W,
+    ) -> anyhow::Result<AutoTask>
+    where
+        W: FnOnce(CancellationToken) -> F,
+        F: Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
+    {
+        debug_assert!(!record.background);
+        let id = record.id.clone();
+        let mut foreground = ForegroundTaskGuard::new(self.clone(), &record);
+        self.spawn_with_cancellation(record, work).await;
+        let current = self
+            .wait(&id, foreground_duration)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("task disappeared: {id}"))?;
+        let outcome = if current.status.terminal() {
+            self.remove(&id).await;
+            AutoTask::Terminal(current)
+        } else {
+            match self.promote_background(&id).await {
+                PromoteBackground::Promoted => AutoTask::Background(id),
+                PromoteBackground::Terminal(record) => {
+                    self.remove(&id).await;
+                    AutoTask::Terminal(record)
+                }
+                PromoteBackground::AtCapacity => {
+                    let record = self
+                        .wait_until_terminal(&id)
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("task disappeared: {id}"))?;
+                    self.remove(&id).await;
+                    AutoTask::Terminal(record)
+                }
+            }
+        };
+        foreground.disarm();
+        Ok(outcome)
     }
 
     async fn spawn_worker<F>(&self, record: TaskRecord, future: F)
@@ -594,6 +698,61 @@ mod tests {
         let completed = tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
         assert_eq!(completed.status, TaskStatus::Completed);
         assert_eq!(completed.content, b"done");
+    }
+
+    #[tokio::test]
+    async fn automatic_backgrounding_returns_fast_results_inline() {
+        let tasks = TaskManager::new();
+        let record = tasks.allocate("test", "quick").await;
+        let id = record.id.clone();
+
+        let result = tasks
+            .run_with_auto_background(record, Duration::from_secs(1), |_| async {
+                Ok(b"final result".to_vec())
+            })
+            .await
+            .unwrap();
+
+        let AutoTask::Terminal(result) = result else {
+            panic!("quick work unexpectedly became a background task");
+        };
+        assert_eq!(result.status, TaskStatus::Completed);
+        assert_eq!(result.content, b"final result");
+        assert!(tasks.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn automatic_backgrounding_keeps_one_operation_and_its_final_result() {
+        let tasks = TaskManager::new();
+        let record = tasks.allocate("test", "slow").await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let work_release = release.clone();
+
+        let result = tasks
+            .run_with_auto_background(record, Duration::from_millis(1), move |_| async move {
+                work_release.notified().await;
+                Ok(b"final search result".to_vec())
+            })
+            .await
+            .unwrap();
+
+        let AutoTask::Background(id) = result else {
+            panic!("slow work unexpectedly completed in the foreground");
+        };
+        assert!(tasks.get(&id).await.unwrap().background);
+        release.notify_one();
+        let completed = tasks.wait_until_terminal(&id).await.unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.content, b"final search result");
+        assert_eq!(
+            tasks
+                .pending_terminal_notifications()
+                .await
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            [id.as_str()]
+        );
     }
 
     #[tokio::test]
