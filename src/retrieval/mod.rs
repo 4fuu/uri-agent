@@ -81,7 +81,10 @@ impl Fragment {
             digest.update(part.len().to_le_bytes());
             digest.update(part.as_bytes());
         }
-        format!("f{:x}", digest.finalize())
+        // zvec primary keys reject values longer than 64 bytes; keep the
+        // letter prefix and truncate the hex digest so every id fits.
+        let digest = format!("{:x}", digest.finalize());
+        format!("f{}", &digest[..digest.len().min(63)])
     }
 
     fn sanitize(mut self) -> Self {
@@ -912,7 +915,12 @@ impl RankedDoc {
             source: required_string(doc, "source")?,
             label: required_string(doc, "label")?,
             text: required_string(doc, "text")?,
-            record_type: required_string(doc, "record_type")?,
+            // zvec omits empty strings on read; an empty record type is the
+            // normal state for code fragments.
+            record_type: doc
+                .get_string("record_type")?
+                .unwrap_or_default()
+                .to_string(),
         })
     }
 
@@ -1229,9 +1237,9 @@ fn ensure_private_index_parent(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_private_file_permissions(path: &Path) -> Result<()> {
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(_path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -1343,6 +1351,22 @@ mod tests {
             embedding_text: format!("path: {id}.rs\n{text}"),
             record_type: record_type.to_string(),
             window_id: 0,
+        }
+    }
+
+    #[test]
+    fn stable_ids_fit_the_zvec_primary_key_limit() {
+        for parts in [
+            vec!["identity"],
+            vec!["src/acp/mod.rs", "1-4"],
+            vec!["group", "0", "fragment text"],
+            vec!["", ""],
+        ] {
+            let id = Fragment::stable_id(&parts);
+            assert!(
+                id.len() <= 64,
+                "zvec primary keys are limited to 64 bytes: {id}"
+            );
         }
     }
 
@@ -1528,6 +1552,7 @@ mod tests {
             "fixture-v1",
             "integration-v1",
         );
+        let stable = Fragment::stable_id(&["zebra"]);
         let (catalog, initial_snapshot) = snapshot(vec![
             fragment(
                 "credentials",
@@ -1540,6 +1565,11 @@ mod tests {
                 "code",
             ),
             fragment("sessions", "为历史会话建立语义索引并搜索相关内容。", "code"),
+            fragment(
+                &stable,
+                "Zebra crossings mark pedestrian priority at intersections.",
+                "",
+            ),
         ]);
 
         let status = rebuild_index(&spec, initial_snapshot, CancellationToken::new())
@@ -1590,6 +1620,23 @@ mod tests {
         .await
         .unwrap();
         assert!(chinese.iter().any(|hit| hit.source == "sessions.rs"));
+
+        let real_id = search_index(
+            &spec,
+            &catalog,
+            "pedestrian crossing priority",
+            SearchMode::Semantic,
+            4,
+            SearchFilter::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            real_id
+                .iter()
+                .any(|hit| hit.source == format!("{stable}.rs"))
+        );
 
         let refreshed = vec![
             fragment(
