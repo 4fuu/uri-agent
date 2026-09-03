@@ -14,7 +14,7 @@ use rig::client::CompletionClient;
 use rig::completion::CompletionModel as RigCompletionModel;
 use rig::http_client::HttpClientExt;
 use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
-use rig::providers::{anthropic, chatgpt, gemini, openai};
+use rig::providers::{anthropic, chatgpt, gemini, openai, openrouter};
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -150,6 +150,7 @@ pub(crate) enum RigClient {
     OpenAiResponses(openai::responses_api::ResponsesCompletionModel<AuthClient>),
     OpenAiCodexResponses(chatgpt::ResponsesCompletionModel<AuthClient>),
     OpenAiCompletions(openai::completion::CompletionModel<AuthClient>),
+    OpenRouter(openrouter::CompletionModel<AuthClient>),
     Anthropic(anthropic::completion::CompletionModel<AuthClient>),
     Gemini(gemini::completion::CompletionModel<AuthClient>),
 }
@@ -386,6 +387,16 @@ impl RigBackend {
                         .completion_model(&model.id),
                 )
             }
+            "openai-completions" if model.provider == "openrouter" => RigClient::OpenRouter(
+                openrouter::Client::builder()
+                    .api_key(api_key)
+                    .base_url(&model.base_url)
+                    .http_headers(headers)
+                    .http_client(request_client)
+                    .build()
+                    .context("cannot initialize OpenRouter provider")?
+                    .completion_model(&model.id),
+            ),
             "openai-completions" => RigClient::OpenAiCompletions(
                 openai::CompletionsClient::builder()
                     .api_key(api_key)
@@ -520,7 +531,10 @@ impl ModelBackend for RigBackend {
                 .and_then(|tokens| u64::try_from(tokens).ok())
                 .unwrap_or(u64::MAX),
         );
-        if matches!(self.client, RigClient::OpenAiCompletions(_)) {
+        if matches!(
+            self.client,
+            RigClient::OpenAiCompletions(_) | RigClient::OpenRouter(_)
+        ) {
             request.history = openai_chat_compatible_history(request.history);
         }
         let mut response = match &self.client {
@@ -533,6 +547,7 @@ impl ModelBackend for RigBackend {
             RigClient::OpenAiCompletions(model) => {
                 complete_with(model, request, max_tokens, deltas).await
             }
+            RigClient::OpenRouter(model) => complete_with(model, request, max_tokens, deltas).await,
             RigClient::Anthropic(model) => complete_with(model, request, max_tokens, deltas).await,
             RigClient::Gemini(model) => complete_with(model, request, max_tokens, deltas).await,
         }?;
@@ -540,6 +555,7 @@ impl ModelBackend for RigBackend {
             RigClient::OpenAiResponses(_) => "openai-responses",
             RigClient::OpenAiCodexResponses(_) => "openai-codex-responses",
             RigClient::OpenAiCompletions(_) => "openai-completions",
+            RigClient::OpenRouter(_) => "openai-completions",
             RigClient::Anthropic(_) => "anthropic-messages",
             RigClient::Gemini(_) => "google-generative-ai",
         };

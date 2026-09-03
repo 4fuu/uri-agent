@@ -59,6 +59,8 @@ The active backend applies catalog data relevant to requests and accounting, inc
 - `reasoning`, `thinkingLevelMap`, and `samplingParams`;
 - request-relevant `compat` values such as token-field names, adaptive thinking, strict role or tool handling, and provider-specific thinking formats.
 
+Reasoning replay is owned by each API adapter rather than by a universal catalog flag. Completed assistant reasoning remains in the typed session message and is serialized back in the provider's required form on later tool rounds. OpenRouter replays structured `reasoning_details`, including encrypted payloads and signed text; OpenAI Responses replays encrypted reasoning items; Anthropic replays signed or redacted thinking; and Gemini replays thought signatures. For an OpenAI-compatible model whose catalog sets `compat.requiresReasoningContentOnAssistantMessages`, URI Agent also adds the required `reasoning_content` field to replayed assistant messages. The catalog's `reasoning` and `thinkingLevelMap` fields control whether and at what effort reasoning is requested; they do not replace this replay logic.
+
 ### Cloudflare AI Gateway
 
 `cloudflare-ai-gateway` has an explicit half-dependent catalog boundary. The merged pi.dev and `models.json` catalog remains authoritative for model identity and capability metadata: API family, modalities, context and output limits, reasoning and thinking compatibility, request `compat` fields, and pricing. URI Agent deliberately ignores that provider record's `baseUrl`, `headers`, and `authHeader` fields. This prevents a catalog change from redirecting a Cloudflare account token or presenting it as an upstream OpenAI or Anthropic key.

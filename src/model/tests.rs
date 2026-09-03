@@ -7,7 +7,7 @@ use crate::config::AuthKind;
 use chrono::{DateTime, Utc};
 use http::{HeaderMap, HeaderValue};
 use rig::completion::{CompletionError, ToolDefinition};
-use rig::message::Message;
+use rig::message::{AssistantContent, Message, ReasoningContent, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -159,6 +159,58 @@ async fn server_once(
     (format!("http://{address}/backend-api"), request_rx, task)
 }
 
+async fn streaming_server(
+    responses: Vec<String>,
+) -> (
+    String,
+    oneshot::Receiver<Vec<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (requests_tx, requests_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::with_capacity(responses.len());
+        for body in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0, "client closed before sending HTTP headers");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or_default();
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            requests.push(String::from_utf8(request).unwrap());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+        let _ = requests_tx.send(requests);
+    });
+    (format!("http://{address}/v1"), requests_rx, task)
+}
+
 fn request_json(request: &str) -> Value {
     let (_, body) = request.split_once("\r\n\r\n").unwrap();
     serde_json::from_str(body).unwrap()
@@ -289,6 +341,216 @@ fn configured_auth_client_applies_request_transforms() {
 
     assert_eq!(body["input"], "hello");
     assert_eq!(body["store"], false);
+}
+
+#[tokio::test]
+async fn openrouter_replays_encrypted_reasoning_across_tool_rounds() {
+    let sse = |events: Vec<Value>| {
+        let mut body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        body.push_str("data: [DONE]\n\n");
+        body
+    };
+    let first_response = sse(vec![
+        json!({
+            "id": "chatcmpl-1",
+            "model": "openai/o4-mini",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": null,
+                    "reasoning_details": [{
+                        "type": "reasoning.encrypted",
+                        "id": "rs_1",
+                        "format": "openai-responses-v1",
+                        "index": 0,
+                        "data": "encrypted-reasoning"
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-1",
+            "model": "openai/o4-mini",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": ""}
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-1",
+            "model": "openai/o4-mini",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "{\"uri\":\"file://README.md\",\"body\":\"\"}"}
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-1",
+            "model": "openai/o4-mini",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+        }),
+    ]);
+    let second_response = sse(vec![
+        json!({
+            "id": "chatcmpl-2",
+            "model": "openai/o4-mini",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "README loaded"},
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-2",
+            "model": "openai/o4-mini",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }),
+    ]);
+    let (base_url, requests_rx, server) =
+        streaming_server(vec![first_response, second_response]).await;
+    let mut model = catalog_model(
+        "openai-completions",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"high": "high"},
+            "contextWindow": 128000,
+            "maxTokens": 4096
+        }),
+    );
+    model.id = "openai/o4-mini".to_string();
+    model.provider = "openrouter".to_string();
+    model.base_url = base_url;
+    model
+        .headers
+        .insert("x-catalog-header".to_string(), "catalog-value".to_string());
+    let backend = RigBackend::new(
+        &model,
+        "openrouter-key",
+        &Default::default(),
+        AuthKind::ApiKey,
+        ThinkingLevel::High,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(backend.client, RigClient::OpenRouter(_)));
+
+    let (first_deltas, _) = mpsc::unbounded_channel();
+    let first = backend
+        .complete(
+            ModelRequest {
+                system: "System instructions".to_string(),
+                history: vec![Message::user("Read the README")],
+                tools: test_tool_definitions(),
+                estimated_context: 100,
+                max_output_tokens: None,
+            },
+            first_deltas,
+        )
+        .await
+        .unwrap();
+    assert!(first.content.iter().any(|content| matches!(
+        content,
+        AssistantContent::Reasoning(reasoning)
+            if reasoning.id.as_deref() == Some("rs_1")
+                && matches!(
+                    reasoning.content.first(),
+                    Some(ReasoningContent::Encrypted(data)) if data == "encrypted-reasoning"
+                )
+    )));
+    let tool_call = first
+        .content
+        .iter()
+        .find_map(|content| match content {
+            AssistantContent::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .expect("OpenRouter response should contain the tool call");
+    let tool_result = Message::User {
+        content: vec![UserContent::tool_result_for(
+            tool_call.id.clone(),
+            tool_call.provider.clone(),
+            tool_call.function.name.clone(),
+            vec![ToolResultContent::text("README contents")],
+        )],
+    };
+    let (second_deltas, _) = mpsc::unbounded_channel();
+    let second = backend
+        .complete(
+            ModelRequest {
+                system: "System instructions".to_string(),
+                history: vec![
+                    Message::user("Read the README"),
+                    Message::Assistant {
+                        id: None,
+                        content: first.content,
+                    },
+                    tool_result,
+                ],
+                tools: test_tool_definitions(),
+                estimated_context: 200,
+                max_output_tokens: None,
+            },
+            second_deltas,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        second.content.first(),
+        Some(AssistantContent::Text(text)) if text.text == "README loaded"
+    ));
+
+    let requests = requests_rx.await.unwrap();
+    server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        let headers = request
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer openrouter-key"));
+        assert!(headers.contains("x-catalog-header: catalog-value"));
+    }
+    let second_body = request_json(&requests[1]);
+    assert_eq!(second_body["reasoning"]["effort"], "high");
+    let messages = second_body["messages"].as_array().unwrap();
+    let assistant_index = messages
+        .iter()
+        .position(|message| message["role"] == "assistant")
+        .expect("second request should replay the assistant turn");
+    let assistant = &messages[assistant_index];
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+    let reasoning_details = assistant["reasoning_details"].as_array().unwrap();
+    assert_eq!(reasoning_details.len(), 1);
+    assert_eq!(reasoning_details[0]["type"], "reasoning.encrypted");
+    assert_eq!(reasoning_details[0]["id"], "rs_1");
+    assert_eq!(reasoning_details[0]["index"], 0);
+    assert_eq!(reasoning_details[0]["data"], "encrypted-reasoning");
+    assert_eq!(messages[assistant_index + 1]["role"], "tool");
+    assert_eq!(messages[assistant_index + 1]["tool_call_id"], "call_1");
 }
 
 #[test]
