@@ -18,7 +18,9 @@ use tokio::fs;
 use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
     Connection,
-    rusqlite::{Connection as SqliteConnection, OpenFlags, OptionalExtension, params},
+    rusqlite::{
+        Connection as SqliteConnection, OpenFlags, OptionalExtension, TransactionBehavior, params,
+    },
 };
 use uuid::Uuid;
 
@@ -1264,7 +1266,7 @@ impl Session {
         let pending_id = self
             .connection
             .call(move |db| {
-                let transaction = db.transaction()?;
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let draft = transaction
                     .query_row(
                         "SELECT draft FROM pending_drafts WHERE cwd = ?1",
@@ -4711,6 +4713,52 @@ mod tests {
             .unwrap();
         assert_eq!(opened.model_settings().await.provider, "changed");
         assert_eq!(opened.model_settings().await.model, "next-model");
+    }
+
+    #[tokio::test]
+    async fn first_pending_input_waits_for_a_concurrent_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("pending-after-writer")).await;
+        let writer = Connection::open(&path).await.unwrap();
+        writer
+            .call(|db| {
+                db.execute_batch("BEGIN IMMEDIATE")?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let pending_session = opened.clone();
+        let pending = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            pending_session
+                .add_pending_input(
+                    SubmitKind::Prompt,
+                    "hello",
+                    &[UserContent::text("hello")],
+                    true,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!pending.is_finished());
+
+        writer
+            .call(|db| {
+                db.execute_batch("COMMIT")?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        let pending_id = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(pending_id > 0);
     }
 
     #[tokio::test]
