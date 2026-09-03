@@ -78,6 +78,12 @@ pub(crate) async fn code_corpus(cwd: &Path, root: &Path, glob: Option<&str>) -> 
 }
 
 fn build_code_corpus(cwd: &Path, root: &Path, glob: Option<&str>) -> Result<CodeCorpus> {
+    let canonical_cwd = cwd.canonicalize().with_context(|| {
+        format!(
+            "cannot resolve code search working directory: {}",
+            display_path(cwd)
+        )
+    })?;
     let canonical = root
         .canonicalize()
         .with_context(|| format!("cannot resolve code search root: {}", display_path(root)))?;
@@ -102,7 +108,7 @@ fn build_code_corpus(cwd: &Path, root: &Path, glob: Option<&str>) -> Result<Code
             continue;
         }
         let source = path
-            .strip_prefix(cwd)
+            .strip_prefix(&canonical_cwd)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
             .map_or_else(|| display_path(&path), display_path);
@@ -296,6 +302,7 @@ mod tests {
     #[tokio::test]
     async fn scanner_honors_ignore_files_globs_and_binary_limits() {
         let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
         fs::create_dir_all(directory.path().join("ignored")).unwrap();
         fs::write(
             directory.path().join("main.rs"),
@@ -308,7 +315,8 @@ mod tests {
         fs::write(directory.path().join("binary.rs"), b"code\0binary").unwrap();
         fs::write(directory.path().join("controls.rs"), vec![1_u8; 100]).unwrap();
 
-        let corpus = code_corpus(directory.path(), directory.path(), Some("**/*.rs"))
+        let lexical_cwd = directory.path().join("nested/..");
+        let corpus = code_corpus(&lexical_cwd, directory.path(), Some("**/*.rs"))
             .await
             .unwrap();
         let snapshot = corpus.load_all(CancellationToken::new()).await.unwrap();

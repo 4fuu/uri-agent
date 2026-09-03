@@ -50,4 +50,27 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: tests
-      - run: cargo test
+      - name: Run platform-sensitive tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          suites=(
+            'acp::'
+            'agent::tests'
+            'atomic_file::tests'
+            'builtins::'
+            'clipboard::tests'
+            'config::tests'
+            'output::tests'
+            'plugin_state::tests'
+            'retrieval::'
+            'session::tests'
+            'skill::tests'
+            'task::tests'
+            'terminal::tests'
+            'tool_download::tests'
+            'wasm_plugin::tests'
+          )
+          for suite in "${suites[@]}"; do
+            cargo test --lib "$suite"
+          done
