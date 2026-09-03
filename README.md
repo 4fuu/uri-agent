@@ -57,7 +57,8 @@ supported providers.
   SQLite sessions preserve drafts, frozen startup context, titled working
   notes, and rollover or summary checkpoints across restarts.
 - **Local semantic retrieval:** fixed, bundled zvec and Model2Vec assets add
-  opt-in semantic and hybrid search to project files and saved conversations;
+  on-demand semantic and hybrid search to project files and saved
+  conversations. Ranked reads create or incrementally refresh private caches;
   exact grep remains the default.
 - **One terminal workflow:** Queue and Steer, built-in web access, keyboard and
   mouse controls, image input, and `@` file or `@@` session references share one

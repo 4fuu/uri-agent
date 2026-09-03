@@ -7,17 +7,21 @@ use crate::plugin::{Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use crate::retrieval::{
-    ConversationCorpus, ConversationDocument, SearchMode, conversation_corpus, index_status,
-    rebuild_index, search_index,
+    ConversationDocument, CorpusCatalog, IndexSpec, SearchFilter, SearchMode, conversation_catalog,
+    conversation_snapshot, conversation_source_key, conversation_spec, index_checkpoint,
+    index_status, rebuild_index, search_index, sync_index,
 };
 use crate::session::{EventKind, Session, SessionEvent};
+use crate::task::AutoTask;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 const MAX_ACTIVE_NOTES: usize = 20;
 const NOTE_BUDGET_PERCENT: usize = 20;
@@ -33,6 +37,8 @@ const MAX_RECORD_CHARS: usize = 6_000;
 const MAX_HISTORY_OUTPUT_TOKENS: usize = 7_000;
 const DEFAULT_AROUND_COUNT: usize = 10;
 const MAX_AROUND_TOTAL: usize = 50;
+const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
+const MAX_INDEX_RETRIES: usize = 3;
 
 fn help() -> &'static str {
     r#"# context
@@ -49,10 +55,28 @@ Conversation records have session-local IDs such as `r42`. The same ID format is
 - `context://notes/<id>/revisions` lists revision metadata and anchors without old content.
 - `context://notes/<id>/context` reads records around a selected revision anchor, including for a deleted note. Optional `revision`, `before`, `after`, and `types` select the revision and surrounding records.
 - `context://history/windows` lists context-window IDs and record-ID ranges.
-- `context://history/index` reports whether the current session's semantic history index is current. Build or refresh it with `exec("context://history/index", "")`; this sidecar cache never changes session events.
-- `context://history/users` lists original user statements across all windows; `context://history/users/search` searches them. Exact search is the default and accepts optional `before=<record-id>` and `limit` pagination. Add `mode=semantic` for vector ranking or `mode=hybrid` for vector plus Jieba BM25 reciprocal-rank fusion; ranked search accepts `offset` and `limit`.
+- Reading `context://history/index` diagnoses the current session's semantic
+  history cache. Use `exec("context://history/index", "")` only to prewarm or
+  force-rebuild that cache. Do not use either operation before a ranked search.
+  The private sidecar cache never changes session events.
+- `context://history/users` lists original user statements across all windows;
+  `context://history/users/search` searches them. Exact search is the default
+  and accepts optional `before=<record-id>` and `limit` pagination. Use exact
+  for known literal wording. Prefer `mode=hybrid`, which combines keyword and
+  semantic ranking, for conceptual searches. Use `mode=semantic` when relevant
+  records are likely to use different wording. Ranked search accepts `offset`
+  and `limit`.
 - `context://history/<window-id>` reads the newest records in one window. Optional `types`, `before=<record-id>`, and `limit` filter and paginate.
-- `context://history/search?window=<window-id>` searches records in one window using the nonempty plain-text body. Exact search accepts optional `types`, `before=<record-id>`, and `limit`; semantic and hybrid modes accept `types`, `offset`, and `limit`. Ranked search fails rather than use a missing or stale index.
+- `context://history/search` searches records across all windows using the
+  nonempty plain-text body; optional `window=<window-id>` narrows the search.
+  Exact search accepts optional `types`, `before=<record-id>`, and `limit`;
+  semantic and hybrid modes accept `types`, `offset`, and `limit`.
+- A ranked history read creates or incrementally refreshes its cache as needed,
+  then searches it. Most searches return in the same call. A longer search
+  continues as one managed task without restarting and delivers its result
+  automatically. If completion marks the output as truncated, follow its
+  `tasks://` instruction once. Do not submit the same search again to retrieve
+  task output.
 - `context://history/around/<record-id>` reads records surrounding one anchor. Optional `before` and `after` are record counts and default to 10 each; their sum must not exceed 50. Optional `types` filters the result.
 - `exec("context://notes/add?title=<percent-encoded-title>", "<content>")` creates a note and returns its stable ID.
 - `exec("context://notes/<id>/replace?title=<percent-encoded-title>", "<content>")` replaces the current content and creates a revision while preserving the ID.
@@ -312,7 +336,7 @@ impl Protocol for ContextPlugin {
     async fn read(
         &self,
         request: ProtocolRequest<'_>,
-        _context: ProtocolContext,
+        context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         let (target, query) = split_target(request.target);
         if target == "help" {
@@ -336,7 +360,7 @@ impl Protocol for ContextPlugin {
             "history/index" => {
                 require_empty(query, request.body, "context://history/index")?;
                 let corpus = current_conversation_corpus(&self.state, &events).await?;
-                Ok(index_status(&corpus.spec, &corpus.snapshot)
+                Ok(index_status(&corpus.spec, &corpus.catalog)
                     .await?
                     .format("Current session"))
             }
@@ -360,46 +384,41 @@ impl Protocol for ContextPlugin {
                         options.limit,
                     ),
                     Some(mode) => {
-                        semantic_history_search(
-                            &self.state,
-                            &events,
-                            query,
-                            &options,
+                        return run_semantic_history_search(
+                            self.state.clone(),
+                            query.to_string(),
+                            options,
                             mode,
-                            None,
                             true,
+                            context,
                         )
-                        .await
+                        .await;
                     }
                 }
             }
             "history/search" => {
                 let options = QueryOptions::parse(query)?;
                 options.validate_history_search()?;
-                let window_id = options
-                    .window
-                    .ok_or_else(|| anyhow!("context history search requires window=<id>"))?;
                 let query = validate_history_search_text(request.body)?;
                 match options.search_mode() {
                     None => format_history_search(
                         &events,
-                        window_id,
+                        options.window,
                         query,
                         options.history_cursor()?,
                         options.limit,
                         options.types.as_ref(),
                     ),
                     Some(mode) => {
-                        semantic_history_search(
-                            &self.state,
-                            &events,
-                            query,
-                            &options,
+                        return run_semantic_history_search(
+                            self.state.clone(),
+                            query.to_string(),
+                            options,
                             mode,
-                            Some(window_id),
                             false,
+                            context,
                         )
-                        .await
+                        .await;
                     }
                 }
             }
@@ -968,46 +987,77 @@ fn format_user_history_search(
 
 fn format_history_search(
     events: &[SessionEvent],
-    window_id: u64,
+    window_id: Option<u64>,
     query: &str,
     before: Option<u64>,
     limit: Option<usize>,
     types: Option<&RecordTypes>,
 ) -> Result<String> {
-    let range = find_window(events, window_id)?;
+    let range = window_id
+        .map(|window| find_window(events, window))
+        .transpose()?;
     let query_lower = query.to_lowercase();
     let limit = normalize_history_limit(limit)?;
     let types = types.cloned().unwrap_or_default();
     let matches = conversation_records(events, &types)
         .into_iter()
-        .filter(|record| range.start <= record.sequence && record.sequence < range.end)
+        .filter(|record| {
+            range.is_none_or(|range| range.start <= record.sequence && record.sequence < range.end)
+        })
         .filter(|record| record.text.to_lowercase().contains(&query_lower))
         .collect::<Vec<_>>();
     if matches.is_empty() {
-        return Ok(format!("No matches in context window {window_id}."));
+        return Ok(window_id.map_or_else(
+            || "No matches in context history.".to_string(),
+            |window_id| format!("No matches in context window {window_id}."),
+        ));
     }
+    let scope = window_id.map_or_else(
+        || "all context windows".to_string(),
+        |window_id| format!("window={window_id}"),
+    );
     format_record_page(
         matches,
         before.unwrap_or(u64::MAX),
         limit,
-        &format!("Untrusted context history search · window={window_id}"),
+        &format!("Untrusted context history search · {scope}"),
         |before, limit| {
+            let mut serializer = form_urlencoded::Serializer::new(String::new());
+            if let Some(window_id) = window_id {
+                serializer.append_pair("window", &window_id.to_string());
+            }
+            serializer.append_pair("before", &record_id(before));
+            serializer.append_pair("limit", &limit.to_string());
+            serializer.append_pair("types", &types.query_value());
             Some(ReadContinuation {
-                uri: format!(
-                    "context://history/search?window={window_id}&before={}&limit={limit}&types={}",
-                    record_id(before),
-                    types.query_value()
-                ),
+                uri: format!("context://history/search?{}", serializer.finish()),
                 body: query.to_string(),
             })
         },
     )
 }
 
+#[derive(Clone)]
+struct CurrentConversationCorpus {
+    spec: IndexSpec,
+    catalog: CorpusCatalog,
+    documents: BTreeMap<String, ConversationDocument>,
+}
+
+impl CurrentConversationCorpus {
+    fn snapshot(&self, sources: BTreeSet<String>) -> Result<crate::retrieval::CorpusSnapshot> {
+        let documents = sources
+            .iter()
+            .filter_map(|source| self.documents.get(source).cloned())
+            .collect();
+        conversation_snapshot(self.catalog.clone(), sources, documents)
+    }
+}
+
 async fn current_conversation_corpus(
     state: &ContextState,
     events: &[SessionEvent],
-) -> Result<ConversationCorpus> {
+) -> Result<CurrentConversationCorpus> {
     let session = &state.inner.session;
     let session_id = session.id().to_string();
     let cwd = crate::config::display_path(&session.spec().await.working_directory);
@@ -1019,15 +1069,31 @@ async fn current_conversation_corpus(
             anchor: record_id(record.sequence),
             header: record.header(),
             text: record.text,
+            record_type: record.record_type.label().to_string(),
+            window_id: record.window_id,
+        })
+        .collect::<Vec<_>>();
+    let catalog = conversation_catalog(&documents);
+    let documents = documents
+        .into_iter()
+        .map(|document| {
+            (
+                conversation_source_key(&document.session_id, &document.anchor),
+                document,
+            )
         })
         .collect();
-    conversation_corpus(
+    let spec = conversation_spec(
         "context",
         &session_id,
         "Current session",
         format!("session {session_id}"),
+    )?;
+    Ok(CurrentConversationCorpus {
+        spec,
+        catalog,
         documents,
-    )
+    })
 }
 
 async fn start_context_index(state: ContextState, context: ProtocolContext) -> Result<Vec<u8>> {
@@ -1039,62 +1105,138 @@ async fn start_context_index(state: ContextState, context: ProtocolContext) -> R
     context
         .tasks
         .spawn_with_cancellation(record, move |cancellation| async move {
-            let events = state.events().await?;
-            let corpus = current_conversation_corpus(&state, &events).await?;
-            if cancellation.is_cancelled() {
-                bail!("context history indexing was cancelled before writing the index");
+            for _ in 0..MAX_INDEX_RETRIES {
+                let events = state.events().await?;
+                let corpus = current_conversation_corpus(&state, &events).await?;
+                let snapshot = corpus.snapshot(corpus.catalog.all_sources())?;
+                let status = rebuild_index(&corpus.spec, snapshot, cancellation.clone()).await?;
+                let fresh_events = state.events().await?;
+                if current_conversation_corpus(&state, &fresh_events)
+                    .await?
+                    .catalog
+                    == corpus.catalog
+                {
+                    return Ok(status.format("Current session").into_bytes());
+                }
             }
-            Ok(rebuild_index(&corpus.spec, corpus.snapshot)
-                .await?
-                .format("Current session")
-                .into_bytes())
+            bail!("context history changed repeatedly while rebuilding the semantic index")
         })
         .await;
     Ok(prompts::task_accepted(&id).into_bytes())
 }
 
+async fn run_semantic_history_search(
+    state: ContextState,
+    query: String,
+    options: QueryOptions,
+    mode: SearchMode,
+    users_only: bool,
+    context: ProtocolContext,
+) -> Result<Vec<u8>> {
+    let label = if users_only {
+        "Search original user statements"
+    } else {
+        "Search context history"
+    };
+    let record = context.tasks.allocate("context", label).await;
+    match context
+        .tasks
+        .run_with_auto_background(
+            record,
+            AUTO_BACKGROUND_AFTER,
+            move |cancellation| async move {
+                Ok(semantic_history_search(
+                    &state,
+                    &query,
+                    &options,
+                    mode,
+                    users_only,
+                    cancellation,
+                )
+                .await?
+                .into_bytes())
+            },
+        )
+        .await?
+    {
+        AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into_bytes()),
+        AutoTask::Terminal(record) => record.terminal_result("context semantic search"),
+    }
+}
+
 async fn semantic_history_search(
     state: &ContextState,
-    events: &[SessionEvent],
     query: &str,
     options: &QueryOptions,
     mode: SearchMode,
-    window_id: Option<u64>,
     users_only: bool,
+    cancellation: CancellationToken,
 ) -> Result<String> {
-    let range = window_id
-        .map(|window| find_window(events, window))
-        .transpose()?;
     let types = if users_only {
-        RecordTypes::messages()
+        RecordTypes::parse("user")?
     } else {
         options.types.clone().unwrap_or_default()
     };
-    let records = conversation_records(events, &types)
-        .into_iter()
-        .filter(|record| !users_only || record.record_type == RecordType::User)
-        .filter(|record| {
-            range.is_none_or(|range| range.start <= record.sequence && record.sequence < range.end)
-        })
-        .map(|record| (record.sequence, record))
-        .collect::<HashMap<_, _>>();
-    let corpus = current_conversation_corpus(state, events).await?;
-    let hits = search_index(&corpus.spec, &corpus.snapshot, query, mode, 2_000).await?;
-    let mut matches = Vec::new();
-    for hit in hits {
-        let sequence = parse_record_id(&hit.anchor)?;
-        if let Some(record) = records.get(&sequence) {
-            matches.push((record.clone(), hit.score));
+    let window_id = if users_only { None } else { options.window };
+    let filter = SearchFilter::conversation(
+        types.query_value().split(',').map(str::to_string),
+        window_id,
+    );
+    let matches = 'attempts: {
+        for _ in 0..MAX_INDEX_RETRIES {
+            let events = state.events().await?;
+            if let Some(window_id) = window_id {
+                find_window(&events, window_id)?;
+            }
+            let corpus = current_conversation_corpus(state, &events).await?;
+            let checkpoint = index_checkpoint(&corpus.spec).await?;
+            let snapshot = corpus.snapshot(corpus.catalog.changed_sources(&checkpoint))?;
+            if !sync_index(
+                &corpus.spec,
+                &corpus.catalog,
+                snapshot,
+                cancellation.clone(),
+            )
+            .await?
+            {
+                continue;
+            }
+            let fresh_events = state.events().await?;
+            if current_conversation_corpus(state, &fresh_events)
+                .await?
+                .catalog
+                != corpus.catalog
+            {
+                continue;
+            }
+            let hits = search_index(
+                &corpus.spec,
+                &corpus.catalog,
+                query,
+                mode,
+                2_000,
+                filter.clone(),
+                cancellation.clone(),
+            )
+            .await?;
+            let final_events = state.events().await?;
+            if current_conversation_corpus(state, &final_events)
+                .await?
+                .catalog
+                == corpus.catalog
+            {
+                break 'attempts hits;
+            }
         }
-    }
+        bail!("context history changed repeatedly while preparing semantic search; retry the read")
+    };
     if matches.is_empty() {
         return Ok(if users_only {
             "No matching original user statements.".to_string()
+        } else if let Some(window_id) = window_id {
+            format!("No matches in context window {window_id}.")
         } else {
-            format!(
-                "No matches in context window {}.",
-                window_id.expect("non-user semantic history requires a window")
-            )
+            "No matches in context history.".to_string()
         });
     }
 
@@ -1106,26 +1248,29 @@ async fn semantic_history_search(
             mode.label()
         )
     } else {
+        let scope = window_id.map_or_else(
+            || "all context windows".to_string(),
+            |window_id| format!("window={window_id}"),
+        );
         format!(
-            "Untrusted context history {} search · window={}",
+            "Untrusted context history {} search · {scope}",
             mode.label(),
-            window_id.expect("non-user semantic history requires a window")
         )
     };
     let available = matches.len();
     let mut output = heading.clone();
     let mut output_tokens = compaction::estimate_text_tokens(&heading);
     let mut returned = 0usize;
-    for (record, score) in matches.iter().skip(offset).take(limit) {
-        let text = bounded_chars(&record.text, MAX_RECORD_CHARS);
+    for hit in matches.iter().skip(offset).take(limit) {
+        let text = bounded_chars(&hit.text, MAX_RECORD_CHARS);
         let tokens = compaction::estimate_text_tokens(&text)
-            .saturating_add(compaction::estimate_text_tokens(&record.header()))
+            .saturating_add(compaction::estimate_text_tokens(&hit.label))
             .saturating_add(12);
         if returned > 0 && output_tokens.saturating_add(tokens) > MAX_HISTORY_OUTPUT_TOKENS {
             break;
         }
         output_tokens = output_tokens.saturating_add(tokens);
-        let _ = writeln!(output, "\n{} · score={score:.6}\n{text}", record.header());
+        let _ = writeln!(output, "\n{}\n{text}", hit.label);
         returned += 1;
     }
     let next = offset.saturating_add(returned);
@@ -1871,6 +2016,28 @@ mod tests {
         assert!(!search.contains("keep the exact user requirements"));
         assert!(search.contains("Earlier: read(\"context://history/users/search?before=r"));
         assert!(search.contains("&limit=1\", \"user requirement\")"));
+
+        let across_windows = format_history_search(
+            &events,
+            None,
+            "implement rollover",
+            None,
+            Some(10),
+            Some(&RecordTypes::parse("user").unwrap()),
+        )
+        .unwrap();
+        assert!(across_windows.contains("all context windows"));
+        assert!(across_windows.contains("implement rollover"));
+        let narrowed = format_history_search(
+            &events,
+            Some(2),
+            "implement rollover",
+            None,
+            Some(10),
+            Some(&RecordTypes::parse("user").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(narrowed, "No matches in context window 2.");
     }
 
     #[tokio::test]
@@ -1960,6 +2127,8 @@ mod tests {
         assert!(help.contains("exec(\"context://history/index\", \"\")"));
         assert!(help.contains("mode=semantic"));
         assert!(help.contains("mode=hybrid"));
+        assert!(help.contains("Do not use either operation before a ranked search"));
+        assert!(help.contains("continues as one managed task without restarting"));
         assert!(help.contains("context://history/around/<record-id>"));
         assert!(help.contains("`user`, `assistant`, `tool_call`, `tool_result`, and `error`"));
         assert!(help.contains("including for a deleted note"));
@@ -1985,6 +2154,10 @@ mod tests {
         .unwrap();
         assert_eq!(semantic.search_mode(), Some(SearchMode::Semantic));
         semantic.validate_history_search().unwrap();
+        QueryOptions::parse(Some("mode=hybrid&limit=7"))
+            .unwrap()
+            .validate_history_search()
+            .unwrap();
         assert!(
             QueryOptions::parse(Some("mode=hybrid&window=2&before=r10"))
                 .unwrap()

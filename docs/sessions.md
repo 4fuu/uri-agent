@@ -15,15 +15,20 @@ On macOS this path is `~/.config/uri-agent/sessions-v3.db`, colocated with confi
 Earlier session databases and their sidecars remain untouched. There is no
 migration into `sessions-v3.db`.
 
-Semantic conversation indexes are disposable sidecar caches under the platform
-cache directory at `uri-agent/retrieval/v1/`. The `context` index is keyed by
-session ID; the `sessions` index is keyed by the archive database path and
-covers every project in that archive. Each manifest pins the extractor,
+Semantic conversation indexes are disposable private sidecar caches under the
+platform cache directory at `uri-agent/retrieval/v2/`. The `context` index is
+keyed by session ID. `sessions` keeps separate indexes for the current project,
+the explicitly requested all-session scope, and an explicitly narrowed working
+directory. Each manifest pins the extractor, per-record source revisions,
 source digest, zvec release, embedding model revision, tensor checksums,
 dimension, and cosine metric. A mismatched or malformed manifest is stale.
-Rebuilds use a cross-process lock, create a complete replacement separately,
-and activate it by rename, so searches never open a partially written
-collection. Removing these directories loses no session data.
+Normal ranked reads add and remove only changed append-only record sources;
+forced rebuilds use a cross-process lock, create a complete replacement
+separately, and activate it by rename. The manifest is invalidated before an
+in-place refresh and published only after flush, so cancellation or failure
+cannot advertise a partial collection as current. Cache directories are mode
+`0700` and cache metadata is mode `0600` on Unix. Removing these directories
+loses no session data.
 
 ## AgentHost and Agent specifications
 
@@ -81,12 +86,18 @@ See [ACP v1](acp.md#project-and-session-lifecycle).
 
 The `sessions` protocol can search archives across projects when explicitly
 requested. Exact metadata and substring search remain available without an
-index. `exec("sessions://index", "")` starts a managed full rebuild of the
-all-session semantic sidecar; `mode=semantic` performs vector ranking and
-`mode=hybrid` fuses vector and Jieba BM25 ranks. Both ranked modes preserve
-scope, working-directory, record-type, offset, and limit filtering and refuse
-a missing or stale index. `@@` completion remains project-scoped. Archive
-reads and indexing never resume or modify a session; see
+index. `mode=semantic` performs vector ranking and `mode=hybrid` fuses vector
+and Jieba BM25 ranks. Both ranked modes automatically ensure the selected
+scope-specific cache, load only newly appended searchable records on a normal
+refresh, and apply record-type filters before top-k ranking. Small searches
+return directly; a long ranked search continues as a managed task whose
+completion carries the search result. If its notification is truncated, follow
+its `tasks://` instruction once rather than rerunning the search. Do not read or
+execute `sessions://index` before a ranked search; its read form reports
+diagnostic state, while its `exec` form optionally prewarms or force-rebuilds
+the selected scope. Ranked results omit backend scores because semantic cosine
+and hybrid fusion scores are not comparable. `@@` completion remains
+project-scoped. Archive reads and indexing never resume or modify a session; see
 [`sessions`](protocols.md#sessions).
 
 Each session records its provider, model, and thinking effort. Changes append a settings event, and resume restores the latest session settings rather than defaults for a new session.
@@ -198,7 +209,13 @@ The built-in `context` protocol provides durable working memory and recovery:
 - a growth write above the hard budget fails, while shrinking replacements and deletes remain available;
 - deleting a note creates a tombstone that retains ID, title, revisions, anchors, and `已删除`; note content is no longer exposed through `context` or `sessions` reads, while ordinary records around its anchors remain available;
 - note reads, prior-window history, user-statement history, search, and anchor neighborhoods are bounded; note bodies and history pages are paginated. Dedicated user-history routes list and search only original user submissions across all windows. History and neighborhood reads filter the shared `user`, `assistant`, `tool_call`, `tool_result`, and `error` record types;
-- exact history search remains the default and uses record-ID pagination. `exec("context://history/index", "")` builds a managed semantic sidecar for the current session; user-statement and per-window searches then accept `mode=semantic` or `mode=hybrid` with relevance-order `offset` pagination. Ranked reads refuse a missing or stale index.
+- exact history search remains the default and uses record-ID pagination;
+  omitting `window` searches every context window, while supplying it narrows
+  the query. User-statement and ordinary history searches accept
+  `mode=semantic` or `mode=hybrid` with relevance-order `offset` pagination.
+  Ranked reads automatically incrementally refresh their cache and apply type
+  and window filters before top-k ranking. The explicit index operation is only
+  for prewarming or forced rebuilding.
 
 Note writes and deletes are sidecar persistence events: they do not modify model replay, and their model-issued tool calls and correlated results remain in the active provider prefix. Notes, handoffs, and context-history results are marked as untrusted reference data. Recovery history excludes system messages, hidden reasoning, all `context://` and `sessions://` calls, and their correlated results. Deletion is not secure erasure: the append-only database still contains historical events, but model-facing note and session-history routes do not return the deleted body.
 

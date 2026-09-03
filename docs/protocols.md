@@ -61,7 +61,7 @@ Protocol names must be unique. Registration fails rather than silently replacing
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched URI Agent documentation embedded in the binary |
 | `file` | `read` | Read files, bounded directory listings, and recursive glob results |
-| `grep` | `read`, `exec` | Search files with exact ripgrep matching or an explicit semantic index |
+| `grep` | `read`, `exec` | Search files with exact ripgrep matching or on-demand semantic retrieval |
 | `sessions` | `read`, `exec` | Discover and search saved sessions while keeping the source archive read-only |
 | `context` | `read`, `exec` | Inspect context usage, maintain titled notes, search prior windows, and request rollover |
 | `https` | `read` | Search through a logged-in web provider and read HTTPS pages as text |
@@ -225,24 +225,33 @@ read("grep://src/tui/app.rs", "fn push(")
 read("grep://?literal=true&ignore_case=true", "exact text")
 ```
 
-Semantic search uses an explicitly built sidecar index for one exact root and
-optional glob. Index creation is a managed background task:
+Semantic search uses a private sidecar index for one exact root and optional
+glob. A ranked read creates or incrementally refreshes that cache itself:
 
 ```text
-exec("grep://src?mode=index&glob=**/*.rs", "")
-read("grep://src?mode=status&glob=**/*.rs", "")
 read("grep://src?mode=semantic&glob=**/*.rs", "credential refresh flow")
 read("grep://src?mode=hybrid&glob=**/*.rs&limit=20", "会话检索")
+read("grep://src?mode=status&glob=**/*.rs", "")
+exec("grep://src?mode=index&glob=**/*.rs", "")
 ```
 
 `semantic` ranks Model2Vec embeddings with zvec cosine search. `hybrid` fuses
-that rank with Jieba BM25 using reciprocal-rank fusion. Ranked search defaults
-to 7 results and allows at most 50. It fails when the matching root/glob index
-is missing or stale; it never silently returns an older corpus. Re-running the
-index operation performs an atomic full rebuild. The scanner follows standard
-ignore files, skips binary and non-UTF-8 data and files over 1 MiB, and stores
-overlapping source fragments under stable file and line-range groups. Source
-files are never changed.
+that rank with Jieba BM25 using reciprocal-rank fusion. Use exact search for
+known identifiers and literals, prefer hybrid for conceptual searches, and use
+semantic when relevant results are likely to use different wording. Ranked
+search defaults to 7 results and allows at most 50. It searches only after the
+source catalog and cache agree, and retries a bounded number of times if files
+change during indexing. Small operations return results directly; after about
+60 seconds the same operation continues as a managed task whose completion
+carries the search result. If the notification marks its output truncated,
+follow its `tasks://` instruction once instead of rerunning the search. Do not
+call `mode=status` or `mode=index` before a ranked search: status is diagnostic,
+while index is optional prewarming or forced recovery and performs an atomic
+full rebuild. Results remain in ranked order but omit backend scores because
+cosine and hybrid fusion scores are not comparable. The scanner follows
+standard ignore files, skips binary and non-UTF-8 data and files over 1 MiB,
+and stores overlapping source fragments under stable file groups with
+fragment-accurate line ranges. Source files are never changed.
 
 URI Agent uses a working `rg` from `PATH` when available. Otherwise the linked
 grep plugin silently installs its pinned platform archive after checking the
@@ -257,12 +266,18 @@ Current note titles and content share a model-relative budget. Growth above the 
 
 History reads and search accept comma-separated `types` values from `user`,
 `assistant`, `tool_call`, `tool_result`, and `error`; all types are included by
-default. Exact search uses record-ID `before` pagination. After
-`exec("context://history/index", "")` builds the current session's sidecar
-index, `mode=semantic` and `mode=hybrid` provide ranked search with `offset`
-pagination for both user-statement and per-window search routes. The
-corresponding `context://history/index` read reports missing, stale, or current
-state. Ranked search fails on missing or stale data.
+default. Exact search uses record-ID `before` pagination. History search spans
+all windows when `window` is omitted and narrows to one window when supplied.
+`mode=semantic` and `mode=hybrid` provide ranked search with `offset`
+pagination; they automatically create or incrementally refresh the current
+session's sidecar before searching. Record-type and window filters are applied
+inside both vector and keyword retrieval before ranking. Results contain the
+actual matching fragment in ranked order without exposing backend scores. A
+long refresh continues as a managed task whose completion carries the search
+result; if the notification is truncated, follow its `tasks://` instruction
+once rather than rerunning the search. Do not read or execute
+`context://history/index` before a ranked search: its read form is diagnostic,
+while its `exec` form is optional prewarming or a forced full rebuild.
 
 An anchor read accepts bounded `before` and `after` record counts. Note mutation
 events are sidecar state and do not alter model replay or remove their tool
@@ -287,20 +302,30 @@ read("sessions://search", "refresh token")
 read("sessions://search?scope=all&limit=20", "billing migration")
 ```
 
-An explicit managed task builds one sidecar index for all saved sessions.
-Semantic searches can still apply project, working-directory, record-type,
-offset, and limit filters:
+Semantic search keeps separate sidecar indexes for the requested project,
+all-session, or narrowed working-directory scope. The default remains the
+current project. A ranked read automatically creates or incrementally refreshes
+its selected cache; explicit indexing is optional prewarming or forced repair:
 
 ```text
-exec("sessions://index", "")
-read("sessions://index", "")
 read("sessions://search?mode=semantic&scope=all&limit=20", "credential renewal")
 read("sessions://search?mode=hybrid&types=user,assistant", "会话迁移")
+read("sessions://index?scope=all", "")
+exec("sessions://index?scope=all", "")
 ```
 
-Ranked search fails when the index is missing or stale. Index creation reads
-only the same conversation-record projection exposed by the protocol; it
-neither resumes nor changes a session.
+Record-type filtering runs inside vector and keyword retrieval before ranking,
+and scope is fixed by the selected index rather than post-filtering a global
+top-k result. Only newly appended searchable records are loaded and embedded
+during a normal refresh; warm search does not load every archived transcript.
+Small operations return directly, while a long refresh continues as a managed
+task whose completion carries the search result. If the notification is
+truncated, follow its `tasks://` instruction once rather than rerunning the
+search. Do not read or execute `sessions://index` before a ranked search; those
+operations are diagnostic and optional forced rebuilding respectively. Results
+remain in ranked order but omit backend scores. Index creation reads only the
+same conversation-record projection exposed by the protocol; it neither
+resumes nor changes a session.
 
 Search results identify matching conversation records with the same
 session-local `r<number>` anchors used by `context`. Read an exact session ID to
@@ -447,14 +472,14 @@ all model providers distinguish failures from successful text.
 
 ## Managed tasks
 
-Protocol execution returns its final result directly by default. Bash and PowerShell commands therefore start in the foreground. If a command is still running after about 60 seconds, URI Agent converts that same process into a managed background task without restarting it:
+Protocol execution returns its final result directly by default. Ranked searches and shell commands therefore start in the foreground. If an operation is still running after about 60 seconds, URI Agent continues that same operation as a managed background task without restarting it:
 
 ```text
 exec("bash://run", "cargo test")
 → <stdout>
 
 # If it remains active past the foreground window:
-→ Background task accepted: tasks://<id>
+→ Background task started: tasks://<id>
 ```
 
 Use `background=true` when the command should become a task immediately:
@@ -503,11 +528,11 @@ sends the model an automatic hidden plain-text notification containing the
 output. A complete-record read instruction appears only when that output was
 truncated. The notification continues the active turn at its next model
 boundary or starts a model turn when idle. When the result is needed before
-continuing, the model may use one bounded wait instead of repeatedly polling.
-Task output is identified as untrusted data. Reading an individual terminal
-task or a summary that already presents it suppresses the duplicate
-notification. Notifications are delivered in batches of at most 10 and
-approximately 16,000 output characters.
+continuing, the model may use one bounded wait instead of polling or rerunning
+the operation. Task output is identified as untrusted data. Reading an
+individual terminal task or a summary that already presents it suppresses the
+duplicate notification. Notifications are delivered in batches of at most 10
+and approximately 16,000 output characters.
 
 Process shutdown cancels and joins active managed tasks. Shell cancellation and timeout terminate the spawned process tree and reap the root process before the task reaches its terminal state, rather than only dropping the Rust future that waits for it.
 

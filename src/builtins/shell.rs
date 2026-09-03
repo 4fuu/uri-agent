@@ -2,7 +2,7 @@ use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, Plu
 use crate::process::{PWSH_STDIN_BOOTSTRAP, ProcessTree};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
-use crate::task::{PromoteBackground, TaskManager, TaskRecord, TaskStatus};
+use crate::task::{AutoTask, TaskManager};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -117,47 +117,6 @@ identified by `stderr:`, and both streams are labeled when both exist. A
 successful command with no output returns `(no output)`. Failures retain the
 exit code or timeout and any output observed before termination.
 "#;
-
-struct ForegroundTaskGuard {
-    tasks: TaskManager,
-    id: String,
-    cancellation: CancellationToken,
-    armed: bool,
-}
-
-impl ForegroundTaskGuard {
-    fn new(tasks: TaskManager, id: String, cancellation: CancellationToken) -> Self {
-        Self {
-            tasks,
-            id,
-            cancellation,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ForegroundTaskGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.cancellation.cancel();
-            let tasks = self.tasks.clone();
-            let id = self.id.clone();
-            tokio::spawn(async move {
-                if tasks
-                    .wait_until_terminal(&id)
-                    .await
-                    .is_some_and(|record| !record.background)
-                {
-                    tasks.remove(&id).await;
-                }
-            });
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ShellOptions {
@@ -375,88 +334,34 @@ impl ShellProtocol {
         };
         let id = record.id.clone();
         let tasks = context.tasks.clone();
-        let mut foreground = (!options.background).then(|| {
-            ForegroundTaskGuard::new(tasks.clone(), id.clone(), record.cancellation.clone())
-        });
         let progress_tasks = tasks.clone();
         let progress_id = id.clone();
-        tasks
-            .spawn_with_cancellation(record, move |cancellation| async move {
-                let environment = environment.snapshot().await;
-                execute_with_cancellation(
-                    &protocol,
-                    &executable,
-                    &cwd,
-                    &command,
-                    &environment,
-                    ExecutionControl {
-                        timeout: options.timeout,
-                        progress: Some((&progress_tasks, &progress_id)),
-                        cancellation,
-                    },
-                )
-                .await
-            })
-            .await;
+        let work = move |cancellation| async move {
+            let environment = environment.snapshot().await;
+            execute_with_cancellation(
+                &protocol,
+                &executable,
+                &cwd,
+                &command,
+                &environment,
+                ExecutionControl {
+                    timeout: options.timeout,
+                    progress: Some((&progress_tasks, &progress_id)),
+                    cancellation,
+                },
+            )
+            .await
+        };
         if options.background {
+            tasks.spawn_with_cancellation(record, work).await;
             return Ok(prompts::task_accepted(&id).into_bytes());
         }
-        let record = context
-            .tasks
-            .wait(&id, auto_background_after)
-            .await
-            .ok_or_else(|| anyhow!("task disappeared: {id}"))?;
-        if record.status.terminal() {
-            let result = finish_foreground(&context.tasks, record).await;
-            foreground
-                .as_mut()
-                .expect("foreground commands have a cancellation guard")
-                .disarm();
-            return result;
-        }
-        match context.tasks.promote_background(&id).await {
-            PromoteBackground::Promoted => {
-                foreground
-                    .as_mut()
-                    .expect("foreground commands have a cancellation guard")
-                    .disarm();
-                Ok(prompts::task_accepted(&id).into_bytes())
-            }
-            PromoteBackground::Terminal(record) => {
-                let result = finish_foreground(&context.tasks, record).await;
-                foreground
-                    .as_mut()
-                    .expect("foreground commands have a cancellation guard")
-                    .disarm();
-                result
-            }
-            PromoteBackground::AtCapacity => {
-                let record = context
-                    .tasks
-                    .wait_until_terminal(&id)
-                    .await
-                    .ok_or_else(|| anyhow!("task disappeared: {id}"))?;
-                let result = finish_foreground(&context.tasks, record).await;
-                foreground
-                    .as_mut()
-                    .expect("foreground commands have a cancellation guard")
-                    .disarm();
-                result
-            }
-        }
-    }
-}
-
-async fn finish_foreground(tasks: &TaskManager, record: TaskRecord) -> Result<Vec<u8>> {
-    tasks.remove(&record.id).await;
-    match record.status {
-        TaskStatus::Completed => Ok(record.content),
-        TaskStatus::Failed => Err(anyhow!(
-            String::from_utf8_lossy(&record.content).into_owned()
-        )),
-        TaskStatus::Cancelled => bail!("shell command was cancelled"),
-        TaskStatus::Pending | TaskStatus::Running => {
-            bail!("shell command did not reach a terminal state")
+        match tasks
+            .run_with_auto_background(record, auto_background_after, work)
+            .await?
+        {
+            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into_bytes()),
+            AutoTask::Terminal(record) => record.terminal_result("shell command"),
         }
     }
 }
@@ -852,6 +757,7 @@ mod tests {
     use super::*;
     use crate::builtins::tasks::TasksProtocol;
     use crate::config::AgentEnvironment;
+    use crate::task::TaskStatus;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1259,8 +1165,8 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() < Duration::from_millis(150));
         let accepted = String::from_utf8(accepted).unwrap();
-        assert!(accepted.contains("Background task accepted: tasks://002"));
-        assert!(accepted.contains("use its bounded wait; do not repeatedly poll"));
+        assert!(accepted.contains("Background task started: tasks://002"));
+        assert!(accepted.contains("then use one bounded wait. Do not poll or rerun"));
 
         let background_uri = format!("{protocol}://run?background=true");
         let started = Instant::now();

@@ -205,10 +205,17 @@ The shared routing and execution lifecycle is in [Protocols, tasks, and output](
 - Rollover replay contains only its host bootstrap and subsequent model messages. The bootstrap must direct the model to `context://help`, active notes, and bounded prior-window history; protocol-help state resets at the boundary.
 - A model-requested rollover is committed only after every tool call from that response has a correlated durable result. Context-note persistence events are sidecar state and cannot change replay; the originating tool call and result remain in the active provider prefix.
 - Recoverable conversation records use session-local `r<sequence>` anchors and the same type projection in `context` and `sessions`. Every `context://` or `sessions://` call and correlated result must remain absent from those recovery views.
-- Semantic indexes are derived sidecars. Their manifest must bind source digest,
-  extractor, schema, zvec release, model revision and checksums, dimension, and
-  metric. Search rejects missing or stale state; rebuilds hold a cross-process
-  writer lock and activate a complete replacement atomically.
+- Semantic indexes are derived private sidecars. Their manifest must bind the
+  per-source revisions and digest, extractor, schema, zvec release, model
+  revision and checksums, dimension, and metric. Ranked reads ensure the cache
+  on demand and must recheck source revisions before returning results. Normal
+  refresh loads and rewrites only changed sources; filters that affect result
+  eligibility run in zvec before top-k ranking. Refresh invalidates the
+  manifest before mutation and republishes it only after a successful flush;
+  forced rebuilds hold a cross-process writer lock and activate a complete
+  replacement atomically. Cancellation between native operations must never
+  leave a partial index advertised as current. Unix cache directories and
+  metadata remain owner-only.
 - Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
 - Preserve provider tool-call identity during replay.
 - Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
