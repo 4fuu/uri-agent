@@ -64,7 +64,9 @@ impl AuthClient {
         let (mut parts, body) = request.into_parts();
         let body = if let Some(transform) = &self.transform {
             transform.transform_headers(&mut parts.headers);
-            transform.transform_bytes(body.into())
+            let body = transform.transform_bytes(body.into());
+            transform.transform_body_dependent_headers(&mut parts.headers, &body);
+            body
         } else {
             body.into()
         };
@@ -319,7 +321,7 @@ impl RigBackend {
             );
             headers.insert(
                 http::header::USER_AGENT,
-                HeaderValue::from_static("claude-cli/2.1.32"),
+                HeaderValue::from_static("claude-cli/2.1.251"),
             );
         }
         let limits = model.limits();

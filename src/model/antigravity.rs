@@ -982,16 +982,21 @@ fn normalize_request_parts(body: &mut Map<String, Value>, upstream_model: &str) 
     };
     for content in contents {
         let mut claude_ids = std::collections::HashMap::<String, usize>::new();
+        let model_content = content.get("role").and_then(Value::as_str) == Some("model");
         let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
             continue;
         };
+        let mut first_function_call = true;
         for part in parts {
             let Some(object) = part.as_object_mut() else {
                 continue;
             };
             mirror_thought_signature(object);
+            let is_function_call = object.contains_key("functionCall");
             if flash
-                && object.contains_key("functionCall")
+                && model_content
+                && first_function_call
+                && is_function_call
                 && !object.contains_key("thoughtSignature")
             {
                 object.insert(
@@ -1002,6 +1007,9 @@ fn normalize_request_parts(body: &mut Map<String, Value>, upstream_model: &str) 
                     "thought_signature".to_string(),
                     Value::String(DUMMY_THOUGHT_SIGNATURE.to_string()),
                 );
+            }
+            if is_function_call {
+                first_function_call = false;
             }
             if claude {
                 for key in ["functionCall", "functionResponse"] {
@@ -1598,17 +1606,33 @@ mod tests {
     #[test]
     fn request_parts_mirror_signatures_and_fill_flash_and_claude_fields() {
         let mut flash = json!({
-            "contents": [{"parts": [
-                {"functionCall": {"name": "read", "args": {}}},
-                {"functionCall": {"name": "exec", "args": {}}, "thought_signature": "real"}
-            ]}]
+            "contents": [
+                {"role": "model", "parts": [
+                    {"text": "before calls"},
+                    {"functionCall": {"name": "read", "args": {}}},
+                    {"functionCall": {"name": "exec", "args": {}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "signed", "args": {}}, "thought_signature": "real"},
+                    {"functionCall": {"name": "unsigned", "args": {}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "next-message", "args": {}}}
+                ]}
+            ]
         });
         prepare_inner_request(&mut flash, "-1", "gemini-3.7-flash-low", None).unwrap();
         assert_eq!(
-            flash["contents"][0]["parts"][0]["thoughtSignature"],
+            flash["contents"][0]["parts"][1]["thoughtSignature"],
             DUMMY_THOUGHT_SIGNATURE
         );
-        assert_eq!(flash["contents"][0]["parts"][1]["thoughtSignature"], "real");
+        assert!(flash["contents"][0]["parts"][2]["thoughtSignature"].is_null());
+        assert_eq!(flash["contents"][1]["parts"][0]["thoughtSignature"], "real");
+        assert!(flash["contents"][1]["parts"][1]["thoughtSignature"].is_null());
+        assert_eq!(
+            flash["contents"][2]["parts"][0]["thoughtSignature"],
+            DUMMY_THOUGHT_SIGNATURE
+        );
 
         let mut claude = json!({
             "contents": [

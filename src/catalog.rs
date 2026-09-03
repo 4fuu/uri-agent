@@ -1015,7 +1015,83 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
             ),
         ),
     ]);
-    BTreeMap::from([("antigravity".to_string(), models)])
+    let abliteration_models = BTreeMap::from([
+        (
+            "abliterated-model".to_string(),
+            abliteration_model(
+                "abliterated-model",
+                "Abliterated Model",
+                serde_json::json!(["text", "image"]),
+                (262_144, 262_134),
+                3.0,
+                serde_json::json!({
+                    "off": "none", "minimal": "minimal", "low": "low",
+                    "medium": "medium", "high": "high", "xhigh": "xhigh", "max": null
+                }),
+            ),
+        ),
+        (
+            "abliterated-model-large".to_string(),
+            abliteration_model(
+                "abliterated-model-large",
+                "Abliterated Model Large",
+                serde_json::json!(["text"]),
+                (1_000_000, 999_990),
+                5.0,
+                serde_json::json!({
+                    "off": "none", "minimal": null, "low": null, "medium": null,
+                    "high": "high", "xhigh": "max", "max": "max"
+                }),
+            ),
+        ),
+        (
+            "abliterated-model-large-v2".to_string(),
+            abliteration_model(
+                "abliterated-model-large-v2",
+                "Abliterated Model Large V2",
+                serde_json::json!(["text"]),
+                (1_000_000, 999_990),
+                5.0,
+                serde_json::json!({
+                    "off": "low", "minimal": "low", "low": "low", "medium": "high",
+                    "high": "high", "xhigh": "max", "max": "max"
+                }),
+            ),
+        ),
+    ]);
+    BTreeMap::from([
+        ("abliteration".to_string(), abliteration_models),
+        ("antigravity".to_string(), models),
+    ])
+}
+
+fn abliteration_model(
+    id: &str,
+    name: &str,
+    input: Value,
+    limits: (u64, u64),
+    price: f64,
+    thinking_level_map: Value,
+) -> Value {
+    let (context_window, max_tokens) = limits;
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "api": "openai-responses",
+        "provider": "abliteration",
+        "providerName": "Abliteration",
+        "baseUrl": "https://api.abliteration.ai/v1",
+        "reasoning": true,
+        "input": input,
+        "cost": {"input": price, "output": price, "cacheRead": price / 10.0, "cacheWrite": 0},
+        "contextWindow": context_window,
+        "maxTokens": max_tokens,
+        "thinkingLevelMap": thinking_level_map,
+        "compat": {
+            "includeEncryptedReasoning": false,
+            "streamIdleTimeoutMs": 0
+        }
+    })
 }
 
 fn antigravity_model(
@@ -1100,6 +1176,7 @@ fn merge_value(base: &mut Value, overlay: Value) {
 
 pub fn api_key_environment(provider: &str) -> String {
     match provider {
+        "abliteration" => "ABLITERATION_API_KEY",
         "amazon-bedrock" => "AWS_BEARER_TOKEN_BEDROCK",
         "ant-ling" => "ANT_LING_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
@@ -1154,15 +1231,17 @@ pub fn api_key_environment(provider: &str) -> String {
 }
 
 pub(crate) fn api_key_environments(provider: &str) -> Vec<String> {
-    if provider == "cloudflare-ai-gateway" {
-        // API_TOKEN names the credential according to Cloudflare's current
-        // contract. Keep API_KEY at lower precedence for existing installs.
-        vec![
-            "CLOUDFLARE_API_KEY".to_string(),
-            api_key_environment(provider),
-        ]
-    } else {
-        vec![api_key_environment(provider)]
+    match provider {
+        "abliteration" => vec!["ABLIT_KEY".to_string(), api_key_environment(provider)],
+        "cloudflare-ai-gateway" => {
+            // API_TOKEN names the credential according to Cloudflare's current
+            // contract. Keep API_KEY at lower precedence for existing installs.
+            vec![
+                "CLOUDFLARE_API_KEY".to_string(),
+                api_key_environment(provider),
+            ]
+        }
+        _ => vec![api_key_environment(provider)],
     }
 }
 
@@ -1392,6 +1471,58 @@ mod tests {
     }
 
     #[test]
+    fn abliteration_models_are_built_in_with_verified_capabilities() {
+        let (merged, warnings) =
+            merge_catalog(&BTreeMap::new(), &ModelsFile::default(), &BTreeMap::new());
+        assert!(warnings.is_empty());
+        let models = &merged["abliteration"];
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "abliterated-model",
+                "abliterated-model-large",
+                "abliterated-model-large-v2"
+            ]
+        );
+
+        let base = &models[0];
+        assert_eq!(base.api, "openai-responses");
+        assert_eq!(base.base_url, "https://api.abliteration.ai/v1");
+        assert_eq!(base.limits().context_window, 262_144);
+        assert_eq!(base.limits().max_tokens, 262_134);
+        assert_eq!(base.limits().cost.input, 3.0);
+        assert_eq!(base.limits().cost.cache_read, 0.3);
+        assert!(base.accepts_input("image"));
+        assert_eq!(
+            base.compat("includeEncryptedReasoning"),
+            Some(&Value::Bool(false))
+        );
+
+        let large = &models[1];
+        assert_eq!(large.limits().context_window, 1_000_000);
+        assert_eq!(large.limits().max_tokens, 999_990);
+        assert!(!large.accepts_input("image"));
+        assert!(!large.supports_thinking_level(ThinkingLevel::Medium));
+        assert_eq!(
+            large.thinking_level(ThinkingLevel::Xhigh),
+            Some(&Value::String("max".to_string()))
+        );
+
+        let large_v2 = &models[2];
+        assert_eq!(
+            large_v2.thinking_level(ThinkingLevel::Off),
+            Some(&Value::String("low".to_string()))
+        );
+        assert_eq!(
+            large_v2.thinking_level(ThinkingLevel::Medium),
+            Some(&Value::String("high".to_string()))
+        );
+    }
+
+    #[test]
     fn pi_provider_payloads_and_user_overrides_merge_by_model_id() {
         let models = parse_provider_payload(
             "openai",
@@ -1436,6 +1567,10 @@ mod tests {
         }))
         .unwrap();
         assert!(!model.supported());
+        assert_eq!(
+            api_key_environments("abliteration"),
+            vec!["ABLIT_KEY", "ABLITERATION_API_KEY"]
+        );
         assert_eq!(api_key_environment("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(
             api_key_environments("cloudflare-ai-gateway"),

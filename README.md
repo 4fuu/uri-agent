@@ -81,8 +81,10 @@ Dedicated integrations cover the places where generic catalog compatibility is
 not enough: ChatGPT Codex subscription OAuth and WebSocket transport,
 Cloudflare AI Gateway's credential-safe endpoint boundary, WorkBuddy China
 browser login and account model discovery, and the explicitly experimental
-Antigravity private protocol. URI Agent also supports provider-specific login
-flows for Anthropic, GitHub Copilot, Kimi Coding, xAI, Radius, and OpenRouter.
+Antigravity private protocol. A built-in Abliteration.ai catalog provides
+credential-scoped live discovery and static fallback models. URI Agent also
+supports provider-specific login flows for Anthropic, GitHub Copilot, Kimi
+Coding, xAI, Radius, and OpenRouter.
 
 Catalog contents and account entitlements change; a listed model still requires
 the matching credentials, region, and subscription. See [Models and

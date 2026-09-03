@@ -1417,6 +1417,24 @@ fn responses_uses_catalog_thinking_map_and_sampling_params() {
 }
 
 #[test]
+fn responses_compat_can_omit_encrypted_reasoning() {
+    let model = catalog_model(
+        "openai-responses",
+        json!({
+            "reasoning": true,
+            "compat": {"includeEncryptedReasoning": false}
+        }),
+    );
+    let body = transformed(
+        model,
+        ThinkingLevel::High,
+        json!({"include": ["reasoning.encrypted_content"]}),
+    );
+    assert!(body.get("include").is_none());
+    assert_eq!(body["reasoning"]["effort"], "high");
+}
+
+#[test]
 fn responses_compat_can_omit_max_output_tokens() {
     let default_body = transformed(
         catalog_model("openai-responses", json!({})),
@@ -1462,6 +1480,23 @@ fn completions_compat_renames_output_cap_and_controls_reasoning() {
     assert!(body.get("max_completion_tokens").is_none());
     assert!(body.get("stream_options").is_none());
     assert_eq!(body["reasoning_effort"], "small");
+}
+
+#[test]
+fn completions_compat_maps_vllm_priority() {
+    let model = catalog_model("openai-completions", json!({"compat": {"vllmPriority": 0}}));
+    let body = transformed(model, ThinkingLevel::Off, json!({}));
+    assert_eq!(body["priority"], 0);
+
+    let ignored = transformed(
+        catalog_model(
+            "openai-completions",
+            json!({"compat": {"vllmPriority": "high"}}),
+        ),
+        ThinkingLevel::Off,
+        json!({}),
+    );
+    assert!(ignored.get("priority").is_none());
 }
 
 #[test]
@@ -1592,6 +1627,181 @@ fn anthropic_force_adaptive_thinking_matches_pi_request_shape() {
     assert_eq!(body["thinking"]["display"], "summarized");
     assert_eq!(body["output_config"]["effort"], "max");
     assert!(body.get("temperature").is_none());
+}
+
+#[test]
+fn anthropic_mid_conversation_effort_inserts_markers_and_binding_controls() {
+    let model = catalog_model(
+        "anthropic-messages",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"xhigh": "max"},
+            "compat": {"supportsMidConvoEffort": true}
+        }),
+    );
+    let body = transformed(
+        model,
+        ThinkingLevel::Xhigh,
+        json!({
+            "temperature": 0.4,
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"}
+            ]
+        }),
+    );
+
+    assert!(body.get("temperature").is_none());
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["thinking"]["display"], "summarized");
+    assert_eq!(
+        body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block"
+    );
+    assert_eq!(body["output_config"]["effort"], "high");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(body["messages"][1]["role"], "system");
+    assert_eq!(body["messages"][1]["content"], json!([]));
+    assert_eq!(body["messages"][1]["output_config"]["effort"], "max");
+    assert_eq!(body["messages"][2]["role"], "assistant");
+    assert_eq!(body["messages"][4]["role"], "system");
+    assert_eq!(body["messages"][4]["output_config"]["effort"], "max");
+}
+
+#[test]
+fn anthropic_mid_conversation_effort_defaults_unmapped_levels_to_high() {
+    let model = catalog_model(
+        "anthropic-messages",
+        json!({
+            "reasoning": true,
+            "compat": {"supportsMidConvoEffort": true}
+        }),
+    );
+    for thinking in [ThinkingLevel::Off, ThinkingLevel::Xhigh, ThinkingLevel::Max] {
+        let body = transformed(
+            model.clone(),
+            thinking,
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+        );
+        assert_eq!(body["messages"][1]["output_config"]["effort"], "high");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+    }
+}
+
+#[test]
+fn anthropic_mid_conversation_effort_adds_betas_unless_explicitly_configured() {
+    let model = catalog_model(
+        "anthropic-messages",
+        json!({"compat": {"supportsMidConvoEffort": true}}),
+    );
+    let transform = ModelRequestTransform {
+        model,
+        thinking: ThinkingLevel::Off,
+        session_id: None,
+    };
+    let mut headers = HeaderMap::new();
+    transform.transform_headers(&mut headers);
+    let betas = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        betas,
+        [
+            "mid-conversation-output-config-2026-07-01",
+            "thinking-binding-controls-2026-08-01"
+        ]
+    );
+
+    let mut explicit_model = transform.model.clone();
+    explicit_model
+        .headers
+        .insert("Anthropic-Beta".to_string(), "custom-beta".to_string());
+    let explicit_transform = ModelRequestTransform {
+        model: explicit_model,
+        ..transform
+    };
+    let mut explicit = HeaderMap::from_iter([(
+        "anthropic-beta".parse().unwrap(),
+        HeaderValue::from_static("custom-beta"),
+    )]);
+    explicit_transform.transform_headers(&mut explicit);
+    assert_eq!(
+        explicit
+            .get_all("anthropic-beta")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["custom-beta"]
+    );
+}
+
+#[test]
+fn github_copilot_uses_official_cli_identity_and_dynamic_initiator() {
+    let mut model = catalog_model("openai-completions", json!({}));
+    model.provider = "github-copilot".to_string();
+    let transform = ModelRequestTransform {
+        model,
+        thinking: ThinkingLevel::Off,
+        session_id: None,
+    };
+    let mut headers = HeaderMap::from_iter([
+        (
+            "User-Agent".parse().unwrap(),
+            HeaderValue::from_static("stale"),
+        ),
+        (
+            "Editor-Plugin-Version".parse().unwrap(),
+            HeaderValue::from_static("stale"),
+        ),
+    ]);
+    transform.transform_body_dependent_headers(
+        &mut headers,
+        &serde_json::to_vec(&json!({
+            "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "tool", "content": "done"}
+            ]
+        }))
+        .unwrap(),
+    );
+
+    assert_eq!(headers["user-agent"], "copilot/1.0.82");
+    assert_eq!(headers["editor-version"], "copilot/1.0.82");
+    assert!(!headers.contains_key("editor-plugin-version"));
+    assert_eq!(headers["copilot-integration-id"], "copilot-developer-cli");
+    assert_eq!(headers["copilot-harness-id"], "copilot-sdk");
+    assert_eq!(headers["openai-intent"], "conversation-agent");
+    assert_eq!(headers["x-github-api-version"], "2026-08-01");
+    assert_eq!(headers["x-initiator"], "agent");
+    assert_eq!(headers["x-interaction-type"], "conversation-agent");
+
+    let mut user_headers = HeaderMap::new();
+    transform.transform_body_dependent_headers(
+        &mut user_headers,
+        &serde_json::to_vec(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap(),
+    );
+    assert_eq!(user_headers["x-initiator"], "user");
+    assert_eq!(user_headers["x-interaction-type"], "conversation-user");
+
+    let mut override_headers = HeaderMap::from_iter([(
+        "x-initiator".parse().unwrap(),
+        HeaderValue::from_static("agent"),
+    )]);
+    transform.transform_body_dependent_headers(
+        &mut override_headers,
+        &serde_json::to_vec(&json!({
+            "messages": [{"role": "user", "content": "explicit override"}]
+        }))
+        .unwrap(),
+    );
+    assert_eq!(override_headers["x-initiator"], "agent");
+    assert_eq!(override_headers["x-interaction-type"], "conversation-agent");
 }
 
 #[test]

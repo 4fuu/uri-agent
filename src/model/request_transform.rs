@@ -41,6 +41,14 @@ impl ModelRequestTransform {
         if self.model.api != "anthropic-messages" {
             return;
         }
+        if self
+            .model
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("anthropic-beta"))
+        {
+            return;
+        }
         let mut beta = |value: &'static str| {
             headers.append(
                 HeaderName::from_static("anthropic-beta"),
@@ -63,6 +71,61 @@ impl ModelRequestTransform {
             .is_some_and(|models| !models.is_empty())
         {
             beta("server-side-fallback-2026-07-01");
+        }
+        if self.compat_bool("supportsMidConvoEffort", false) {
+            beta("mid-conversation-output-config-2026-07-01");
+            beta("thinking-binding-controls-2026-08-01");
+        }
+    }
+
+    pub(super) fn transform_body_dependent_headers(&self, headers: &mut HeaderMap, body: &[u8]) {
+        if self.model.provider != "github-copilot" {
+            return;
+        }
+        let mut initiator_override = None;
+        for value in headers.get_all("x-initiator") {
+            let Ok(value) = value.to_str() else { continue };
+            if value.trim().eq_ignore_ascii_case("user") {
+                initiator_override = Some("user");
+            } else if value.trim().eq_ignore_ascii_case("agent") {
+                initiator_override = Some("agent");
+            }
+        }
+        for name in [
+            "user-agent",
+            "editor-version",
+            "editor-plugin-version",
+            "copilot-integration-id",
+            "copilot-harness-id",
+            "openai-intent",
+            "x-github-api-version",
+            "x-initiator",
+            "x-interaction-type",
+        ] {
+            headers.remove(name);
+        }
+        let initiator = initiator_override.unwrap_or_else(|| copilot_initiator(body));
+        for (name, value) in [
+            ("user-agent", "copilot/1.0.82"),
+            ("editor-version", "copilot/1.0.82"),
+            ("copilot-integration-id", "copilot-developer-cli"),
+            ("copilot-harness-id", "copilot-sdk"),
+            ("openai-intent", "conversation-agent"),
+            ("x-github-api-version", "2026-08-01"),
+            ("x-initiator", initiator),
+            (
+                "x-interaction-type",
+                if initiator == "agent" {
+                    "conversation-agent"
+                } else {
+                    "conversation-user"
+                },
+            ),
+        ] {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
         }
     }
 
@@ -220,10 +283,14 @@ impl ModelRequestTransform {
                     "reasoning".to_string(),
                     json!({"effort": self.mapped_level(), "summary": "auto"}),
                 );
-                body.insert(
-                    "include".to_string(),
-                    json!(["reasoning.encrypted_content"]),
-                );
+                if self.compat_bool("includeEncryptedReasoning", true) {
+                    body.insert(
+                        "include".to_string(),
+                        json!(["reasoning.encrypted_content"]),
+                    );
+                } else {
+                    body.remove("include");
+                }
             } else if self.model.provider != "github-copilot"
                 && let Some(off) = self.off_mapping()
             {
@@ -383,6 +450,13 @@ impl ModelRequestTransform {
         self.apply_completions_thinking(body);
         if self.compat_bool("zaiToolStream", false) && body.contains_key("tools") {
             body.insert("tool_stream".to_string(), Value::Bool(true));
+        }
+        if let Some(priority) = self
+            .model
+            .compat("vllmPriority")
+            .filter(|priority| priority.is_number())
+        {
+            body.insert("priority".to_string(), priority.clone());
         }
         self.apply_sampling_params(body);
     }
@@ -627,6 +701,39 @@ impl ModelRequestTransform {
         if !self.compat_bool("supportsTemperature", true) {
             body.remove("temperature");
         }
+        if self.compat_bool("supportsMidConvoEffort", false) {
+            body.remove("temperature");
+            let effort = self.anthropic_effort();
+            if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+                let original = std::mem::take(messages);
+                messages.reserve(original.len().saturating_mul(2).saturating_add(1));
+                for message in original {
+                    if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                        messages.push(json!({
+                            "role": "system",
+                            "content": [],
+                            "output_config": {"effort": effort.clone()}
+                        }));
+                    }
+                    messages.push(message);
+                }
+                messages.push(json!({
+                    "role": "system",
+                    "content": [],
+                    "output_config": {"effort": effort}
+                }));
+            }
+            body.insert(
+                "thinking".to_string(),
+                json!({
+                    "type": "adaptive",
+                    "display": "summarized",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+                }),
+            );
+            body.insert("output_config".to_string(), json!({"effort": "high"}));
+            return;
+        }
         if !self.model.reasoning() {
             return;
         }
@@ -665,6 +772,25 @@ impl ModelRequestTransform {
                 json!({"type": "enabled", "budget_tokens": budget, "display": "summarized"}),
             );
         }
+    }
+
+    fn anthropic_effort(&self) -> Value {
+        if let Some(effort @ ("low" | "medium" | "high" | "xhigh" | "max")) = self
+            .model
+            .thinking_level(self.thinking)
+            .and_then(Value::as_str)
+        {
+            return Value::String(effort.to_string());
+        }
+        Value::String(
+            match self.thinking {
+                ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                ThinkingLevel::Medium => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Xhigh | ThinkingLevel::Max | ThinkingLevel::Off => "high",
+            }
+            .to_string(),
+        )
     }
 
     fn apply_anthropic_request_compat(&self, body: &mut Map<String, Value>) {
@@ -874,6 +1000,55 @@ impl ModelRequestTransform {
             ThinkingLevel::Medium => values[2],
             _ => values[3],
         }
+    }
+}
+
+fn copilot_initiator(body: &[u8]) -> &'static str {
+    let Ok(body) = serde_json::from_slice::<Value>(body) else {
+        return "user";
+    };
+    let Some(last) = body
+        .get("messages")
+        .or_else(|| body.get("input"))
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+    else {
+        return "user";
+    };
+    if let Some(attribution) = last
+        .get("attribution")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        if attribution.eq_ignore_ascii_case("agent") {
+            return "agent";
+        }
+        if attribution.eq_ignore_ascii_case("user") {
+            return "user";
+        }
+    }
+    if matches!(
+        last.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "tool_result")
+    ) {
+        return "agent";
+    }
+    match last.get("role").and_then(Value::as_str) {
+        Some("user") => {}
+        Some(_) => return "agent",
+        None => return "user",
+    }
+    if last
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.last())
+        .and_then(|block| block.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "function_call_output" | "tool_result"))
+    {
+        "agent"
+    } else {
+        "user"
     }
 }
 

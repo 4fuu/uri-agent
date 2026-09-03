@@ -49,7 +49,7 @@ URI Agent 的目标是广泛兼容 pi.dev 模型生态，而不是只适配少�
 
 已支持 OpenAI Responses、OpenAI Codex Responses、OpenAI Chat Completions、Anthropic Messages 和 Google Generative AI 五类 API。Provider 实时结果按凭据隔离缓存，并补充共享目录，因此账户中新开放的模型可以在 pi.dev 收录前出现。
 
-对于无法只靠通用目录兼容的 Provider，URI Agent 还提供专用集成：ChatGPT Codex 订阅 OAuth 与 WebSocket 传输、Cloudflare AI Gateway 的凭据安全端点边界、WorkBuddy 中国站浏览器登录与账户模型发现，以及明确标记为实验性的 Antigravity 私有协议。此外还支持 Anthropic、GitHub Copilot、Kimi Coding、xAI、Radius 和 OpenRouter 的 Provider 专属登录流程。
+对于无法只靠通用目录兼容的 Provider，URI Agent 还提供专用集成：ChatGPT Codex 订阅 OAuth 与 WebSocket 传输、Cloudflare AI Gateway 的凭据安全端点边界、WorkBuddy 中国站浏览器登录与账户模型发现，以及明确标记为实验性的 Antigravity 私有协议。内置的 Abliteration.ai 目录提供按凭据隔离的实时发现和静态后备模型。此外还支持 Anthropic、GitHub Copilot、Kimi Coding、xAI、Radius 和 OpenRouter 的 Provider 专属登录流程。
 
 目录内容和账户权限会变化；目录中的模型仍需匹配的凭据、地区和订阅。当前 Provider、实时发现、认证和兼容性细节见英文文档 [Models and configuration](docs/configuration.md#model-catalog)。
 

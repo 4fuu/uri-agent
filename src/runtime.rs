@@ -107,15 +107,24 @@ struct ToolCallLoopGuard {
 }
 
 impl ToolCallLoopGuard {
-    fn record_turn(&mut self, calls: &[ToolCall], result: Option<&str>) -> Option<String> {
-        let [call] = calls else {
+    fn record_turn(&mut self, calls: &[ToolCall], results: &[String]) -> Option<String> {
+        if calls.is_empty() {
             self.reset();
             return None;
-        };
+        }
 
-        let arguments = serde_json::to_string(&canonical_tool_arguments(&call.function.arguments))
-            .unwrap_or_else(|_| call.function.arguments.to_string());
-        let signature = format!("{}:{arguments}", call.function.name);
+        let mut call_signatures = calls
+            .iter()
+            .map(|call| {
+                serde_json::to_string(&Value::Array(vec![
+                    Value::String(call.function.name.clone()),
+                    canonical_tool_arguments(&call.function.arguments),
+                ]))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        call_signatures.sort_unstable();
+        let signature = serde_json::to_string(&call_signatures).ok()?;
         if self.last_signature.as_deref() == Some(&signature) {
             self.count = self.count.saturating_add(1);
         } else {
@@ -126,8 +135,14 @@ impl ToolCallLoopGuard {
             return None;
         }
 
+        let call = calls.first()?;
+        let arguments = serde_json::to_string(&canonical_tool_arguments(&call.function.arguments))
+            .unwrap_or_else(|_| call.function.arguments.to_string());
         let arguments = summarize_text(&arguments, TOOL_CALL_ARGUMENT_SUMMARY_CHARS);
-        let result = summarize_text(result.unwrap_or_default(), TOOL_CALL_RESULT_SUMMARY_CHARS);
+        let result = summarize_text(
+            results.first().map(String::as_str).unwrap_or_default(),
+            TOOL_CALL_RESULT_SUMMARY_CHARS,
+        );
         let result = if result.is_empty() {
             "(no text result)"
         } else {
@@ -135,12 +150,14 @@ impl ToolCallLoopGuard {
         };
         Some(format!(
             "<system-interrupt reason=\"tool_call_loop_detected\">\n\
-             You called `{}` {} consecutive times with identical arguments:\n\
+             You issued the same batch of {} tool call(s) {} consecutive times. A representative call was `{}` with arguments:\n\
              `{arguments}`\n\n\
-             Last result (truncated): `{result}`\n\n\
-             NEVER call `{}` with those arguments again this turn. Use different arguments, choose another tool, or summarize findings and yield if complete.\n\
+             Representative result (truncated): `{result}`\n\n\
+             NEVER repeat this tool-call batch again this turn. Use different arguments, choose another tool, or summarize findings and yield if complete.\n\
              </system-interrupt>",
-            call.function.name, self.count, call.function.name
+            calls.len(),
+            self.count,
+            call.function.name
         ))
     }
 
@@ -1537,15 +1554,13 @@ impl AgentRuntime {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let mut sole_result = None;
+            let mut tool_results = Vec::with_capacity(tool_calls.len());
             let mut cancellation = None;
             for call in tool_calls.iter().cloned() {
                 let (result, interrupted) =
                     self.execute_tool(call, backend.as_ref(), cancel).await?;
                 cancellation = cancellation.or(interrupted);
-                if tool_calls.len() == 1 {
-                    sole_result = Some(result);
-                }
+                tool_results.push(result);
             }
             let requested_rollover = self.context_state.take_rollover_request().await;
             if let Some(cancellation) = cancellation.or(*cancel.borrow()) {
@@ -1554,7 +1569,7 @@ impl AgentRuntime {
             if let Some(handoff) = requested_rollover {
                 self.rollover_context(&handoff, false).await?;
             }
-            if let Some(redirect) = loop_guard.record_turn(&tool_calls, sole_result.as_deref()) {
+            if let Some(redirect) = loop_guard.record_turn(&tool_calls, &tool_results) {
                 self.session
                     .append(EventKind::ModelMessage {
                         message: Message::user(redirect),
@@ -3149,7 +3164,7 @@ mod tests {
             let call = read_call(&format!("same-{index}"), "file://same");
             assert!(
                 guard
-                    .record_turn(std::slice::from_ref(&call), Some("same result"))
+                    .record_turn(std::slice::from_ref(&call), &["same result".into()])
                     .is_none()
             );
         }
@@ -3157,28 +3172,31 @@ mod tests {
         let different = read_call("different", "file://different");
         assert!(
             guard
-                .record_turn(std::slice::from_ref(&different), Some("different result"))
+                .record_turn(
+                    std::slice::from_ref(&different),
+                    &["different result".into()]
+                )
                 .is_none()
         );
         for index in 0..4 {
             let call = read_call(&format!("again-{index}"), "file://same");
             assert!(
                 guard
-                    .record_turn(std::slice::from_ref(&call), Some("same result"))
+                    .record_turn(std::slice::from_ref(&call), &["same result".into()])
                     .is_none()
             );
         }
         let fifth = read_call("again-4", "file://same");
         assert!(
             guard
-                .record_turn(std::slice::from_ref(&fifth), Some("same result"))
+                .record_turn(std::slice::from_ref(&fifth), &["same result".into()])
                 .unwrap()
                 .contains("tool_call_loop_detected")
         );
 
         for index in 0..5 {
             let task = read_call(&format!("task-{index}"), "tasks://001");
-            let redirect = guard.record_turn(std::slice::from_ref(&task), Some("running"));
+            let redirect = guard.record_turn(std::slice::from_ref(&task), &["running".into()]);
             assert_eq!(redirect.is_some(), index == 4);
         }
     }
@@ -3197,9 +3215,67 @@ mod tests {
                 ToolCallId::new(format!("ordered-{index}")).unwrap(),
                 ToolFunction::new("custom".to_string(), arguments),
             );
-            let redirect = guard.record_turn(std::slice::from_ref(&call), Some("same result"));
+            let redirect = guard.record_turn(std::slice::from_ref(&call), &["same result".into()]);
             assert_eq!(redirect.is_some(), index == 4);
         }
+    }
+
+    #[test]
+    fn tool_call_loop_guard_matches_reordered_parallel_batches() {
+        let mut guard = ToolCallLoopGuard::default();
+        let first = vec![
+            read_call("read", "file://same"),
+            ToolCall::new(
+                ToolCallId::new("exec").unwrap(),
+                ToolFunction::new(
+                    "exec".to_string(),
+                    serde_json::from_str(r#"{"command":"pwd","timeout":1}"#).unwrap(),
+                ),
+            ),
+        ];
+        let reordered = vec![
+            ToolCall::new(
+                ToolCallId::new("exec-again").unwrap(),
+                ToolFunction::new(
+                    "exec".to_string(),
+                    serde_json::from_str(r#"{"timeout":1,"command":"pwd"}"#).unwrap(),
+                ),
+            ),
+            read_call("read-again", "file://same"),
+        ];
+
+        for _ in 0..4 {
+            assert!(
+                guard
+                    .record_turn(&first, &["read result".into(), "exec result".into()])
+                    .is_none()
+            );
+        }
+        let redirect = guard
+            .record_turn(&reordered, &["exec result".into(), "read result".into()])
+            .expect("reordered fifth batch should inject a redirect");
+        assert!(redirect.contains("batch of 2 tool call(s)"));
+        assert!(redirect.contains("`exec`"));
+        assert!(redirect.contains("`exec result`"));
+    }
+
+    #[test]
+    fn tool_call_loop_guard_preserves_parallel_call_multiplicity() {
+        let mut guard = ToolCallLoopGuard::default();
+        let duplicate = vec![
+            read_call("read-1", "file://same"),
+            read_call("read-2", "file://same"),
+        ];
+        let single = vec![read_call("read-3", "file://same")];
+
+        for _ in 0..4 {
+            assert!(
+                guard
+                    .record_turn(&duplicate, &["same".into(), "same".into()])
+                    .is_none()
+            );
+        }
+        assert!(guard.record_turn(&single, &["same".into()]).is_none());
     }
 
     #[tokio::test]

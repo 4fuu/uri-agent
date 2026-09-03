@@ -29,7 +29,7 @@ URI Agent downloads provider and model records from pi.dev, supplements them fro
 - `anthropic-messages`
 - `google-generative-ai`
 
-URI Agent also provides a built-in `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol) and authenticated [`workbuddy` cloud discovery](#workbuddy). Neither is part of the pi.dev coverage count.
+URI Agent also provides a built-in [`abliteration` provider catalog](#abliterationai), an `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol), and authenticated [`workbuddy` cloud discovery](#workbuddy). None is part of the pi.dev coverage count.
 
 The model selector shows only models using a supported API family whose provider has a configured credential from `models.json`, `auth.json`, or a recognized provider environment variable. The generic `URI_AGENT_API_KEY` and `--api-key` overrides expose only the current provider rather than every catalog provider. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
 
@@ -44,6 +44,10 @@ xiaomi-token-plan-ams, xiaomi-token-plan-cn, xiaomi-token-plan-sgp, zai,
 zai-coding-cn
 ```
 
+The built-in `abliteration` provider also supports credential-scoped discovery
+through its authenticated `/v1/models` route; it is omitted from the count
+above because it is not a pi provider ID.
+
 URI Agent does not attempt live discovery for `cloudflare-ai-gateway`, `cloudflare-workers-ai`, `fireworks`, `github-copilot`, `kimi-coding`, `openai-codex`, or `vercel-ai-gateway`: those supported backends do not expose a portable model-list route from which URI Agent can safely construct runnable unknown model IDs.
 
 Provider results are additive. A pi model with the same provider and ID always wins once the cloud catalog catches up. For a model known only to the provider, URI Agent conservatively inherits runtime metadata from the nearest compatible pi model and omits price metadata rather than reporting an unverified cost. These provisional records are marked as discovered in the cache.
@@ -57,7 +61,23 @@ The active backend applies catalog data relevant to requests and accounting, inc
 - context windows, output limits, and tiered prices;
 - text and image input modalities;
 - `reasoning`, `thinkingLevelMap`, and `samplingParams`;
-- request-relevant `compat` values such as token-field names, adaptive thinking, strict role or tool handling, and provider-specific thinking formats.
+- request-relevant `compat` values such as token-field names, vLLM priority, adaptive or mid-conversation thinking, strict role or tool handling, and provider-specific thinking formats.
+
+### Abliteration.ai
+
+The built-in provider ID is `abliteration`. It uses the OpenAI Responses API at
+`https://api.abliteration.ai/v1` with bearer authentication and includes
+verified fallback records for `abliterated-model`, `abliterated-model-large`,
+and `abliterated-model-large-v2`. The base model accepts text and images with a
+262,144-token context; both large models are text-only with 1,000,000-token
+contexts. Live `/models` results supplement these records and inherit
+capability metadata without copying unverified prices.
+
+Run `:login` and select Abliteration, or set `ABLITERATION_API_KEY`.
+`ABLIT_KEY` is a lower-precedence compatibility alias. All three models expose
+reasoning effort; Large maps `xhigh` to `max`, while Large V2 maps `medium` to
+`high`, `xhigh` to `max`, and an off request to hidden low reasoning, matching
+the provider's documented behavior.
 
 Reasoning replay is owned by each API adapter rather than by a universal catalog flag. Completed assistant reasoning remains in the typed session message and is serialized back in the provider's required form on later tool rounds. OpenRouter replays structured `reasoning_details`, including encrypted payloads and signed text; OpenAI Responses replays encrypted reasoning items; Anthropic replays signed or redacted thinking; and Gemini replays thought signatures. For an OpenAI-compatible model whose catalog sets `compat.requiresReasoningContentOnAssistantMessages`, URI Agent also adds the required `reasoning_content` field to replayed assistant messages. The catalog's `reasoning` and `thinkingLevelMap` fields control whether and at what effort reasoning is requested; they do not replace this replay logic.
 
@@ -107,6 +127,7 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 
 | Provider ID | Login |
 | --- | --- |
+| `abliteration` | Abliteration API key |
 | `cloudflare-ai-gateway` | Cloudflare API token, account ID, and AI Gateway ID |
 | `antigravity` | Experimental Google browser OAuth for the private Antigravity protocol |
 | `anthropic` | Claude Pro/Max browser OAuth |
@@ -124,6 +145,14 @@ Offline mode still loads `models-store.json` and `models.json`, including discov
 Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent resolves the active credential before each model request and refreshes it within five minutes of expiry rather than refreshing every stored provider during startup. Credential writes and refreshes use a cross-process transaction lock, so concurrent URI Agent processes re-read and merge the current file instead of overwriting each other's updates. The refreshed access token, new expiry, and rotated refresh token are persisted before the request continues; when a provider omits the refresh token, URI Agent retains the previous one rather than replacing it with an empty value. Kimi refresh retries connection failures, HTTP 429, and server errors up to three times with 1-, 2-, and 4-second delays; authentication failures are not retried. On Unix, URI Agent creates `auth.json` and its lock with mode `0600` and the configuration directory with mode `0700`.
 
 Models using `openai-codex-responses` require the `openai-codex` OAuth entry created by the OpenAI browser or device-code login. An OpenAI Platform API key—including `OPENAI_API_KEY`, `URI_AGENT_API_KEY`, or `--api-key`—is not accepted for this subscription endpoint. Model availability is determined by the signed-in ChatGPT account and its subscription.
+
+GitHub Copilot model requests identify as the official Copilot CLI and SDK,
+including the conversation intent and whether the current request was initiated
+by a user message or an Agent tool result. An explicit `X-Initiator` model
+header may override that inference with `user` or `agent`. Authentication keeps
+URI Agent's existing device-code and short-lived Copilot-token exchange; the
+official CLI's raw GitHub-token and enterprise-endpoint lifecycle is not
+partially emulated.
 
 ### WorkBuddy
 
@@ -220,7 +249,7 @@ Requests use the private `v1internal:streamGenerateContent` SSE operation. URI A
 
 URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
 
-Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. Cloudflare AI Gateway's structured variables and compatibility alias are documented [above](#cloudflare-ai-gateway), and WorkBuddy's variables and provider-specific precedence are documented in the [WorkBuddy section](#workbuddy). The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
+Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. Abliteration's canonical variable and alias are documented [above](#abliterationai), Cloudflare AI Gateway's structured variables and compatibility alias are documented in its [provider section](#cloudflare-ai-gateway), and WorkBuddy's variables and provider-specific precedence are documented in the [WorkBuddy section](#workbuddy). The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
 
 ### Credential precedence
 

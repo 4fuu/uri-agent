@@ -18,6 +18,7 @@ enum DiscoveryKind {
 }
 
 const PROVIDERS: &[(&str, DiscoveryKind)] = &[
+    ("abliteration", DiscoveryKind::OpenAi),
     ("ant-ling", DiscoveryKind::OpenAi),
     ("anthropic", DiscoveryKind::Anthropic),
     ("baseten", DiscoveryKind::OpenAi),
@@ -620,7 +621,8 @@ mod tests {
 
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
-        assert_eq!(provider_ids().count(), 29);
+        assert_eq!(provider_ids().count(), 30);
+        assert!(supports_provider("abliteration"));
         assert!(supports_provider("workbuddy"));
         assert!(!supports_provider("codebuddy"));
         assert!(supports_provider("opencode-go"));
