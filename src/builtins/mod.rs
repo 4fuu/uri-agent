@@ -111,6 +111,10 @@ pub(crate) fn plugins_with_session_profile(
     plugins
 }
 
+pub(crate) fn add_legacy_grep(plugins: &mut PluginRegistry, cwd: &Path) {
+    plugins.add(grep::GrepProtocol::legacy(cwd));
+}
+
 fn add_agent_plugins(
     plugins: &mut PluginRegistry,
     cwd: &Path,
@@ -199,7 +203,8 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "uri-agent-docs"));
         assert!(names.iter().any(|name| name == "file"));
-        assert!(names.iter().any(|name| name == "grep"));
+        assert!(names.iter().any(|name| name == "search"));
+        assert!(!names.iter().any(|name| name == "grep"));
         assert!(names.iter().any(|name| name == "https"));
         assert!(names.iter().any(|name| name == "tasks"));
         assert!(!names.iter().any(|name| name == "replace"));

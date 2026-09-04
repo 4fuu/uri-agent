@@ -27,35 +27,39 @@ const MAX_CONTEXT: usize = 20;
 const RIPGREP_VERSION: &str = "14.1.1";
 const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 const MAX_INDEX_RETRIES: usize = 3;
+const SEARCH_SCHEME: &str = "search";
+const LEGACY_GREP_SCHEME: &str = "grep";
 
-fn help(cwd: &Path) -> String {
+fn help(cwd: &Path, scheme: &str) -> String {
     format!(
-        r#"# grep
+        r#"# {scheme}
 
-Search file contents with exact ripgrep matching or on-demand semantic retrieval.
+Search file contents with ripgrep (`rg`) or on-demand semantic and hybrid
+retrieval.
 
-Current working directory: `grep://{}`
+Current working directory: `{scheme}://{}`
 
 Search reads MUST pass a nonempty search pattern in the string body. Use
-`grep://<root>` for a project-relative or absolute file/directory root. The root
-may be empty: `grep://` searches the current working directory. On Unix, `~`
+`{scheme}://<root>` for a project-relative or absolute file/directory root. The
+root may be empty: `{scheme}://` searches the current working directory. On Unix, `~`
 and paths beginning with `~/` resolve from the current user's home directory;
 `~user` is not expanded.
 
 Optional query parameters:
 
-- `mode=exact` (the default) uses ripgrep. Use it for known identifiers, paths,
-  syntax, or literal wording.
+- `mode=exact` (the default) uses ripgrep (`rg`). Patterns use `rg`
+  regular-expression syntax unless `literal=true` is set. Use this mode for
+  known identifiers, paths, syntax, or literal wording.
 - `mode=hybrid` combines keyword and semantic ranking. Prefer it for conceptual
   searches.
 - `mode=semantic` prioritizes meaning over shared wording. Use it when relevant
   results are likely to use different wording from the query.
-- `mode=status` is a diagnostic that reports whether the selected root's
-  semantic cache is current; its body must be empty.
-- `glob=<pattern>` filters searched paths with a glob pattern.
-- Search patterns are regular expressions by default. If a pattern is not valid
-  as a regular expression, the protocol retries it as literal text.
-- `literal=true` always treats the body as literal text.
+- `mode=status` reports whether the selected root's semantic cache is current;
+  its body must be empty.
+- `glob=<pattern>` filters searched paths using `rg` glob syntax.
+- If `rg` rejects a regular expression, the protocol retries it as literal
+  text.
+- `literal=true` always uses `rg` literal matching.
 - `ignore_case=true` enables case-insensitive matching.
 - `context=<lines>` includes surrounding lines; values are clamped to 0 through 20.
 - `limit=<count>` bounds the number of matches; the default is 200 and values are
@@ -74,7 +78,7 @@ diagnose the cache. Use `exec` only to prewarm or force-rebuild that exact
 root/glob cache:
 
 ```text
-exec("grep://<root>?mode=index&glob=<pattern>", "")
+exec("{scheme}://<root>?mode=index&glob=<pattern>", "")
 ```
 
 Indexing follows standard ignore files, skips binary/non-UTF-8 files and files
@@ -85,14 +89,14 @@ private rebuildable cache; source files are never changed.
 Examples:
 
 ```text
-read("grep://src?glob=**/*.rs&limit=100", "ProtocolRequest")
-read("grep://src/tui/app.rs", "fn push(")
-read("grep://?literal=true&ignore_case=true", "exact text")
-read("grep://src?mode=hybrid&glob=**/*.rs&limit=10", "authentication flow")
-exec("grep://src?mode=index&glob=**/*.rs", "")
+read("{scheme}://src?glob=**/*.rs&limit=100", "ProtocolRequest")
+read("{scheme}://src/tui/app.rs", "fn push(")
+read("{scheme}://?literal=true&ignore_case=true", "exact text")
+read("{scheme}://src?mode=hybrid&glob=**/*.rs&limit=10", "authentication flow")
+exec("{scheme}://src?mode=index&glob=**/*.rs", "")
 ```
 
-`grep://help` MUST use an empty string body. `exec` supports only
+`{scheme}://help` MUST use an empty string body. `exec` supports only
 `mode=index` with an empty body.
 "#,
         display_path(cwd)
@@ -103,6 +107,7 @@ exec("grep://src?mode=index&glob=**/*.rs", "")
 pub(super) struct GrepProtocol {
     cwd: PathBuf,
     downloads: Option<PluginDownloads>,
+    scheme: &'static str,
 }
 
 impl GrepProtocol {
@@ -110,6 +115,14 @@ impl GrepProtocol {
         Self {
             cwd: cwd.to_path_buf(),
             downloads: None,
+            scheme: SEARCH_SCHEME,
+        }
+    }
+
+    pub(super) fn legacy(cwd: &Path) -> Self {
+        Self {
+            scheme: LEGACY_GREP_SCHEME,
+            ..Self::new(cwd)
         }
     }
 
@@ -117,6 +130,48 @@ impl GrepProtocol {
     fn with_downloads(mut self, downloads: PluginDownloads) -> Self {
         self.downloads = Some(downloads);
         self
+    }
+
+    async fn run_semantic_grep(
+        &self,
+        root: PathBuf,
+        glob: Option<String>,
+        query: String,
+        mode: SearchMode,
+        limit: usize,
+        context: ProtocolContext,
+    ) -> Result<Vec<u8>> {
+        let record = context
+            .tasks
+            .allocate(
+                self.scheme,
+                format!("Search code under {}", display_path(&root)),
+            )
+            .await;
+        let cwd = self.cwd.clone();
+        match context
+            .tasks
+            .run_with_auto_background(
+                record,
+                AUTO_BACKGROUND_AFTER,
+                move |cancellation| async move {
+                    semantic_grep(
+                        &cwd,
+                        &root,
+                        glob.as_deref(),
+                        &query,
+                        mode,
+                        limit,
+                        cancellation,
+                    )
+                    .await
+                },
+            )
+            .await?
+        {
+            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into_bytes()),
+            AutoTask::Terminal(record) => record.terminal_result("semantic search"),
+        }
     }
 }
 
@@ -140,8 +195,8 @@ impl Plugin for GrepProtocol {
 impl Protocol for GrepProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
-            name: "grep".to_string(),
-            description: "Search file contents with exact ripgrep matching or on-demand semantic and hybrid retrieval.".to_string(),
+            name: self.scheme.to_string(),
+            description: "Search file contents with ripgrep (`rg`) or on-demand semantic and hybrid retrieval.".to_string(),
             can_read: true,
             can_exec: true,
         }
@@ -154,24 +209,27 @@ impl Protocol for GrepProtocol {
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
             if !request.body.is_empty() {
-                bail!(r#"grep://help requires an empty body; retry read("grep://help", "")"#);
+                bail!(
+                    r#"{}://help requires an empty body; retry read("{}://help", "")"#,
+                    self.scheme,
+                    self.scheme
+                );
             }
-            return Ok(help(&self.cwd).into_bytes());
+            return Ok(help(&self.cwd, self.scheme).into_bytes());
         }
         let (root, query) = request
             .target
             .split_once('?')
             .map_or((request.target, None), |(root, query)| (root, Some(query)));
-        let options = GrepOptions::parse(query)?;
+        let options = GrepOptions::parse(query, self.scheme)?;
         let resolved = resolve_path(&self.cwd, root)?;
-        validate_root(&resolved).await?;
+        validate_root(&resolved, self.scheme).await?;
         match options.mode {
             GrepMode::Exact => {
-                require_search_body(request.body, request.uri)?;
-                let downloads = self
-                    .downloads
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("grep binary download access is not attached"))?;
+                require_search_body(request.body, request.uri, self.scheme)?;
+                let downloads = self.downloads.as_ref().ok_or_else(|| {
+                    anyhow!("{} binary download access is not attached", self.scheme)
+                })?;
                 let rg = downloads.ensure(&ripgrep_download()?).await?;
                 run_grep(
                     &rg,
@@ -179,15 +237,15 @@ impl Protocol for GrepProtocol {
                     &grep_root_argument(&self.cwd, root, &resolved),
                     request.body,
                     &options,
+                    self.scheme,
                 )
                 .await
                 .map(String::into_bytes)
             }
             GrepMode::Semantic(mode) => {
-                require_search_body(request.body, request.uri)?;
-                options.validate_semantic()?;
-                run_semantic_grep(
-                    self.cwd.clone(),
+                require_search_body(request.body, request.uri, self.scheme)?;
+                options.validate_semantic(self.scheme)?;
+                self.run_semantic_grep(
                     resolved,
                     options.glob.clone(),
                     request.body.to_string(),
@@ -199,9 +257,12 @@ impl Protocol for GrepProtocol {
             }
             GrepMode::Status => {
                 if !request.body.is_empty() {
-                    bail!("grep semantic index status requires an empty body");
+                    bail!(
+                        "{} semantic index status requires an empty body",
+                        self.scheme
+                    );
                 }
-                options.validate_index_operation()?;
+                options.validate_index_operation(self.scheme)?;
                 let corpus = code_corpus(&self.cwd, &resolved, options.glob.as_deref()).await?;
                 Ok(index_status(&corpus.spec, &corpus.catalog)
                     .await?
@@ -220,15 +281,18 @@ impl Protocol for GrepProtocol {
             .target
             .split_once('?')
             .map_or((request.target, None), |(root, query)| (root, Some(query)));
-        let options = GrepOptions::parse_exec(query)?;
+        let options = GrepOptions::parse_exec(query, self.scheme)?;
         if !request.body.is_empty() {
-            bail!("grep semantic indexing requires an empty body");
+            bail!("{} semantic indexing requires an empty body", self.scheme);
         }
-        options.validate_index_operation()?;
+        options.validate_index_operation(self.scheme)?;
         let resolved = resolve_path(&self.cwd, root)?;
-        validate_root(&resolved).await?;
+        validate_root(&resolved, self.scheme).await?;
         let label = format!("Index code under {}", display_path(&resolved));
-        let record = context.tasks.allocate_background("grep", label).await?;
+        let record = context
+            .tasks
+            .allocate_background(self.scheme, label)
+            .await?;
         let id = record.id.clone();
         let cwd = self.cwd.clone();
         let glob = options.glob.clone();
@@ -239,44 +303,6 @@ impl Protocol for GrepProtocol {
             })
             .await;
         Ok(prompts::task_accepted(&id).into_bytes())
-    }
-}
-
-async fn run_semantic_grep(
-    cwd: PathBuf,
-    root: PathBuf,
-    glob: Option<String>,
-    query: String,
-    mode: SearchMode,
-    limit: usize,
-    context: ProtocolContext,
-) -> Result<Vec<u8>> {
-    let record = context
-        .tasks
-        .allocate("grep", format!("Search code under {}", display_path(&root)))
-        .await;
-    match context
-        .tasks
-        .run_with_auto_background(
-            record,
-            AUTO_BACKGROUND_AFTER,
-            move |cancellation| async move {
-                semantic_grep(
-                    &cwd,
-                    &root,
-                    glob.as_deref(),
-                    &query,
-                    mode,
-                    limit,
-                    cancellation,
-                )
-                .await
-            },
-        )
-        .await?
-    {
-        AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into_bytes()),
-        AutoTask::Terminal(record) => record.terminal_result("semantic grep"),
     }
 }
 
@@ -368,7 +394,7 @@ struct GrepOptions {
 }
 
 impl GrepOptions {
-    fn parse(query: Option<&str>) -> Result<Self> {
+    fn parse(query: Option<&str>, scheme: &str) -> Result<Self> {
         let mut options = Self {
             mode: GrepMode::Exact,
             glob: None,
@@ -386,50 +412,54 @@ impl GrepOptions {
         {
             let (name, value) = pair
                 .split_once('=')
-                .ok_or_else(|| anyhow!("invalid grep query component: {pair}"))?;
+                .ok_or_else(|| anyhow!("invalid {scheme} query component: {pair}"))?;
             if !seen.insert(name) {
-                bail!("duplicate grep query parameter: {name}");
+                bail!("duplicate {scheme} query parameter: {name}");
             }
             match name {
                 "mode" => {
                     options.mode = match value {
                         "exact" => GrepMode::Exact,
                         "semantic" | "hybrid" => {
-                            GrepMode::Semantic(SearchMode::parse(value, "grep")?)
+                            GrepMode::Semantic(SearchMode::parse(value, scheme)?)
                         }
                         "status" => GrepMode::Status,
-                        "index" => bail!("grep mode=index is available only through exec"),
+                        "index" => {
+                            bail!("{scheme} mode=index is available only through exec")
+                        }
                         _ => {
-                            bail!("grep mode must be exact, semantic, hybrid, or status for reads")
+                            bail!(
+                                "{scheme} mode must be exact, semantic, hybrid, or status for reads"
+                            )
                         }
                     }
                 }
                 "glob" if !value.is_empty() => options.glob = Some(value.to_string()),
-                "glob" => bail!("grep glob cannot be empty"),
-                "literal" => options.literal = parse_bool(name, value)?,
-                "ignore_case" => options.ignore_case = parse_bool(name, value)?,
+                "glob" => bail!("{scheme} glob cannot be empty"),
+                "literal" => options.literal = parse_bool(name, value, scheme)?,
+                "ignore_case" => options.ignore_case = parse_bool(name, value, scheme)?,
                 "context" => {
                     options.context = value
                         .parse::<usize>()
-                        .with_context(|| format!("invalid grep context: {value}"))?
+                        .with_context(|| format!("invalid {scheme} context: {value}"))?
                         .min(MAX_CONTEXT);
                 }
                 "limit" => {
                     options.limit = value
                         .parse::<usize>()
-                        .with_context(|| format!("invalid grep limit: {value}"))?
+                        .with_context(|| format!("invalid {scheme} limit: {value}"))?
                         .clamp(1, MAX_LIMIT);
                     options.limit_set = true;
                 }
-                _ => bail!("unknown grep query parameter: {name}"),
+                _ => bail!("unknown {scheme} query parameter: {name}"),
             }
         }
         Ok(options)
     }
 
-    fn parse_exec(query: Option<&str>) -> Result<Self> {
+    fn parse_exec(query: Option<&str>, scheme: &str) -> Result<Self> {
         let Some(query) = query else {
-            bail!("grep exec requires mode=index");
+            bail!("{scheme} exec requires mode=index");
         };
         let rewritten = query
             .split('&')
@@ -443,23 +473,23 @@ impl GrepOptions {
             .collect::<Vec<_>>()
             .join("&");
         if !query.split('&').any(|pair| pair == "mode=index") {
-            bail!("grep exec requires mode=index");
+            bail!("{scheme} exec requires mode=index");
         }
-        let mut options = Self::parse(Some(&rewritten))?;
+        let mut options = Self::parse(Some(&rewritten), scheme)?;
         options.mode = GrepMode::Status;
         Ok(options)
     }
 
-    fn validate_semantic(&self) -> Result<()> {
+    fn validate_semantic(&self, scheme: &str) -> Result<()> {
         if self.literal || self.ignore_case || self.context != 0 {
-            bail!("semantic grep accepts only mode, glob, and limit");
+            bail!("semantic {scheme} accepts only mode, glob, and limit");
         }
         Ok(())
     }
 
-    fn validate_index_operation(&self) -> Result<()> {
+    fn validate_index_operation(&self, scheme: &str) -> Result<()> {
         if self.literal || self.ignore_case || self.context != 0 || self.limit_set {
-            bail!("grep semantic index operations accept only mode and glob");
+            bail!("{scheme} semantic index operations accept only mode and glob");
         }
         Ok(())
     }
@@ -473,22 +503,22 @@ impl GrepOptions {
     }
 }
 
-fn require_search_body(body: &str, uri: &str) -> Result<()> {
+fn require_search_body(body: &str, uri: &str, scheme: &str) -> Result<()> {
     if body.is_empty() {
         bail!(
-            "grep requires a nonempty search pattern in the body; use read({uri:?}, \"<pattern>\")"
+            "{scheme} requires a nonempty search pattern in the body; use read({uri:?}, \"<pattern>\")"
         );
     }
     Ok(())
 }
 
-async fn validate_root(resolved: &Path) -> Result<()> {
+async fn validate_root(resolved: &Path, scheme: &str) -> Result<()> {
     let metadata = tokio::fs::metadata(resolved)
         .await
         .with_context(|| format!("cannot search {}", display_path(resolved)))?;
     if !metadata.is_dir() && !metadata.is_file() {
         bail!(
-            "grep root is not a regular file or directory: {}",
+            "{scheme} root is not a regular file or directory: {}",
             display_path(resolved)
         );
     }
@@ -508,11 +538,11 @@ fn format_semantic_results(hits: &[SearchHit], mode: SearchMode) -> String {
     output
 }
 
-fn parse_bool(name: &str, value: &str) -> Result<bool> {
+fn parse_bool(name: &str, value: &str, scheme: &str) -> Result<bool> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => bail!("grep {name} must be true or false"),
+        _ => bail!("{scheme} {name} must be true or false"),
     }
 }
 
@@ -534,17 +564,26 @@ async fn run_grep(
     root: &Path,
     pattern: &str,
     options: &GrepOptions,
+    scheme: &str,
 ) -> Result<String> {
     let mut fixed_strings = options.literal;
     loop {
-        let result = run_grep_once(executable, cwd, root, pattern, options, fixed_strings)
-            .await
-            .context("grep failed")?;
+        let result = run_grep_once(
+            executable,
+            cwd,
+            root,
+            pattern,
+            options,
+            fixed_strings,
+            scheme,
+        )
+        .await
+        .with_context(|| format!("{scheme} failed"))?;
         if !fixed_strings && result.regex_parse_failed() {
             fixed_strings = true;
             continue;
         }
-        return result.into_output(options.limit);
+        return result.into_output(options.limit, scheme);
     }
 }
 
@@ -564,13 +603,13 @@ impl GrepRun {
             && String::from_utf8_lossy(&self.stderr).contains("regex parse error:")
     }
 
-    fn into_output(mut self, limit: usize) -> Result<String> {
+    fn into_output(mut self, limit: usize, scheme: &str) -> Result<String> {
         if !self.truncated && !matches!(self.status.code(), Some(0 | 1)) {
             let message = String::from_utf8_lossy(&self.stderr);
             let message = message.trim();
             let message = message.strip_prefix("rg: ").unwrap_or(message);
             bail!(
-                "grep failed{}",
+                "{scheme} failed{}",
                 if message.is_empty() {
                     String::new()
                 } else {
@@ -596,6 +635,7 @@ async fn run_grep_once(
     pattern: &str,
     options: &GrepOptions,
     fixed_strings: bool,
+    scheme: &str,
 ) -> Result<GrepRun> {
     let mut command = Command::new(executable);
     command
@@ -661,7 +701,7 @@ async fn run_grep_once(
             }
             *remaining -= 1;
         }
-        append_event(&mut output, &event, kind == "match")?;
+        append_event(&mut output, &event, kind == "match", scheme)?;
         if trailing_context == Some(0) {
             truncated = true;
             break;
@@ -671,10 +711,12 @@ async fn run_grep_once(
         child
             .kill()
             .await
-            .context("failed to stop bounded grep search")?;
+            .with_context(|| format!("failed to stop bounded {scheme} search"))?;
     }
     let status = child.wait().await?;
-    let stderr = stderr_task.await.context("grep stderr reader failed")??;
+    let stderr = stderr_task
+        .await
+        .with_context(|| format!("{scheme} stderr reader failed"))??;
     Ok(GrepRun {
         output,
         matches,
@@ -684,11 +726,11 @@ async fn run_grep_once(
     })
 }
 
-fn append_event(output: &mut String, event: &Value, is_match: bool) -> Result<()> {
+fn append_event(output: &mut String, event: &Value, is_match: bool, scheme: &str) -> Result<()> {
     let data = event
         .get("data")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("grep event has no data object"))?;
+        .ok_or_else(|| anyhow!("{scheme} event has no data object"))?;
     let path = data
         .get("path")
         .and_then(|path| path.get("text"))
@@ -780,9 +822,10 @@ mod tests {
     #[test]
     fn grep_options_are_typed_bounded_and_reject_duplicates() {
         assert_eq!(
-            GrepOptions::parse(Some(
-                "glob=**/*.rs&literal=true&ignore_case=true&context=2&limit=10"
-            ))
+            GrepOptions::parse(
+                Some("glob=**/*.rs&literal=true&ignore_case=true&context=2&limit=10"),
+                SEARCH_SCHEME
+            )
             .unwrap(),
             GrepOptions {
                 mode: GrepMode::Exact,
@@ -795,29 +838,41 @@ mod tests {
             }
         );
         assert_eq!(
-            GrepOptions::parse(Some("mode=semantic"))
+            GrepOptions::parse(Some("mode=semantic"), SEARCH_SCHEME)
                 .unwrap()
                 .semantic_limit(),
             7
         );
-        let hybrid = GrepOptions::parse(Some("mode=hybrid&limit=51")).unwrap();
-        hybrid.validate_semantic().unwrap();
+        let hybrid = GrepOptions::parse(Some("mode=hybrid&limit=51"), SEARCH_SCHEME).unwrap();
+        hybrid.validate_semantic(SEARCH_SCHEME).unwrap();
         assert_eq!(hybrid.semantic_limit(), 50);
-        assert!(GrepOptions::parse_exec(Some("mode=index&glob=**/*.rs")).is_ok());
-        assert!(GrepOptions::parse_exec(Some("mode=semantic")).is_err());
+        assert!(GrepOptions::parse_exec(Some("mode=index&glob=**/*.rs"), SEARCH_SCHEME).is_ok());
+        assert!(GrepOptions::parse_exec(Some("mode=semantic"), SEARCH_SCHEME).is_err());
         assert!(
-            GrepOptions::parse_exec(Some("mode=index&limit=1"))
+            GrepOptions::parse_exec(Some("mode=index&limit=1"), SEARCH_SCHEME)
                 .unwrap()
-                .validate_index_operation()
+                .validate_index_operation(SEARCH_SCHEME)
                 .is_err()
         );
-        assert_eq!(GrepOptions::parse(Some("context=21")).unwrap().context, 20);
-        assert_eq!(GrepOptions::parse(Some("limit=0")).unwrap().limit, 1);
         assert_eq!(
-            GrepOptions::parse(Some("limit=99999")).unwrap().limit,
+            GrepOptions::parse(Some("context=21"), SEARCH_SCHEME)
+                .unwrap()
+                .context,
+            20
+        );
+        assert_eq!(
+            GrepOptions::parse(Some("limit=0"), SEARCH_SCHEME)
+                .unwrap()
+                .limit,
+            1
+        );
+        assert_eq!(
+            GrepOptions::parse(Some("limit=99999"), SEARCH_SCHEME)
+                .unwrap()
+                .limit,
             2_000
         );
-        assert!(GrepOptions::parse(Some("literal=true&literal=false")).is_err());
+        assert!(GrepOptions::parse(Some("literal=true&literal=false"), SEARCH_SCHEME).is_err());
     }
 
     #[test]
@@ -839,10 +894,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_help_distinguishes_empty_root_from_nonempty_body() {
+    async fn search_help_uses_rg_contract_and_legacy_help_keeps_its_scheme() {
         let directory = tempfile::tempdir().unwrap();
         let protocol = GrepProtocol::new(directory.path());
+        assert_eq!(protocol.descriptor().name, SEARCH_SCHEME);
         let help = protocol
+            .read(
+                ProtocolRequest {
+                    uri: "search://help",
+                    target: "help",
+                    body: "",
+                },
+                ProtocolContext {
+                    tasks: TaskManager::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("MUST pass a nonempty search pattern"));
+        assert!(help.contains("The\nroot may be empty"));
+        assert!(help.contains("paths beginning with `~/` resolve"));
+        assert!(help.contains("`~user` is not expanded"));
+        assert!(help.contains("uses ripgrep (`rg`)"));
+        assert!(help.contains("Patterns use `rg`\n  regular-expression syntax"));
+        assert!(help.contains("retries it as literal\n  text"));
+        assert!(help.contains(r#"read("search://src/tui/app.rs", "fn push(")"#));
+        assert!(!help.contains("grep://"));
+        assert!(help.contains("Prefer it for conceptual\n  searches"));
+        assert!(help.contains("values are clamped to 0 through 20"));
+        assert!(help.contains("clamped to 1 through 2,000"));
+        assert!(help.contains("clamped to 1 through 50"));
+        assert!(help.contains("Do not call status or index before a ranked search"));
+        assert!(help.contains("continues as one\nmanaged task without restarting"));
+        assert!(help.contains("`search://help` MUST use an empty string body"));
+
+        let legacy = GrepProtocol::legacy(directory.path());
+        assert_eq!(legacy.descriptor().name, LEGACY_GREP_SCHEME);
+        let legacy_help = legacy
             .read(
                 ProtocolRequest {
                     uri: "grep://help",
@@ -855,25 +944,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let help = String::from_utf8(help).unwrap();
-        assert!(help.contains("MUST pass a nonempty search pattern"));
-        assert!(help.contains("The root\nmay be empty"));
-        assert!(help.contains("paths beginning with `~/` resolve"));
-        assert!(help.contains("`~user` is not expanded"));
-        assert!(help.contains("retries it as literal text"));
-        assert!(help.contains(r#"read("grep://src/tui/app.rs", "fn push(")"#));
-        assert!(help.contains("Prefer it for conceptual\n  searches"));
-        assert!(help.contains("values are clamped to 0 through 20"));
-        assert!(help.contains("clamped to 1 through 2,000"));
-        assert!(help.contains("clamped to 1 through 50"));
-        assert!(help.contains("Do not call status or index before a ranked search"));
-        assert!(help.contains("continues as one\nmanaged task without restarting"));
-        assert!(help.contains("`grep://help` MUST use an empty string body"));
+        let legacy_help = String::from_utf8(legacy_help).unwrap();
+        assert!(legacy_help.contains("`grep://help` MUST use an empty string body"));
+        assert!(!legacy_help.contains("search://"));
 
         let error = protocol
             .read(
                 ProtocolRequest {
-                    uri: "grep://",
+                    uri: "search://",
                     target: "",
                     body: "",
                 },
@@ -885,7 +963,7 @@ mod tests {
             .unwrap_err();
         let error = error.to_string();
         assert!(error.contains("nonempty search pattern"));
-        assert!(error.contains(r#"read("grep://", "<pattern>")"#));
+        assert!(error.contains(r#"read("search://", "<pattern>")"#));
     }
 
     #[test]
@@ -928,7 +1006,7 @@ mod tests {
         let output = protocol
             .read(
                 ProtocolRequest {
-                    uri: "grep://?glob=**/*.rs&ignore_case=true&context=1&limit=1",
+                    uri: "search://?glob=**/*.rs&ignore_case=true&context=1&limit=1",
                     target: "?glob=**/*.rs&ignore_case=true&context=1&limit=1",
                     body: "needle",
                 },
@@ -954,7 +1032,7 @@ mod tests {
         tokio::fs::write(directory.path().join("values.txt"), "a.b\naxb\nfn push(\n")
             .await
             .unwrap();
-        let default_options = GrepOptions::parse(None).unwrap();
+        let default_options = GrepOptions::parse(None, SEARCH_SCHEME).unwrap();
 
         assert_eq!(
             run_grep(
@@ -963,6 +1041,7 @@ mod tests {
                 Path::new("."),
                 "missing",
                 &default_options,
+                SEARCH_SCHEME,
             )
             .await
             .unwrap(),
@@ -974,6 +1053,7 @@ mod tests {
             Path::new("."),
             "a.b",
             &default_options,
+            SEARCH_SCHEME,
         )
         .await
         .unwrap();
@@ -982,11 +1062,18 @@ mod tests {
 
         let literal = GrepOptions {
             literal: true,
-            ..GrepOptions::parse(None).unwrap()
+            ..GrepOptions::parse(None, SEARCH_SCHEME).unwrap()
         };
-        let output = run_grep(&rg, directory.path(), Path::new("."), "a.b", &literal)
-            .await
-            .unwrap();
+        let output = run_grep(
+            &rg,
+            directory.path(),
+            Path::new("."),
+            "a.b",
+            &literal,
+            SEARCH_SCHEME,
+        )
+        .await
+        .unwrap();
         assert!(output.contains("values.txt:1:a.b"));
         assert!(!output.contains("values.txt:2:axb"));
 
@@ -996,6 +1083,7 @@ mod tests {
             Path::new("."),
             "fn push(",
             &default_options,
+            SEARCH_SCHEME,
         )
         .await
         .unwrap();
@@ -1007,11 +1095,12 @@ mod tests {
             Path::new("missing-root"),
             "needle",
             &default_options,
+            SEARCH_SCHEME,
         )
         .await
         .unwrap_err();
         let error = format!("{error:#}");
-        assert!(error.contains("grep failed"));
+        assert!(error.contains("search failed"));
         assert!(!error.contains("ripgrep"));
         assert!(!error.contains("rg:"));
     }

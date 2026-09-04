@@ -43,7 +43,8 @@ existing capability.
 | --- | --- | --- |
 | `uri-agent-docs` | `read` | Read version-matched documentation embedded in the binary |
 | `file` | `read` | Read files, directories, globs, and supported images |
-| `grep` | `read`, `exec` | Run exact, semantic, or hybrid project search |
+| `search` | `read`, `exec` | Run ripgrep, semantic, or hybrid project search |
+| `grep` | `read`, `exec` | Compatibility route for resumed sessions whose frozen prompt used `grep://` |
 | `context` | `read`, `exec` | Inspect active context, maintain current-session notes, recover history, and read saved sessions |
 | `collaboration` | `read`, `exec` | Name this session, inspect active participants and model status, and exchange Queue or Steer messages |
 | `sessions` | `read`, `exec` | Compatibility route retained only for sessions whose frozen prompt already used it |
@@ -85,7 +86,7 @@ absolute paths absolute. It reads bounded text ranges, efficient text-file
 tails, bounded directory or glob listings, and PNG, JPEG, GIF, or WebP images.
 Image reads require a model whose catalog declares image input.
 
-`grep` uses ripgrep for exact regular-expression or literal search. Semantic
+`search` uses ripgrep (`rg`) for regular-expression or literal search. Semantic
 and hybrid modes use private, disposable sidecar indexes. A ranked read creates
 or incrementally refreshes its selected root and glob cache automatically;
 explicit indexing is only for prewarming or repair. Use exact search for known
@@ -93,9 +94,13 @@ identifiers, hybrid search for most conceptual queries, and semantic search
 when relevant text is likely to use different wording.
 
 ```text
-read("grep://src", "ProtocolRequest")
-read("grep://src?mode=hybrid&glob=**/*.rs", "credential refresh flow")
+read("search://src", "ProtocolRequest")
+read("search://src?mode=hybrid&glob=**/*.rs", "credential refresh flow")
 ```
+
+New sessions expose this capability as `search://`. A resumed session whose
+frozen startup prompt used `grep://` retains that address as a compatibility
+route with the same options and `rg` syntax.
 
 `context` exposes bounded recovery information for the active conversation,
 including context usage, titled notes, prior windows, user statements, search,

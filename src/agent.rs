@@ -730,6 +730,10 @@ fn frozen_prompt_uses_legacy_sessions(prompt: &str) -> bool {
     prompt.contains("\n- sessions: ") || prompt.contains("sessions://")
 }
 
+fn frozen_prompt_uses_legacy_grep(prompt: &str) -> bool {
+    prompt.contains("\n- grep: ") || prompt.contains("grep://")
+}
+
 impl AgentHost {
     async fn build_services(
         &self,
@@ -756,6 +760,7 @@ impl AgentHost {
             self.inner.manager.directory(),
             mcp_profile,
         );
+        // TODO: Remove resumed-session `sessions://` compatibility after the migration window.
         let legacy_sessions = if session.is_new() {
             false
         } else {
@@ -763,6 +768,15 @@ impl AgentHost {
         };
         if legacy_sessions {
             plugins.add(crate::builtins::SessionsPlugin::new(&self.inner.cwd));
+        }
+        // TODO: Remove resumed-session `grep://` compatibility after the migration window.
+        let legacy_grep = if session.is_new() {
+            false
+        } else {
+            frozen_prompt_uses_legacy_grep(&session.context().await.system_prompt)
+        };
+        if legacy_grep {
+            crate::builtins::add_legacy_grep(&mut plugins, &self.inner.cwd);
         }
         plugins.add(ContextPlugin::new(context_state.clone()));
         if let Some(state) = &collaboration_state {
@@ -1147,6 +1161,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_grep_compatibility_comes_only_from_the_frozen_prompt() {
+        assert!(frozen_prompt_uses_legacy_grep(
+            "Available protocols:\n- grep: Search file contents."
+        ));
+        assert!(frozen_prompt_uses_legacy_grep(
+            "Use read(\"grep://src\", \"needle\")"
+        ));
+        assert!(!frozen_prompt_uses_legacy_grep(
+            "Search file contents through search."
+        ));
+    }
+
+    #[test]
     fn plugin_open_requires_a_depth_two_session_owned_by_the_bound_parent() {
         let root = AgentSpec::root("provider", "model", ThinkingLevel::Off, Path::new("/work"));
         assert!(validate_plugin_open(&root, None).is_err());
@@ -1229,6 +1256,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(protocol_names.iter().any(|name| name == "context"));
         assert!(protocol_names.iter().any(|name| name == "collaboration"));
+        assert!(protocol_names.iter().any(|name| name == "search"));
+        assert!(!protocol_names.iter().any(|name| name == "grep"));
         assert!(!protocol_names.iter().any(|name| name == "sessions"));
         assert!(
             protocol_names
@@ -1279,7 +1308,7 @@ mod tests {
         reopened.close().await;
 
         let legacy_spec = spec.replace_system_prompt(
-            "Legacy frozen prompt\nAvailable protocols:\n- sessions: Search saved sessions.",
+            "Legacy frozen prompt\nAvailable protocols:\n- grep: Search file contents.\n- sessions: Search saved sessions.",
         );
         let legacy = host.open_root(None, legacy_spec.clone()).await.unwrap();
         legacy.services().runtime.prepare_context().await.unwrap();
@@ -1293,6 +1322,14 @@ mod tests {
                 .iter()
                 .any(|descriptor| descriptor.name == "sessions")
         );
+        assert!(
+            !legacy
+                .services()
+                .protocols
+                .descriptors()
+                .iter()
+                .any(|descriptor| descriptor.name == "grep")
+        );
         legacy.close().await;
 
         let legacy = host.open_root(Some(&legacy_id), legacy_spec).await.unwrap();
@@ -1303,6 +1340,14 @@ mod tests {
                 .descriptors()
                 .iter()
                 .any(|descriptor| descriptor.name == "sessions")
+        );
+        assert!(
+            legacy
+                .services()
+                .protocols
+                .descriptors()
+                .iter()
+                .any(|descriptor| descriptor.name == "grep")
         );
         legacy.close().await;
     }

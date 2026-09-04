@@ -223,7 +223,7 @@ impl Protocol for CollaborationPlugin {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: "collaboration".to_string(),
-            description: "Name this session, discover active URI Agent participants and model status, and send durable queue or steer messages between running processes.".to_string(),
+            description: "Coordinate work with other active URI Agent sessions by checking their status and sending messages.".to_string(),
             can_read: true,
             can_exec: true,
         }

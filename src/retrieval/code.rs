@@ -135,7 +135,7 @@ fn metadata_revision(metadata: &fs::Metadata) -> Result<String> {
 fn matching_files(root: &Path, glob: Option<&str>) -> Result<Vec<PathBuf>> {
     if root.is_file() {
         if glob.is_some() {
-            bail!("grep glob filtering requires a directory root for semantic indexing");
+            bail!("glob filtering requires a directory root for semantic indexing");
         }
         return Ok(vec![root.to_path_buf()]);
     }
@@ -145,7 +145,7 @@ fn matching_files(root: &Path, glob: Option<&str>) -> Result<Vec<PathBuf>> {
         let mut overrides = OverrideBuilder::new(root);
         overrides
             .add(glob)
-            .with_context(|| format!("invalid grep glob: {glob}"))?;
+            .with_context(|| format!("invalid semantic search glob: {glob}"))?;
         builder.overrides(overrides.build()?);
     }
     let mut files = Vec::new();

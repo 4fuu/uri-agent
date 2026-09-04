@@ -4933,7 +4933,7 @@ mod tests {
                 EventKind::ToolCall {
                     call_id: "failed-help".into(),
                     name: "read".into(),
-                    arguments: serde_json::json!({"uri":"grep://help","body":""}),
+                    arguments: serde_json::json!({"uri":"search://help","body":""}),
                 },
                 EventKind::ToolResult {
                     call_id: "failed-help".into(),
@@ -5148,7 +5148,7 @@ mod tests {
             assert_eq!(interrupted.content, b"partial output");
             let help_reads = resumed.successful_protocol_help_reads().await;
             assert!(help_reads.contains("file"));
-            assert!(!help_reads.contains("grep"));
+            assert!(!help_reads.contains("search"));
             assert!(!help_reads.contains("tasks"));
             assert!(
                 !resumed

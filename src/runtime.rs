@@ -3189,7 +3189,7 @@ mod tests {
     async fn truncated_task_notifications_require_help_then_one_complete_read() {
         let tasks = TaskManager::new();
         let record = tasks
-            .allocate_background("grep", "semantic search")
+            .allocate_background("search", "semantic search")
             .await
             .unwrap();
         let id = record.id.clone();
