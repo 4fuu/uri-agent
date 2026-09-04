@@ -57,12 +57,14 @@ Optional query parameters:
   as a regular expression, the protocol retries it as literal text.
 - `literal=true` always treats the body as literal text.
 - `ignore_case=true` enables case-insensitive matching.
-- `context=<0..20>` includes surrounding lines.
-- `limit=<1..2000>` bounds the number of matches; the default is 200.
+- `context=<lines>` includes surrounding lines; values above 20 clamp to 20.
+- `limit=<count>` bounds the number of matches; the default is 200 and values
+  above 2,000 clamp to 2,000.
 
 Semantic and hybrid reads accept only `mode`, `glob`, and `limit`; their
-default limit is 7 and maximum is 50. A ranked read creates or incrementally
-refreshes its selected root/glob cache as needed, then searches it. Most
+default limit is 7 and values above 50 clamp to 50. A ranked read creates or
+incrementally refreshes its selected root/glob cache as needed, then searches
+it. Most
 searches return in the same call; a longer search continues as one managed task
 without restarting and delivers its result automatically. If completion marks
 the output as truncated, follow its `tasks://` instruction once. Do not submit
@@ -410,18 +412,14 @@ impl GrepOptions {
                 "context" => {
                     options.context = value
                         .parse::<usize>()
-                        .with_context(|| format!("invalid grep context: {value}"))?;
-                    if options.context > MAX_CONTEXT {
-                        bail!("grep context cannot exceed {MAX_CONTEXT}");
-                    }
+                        .with_context(|| format!("invalid grep context: {value}"))?
+                        .min(MAX_CONTEXT);
                 }
                 "limit" => {
                     options.limit = value
                         .parse::<usize>()
-                        .with_context(|| format!("invalid grep limit: {value}"))?;
-                    if !(1..=MAX_LIMIT).contains(&options.limit) {
-                        bail!("grep limit must be between 1 and {MAX_LIMIT}");
-                    }
+                        .with_context(|| format!("invalid grep limit: {value}"))?
+                        .clamp(1, MAX_LIMIT);
                     options.limit_set = true;
                 }
                 _ => bail!("unknown grep query parameter: {name}"),
@@ -457,9 +455,6 @@ impl GrepOptions {
         if self.literal || self.ignore_case || self.context != 0 {
             bail!("semantic grep accepts only mode, glob, and limit");
         }
-        if self.limit_set && self.limit > MAX_SEMANTIC_LIMIT {
-            bail!("semantic grep limit cannot exceed {MAX_SEMANTIC_LIMIT}");
-        }
         Ok(())
     }
 
@@ -471,7 +466,11 @@ impl GrepOptions {
     }
 
     fn semantic_limit(&self) -> usize {
-        if self.limit_set { self.limit } else { 7 }
+        if self.limit_set {
+            self.limit.min(MAX_SEMANTIC_LIMIT)
+        } else {
+            7
+        }
     }
 }
 
@@ -802,12 +801,9 @@ mod tests {
                 .semantic_limit(),
             7
         );
-        assert!(
-            GrepOptions::parse(Some("mode=hybrid&limit=51"))
-                .unwrap()
-                .validate_semantic()
-                .is_err()
-        );
+        let hybrid = GrepOptions::parse(Some("mode=hybrid&limit=51")).unwrap();
+        hybrid.validate_semantic().unwrap();
+        assert_eq!(hybrid.semantic_limit(), 50);
         assert!(GrepOptions::parse_exec(Some("mode=index&glob=**/*.rs")).is_ok());
         assert!(GrepOptions::parse_exec(Some("mode=semantic")).is_err());
         assert!(
@@ -816,8 +812,12 @@ mod tests {
                 .validate_index_operation()
                 .is_err()
         );
-        assert!(GrepOptions::parse(Some("context=21")).is_err());
-        assert!(GrepOptions::parse(Some("limit=0")).is_err());
+        assert_eq!(GrepOptions::parse(Some("context=21")).unwrap().context, 20);
+        assert_eq!(GrepOptions::parse(Some("limit=0")).unwrap().limit, 1);
+        assert_eq!(
+            GrepOptions::parse(Some("limit=99999")).unwrap().limit,
+            2_000
+        );
         assert!(GrepOptions::parse(Some("literal=true&literal=false")).is_err());
     }
 

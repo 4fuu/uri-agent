@@ -52,8 +52,8 @@ Current project: `{}`
 Conversation records use session-local IDs such as `r42`, matching `context://`. Record types are `user`, `assistant`, `tool_call`, `tool_result`, and `error`. A comma-separated `types` parameter filters records; omitting it includes every type.
 
 - `sessions://recent` lists saved sessions. Query parameters accept `scope`
-  (`project` or `all`), `cwd` (only with `scope=all`), `limit` (1..50), and
-  `offset`. Its body must be empty.
+  (`project` or `all`), `cwd` (only with `scope=all`), `limit` (clamped to
+  1..50), and `offset`. Its body must be empty.
 - `sessions://search` searches session IDs, working directories, and selected
   record types. Put the nonempty search text directly in the body. It accepts
   `types` in addition to the discovery parameters and returns record IDs for
@@ -72,7 +72,7 @@ Conversation records use session-local IDs such as `r42`, matching `context://`.
   diagnoses the selected cache. Executing it only prewarms or force-rebuilds
   that cache. Both routes accept `scope` and `cwd` like discovery. The private
   sidecar cache never modifies a session.
-- `sessions://<session-id>` reads the newest records from one exact session. Query parameters accept `types`, `limit` (1..50), and `before=<record-id>`. Its body must be empty.
+- `sessions://<session-id>` reads the newest records from one exact session. Query parameters accept `types`, `limit` (clamped to 1..50), and `before=<record-id>`. Its body must be empty.
 - `sessions://<session-id>/around/<record-id>` reads records around one anchor. Optional `before` and `after` are record counts and default to 10 each; their sum must not exceed 50. Optional `types` filters the result.
 
 `include_tools` remains supported for compatibility and cannot be combined with `types`. `include_tools=false` selects `user,assistant,error`; `include_tools=true` selects every type.
@@ -444,7 +444,6 @@ impl SessionsOptions {
         if self.cwd.is_some() && self.scope != Some(Scope::All) {
             bail!("sessions cwd requires scope=\"all\"")
         }
-        normalize_limit(self.limit, DEFAULT_DISCOVERY_LIMIT)?;
         Ok(())
     }
 
@@ -459,7 +458,6 @@ impl SessionsOptions {
         }
         self.resolve_types()?;
         self.history_cursor()?;
-        normalize_limit(self.limit, DEFAULT_READ_LIMIT)?;
         Ok(())
     }
 
@@ -809,7 +807,7 @@ async fn semantic_discover(
         query,
         (scope_label, options.cwd.as_deref()),
         options.offset.unwrap_or_default(),
-        normalize_limit(options.limit, DEFAULT_DISCOVERY_LIMIT)?,
+        normalize_limit(options.limit, DEFAULT_DISCOVERY_LIMIT),
         Some(&types),
         Some(mode),
     )
@@ -846,7 +844,7 @@ async fn discover(
         sessions.retain(|session| same_path(&session.cwd, cwd));
     }
     let offset = options.offset.unwrap_or_default();
-    let limit = normalize_limit(options.limit, DEFAULT_DISCOVERY_LIMIT)?;
+    let limit = normalize_limit(options.limit, DEFAULT_DISCOVERY_LIMIT);
     let scope_label = match scope {
         Scope::Project => "project",
         Scope::All => "all",
@@ -1079,7 +1077,7 @@ async fn read_session(
         .ok_or_else(|| anyhow!("sessions: session not found: {id}"))?;
     let types = options.resolve_types()?;
     let before = options.history_cursor()?;
-    let limit = normalize_limit(options.limit, DEFAULT_READ_LIMIT)?;
+    let limit = normalize_limit(options.limit, DEFAULT_READ_LIMIT);
     let records = conversation_records(&session.events, &types);
     let end = before.map_or(records.len(), |before| {
         records.partition_point(|record| record.sequence < before)
@@ -1208,12 +1206,8 @@ fn archive_header() -> String {
         .to_string()
 }
 
-fn normalize_limit(value: Option<usize>, fallback: usize) -> Result<usize> {
-    let value = value.unwrap_or(fallback);
-    if !(1..=MAX_LIMIT).contains(&value) {
-        bail!("sessions limit must be between 1 and {MAX_LIMIT}")
-    }
-    Ok(value)
+fn normalize_limit(value: Option<usize>, fallback: usize) -> usize {
+    value.unwrap_or(fallback).clamp(1, MAX_LIMIT)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

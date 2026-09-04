@@ -15,7 +15,13 @@ use tokio::process::Command;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
-const PWSH_UTF8_PREFIX: &str = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ";
+// The Out-String default keeps formatted tables from truncating columns at the
+// inherited console width; streaming still flows through Out-Default.
+const PWSH_UTF8_PREFIX: &str = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; $PSDefaultParameterValues['Out-String:Width'] = 4096; ";
+// Width-aware tools (ps, git, docker, kubectl) size output to COLUMNS and fall
+// back to 80 columns when it is unset; export a wide default so piped output is
+// not truncated. Bash leaves COLUMNS untouched in non-interactive shells.
+const BASH_PREFIX: &str = "export COLUMNS=4096\n";
 const PWSH_EXIT_EPILOGUE: &str = "\n; $__uri_agent_ok = $?; $__uri_agent_native = $global:LASTEXITCODE; if ($__uri_agent_ok) { $global:__uri_agent_exit_code = 0 } elseif ($null -ne $__uri_agent_native -and $__uri_agent_native -ne 0) { $global:__uri_agent_exit_code = $__uri_agent_native } else { $global:__uri_agent_exit_code = 1 }";
 const PWSH_WINDOWS_WARNING: &str =
     "PowerShell 7 or newer was not found on Windows; pwsh:// is disabled.";
@@ -433,6 +439,10 @@ fn command_label(command: &str) -> String {
     label
 }
 
+fn bash_script_input(script: &str) -> String {
+    format!("{BASH_PREFIX}{script}")
+}
+
 fn encode_pwsh_script(script: &str) -> String {
     let source = format!(
         "{PWSH_UTF8_PREFIX}$global:LASTEXITCODE = $null; $global:__uri_agent_exit_code = 0; . {{\n{script}{PWSH_EXIT_EPILOGUE}\n}} | Out-Default\nexit $global:__uri_agent_exit_code"
@@ -488,7 +498,7 @@ async fn execute_with_cancellation(
     let mut command = Command::new(executable);
     let input = if protocol == "bash" {
         command.args(["--noprofile", "--norc"]);
-        script.to_string()
+        bash_script_input(script)
     } else {
         command.args([
             "-NoLogo",
@@ -895,11 +905,19 @@ mod tests {
     }
 
     #[test]
+    fn bash_input_exports_a_wide_columns_default() {
+        let input = bash_script_input("printf 'ok'");
+        assert!(input.starts_with("export COLUMNS=4096\n"));
+        assert!(input.ends_with("printf 'ok'"));
+    }
+
+    #[test]
     fn pwsh_source_transport_is_utf8_and_preserves_final_status() {
         let encoded = encode_pwsh_script("Write-Output '中文 ✓' # trailing comment");
         let decoded = String::from_utf8(BASE64.decode(encoded).unwrap()).unwrap();
 
         assert!(decoded.starts_with(PWSH_UTF8_PREFIX));
+        assert!(PWSH_UTF8_PREFIX.contains("$PSDefaultParameterValues['Out-String:Width']"));
         assert!(decoded.contains("Write-Output '中文 ✓' # trailing comment\n; "));
         assert!(decoded.contains("$__uri_agent_native = $global:LASTEXITCODE"));
         assert!(decoded.contains("} | Out-Default\nexit $global:__uri_agent_exit_code"));

@@ -444,9 +444,17 @@ absolute paths are accepted. On Unix, `~` and paths beginning with `~/` resolve
 from the current user's home directory, while `~user` is not expanded.
 
 URI Agent parses and applies the complete patch to an in-memory plan before
-changing files. A commit failure rolls back every affected file. `apply_patch`
-is registered only as a direct tool; it has no protocol route. The same grammar
-is included in its active tool schema.
+changing files. A commit failure rolls back every affected file.
+
+The summary lists one line per file: `A <path> (+n)` for an addition, `M
+<path> (+a/-b)` for a modification, `D <path> (-n)` for a deletion, and
+`= <path> (unchanged)` for an update that matched but made no net change. A
+patch with no net changes returns `Patch made no changes:` instead of `Applied
+patch:`. Matching is line-exact apart from trailing whitespace, so CRLF and LF
+files both match, and original line endings and BOM are preserved.
+
+`apply_patch` is registered only as a direct tool; it has no protocol route.
+The same grammar is included in its active tool schema.
 
 ### `bash` and `pwsh`
 
@@ -459,6 +467,9 @@ exec("pwsh://run", "cargo test")
 ```
 
 Commands run from the startup working directory. Bash starts without profile or rc files; PowerShell starts without a profile and reads the script from standard input.
+
+Bash exports `COLUMNS=4096` so width-aware tools (ps, git, docker, kubectl) do
+not fall back to 80-column truncation when stdout is not a terminal.
 
 URI Agent injects the latest values from its global Agent environment manager into every new shell command. Managed values override inherited process variables with the same name. The user-controlled `:terminal` is separate and does not receive them; see [Agent environment](configuration.md#agent-environment).
 
@@ -509,9 +520,10 @@ Task acceptance is not success. A model-facing task record exposes `pending`,
 `running`, `completed`, `failed`, or `cancelled` state, its originating
 protocol, label, bounded latest output while active, and complete terminal
 output. A read without `wait` returns immediately. `wait` accepts an integer
-from 1 through 300 seconds. If the task finishes during the wait, the read
-returns its complete terminal output. If the wait expires, it returns current
-status and bounded latest output while the task keeps running. Internal
+number of seconds, clamped to the range 1 through 300. If the task finishes
+during the wait, the read returns its complete terminal output. If the wait
+expires, it returns current status and bounded latest output while the task
+keeps running. Internal
 timestamps and duration do not enter the model result. Task IDs increase within
 their session as lowercase hexadecimal values: they start at `001`, remain at
 least three digits wide, expand after `fff`, and continue after the highest

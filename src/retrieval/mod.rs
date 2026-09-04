@@ -14,7 +14,7 @@ use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -1096,25 +1096,34 @@ fn jieba_directory() -> Result<PathBuf> {
     Ok(directory)
 }
 
-fn embedding_model() -> Result<Arc<embedding::Model2VecEmbedding>> {
-    static MODEL: OnceLock<Result<Arc<embedding::Model2VecEmbedding>, String>> = OnceLock::new();
-    match MODEL.get_or_init(|| {
-        embedding::Model2VecEmbedding::load(model_directory().map_err(|error| error.to_string())?)
-            .map(Arc::new)
-            .map_err(|error| format!("cannot load bundled embedding model: {error:#}"))
-    }) {
-        Ok(model) => Ok(model.clone()),
-        Err(error) => Err(anyhow!(error.clone())),
+/// Caches only a successful initialization; failures are retried on the next
+/// call so late-staged retrieval assets do not require a process restart.
+fn cached_or_init<T: Clone>(cell: &OnceLock<T>, init: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some(value) = cell.get() {
+        return Ok(value.clone());
     }
+    let value = init()?;
+    Ok(cell.get_or_init(|| value).clone())
+}
+
+fn embedding_model() -> Result<Arc<embedding::Model2VecEmbedding>> {
+    static MODEL: OnceLock<Arc<embedding::Model2VecEmbedding>> = OnceLock::new();
+    cached_or_init(&MODEL, || {
+        embedding::Model2VecEmbedding::load(model_directory()?)
+            .map(Arc::new)
+            .context("cannot load bundled embedding model")
+    })
 }
 
 fn initialize_zvec() -> Result<()> {
-    static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
-    match INITIALIZED.get_or_init(|| zvec_rust::initialize(None).map_err(|error| error.to_string()))
-    {
-        Ok(()) => Ok(()),
-        Err(error) => Err(anyhow!(error.clone())),
-    }
+    static INITIALIZED: OnceLock<()> = OnceLock::new();
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = INIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cached_or_init(&INITIALIZED, || {
+        zvec_rust::initialize(None).map_err(|error| anyhow!(error.to_string()))
+    })
 }
 
 fn path_text(path: &Path) -> Result<&str> {
@@ -1368,6 +1377,31 @@ mod tests {
                 "zvec primary keys are limited to 64 bytes: {id}"
             );
         }
+    }
+
+    #[test]
+    fn cached_or_init_retries_failures_and_caches_only_success() {
+        let cell = OnceLock::new();
+        let attempts = std::cell::Cell::new(0_usize);
+
+        let failed = cached_or_init(&cell, || -> Result<u32> {
+            attempts.set(attempts.get() + 1);
+            bail!("not ready")
+        });
+        assert_eq!(failed.unwrap_err().to_string(), "not ready");
+        assert!(cell.get().is_none());
+
+        let loaded = cached_or_init(&cell, || -> Result<u32> {
+            attempts.set(attempts.get() + 1);
+            Ok(42)
+        });
+        assert_eq!(loaded.unwrap(), 42);
+
+        let cached = cached_or_init(&cell, || -> Result<u32> {
+            panic!("cached value must be reused without reinitialization")
+        });
+        assert_eq!(cached.unwrap(), 42);
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]

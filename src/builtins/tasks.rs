@@ -34,9 +34,10 @@ Wait up to 300 seconds when the result is needed before continuing:
 read("tasks://<id>?wait=30", "")
 ```
 
-`wait` must be an integer from 1 through 300. If the task finishes during the
-wait, the read returns its complete terminal output. If the wait expires, it
-returns current status and bounded latest output while the task keeps running.
+`wait` accepts an integer number of seconds; values outside 1 through 300 are
+clamped to the nearest bound. If the task finishes during the wait, the read
+returns its complete terminal output. If the wait expires, it returns current
+status and bounded latest output while the task keeps running.
 
 Cancel a pending or running task:
 
@@ -169,8 +170,8 @@ fn parse_read_target(target: &str) -> Result<(&str, Option<Duration>)> {
     let seconds = query
         .strip_prefix("wait=")
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| (1..=MAX_WAIT_SECONDS).contains(seconds))
-        .ok_or_else(|| anyhow!("task wait must be an integer from 1 through 300 seconds"))?;
+        .map(|seconds| seconds.clamp(1, MAX_WAIT_SECONDS))
+        .ok_or_else(|| anyhow!("task wait must be an integer number of seconds"))?;
     Ok((id, Some(Duration::from_secs(seconds))))
 }
 
@@ -288,7 +289,7 @@ mod tests {
         assert!(HELP.contains("tasks://<id>?wait=30"));
         assert!(HELP.contains("tasks://<id>/cancel"));
         assert!(HELP.contains("MUST pass an empty string body"));
-        assert!(HELP.contains("integer from 1 through 300"));
+        assert!(HELP.contains("clamped to the nearest bound"));
         assert!(HELP.contains("Operations normally return in their original"));
         assert!(HELP.contains("use one bounded wait; do not poll or rerun the operation"));
         assert!(HELP.contains("At most 16 background tasks"));
@@ -301,12 +302,18 @@ mod tests {
             parse_read_target("001?wait=30").unwrap(),
             ("001", Some(Duration::from_secs(30)))
         );
+        assert_eq!(
+            parse_read_target("001?wait=0").unwrap(),
+            ("001", Some(Duration::from_secs(1)))
+        );
+        assert_eq!(
+            parse_read_target("001?wait=301").unwrap(),
+            ("001", Some(Duration::from_secs(300)))
+        );
         for target in [
             "",
             "001/extra",
             "001?",
-            "001?wait=0",
-            "001?wait=301",
             "001?wait=soon",
             "001?other=30",
             "001?wait=1&wait=2",

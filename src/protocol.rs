@@ -487,7 +487,7 @@ impl ProtocolRegistry {
         let protocol = self
             .find_protocol(name, include_dynamic)
             .await
-            .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
+            .ok_or_else(|| self.unknown_protocol_error(name, include_dynamic))?;
         let descriptor = protocol.descriptor();
         if !descriptor.can_read {
             bail!("protocol does not support read: {name}");
@@ -527,7 +527,7 @@ impl ProtocolRegistry {
         let protocol = self
             .find_protocol(name, include_dynamic)
             .await
-            .ok_or_else(|| anyhow!("unknown protocol: {name}"))?;
+            .ok_or_else(|| self.unknown_protocol_error(name, include_dynamic))?;
         if require_help {
             let help_read = self.help_read.lock().await;
             if let Some(dependency) = protocol
@@ -579,6 +579,43 @@ impl ProtocolRegistry {
             }
         }
         None
+    }
+
+    fn unknown_protocol_error(&self, name: &str, include_dynamic: bool) -> anyhow::Error {
+        let allowed = self
+            .allowed
+            .read()
+            .expect("protocol selection lock poisoned");
+        let mut names = self
+            .protocols
+            .keys()
+            .filter(|name| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(name.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if include_dynamic {
+            names.extend(
+                self.dynamic
+                    .iter()
+                    .flat_map(|source| source.descriptors())
+                    .map(|descriptor| descriptor.name)
+                    .filter(|name| {
+                        allowed
+                            .as_ref()
+                            .is_none_or(|allowed| allowed.contains(name.as_str()))
+                    }),
+            );
+        }
+        drop(allowed);
+        names.sort();
+        if names.is_empty() {
+            anyhow!("unknown protocol: {name}")
+        } else {
+            anyhow!("unknown protocol: {name}; available: {}", names.join(", "))
+        }
     }
 }
 
@@ -938,7 +975,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string(),
-            "unknown protocol: first"
+            "unknown protocol: first; available: second"
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

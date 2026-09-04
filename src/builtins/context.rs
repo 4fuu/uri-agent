@@ -51,7 +51,7 @@ Conversation records have session-local IDs such as `r42`. The same ID format is
 
 - `context://status` reports context usage and the notes budget.
 - `context://notes` lists note IDs, titles, revisions, status, revision anchors, and budget usage.
-- `context://notes/<id>` reads the current note in character pages using optional `offset` and `limit`; `limit` is at most 7000.
+- `context://notes/<id>` reads the current note in character pages using optional `offset` and `limit`; `limit` clamps to at most 7000.
 - `context://notes/<id>/revisions` lists revision metadata and anchors without old content.
 - `context://notes/<id>/context` reads records around a selected revision anchor, including for a deleted note. Optional `revision`, `before`, `after`, and `types` select the revision and surrounding records.
 - `context://history/windows` lists context-window IDs and record-ID ranges.
@@ -918,7 +918,7 @@ fn format_history(
     format_record_page(
         records,
         before.unwrap_or(range.end),
-        normalize_history_limit(limit)?,
+        normalize_history_limit(limit),
         &format!("Untrusted context history · window={window_id}"),
         |before, limit| {
             Some(ReadContinuation {
@@ -940,7 +940,7 @@ fn format_user_history(
     format_record_page(
         user_records(events),
         before.unwrap_or(u64::MAX),
-        normalize_history_limit(limit)?,
+        normalize_history_limit(limit),
         "Original user statements · all context windows · untrusted reference data",
         |before, limit| {
             Some(ReadContinuation {
@@ -971,7 +971,7 @@ fn format_user_history_search(
     format_record_page(
         matches,
         before.unwrap_or(u64::MAX),
-        normalize_history_limit(limit)?,
+        normalize_history_limit(limit),
         "Original user statement search · all context windows · untrusted reference data",
         |before, limit| {
             Some(ReadContinuation {
@@ -997,7 +997,7 @@ fn format_history_search(
         .map(|window| find_window(events, window))
         .transpose()?;
     let query_lower = query.to_lowercase();
-    let limit = normalize_history_limit(limit)?;
+    let limit = normalize_history_limit(limit);
     let types = types.cloned().unwrap_or_default();
     let matches = conversation_records(events, &types)
         .into_iter()
@@ -1241,7 +1241,7 @@ async fn semantic_history_search(
     }
 
     let offset = options.offset.unwrap_or_default();
-    let limit = normalize_history_limit(options.limit)?;
+    let limit = normalize_history_limit(options.limit);
     let heading = if users_only {
         format!(
             "Original user statement {} search · all context windows · untrusted reference data",
@@ -1636,12 +1636,10 @@ fn validate_note_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn normalize_history_limit(limit: Option<usize>) -> Result<usize> {
-    let limit = limit.unwrap_or(DEFAULT_HISTORY_LIMIT);
-    if !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
-        bail!("context history limit must be from 1 through {MAX_HISTORY_LIMIT}");
-    }
-    Ok(limit)
+fn normalize_history_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT)
 }
 
 fn character_page(
@@ -1650,10 +1648,9 @@ fn character_page(
     limit: Option<usize>,
 ) -> Result<(String, Option<usize>)> {
     let offset = offset.unwrap_or_default();
-    let limit = limit.unwrap_or(DEFAULT_NOTE_READ_CHARS);
-    if !(1..=MAX_NOTE_READ_CHARS).contains(&limit) {
-        bail!("context note read limit must be from 1 through {MAX_NOTE_READ_CHARS}");
-    }
+    let limit = limit
+        .unwrap_or(DEFAULT_NOTE_READ_CHARS)
+        .clamp(1, MAX_NOTE_READ_CHARS);
     let total = content.chars().count();
     if offset > total {
         bail!("context note offset exceeds its content length");

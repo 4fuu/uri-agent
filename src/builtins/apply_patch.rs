@@ -36,7 +36,13 @@ const PATCH_ARGUMENT_DESCRIPTION: &str = concat!(
     "*** End of File anchors the preceding chunk at EOF. Every Add File content line ",
     "begins with +. Relative paths resolve from the startup working directory; absolute ",
     "paths are accepted. On Unix, ~ and paths beginning with ~/ resolve from the current ",
-    "user's home directory; ~user is not expanded."
+    "user's home directory; ~user is not expanded. Matching is line-exact apart from ",
+    "trailing whitespace, so CRLF and LF files both match, and original line endings ",
+    "and BOM are preserved. The output lists one line per file: A (added), M (modified), ",
+    "or D (deleted) with +added/-removed line counts. An update that matches but ",
+    "changes nothing prints '= path (unchanged)', and a patch with no net changes ",
+    "returns 'Patch made no changes:' instead of 'Applied patch:'; treat that as a ",
+    "signal to recheck the patch. On failure every file is left unchanged."
 );
 
 #[derive(Clone)]
@@ -125,6 +131,7 @@ struct UpdateChunk {
     change_context: Option<String>,
     old_lines: Vec<String>,
     new_lines: Vec<String>,
+    context_lines: usize,
     end_of_file: bool,
 }
 
@@ -136,6 +143,34 @@ impl UpdateChunk {
     fn push_context(&mut self, line: &str) {
         self.old_lines.push(line.to_string());
         self.new_lines.push(line.to_string());
+        self.context_lines += 1;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PatchStats {
+    added: usize,
+    removed: usize,
+}
+
+impl PatchStats {
+    fn from_chunks(chunks: &[UpdateChunk]) -> Self {
+        Self {
+            added: chunks
+                .iter()
+                .map(|chunk| chunk.new_lines.len() - chunk.context_lines)
+                .sum(),
+            removed: chunks
+                .iter()
+                .map(|chunk| chunk.old_lines.len() - chunk.context_lines)
+                .sum(),
+        }
+    }
+}
+
+impl std::fmt::Display for PatchStats {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "+{}/-{}", self.added, self.removed)
     }
 }
 
@@ -324,33 +359,37 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
+    let mut unchanged = Vec::new();
 
     for hunk in hunks {
         match hunk {
             PatchHunk::Add { path, content } => {
+                let lines = content.lines().count();
                 let resolved = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 load_planned_file(&mut files, &resolved)
                     .await?
                     .final_content = Some(content.into_bytes());
-                added.push(path);
+                added.push((path, lines));
             }
             PatchHunk::Delete { path } => {
                 let resolved = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 let file = load_planned_file(&mut files, &resolved).await?;
-                if file.final_content.is_none() {
+                let Some(content) = &file.final_content else {
                     bail!(
                         "failed to delete file {}: file not found",
                         display_path(&resolved)
                     );
-                }
+                };
+                let lines = String::from_utf8_lossy(content).lines().count();
                 file.final_content = None;
-                deleted.push(path);
+                deleted.push((path, lines));
             }
             PatchHunk::Update {
                 path,
                 move_to,
                 chunks,
             } => {
+                let stats = PatchStats::from_chunks(&chunks);
                 let source = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 let source_content = load_planned_file(&mut files, &source)
                     .await?
@@ -363,6 +402,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                     format!("file to update is not UTF-8: {}", display_path(&source))
                 })?;
                 let updated = derive_updated_content(&source, &source_text, &chunks)?;
+                let content_changed = updated != source_text;
                 if let Some(destination) = move_to {
                     let resolved_destination =
                         resolve_path(cwd, destination.to_string_lossy().as_ref())?;
@@ -380,13 +420,17 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                             .expect("source was loaded")
                             .final_content = Some(updated.into_bytes());
                     }
-                    modified.push(destination);
+                    modified.push((destination, stats));
                 } else {
                     files
                         .get_mut(&source)
                         .expect("source was loaded")
                         .final_content = Some(updated.into_bytes());
-                    modified.push(path);
+                    if content_changed {
+                        modified.push((path, stats));
+                    } else {
+                        unchanged.push(path);
+                    }
                 }
             }
         }
@@ -394,15 +438,22 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
 
     commit_plan(&files).await?;
 
-    let mut output = String::from("Applied patch:\n");
-    for path in added {
-        output.push_str(&format!("A {}\n", display_path(&path)));
+    let mut output = if added.is_empty() && modified.is_empty() && deleted.is_empty() {
+        String::from("Patch made no changes:\n")
+    } else {
+        String::from("Applied patch:\n")
+    };
+    for (path, lines) in added {
+        output.push_str(&format!("A {} (+{lines})\n", display_path(&path)));
     }
-    for path in modified {
-        output.push_str(&format!("M {}\n", display_path(&path)));
+    for (path, stats) in modified {
+        output.push_str(&format!("M {} ({stats})\n", display_path(&path)));
     }
-    for path in deleted {
-        output.push_str(&format!("D {}\n", display_path(&path)));
+    for (path, lines) in deleted {
+        output.push_str(&format!("D {} (-{lines})\n", display_path(&path)));
+    }
+    for path in unchanged {
+        output.push_str(&format!("= {} (unchanged)\n", display_path(&path)));
     }
     Ok(output)
 }
@@ -764,6 +815,12 @@ mod tests {
                 .unwrap()
                 .contains("paths beginning with ~/")
         );
+        assert!(
+            descriptor.parameters["properties"]["patch"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("'Patch made no changes:' instead of 'Applied patch:'")
+        );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }
 
@@ -799,7 +856,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "Applied patch:\nA nested/add.txt\nM update.txt\nM nested/moved.txt\nD delete.txt\n"
+            "Applied patch:\nA nested/add.txt (+1)\nM update.txt (+1/-1)\nM nested/moved.txt (+1/-1)\nD delete.txt (-1)\n"
         );
         assert_eq!(
             fs::read_to_string(directory.path().join("nested/add.txt"))
@@ -821,6 +878,56 @@ mod tests {
             "moved\n"
         );
         assert!(!directory.path().join("delete.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn codex_patch_reports_context_only_updates_as_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("same.txt"), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        fs::write(directory.path().join("real.txt"), "one\ntwo\n")
+            .await
+            .unwrap();
+        let patch = r#"*** Begin Patch
+*** Update File: same.txt
+@@
+ alpha
+ beta
+*** Update File: real.txt
+@@
+-one
++uno
+*** End Patch"#;
+
+        let output = apply_patch(directory.path(), patch).await.unwrap();
+
+        assert_eq!(
+            output,
+            "Applied patch:\nM real.txt (+1/-1)\n= same.txt (unchanged)\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("same.txt"))
+                .await
+                .unwrap(),
+            "alpha\nbeta\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("real.txt"))
+                .await
+                .unwrap(),
+            "uno\ntwo\n"
+        );
+
+        let noop_only = r#"*** Begin Patch
+*** Update File: same.txt
+@@
+ alpha
+*** End Patch"#;
+        assert_eq!(
+            apply_patch(directory.path(), noop_only).await.unwrap(),
+            "Patch made no changes:\n= same.txt (unchanged)\n"
+        );
     }
 
     #[tokio::test]
