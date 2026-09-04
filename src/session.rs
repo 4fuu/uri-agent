@@ -19,8 +19,8 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
     Connection,
     rusqlite::{
-        Connection as SqliteConnection, OpenFlags, OptionalExtension, Transaction,
-        TransactionBehavior, params,
+        Connection as SqliteConnection, Error as SqliteError, ErrorCode, OpenFlags,
+        OptionalExtension, Transaction, TransactionBehavior, params,
     },
 };
 use uuid::Uuid;
@@ -3227,10 +3227,31 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
 
 fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::Result<()> {
     db.busy_timeout(SESSION_DATABASE_BUSY_TIMEOUT)?;
-    db.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS sessions (
+    db.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let deadline = std::time::Instant::now() + SESSION_DATABASE_BUSY_TIMEOUT;
+    loop {
+        match db.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => break,
+            Err(error)
+                if matches!(
+                    error,
+                    SqliteError::SqliteFailure(
+                        tokio_rusqlite::rusqlite::ffi::Error {
+                            code: ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked,
+                            ..
+                        },
+                        _
+                    )
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
            id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
            cwd TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
            thinking TEXT NOT NULL,
@@ -3302,7 +3323,7 @@ fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::R
          );",
     )?;
     let has_checksum = {
-        let mut statement = db.prepare("PRAGMA table_info(session_resume_index)")?;
+        let mut statement = transaction.prepare("PRAGMA table_info(session_resume_index)")?;
         statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?
@@ -3310,13 +3331,13 @@ fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::R
             .any(|column| column == "checksum")
     };
     if !has_checksum {
-        db.execute(
+        transaction.execute(
             "ALTER TABLE session_resume_index
              ADD COLUMN checksum TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }
-    Ok(())
+    transaction.commit()
 }
 
 fn payload_kind(kind: &EventKind) -> &'static str {
@@ -5572,6 +5593,31 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_database_initializers_share_a_fresh_database() {
+        const INITIALIZERS: usize = 8;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let barrier = Arc::new(std::sync::Barrier::new(INITIALIZERS));
+        let mut initializers = Vec::new();
+        for _ in 0..INITIALIZERS {
+            let connection = Connection::open(&path).await.unwrap();
+            let barrier = barrier.clone();
+            initializers.push(tokio::spawn(async move {
+                connection
+                    .call(move |db| {
+                        barrier.wait();
+                        initialize_database(db)
+                    })
+                    .await
+            }));
+        }
+
+        for initializer in initializers {
+            initializer.await.unwrap().unwrap();
+        }
     }
 
     #[test]
