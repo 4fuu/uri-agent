@@ -68,8 +68,10 @@ Each running depth-1 TUI session can join local collaboration after its session
 has been materialized. Its optional human name is stored with the session.
 Names are unique only among live participants: concurrent conflicts are
 resolved transactionally by appending ` 2`, ` 3`, and so on, and the effective
-name remains on resume. Stable session IDs are always included in delivered
-source metadata and remain the unambiguous archive reference.
+name remains on resume. Existing stable session IDs are reserved from use as
+names and receive the same suffix treatment. Stable session IDs are always
+included in delivered source metadata and remain the unambiguous archive
+reference.
 
 Live presence is a renewable SQLite lease rather than transcript history. It
 publishes `idle` or `working` model state and queue depth, and stale leases stop

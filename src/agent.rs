@@ -726,6 +726,10 @@ fn validate_spec(spec: &AgentSpec) -> Result<()> {
     Ok(())
 }
 
+fn frozen_prompt_uses_legacy_sessions(prompt: &str) -> bool {
+    prompt.contains("\n- sessions: ") || prompt.contains("sessions://")
+}
+
 impl AgentHost {
     async fn build_services(
         &self,
@@ -752,7 +756,12 @@ impl AgentHost {
             self.inner.manager.directory(),
             mcp_profile,
         );
-        if !session.is_new() {
+        let legacy_sessions = if session.is_new() {
+            false
+        } else {
+            frozen_prompt_uses_legacy_sessions(&session.context().await.system_prompt)
+        };
+        if legacy_sessions {
             plugins.add(crate::builtins::SessionsPlugin::new(&self.inner.cwd));
         }
         plugins.add(ContextPlugin::new(context_state.clone()));
@@ -1125,6 +1134,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sessions_compatibility_comes_only_from_the_frozen_prompt() {
+        assert!(frozen_prompt_uses_legacy_sessions(
+            "Available protocols:\n- sessions: Search saved sessions."
+        ));
+        assert!(frozen_prompt_uses_legacy_sessions(
+            "Use read(\"sessions://recent\", \"\")"
+        ));
+        assert!(!frozen_prompt_uses_legacy_sessions(
+            "Search saved sessions through context."
+        ));
+    }
+
+    #[test]
     fn plugin_open_requires_a_depth_two_session_owned_by_the_bound_parent() {
         let root = AgentSpec::root("provider", "model", ThinkingLevel::Off, Path::new("/work"));
         assert!(validate_plugin_open(&root, None).is_err());
@@ -1226,7 +1248,10 @@ mod tests {
         assert!(!transcript.contains("private-test-value"));
         created.close().await;
 
-        let reopened = host.open_root(Some(&session_id), spec).await.unwrap();
+        let reopened = host
+            .open_root(Some(&session_id), spec.clone())
+            .await
+            .unwrap();
         reopened.services().runtime.prepare_context().await.unwrap();
         assert_eq!(
             reopened
@@ -1248,18 +1273,37 @@ mod tests {
                 .descriptors()
                 .into_iter()
                 .map(|descriptor| descriptor.name)
-                .filter(|name| name != "sessions")
                 .collect::<Vec<_>>(),
             protocol_names,
         );
+        reopened.close().await;
+
+        let legacy_spec = spec.replace_system_prompt(
+            "Legacy frozen prompt\nAvailable protocols:\n- sessions: Search saved sessions.",
+        );
+        let legacy = host.open_root(None, legacy_spec.clone()).await.unwrap();
+        legacy.services().runtime.prepare_context().await.unwrap();
+        legacy.services().runtime.session().persist().await.unwrap();
+        let legacy_id = legacy.session_id().to_string();
         assert!(
-            reopened
+            !legacy
                 .services()
                 .protocols
                 .descriptors()
                 .iter()
                 .any(|descriptor| descriptor.name == "sessions")
         );
-        reopened.close().await;
+        legacy.close().await;
+
+        let legacy = host.open_root(Some(&legacy_id), legacy_spec).await.unwrap();
+        assert!(
+            legacy
+                .services()
+                .protocols
+                .descriptors()
+                .iter()
+                .any(|descriptor| descriptor.name == "sessions")
+        );
+        legacy.close().await;
     }
 }

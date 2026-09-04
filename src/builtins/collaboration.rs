@@ -3,7 +3,9 @@ use crate::config::display_path;
 use crate::plugin::{Plugin, PluginHost};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
 use crate::runtime::AgentRuntime;
-use crate::session::{CollaborationParticipant, CollaborationStatus, Session};
+use crate::session::{
+    CollaborationOwnershipConflict, CollaborationParticipant, CollaborationStatus, Session,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use rig::message::UserContent;
@@ -91,6 +93,9 @@ impl CollaborationState {
             .runtime
             .set(Arc::downgrade(runtime))
             .map_err(|_| anyhow!("collaboration runtime is already bound"))?;
+        if self.inner.session.is_persisted().await {
+            self.refresh_presence(runtime).await?;
+        }
         let state = self.clone();
         let worker = tokio::spawn(async move { state.run().await });
         *self.inner.worker.lock().await = Some(worker);
@@ -109,7 +114,10 @@ impl CollaborationState {
                 let now = tokio::time::Instant::now();
                 if last_heartbeat.is_none_or(|last| now.duration_since(last) >= HEARTBEAT_INTERVAL)
                 {
-                    if self.refresh_presence(&runtime).await.is_err() {
+                    if let Err(error) = self.refresh_presence(&runtime).await {
+                        if error.is::<CollaborationOwnershipConflict>() {
+                            break;
+                        }
                         tokio::select! {
                             () = self.inner.cancellation.cancelled() => break,
                             () = tokio::time::sleep(POLL_INTERVAL) => {}
@@ -118,7 +126,7 @@ impl CollaborationState {
                     }
                     last_heartbeat = Some(now);
                 }
-                let _ = runtime.reconcile_external_inputs().await;
+                let _ = runtime.try_reconcile_external_inputs().await;
             }
             tokio::select! {
                 () = self.inner.cancellation.cancelled() => break,
@@ -131,26 +139,26 @@ impl CollaborationState {
         self.inner.runtime.get().and_then(Weak::upgrade)
     }
 
-    async fn runtime_snapshot(&self) -> Result<(Arc<AgentRuntime>, CollaborationStatus, usize)> {
+    fn runtime_snapshot(&self) -> Result<(Arc<AgentRuntime>, CollaborationStatus, usize)> {
         let runtime = self
             .runtime()
             .ok_or_else(|| anyhow!("collaboration runtime is unavailable"))?;
-        let status = if runtime.turn_running().await {
+        let (working, queued) = runtime.collaboration_snapshot();
+        let status = if working {
             CollaborationStatus::Working
         } else {
             CollaborationStatus::Idle
         };
-        let queued = runtime.pending_messages().await.len();
         Ok((runtime, status, queued))
     }
 
     async fn refresh_presence(&self, runtime: &Arc<AgentRuntime>) -> Result<Option<String>> {
-        let status = if runtime.turn_running().await {
+        let (working, queued) = runtime.collaboration_snapshot();
+        let status = if working {
             CollaborationStatus::Working
         } else {
             CollaborationStatus::Idle
         };
-        let queued = runtime.pending_messages().await.len();
         self.inner
             .session
             .refresh_collaboration_presence(&self.inner.instance_id, status, queued)
@@ -158,14 +166,14 @@ impl CollaborationState {
     }
 
     async fn ensure_presence(&self) -> Result<Option<String>> {
-        let (runtime, _, _) = self.runtime_snapshot().await?;
+        let (runtime, _, _) = self.runtime_snapshot()?;
         let name = self.refresh_presence(&runtime).await?;
         runtime.reconcile_external_inputs().await?;
         Ok(name)
     }
 
     async fn set_name(&self, requested: &str) -> Result<String> {
-        let (_, status, queued) = self.runtime_snapshot().await?;
+        let (_, status, queued) = self.runtime_snapshot()?;
         self.inner
             .session
             .set_collaboration_name(&self.inner.instance_id, requested, status, queued)
@@ -466,8 +474,9 @@ exec("collaboration://name", "Wu Sir")
 Names are 1 to 40 characters, must contain a Unicode letter or number, may
 contain spaces and ordinary punctuation, and cannot contain `/`, `?`, `#`, `%`,
 or control characters. Use the name directly, without `@`. Names are unique
-among active participants; a conflict is resolved automatically with ` 2`,
-` 3`, and so on. The assigned name persists with this session.
+among active participants, and existing stable session IDs are reserved. A
+conflict is resolved automatically with ` 2`, ` 3`, and so on. The assigned
+name persists with this session.
 
 List active participants in this project, including names, stable IDs,
 working directories, model status, provider/model, queue depth, and bounded
@@ -886,5 +895,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn starting_a_second_runtime_for_one_persisted_session_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("sessions.db");
+        let cwd = temp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let (first, first_runtime, _) = protocol_fixture(&database, &cwd, "shared-session").await;
+
+        let duplicate_session = Session::open_at(
+            database,
+            Some("shared-session"),
+            &cwd,
+            "test-provider",
+            "test-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new("shared-session-duplicate", 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let duplicate_runtime = Arc::new(AgentRuntime::new(
+            None,
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            Arc::new(ModelToolRegistry::new()),
+            duplicate_session.clone(),
+            "system".to_string(),
+            ModelLimits::default(),
+        ));
+        let duplicate = CollaborationState::new(duplicate_session);
+        let error = duplicate.start(&duplicate_runtime).await.unwrap_err();
+        assert!(error.is::<CollaborationOwnershipConflict>());
+        assert!(error.to_string().contains("already active"));
+
+        first.shutdown().await.unwrap();
+        first_runtime.shutdown().await;
+        duplicate_runtime.shutdown().await;
     }
 }

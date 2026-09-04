@@ -612,6 +612,17 @@ enum CollaborationPresenceOutcome {
     AlreadyActive,
 }
 
+#[derive(Debug)]
+pub(crate) struct CollaborationOwnershipConflict;
+
+impl std::fmt::Display for CollaborationOwnershipConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("this session is already active in another URI Agent process")
+    }
+}
+
+impl std::error::Error for CollaborationOwnershipConflict {}
+
 enum CollaborationNameOutcome {
     Assigned(String),
     AlreadyActive,
@@ -1641,7 +1652,7 @@ impl Session {
         match outcome {
             CollaborationPresenceOutcome::Registered(name) => Ok(name),
             CollaborationPresenceOutcome::AlreadyActive => {
-                bail!("this session is already active in another URI Agent process")
+                Err(CollaborationOwnershipConflict.into())
             }
         }
     }
@@ -1720,9 +1731,7 @@ impl Session {
             .context("cannot assign collaboration name")?;
         match outcome {
             CollaborationNameOutcome::Assigned(name) => Ok(name),
-            CollaborationNameOutcome::AlreadyActive => {
-                bail!("this session is already active in another URI Agent process")
-            }
+            CollaborationNameOutcome::AlreadyActive => Err(CollaborationOwnershipConflict.into()),
         }
     }
 
@@ -1807,7 +1816,15 @@ impl Session {
                                 presence.last_seen, presence.instance_id
                          FROM collaboration_presence AS presence
                          JOIN sessions ON sessions.id = presence.session_id
-                         WHERE (presence.session_id = ?1 OR presence.normalized_name = ?2)
+                         WHERE (
+                           presence.session_id = ?1
+                           OR (
+                             presence.normalized_name = ?2
+                             AND NOT EXISTS(
+                               SELECT 1 FROM sessions AS exact WHERE exact.id = ?1
+                             )
+                           )
+                         )
                            AND (?3 OR sessions.cwd = ?4)
                          ORDER BY presence.session_id = ?1 DESC
                          LIMIT 1",
@@ -3081,6 +3098,9 @@ fn allocate_collaboration_name(
             "SELECT EXISTS(
                SELECT 1 FROM collaboration_presence
                WHERE normalized_name = ?1 AND session_id != ?2
+               UNION ALL
+               SELECT 1 FROM sessions
+               WHERE lower(id) = ?1
              )",
             params![normalized, session_id],
             |row| row.get::<_, bool>(0),
@@ -3813,6 +3833,25 @@ mod tests {
             .clear_collaboration_presence("target-instance")
             .await
             .unwrap();
+        let interceptor =
+            persisted_collaboration_session(&path, "interceptor", &cwd, "Intercept").await;
+        let interceptor_name = interceptor
+            .set_collaboration_name(
+                "interceptor-instance",
+                target.id(),
+                CollaborationStatus::Idle,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(interceptor_name, format!("{} 2", target.id()));
+        assert!(
+            source
+                .collaboration_participant(target.id(), false, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             source
                 .deliver_collaboration_input(
