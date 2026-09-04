@@ -57,18 +57,17 @@ Optional query parameters:
   as a regular expression, the protocol retries it as literal text.
 - `literal=true` always treats the body as literal text.
 - `ignore_case=true` enables case-insensitive matching.
-- `context=<lines>` includes surrounding lines; values above 20 clamp to 20.
-- `limit=<count>` bounds the number of matches; the default is 200 and values
-  above 2,000 clamp to 2,000.
+- `context=<lines>` includes surrounding lines; values are clamped to 0 through 20.
+- `limit=<count>` bounds the number of matches; the default is 200 and values are
+  clamped to 1 through 2,000.
 
 Semantic and hybrid reads accept only `mode`, `glob`, and `limit`; their
-default limit is 7 and values above 50 clamp to 50. A ranked read creates or
-incrementally refreshes its selected root/glob cache as needed, then searches
-it. Most
-searches return in the same call; a longer search continues as one managed task
-without restarting and delivers its result automatically. If completion marks
-the output as truncated, follow its `tasks://` instruction once. Do not submit
-the same search again to retrieve task output.
+default limit is 7 and values are clamped to 1 through 50. A ranked read creates
+or incrementally refreshes its selected root/glob cache as needed, then searches
+it. Most searches return in the same call; a longer search continues as one
+managed task without restarting and delivers its result automatically. If
+completion marks the output as truncated, follow its `tasks://` instruction
+once. Do not submit the same search again to retrieve task output.
 
 Do not call status or index before a ranked search. Use `mode=status` only to
 diagnose the cache. Use `exec` only to prewarm or force-rebuild that exact
@@ -864,8 +863,11 @@ mod tests {
         assert!(help.contains("retries it as literal text"));
         assert!(help.contains(r#"read("grep://src/tui/app.rs", "fn push(")"#));
         assert!(help.contains("Prefer it for conceptual\n  searches"));
+        assert!(help.contains("values are clamped to 0 through 20"));
+        assert!(help.contains("clamped to 1 through 2,000"));
+        assert!(help.contains("clamped to 1 through 50"));
         assert!(help.contains("Do not call status or index before a ranked search"));
-        assert!(help.contains("continues as one managed task\nwithout restarting"));
+        assert!(help.contains("continues as one\nmanaged task without restarting"));
         assert!(help.contains("`grep://help` MUST use an empty string body"));
 
         let error = protocol

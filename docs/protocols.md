@@ -133,8 +133,11 @@ writes are atomic.
 
 The typed `apply_patch` tool supports adding, updating, moving, and deleting
 multiple files in one Codex-format patch. URI Agent preflights the complete
-in-memory plan before writing and rolls back every affected file if commit
-fails. The active tool schema owns the exact grammar and argument contract.
+in-memory plan before writing, so parsing and planning failures leave files
+unchanged. If writing fails after some changes, it attempts to roll them back
+and reports any rollback failure. A plan that leaves the original files
+unchanged is reported explicitly. The active tool schema owns the exact grammar
+and argument contract.
 
 Both tools resolve relative paths from the startup directory and accept
 absolute paths. On Unix, `~` and `~/` expand to the current user's home.

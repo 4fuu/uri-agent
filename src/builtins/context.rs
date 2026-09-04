@@ -51,7 +51,7 @@ Conversation records have session-local IDs such as `r42`. The same ID format is
 
 - `context://status` reports context usage and the notes budget.
 - `context://notes` lists note IDs, titles, revisions, status, revision anchors, and budget usage.
-- `context://notes/<id>` reads the current note in character pages using optional `offset` and `limit`; `limit` clamps to at most 7000.
+- `context://notes/<id>` reads the current note in character pages using optional `offset` and `limit`; `limit` defaults to 7,000 and is clamped to 1 through 7,000.
 - `context://notes/<id>/revisions` lists revision metadata and anchors without old content.
 - `context://notes/<id>/context` reads records around a selected revision anchor, including for a deleted note. Optional `revision`, `before`, `after`, and `types` select the revision and surrounding records.
 - `context://history/windows` lists context-window IDs and record-ID ranges.
@@ -71,6 +71,10 @@ Conversation records have session-local IDs such as `r42`. The same ID format is
   nonempty plain-text body; optional `window=<window-id>` narrows the search.
   Exact search accepts optional `types`, `before=<record-id>`, and `limit`;
   semantic and hybrid modes accept `types`, `offset`, and `limit`.
+
+`limit` on `history/users`, `history/<window-id>`, and history search routes
+defaults to 20 and is clamped to 1 through 50.
+
 - A ranked history read creates or incrementally refreshes its cache as needed,
   then searches it. Most searches return in the same call. A longer search
   continues as one managed task without restarting and delivers its result
@@ -772,7 +776,8 @@ fn read_note_target(
             let options = QueryOptions::parse(query)?;
             options.validate_note_read()?;
             let content = note.content.as_deref().unwrap_or_default();
-            let (page, next) = character_page(content, options.offset, options.char_limit)?;
+            let limit = normalize_note_read_limit(options.char_limit);
+            let (page, next) = character_page(content, options.offset, limit)?;
             let mut output = format!(
                 "{} · {} · revision={} · window={} · anchor={}\n\n{}",
                 note.id,
@@ -786,8 +791,7 @@ fn read_note_target(
                 let _ = write!(
                     output,
                     "\n\nNext: read(\"context://notes/{}?offset={offset}&limit={}\", \"\")",
-                    note.id,
-                    options.char_limit.unwrap_or(DEFAULT_NOTE_READ_CHARS)
+                    note.id, limit
                 );
             }
             Ok(output)
@@ -1642,15 +1646,18 @@ fn normalize_history_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_HISTORY_LIMIT)
 }
 
+fn normalize_note_read_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_NOTE_READ_CHARS)
+        .clamp(1, MAX_NOTE_READ_CHARS)
+}
+
 fn character_page(
     content: &str,
     offset: Option<usize>,
-    limit: Option<usize>,
+    limit: usize,
 ) -> Result<(String, Option<usize>)> {
     let offset = offset.unwrap_or_default();
-    let limit = limit
-        .unwrap_or(DEFAULT_NOTE_READ_CHARS)
-        .clamp(1, MAX_NOTE_READ_CHARS);
     let total = content.chars().count();
     if offset > total {
         bail!("context note offset exceeds its content length");
@@ -1770,6 +1777,27 @@ mod tests {
         assert!(revisions.contains("anchor=r"));
         assert!(revisions.contains("已删除"));
         assert!(!revisions.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn note_pagination_continuations_use_the_clamped_limit() {
+        let (_temp, state) = state().await;
+        mutate_note(
+            &state,
+            NoteMutation::Add {
+                title: "Paged note".to_string(),
+            },
+            &"x".repeat(MAX_NOTE_READ_CHARS + 1),
+        )
+        .await
+        .unwrap();
+        let events = state.events().await.unwrap();
+
+        let upper = read_note_target(&events, "n001", Some("limit=8000"), "").unwrap();
+        assert!(upper.contains("?offset=7000&limit=7000\", \"\")"));
+
+        let lower = read_note_target(&events, "n001", Some("limit=0"), "").unwrap();
+        assert!(lower.contains("?offset=1&limit=1\", \"\")"));
     }
 
     #[tokio::test]
@@ -2130,6 +2158,18 @@ mod tests {
         assert!(help.contains("`user`, `assistant`, `tool_call`, `tool_result`, and `error`"));
         assert!(help.contains("including for a deleted note"));
         assert!(help.contains("do not remove or rewrite messages, tool calls, or tool results"));
+        assert!(help.contains("`limit` defaults to 7,000 and is clamped to 1 through 7,000"));
+        assert!(help.contains("defaults to 20 and is clamped to 1 through 50"));
+    }
+
+    #[test]
+    fn note_and_history_limits_clamp_to_documented_ranges() {
+        assert_eq!(normalize_note_read_limit(None), 7_000);
+        assert_eq!(normalize_note_read_limit(Some(0)), 1);
+        assert_eq!(normalize_note_read_limit(Some(8_000)), 7_000);
+        assert_eq!(normalize_history_limit(None), 20);
+        assert_eq!(normalize_history_limit(Some(0)), 1);
+        assert_eq!(normalize_history_limit(Some(51)), 50);
     }
 
     #[test]

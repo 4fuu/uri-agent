@@ -19,31 +19,41 @@ const DELETE_FILE: &str = "*** Delete File: ";
 const UPDATE_FILE: &str = "*** Update File: ";
 const MOVE_TO: &str = "*** Move to: ";
 const END_OF_FILE: &str = "*** End of File";
-const PATCH_ARGUMENT_DESCRIPTION: &str = concat!(
-    "Complete Codex-style patch in this format:\n",
-    "*** Begin Patch\n",
-    "*** Add File: <path>\n",
-    "+<new content>\n",
-    "*** Update File: <path>\n",
-    "@@ <optional landmark>\n",
-    "-<old line>\n",
-    "+<new line>\n",
-    "*** Delete File: <path>\n",
-    "*** End Patch\n\n",
-    "Replace placeholders with actual values. Use @@ without a landmark when none is needed. ",
-    "An Update File may put *** Move to: <new path> immediately after its header. ",
-    "Update lines begin with a space for context, - for removal, or + for addition. ",
-    "*** End of File anchors the preceding chunk at EOF. Every Add File content line ",
-    "begins with +. Relative paths resolve from the startup working directory; absolute ",
-    "paths are accepted. On Unix, ~ and paths beginning with ~/ resolve from the current ",
-    "user's home directory; ~user is not expanded. Matching is line-exact apart from ",
-    "trailing whitespace, so CRLF and LF files both match, and original line endings ",
-    "and BOM are preserved. The output lists one line per file: A (added), M (modified), ",
-    "or D (deleted) with +added/-removed line counts. An update that matches but ",
-    "changes nothing prints '= path (unchanged)', and a patch with no net changes ",
-    "returns 'Patch made no changes:' instead of 'Applied patch:'; treat that as a ",
-    "signal to recheck the patch. On failure every file is left unchanged."
-);
+const PATCH_ARGUMENT_DESCRIPTION: &str = r#"Complete Codex-style patch. Pass only the patch text, without Markdown fences or commentary.
+
+Every patch must start with `*** Begin Patch`, end with `*** End Patch`, and contain one or more file operations. Use only the operations needed and replace every placeholder with an actual value:
+
+*** Begin Patch
+*** Add File: <path>
++<new content>
+*** Update File: <path>
+*** Move to: <new path>
+@@ <optional landmark>
+ <unchanged context>
+-<content to remove>
++<content to add>
+*** End of File
+*** Delete File: <path>
+*** End Patch
+
+Operation rules:
+
+- `*** Add File: <path>` creates or replaces a planned file. Every following content line, including a blank line, must start with `+`.
+- `*** Delete File: <path>` contains no content lines.
+- `*** Update File: <path>` contains one or more chunks. Start each chunk with `@@`; use `@@ <landmark>` to name an exact nearby line before the change. Chunk matching starts after that landmark.
+- `*** Move to: <new path>` is optional and may appear only immediately after an Update File header, before the first `@@`.
+- Every line inside an update chunk must start with exactly one patch marker: a space for unchanged context, `-` for removed content, or `+` for added content. Preserve the file's indentation after that marker.
+- Include at least three unchanged context lines before and after a change when available. Use more context or an `@@ <landmark>` when similar code appears more than once.
+- A chunk containing only `+` lines appends at EOF. To insert inside an existing file, include unchanged context that anchors the insertion.
+- Put `*** End of File` after a chunk only when that chunk must match at EOF.
+
+Relative paths resolve from the startup working directory; absolute paths are accepted. On Unix, `~` and paths beginning with `~/` resolve from the current user's home directory; `~user` is not expanded.
+
+Matching first tries exact lines, then tolerates surrounding whitespace and common Unicode variants of spaces, dashes, and quotes. CRLF and LF files both match; original line endings and BOM are preserved.
+
+The output summarizes submitted operations as `A` (Add File), `M` (Update File, including moves), or `D` (Delete File), with added and removed line counts. An update without `*** Move to` that leaves content unchanged prints `= <path> (unchanged)`. If the complete in-memory plan matches the original files, the output starts with `Patch made no changes:` and lists the touched paths as unchanged; recheck the patch before continuing.
+
+Parsing and planning failures leave files unchanged. If writing fails after some changes, URI Agent attempts to roll them back and reports any rollback failure."#;
 
 #[derive(Clone)]
 pub(super) struct ApplyPatchTool {
@@ -356,6 +366,7 @@ fn is_operation_or_end(line: &str) -> bool {
 async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     let hunks = parse_patch(patch)?;
     let mut files = BTreeMap::<PathBuf, PlannedFile>::new();
+    let mut touched = BTreeSet::new();
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
@@ -364,6 +375,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
     for hunk in hunks {
         match hunk {
             PatchHunk::Add { path, content } => {
+                touched.insert(path.clone());
                 let lines = content.lines().count();
                 let resolved = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 load_planned_file(&mut files, &resolved)
@@ -372,6 +384,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 added.push((path, lines));
             }
             PatchHunk::Delete { path } => {
+                touched.insert(path.clone());
                 let resolved = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 let file = load_planned_file(&mut files, &resolved).await?;
                 let Some(content) = &file.final_content else {
@@ -389,6 +402,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 move_to,
                 chunks,
             } => {
+                touched.insert(path.clone());
                 let stats = PatchStats::from_chunks(&chunks);
                 let source = resolve_path(cwd, path.to_string_lossy().as_ref())?;
                 let source_content = load_planned_file(&mut files, &source)
@@ -404,6 +418,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
                 let updated = derive_updated_content(&source, &source_text, &chunks)?;
                 let content_changed = updated != source_text;
                 if let Some(destination) = move_to {
+                    touched.insert(destination.clone());
                     let resolved_destination =
                         resolve_path(cwd, destination.to_string_lossy().as_ref())?;
                     if source != resolved_destination {
@@ -436,13 +451,17 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
         }
     }
 
-    commit_plan(&files).await?;
+    let made_changes = commit_plan(&files).await?;
 
-    let mut output = if added.is_empty() && modified.is_empty() && deleted.is_empty() {
-        String::from("Patch made no changes:\n")
-    } else {
-        String::from("Applied patch:\n")
-    };
+    if !made_changes {
+        let mut output = String::from("Patch made no changes:\n");
+        for path in touched {
+            output.push_str(&format!("= {} (unchanged)\n", display_path(&path)));
+        }
+        return Ok(output);
+    }
+
+    let mut output = String::from("Applied patch:\n");
     for (path, lines) in added {
         output.push_str(&format!("A {} (+{lines})\n", display_path(&path)));
     }
@@ -509,7 +528,7 @@ async fn load_planned_file<'a>(
     Ok(files.get_mut(path).expect("planned file was inserted"))
 }
 
-async fn commit_plan(files: &BTreeMap<PathBuf, PlannedFile>) -> Result<()> {
+async fn commit_plan(files: &BTreeMap<PathBuf, PlannedFile>) -> Result<bool> {
     let changed = files
         .iter()
         .filter(|(_, file)| {
@@ -553,7 +572,7 @@ async fn commit_plan(files: &BTreeMap<PathBuf, PlannedFile>) -> Result<()> {
     }
     .await;
     let Err(error) = result else {
-        return Ok(());
+        return Ok(!changed.is_empty());
     };
 
     let rollback_errors = rollback_plan(files, &applied, &created_directories).await;
@@ -813,13 +832,19 @@ mod tests {
             descriptor.parameters["properties"]["patch"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("paths beginning with ~/")
+                .contains("paths beginning with `~/`")
         );
         assert!(
             descriptor.parameters["properties"]["patch"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("'Patch made no changes:' instead of 'Applied patch:'")
+                .contains("output starts with `Patch made no changes:`")
+        );
+        assert!(
+            descriptor.parameters["properties"]["patch"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("A chunk containing only `+` lines appends at EOF")
         );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }
@@ -928,6 +953,22 @@ mod tests {
             apply_patch(directory.path(), noop_only).await.unwrap(),
             "Patch made no changes:\n= same.txt (unchanged)\n"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_patch_reports_multi_operation_net_zero_as_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let patch = r#"*** Begin Patch
+*** Add File: temporary.txt
++temporary
+*** Delete File: temporary.txt
+*** End Patch"#;
+
+        assert_eq!(
+            apply_patch(directory.path(), patch).await.unwrap(),
+            "Patch made no changes:\n= temporary.txt (unchanged)\n"
+        );
+        assert!(!directory.path().join("temporary.txt").exists());
     }
 
     #[tokio::test]
