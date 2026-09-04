@@ -727,6 +727,9 @@ impl AgentHost {
             self.inner.manager.directory(),
             mcp_profile,
         );
+        if !session.is_new() {
+            plugins.add(crate::builtins::SessionsPlugin::new(&self.inner.cwd));
+        }
         plugins.add(ContextPlugin::new(context_state.clone()));
         let wasm_plugins =
             WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
@@ -1172,6 +1175,8 @@ mod tests {
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<Vec<_>>();
+        assert!(protocol_names.iter().any(|name| name == "context"));
+        assert!(!protocol_names.iter().any(|name| name == "sessions"));
         assert!(
             protocol_names
                 .iter()
@@ -1212,8 +1217,17 @@ mod tests {
                 .descriptors()
                 .into_iter()
                 .map(|descriptor| descriptor.name)
+                .filter(|name| name != "sessions")
                 .collect::<Vec<_>>(),
-            protocol_names
+            protocol_names,
+        );
+        assert!(
+            reopened
+                .services()
+                .protocols
+                .descriptors()
+                .iter()
+                .any(|descriptor| descriptor.name == "sessions")
         );
         reopened.close().await;
     }

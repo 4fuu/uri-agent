@@ -107,21 +107,20 @@ and `cwd` query parameters.
 }
 
 #[derive(Clone)]
-pub(super) struct SessionsPlugin {
+pub(crate) struct SessionsPlugin {
     archive: SessionArchive,
     cwd: PathBuf,
 }
 
 impl SessionsPlugin {
-    pub(super) fn new(cwd: &Path) -> Self {
+    pub(crate) fn new(cwd: &Path) -> Self {
         Self {
             archive: SessionArchive::for_project(cwd),
             cwd: cwd.to_path_buf(),
         }
     }
 
-    #[cfg(test)]
-    fn with_archive(cwd: &Path, archive: SessionArchive) -> Self {
+    pub(super) fn with_archive(cwd: &Path, archive: SessionArchive) -> Self {
         Self {
             archive,
             cwd: cwd.to_path_buf(),
@@ -135,7 +134,25 @@ impl Plugin for SessionsPlugin {
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        host.protocols.register(self.clone())?;
+        host.protocols.register(self.clone())
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct SessionCompletionPlugin {
+    archive: SessionArchive,
+}
+
+impl SessionCompletionPlugin {
+    pub(super) fn new(cwd: &Path) -> Self {
+        Self {
+            archive: SessionArchive::for_project(cwd),
+        }
+    }
+}
+
+impl Plugin for SessionCompletionPlugin {
+    fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         host.tui.register_completion(
             "sessions",
             SessionCompletionProvider {

@@ -18,6 +18,7 @@ pub use mcp::{
     SessionMcpProfile, SessionMcpServer, SessionMcpTransport, session_profile_owner,
     session_profile_record,
 };
+pub(crate) use sessions::SessionsPlugin;
 pub(crate) const MCP_SESSION_PROFILE_OWNER: &str = mcp::SESSION_PROFILE_OWNER;
 
 use crate::config::display_path;
@@ -128,7 +129,7 @@ fn add_agent_plugins(
     plugins.add(https::HttpsProtocol::new());
     plugins.add(replace::ReplaceTool::new(cwd));
     plugins.add(apply_patch::ApplyPatchTool::new(cwd));
-    plugins.add(sessions::SessionsPlugin::new(cwd));
+    plugins.add(sessions::SessionCompletionPlugin::new(cwd));
     plugins.add(tasks::TasksProtocol);
     shell::add_plugins(plugins, cwd);
 }
