@@ -23,11 +23,12 @@ The canonical startup directory is each session's project boundary:
 - `--session <id>` accepts only an ID from that project;
 - `:resume` lists the project's root conversations.
 
-The `sessions` protocol can search wider scopes only when explicitly asked.
-Exact search reads SQLite directly; semantic and hybrid search use disposable,
-automatically maintained sidecar indexes. Searching or indexing never resumes
-or changes a conversation. See [Protocols, tasks, and
-output](protocols.md#files-search-and-saved-context).
+The `context://sessions/...` routes can search wider scopes only when explicitly
+asked. Exact search reads SQLite directly; semantic and hybrid search use
+disposable, automatically maintained sidecar indexes. Searching or indexing
+never resumes or changes a conversation. Existing sessions whose frozen prompt
+used `sessions://` retain it as a compatibility route. See [Protocols, tasks,
+and output](protocols.md#files-search-and-saved-context).
 
 Each session records its provider, model, and thinking effort. Changes are
 appended and restored on resume. Composer drafts are saved on exit and session
@@ -60,6 +61,35 @@ database.
 Submissions are `Prompt` or `Steer`. Prompt starts an idle Agent or queues a new
 turn. Steer targets the next model boundary while an Agent is active and acts
 as Prompt when it is idle. Accepted input is durable until delivered.
+
+## Cross-process collaboration
+
+Each running depth-1 TUI session can join local collaboration after its session
+has been materialized. Its optional human name is stored with the session.
+Names are unique only among live participants: concurrent conflicts are
+resolved transactionally by appending ` 2`, ` 3`, and so on, and the effective
+name remains on resume. Existing stable session IDs are reserved from use as
+names and receive the same suffix treatment. Stable session IDs are always
+included in delivered source metadata and remain the unambiguous archive
+reference.
+
+Live presence is a renewable SQLite lease rather than transcript history. It
+publishes `idle` or `working` model state and queue depth, and stale leases stop
+resolving automatically. Graceful close removes the lease immediately. This
+supports independent URI Agent processes without a daemon or socket, but it
+does not wake or create a process. ACP sessions and depth-2 child Agents remain
+outside live collaboration so their exclusive or parent-owned input contracts
+do not receive unsolicited turns.
+
+Cross-process messages commit to the existing `pending_inputs` queue. The target
+runtime reconciles external rows in durable ID order, including at model
+boundaries, so a committed earlier message is not reordered behind later local
+input. `queue` remains a Prompt and `steer` remains a Steer while work is active;
+an idle Steer is promoted to Prompt. If the target exits after acceptance, its
+pending row remains available on manual resume, but URI Agent does not restart
+the process. The sender's plain body is delivered as model content inside a
+host-generated XML provenance envelope; the visible transcript projection is a
+bounded source preview.
 
 A new session remains in memory while startup context is prepared. The first
 accepted prompt persists the frozen context and message together; opening and
@@ -138,10 +168,11 @@ session-local record anchors. Notes have stable IDs and revisions, a shared
 model-relative budget, and a bounded active count. Exact limits and mutation
 routes belong to `context://help`.
 
-Deleting a note creates a tombstone and hides its body from `context` and
-`sessions` recovery views. It is not secure erasure: append-only historical
-events remain in SQLite. All recovered notes and transcript content are marked
-as untrusted reference data.
+Deleting a note creates a tombstone and hides its body from current and saved
+`context` recovery views (and the resumed-session `sessions` compatibility
+view). It is not secure erasure: append-only historical events remain in
+SQLite. All recovered notes and transcript content are marked as untrusted
+reference data.
 
 The alternative `summary` strategy asks the model to summarize older history,
 then replays the frozen prompt, summary checkpoint, a valid recent-history

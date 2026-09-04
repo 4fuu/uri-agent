@@ -19,7 +19,8 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
     Connection,
     rusqlite::{
-        Connection as SqliteConnection, OpenFlags, OptionalExtension, TransactionBehavior, params,
+        Connection as SqliteConnection, OpenFlags, OptionalExtension, Transaction,
+        TransactionBehavior, params,
     },
 };
 use uuid::Uuid;
@@ -28,6 +29,7 @@ const SESSION_DATABASE_FILE: &str = "sessions-v3.db";
 const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESUME_INDEX_VERSION: u32 = 3;
 const MAX_EVENT_PAGE: usize = 512;
+const COLLABORATION_PRESENCE_TTL: chrono::Duration = chrono::Duration::seconds(10);
 const RESUME_EVENT_KINDS: &[&str] = &[
     "session_created",
     "agent_spec_updated",
@@ -101,6 +103,37 @@ pub(crate) struct PendingInput {
     pub(crate) text: String,
     pub(crate) content: Vec<UserContent>,
     pub(crate) visible: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CollaborationStatus {
+    Idle,
+    Working,
+    Offline,
+}
+
+impl CollaborationStatus {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CollaborationParticipant {
+    pub(crate) session_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) summary: String,
+    pub(crate) status: CollaborationStatus,
+    pub(crate) queued: usize,
+    pub(crate) last_seen: Option<DateTime<Utc>>,
+    pub(crate) instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +583,54 @@ struct State {
     private_records: HashMap<String, Value>,
     derived: ResumeState,
     replay: ReplayState,
+}
+
+type ActiveCollaborationRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    i64,
+    String,
+    String,
+);
+
+type OfflineCollaborationRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
+enum CollaborationPresenceOutcome {
+    Registered(Option<String>),
+    AlreadyActive,
+}
+
+#[derive(Debug)]
+pub(crate) struct CollaborationOwnershipConflict;
+
+impl std::fmt::Display for CollaborationOwnershipConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("this session is already active in another URI Agent process")
+    }
+}
+
+impl std::error::Error for CollaborationOwnershipConflict {}
+
+enum CollaborationNameOutcome {
+    Assigned(String),
+    AlreadyActive,
+}
+
+enum CollaborationParticipantRow {
+    Active(Option<ActiveCollaborationRow>),
+    Offline(Option<OfflineCollaborationRow>),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -1479,6 +1560,374 @@ impl Session {
             })
             .await
             .context("cannot update pending Agent input")
+    }
+
+    pub(crate) async fn refresh_collaboration_presence(
+        &self,
+        instance_id: &str,
+        status: CollaborationStatus,
+        queued: usize,
+    ) -> Result<Option<String>> {
+        if !self.is_persisted().await {
+            return Ok(None);
+        }
+        let session_id = self.id.clone();
+        let instance_id = instance_id.to_string();
+        let status = status.as_str().to_string();
+        let queued = i64::try_from(queued).unwrap_or(i64::MAX);
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let cutoff = (now - COLLABORATION_PRESENCE_TTL).to_rfc3339();
+        let outcome = self
+            .connection
+            .call(move |db| {
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                delete_stale_collaboration_presence(&transaction, &cutoff)?;
+                let existing = transaction
+                    .query_row(
+                        "SELECT instance_id, name FROM collaboration_presence
+                         WHERE session_id = ?1",
+                        [&session_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((owner, name)) = existing {
+                    if owner != instance_id {
+                        return Ok(CollaborationPresenceOutcome::AlreadyActive);
+                    }
+                    transaction.execute(
+                        "UPDATE collaboration_presence
+                         SET status = ?3, pending_count = ?4, last_seen = ?5
+                         WHERE session_id = ?1 AND instance_id = ?2",
+                        params![session_id, instance_id, status, queued, now_text],
+                    )?;
+                    transaction.commit()?;
+                    return Ok(CollaborationPresenceOutcome::Registered(name));
+                }
+
+                let stored_name = transaction
+                    .query_row(
+                        "SELECT name FROM collaboration_identities WHERE session_id = ?1",
+                        [&session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let assigned = stored_name
+                    .map(|name| allocate_collaboration_name(&transaction, &session_id, &name))
+                    .transpose()?;
+                if let Some((name, normalized)) = &assigned {
+                    transaction.execute(
+                        "INSERT INTO collaboration_identities
+                         (session_id, name, normalized_name, updated_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(session_id) DO UPDATE SET
+                           name = excluded.name,
+                           normalized_name = excluded.normalized_name,
+                           updated_at = excluded.updated_at",
+                        params![session_id, name, normalized, now_text],
+                    )?;
+                }
+                transaction.execute(
+                    "INSERT INTO collaboration_presence
+                     (session_id, instance_id, name, normalized_name, status,
+                      pending_count, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        session_id,
+                        instance_id,
+                        assigned.as_ref().map(|value| &value.0),
+                        assigned.as_ref().map(|value| &value.1),
+                        status,
+                        queued,
+                        now_text,
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(CollaborationPresenceOutcome::Registered(
+                    assigned.map(|value| value.0),
+                ))
+            })
+            .await
+            .context("cannot refresh collaboration presence")?;
+        match outcome {
+            CollaborationPresenceOutcome::Registered(name) => Ok(name),
+            CollaborationPresenceOutcome::AlreadyActive => {
+                Err(CollaborationOwnershipConflict.into())
+            }
+        }
+    }
+
+    pub(crate) async fn set_collaboration_name(
+        &self,
+        instance_id: &str,
+        requested: &str,
+        status: CollaborationStatus,
+        queued: usize,
+    ) -> Result<String> {
+        if !self.is_persisted().await {
+            bail!("the session must be persisted before it can join collaboration")
+        }
+        let requested = validate_collaboration_name(requested)?;
+        let session_id = self.id.clone();
+        let instance_id = instance_id.to_string();
+        let status = status.as_str().to_string();
+        let queued = i64::try_from(queued).unwrap_or(i64::MAX);
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let cutoff = (now - COLLABORATION_PRESENCE_TTL).to_rfc3339();
+        let outcome = self
+            .connection
+            .call(move |db| {
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                delete_stale_collaboration_presence(&transaction, &cutoff)?;
+                let owner = transaction
+                    .query_row(
+                        "SELECT instance_id FROM collaboration_presence WHERE session_id = ?1",
+                        [&session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if owner.as_deref().is_some_and(|owner| owner != instance_id) {
+                    return Ok(CollaborationNameOutcome::AlreadyActive);
+                }
+                let (name, normalized) =
+                    allocate_collaboration_name(&transaction, &session_id, &requested)?;
+                transaction.execute(
+                    "INSERT INTO collaboration_identities
+                     (session_id, name, normalized_name, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       name = excluded.name,
+                       normalized_name = excluded.normalized_name,
+                       updated_at = excluded.updated_at",
+                    params![session_id, name, normalized, now_text],
+                )?;
+                transaction.execute(
+                    "INSERT INTO collaboration_presence
+                     (session_id, instance_id, name, normalized_name, status,
+                      pending_count, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       instance_id = excluded.instance_id,
+                       name = excluded.name,
+                       normalized_name = excluded.normalized_name,
+                       status = excluded.status,
+                       pending_count = excluded.pending_count,
+                       last_seen = excluded.last_seen",
+                    params![
+                        session_id,
+                        instance_id,
+                        name,
+                        normalized,
+                        status,
+                        queued,
+                        now_text,
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(CollaborationNameOutcome::Assigned(name))
+            })
+            .await
+            .context("cannot assign collaboration name")?;
+        match outcome {
+            CollaborationNameOutcome::Assigned(name) => Ok(name),
+            CollaborationNameOutcome::AlreadyActive => Err(CollaborationOwnershipConflict.into()),
+        }
+    }
+
+    pub(crate) async fn clear_collaboration_presence(&self, instance_id: &str) -> Result<()> {
+        let session_id = self.id.clone();
+        let instance_id = instance_id.to_string();
+        self.connection
+            .call(move |db| {
+                db.execute(
+                    "DELETE FROM collaboration_presence
+                     WHERE session_id = ?1 AND instance_id = ?2",
+                    params![session_id, instance_id],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .context("cannot clear collaboration presence")
+    }
+
+    pub(crate) async fn collaboration_participants(
+        &self,
+        all_projects: bool,
+    ) -> Result<Vec<CollaborationParticipant>> {
+        let project = self.project.clone();
+        let cutoff = (Utc::now() - COLLABORATION_PRESENCE_TTL).to_rfc3339();
+        let rows = self
+            .connection
+            .call(move |db| {
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                delete_stale_collaboration_presence(&transaction, &cutoff)?;
+                let mut statement = transaction.prepare(
+                    "SELECT presence.session_id, presence.name, sessions.cwd,
+                            sessions.provider, sessions.model,
+                            (SELECT payload_json FROM events
+                             WHERE events.session_id = sessions.id AND kind = 'user'
+                             ORDER BY sequence LIMIT 1),
+                            presence.status, presence.pending_count,
+                            presence.last_seen, presence.instance_id
+                     FROM collaboration_presence AS presence
+                     JOIN sessions ON sessions.id = presence.session_id
+                     WHERE (?1 OR sessions.cwd = ?2)
+                     ORDER BY presence.name IS NULL, lower(presence.name), presence.session_id",
+                )?;
+                let rows = statement
+                    .query_map(params![all_projects, project], collaboration_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(statement);
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(rows)
+            })
+            .await
+            .context("cannot list collaboration participants")?;
+        Ok(rows
+            .into_iter()
+            .map(active_collaboration_participant)
+            .collect())
+    }
+
+    pub(crate) async fn collaboration_participant(
+        &self,
+        target: &str,
+        all_projects: bool,
+        include_offline_id: bool,
+    ) -> Result<Option<CollaborationParticipant>> {
+        let normalized = normalize_collaboration_name(target);
+        let target = target.to_string();
+        let project = self.project.clone();
+        let cutoff = (Utc::now() - COLLABORATION_PRESENCE_TTL).to_rfc3339();
+        let row = self
+            .connection
+            .call(move |db| {
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                delete_stale_collaboration_presence(&transaction, &cutoff)?;
+                let active = transaction
+                    .query_row(
+                        "SELECT presence.session_id, presence.name, sessions.cwd,
+                                sessions.provider, sessions.model,
+                                (SELECT payload_json FROM events
+                                 WHERE events.session_id = sessions.id AND kind = 'user'
+                                 ORDER BY sequence LIMIT 1),
+                                presence.status, presence.pending_count,
+                                presence.last_seen, presence.instance_id
+                         FROM collaboration_presence AS presence
+                         JOIN sessions ON sessions.id = presence.session_id
+                         WHERE (
+                           presence.session_id = ?1
+                           OR (
+                             presence.normalized_name = ?2
+                             AND NOT EXISTS(
+                               SELECT 1 FROM sessions AS exact WHERE exact.id = ?1
+                             )
+                           )
+                         )
+                           AND (?3 OR sessions.cwd = ?4)
+                         ORDER BY presence.session_id = ?1 DESC
+                         LIMIT 1",
+                        params![target, normalized, all_projects, project],
+                        collaboration_row,
+                    )
+                    .optional()?;
+                if active.is_some() || !include_offline_id {
+                    transaction.commit()?;
+                    return Ok(CollaborationParticipantRow::Active(active));
+                }
+                let offline = transaction
+                    .query_row(
+                        "SELECT sessions.id, identity.name, sessions.cwd,
+                                sessions.provider, sessions.model,
+                                (SELECT payload_json FROM events
+                                 WHERE events.session_id = sessions.id AND kind = 'user'
+                                 ORDER BY sequence LIMIT 1)
+                         FROM sessions
+                         LEFT JOIN collaboration_identities AS identity
+                           ON identity.session_id = sessions.id
+                         WHERE sessions.id = ?1 AND sessions.depth = 1
+                           AND (?2 OR sessions.cwd = ?3)",
+                        params![target, all_projects, project],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, Option<String>>(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(CollaborationParticipantRow::Offline(
+                    offline,
+                ))
+            })
+            .await
+            .context("cannot inspect collaboration participant")?;
+        Ok(match row {
+            CollaborationParticipantRow::Active(row) => row.map(active_collaboration_participant),
+            CollaborationParticipantRow::Offline(row) => row.map(offline_collaboration_participant),
+        })
+    }
+
+    pub(crate) async fn deliver_collaboration_input(
+        &self,
+        target_session_id: &str,
+        target_instance_id: &str,
+        kind: SubmitKind,
+        text: &str,
+        content: &[UserContent],
+    ) -> Result<Option<i64>> {
+        let target_session_id = target_session_id.to_string();
+        let target_instance_id = target_instance_id.to_string();
+        let kind = match kind {
+            SubmitKind::Prompt => "prompt",
+            SubmitKind::Steer => "steer",
+        };
+        let text = text.to_string();
+        let content =
+            serde_json::to_string(content).context("cannot serialize collaboration input")?;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let cutoff = (now - COLLABORATION_PRESENCE_TTL).to_rfc3339();
+        self.connection
+            .call(move |db| {
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                delete_stale_collaboration_presence(&transaction, &cutoff)?;
+                let active = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM collaboration_presence
+                       WHERE session_id = ?1 AND instance_id = ?2
+                     )",
+                    params![target_session_id, target_instance_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !active {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                transaction.execute(
+                    "INSERT INTO pending_inputs
+                     (session_id, kind, text, content_json, visible, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                    params![target_session_id, kind, text, content, now_text],
+                )?;
+                let pending_id = transaction.last_insert_rowid();
+                transaction.execute(
+                    "UPDATE collaboration_presence
+                     SET pending_count = pending_count + 1
+                     WHERE session_id = ?1 AND instance_id = ?2",
+                    params![target_session_id, target_instance_id],
+                )?;
+                transaction.commit()?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(Some(pending_id))
+            })
+            .await
+            .context("cannot deliver collaboration input")
     }
 
     pub async fn initialize_context(&self, context: SessionContext) -> Result<()> {
@@ -2595,6 +3044,140 @@ fn session_database_path_from(
         .unwrap_or_else(|| fallback.join(".uri-agent").join(SESSION_DATABASE_FILE))
 }
 
+pub(crate) fn validate_collaboration_name(name: &str) -> Result<String> {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        bail!("collaboration name cannot be empty")
+    }
+    if name.chars().count() > 40 {
+        bail!("collaboration name cannot exceed 40 characters")
+    }
+    if !name.chars().any(char::is_alphanumeric) {
+        bail!("collaboration name must contain a letter or number")
+    }
+    if name
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '/' | '?' | '#' | '%'))
+    {
+        bail!("collaboration name cannot contain control characters or / ? # %")
+    }
+    Ok(name)
+}
+
+fn normalize_collaboration_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn delete_stale_collaboration_presence(
+    transaction: &Transaction<'_>,
+    cutoff: &str,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    transaction.execute(
+        "DELETE FROM collaboration_presence WHERE last_seen < ?1",
+        [cutoff],
+    )?;
+    Ok(())
+}
+
+fn allocate_collaboration_name(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    requested: &str,
+) -> tokio_rusqlite::rusqlite::Result<(String, String)> {
+    for suffix in 1_u64.. {
+        let candidate = if suffix == 1 {
+            requested.to_string()
+        } else {
+            format!("{requested} {suffix}")
+        };
+        let normalized = normalize_collaboration_name(&candidate);
+        let exists = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM collaboration_presence
+               WHERE normalized_name = ?1 AND session_id != ?2
+               UNION ALL
+               SELECT 1 FROM sessions
+               WHERE lower(id) = ?1
+             )",
+            params![normalized, session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Ok((candidate, normalized));
+        }
+    }
+    unreachable!("the numeric collaboration name suffix is unbounded")
+}
+
+fn collaboration_row(
+    row: &tokio_rusqlite::rusqlite::Row<'_>,
+) -> tokio_rusqlite::rusqlite::Result<ActiveCollaborationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn collaboration_summary(payload: Option<String>) -> String {
+    payload
+        .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
+        .and_then(|event| match event {
+            EventKind::User { text } => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn active_collaboration_participant(row: ActiveCollaborationRow) -> CollaborationParticipant {
+    let (session_id, name, cwd, provider, model, summary, status, queued, last_seen, instance_id) =
+        row;
+    CollaborationParticipant {
+        session_id,
+        name,
+        cwd: PathBuf::from(cwd),
+        provider,
+        model,
+        summary: collaboration_summary(summary),
+        status: if status == "working" {
+            CollaborationStatus::Working
+        } else {
+            CollaborationStatus::Idle
+        },
+        queued: usize::try_from(queued).unwrap_or_default(),
+        last_seen: DateTime::parse_from_rfc3339(&last_seen)
+            .ok()
+            .map(|value| value.with_timezone(&Utc)),
+        instance_id: Some(instance_id),
+    }
+}
+
+fn offline_collaboration_participant(row: OfflineCollaborationRow) -> CollaborationParticipant {
+    let (session_id, name, cwd, provider, model, summary) = row;
+    CollaborationParticipant {
+        session_id,
+        name,
+        cwd: PathBuf::from(cwd),
+        provider,
+        model,
+        summary: collaboration_summary(summary),
+        status: CollaborationStatus::Offline,
+        queued: 0,
+        last_seen: None,
+        instance_id: None,
+    }
+}
+
 async fn open_archive_database(path: &Path) -> Result<Option<Connection>> {
     if !fs::try_exists(path)
         .await
@@ -2692,6 +3275,28 @@ fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::R
          );
          CREATE INDEX IF NOT EXISTS pending_inputs_session_id_id
            ON pending_inputs(session_id, id);
+         CREATE TABLE IF NOT EXISTS collaboration_identities (
+           session_id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           normalized_name TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS collaboration_presence (
+           session_id TEXT PRIMARY KEY,
+           instance_id TEXT NOT NULL UNIQUE,
+           name TEXT,
+           normalized_name TEXT,
+           status TEXT NOT NULL CHECK (status IN ('idle', 'working')),
+           pending_count INTEGER NOT NULL CHECK (pending_count >= 0),
+           last_seen TEXT NOT NULL,
+           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS collaboration_presence_name
+           ON collaboration_presence(normalized_name)
+           WHERE normalized_name IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS collaboration_presence_last_seen
+           ON collaboration_presence(last_seen);
          CREATE TABLE IF NOT EXISTS pending_drafts (
            cwd TEXT PRIMARY KEY, draft TEXT NOT NULL
          );",
@@ -3108,6 +3713,215 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn persisted_collaboration_session(
+        path: &Path,
+        requested: &str,
+        cwd: &Path,
+        first_message: &str,
+    ) -> Session {
+        let session = Session::open_at(
+            path.to_path_buf(),
+            Some(requested),
+            cwd,
+            "test-provider",
+            "test-model",
+            context(requested),
+        )
+        .await
+        .unwrap();
+        session.persist().await.unwrap();
+        session
+            .append(EventKind::User {
+                text: first_message.to_string(),
+            })
+            .await
+            .unwrap();
+        session
+    }
+
+    #[tokio::test]
+    async fn collaboration_names_are_unique_only_while_participants_are_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&cwd).await.unwrap();
+        let first = persisted_collaboration_session(&path, "first", &cwd, "Fix auth").await;
+        let second = persisted_collaboration_session(&path, "second", &cwd, "Review auth").await;
+
+        let (first_name, second_name) = tokio::join!(
+            first.set_collaboration_name("instance-first", "Bob", CollaborationStatus::Working, 0,),
+            second.set_collaboration_name("instance-second", "Bob", CollaborationStatus::Idle, 2,),
+        );
+        let mut names = vec![first_name.unwrap(), second_name.unwrap()];
+        names.sort();
+        assert_eq!(names, ["Bob", "Bob 2"]);
+
+        let participants = first.collaboration_participants(false).await.unwrap();
+        assert_eq!(participants.len(), 2);
+        assert!(participants.iter().any(|participant| {
+            participant.summary == "Fix auth" && participant.status == CollaborationStatus::Working
+        }));
+        assert_eq!(
+            first
+                .collaboration_participant("bob", false, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Bob")
+        );
+
+        first
+            .clear_collaboration_presence("instance-first")
+            .await
+            .unwrap();
+        let reassigned = second
+            .set_collaboration_name("instance-second", "Bob", CollaborationStatus::Idle, 0)
+            .await
+            .unwrap();
+        assert_eq!(reassigned, "Bob");
+    }
+
+    #[tokio::test]
+    async fn collaboration_delivery_is_durable_and_requires_live_target_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&cwd).await.unwrap();
+        let source = persisted_collaboration_session(&path, "source", &cwd, "Coordinate").await;
+        let target = persisted_collaboration_session(&path, "target", &cwd, "Implement").await;
+        target
+            .set_collaboration_name("target-instance", "Wu Sir", CollaborationStatus::Idle, 0)
+            .await
+            .unwrap();
+
+        let participant = source
+            .collaboration_participant("wu sir", false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(participant.session_id, target.id());
+        let pending_id = source
+            .deliver_collaboration_input(
+                target.id(),
+                participant.instance_id.as_deref().unwrap(),
+                SubmitKind::Steer,
+                "Collaboration from source: inspect this",
+                &[UserContent::text(
+                    "<collaboration_message>inspect this</collaboration_message>",
+                )],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = target.pending_inputs().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
+        assert_eq!(pending[0].kind, SubmitKind::Steer);
+        assert_eq!(pending[0].text, "Collaboration from source: inspect this");
+        assert!(pending[0].visible);
+        assert!(
+            serde_json::to_string(&pending[0].content)
+                .unwrap()
+                .contains("collaboration_message")
+        );
+
+        target
+            .clear_collaboration_presence("target-instance")
+            .await
+            .unwrap();
+        let interceptor =
+            persisted_collaboration_session(&path, "interceptor", &cwd, "Intercept").await;
+        let interceptor_name = interceptor
+            .set_collaboration_name(
+                "interceptor-instance",
+                target.id(),
+                CollaborationStatus::Idle,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(interceptor_name, format!("{} 2", target.id()));
+        assert!(
+            source
+                .collaboration_participant(target.id(), false, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            source
+                .deliver_collaboration_input(
+                    target.id(),
+                    "target-instance",
+                    SubmitKind::Prompt,
+                    "late",
+                    &[UserContent::text("late")],
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let offline = source
+            .collaboration_participant(target.id(), false, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(offline.status, CollaborationStatus::Offline);
+        assert_eq!(offline.name.as_deref(), Some("Wu Sir"));
+    }
+
+    #[tokio::test]
+    async fn collaboration_scope_and_presence_expiry_are_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first_cwd = temp.path().join("first-project");
+        let second_cwd = temp.path().join("second-project");
+        fs::create_dir_all(&first_cwd).await.unwrap();
+        fs::create_dir_all(&second_cwd).await.unwrap();
+        let first = persisted_collaboration_session(&path, "first", &first_cwd, "First").await;
+        let second = persisted_collaboration_session(&path, "second", &second_cwd, "Second").await;
+        second
+            .set_collaboration_name("second-instance", "Scout", CollaborationStatus::Idle, 0)
+            .await
+            .unwrap();
+
+        assert!(
+            first
+                .collaboration_participant("Scout", false, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            first
+                .collaboration_participant("Scout", true, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        second
+            .connection
+            .call(|db| {
+                db.execute(
+                    "UPDATE collaboration_presence SET last_seen = ?1",
+                    [DateTime::<Utc>::UNIX_EPOCH.to_rfc3339()],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            first
+                .collaboration_participants(true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn eager_model_context(events: &[SessionEvent], provider: &str, model: &str) -> ModelContext {

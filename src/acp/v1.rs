@@ -328,7 +328,10 @@ impl AcpV1State {
         let project = self.project(&request.cwd).await.map_err(invalid_params)?;
         let profile = mcp_profile(request.mcp_servers)?;
         let (owner, payload) = session_profile_record(profile).map_err(internal_error)?;
-        let mut options = AgentOpenOptions::default();
+        let mut options = AgentOpenOptions {
+            collaboration_enabled: false,
+            ..AgentOpenOptions::default()
+        };
         options.private_records.insert(owner, payload);
         let initial = project.manager.current().await;
         let spec = AgentSpec::root(
@@ -418,7 +421,10 @@ impl AcpV1State {
             Session::persisted_private_record(&project.cwd, session_id, session_profile_owner())
                 .await
                 .map_err(internal_error)?;
-        let mut options = AgentOpenOptions::default();
+        let mut options = AgentOpenOptions {
+            collaboration_enabled: false,
+            ..AgentOpenOptions::default()
+        };
         match stored_profile {
             Some(stored) => {
                 let stored: SessionMcpProfile = serde_json::from_value(stored)

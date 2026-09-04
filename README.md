@@ -56,6 +56,9 @@ supported providers.
 - **Durable work:** let long commands continue as managed tasks and resume work
   across restarts. Append-only SQLite sessions preserve drafts, frozen startup
   context, titled working notes, and rollover or summary checkpoints.
+- **Session collaboration:** give running TUI sessions persistent human names,
+  inspect their model status, and exchange durable Queue or Steer messages
+  across URI Agent processes. Stopped peers are not started automatically.
 - **Local semantic retrieval:** run on-demand semantic and hybrid search across
   project files and saved conversations with bundled zvec and Model2Vec assets.
 - **One terminal workflow:** use Queue and Steer, web access, keyboard and mouse
@@ -185,7 +188,7 @@ lifecycle operations, and ownership constraints.
 | Use the conversation, commands, keymap, terminal, or attachments | [Terminal interface](docs/interface.md) and [terminal features](docs/terminal.md) |
 | Understand tools, protocols, tasks, and complete output | [Protocols, tasks, and output](docs/protocols.md) |
 | Use project instructions or Skills | [Startup context and Skills](docs/context.md) |
-| Resume sessions or understand notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
+| Resume sessions or understand collaboration, notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
 | Build or audit an extension | [WASM plugins](docs/plugins.md) |
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At

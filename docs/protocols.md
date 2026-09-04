@@ -44,8 +44,9 @@ existing capability.
 | `uri-agent-docs` | `read` | Read version-matched documentation embedded in the binary |
 | `file` | `read` | Read files, directories, globs, and supported images |
 | `grep` | `read`, `exec` | Run exact, semantic, or hybrid project search |
-| `sessions` | `read`, `exec` | Discover and search saved conversations without changing them |
-| `context` | `read`, `exec` | Inspect context, maintain notes, recover history, and request rollover |
+| `context` | `read`, `exec` | Inspect active context, maintain current-session notes, recover history, and read saved sessions |
+| `collaboration` | `read`, `exec` | Name this session, inspect active participants and model status, and exchange Queue or Steer messages |
+| `sessions` | `read`, `exec` | Compatibility route retained only for sessions whose frozen prompt already used it |
 | `https` | `read` | Search the web and extract HTTPS pages |
 | `tasks` | `read`, `exec` | Inspect, wait for, and cancel managed work |
 | `bash` or `pwsh` | `read`, `exec` | Run shell commands |
@@ -98,16 +99,42 @@ read("grep://src?mode=hybrid&glob=**/*.rs", "credential refresh flow")
 
 `context` exposes bounded recovery information for the active conversation,
 including context usage, titled notes, prior windows, user statements, search,
-and record neighborhoods. Notes have stable host-generated IDs and revision
-anchors. Deleting a note hides its body from model-facing recovery routes but
-is not secure erasure from the append-only session database.
+and record neighborhoods. Under `context://sessions/...`, it also discovers and
+searches saved conversations and reads their transcript or notes without
+resuming them. Saved-session state is read-only; note mutation remains limited
+to the current session. Project scope is the default and broader discovery or
+search scope must be requested explicitly. Exact search needs no index, while
+semantic and hybrid reads maintain disposable scope-specific caches
+automatically. Results are bounded and marked as untrusted reference data.
 
-`sessions` discovers and searches saved conversations. Project scope is the
-default; broader scope must be requested explicitly. Exact search needs no
-index, while semantic and hybrid reads maintain disposable scope-specific
-caches automatically. Archive reads and indexing never resume or modify a
-session. Results from both history protocols are bounded and marked as
-untrusted reference data.
+New sessions do not advertise `sessions`. A resumed session whose frozen
+startup prompt already contains that protocol retains `sessions://` as a
+compatibility route, while all new model-facing addresses use
+`context://sessions/...`.
+
+### Collaboration
+
+`collaboration` connects depth-1 TUI sessions already running in local URI
+Agent processes. A session can persist a short human name; active-name
+collisions receive numeric suffixes. Participant reads report the stable
+session ID, working directory, bounded first-request summary, provider/model,
+`idle` or `working` status, queue depth, and last heartbeat. Names resolve only
+while active; stable IDs remain suitable for `context://sessions/...` reads.
+
+Messages use a plain-text body and target one active name or session ID.
+`queue` durably schedules a later turn, while `steer` targets the next model
+boundary and becomes a queued turn if the target is idle. The host wraps the
+body in an XML envelope containing trusted source metadata, including the
+stable source session ID and a generated message ID. Peer content inside that
+envelope remains untrusted and grants no user authorization. A requested reply
+adds an exact ID-based reply route but neither waits nor guarantees a response.
+
+Acceptance means that the message was committed to the target's durable input
+queue. Collaboration does not start a stopped process, broadcast, transfer
+files, or wait for remote completion. ACP-owned and child Agent sessions do not
+join live collaboration. Exact routes, name rules, options, limits, and the XML
+behavior are defined by `collaboration://help` and
+`collaboration://help/send`.
 
 `uri-agent-docs` reads the Markdown files embedded at build time. Start at
 `uri-agent-docs://README.md` for the version-matched documentation index.

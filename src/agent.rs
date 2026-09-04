@@ -1,3 +1,4 @@
+use crate::builtins::collaboration::{CollaborationPlugin, CollaborationState};
 use crate::builtins::context::{ContextPlugin, ContextState};
 use crate::catalog::{ModelCatalog, ModelLimits, ThinkingLevel};
 use crate::config::{AgentEnvironment, ConfigManager, display_path};
@@ -28,9 +29,19 @@ use tokio::sync::Mutex;
 pub const ROOT_AGENT_DEPTH: u8 = 1;
 pub const MAX_AGENT_DEPTH: u8 = 2;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AgentOpenOptions {
     pub private_records: BTreeMap<String, Value>,
+    pub collaboration_enabled: bool,
+}
+
+impl Default for AgentOpenOptions {
+    fn default() -> Self {
+        Self {
+            private_records: BTreeMap::new(),
+            collaboration_enabled: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -517,12 +528,15 @@ impl AgentHost {
                 .await;
             return Ok(handle);
         }
+        let collaboration_enabled = root && options.collaboration_enabled;
         let private_record_owners = options.private_records.keys().cloned().collect::<Vec<_>>();
         for (owner, payload) in options.private_records {
             session.stage_private_record(&owner, payload).await?;
         }
         let resume_pending = resume_pending && !session.pending_inputs().await?.is_empty();
-        let services = self.build_services(session.clone(), callback).await?;
+        let services = self
+            .build_services(session.clone(), callback, collaboration_enabled)
+            .await?;
         if !private_record_owners.is_empty()
             && let Err(error) = services.runtime.prepare_context().await
         {
@@ -712,13 +726,28 @@ fn validate_spec(spec: &AgentSpec) -> Result<()> {
     Ok(())
 }
 
+fn frozen_prompt_uses_legacy_sessions(prompt: &str) -> bool {
+    prompt.contains("\n- sessions: ") || prompt.contains("sessions://")
+}
+
 impl AgentHost {
     async fn build_services(
         &self,
         session: Session,
         callback: Option<Arc<dyn CompactionCallback>>,
+        collaboration_enabled: bool,
     ) -> Result<AgentServices> {
         let context_state = ContextState::new(session.clone());
+        let spec = session.spec().await;
+        let collaboration_enabled = collaboration_enabled
+            && match &spec.protocols {
+                CapabilitySelection::All => true,
+                CapabilitySelection::Only(protocols) => {
+                    protocols.iter().any(|protocol| protocol == "collaboration")
+                }
+            };
+        let collaboration_state =
+            collaboration_enabled.then(|| CollaborationState::new(session.clone()));
         let mcp_profile = session
             .private_record(crate::builtins::MCP_SESSION_PROFILE_OWNER)
             .await;
@@ -727,7 +756,18 @@ impl AgentHost {
             self.inner.manager.directory(),
             mcp_profile,
         );
+        let legacy_sessions = if session.is_new() {
+            false
+        } else {
+            frozen_prompt_uses_legacy_sessions(&session.context().await.system_prompt)
+        };
+        if legacy_sessions {
+            plugins.add(crate::builtins::SessionsPlugin::new(&self.inner.cwd));
+        }
         plugins.add(ContextPlugin::new(context_state.clone()));
+        if let Some(state) = &collaboration_state {
+            plugins.add(CollaborationPlugin::new(state.clone()));
+        }
         let wasm_plugins =
             WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
         plugins.add(wasm_plugins.clone());
@@ -741,7 +781,6 @@ impl AgentHost {
             .map(|descriptor| descriptor.name)
             .collect::<HashSet<_>>();
         let tasks = TaskManager::from_reports(session.task_reports().await?);
-        let spec = session.spec().await;
         let active = self
             .inner
             .manager
@@ -842,6 +881,9 @@ impl AgentHost {
         runtime.set_compaction_settings(active.compaction).await;
         runtime.set_compaction_callback(callback).await;
         runtime.set_max_output_tokens(spec.max_output_tokens).await;
+        if let Some(state) = collaboration_state {
+            state.start(&runtime).await?;
+        }
         Ok(AgentServices {
             runtime,
             protocols,
@@ -1092,6 +1134,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sessions_compatibility_comes_only_from_the_frozen_prompt() {
+        assert!(frozen_prompt_uses_legacy_sessions(
+            "Available protocols:\n- sessions: Search saved sessions."
+        ));
+        assert!(frozen_prompt_uses_legacy_sessions(
+            "Use read(\"sessions://recent\", \"\")"
+        ));
+        assert!(!frozen_prompt_uses_legacy_sessions(
+            "Search saved sessions through context."
+        ));
+    }
+
+    #[test]
     fn plugin_open_requires_a_depth_two_session_owned_by_the_bound_parent() {
         let root = AgentSpec::root("provider", "model", ThinkingLevel::Off, Path::new("/work"));
         assert!(validate_plugin_open(&root, None).is_err());
@@ -1172,6 +1227,9 @@ mod tests {
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<Vec<_>>();
+        assert!(protocol_names.iter().any(|name| name == "context"));
+        assert!(protocol_names.iter().any(|name| name == "collaboration"));
+        assert!(!protocol_names.iter().any(|name| name == "sessions"));
         assert!(
             protocol_names
                 .iter()
@@ -1190,7 +1248,10 @@ mod tests {
         assert!(!transcript.contains("private-test-value"));
         created.close().await;
 
-        let reopened = host.open_root(Some(&session_id), spec).await.unwrap();
+        let reopened = host
+            .open_root(Some(&session_id), spec.clone())
+            .await
+            .unwrap();
         reopened.services().runtime.prepare_context().await.unwrap();
         assert_eq!(
             reopened
@@ -1213,8 +1274,36 @@ mod tests {
                 .into_iter()
                 .map(|descriptor| descriptor.name)
                 .collect::<Vec<_>>(),
-            protocol_names
+            protocol_names,
         );
         reopened.close().await;
+
+        let legacy_spec = spec.replace_system_prompt(
+            "Legacy frozen prompt\nAvailable protocols:\n- sessions: Search saved sessions.",
+        );
+        let legacy = host.open_root(None, legacy_spec.clone()).await.unwrap();
+        legacy.services().runtime.prepare_context().await.unwrap();
+        legacy.services().runtime.session().persist().await.unwrap();
+        let legacy_id = legacy.session_id().to_string();
+        assert!(
+            !legacy
+                .services()
+                .protocols
+                .descriptors()
+                .iter()
+                .any(|descriptor| descriptor.name == "sessions")
+        );
+        legacy.close().await;
+
+        let legacy = host.open_root(Some(&legacy_id), legacy_spec).await.unwrap();
+        assert!(
+            legacy
+                .services()
+                .protocols
+                .descriptors()
+                .iter()
+                .any(|descriptor| descriptor.name == "sessions")
+        );
+        legacy.close().await;
     }
 }

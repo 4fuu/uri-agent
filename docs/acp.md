@@ -69,6 +69,11 @@ protocol set, provider, model, thinking level, and session-scoped MCP profile.
 ACP and TUI ownership is sequential; do not open the same session concurrently
 in separate processes.
 
+ACP-owned sessions do not publish live `collaboration` presence or accept
+unsolicited cross-process Queue or Steer messages. This preserves ACP's
+exclusive request/response prompt ownership. Close the ACP session and reopen
+it in the TUI before using live session collaboration.
+
 ## Prompt and update mapping
 
 Prompts accept text, resource links, and JPEG, PNG, GIF, or WebP images whose
