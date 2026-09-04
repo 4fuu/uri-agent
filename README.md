@@ -56,9 +56,8 @@ supported providers.
 - **Durable work:** let long commands continue as managed tasks and resume work
   across restarts. Append-only SQLite sessions preserve drafts, frozen startup
   context, titled working notes, and rollover or summary checkpoints.
-- **Session collaboration:** give running TUI sessions persistent human names,
-  inspect their model status, and exchange durable Queue or Steer messages
-  across URI Agent processes. Stopped peers are not started automatically.
+- **Session collaboration:** multiple URI Agent processes can communicate with
+  each other.
 - **Local semantic retrieval:** run on-demand semantic and hybrid search across
   project files and saved conversations with bundled zvec and Model2Vec assets.
 - **One terminal workflow:** use Queue and Steer, web access, keyboard and mouse
