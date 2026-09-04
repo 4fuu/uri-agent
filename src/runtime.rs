@@ -25,7 +25,7 @@ use rig::message::{
     AssistantContent, ImageMediaType, Message, Text, ToolCall, ToolResultContent, UserContent,
 };
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock as SyncRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -278,6 +278,7 @@ pub struct AgentRuntime {
     pending_updates: watch::Sender<Vec<PendingMessage>>,
     turn_completions: broadcast::Sender<TurnCompletion>,
     pending_restored: OnceCell<()>,
+    external_pending_enabled: AtomicBool,
 }
 
 #[async_trait]
@@ -355,6 +356,7 @@ impl AgentRuntime {
             pending_updates,
             turn_completions,
             pending_restored: OnceCell::new(),
+            external_pending_enabled: AtomicBool::new(false),
         }
     }
 
@@ -435,6 +437,54 @@ impl AgentRuntime {
                 Ok(())
             })
             .await?;
+        Ok(())
+    }
+
+    async fn synchronize_pending_inputs(&self) -> Result<usize> {
+        if !self.session.is_persisted().await {
+            return Ok(0);
+        }
+        let active = self.active_turn.lock().await;
+        let active_id = active.as_ref().map(|turn| turn.submission_id);
+        let stored = self.session.pending_inputs().await?;
+        let mut pending = self.pending.lock().await;
+        let known = pending
+            .messages
+            .iter()
+            .filter_map(|entry| entry.persistent_id)
+            .collect::<HashSet<_>>();
+        let additions = stored
+            .into_iter()
+            .filter(|input| !known.contains(&input.id) && active_id != u64::try_from(input.id).ok())
+            .map(pending_entry)
+            .collect::<Vec<_>>();
+        let added = additions.len();
+        if added == 0 {
+            return Ok(0);
+        }
+        pending.messages.extend(additions);
+        pending
+            .messages
+            .make_contiguous()
+            .sort_by_key(|entry| entry.persistent_id.unwrap_or(i64::MAX));
+        self.publish_pending(&pending);
+        Ok(added)
+    }
+
+    pub(crate) async fn reconcile_external_inputs(self: &Arc<Self>) -> Result<usize> {
+        self.external_pending_enabled.store(true, Ordering::Release);
+        self.prepare_context().await?;
+        let added = self.synchronize_pending_inputs().await?;
+        if added > 0 {
+            self.start_accepted_prompt().await?;
+        }
+        Ok(added)
+    }
+
+    async fn reconcile_external_inputs_at_boundary(&self) -> Result<()> {
+        if self.external_pending_enabled.load(Ordering::Acquire) {
+            self.synchronize_pending_inputs().await?;
+        }
         Ok(())
     }
 
@@ -765,14 +815,31 @@ impl AgentRuntime {
         }
         let (index, input) = {
             let mut pending = self.pending.lock().await;
-            let Some(index) = pending
+            let index = pending
                 .messages
                 .iter()
                 .position(|entry| entry.message.kind == PendingMessageKind::Queued)
-            else {
+                .or_else(|| {
+                    pending
+                        .messages
+                        .iter()
+                        .position(|entry| entry.message.kind == PendingMessageKind::Steer)
+                });
+            let Some(index) = index else {
                 pending.accepting = false;
                 return Ok(false);
             };
+            if pending.messages[index].message.kind == PendingMessageKind::Steer {
+                if let Some(id) = pending.messages[index].persistent_id
+                    && !self
+                        .session
+                        .update_pending_input_kind(id, SubmitKind::Prompt)
+                        .await?
+                {
+                    bail!("cannot promote missing pending Steer input")
+                }
+                pending.messages[index].message.kind = PendingMessageKind::Queued;
+            }
             let input = pending
                 .messages
                 .remove(index)
@@ -1459,6 +1526,7 @@ impl AgentRuntime {
         let mut skip_task_notifications = skip_initial_task_notifications;
         let mut loop_guard = ToolCallLoopGuard::default();
         let _ = self.context_state.take_rollover_request().await;
+        self.reconcile_external_inputs_at_boundary().await?;
         if take_initial_steer && let Some((index, steer)) = self.take_steer().await {
             self.append_pending_input(index, steer, false).await?;
             steer_ready = true;
@@ -1578,6 +1646,7 @@ impl AgentRuntime {
                     .context("cannot persist tool-call loop redirect")?;
                 self.refresh_context_estimate().await;
             }
+            self.reconcile_external_inputs_at_boundary().await?;
             if let Some((index, steer)) = self.take_steer().await {
                 self.append_pending_input(index, steer, true).await?;
                 steer_ready = true;
@@ -2465,7 +2534,7 @@ mod tests {
     use crate::builtins::context::ContextPlugin;
     use crate::model::ModelDelta;
     use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
-    use crate::session::SessionContext;
+    use crate::session::{CollaborationStatus, SessionContext};
     use async_trait::async_trait;
     use rig::message::{ToolCallId, ToolFunction};
     use std::collections::{HashSet, VecDeque};
@@ -3432,6 +3501,137 @@ mod tests {
         backend.release.add_permits(1);
         wait_for_turn(runtime.as_ref()).await;
         assert!(session.pending_inputs().await.unwrap().is_empty());
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn externally_persisted_steer_reconciles_into_the_next_model_boundary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([
+                text_response("first boundary"),
+                text_response("after steer"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        session.persist().await.unwrap();
+        session
+            .set_collaboration_name("target-instance", "Target", CollaborationStatus::Idle, 0)
+            .await
+            .unwrap();
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        session
+            .deliver_collaboration_input(
+                session.id(),
+                "target-instance",
+                SubmitKind::Steer,
+                "Collaboration from Source: redirect",
+                &[UserContent::text(
+                    "<collaboration_message>redirect</collaboration_message>",
+                )],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.reconcile_external_inputs().await.unwrap(), 1);
+        assert_eq!(
+            runtime.pending_messages().await[0].kind,
+            PendingMessageKind::Steer
+        );
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        let requests = backend.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            serde_json::to_string(requests[1].history.last().unwrap())
+                .unwrap()
+                .contains("<collaboration_message>redirect</collaboration_message>")
+        );
+        drop(requests);
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        assert!(session.pending_inputs().await.unwrap().is_empty());
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_orders_an_earlier_external_queue_before_later_local_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (started, mut requests_started) = mpsc::unbounded_channel();
+        let backend = Arc::new(GatedBackend {
+            responses: Mutex::new(VecDeque::from([
+                text_response("initial complete"),
+                text_response("external complete"),
+                text_response("local complete"),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            started,
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+        session.persist().await.unwrap();
+        session
+            .set_collaboration_name("target-instance", "Target", CollaborationStatus::Idle, 0)
+            .await
+            .unwrap();
+
+        runtime.start_turn("initial".into()).await.unwrap();
+        requests_started.recv().await.unwrap();
+        session
+            .deliver_collaboration_input(
+                session.id(),
+                "target-instance",
+                SubmitKind::Prompt,
+                "external first",
+                &[UserContent::text("external first")],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .submit("local second".into(), SubmitKind::Prompt)
+            .await
+            .unwrap();
+        assert_eq!(runtime.reconcile_external_inputs().await.unwrap(), 1);
+        assert_eq!(
+            runtime
+                .pending_messages()
+                .await
+                .into_iter()
+                .map(|message| message.text)
+                .collect::<Vec<_>>(),
+            ["external first", "local second"]
+        );
+
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        backend.release.add_permits(1);
+        requests_started.recv().await.unwrap();
+        backend.release.add_permits(1);
+        wait_for_turn(runtime.as_ref()).await;
+        let requests = backend.requests.lock().await;
+        assert!(
+            serde_json::to_string(requests[1].history.last().unwrap())
+                .unwrap()
+                .contains("external first")
+        );
+        assert!(
+            serde_json::to_string(requests[2].history.last().unwrap())
+                .unwrap()
+                .contains("local second")
+        );
+        drop(requests);
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

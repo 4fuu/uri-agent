@@ -1,5 +1,6 @@
 mod agents;
 mod apply_patch;
+pub(crate) mod collaboration;
 pub(crate) mod context;
 mod file;
 mod grep;
