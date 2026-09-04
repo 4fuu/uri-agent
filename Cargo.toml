@@ -63,7 +63,7 @@ unicode-general-category = "1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 uri-agent-plugin-sdk = { version = "=2026.904.1", path = "sdk" }
-uuid = { version = "1", features = ["serde", "v7"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
 vt100 = "0.16"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 zvec-rust = "=0.7.0"

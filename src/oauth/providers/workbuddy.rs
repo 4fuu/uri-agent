@@ -13,8 +13,8 @@ use tokio::sync::{oneshot, watch};
 const WORKBUDDY_ENDPOINT: &str = "https://copilot.tencent.com";
 const PLATFORM: &str = "workbuddy";
 const PREFIX_PATH: &str = "/plugin";
-const REFERENCE_VERSION: &str = "5.3.14";
-pub(crate) const USER_AGENT: &str = "WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0";
+const REFERENCE_VERSION: &str = "5.5.3";
+pub(crate) const USER_AGENT: &str = "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_FETCH_TOKEN: i64 = 11217;
@@ -736,7 +736,8 @@ fn decorate_auth_url(value: String) -> Result<String> {
     let value = trusted_http_url(&value)?;
     let mut url = Url::parse(&value).context("invalid WorkBuddy login URL")?;
     url.query_pairs_mut()
-        .append_pair("version", REFERENCE_VERSION);
+        .append_pair("version", REFERENCE_VERSION)
+        .append_pair("loginSessionId", &uuid::Uuid::new_v4().to_string());
     Ok(url.to_string())
 }
 
@@ -800,8 +801,8 @@ mod tests {
         assert_eq!(default_endpoint("external"), None);
         assert_eq!(default_endpoint("iOA"), None);
         assert_eq!(PLATFORM, "workbuddy");
-        assert_eq!(REFERENCE_VERSION, "5.3.14");
-        assert_eq!(USER_AGENT, "WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0");
+        assert_eq!(REFERENCE_VERSION, "5.5.3");
+        assert_eq!(USER_AGENT, "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1");
     }
 
     #[test]
@@ -845,13 +846,19 @@ mod tests {
     }
 
     #[test]
-    fn browser_url_includes_the_reference_client_version() {
+    fn browser_url_includes_the_reference_client_identity() {
         let url =
             decorate_auth_url("https://copilot.tencent.com/login?state=one".to_string()).unwrap();
         let url = Url::parse(&url).unwrap();
-        assert!(
-            url.query_pairs()
-                .any(|(key, value)| key == "version" && value == REFERENCE_VERSION)
+        let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(query.get("state").unwrap(), "one");
+        assert_eq!(query.get("version").unwrap(), REFERENCE_VERSION);
+        let login_session_id = query.get("loginSessionId").unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(login_session_id)
+                .unwrap()
+                .get_version_num(),
+            4
         );
     }
 
