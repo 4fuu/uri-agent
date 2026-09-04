@@ -34,6 +34,7 @@ URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变�
 - **ACP 编辑器集成：**通过稳定的 ACP v1 stdio 接口，在兼容的编辑器中使用 URI Agent。每个会话都能选择模型，对话之后还可以在普通 TUI 中重新打开。
 - **广泛模型支持：**直接在模型选择器中使用 pi.dev 目录、模型服务商专属登录和账户模型实时发现。
 - **持久化工作：**让长命令作为受管任务继续运行，并在重启后恢复工作。仅追加的 SQLite 会话会保留草稿、固化的启动上下文、有标题的工作笔记，以及上下文滚动或摘要检查点。
+- **会话协作：**为正在运行的 TUI 会话设置持久化的人性化名称，检查其模型状态，并在多个 URI Agent 进程之间发送持久化的 Queue 或 Steer 消息；已停止的进程不会被自动启动。
 - **本地语义检索：**利用随安装包提供的 zvec 和 Model2Vec 资产，按需搜索项目文件和已保存会话。
 - **单一终端工作流：**在同一个对话界面中使用 Queue 与 Steer、网络访问、键盘和鼠标控制、图片输入，以及 `@` 文件和 `@@` 会话引用。
 
@@ -132,7 +133,7 @@ uri-agent --acpv1
 | 使用对话、命令、快捷键、终端或附件 | [Terminal interface](docs/interface.md) 和 [terminal features](docs/terminal.md) |
 | 了解工具、协议、任务和完整输出 | [Protocols, tasks, and output](docs/protocols.md) |
 | 使用项目指令或 Skills | [Startup context and Skills](docs/context.md) |
-| 恢复会话，或了解笔记、上下文滚动与持久化 | [Sessions and context](docs/sessions.md) |
+| 恢复会话，或了解协作、笔记、上下文滚动与持久化 | [Sessions and context](docs/sessions.md) |
 | 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
 [`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和请求体格式以 `<protocol>://help` 为准；当前生效的界面说明以 `F1` 和 `:help` 为准。
