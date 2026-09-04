@@ -1,7 +1,8 @@
 use crate::text_metrics::{count_visible_units, visible_units};
 use std::time::{Duration, Instant};
 
-const DEFAULT_VISIBLE_UNITS_PER_SECOND: f64 = 100.0;
+const STARTUP_CLAMP_WINDOW: Duration = Duration::from_millis(500);
+const STARTUP_CLAMP_UNITS_PER_SECOND: f64 = 100.0;
 const DISPLAY_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 const DISPLAY_SMOOTHING_TIME: Duration = Duration::from_secs(3);
 const MIN_DISPLAY_RATE: f64 = 0.05;
@@ -26,12 +27,22 @@ impl StreamRateEstimator {
 
     /// Average visible units per second since the response's first output.
     /// Stall time stays in the denominator, so pauses decay the rate instead
-    /// of clearing it.
+    /// of clearing it. The startup clamp only bounds the first sample, where
+    /// one large chunk over a tiny interval would spike the average; it never
+    /// caps a sustained fast stream.
     fn current_units_per_second(&self, now: Instant) -> Option<f64> {
         let first_output_at = self.first_output_at?;
-        let seconds = now.saturating_duration_since(first_output_at).as_secs_f64();
-        (seconds > 0.0 && self.total_units > 0)
-            .then(|| DEFAULT_VISIBLE_UNITS_PER_SECOND.min(self.total_units as f64 / seconds))
+        let elapsed = now.saturating_duration_since(first_output_at);
+        let seconds = elapsed.as_secs_f64();
+        if seconds <= 0.0 || self.total_units == 0 {
+            return None;
+        }
+        let rate = self.total_units as f64 / seconds;
+        Some(if elapsed < STARTUP_CLAMP_WINDOW {
+            rate.min(STARTUP_CLAMP_UNITS_PER_SECOND)
+        } else {
+            rate
+        })
     }
 
     fn elapsed(&self, completed_at: Instant) -> Option<Duration> {
@@ -352,6 +363,38 @@ mod tests {
         assert_eq!(
             estimator.current_units_per_second(start + Duration::from_secs(8)),
             Some(0.5)
+        );
+    }
+
+    #[test]
+    fn the_startup_clamp_only_bounds_the_first_sample() {
+        let start = Instant::now();
+        let mut estimator = StreamRateEstimator::default();
+        estimator.observe(&"word ".repeat(250), start);
+        // One big chunk over a short interval stays clamped to 100 units/s.
+        assert_eq!(
+            estimator.current_units_per_second(start + Duration::from_millis(100)),
+            Some(100.0)
+        );
+        // Once the average has time to settle, the true rate is reported.
+        assert_eq!(
+            estimator.current_units_per_second(start + Duration::from_millis(500)),
+            Some(500.0)
+        );
+    }
+
+    #[test]
+    fn the_startup_clamp_does_not_cap_a_sustained_fast_stream() {
+        let start = Instant::now();
+        let mut estimator = StreamRateEstimator::default();
+        estimator.observe(&"word ".repeat(250), start);
+        estimator.observe(&"word ".repeat(250), start + Duration::from_secs(1));
+        estimator.observe("end", start + Duration::from_secs(2));
+        // 501 units over 2 seconds average 250.5 units per second, above the
+        // startup clamp, so the displayed live rate matches the final average.
+        assert_eq!(
+            estimator.current_units_per_second(start + Duration::from_secs(2)),
+            Some(250.5)
         );
     }
 
