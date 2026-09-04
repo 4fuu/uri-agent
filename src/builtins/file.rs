@@ -1,4 +1,4 @@
-use super::EditableText;
+use super::{EditableText, normalize_line_endings};
 use crate::config::display_path;
 use crate::plugin::{
     Plugin, PluginHost, TuiCompletionContext, TuiCompletionItem, TuiCompletionProvider,
@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use ignore::{DirEntry, WalkBuilder, overrides::OverrideBuilder};
 use std::cmp::Reverse;
 use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -20,6 +21,7 @@ const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 2_000;
 const MAX_COMPLETIONS: usize = 20;
 const MAX_SCANNED_FILES: usize = 50_000;
+const TAIL_SCAN_CHUNK: usize = 64 * 1024;
 
 fn help(cwd: &Path) -> String {
     format!(
@@ -40,7 +42,10 @@ Current working directory: `file://{}`
   one-based starting line or directory-entry position, and `<count>` is the
   maximum number of lines or entries to return. The default is 200 and the
   maximum is 2000.
-- Add `?line_numbers=true` to prefix file content with one-based line numbers. Line numbers are disabled by default.
+- Add `?tail=<count>` to efficiently read the last lines of a text file. The
+  maximum is 2000. `tail` cannot be combined with `offset`, `limit`, or `glob`.
+- Add `?line_numbers=true` to prefix file content with its original one-based
+  line numbers. Line numbers are disabled by default.
 - Add `?glob=<pattern>` to a directory address to list matching files
   recursively with standard ignore rules. Patterns are relative to that
   directory; for example, `file://src?glob=**/*.rs`. A glob scans at most
@@ -107,6 +112,9 @@ impl FileProtocol {
                 .into());
         }
         if metadata.is_dir() {
+            if range.tail.is_some() {
+                bail!("tail is only supported for text file reads");
+            }
             Ok(read_directory(&path, request.uri, range).await?.into())
         } else if metadata.is_file() {
             read_file(&path, request.uri, query.is_some(), range).await
@@ -272,7 +280,7 @@ impl Protocol for FileProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: "file".to_string(),
-            description: "Read text files, supported images, and directory listings with bounded line ranges."
+            description: "Read text files, supported images, and directory listings with bounded ranges and efficient text tails."
                 .to_string(),
             can_read: true,
             can_exec: false,
@@ -327,6 +335,7 @@ fn split_query(target: &str) -> (&str, Option<&str>) {
 struct Range {
     offset: usize,
     limit: usize,
+    tail: Option<usize>,
     line_numbers: bool,
     glob: Option<String>,
 }
@@ -335,6 +344,7 @@ impl Range {
     fn parse(query: Option<&str>) -> Result<Self> {
         let mut offset = 1_usize;
         let mut limit = DEFAULT_LIMIT;
+        let mut tail = None;
         let mut line_numbers = false;
         let mut glob = None;
         let mut seen = std::collections::HashSet::new();
@@ -355,6 +365,14 @@ impl Range {
                         .with_context(|| format!("invalid limit: {value}"))?
                         .clamp(1, MAX_LIMIT)
                 }
+                "tail" => {
+                    tail = Some(
+                        value
+                            .parse::<usize>()
+                            .with_context(|| format!("invalid tail: {value}"))?
+                            .clamp(1, MAX_LIMIT),
+                    )
+                }
                 "line_numbers" => {
                     line_numbers = match value.as_ref() {
                         "true" => true,
@@ -371,9 +389,17 @@ impl Range {
                 _ => bail!("unknown file query parameter: {key}"),
             }
         }
+        if tail.is_some()
+            && ["offset", "limit", "glob"]
+                .iter()
+                .any(|key| seen.contains(*key))
+        {
+            bail!("tail cannot be combined with offset, limit, or glob");
+        }
         Ok(Self {
             offset,
             limit,
+            tail,
             line_numbers,
             glob,
         })
@@ -454,6 +480,9 @@ async fn read_file(
     has_query: bool,
     range: Range,
 ) -> Result<ProtocolReadOutput> {
+    if let Some(tail) = range.tail {
+        return read_file_tail(path, tail, range.line_numbers).await;
+    }
     let content = fs::read(path)
         .await
         .with_context(|| format!("cannot read {}", display_path(path)))?;
@@ -508,6 +537,136 @@ async fn read_file(
     Ok(output.into_bytes().into())
 }
 
+struct TailRead {
+    content: Vec<u8>,
+    total_lines: Option<usize>,
+    starts_at_beginning: bool,
+}
+
+async fn read_file_tail(
+    path: &Path,
+    count: usize,
+    line_numbers: bool,
+) -> Result<ProtocolReadOutput> {
+    let path = path.to_path_buf();
+    let tail = tokio::task::spawn_blocking(move || read_tail(&path, count, line_numbers))
+        .await
+        .context("file tail worker stopped unexpectedly")??;
+    let content = String::from_utf8_lossy(&tail.content);
+    let content = if tail.starts_at_beginning {
+        content.strip_prefix('\u{feff}').unwrap_or(&content)
+    } else {
+        &content
+    };
+    let content = normalize_line_endings(content);
+    let lines = content.lines().collect::<Vec<_>>();
+    let first_line = tail
+        .total_lines
+        .map_or(1, |total| total.saturating_sub(lines.len()) + 1);
+    let width = first_line
+        .saturating_add(lines.len().saturating_sub(1))
+        .max(1)
+        .to_string()
+        .len();
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line_numbers {
+            let line_number = first_line + index;
+            let _ = writeln!(output, "{line_number:>width$} │ {line}");
+        } else {
+            let _ = writeln!(output, "{line}");
+        }
+    }
+    Ok(output.into_bytes().into())
+}
+
+fn read_tail(path: &Path, count: usize, count_all_lines: bool) -> Result<TailRead> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot read {}", display_path(path)))?;
+    let length = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {}", display_path(path)))?
+        .len();
+    let mut header = [0_u8; 12];
+    let header_length = length.min(header.len() as u64) as usize;
+    file.read_exact(&mut header[..header_length])
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
+    if ProtocolImageMediaType::detect(&header[..header_length]).is_some() {
+        bail!("file query parameters are not supported for image reads");
+    }
+
+    let mut position = length;
+    let mut buffer = vec![0_u8; TAIL_SCAN_CHUNK];
+    let mut separator_count = 0_usize;
+    let mut start = None;
+    let mut at_end = true;
+    let mut skip_cr_before_lf = false;
+    'chunks: while position > 0 {
+        let chunk_start = position.saturating_sub(TAIL_SCAN_CHUNK as u64);
+        let chunk_length = (position - chunk_start) as usize;
+        file.seek(SeekFrom::Start(chunk_start))
+            .with_context(|| format!("cannot read {}", display_path(path)))?;
+        file.read_exact(&mut buffer[..chunk_length])
+            .with_context(|| format!("cannot read {}", display_path(path)))?;
+
+        for index in (0..chunk_length).rev() {
+            let byte = buffer[index];
+            if skip_cr_before_lf {
+                skip_cr_before_lf = false;
+                if byte == b'\r' {
+                    continue;
+                }
+            }
+            if at_end {
+                at_end = false;
+                if byte == b'\n' {
+                    skip_cr_before_lf = true;
+                    continue;
+                }
+                if byte == b'\r' {
+                    continue;
+                }
+            }
+
+            let separator_end = match byte {
+                b'\n' => {
+                    skip_cr_before_lf = true;
+                    Some(chunk_start + index as u64 + 1)
+                }
+                b'\r' => Some(chunk_start + index as u64 + 1),
+                _ => None,
+            };
+            if let Some(separator_end) = separator_end {
+                separator_count = separator_count.saturating_add(1);
+                if separator_count == count {
+                    start = Some(separator_end);
+                    if !count_all_lines {
+                        break 'chunks;
+                    }
+                }
+            }
+        }
+        position = chunk_start;
+    }
+
+    let start = start.unwrap_or(0);
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
+    let mut content = Vec::new();
+    file.take(length - start)
+        .read_to_end(&mut content)
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
+    Ok(TailRead {
+        content,
+        total_lines: count_all_lines.then_some(if length == 0 {
+            0
+        } else {
+            separator_count.saturating_add(1)
+        }),
+        starts_at_beginning: start == 0,
+    })
+}
+
 async fn read_directory(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>> {
     let mut directory = fs::read_dir(path)
         .await
@@ -557,6 +716,8 @@ mod tests {
         assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
         assert!(help.contains("`file://<path>`"));
         assert!(help.contains("`?offset=<line>&limit=<count>`"));
+        assert!(help.contains("`?tail=<count>`"));
+        assert!(help.contains("`tail` cannot be combined with `offset`, `limit`, or `glob`"));
         assert!(help.contains("`?line_numbers=true`"));
         assert!(help.contains("Line numbers are disabled by default."));
         assert!(help.contains("PNG, JPEG, GIF, and WebP"));
@@ -638,11 +799,26 @@ mod tests {
         let range = Range::parse(Some("offset=0&limit=99999")).unwrap();
         assert_eq!(range.offset, 1);
         assert_eq!(range.limit, MAX_LIMIT);
+        assert_eq!(range.tail, None);
         assert!(!range.line_numbers);
         assert!(Range::parse(Some("offset=1&offset=2")).is_err());
         assert!(Range::parse(Some("limit=1&limit=2")).is_err());
+        assert!(Range::parse(Some("tail=1&tail=2")).is_err());
         assert!(Range::parse(Some("line_numbers=true&line_numbers=false")).is_err());
         assert!(Range::parse(Some("glob=*.rs&glob=*.md")).is_err());
+    }
+
+    #[test]
+    fn tail_ranges_are_bounded_and_exclusive() {
+        assert_eq!(Range::parse(Some("tail=0")).unwrap().tail, Some(1));
+        assert_eq!(
+            Range::parse(Some("tail=99999")).unwrap().tail,
+            Some(MAX_LIMIT)
+        );
+        assert!(Range::parse(Some("tail=2&line_numbers=true")).is_ok());
+        assert!(Range::parse(Some("tail=2&offset=1")).is_err());
+        assert!(Range::parse(Some("limit=2&tail=2")).is_err());
+        assert!(Range::parse(Some("glob=*.log&tail=2")).is_err());
     }
 
     #[test]
@@ -760,6 +936,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tail_returns_the_last_lines_with_or_without_a_final_newline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+
+        for content in ["zero\none\ntwo", "zero\none\ntwo\n"] {
+            fs::write(&path, content).await.unwrap();
+            let output = read_file(
+                &path,
+                "file://file.txt?tail=2",
+                true,
+                Range::parse(Some("tail=2")).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                String::from_utf8(output.into_parts().0).unwrap(),
+                "one\ntwo\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_matches_normalized_line_semantics_for_empty_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+
+        for (content, expected) in [
+            ("", ""),
+            ("alpha", "alpha\n"),
+            ("alpha\n", "alpha\n"),
+            ("alpha\n\n", "\n"),
+            ("\r\n\r\n", "\n"),
+            ("zero\n\u{feff}one", "\u{feff}one\n"),
+        ] {
+            fs::write(&path, content).await.unwrap();
+            let output = read_file(
+                &path,
+                "file://file.txt?tail=1",
+                true,
+                Range::parse(Some("tail=1")).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(String::from_utf8(output.into_parts().0).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_normalizes_crlf_and_lone_cr_line_endings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "\u{feff}zero\r\none\rtwo\r\n")
+            .await
+            .unwrap();
+
+        let output = read_file(
+            &path,
+            "file://file.txt?tail=20",
+            true,
+            Range::parse(Some("tail=20")).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output.into_parts().0).unwrap(),
+            "zero\none\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn tail_preserves_original_line_numbers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        let content = (1..=12)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(&path, content).await.unwrap();
+
+        let output = read_file(
+            &path,
+            "file://file.txt?tail=2&line_numbers=true",
+            true,
+            Range::parse(Some("tail=2&line_numbers=true")).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output.into_parts().0).unwrap(),
+            "11 │ line 11\n12 │ line 12\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_tail_returns_the_complete_file_without_a_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "zero\none\ntwo\n").await.unwrap();
+
+        let output = read_file(
+            &path,
+            "file://file.txt?tail=20",
+            true,
+            Range::parse(Some("tail=20")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output.into_parts().0).unwrap();
+
+        assert_eq!(output, "zero\none\ntwo\n");
+        assert!(!output.contains("Next:"));
+    }
+
+    #[tokio::test]
+    async fn tail_scans_across_multiple_chunks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        let suffix = "x".repeat(TAIL_SCAN_CHUNK - 1);
+        let content = format!("before\nmiddle\r\n{suffix}");
+        assert!(content.len() > TAIL_SCAN_CHUNK);
+        fs::write(&path, &content).await.unwrap();
+
+        let output = read_file(
+            &path,
+            "file://file.txt?tail=2",
+            true,
+            Range::parse(Some("tail=2")).unwrap(),
+        )
+        .await
+        .unwrap();
+        let expected = format!("middle\n{suffix}\n");
+
+        assert_eq!(String::from_utf8(output.into_parts().0).unwrap(), expected);
+    }
+
+    #[tokio::test]
     async fn pagination_preserves_the_line_number_option() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("file.txt");
@@ -803,6 +1118,16 @@ mod tests {
             "file://screenshot.bin?limit=1",
             true,
             Range::parse(Some("limit=1")).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not supported for image reads"));
+
+        let error = read_file(
+            &path,
+            "file://screenshot.bin?tail=1",
+            true,
+            Range::parse(Some("tail=1")).unwrap(),
         )
         .await
         .unwrap_err();
@@ -921,6 +1246,26 @@ mod tests {
 
         assert_eq!(glob, b"No matches.");
         assert_eq!(listing, b"No entries.");
+    }
+
+    #[tokio::test]
+    async fn directories_reject_tail_reads() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let error = FileProtocol::new(directory.path())
+            .read_request(ProtocolRequest {
+                uri: "file://?tail=1",
+                target: "?tail=1",
+                body: "",
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("tail is only supported for text file reads")
+        );
     }
 
     #[tokio::test]

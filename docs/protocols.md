@@ -80,9 +80,9 @@ described in [Models and configuration](configuration.md#mcp-servers).
 ### Files, search, and saved context
 
 `file` resolves relative paths from the canonical startup directory and leaves
-absolute paths absolute. It reads text, bounded directory or glob listings,
-and PNG, JPEG, GIF, or WebP images. Image reads require a model whose catalog
-declares image input.
+absolute paths absolute. It reads bounded text ranges, efficient text-file
+tails, bounded directory or glob listings, and PNG, JPEG, GIF, or WebP images.
+Image reads require a model whose catalog declares image input.
 
 `grep` uses ripgrep for exact regular-expression or literal search. Semantic
 and hybrid modes use private, disposable sidecar indexes. A ranked read creates
