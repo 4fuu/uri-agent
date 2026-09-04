@@ -30,7 +30,7 @@ itself directly in the body; do not wrap it in JSON or XML. Identify the target
 by its current human name or stable session ID, without an `@` prefix:
 
 ```text
-exec("collaboration://send/Wu Sir?delivery=queue", "Review the parser changes and report risks.")
+exec("collaboration://send/Crane?delivery=queue", "Review the parser changes and report risks.")
 exec("collaboration://send/<session-id>?delivery=steer&reply=requested", "Check this failing test now.")
 ```
 
@@ -465,10 +465,10 @@ Coordinate with other already-running URI Agent processes. This session's
 stable ID is `{session_id}` and its current collaboration name is `{}`.
 
 Before collaborating, choose a short human name that another agent can reason
-about, such as `Bob`, `Wu Sir`, or `Build Scout`:
+about, such as `Nightingale`, `Ferris`, or `Crane`:
 
 ```text
-exec("collaboration://name", "Wu Sir")
+exec("collaboration://name", "Ferris")
 ```
 
 Names are 1 to 40 characters, must contain a Unicode letter or number, may
@@ -491,7 +491,7 @@ Inspect one participant by current name or stable ID. An exact stable ID can
 also report that a saved session is offline:
 
 ```text
-read("collaboration://status/Wu Sir", "")
+read("collaboration://status/Nightingale", "")
 read("collaboration://status/<session-id>?scope=all", "")
 ```
 
