@@ -32,6 +32,8 @@ These documents explain stable concepts and cross-cutting behavior. More specifi
 ## Documentation policy
 
 - Keep root `README.md` and `README.zh-CN.md` equivalent as adoption guides.
+- Keep their dated pi.dev model and provider coverage together and update both
+  from the live catalog when those public figures change.
 - Detailed documents in `docs/` are maintained in English only.
 - Put mutable detail in one authoritative document and link to it instead of copying it.
 - Keep protocol-specific model instructions in `<protocol>://help`; documentation here should explain how the protocol system fits together.

@@ -1,27 +1,27 @@
 # Models and configuration
 
-URI Agent combines the [pi model catalog](https://github.com/earendil-works/pi), live provider model discovery, local provider definitions, layered settings, and process-specific overrides. This document describes model support, authentication, file locations, precedence, and command-line configuration.
-
-Run `uri-agent --help` for the current CLI syntax. In the TUI, `:settings` separates model and Agent values into tabs and shows each value's source or pending state. `:model` and `:model-roles` open the shared Model Hub for conversation models and role assignments.
+URI Agent combines the [pi model catalog](https://github.com/earendil-works/pi),
+provider discovery, local model definitions, layered settings, and process
+overrides. Run `uri-agent --help` for the exact CLI, and use `:settings` to see
+each effective value and its source.
 
 ## First-time setup
 
-URI Agent does not choose a default provider or model. After starting it in a project:
+URI Agent does not choose a default provider or model:
 
 1. Run `:login` to save an API key or complete an available OAuth flow.
-2. Run `:model` to select a runnable model.
-3. Use `:settings` to inspect the effective values.
+2. Run `:model` and select a runnable model.
+3. Use `:settings` to inspect or change model and Agent values.
 
-`:model` lists only providers with a currently configured credential source.
-`:logout` removes a stored credential. If it removes the current provider's
-last credential source, URI Agent also clears that provider's saved default and
-the current session's model instead of switching providers automatically.
-Per-model thinking preferences are retained. Model and credential changes apply
-to the current session without restarting the application.
+The model selector shows only providers with a usable credential source.
+`:logout` removes a stored credential; if that was the current provider's last
+source, URI Agent also clears its saved default and the current session model.
 
 ## Model catalog
 
-URI Agent downloads provider and model records from pi.dev, supplements them from supported providers' model-list APIs and built-in provider catalogs, and merges them with the local `models.json`. The Rust/Rig backend currently runs these API families:
+URI Agent merges pi.dev records, supported provider model-list APIs, built-in
+provider records, and local `models.json`. The runtime supports these pi API
+families:
 
 - `openai-responses`
 - `openai-codex-responses`
@@ -29,89 +29,21 @@ URI Agent downloads provider and model records from pi.dev, supplements them fro
 - `anthropic-messages`
 - `google-generative-ai`
 
-URI Agent also provides a built-in [`abliteration` provider catalog](#abliterationai), an `antigravity` family for the [experimental private protocol](#experimental-antigravity-private-protocol), and authenticated [`workbuddy` cloud discovery](#workbuddy). None is part of the pi.dev coverage count.
+The root [README](../README.md#model-and-provider-coverage) publishes the dated
+catalog coverage visible to prospective users. A catalog entry does not
+guarantee account access; credentials, subscription, region, and provider
+entitlements still apply.
 
-The model selector shows only models using a supported API family whose provider has a configured credential from `models.json`, `auth.json`, or a recognized provider environment variable. The generic `URI_AGENT_API_KEY` and `--api-key` overrides expose only the current provider rather than every catalog provider. Catalog model records are cached without dropping unknown fields so that future metadata survives a read/write cycle. A catalog entry does not guarantee account entitlement: availability still depends on the selected provider, credentials, region, and subscription.
+Provider discovery supplements the shared catalog with models available to the
+current credential. Results are cached per credential so switching accounts
+does not expose another account's discovery results. Pi records win when the
+shared catalog later adds the same provider and model ID. Discovered-only
+records inherit conservative compatibility metadata and omit unverified prices.
 
-Live discovery is enabled for 28 of the 35 runnable pi provider IDs:
-
-```text
-ant-ling, anthropic, baseten, cerebras, deepseek, google, groq,
-huggingface, minimax, minimax-cn, moonshotai, moonshotai-cn, nvidia,
-openai, opencode, opencode-go, openrouter, qwen-token-plan,
-qwen-token-plan-cn, qwen-token-plan-individual, together, xai, xiaomi,
-xiaomi-token-plan-ams, xiaomi-token-plan-cn, xiaomi-token-plan-sgp, zai,
-zai-coding-cn
-```
-
-The built-in `abliteration` provider also supports credential-scoped discovery
-through its authenticated `/v1/models` route; it is omitted from the count
-above because it is not a pi provider ID.
-
-URI Agent does not attempt live discovery for `cloudflare-ai-gateway`, `cloudflare-workers-ai`, `fireworks`, `github-copilot`, `kimi-coding`, `openai-codex`, or `vercel-ai-gateway`: those supported backends do not expose a portable model-list route from which URI Agent can safely construct runnable unknown model IDs.
-
-Provider results are additive. A pi model with the same provider and ID always wins once the cloud catalog catches up. For a model known only to the provider, URI Agent conservatively inherits runtime metadata from the nearest compatible pi model and omits price metadata rather than reporting an unverified cost. These provisional records are marked as discovered in the cache.
-
-`openai-codex-responses` targets the ChatGPT Codex subscription endpoint and uses WebSocket streaming by default. URI Agent supplies the account ID from the OAuth access token, stable session headers and prompt cache key, and the Codex Responses request fields required for reasoning and tool calls. Within a session it reuses an idle connection, retains it for up to five idle minutes or 55 minutes total, and—when request options and history still match—continues from `previous_response_id` while sending only newly appended input. A busy connection is never shared between concurrent requests.
-
-WebSocket setup or transport failure before the first provider event falls back to SSE and disables WebSocket for the rest of that session. A failure after an event is returned instead of replaying the request over SSE, which avoids duplicated text or tool calls. An expired `previous_response_id` is retried once with the full input, and a connection-limit response is retried once on a fresh WebSocket. Requests always set `store: false`.
-
-The active backend applies catalog data relevant to requests and accounting, including:
-
-- context windows, output limits, and tiered prices;
-- text and image input modalities;
-- `reasoning`, `thinkingLevelMap`, and `samplingParams`;
-- request-relevant `compat` values such as token-field names, vLLM priority, adaptive or mid-conversation thinking, strict role or tool handling, and provider-specific thinking formats.
-
-### Abliteration.ai
-
-The built-in provider ID is `abliteration`. It uses the OpenAI Responses API at
-`https://api.abliteration.ai/v1` with bearer authentication and includes
-verified fallback records for `abliterated-model`, `abliterated-model-large`,
-and `abliterated-model-large-v2`. The base model accepts text and images with a
-262,144-token context; both large models are text-only with 1,000,000-token
-contexts. Live `/models` results supplement these records and inherit
-capability metadata without copying unverified prices.
-
-Run `:login` and select Abliteration, or set `ABLITERATION_API_KEY`.
-`ABLIT_KEY` is a lower-precedence compatibility alias. All three models expose
-reasoning effort; Large maps `xhigh` to `max`, while Large V2 maps `medium` to
-`high`, `xhigh` to `max`, and an off request to hidden low reasoning, matching
-the provider's documented behavior.
-
-Reasoning replay is owned by each API adapter rather than by a universal catalog flag. Completed assistant reasoning remains in the typed session message and is serialized back in the provider's required form on later tool rounds. OpenRouter replays structured `reasoning_details`, including encrypted payloads and signed text; OpenAI Responses replays encrypted reasoning items; Anthropic replays signed or redacted thinking; and Gemini replays thought signatures. For an OpenAI-compatible model whose catalog sets `compat.requiresReasoningContentOnAssistantMessages`, URI Agent also adds the required `reasoning_content` field to replayed assistant messages. The catalog's `reasoning` and `thinkingLevelMap` fields control whether and at what effort reasoning is requested; they do not replace this replay logic.
-
-### Cloudflare AI Gateway
-
-`cloudflare-ai-gateway` has an explicit half-dependent catalog boundary. The merged pi.dev and `models.json` catalog remains authoritative for model identity and capability metadata: API family, modalities, context and output limits, reasoning and thinking compatibility, request `compat` fields, and pricing. URI Agent deliberately ignores that provider record's `baseUrl`, `headers`, and `authHeader` fields. This prevents a catalog change from redirecting a Cloudflare account token or presenting it as an upstream OpenAI or Anthropic key.
-
-The dedicated backend follows Cloudflare's [REST API contract](https://developers.cloudflare.com/ai-gateway/usage/rest-api/) and constructs its base locally:
-
-```text
-https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
-```
-
-It supports catalog families `openai-responses`, `openai-completions`, and `anthropic-messages`, producing `/responses`, `/chat/completions`, and `/messages` requests respectively. Other API families are rejected before network I/O. Every request sends `Authorization: Bearer <Cloudflare API token>` and `cf-aig-gateway-id: <gateway ID>`. Anthropic's normal `x-api-key` header is removed so the Cloudflare account token cannot become an upstream provider credential.
-
-Catalog IDs are converted to Cloudflare REST wire IDs: unqualified OpenAI and Anthropic IDs gain `openai/` or `anthropic/`; `workers-ai/@cf/...` becomes `@cf/...`; already namespaced IDs remain unchanged. Because Cloudflare does not expose a portable complete listing for third-party models, URI Agent continues to get identity and capability records from the merged catalog rather than hard-coding or scraping a second model catalog.
-
-Run `:login` and select `cloudflare-ai-gateway`. The three-step prompt collects the API token, account ID, and gateway ID, then saves all three atomically; cancelling any step saves nothing. The `auth.json` entry remains `type: "api_key"` and stores the routing values as `accountId` and `gatewayId` metadata. A blank gateway ID uses `default`. Existing token-only entries must run `:login` once to add the account and gateway metadata. The same values can be supplied as process environment variables:
-
-```bash
-export CLOUDFLARE_API_TOKEN='<cloudflare-api-token>'
-export CLOUDFLARE_ACCOUNT_ID='<cloudflare-account-id>'
-export CLOUDFLARE_GATEWAY_ID='<gateway-id>' # optional; defaults to default
-```
-
-`CLOUDFLARE_API_KEY` remains a lower-precedence compatibility alias for the token. `CLOUDFLARE_API_TOKEN` takes precedence when both are set. Process account and gateway variables override the values saved by `:login`. `URI_AGENT_API_KEY` and `--api-key` can still override the token for the current provider, but they do not supply an account or gateway ID; provide those through `:login` or the Cloudflare-specific variables. A missing account ID fails locally before a provider request.
-
-### Refresh and offline mode
-
-Startup loads the local catalog immediately, then refreshes pi.dev and eligible configured providers in the background after the TUI is available. Pi entries are considered fresh for four hours; provider listings are considered fresh for five minutes. Run `:refresh-catalog`, press `Ctrl+R` in the model selector, or press `r` in Settings to bypass both freshness windows and immediately apply the resulting model configurations. Refreshes are serialized and provider requests run concurrently, so one slow or failing provider does not block cached results from the others.
-
-Live discovery uses each provider's resolved API key or OAuth access token. Providers without a currently usable credential are skipped without a request or warning, including credentials that refer to an unset environment variable. The cache is scoped to a one-way credential fingerprint: raw credentials are never stored in `models-store.json`, and cached models from one account are not exposed after switching credentials. Pi and provider request failures silently retain cached data; catalog probing is opportunistic and never adds errors or warnings to the conversation. Background startup refresh does not execute credentials configured with a leading `!`; an explicit force refresh may execute them through the normal trusted configuration-command path, and discovery is skipped without warning if the command does not produce a usable credential.
-
-Use any of the following to disable all catalog requests and rely on local catalog data:
+Startup loads cached data immediately and refreshes eligible sources in the
+background. Use `:refresh-catalog` or refresh from Model Hub when an immediate
+update is needed. Offline mode disables catalog networking while retaining
+local files and matching cached results:
 
 ```text
 uri-agent --offline
@@ -119,68 +51,54 @@ URI_AGENT_OFFLINE=1 uri-agent
 PI_OFFLINE=1 uri-agent
 ```
 
-Offline mode still loads `models-store.json` and `models.json`, including discovered models cached for the currently resolved credential; it only disables catalog networking.
+### Provider-specific setup
 
-## Authentication
+**Abliteration.ai.** Use provider ID `abliteration`, sign in through `:login`,
+or set `ABLITERATION_API_KEY`; `ABLIT_KEY` is a lower-priority compatibility
+alias. Built-in fallback records remain available when live model discovery
+fails.
 
-`:login` accepts API keys and offers OAuth for these provider IDs:
+**ChatGPT Codex.** Models using `openai-codex-responses` require the
+`openai-codex` OAuth entry created by browser or device-code login. An OpenAI
+Platform API key cannot authenticate the subscription endpoint. WebSocket and
+SSE transport recovery is automatic.
 
-| Provider ID | Login |
-| --- | --- |
-| `abliteration` | Abliteration API key |
-| `cloudflare-ai-gateway` | Cloudflare API token, account ID, and AI Gateway ID |
-| `antigravity` | Experimental Google browser OAuth for the private Antigravity protocol |
-| `anthropic` | Claude Pro/Max browser OAuth |
-| `workbuddy` | WorkBuddy China browser login through `https://copilot.tencent.com` |
-| `openrouter` | Browser PKCE |
-| `openai-codex` | Browser or device-code login |
-| `github-copilot` | Device-code login, including an optional Enterprise domain |
-| `kimi-coding` | Subscription device-code login |
-| `xai` | SuperGrok or X Premium device-code login |
-| `radius` | Browser or device-code login |
-| `parallel` | API key for built-in web search and page extraction |
-| `exa` | API key for built-in web search and page extraction |
-| `tinyfish` | API key for built-in web search and page extraction |
-
-Stored entries in `auth.json` use `type: "api_key"` or `type: "oauth"`. OAuth entries retain refresh data; URI Agent resolves the active credential before each model request and refreshes it within five minutes of expiry rather than refreshing every stored provider during startup. Credential writes and refreshes use a cross-process transaction lock, so concurrent URI Agent processes re-read and merge the current file instead of overwriting each other's updates. The refreshed access token, new expiry, and rotated refresh token are persisted before the request continues; when a provider omits the refresh token, URI Agent retains the previous one rather than replacing it with an empty value. Kimi refresh retries connection failures, HTTP 429, and server errors up to three times with 1-, 2-, and 4-second delays; authentication failures are not retried. On Unix, URI Agent creates `auth.json` and its lock with mode `0600` and the configuration directory with mode `0700`.
-
-Models using `openai-codex-responses` require the `openai-codex` OAuth entry created by the OpenAI browser or device-code login. An OpenAI Platform API key—including `OPENAI_API_KEY`, `URI_AGENT_API_KEY`, or `--api-key`—is not accepted for this subscription endpoint. Model availability is determined by the signed-in ChatGPT account and its subscription.
-
-GitHub Copilot model requests identify as the official Copilot CLI and SDK,
-including the conversation intent and whether the current request was initiated
-by a user message or an Agent tool result. An explicit `X-Initiator` model
-header may override that inference with `user` or `agent`. Authentication keeps
-URI Agent's existing device-code and short-lived Copilot-token exchange; the
-official CLI's raw GitHub-token and enterprise-endpoint lifecycle is not
-partially emulated.
-
-### WorkBuddy
-
-The provider ID is `workbuddy`. Run `:login`, choose **WorkBuddy**, then choose **WorkBuddy China**. Login always targets the Chinese WorkBuddy endpoint `https://copilot.tencent.com`; international, Tencent-internal iOA, and custom enterprise-domain browser routes are not offered. URI Agent does not recognize `codebuddy` as an alias: existing `codebuddy` entries in `auth.json` or `models.json` must be removed or recreated under `workbuddy`.
-
-A WorkBuddy login has a five-minute deadline. It creates browser state through `POST /v2/plugin/auth/state?platform=workbuddy`, opens the returned URL with WorkBuddy version `5.3.14`, and polls the token and account routes once per second. Authentication requests use WorkBuddy's `SaaS` product header and Chinese desktop identity `WorkBuddy/5.3.14 WorkBuddy/5.3.14 CLI/2.115.0`. Token code `11217` and account code `12151` mean the browser flow is still pending; account polling retries HTTP 401 or 403 up to five times. The resulting access token, refresh token, endpoint, `internal` network environment, domain, authentication method, and account identity are saved in `auth.json`; access and refresh secrets are not duplicated in metadata. In WorkBuddy's own environment enum, `internal` identifies its Chinese public SaaS domains and is distinct from the unsupported `iOA` environment.
-
-The state and polling requests reuse one HTTP client but deliberately do not enable a cookie store. The inspected WorkBuddy China desktop client uses Axios's Node transport without a cookie jar; the protocol correlates these requests with the returned `state` value.
-
-WorkBuddy refresh sends the old bearer token and `X-Refresh-Token` to `POST /v2/plugin/auth/token/refresh`, then requires a successful `GET /v2/plugin/accounts`. URI Agent saves a rotated refresh token when returned and preserves the current account while enriching it from the returned account snapshot. The account snapshot is optional during initial login, matching the desktop client, so a temporary account-list failure does not discard an otherwise completed browser login. License failures and disallowed-IP failures are returned as login or refresh errors. A request-phase HTTP 401 refreshes a stored OAuth credential and retries once before any streamed event; API keys and custom bearer tokens are never refreshed.
-
-Model requests use OpenAI Chat Completions streaming at `{endpoint}/v2/chat/completions` and always send `Authorization: Bearer ...`, `X-Requested-With: XMLHttpRequest`, and `X-Product: SaaS`. An API key is also sent as `X-API-Key`, matching WorkBuddy. A signed-in account adds WorkBuddy's domain, user, enterprise, department, tenant, authentication-method, identity-source, and base64-encoded `X-Userinfo` headers. If an API key overrides a stored login, the stored account identity is retained; `CODEBUDDY_AUTH_TOKEN` instead supplies a complete custom bearer session without refresh. The WorkBuddy backend owns the endpoint and authentication headers, so catalog and `models.json` transport fields cannot redirect these credentials or replace their identity headers.
-
-WorkBuddy does not expose a generic `/models` API. After credentials are configured, URI Agent sends an authenticated `GET {endpoint}/v3/config` request with the account identity and product headers. It converts runnable chat records from the response's `data.models` and merges them by model ID with the current pi.dev catalog. The cloud record is authoritative for a `workbuddy` model ID; an explicit user `modelOverrides` entry remains the final metadata layer. Personal WorkBuddy accounts may return no `models` array, so this endpoint alone is not guaranteed to supply a model list.
-
-WorkBuddy cloud configuration is cached for eight minutes and scoped to the credential, account identity, and endpoint. Up to 20 account configurations are retained in `models-store.json`. A failed or empty response keeps the last successful configuration for that scope. A new login refreshes the cloud catalog immediately. URI Agent does not currently bundle WorkBuddy's static product model table, so when `/v3/config` omits models, selectable `workbuddy` models must already exist in pi.dev, the matching cache, or `models.json`.
-
-The reference process variables are supported:
+**Cloudflare AI Gateway.** Run `:login` and supply the Cloudflare token, account
+ID, and gateway ID. A blank gateway ID uses `default`. URI Agent constructs the
+gateway endpoint locally and ignores catalog transport and authentication
+fields for this provider so a catalog change cannot redirect the Cloudflare
+token. It supports catalog models using OpenAI Responses, OpenAI Completions,
+and Anthropic Messages. Process values are also accepted:
 
 ```bash
-export CODEBUDDY_INTERNET_ENVIRONMENT='internal' # Chinese public SaaS; iOA is unsupported
-export CODEBUDDY_BASE_URL='https://custom.example' # model/config endpoint override
-export CODEBUDDY_API_KEY='<workbuddy-api-key>'
-export CODEBUDDY_AUTH_TOKEN='<custom-bearer-token>'
-export CODEBUDDY_REMOTE_CONFIG_DISABLED='true' # optional: do not refresh /v3/config
+export CLOUDFLARE_API_TOKEN='<cloudflare-api-token>'
+export CLOUDFLARE_ACCOUNT_ID='<cloudflare-account-id>'
+export CLOUDFLARE_GATEWAY_ID='<gateway-id>' # optional
 ```
 
-The `CODEBUDDY_*` names above come from the WorkBuddy reference client and remain the supported process-variable contract; they do not create a `codebuddy` provider alias. `CODEBUDDY_BASE_URL` overrides only the cloud-configuration and generation endpoint; it does not add a custom browser-login route or change the refresh endpoint recorded by OAuth. `CODEBUDDY_REMOTE_CONFIG_DISABLED=1|true` disables cloud refresh while leaving a matching cached configuration available. The existing `models.json apiKey` field, including a leading `!command`, is an optional equivalent of WorkBuddy's `apiKeyHelper`. Credential precedence for the `workbuddy` provider from lowest to highest is:
+`CLOUDFLARE_API_KEY` remains a lower-priority token alias. Generic API-key
+overrides can replace the token but do not supply the required account or
+gateway metadata.
+
+**WorkBuddy.** Provider ID `workbuddy` supports the WorkBuddy China browser
+flow at `https://copilot.tencent.com`; international, Tencent-internal iOA, and
+custom browser-login domains are not supported. `codebuddy` is not a provider
+alias. WorkBuddy discovers account models from its product configuration when
+available; otherwise selectable models must already exist in pi.dev, cache, or
+`models.json`.
+
+Reference-client environment names remain supported:
+
+```bash
+export CODEBUDDY_INTERNET_ENVIRONMENT='internal'
+export CODEBUDDY_BASE_URL='https://custom.example'
+export CODEBUDDY_API_KEY='<workbuddy-api-key>'
+export CODEBUDDY_AUTH_TOKEN='<custom-bearer-token>'
+export CODEBUDDY_REMOTE_CONFIG_DISABLED='true'
+```
+
+`CODEBUDDY_BASE_URL` changes model and cloud-configuration endpoints, not the
+browser-login or OAuth refresh endpoints. Credential priority is:
 
 ```text
 auth.json
@@ -191,69 +109,54 @@ auth.json
 < --api-key
 ```
 
-### Experimental Antigravity private protocol
+**Experimental Antigravity.**
 
 > [!WARNING]
-> This integration uses undocumented Google Antigravity OAuth and Cloud Code endpoints. It is unsupported, can change without notice, and may conflict with provider terms or trigger account restrictions. Use it only for protocol experiments with an account you can afford to lose after assessing the applicable terms. Do not treat it as a production or stable authentication path.
+> This integration uses undocumented Google Antigravity OAuth and Cloud Code
+> endpoints. It may change without notice, conflict with provider terms, or
+> trigger account restrictions. Do not treat it as a stable production path.
 
-Like the reference implementation, URI Agent includes the extracted Antigravity OAuth client identity, so `:login` works without environment setup. OAuth requests identify as `vscode/1.X.X (Antigravity/4.3.0)`; generation requests use the corresponding Antigravity 4.3.0 Chrome/Electron fingerprint for the current platform. These unofficial embedded values may stop working or increase the account and provider-terms risks described above. The following process variables remain available as optional overrides:
+Run `:login` and choose **Google Antigravity**. Only the resulting OAuth
+credential is accepted; API-key sources cannot replace it. URI Agent includes
+an extracted client identity for experimentation. These process variables can
+override it when required:
 
 ```bash
 export ANTIGRAVITY_OAUTH_CLIENT_ID='<google-oauth-client-id>'
 export ANTIGRAVITY_OAUTH_CLIENT_SECRET='<google-oauth-client-secret>'
 export ANTIGRAVITY_USER_AGENT='<complete-antigravity-user-agent>'
-# Or override the Antigravity version in the default OAuth and generation fingerprints:
 export ANTIGRAVITY_USER_AGENT_VERSION='<version>'
-uri-agent --cwd /path/to/project
 ```
 
-Overrides must be process environment variables; values saved through `:set-env` are reserved for Agent commands and do not modify URI Agent's own environment. Run `:login`, choose **Google Antigravity**, and select an `antigravity` model. Login uses Google OAuth with PKCE and the `openid` and Cloud Code scopes, discovers the Cloud AI Companion project through `loadCodeAssist`, and runs `onboardUser` when the account has no project yet. New logins store the OAuth client ID that issued the credential, but never its secret; once that metadata is present, refresh stops with a new-login instruction if the current client ID differs, so it does not send a refresh token to the wrong client. A refresh response reporting `invalid_grant` is confirmed once with the same client after 500 milliseconds before the failure is returned. Control and generation requests try the sandbox, daily, and production Cloud Code endpoints in that order when a transport or retryable server error requires fallback. Only the resulting stored OAuth credential is accepted: `models.json apiKey`, provider API-key variables, `URI_AGENT_API_KEY`, and `--api-key` cannot replace it.
+Values saved through `:set-env` configure Agent commands, not URI Agent's own
+OAuth process. New logins bind refresh to their issuing client ID. Set
+`ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment requires a
+custom identity prefix.
 
-The selector exposes canonical models rather than the private low/medium/high route IDs. The selected effort chooses both the private model and its numeric thinking budget:
+## Authentication and credential precedence
 
-| Selector model | Effort routes |
+`:login` accepts API keys and supports these provider-specific flows:
+
+| Provider ID | Login |
 | --- | --- |
-| `gemini-3.8-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
-| `gemini-3.7-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
-| `gemini-3.5-flash` | `low` 1,000; `medium` 4,000; `high` 10,000 |
-| `gemini-3.1-pro` | `low` 1,001; `medium` or `high` 10,001 |
-| `gemini-3.1-flash-lite` | no thinking |
-| `claude-sonnet-4-6` | `off`; `low` 8,192; `medium` 16,384; `high` 24,576; `max` 32,768 |
-| `claude-opus-4-6` | `low` 8,192; `medium` 16,384; `high` 24,576; `max` 32,768 |
+| `abliteration` | API key |
+| `cloudflare-ai-gateway` | API token, account ID, and gateway ID |
+| `antigravity` | Experimental Google browser OAuth |
+| `anthropic` | Claude Pro/Max browser OAuth |
+| `workbuddy` | WorkBuddy China browser login |
+| `openrouter` | Browser PKCE |
+| `openai-codex` | Browser or device-code login |
+| `github-copilot` | Device-code login, with optional Enterprise domain |
+| `kimi-coding` | Subscription device-code login |
+| `xai` | SuperGrok or X Premium device-code login |
+| `radius` | Browser or device-code login |
+| `parallel`, `exa`, `tinyfish` | Web search and extraction API key |
 
-A local `models.json` can overlay individual effort routes when the private service changes:
+OAuth refresh data and API keys are stored in `auth.json`. On Unix, URI Agent
+keeps that file owner-only. Filesystem permissions are the protection boundary;
+stored credentials are not encrypted.
 
-```json
-{
-  "providers": {
-    "antigravity": {
-      "modelOverrides": {
-        "gemini-3.7-flash": {
-          "compat": {
-            "antigravityRoutes": {
-              "high": {
-                "model": "replacement-private-route",
-                "thinkingBudget": 10000,
-                "maxOutputTokens": 65536
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Requests use the private `v1internal:streamGenerateContent` SSE operation. URI Agent sends numeric `thinkingBudget` values, preserves and mirrors Gemini thought signatures across tool rounds, normalizes registered tool schemas and `toolConfig`, and adds stable missing Claude tool IDs. The required `read` and `exec` body remains a concrete string schema through normalization. A 401 refreshes the OAuth token once; a project-header 403 retries once without that header. After these transport-specific repairs and endpoint fallbacks are exhausted, failures retain URI Agent's normal model retry classification and budget.
-
-URI Agent does not inject an Antigravity identity prompt by default. Set `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment explicitly requires a custom prefix.
-
-Known providers use conventional environment variables. Examples include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `GROQ_API_KEY`. Anthropic also recognizes `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN`. Abliteration's canonical variable and alias are documented [above](#abliterationai), Cloudflare AI Gateway's structured variables and compatibility alias are documented in its [provider section](#cloudflare-ai-gateway), and WorkBuddy's variables and provider-specific precedence are documented in the [WorkBuddy section](#workbuddy). The built-in `https` protocol recognizes `PARALLEL_API_KEY`, `EXA_API_KEY`, and `TINYFISH_API_KEY` for web search and page extraction.
-
-### Credential precedence
-
-From lowest to highest priority:
+For ordinary model providers, credential priority is:
 
 ```text
 models.json apiKey
@@ -263,81 +166,62 @@ models.json apiKey
 < --api-key
 ```
 
-The command-line API key is process-only and is not written to `auth.json`.
-
-WorkBuddy follows the provider-specific order in the [WorkBuddy section](#workbuddy), which places the optional `models.json apiKey` helper above its stored credential and `CODEBUDDY_API_KEY` to match the reference client.
-
-Web-provider credentials are independent of the active model. Parallel, Exa,
-and TinyFish resolve a key from `auth.json`, overridden by that provider's
-process environment variable. `models.json apiKey`, `URI_AGENT_API_KEY`, and
-`--api-key` configure model requests and are not web-provider credentials.
+The CLI key is process-only. Known providers use conventional variables such as
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+and `GROQ_API_KEY`. Web-provider credentials are independent of the active
+model and use `PARALLEL_API_KEY`, `EXA_API_KEY`, or `TINYFISH_API_KEY` above a
+stored web credential.
 
 ## Configuration locations
 
-URI Agent stores global configuration in `~/.config/uri-agent` on macOS and Linux. On Windows this is normally `%AppData%\uri-agent`.
-
-On macOS, earlier releases used `~/Library/Application Support/uri-agent`. If that directory still exists, URI Agent moves its complete contents — including session databases — into `~/.config/uri-agent` before loading settings, then deletes the old directory. Existing files in the new location are kept.
-
-Set `URI_AGENT_CONFIG_DIR` to replace the complete configuration directory path. An explicit override is used as-is and does not migrate files from the previous macOS location.
+The default configuration directory is `~/.config/uri-agent` on macOS and
+Linux, and normally `%AppData%\uri-agent` on Windows. Set
+`URI_AGENT_CONFIG_DIR` to replace it. Older macOS installations under
+`~/Library/Application Support/uri-agent` are migrated automatically while
+files already present in the new location are kept.
 
 | Path | Purpose |
 | --- | --- |
-| `<config>/settings.json` | Global provider, model, model-role, plugin-owned, thinking, output, and terminal settings |
-| `<config>/auth.json` | Global provider credentials |
-| `<config>/environment.json` | Global environment variables for Agent shell commands and trusted plugins |
-| `<config>/models.json` | Custom providers, models, headers, and model overrides |
-| `<config>/models-store.json` | Generated pi and credential-scoped provider catalog cache |
+| `<config>/settings.json` | Global model, Agent, role, plugin, and terminal settings |
+| `<config>/auth.json` | Provider credentials |
+| `<config>/environment.json` | Agent environment values |
+| `<config>/models.json` | Custom providers, models, headers, and overrides |
+| `<config>/models-store.json` | Generated catalog and discovery cache |
 | `<config>/keymap.rhai` | Global keymap overrides |
-| `<config>/mcp.json` | User-scoped MCP server definitions |
-| `<config>/wasm-plugins/` | Trusted WASM modules loaded at startup and on reload |
-| `<project>/.agents/mcp.json` | Project-scoped MCP server definitions |
-| `<project>/.uri-agent/settings.json` | Optional project settings |
-| `<project>/.uri-agent/keymap.rhai` | Optional project keymap overrides |
+| `<config>/mcp.json` | User-scoped MCP servers |
+| `<config>/wasm-plugins/` | Trusted WASM modules |
+| `<project>/.agents/mcp.json` | Project-scoped MCP servers |
+| `<project>/.uri-agent/settings.json` | Project settings |
+| `<project>/.uri-agent/keymap.rhai` | Project keymap overrides |
 
-Sessions live in this configuration directory on macOS after the Application Support cutover. On other platforms, sessions and complete tool outputs use platform data and cache directories rather than this configuration directory. See [Session storage and project boundaries](sessions.md#session-storage-and-project-boundaries) and [Complete output preservation](protocols.md#complete-output-preservation).
+Sessions and complete outputs use platform data and cache locations described
+in [Sessions and context](sessions.md) and [Protocols, tasks, and
+output](protocols.md#complete-output-and-diagnostics). Semantic indexes under
+`<platform-cache-dir>/uri-agent/retrieval/v2/` are disposable and rebuilt or
+incrementally refreshed by ranked searches. Retrieval runtime assets are
+installed beside the executable.
 
-Semantic indexes live under `<platform-cache-dir>/uri-agent/retrieval/v1/`,
-separated into code-root, current-session, and all-session namespaces. They are
-derived caches rather than settings or authoritative conversation data and may
-be deleted at any time. A later semantic search requires the corresponding
-index operation to rebuild them. The zvec runtime, Jieba dictionaries, and
-embedding model are installed beside the executable, not downloaded into the
-configuration or cache directory at runtime.
-
-Atomic updates to `settings.json`, project settings, `auth.json`,
-`environment.json`, and user or project `mcp.json` preserve symbolic links at
-those paths. URI Agent resolves complete and dangling multi-hop chains, writes a
-temporary file beside the final target, and leaves the links intact. Auth and
-MCP transaction locks are also based on the final target so different links to
-the same file coordinate. Cyclic chains, chains longer than 40 links, and a
-target that tries to traverse `..` after a missing component are rejected
-without replacing the original link.
-
-The WASM plugin directory follows `URI_AGENT_CONFIG_DIR` but is not a settings field. See [WASM plugins](plugins.md) for loading, installation, and reload behavior.
+Configuration writes are atomic and preserve symbolic links at managed file
+paths. Invalid or cyclic link chains fail without replacing the original.
 
 ## Agent environment
 
-Use `:set-env` to add or replace a variable such as `NPM_TOKEN`. The **Agent environment** row in the Agent tab of Settings opens the complete manager: it displays names without values, `Enter` replaces the selected value, `Ctrl+N` adds a variable, and `Delete` removes one. Value prompts mask their input. Names use the portable form `[A-Za-z_][A-Za-z0-9_]*`.
+Use `:set-env` to add or replace a variable, or open **Agent environment** from
+Settings to list names, update masked values, and remove entries. Names use the
+portable form `[A-Za-z_][A-Za-z0-9_]*`.
 
-Variables are global rather than project- or session-specific. URI Agent stores them as plain text in the private `environment.json` configuration file; on Unix it enforces mode `0600` and keeps the configuration directory at `0700`. Filesystem permissions are the protection boundary—values are not encrypted.
-
-Each future Agent `bash` or `pwsh` command receives the latest saved values. A saved value overrides an inherited process variable with the same name; other process variables remain inherited normally. The manager does not modify URI Agent's own process environment, and variables are deliberately not injected into the user-controlled `:terminal` PTY.
-
-The dedicated linked Rust and WASM host interface requires an explicitly requested whole-environment capability. The request names no individual variables and has no interactive approval flow; it exists as a sensitive-access marker for source review. See [WASM plugin environment access](plugins.md#agent-environment-access).
+Values are global, stored as plaintext in private `environment.json`, and
+injected into future Agent `bash` and `pwsh` commands. They override inherited
+variables with the same name but do not modify URI Agent's process or the
+user-controlled `:terminal` PTY. Trusted linked and WASM plugins must explicitly
+declare whole-environment access before using the host interface.
 
 ## MCP servers
 
-Run `:mcp` to manage URI Agent's own MCP configuration. The panel lists known
-status without connecting every server and supports Add, Edit, Test, Reconnect,
-Enable/Disable, and Remove. Add defaults to Project scope. Editing can move a
-server between User and Project scope; the destination is written before the
-source is removed, and a failed removal is rolled back. Existing names are
-immutable. The add/edit workflow validates the form, automatically tests the
-connection, then shows a review screen; a failed test reports the complete
-error but does not prevent saving.
-
-User definitions live in `<config>/mcp.json`; Project definitions live in
-`<project>/.agents/mcp.json`. Both files use an independent `servers` object:
+Run `:mcp` to add, edit, test, reconnect, enable, disable, or remove URI Agent's
+MCP servers. User definitions live in `<config>/mcp.json`; project definitions
+live in `<project>/.agents/mcp.json`. A project entry completely replaces the
+same user name.
 
 ```json
 {
@@ -348,7 +232,6 @@ User definitions live in `<config>/mcp.json`; Project definitions live in
       "transport": "stdio",
       "command": "github-mcp-server",
       "args": ["stdio"],
-      "cwd": ".",
       "environment": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "GITHUB_TOKEN"
       }
@@ -366,65 +249,40 @@ User definitions live in `<config>/mcp.json`; Project definitions live in
 }
 ```
 
-A Project entry completely replaces the same User name; fields are not merged.
-Enable/Disable edits the effective entry, so disabling an effective User entry
-changes User scope rather than creating a Project override. Removing a Project
-entry removes only that scope and warns when the same User name will become
-effective again. Configuration updates use per-file cross-process locks and
-re-read the current files before writing, so simultaneous URI Agent processes
-do not overwrite one another's unrelated MCP server changes.
-
-Every server requires a nonempty `description`. `stdio` requires `command` and
-keeps `args` as an exact string list rather than splitting a shell command.
-`cwd` may be absolute or project-relative and defaults to the project. The
-child inherits URI Agent's process environment. Each `environment` entry maps a
-child variable name to the name of a global [Agent environment](#agent-environment)
-value, which overrides the inherited value; missing references fail when
-connecting.
-
-Streamable HTTP requires HTTPS except for loopback HTTP addresses, and URLs
-cannot contain username/password credentials. Header templates expand
-`${NAME}` from Agent Environment at connection time, and a missing value fails
-directly. Credential-bearing headers such as
-`Authorization`, `Cookie`, and `X-API-Key` must use such a reference instead of
-storing plaintext credentials. MCP OAuth and the deprecated HTTP+SSE transport
+`stdio` arguments remain an exact string list rather than a shell command.
+Environment mappings name values from [Agent environment](#agent-environment).
+Streamable HTTP requires HTTPS except for loopback addresses; URLs cannot
+contain credentials. Credential-bearing headers must reference Agent
+Environment values instead of storing plaintext secrets. OAuth and HTTP+SSE
 are not supported.
 
-New sessions record enabled server identities and required descriptions without
-connecting or fully validating transports. Newly saved servers therefore join
-only new sessions. Calls from an existing session keep its recorded protocol
-set but resolve the latest transport, URL, and Agent Environment values; a
-configuration change or successful Agent Environment update reconnects an
-existing server before its next operation. A removed or disabled recorded
-server fails on its next call. See [MCP
-protocols](protocols.md#mcp-servers) for routes and argument encoding.
-
-An [ACP v1](acp.md) client may instead provide a complete session-scoped MCP
-profile. That profile does not read or change User or Project `mcp.json` and is
-read-only in the TUI. ACP environment and header values are literal rather than
-Agent Environment references.
+Enabled server names and descriptions join only new sessions. Existing
+sessions retain their protocol set but resolve current transport and credential
+references on each connection. An ACP client may instead provide a complete,
+session-scoped profile; see [ACP v1](acp.md) and [MCP protocol
+behavior](protocols.md#mcp).
 
 ## Settings fields and precedence
 
-`settings.json` and project settings use camel-case JSON fields:
+Global and project settings use camel-case JSON fields:
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `defaultProvider` | Provider selected when no higher-priority override exists | unset |
-| `defaultModel` | Model selected for that provider | unset |
-| `outputLimit` | Maximum bytes returned inline before preserving full output | `32768` |
+| `defaultProvider` | Default provider | unset |
+| `defaultModel` | Default model for that provider | unset |
+| `outputLimit` | Inline tool-result bytes | `32768` |
 | `defaultThinkingLevel` | Fallback reasoning effort | `off` |
-| `modelThinkingLevels` | Per-model effort keyed by `provider/model` | `{}` |
-| `modelRoles` | Named model routes available to linked and WASM plugins | `{}` |
-| `pluginSettings` | Plugin-owned JSON key/value settings grouped by namespace | `{}` |
+| `modelThinkingLevels` | Per-model effort by `provider/model` | `{}` |
+| `modelRoles` | Named model routes for plugins | `{}` |
+| `pluginSettings` | Plugin-owned values grouped by namespace | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
-| `keyDisplay` | Key-hint style: `auto`, `macos`, or `text` | `auto` |
-| `compaction.enabled` | Run threshold and overflow checkpoints automatically | `true` |
-| `compaction.strategy` | Checkpoint mode: `rollover` or `summary` | `rollover` |
-| `compaction.reserveTokens` | Context held back by the automatic-checkpoint threshold | `16384` |
-| `compaction.keepRecentTokens` | Approximate recent replay retained by `summary` | `20000` |
+| `keyDisplay` | `auto`, `macos`, or `text` hints | `auto` |
+| `compaction.enabled` | Enable automatic checkpoints | `true` |
+| `compaction.strategy` | `rollover` or `summary` | `rollover` |
+| `compaction.reserveTokens` | Context reserved before checkpointing | `16384` |
+| `compaction.keepRecentTokens` | Approximate recent replay kept by summaries | `20000` |
 
-Settings are resolved from lowest to highest priority:
+Settings resolve from lowest to highest priority:
 
 ```text
 built-in default
@@ -434,66 +292,31 @@ built-in default
 < command-line flag
 ```
 
-Relevant environment variables are:
+Process overrides include `URI_AGENT_PROVIDER`, `URI_AGENT_MODEL`,
+`URI_AGENT_OUTPUT_LIMIT`, `URI_AGENT_THINKING`, `URI_AGENT_TERMINAL`, and
+`URI_AGENT_KEY_DISPLAY`. TUI changes write project settings when that file
+already exists; otherwise they write global settings. Process overrides remain
+in force and are not replaced by those writes.
 
-| Variable | Setting |
-| --- | --- |
-| `URI_AGENT_PROVIDER` | Provider |
-| `URI_AGENT_MODEL` | Model |
-| `URI_AGENT_OUTPUT_LIMIT` | Inline output bytes |
-| `URI_AGENT_THINKING` | Thinking level |
-| `URI_AGENT_TERMINAL` | Embedded terminal command |
-| `URI_AGENT_KEY_DISPLAY` | Key-hint style |
+Compaction fields merge individually. For small model windows, reserve and
+recent-history budgets are capped at one quarter of the context window. Agents
+without the `context` protocol and Agents with a legacy compaction callback use
+`summary` even when `rollover` is configured. See [Sessions and
+context](sessions.md#context-windows-and-checkpoints).
 
-When the project settings file already exists, changes made through model selection, model-role selection, Settings, `:effort`, and `:set-terminal` are written there. Otherwise they are written to global `settings.json`. Environment and CLI overrides remain in force for the current invocation and are not replaced by those writes.
+### Thinking effort
 
-Compaction fields merge individually across global and project settings. Token values must be greater than zero. For models with small context windows, the effective reserve and recent-history budgets are each capped at one quarter of the model context window. `rollover` starts a fresh model window and recovers through titled notes and bounded history; `summary` generates and retains the legacy summary handoff. Agents without the `context` protocol and Agents with a legacy compaction callback use `summary` regardless of the configured strategy. Disabling automatic checkpoints also disables automatic provider-overflow recovery; `:compact` remains available. `:context-strategy` changes only the active runtime and does not rewrite settings.
+Supported values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+`max`; the active model determines which are selectable. `:effort` persists a
+per-model choice in `modelThinkingLevels`. `defaultThinkingLevel` is the file
+fallback, while `URI_AGENT_THINKING` and `--thinking` override it for one
+invocation.
 
-`keyDisplay: "auto"` uses macOS symbols when URI Agent itself runs on macOS and text labels elsewhere. Set it to `"macos"` when a macOS terminal is controlling URI Agent on a remote non-macOS host, or to `"text"` to force labels such as `Ctrl+R` and `Shift+Enter`. The resolved macOS style also adds Command aliases for Settings, paste, undo, and redo without removing the portable Control and Option bindings. A terminal may consume Command shortcuts before URI Agent receives them, so the portable bindings remain available. Keymaps and their display style are loaded when the TUI starts.
+### Model roles and plugin settings
 
-```json
-{
-  "keyDisplay": "macos",
-  "compaction": {
-    "enabled": true,
-    "strategy": "rollover",
-    "reserveTokens": 16384,
-    "keepRecentTokens": 20000
-  }
-}
-```
-
-## Thinking effort
-
-Thinking defaults to `off`. Supported values are:
-
-```text
-off, minimal, low, medium, high, xhigh, max
-```
-
-The active model determines which levels are available. Run `:effort` to open a selector containing only supported levels; the current effective level is selected when the panel opens.
-
-`:effort` and the Thinking row in Settings persist the selection in `modelThinkingLevels` under `provider/model`. Switching models restores that model's saved value. `defaultThinkingLevel` is the file-level fallback; `URI_AGENT_THINKING` and `--thinking` override it for the current invocation.
-
-## Model roles for plugins
-
-URI Agent provides one built-in role, `small`, as a semantic route rather than
-a hard-coded catalog model. It starts without a model assignment: selecting the
-conversation model does not change it. Other roles are custom and exist only
-after they are explicitly added.
-
-Use `:model-roles` to open Model Hub's Roles tab. The list shows each role's
-assignment, thinking effort, and global or project source; a project override
-of a same-named global role is marked in the source column. `Ctrl+N` adds a
-custom role without leaving the Hub. `Enter` first selects a runnable model and
-then one of that model's supported thinking levels; `Esc` returns one step and
-saving returns to the role list. `Delete` asks for confirmation before removing
-the explicit assignment and identifies the affected scope. Removing a project
-override reveals the same-named global assignment. Unassigning `small` leaves
-it in the list; removing the only assignment for a custom role removes it from
-the list.
-
-`modelRoles` stores explicit role assignments:
+The built-in `small` role starts unassigned. Use `:model-roles` to assign it or
+create custom roles. Global and project assignments are layered by complete
+role name:
 
 ```json
 {
@@ -502,81 +325,34 @@ the list.
       "provider": "anthropic",
       "model": "claude-sonnet-4-5",
       "thinking": "high"
-    },
-    "commit": {
-      "provider": "openai",
-      "model": "gpt-5.2",
-      "thinking": "low"
     }
   }
 }
 ```
 
-Role names contain only ASCII letters, digits, `-`, and `_`. A same-named
-project role replaces the complete global role. `provider` and `model` are
-required and must identify a runnable catalog model. When `thinking` is
-omitted, resolution uses that model's `modelThinkingLevels` entry and then
-`defaultThinkingLevel`. Lookup is dynamic, returns no credential, and does not
-alter the current session.
+Role names use ASCII letters, digits, `-`, and `_`. Provider and model must
+identify a runnable catalog model. When `thinking` is omitted, resolution uses
+the model-specific choice and then the default. Plugins resolve roles
+dynamically without changing the conversation model; an Agent freezes its
+resolved provider, model, and effort after the first durable submission.
 
-Plugins store their own settings independently of role assignments. Each
-namespace contains arbitrary JSON values keyed by the plugin. For example, the
-built-in terminal-title plugin defaults to `small` and stores an explicit role
-selection like this:
+`pluginSettings` is a separate, project-overridable JSON namespace for trusted
+plugin configuration. It is not a credential store or permission boundary.
 
-```json
-{
-  "pluginSettings": {
-    "terminal-title": {
-      "role": "review"
-    }
-  }
-}
-```
+## CLI modes
 
-A project value overrides the same global namespace and key without replacing
-the plugin's other global keys. Linked plugins choose their namespace through
-`PluginHost::settings`; a WASM plugin automatically uses its `.wasm` filename
-stem. Keys and namespaces may not contain control characters, `.`, `/`, or
-`\\`; each must be nonempty and at most 128 bytes. One encoded value may not
-exceed 1 MiB. These values are trusted plugin configuration, not a secret store
-or permission boundary.
+Run `uri-agent --help` for current names, conflicts, and accepted values.
+Notable modes are:
 
-Linked plugins can register `CommandTarget::ModelRole` to open the generic role
-selector and persist the result as one of these string values, or provide their
-own settings UI. The built-in `:terminal-title-role` (`:title-role`) command
-uses that selector. A plugin decides its own default and missing-role behavior;
-terminal-title uses `small` only when the setting is absent and silently skips
-generation if the selected role cannot run.
+- native TUI session selection remains scoped to canonical `--cwd`;
+- `--background` runs opted-in resident plugins under external supervision and
+  does not daemonize or schedule jobs;
+- `--acpv1` serves ACP over stdin/stdout, with project directories supplied by
+  the client. See [ACP v1](acp.md).
 
-Plugins may resolve a role and use its provider, model, and thinking values to
-construct an `AgentSpec`. Agent provider/model and thinking freeze after the
-first durably accepted submission, so later role or configuration changes do
-not retarget that Agent. See [Agent sessions](sessions.md#agenthost-and-agent-specifications).
+## Custom providers and dynamic values
 
-## Command-line options
-
-Command-line flags can override the provider, model, process-only API key, project working directory, thinking effort, inline output limit, and offline catalog behavior. They can also resume the latest project session or a project-scoped session ID. Run `uri-agent --help` for the exact names, accepted values, and current syntax.
-
-`--background` omits the TUI and runs opted-in resident plugins while remaining
-foreground-blocking for an external supervisor. It does not daemonize, schedule
-jobs, or provide a trigger or gateway service. See [Resident plugins](plugins.md#resident-plugins).
-
-`--continue-session` and `--session` conflict. Session selection remains scoped to the canonical `--cwd`; see [Sessions and context](sessions.md).
-
-`--acpv1` serves stable ACP v1 over stdin/stdout instead of starting the TUI.
-The ACP client supplies each session's absolute working directory, so this flag
-conflicts with `--cwd`, native session selection, and `--background`. A single
-ACP process may host independent sessions for multiple project directories,
-with separate project configuration and Agent runtimes. Configure
-authentication before starting ACP. The default model or usual command-line
-overrides initialize each pending session; compatible clients may select an
-authenticated model and thinking level before the first prompt without changing
-those defaults. See [ACP v1](acp.md) for the client and session contract.
-
-## Custom providers and model overrides
-
-Add a provider to `models.json` for a local or custom OpenAI-compatible endpoint:
+Define a local or custom OpenAI-compatible provider in `models.json`:
 
 ```json
 {
@@ -598,52 +374,15 @@ Add a provider to `models.json` for a local or custom OpenAI-compatible endpoint
 }
 ```
 
-Provider entries may also define headers, compatibility values, authentication-header behavior, or model overrides. Local definitions are merged with downloaded catalog records. After editing `models.json`, refresh or reload Settings before selecting the new model.
+Provider entries may also define headers, compatibility values, authentication
+behavior, and model overrides. Only models whose final API belongs to a
+supported family are runnable. Reload Settings or refresh the catalog after
+editing the file.
 
-`openai-responses` sends `max_output_tokens` by default. For a compatible
-gateway that rejects that field, disable it through provider or model
-compatibility metadata:
-
-```json
-{
-  "providers": {
-    "responses-proxy": {
-      "baseUrl": "https://gateway.example/v1",
-      "api": "openai-responses",
-      "apiKey": "${RESPONSES_PROXY_API_KEY}",
-      "compat": {
-        "supportsMaxOutputTokens": false
-      },
-      "models": [
-        {
-          "id": "gateway-model",
-          "name": "Gateway Model",
-          "contextWindow": 131072,
-          "maxTokens": 16384
-        }
-      ]
-    }
-  }
-}
-```
-
-Only models whose final `api` belongs to a supported API family are runnable.
-
-## Dynamic credential and header values
-
-API keys and configured header values support pi-style environment expansion. They may also begin with `!` to execute a shell command and use its trimmed standard output:
-
-```json
-{
-  "providers": {
-    "example": {
-      "apiKey": "!secret-tool read model-key"
-    }
-  }
-}
-```
-
-Command values run when the credential or header is first needed, not while URI Agent starts. They time out after 10 seconds and are cached for the process. On Windows they run through PowerShell; on other platforms they run through `sh -c`. Standard input is closed, standard output and error are captured, and unrelated inherited file descriptors are closed on Unix. The command and remaining descendants are terminated when the root command exits or the deadline expires; a timeout is returned only after the root process has been reaped.
+API keys and headers support pi-style environment expansion. A value beginning
+with `!` executes a shell command when first needed and uses trimmed stdout;
+the result is cached for the process.
 
 > [!WARNING]
-> A leading `!` executes with the permissions of URI Agent. Do not load credential or header configuration from an untrusted project.
+> A leading `!` executes with URI Agent's permissions. Do not load credential
+> or header configuration from an untrusted project.

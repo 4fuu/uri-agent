@@ -1,130 +1,102 @@
 # Architecture and development
 
-URI Agent is a stable-Rust terminal application. Its architecture is organized around a fixed model interface, registered protocols, append-only sessions, and one generic TUI surface. This document is the detailed engineering reference linked from [`AGENTS.md`](../AGENTS.md).
+URI Agent is a stable-Rust terminal application organized around a fixed model
+interface, registered extensions, append-only sessions, and one generic TUI.
+This is the engineering reference linked from [`AGENTS.md`](../AGENTS.md).
 
 ## System shape
-
-The application assembles capabilities at startup, freezes the model context for a new session, and then runs the model/tool loop against the registered protocols:
 
 ```text
 CLI + files + environment
           |
           v
-  configuration + pi catalog
+configuration + catalogs + startup discovery
+          |
+          +----> plugin and protocol descriptors
+          |                  |
+          |                  v
+          |          generated system prompt
+          |                  |
+          v                  v
+tool / protocol / command / TUI registries
+          |                  |
+          v                  v
+      runtime model loop <-> append-only SQLite session
           |
           v
-built-in plugins + discovered Skills
-          |
-          +----> protocol descriptors + prompt fragments
-          |                         |
-          |                         v
-          |                generated system prompt
-          |                         |
-          |                         v
-          |                 frozen SessionContext
-          v                         |
-protocol / model-tool / command / TUI registries <------------+
-          |
-          v
-   runtime model loop <----> append-only SQLite session
-          |
-          v
-generic tool dispatch ----> protocol or direct tool ----> bounded or preserved output
+generic tool dispatch -> protocol or direct tool -> bounded output
 ```
 
-For a resumed session, the stored `SessionContext` and session-scoped protocol
-records replace newly generated prompt, protocol, and Skill context. Current
-startup discovery must not reinterpret historical sessions.
+New sessions freeze generated prompt, protocol, and Skill state. Resumed
+sessions restore that snapshot instead of reinterpreting current startup
+discovery.
 
 ## Repository map
 
 | Path | Ownership |
 | --- | --- |
-| `src/main.rs` | Application assembly, plugin installation, Skill registration, and runtime/TUI wiring |
-| `src/acp/` | Stable ACP v1 transport, schema mapping, session ownership, and native-event projection |
-| `src/catalog.rs`, `src/catalog/` | pi.dev, built-in, and provider cloud model catalogs, including WorkBuddy cloud discovery, credential-scoped cache, `models.json` overlays, model limits, and pricing |
-| `src/config.rs` | CLI parsing, layered settings, credential files, environment overrides, and dynamic values |
-| `src/atomic_file.rs` | Symlink-preserving target resolution shared by atomic configuration writes and their transaction locks |
-| `src/model/` | Public model contracts, failure classification, catalog-driven request transforms, Rig provider adapters, dedicated Cloudflare AI Gateway and WorkBuddy boundaries, Codex WebSocket and experimental Antigravity transports, and multimodal support |
-| `src/oauth/`, `src/oauth/providers/` | OAuth provider registration, browser and device flows, token refresh, and WorkBuddy session identity and authenticated headers |
-| `src/agent.rs` | Process-wide `AgentHost`, Agent specifications and handles, depth enforcement, child lifecycle, and background resident execution |
-| `src/clipboard.rs` | Cross-platform clipboard text and image reads, with image PNG encoding |
-| `src/prompts.rs` | Initial system prompt, model-facing tool descriptions, and shared result formatting |
-| `src/protocol.rs` | `Protocol`, text and image read output, descriptors, registry, address splitting, dispatch, and output presentation |
-| `src/builtins/` | Built-in project-instruction, embedded-documentation, context notes/history, file, grep, session archive, HTTPS, MCP, exact replacement, Codex patch, unified tasks, Bash, PowerShell, and model-tool plugins, including protocol help, direct-tool schemas, and provider-specific internals |
-| `src/retrieval/` | Fixed Model2Vec embedding, zvec schema and lifecycle, atomic versioned semantic indexes, code scanning, and semantic/hybrid ranking shared by grep and conversation search |
-| `src/plugin.rs` | Plugin declarations, startup notices, system prompt fragments, permissions, persistent settings, and model-tool, protocol, command, generic panel, status, composer completion, and submission-effect registration |
-| `src/process.rs` | Cross-platform child-process isolation, process-tree ownership, termination, and root-process reaping |
-| `src/tool_download.rs` | PATH-first resolution and pinned, checksummed fallback installation for plugin-managed executables |
-| `src/wasm_plugin.rs` | Persistent module discovery, manager protocol help, Extism ABI and host calls, dynamic protocol and model-tool routing, trusted permissions, and atomic reload |
-| `sdk/` | ABI-v6 Rust guest types, export macro, and built-in protocol, Agent, state, resident, model-role, and plugin-setting host calls |
-| `src/plugin_state.rs` | Separate global/project plugin-state SQLite storage, revisions, and compare-and-set |
-| `examples/wasm-plugin/` | Buildable Rust guest plugin example |
-| `src/task.rs` | In-process task lifecycle, foreground-to-background promotion, capacity, progress, waiting, cancellation, records, and notices |
-| `src/output.rs` | Inline output limits, previews, complete-output persistence, and per-session JSONL diagnostics |
-| `src/skill.rs` | Skill discovery, frontmatter, protocol naming and help, snapshots, and resource containment |
-| `src/session.rs` | SQLite schema, session boundaries, frozen context, events, drafts, checkpoints, and replay |
-| `src/compaction.rs` | Context estimation, checkpoint strategies, complete-turn summary boundaries, summaries, and retained history |
-| `src/runtime.rs` | User turns, image attachments, model/tool loop, tool-call correlation, low-context reminders, and checkpoint triggers |
-| `src/keymap.rs` | Built-in Rhai mappings and global/project overrides |
-| `src/terminal.rs` | Embedded PTY lifecycle, emulation, resize, and input encoding |
-| `src/oauth/` | OAuth orchestration, callbacks, device codes, shared token parsing, and provider-owned login and refresh flows |
-| `src/tui.rs`, `src/tui/` | Public TUI facade, conversation state, composer, controller/input handling, rendering, animation, Markdown, model selection, and focused tests |
+| `src/main.rs` | Application assembly and runtime/TUI wiring |
+| `src/acp/` | ACP v1 transport, sessions, content mapping, and MCP handoff |
+| `src/catalog.rs`, `src/catalog/` | Pi, built-in, provider, and user model catalogs |
+| `src/config.rs` | CLI, settings, credentials, environment, and precedence |
+| `src/oauth/` | Provider login and refresh flows |
+| `src/model/` | Model contracts, request transforms, and provider adapters |
+| `src/agent.rs` | Process-wide Agent ownership, depth, and lifecycle |
+| `src/plugin.rs` | Linked plugin declarations and extension registries |
+| `src/protocol.rs` | Protocol contract, routing, dispatch, and output projection |
+| `src/prompts.rs` | Initial prompt, tool descriptions, and shared formatting |
+| `src/builtins/` | Linked protocols, direct tools, commands, and providers |
+| `src/retrieval/` | Model2Vec/zvec indexing and semantic or hybrid ranking |
+| `src/task.rs` | Managed work, waiting, cancellation, and notices |
+| `src/output.rs` | Inline limits, complete output, and diagnostics |
+| `src/skill.rs` | Skill discovery, naming, snapshots, and resource containment |
+| `src/session.rs` | SQLite schema, events, drafts, checkpoints, and replay |
+| `src/compaction.rs` | Rollover and summary checkpoint strategies |
+| `src/runtime.rs` | User turns, model/tool loop, retries, and checkpoint triggers |
+| `src/keymap.rs`, `src/terminal.rs` | Key bindings and embedded PTY behavior |
+| `src/tui.rs`, `src/tui/` | Conversation state, controllers, rendering, and UI tests |
+| `src/wasm_plugin.rs` | WASM discovery, ABI, permissions, and dynamic dispatch |
+| `src/plugin_state.rs` | Global and project plugin-state databases |
+| `src/process.rs`, `src/atomic_file.rs` | Process-tree and atomic-file primitives |
+| `src/tool_download.rs` | Pinned fallback downloads for plugin-managed tools |
+| `sdk/`, `examples/wasm-plugin/` | Guest ABI, SDK, and buildable example |
 
-Put behavior in the module that owns the corresponding state and contract. Before adding a wrapper, helper, or type, check whether changing the existing source of truth is clearer. A one-use abstraction is justified only when it enforces a named invariant or removes real complexity.
+Put behavior in the module that owns its state and contract. Add a helper or
+type only when it enforces a named invariant, removes real duplication, or
+matches an established reusable boundary.
 
 ## Linked Rust extensions
 
-First-party capabilities use the plugin path exposed to linked Rust extensions:
+A [`Plugin`](../src/plugin.rs) declares prompt fragments, permissions, session
+records, protocols, typed model tools, commands, and generic TUI providers.
+`PluginRegistry` validates declarations against installed capabilities, rejects
+name collisions, and preserves prompt-fragment order before a new session is
+frozen.
 
-1. A [`Plugin`](../src/plugin.rs) may declare protocol and direct model-tool descriptors, startup notices, and a system prompt fragment that is added before a new session's prompt is frozen. A plugin with configuration-derived protocols may instead own stable session protocol records whose descriptors are restored before a resumed session installs capabilities.
-2. `PluginRegistry` validates descriptor names, session-record ownership, and tool schemas, rejects duplicates, requires declarations to match installed capabilities, collects notices, and preserves registration order for prompt fragments.
-3. Plugins install model tools, protocols, commands, panel providers, status providers, composer completion providers, and submission effects through `PluginHost`; they may resolve model roles, use plugin settings or separately permissioned state, create child Agents through the process-wide `AgentHost`, and opt into resident callbacks, while prompt-only plugins need no runtime registration.
-4. Simple string-input capabilities remain behind `read` and `exec`; typed or escape-heavy operations should register a direct model tool, while commands join the searchable panel and key-bindable command registry.
+Simple string-input operations belong behind `read` or `exec`; structured or
+escape-heavy operations use typed direct tools. Commands join the shared
+registry, and extension UI returns semantic state for generic panels, status,
+composer completion, or submission effects. Keep operational behavior in those
+registered interfaces rather than prompt prose.
 
-Sensitive or model-consuming host access uses explicit plugin permissions. Environment, credentials, downloads, Agents, and separate plugin state are refused when undeclared. These declarations are audit markers for trusted source, not approval state. Model-role lookup and project-overridable `PluginSettings` require no permission.
+Environment, credentials, downloads, Agents, and separate plugin state require
+declared permissions. These are source-audit markers for trusted code, not
+interactive approval. Model roles and project-overridable plugin settings do
+not require permissions.
 
-A linked plugin can register `CommandTarget::ModelRole` with its settings
-namespace, key, and default role to reuse the generic TUI selector. The
-selection is an ordinary value under `pluginSettings`, separate from the
-`modelRoles` route definitions. Agent creation selects prompt mode and all or
-exact named tool/protocol sets in `AgentSpec`; no generic model-facing Agent
-creation protocol or tool is registered.
-
-TUI extensions return stateful semantic panel rows, tones, selection, cursor and
-key-hint state; semantic status items; text replacement candidates for the
-composer; or failure-isolated effects for an accepted submission. The generic
-TUI renders panel state and forwards keyboard, paste, page, selection, and
-activation events while the provider owns its workflow and data. Completion
-of provider-owned background work calls the panel context's wake handle; the
-next mutable `view` call consumes that completed state without blocking input.
-Hints with actions receive generic mouse hit regions and are forwarded as the
-same action events as key bindings. Composer completion
-providers receive the current lines and character-based cursor position, then
-return a replacement range and labeled candidates; the TUI owns popup
-rendering, stale-result rejection, selection, and insertion. Status providers
-run while frames are drawn, so they must be fast and non-blocking. Keep
-operational behavior inside registered protocols, commands, panel providers,
-or submission providers; reserve prompt fragments for context required before
-the first tool call.
-
-URI Agent links one fixed native dynamic library: the bundled zvec core used by
-first-party semantic retrieval. This is not a general native plugin ABI.
-Third-party runtime protocols and direct tools continue to use the trusted
-[WASM plugin](plugins.md) path.
+URI Agent links one fixed native dynamic library for first-party zvec retrieval.
+It is not a general native plugin ABI; third-party runtime extensions use the
+trusted [WASM path](plugins.md).
 
 ## Native retrieval assets
 
-Each URI Agent release is matched to one exact `zvec-rust` crate, zvec native
-archive, Jieba dictionary revision, and Model2Vec model revision. The
-checksummed mapping and supported release targets live in
+Each release binds an exact zvec crate and native archive, Jieba dictionary,
+and Model2Vec revision. Checksums, targets, and staging layout live in
 [`scripts/prepare-retrieval-assets.py`](../scripts/prepare-retrieval-assets.py).
-Release archives place the dynamic library beside `uri-agent` and model and
-dictionary files under `retrieval/`; runtime resolution is relative to the
-actual executable. The application crate is not published independently
-because a standalone Cargo-installed executable would omit these assets.
+The application crate is not published independently because a Cargo-installed
+binary would omit these matched assets.
 
-For a native Unix development build, prepare and stage the complete bundle:
+For a native Unix development build:
 
 ```bash
 target=x86_64-unknown-linux-gnu # or aarch64-unknown-linux-gnu / aarch64-apple-darwin
@@ -136,10 +108,9 @@ LD_LIBRARY_PATH="$stage${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   "$stage/uri-agent" --version # use DYLD_LIBRARY_PATH="$stage" on macOS
 ```
 
-The Windows target is `x86_64-pc-windows-msvc` and uses `uri-agent.exe` plus
-`zvec_c_api.dll`. Retrieval assets are never fetched by the running
-application. To exercise the native collection, embedding, FTS, and hybrid
-path after preparing the host assets, run:
+Windows uses target `x86_64-pc-windows-msvc`, `uri-agent.exe`, and
+`zvec_c_api.dll`. To exercise the complete native retrieval path after staging
+host assets:
 
 ```bash
 URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
@@ -150,155 +121,92 @@ URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
 
 ## Architectural contracts
 
-### Model-facing interface and protocols
+### Registration and model interface
 
-- Linked plugins register `read`, `exec`, typed `replace`, and typed
-  `apply_patch`; runtime WASM plugins may register additional model tools.
-- Runtime dispatch is generic over the model-tool registry and must not
+- Runtime dispatch is generic over registered model tools and must not
   special-case tool names.
-- Every model tool, including `read` and `exec`, is declared and installed by a
-  plugin rather than coupled to the runtime.
-- `read` and `exec` require a string `body`. Split protocol addresses only at
-  the first `://`, then pass the opaque remainder and body, including `""`, to
-  the selected protocol unchanged.
-- Protocol names are unique. Every protocol implements `read` so its mandatory
-  `<protocol>://help` route is available; it may additionally implement `exec`.
-- A protocol may declare ordered shared-help dependencies through the generic
-  protocol contract. Dependencies must be registered and selected with the
-  dependent protocol; the runtime requires their help reads before the
-  dependent protocol's still-mandatory own help read.
-- Each protocol documents its exact model-facing operation contract at `<protocol>://help`; implementation, tests, and help must remain synchronized.
-- Linked protocols that return images use `Protocol::read_output` and retain a
-  textual result for transcript presentation. The runtime carries images as
-  typed model content, rejects them for text-only models, and persists them in
-  the correlated model-message boundary. Ordinary `Protocol::read`
-  implementations remain text-compatible through the default adapter.
-- Keep protocol bodies semantically plain text when practical. Put operation
-  selection and bounded options in the protocol-owned URI path or query. If a
-  capability needs complex structured arguments, or its common calls require
-  substantial escaping, register a typed direct model tool through the owning
-  plugin instead of encoding that payload in a protocol body. Do not embed
-  every capability in the initial prompt.
-- Reserve plugin system prompt fragments for context the model must receive before its first tool call. Prompt-only plugins do not need to register a protocol.
-
-The shared routing and execution lifecycle is in [Protocols, tasks, and output](protocols.md).
+- Every tool is declared and installed by a plugin. Protocol names and tool
+  names are unique.
+- `read` and `exec` always receive a string body. The registry splits only the
+  first `://` and passes the opaque remainder and body unchanged.
+- Every protocol implements its mandatory help read. Exact protocol behavior
+  belongs to `<protocol>://help`; implementation, tests, and help change
+  together.
+- Protocol images remain typed model content while retaining a textual
+  transcript projection. Text-only models reject image content.
+- System-prompt fragments contain only context required before the first tool
+  call. Full operation instructions remain on demand.
 
 ### Execution and persistence
 
-- Protocol execution returns its final result directly by default.
-- Use a managed task only when an operation necessarily runs long enough that keeping the tool call open is inappropriate, or when the caller explicitly requests background execution.
-- Managed task acceptance is not completion. Status, latest output, final content, and cancellation remain available through the unified `tasks` protocol.
-- URI syntax belongs to its protocol; the registry must not interpret protocol-specific options.
-- Shell cancellation terminates child processes, waits for root-process cleanup, and only then settles the managed task.
-- File writes remain atomic. Exact replacement rejects missing and ambiguous matches.
-- Patch application preflights the complete in-memory plan before writing and
-  rolls back every affected file after a commit failure.
-- Preserve oversized output in the session output directory and return a readable `file://` address.
-- Keep model-facing tool results separate from user-facing detail and diagnostic
-  metadata. Diagnostics may record identifiers, field names, sizes, timing, and
-  state, but not raw arguments, credentials, environment values, or successful
-  tool output.
-- Contain Skill resource reads within the frozen Skill directory, including after following symlinks.
-- Freeze the complete generated system prompt and each selected Skill's name, description, and canonical `SKILL.md` path when creating a session.
-- Resume from the frozen snapshot rather than regenerating current prompt or Skill state.
-- Session events are append-only. Rollover and summary change model replay by adding a checkpoint; they do not delete original events.
-- Rollover replay contains only its host bootstrap and subsequent model messages. The bootstrap must direct the model to `context://help`, active notes, and bounded prior-window history; protocol-help state resets at the boundary.
-- A model-requested rollover is committed only after every tool call from that response has a correlated durable result. Context-note persistence events are sidecar state and cannot change replay; the originating tool call and result remain in the active provider prefix.
-- Recoverable conversation records use session-local `r<sequence>` anchors and the same type projection in `context` and `sessions`. Every `context://` or `sessions://` call and correlated result must remain absent from those recovery views.
-- Semantic indexes are derived private sidecars. Their manifest must bind the
-  per-source revisions and digest, extractor, schema, zvec release, model
-  revision and checksums, dimension, and metric. Ranked reads ensure the cache
-  on demand and must recheck source revisions before returning results. Normal
-  refresh loads and rewrites only changed sources; filters that affect result
-  eligibility run in zvec before top-k ranking. Refresh invalidates the
-  manifest before mutation and republishes it only after a successful flush;
-  forced rebuilds hold a cross-process writer lock and activate a complete
-  replacement atomically. Cancellation between native operations must never
-  leave a partial index advertised as current. Unix cache directories and
-  metadata remain owner-only.
-- Persist each transcript/model-replay message boundary in one transaction; streaming deltas are transient.
-- Preserve provider tool-call identity during replay.
-- Keep detached turns owned until completion. Session switching leaves them running; process exit cancels, durably settles, and joins them.
-- Treat the canonical launch directory as the project boundary for attachments and session selection.
+- Operations return final results directly unless they necessarily become long
+  running or the caller explicitly requests managed work.
+- Task acceptance is not completion. Terminal state and complete output remain
+  available after resume; processes themselves do not restart.
+- Cancellation owns and reaps process trees before work settles.
+- File edits are atomic. Patch application preflights all files and rolls back
+  a partial commit.
+- Oversized results preserve complete bytes and return a readable address.
+  Diagnostics never copy secrets, raw arguments, or successful tool output.
+- Session events are authoritative and append-only. Derived indexes may be
+  removed and rebuilt without changing replay.
+- A transcript/model message boundary commits in one transaction, including
+  correlated tool results and typed image content.
+- Rollover and summary add checkpoints rather than deleting history. Resumed
+  sessions use frozen startup state and preserve provider tool-call identity.
+- Recovery views share stable record anchors and exclude their own protocol
+  calls so searches do not recursively alter the indexed corpus.
+- Semantic caches bind source revisions and retrieval assets, verify freshness
+  before ranked reads, and never advertise partial updates as current.
 
-The exact Skill rules are in [Startup context and Skills](context.md); persistence and context checkpoints are in [Sessions and context](sessions.md).
+### Configuration, providers, and UI
 
-### TUI and extensions
-
-- The TUI is one conversation surface. Do not introduce Browse, Insert, or Detail modes, a slash-command syntax, or a second command path.
-- Keep the interface keyboard-complete, with arrow keys and mouse input as first-class paths.
-- Route configurable keys through the layered Rhai keymap, commands through `CommandRegistry`, and extension UI through generic `PluginHost` registrations.
-- Keep completion triggers and candidate generation in providers. The composer may understand generic ranges and candidates, but not file or session reference syntax.
-- Preserve mouse hit regions for selectable lists and command panels.
-- Preserve terminal restoration, mouse selection, and OSC52 copy on every exit and error path.
-
-Conversation behavior is owned by [Terminal interface](interface.md); keymaps, the embedded PTY, selection, and attachments are in [Keymaps, terminal, and attachments](terminal.md). `F1` and `:help` remain the runtime reference.
-
-### Models and configuration
-
-- Keep provider adapters thin; catalog metadata and explicit compatibility values should drive provider-specific request shape.
-- When endpoint or authentication security cannot trust catalog transport fields, isolate that provider in its own `src/model/<provider>.rs` module. Document which catalog fields remain authoritative and which local values replace them. Future exceptions must not add provider branches to generic Rig construction or request transformation.
-- Keep fake-backend tests provider-independent. Tests must not require live credentials or network access.
-- Preserve unknown downloaded model fields in the catalog cache.
-- Keep global/project/environment/CLI precedence and credential precedence consistent with [Models and configuration](configuration.md).
-- Treat leading `!` configuration values as code execution. Do not weaken the trust warning or accidentally log secret values.
+- Catalog metadata drives generic provider behavior. Security-sensitive
+  endpoint or authentication exceptions live in dedicated provider modules,
+  not branches spread through generic construction.
+- Configuration and credential precedence must remain consistent with [Models
+  and configuration](configuration.md). Leading `!` values remain explicit
+  code execution and must never be logged with secret output.
+- Provider-independent tests use fake backends and require no live credentials
+  or network access.
+- The TUI remains one keyboard-complete conversation surface. Commands,
+  keymaps, completion, status, panels, and submission effects use their generic
+  registries rather than second routing paths.
+- Terminal restoration, selection, mouse input, and OSC52 copy remain correct
+  on normal and error exits.
 
 ## Change rules
 
 ### Scope and ownership
 
-- Make the smallest change that fully implements the requested behavior.
-- Keep unrelated refactors, formatting, generated data, and speculative configurability out of the patch.
-- Follow references when removing behavior and delete code that exists only for that behavior.
-- Do not commit credentials, sessions, complete-output files, `.uri-agent/`, `.amp/`, or `target/` artifacts.
+- Make the smallest complete change and leave unrelated cleanup out.
+- Follow references when removing behavior and remove code that exists only for
+  it.
+- Do not commit credentials, generated sessions, complete outputs,
+  `.uri-agent/`, `.amp/`, or `target/` artifacts.
 
-### Protocol changes
+### Contract changes
 
-When adding or changing a protocol:
+When changing a protocol, update its implementation, descriptor, help, and
+focused tests. Also update shared protocol documentation only when the stable
+cross-protocol behavior changes.
 
-1. update its implementation and descriptor;
-2. update its `<protocol>://help` contract in the owning protocol module;
-3. preserve opaque registry routing and body pass-through;
-4. add focused normal-path and boundary-condition tests;
-5. update [protocol documentation](protocols.md) when public cross-cutting behavior changes.
+When changing a direct model tool, keep the schema strict, register it through
+the owning plugin, and test validation, dispatch, presentation, and failure
+paths. Do not add runtime branches for its name.
 
-Do not add generic registry behavior for syntax that belongs to one protocol.
+WASM ABI changes require synchronized host, SDK, example, ABI version,
+compatibility tests, and plugin documentation. Reject unsupported versions
+explicitly rather than guessing compatibility.
 
-### Direct model-tool changes
-
-When adding or changing a direct model tool:
-
-1. implement `ModelTool` in the plugin that owns the behavior;
-2. return the same descriptor from `Plugin::model_tool_descriptors` and install
-   the tool through `PluginHost::model_tools`;
-3. use a strict JSON Schema and reject unknown fields when decoding typed
-   arguments;
-4. keep runtime dispatch generic and add focused schema, dispatch, and failure
-   tests;
-5. update [protocol documentation](protocols.md) when the active public tool
-   surface changes.
-
-Use `PluginPermission::Downloads` before calling `PluginHost::downloads` for a
-linked plugin-managed executable. The request exists to make download behavior
-easy to find in source review; it does not show an approval prompt. Prefer a
-working executable from `PATH`, then use a pinned URL, checksum, version check,
-bounded download, process and cross-process lock, and atomic cache install.
-
-### WASM plugin and SDK changes
-
-Keep `wasm_plugin://help` and its detailed help paths, [WASM plugin documentation](plugins.md), the [`uri-agent-plugin-sdk`](../sdk/) API, and the buildable example synchronized. ABI v6 has no compatibility path. Test both a valid module and the affected reload, collision, permission, persistence, resident, or resource-limit boundary. Preserve whole-set replacement and keep guest host calls out of dynamic WASM routing. Agent access and separate state require manifest permissions; plugin settings do not. Enforce the global depth-2 maximum and persisted same-project depth-1 parent requirement.
-
-### Agent, model, Skill, session, and runtime changes
-
-Preserve the single process-wide `AgentHost`, full `AgentRuntime` behavior for every caller, provider-independent model loops, append-only persistence, durable submissions, model/thinking freeze, exact rollover replay, and the atomic legacy compaction spec-update/checkpoint invariant. Shared changes to Agent, protocol, task, session, compaction, or runtime boundaries need both a normal-path test and the affected boundary-condition test. Session tests should verify persisted replay, not only in-memory state.
-
-### TUI changes
-
-Keep input and rendering paths aligned: a visible action must be keyboard-accessible, and selectable controls need mouse hit regions. Test the affected surface and its input path. For rendering changes, assert meaningful cells or text rather than only taking a snapshot.
+For session, Agent, model, Skill, ACP, or TUI changes, preserve the applicable
+contracts above and read the owning focused document before editing. Test both
+fresh and restored state when persistence is involved, and keyboard plus mouse
+paths when an interaction is affected.
 
 ## Verification
 
-Use stable Rust. Before completing a code change, run:
+Use stable Rust. For code changes, run focused tests first, then:
 
 ```bash
 cargo fmt --check
@@ -307,32 +215,38 @@ cargo test
 cargo check
 ```
 
-Scale focused tests to the changed behavior before running the full suite. Do not require live API keys in tests.
+Tests must not require live credentials or network access.
 
-For documentation-only changes, the full Rust suite is unnecessary unless code or documentation generation changed. Verify instead:
+For documentation-only changes, verify instead:
 
 - relative links and referenced files exist;
-- examples match current protocol, CLI, command, configuration, and keymap names;
-- stated defaults and precedence match source;
+- examples match current protocol, CLI, command, configuration, and keymap
+  names;
+- defaults and precedence match source;
 - `README.md` and `README.zh-CN.md` remain equivalent;
-- detailed `docs/` content stays English-only;
+- detailed `docs/` content remains English-only;
 - protocol behavior changes are also reflected in `<protocol>://help`.
 
 ## Documentation ownership
 
-- Root READMEs own project fit, critical warnings, the shortest successful setup, and navigation.
-- [`docs/acp.md`](acp.md) owns the ACP v1 transport, capability mapping, session lifecycle, and frontend MCP handoff.
-- [`docs/protocols.md`](protocols.md) owns cross-cutting protocol, task, and output detail.
-- [`docs/context.md`](context.md) owns project instructions, Skill discovery and resources, and frozen startup context.
-- [`docs/plugins.md`](plugins.md) owns WASM installation, reload, ABI, trust boundaries, and runtime limits; [`sdk/README.md`](../sdk/README.md) owns Rust guest SDK usage.
-- [`docs/configuration.md`](configuration.md) owns models, authentication, files, precedence, CLI override semantics, and custom providers.
-- [`docs/interface.md`](interface.md) owns the conversation surface, composer, commands, and navigation.
-- [`docs/terminal.md`](terminal.md) owns keymaps, terminal interaction, selection, copying, and attachments.
-- [`docs/sessions.md`](sessions.md) owns persistence, project scoping, frozen session context, the model/tool loop, request retries, notes, rollover, and summary checkpoints.
-- This document owns architecture, module boundaries, engineering invariants, change rules, and verification.
-- [`docs/release.md`](release.md) owns release versioning, preparation, automation, and first-release setup.
-- `uri-agent --help` owns the exact CLI contract.
-- `<protocol>://help` owns the exact model-facing contract for one protocol.
-- [`AGENTS.md`](../AGENTS.md) remains a concise agent entry point and links here instead of duplicating the complete manual.
+- Root READMEs own project fit, public coverage data, critical warnings, first
+  success, and navigation.
+- [`docs/acp.md`](acp.md) owns ACP transport and session lifecycle.
+- [`docs/protocols.md`](protocols.md) owns cross-protocol, task, and output
+  concepts; runtime help owns exact protocol syntax.
+- [`docs/context.md`](context.md) owns project instructions and Skills.
+- [`docs/plugins.md`](plugins.md) and [`sdk/README.md`](../sdk/README.md) own WASM
+  runtime and guest SDK usage.
+- [`docs/configuration.md`](configuration.md) owns models, authentication,
+  settings, MCP configuration, and precedence; `uri-agent --help` owns exact
+  CLI syntax.
+- [`docs/interface.md`](interface.md) and [`docs/terminal.md`](terminal.md) own
+  interaction concepts; `F1` and `:help` own active commands and keys.
+- [`docs/sessions.md`](sessions.md) owns persistence, Agents, retries, and
+  checkpoints.
+- This document owns architecture, module boundaries, engineering invariants,
+  change rules, and verification.
+- [`docs/release.md`](release.md) owns release procedure.
 
-Use `URI Agent` in prose and `uri-agent` for the binary, crate, commands, and filesystem names.
+Use `URI Agent` in prose and `uri-agent` for the binary, crate, commands, and
+filesystem names.

@@ -1,8 +1,10 @@
 # Sessions and context
 
-URI Agent stores conversations as append-only sessions and preserves the exact startup context used by the model. This document covers persistence, project scoping, the model/tool loop, retries, and context-window checkpoints.
+URI Agent stores conversations as append-only sessions and preserves the exact
+startup context used by the model. This document describes project scoping,
+Agent sessions, durability, retries, and context checkpoints.
 
-## Session storage and project boundaries
+## Storage and project boundaries
 
 Sessions are stored in SQLite at:
 
@@ -10,243 +12,149 @@ Sessions are stored in SQLite at:
 <platform-data-dir>/uri-agent/sessions-v3.db
 ```
 
-On macOS this path is `~/.config/uri-agent/sessions-v3.db`, colocated with configuration. If no platform data directory is available, URI Agent falls back to `<project>/.uri-agent/sessions-v3.db`.
+On macOS the database is under `~/.config/uri-agent`; if no platform data
+directory exists, URI Agent falls back to `<project>/.uri-agent`. Earlier
+database versions remain untouched and are not migrated into `sessions-v3.db`.
 
-Earlier session databases and their sidecars remain untouched. There is no
-migration into `sessions-v3.db`.
+The canonical startup directory is each session's project boundary:
 
-Semantic conversation indexes are disposable private sidecar caches under the
-platform cache directory at `uri-agent/retrieval/v2/`. The `context` index is
-keyed by session ID. `sessions` keeps separate indexes for the current project,
-the explicitly requested all-session scope, and an explicitly narrowed working
-directory. Each manifest pins the extractor, per-record source revisions,
-source digest, zvec release, embedding model revision, tensor checksums,
-dimension, and cosine metric. A mismatched or malformed manifest is stale.
-Normal ranked reads add and remove only changed append-only record sources;
-forced rebuilds use a cross-process lock, create a complete replacement
-separately, and activate it by rename. The manifest is invalidated before an
-in-place refresh and published only after flush, so cancellation or failure
-cannot advertise a partial collection as current. Cache directories are mode
-`0700` and cache metadata is mode `0600` on Unix. Removing these directories
-loses no session data.
+- a normal launch creates a new in-memory session;
+- `--continue-session` and `--session latest` select the latest project session;
+- `--session <id>` accepts only an ID from that project;
+- `:resume` lists the project's root conversations.
+
+The `sessions` protocol can search wider scopes only when explicitly asked.
+Exact search reads SQLite directly; semantic and hybrid search use disposable,
+automatically maintained sidecar indexes. Searching or indexing never resumes
+or changes a conversation. See [Protocols, tasks, and
+output](protocols.md#files-search-and-saved-context).
+
+Each session records its provider, model, and thinking effort. Changes are
+appended and restored on resume. Composer drafts are saved on exit and session
+switch; before the first message, a draft remains project state rather than
+creating an empty conversation. Switching sessions leaves active work and
+undelivered input attached to the original session. Process exit cancels and
+joins active work after durable interruption records are written.
+
+ACP-created sessions use the same database and become available to the TUI
+after the ACP owner releases them. One ACP process may serve multiple projects,
+but every project has isolated configuration, plugins, MCP state, Skills, and
+Agents. See [ACP v1](acp.md#project-and-session-lifecycle).
 
 ## AgentHost and Agent specifications
 
-A project runtime owns one `AgentHost`, giving the TUI, linked and WASM plugins,
-child Agents, and resident plugins the same full `AgentRuntime` behavior and
-normal session persistence. A normal TUI process has one such runtime; an ACP
-process may keep one isolated `AgentHost` for each canonical project directory.
-The former subagent API, SDK, and ABI have been removed without a compatibility
-path.
+Each project runtime owns one `AgentHost`. The TUI, linked and WASM plugins,
+child Agents, and resident plugins use the same persisted Agent runtime.
 
 An `AgentSpec` selects provider, model, thinking effort, working directory,
-required parent session, system-prompt mode (`inherit`, `append`, or `replace`),
-all/exact tool and protocol sets, and an optional output-token cap. Prompt and
-capability selection is established at creation. Provider/model and thinking
-freeze after the first submission is durably accepted; later configuration
-changes do not alter that Agent.
+parent session, system-prompt mode (`inherit`, `append`, or `replace`), exact or
+complete tool/protocol sets, and an optional output cap. Prompt and capability
+selection are fixed at creation. Provider, model, and thinking freeze after the
+first submission is durably accepted.
 
-The global maximum depth is 2. A root Agent is depth 1. A plugin may create or
-open only a depth-2 Agent whose parent is a persisted, same-project depth-1
-session; depth-2 Agents cannot create children. The TUI lists only depth-1
-conversations. Child conversations use the same normal session database.
+Root Agents are depth 1. Plugins may create only depth-2 Agents with a persisted,
+same-project root parent; children cannot create another generation. The TUI
+lists only root conversations, while child conversations use the same session
+database.
 
 Submissions are `Prompt` or `Steer`. Prompt starts an idle Agent or queues a new
-turn behind active work. Steer follows Pi-style model-boundary delivery and
-targets the next boundary while work is active; when the Agent is idle it is
-accepted as Prompt and starts a new turn. Acceptance and undelivered input are
-durable.
+turn. Steer targets the next model boundary while an Agent is active and acts
+as Prompt when it is idle. Accepted input is durable until delivered.
 
-A new TUI session remains in memory while its startup context prepares in the
-background. On the first submit, the TUI leaves the welcome view and presents
-the user message immediately while that preparation continues. Persistence
-still waits for the context, then URI Agent writes the frozen context, queued
-startup events, and message in one transaction. Opening and closing an empty
-TUI session creates no session record. ACP follows the same persistence
-boundary: `session/new` reserves an in-memory ID and session setup, and the
-first durably accepted prompt creates the native session with that ID. Pending
-ACP sessions can be listed and closed by their owning process but do not
-survive its exit.
-
-The canonical startup directory is the project boundary recorded with every session:
-
-- a normal launch starts a new session;
-- `--continue-session` and `--session latest` select the latest session for the project;
-- `--session <id>` resumes that ID only when it belongs to the project;
-- `:resume` lists project sessions with their model and thinking effort.
-
-Materialized ACP-created depth-1 sessions use the same project-scoped database
-and can be opened through these normal TUI paths after the ACP owner releases
-them. Their private frontend records restore reconstructible capability state,
-such as an ACP-provided MCP profile, without placing secret values in
-append-only events. One ACP process may own sessions from multiple projects,
-but each session remains bound to exactly one canonical project and its
-project-local configuration, plugins, MCP runtime, and Skills.
-See [ACP v1](acp.md#project-and-session-lifecycle).
-
-The `sessions` protocol can search archives across projects when explicitly
-requested. Exact metadata and substring search remain available without an
-index. `mode=semantic` performs vector ranking and `mode=hybrid` fuses vector
-and Jieba BM25 ranks. Both ranked modes automatically ensure the selected
-scope-specific cache, load only newly appended searchable records on a normal
-refresh, and apply record-type filters before top-k ranking. Small searches
-return directly; a long ranked search continues as a managed task whose
-completion carries the search result. If its notification is truncated, follow
-its `tasks://` instruction once rather than rerunning the search. Do not read or
-execute `sessions://index` before a ranked search; its read form reports
-diagnostic state, while its `exec` form optionally prewarms or force-rebuilds
-the selected scope. Ranked results omit backend scores because semantic cosine
-and hybrid fusion scores are not comparable. `@@` completion remains
-project-scoped. Archive reads and indexing never resume or modify a session; see
-[`sessions`](protocols.md#sessions).
-
-Each session records its provider, model, and thinking effort. Changes append a settings event, and resume restores the latest session settings rather than defaults for a new session.
-
-URI Agent saves the composer draft when the TUI exits or switches sessions. Before the first message, it stores the draft separately by project to avoid creating an empty session. Switching sessions leaves an active turn and undelivered messages attached to the original session. On process exit, URI Agent cancels and joins active turns after their interruption records are durable, then restores messages not yet taken for delivery to the corresponding draft.
+A new session remains in memory while startup context is prepared. The first
+accepted prompt persists the frozen context and message together; opening and
+closing an empty session creates no database record. ACP `session/new` follows
+the same boundary and reserves only in-memory state until its first prompt.
 
 ## Frozen startup context
 
-A new session freezes a `SessionContext` event containing the complete generated system prompt, session-scoped protocol records, and selected Skill snapshots before accepting its first user message. Resume reuses it instead of regenerating the prompt, rediscovering that protocol set, or rebinding Skills from the current filesystem. MCP records preserve only stable identity and prompt metadata; each operation still resolves mutable server configuration and fails if that recorded server was removed or disabled. See [Startup context and Skills](context.md) for the inputs and Skill rules.
+Before accepting the first prompt, a session freezes its complete generated
+system prompt, session-scoped protocol records, and selected Skill snapshots.
+Resume uses that snapshot instead of rediscovering current project instructions,
+protocols, or Skills.
 
-## Append-only events
+MCP records freeze stable identity and prompt metadata, while each operation
+still resolves mutable transport and credential references. A newly configured
+server does not join an existing session; removing or disabling one already
+recorded by the session makes later calls fail. See [Startup context and
+Skills](context.md).
 
-User and model messages, model settings, tool calls and results, usage, notices,
-errors, task lifecycle notices and terminal reports, turn boundaries, context
-notes, and rollover or summary checkpoints are appended as events. Resuming a session reconstructs
-its settled task reports; a task left pending or running when its process ended
-is restored as cancelled rather than restarted. Normal operation and checkpoints
-do not rewrite or delete earlier events.
+## Append-only durability
 
-SQLite also keeps a versioned, rebuildable resume index at real checkpoint
-boundaries. The index contains only cumulative derived state needed at startup,
-such as the user-message flag, latest-checkpoint pointer, context-window ID, usage and cache
-totals, protocol-help correlations, frozen-context and task event pointers,
-model settings, and token-rate calibration inputs. It never contains model
-history or checkpoint replacement history. On resume, model replay is loaded
-from the highest-sequence authoritative rollover or summary event and
-the later usage and model-message events; other startup state is reduced from
-the index plus the authoritative event tail. Each row carries an integrity
-checksum over its version, session identity, sequence, and payload. Missing,
-stale, malformed, checksum-invalid, or newer-version rows fall back to an event
-reduction and may be rebuilt. The append-only events remain the sole source of
-truth, and deleting the resume index cannot change replay or session behavior.
+Messages, model settings, tool calls and results, usage, notices, errors, task
+state, turn boundaries, notes, and checkpoints are appended as events. Normal
+operation and checkpointing do not rewrite earlier events.
 
-Resume-index writes happen only after the authoritative event transaction
-commits and cannot replace a checkpoint at a later sequence. Committed events
-are published in sequence before the disposable cache write begins: cache
-failure does not fail an otherwise valid append, publish uncommitted state, or
-make the session unavailable.
+Derived resume and semantic indexes are rebuildable caches, never the source of
+truth. Missing or invalid cache data falls back to authoritative events.
+Removing the semantic cache under `uri-agent/retrieval/v2/` loses no session
+data; a later ranked search rebuilds it.
 
-Session event range reads use exclusive sequence cursors. `after` and `before`
-pages and tail reads are bounded and returned in ascending sequence order, so
-adjacent pages concatenate without overlap or gaps, including across
-checkpoints and tool call/result pairs. A page is a committed view at the time
-of its query. Appends between requests do not alter earlier sequence ranges;
-they become visible to a later `after` query when its cursor reaches them.
-Turn-aware grouping remains a presentation-layer policy.
+Transcript and model-replay forms of one completed message commit together.
+This keeps typed images and provider tool-call identities valid across resume.
+Streaming text and reasoning are provisional and become durable only with the
+completed response. A task that was still active when its process ended is
+restored as cancelled rather than restarted.
 
-The transcript and model-replay forms of one message commit in the same SQLite
-transaction. This includes typed images returned by a protocol read: the
-transcript retains its textual tool-result summary while the corresponding
-model message retains the image content for replay and resume. Streaming text
-and reasoning are provisional TUI updates; only the completed response enters
-durable replay. Provider tool-call identity is preserved so resumed tool
-conversations remain valid for the selected backend.
+## Retries and the model loop
 
-## Model request retries
+URI Agent retries transient rate-limit, network, server, timeout, conflict, and
+empty-response failures with bounded, failure-specific budgets. Provider retry
+headers take priority over fallback exponential delays. Authentication,
+billing, malformed-request, and other non-transient failures settle directly.
 
-URI Agent retries transient failures for normal model calls and context-summary calls. Each failure class has an independent counter within one logical call; success or a new model round resets all counters. Counts below are additional attempts after the initial request:
+Retries are visible session events. Provisional output from a failed stream is
+discarded before another attempt and never enters model replay. Double `Esc`
+interrupts an active request or retry delay.
 
-| Failure | Retries | Fallback backoff before jitter |
-| --- | ---: | --- |
-| Rate limit (`429`) | 20 | 1s exponential, capped at 30s |
-| Network or stream transport failure | 5 | 500ms exponential, capped at 8s |
-| Server failure (`5xx`) | 5 | 1s exponential, capped at 15s |
-| Timeout or `408` | 4 | 1s exponential, capped at 10s |
-| Request conflict (`409`) | 4 | 500ms exponential, capped at 8s |
-| Empty completed response | 4 | 1s exponential, capped at 8s |
+A turn has no fixed tool-round limit. It continues until the model returns no
+tool call, the user interrupts it, or an unrecoverable provider, persistence,
+or runtime failure occurs. Model-facing protocol calls must satisfy the help
+gate described in [Protocols, tasks, and output](protocols.md#model-interface).
 
-Fallback delays add up to 25% jitter. `Retry-After` or `retry-after-ms` takes precedence, capped at 60 seconds. When those headers are absent, a Google RPC `RetryInfo.retryDelay` in the response body supplies the same delay. Authentication, billing or quota, other client (`4xx`), malformed-request, and unclassified failures settle immediately.
+When interruption leaves tool calls unfinished, URI Agent appends correlated
+failed results before settling the turn so future replay never contains an
+unanswered tool call. Repeated identical tool-call batches receive a hidden
+redirect asking the model to change arguments, use another tool, or finish;
+this also prevents polling completed background work indefinitely.
 
-The experimental Antigravity transport performs bounded protocol-specific recovery before this generic policy sees a failure. An expired token or the first `401` refreshes the stored OAuth credential once. The first project-header `403` retries without that header. A Gemini `400` that specifically reports an invalid thought signature replaces signatures in that request copy with the private protocol's dummy marker and retries once; persisted replay remains unchanged. Within each generic attempt, network errors, `408`, `404`, and `5xx` responses fall through the sandbox, daily, and production endpoints in order. Once those endpoints are exhausted, the final failure retains its normal runtime classification and retry budget; `429` responses are never replayed internally.
+## Context windows and checkpoints
 
-Because the counters are independent, alternating failure classes can consume up to 42 additional attempts in one logical model call. There is no separate aggregate attempt or elapsed-time limit.
+URI Agent measures replay against the selected model's context window. Provider
+usage is authoritative when available; later content is estimated until a new
+response arrives. Before each request, the requested output is capped to the
+estimated remaining room after a safety margin.
 
-Each retry becomes a visible session event with its reason, delay, and count. Provisional output from a failed stream is cleared before retry and never enters model replay. Double `Esc` interrupts an active request or retry delay.
+`rollover` is the default checkpoint strategy. Near the configured threshold,
+the model receives one hidden reminder to review its notes. At the threshold,
+URI Agent starts a fresh model window without generating a summary. The previous
+transcript remains in SQLite but leaves provider replay; a hidden bootstrap
+directs the model to active notes and bounded prior history. Protocol-help state
+resets for the new window.
 
-## Model and tool loop
+The `context` protocol provides durable titled notes, context status, window and
+user-statement listings, exact or ranked history search, and reads around stable
+session-local record anchors. Notes have stable IDs and revisions, a shared
+model-relative budget, and a bounded active count. Exact limits and mutation
+routes belong to `context://help`.
 
-A turn has no fixed tool-round limit. It continues until the model returns no tool call, the user interrupts it, or an unrecoverable model, persistence, or runtime error occurs.
+Deleting a note creates a tombstone and hides its body from `context` and
+`sessions` recovery views. It is not secure erasure: append-only historical
+events remain in SQLite. All recovered notes and transcript content are marked
+as untrusted reference data.
 
-The first model-facing call to each protocol must successfully read its exact
-`<protocol>://help` route with an empty body. Protocol-declared shared-help
-dependencies must be read first, in order; the protocol's own help remains
-mandatory. This state belongs to the session, and resuming reconstructs it from
-successful persisted tool results. Internal protocol calls made by a WASM
-plugin are not model-facing and bypass this gate.
+The alternative `summary` strategy asks the model to summarize older history,
+then replays the frozen prompt, summary checkpoint, a valid recent-history
+suffix, and later events. Summary generation has no tools and treats transcript
+content as untrusted. Original events remain stored.
 
-If a turn is interrupted while tool calls from one model response are pending, URI Agent appends a failed result with the original correlation identity for every unfinished call before settling the turn. Later requests therefore never replay a tool call without its corresponding result.
+An Agent with a legacy compaction callback always uses `summary`. After summary
+generation, its plugin may atomically change only the system prompt, tools, or
+protocols for the checkpoint; provider, model, thinking, project, parent, depth,
+and output cap remain fixed. Agents without the `context` protocol also use
+`summary` because they cannot recover from rollover.
 
-URI Agent detects consecutive model responses that contain the same batch of tool names and canonical JSON arguments. Batch identity ignores parallel call order but preserves duplicate calls. On the fifth identical batch, it appends a hidden, durable redirect before the next model request, asking the model to change arguments, use another tool, or finish with its findings. The redirect enters persisted model replay without appearing as user input or ending the turn. A different batch or no call resets the sequence. Background task completion is delivered automatically, so repeated identical `tasks://` reads are polling and receive the same loop protection as other calls.
-
-## Context windows, notes, and checkpoints
-
-URI Agent measures replay against the selected model's context window. The latest valid ordinary API response supplies authoritative usage; later messages are estimated until another response arrives. Before the first response, the estimate includes the frozen prompt, tool definitions, messages, and images. It counts four ASCII characters or one non-ASCII character per token and assigns 1,200 tokens to each image regardless of payload size. A summary checkpoint invalidates the previous usage baseline until the next response; a rollover starts from a newly estimated bootstrap.
-
-Before each provider request, URI Agent caps the catalog output limit to estimated context room after a fixed 4,096-token safety margin, with a minimum request of one output token. This cap is separate from the configurable checkpoint reserve.
-
-### Rollover strategy
-
-`rollover` is the default strategy. Before the hard threshold, URI Agent adds one hidden low-context reminder per context window asking the model to review its notes. At the threshold it appends a rollover checkpoint without making a summary-model request. Replay becomes one hidden host bootstrap; the previous transcript remains in append-only storage but is no longer sent to the provider.
-
-The bootstrap identifies the old and new context-window IDs and requires the model to read `context://help`, inspect the note index and every active note, inspect the cross-window list of original user statements, then query bounded history from the previous window as needed. Searches, user statements, ordinary history, and note revisions expose session-local record anchors such as `r42`; the model can read a small neighborhood around any anchor instead of paging an entire window. It must recover exact user requirements and continue without asking the user to repeat available information. Protocol-help state resets at each rollover, so the required `context://help` read is enforced again in the new window.
-
-The built-in `context` protocol provides durable working memory and recovery:
-
-- notes have host-generated stable IDs, required single-line titles of at most 120 characters, and revision metadata;
-- at most 20 notes are active; replacing a note preserves its ID and records the current window and session-local record ID as a new anchor;
-- current titles and content share a hard budget of 20% of the model window remaining after the frozen prompt, tool definitions, and 4,096-token safety margin; writes warn at 15%;
-- a growth write above the hard budget fails, while shrinking replacements and deletes remain available;
-- deleting a note creates a tombstone that retains ID, title, revisions, anchors, and `已删除`; note content is no longer exposed through `context` or `sessions` reads, while ordinary records around its anchors remain available;
-- note reads, prior-window history, user-statement history, search, and anchor neighborhoods are bounded; note bodies and history pages are paginated. Dedicated user-history routes list and search only original user submissions across all windows. History and neighborhood reads filter the shared `user`, `assistant`, `tool_call`, `tool_result`, and `error` record types;
-- exact history search remains the default and uses record-ID pagination;
-  omitting `window` searches every context window, while supplying it narrows
-  the query. User-statement and ordinary history searches accept
-  `mode=semantic` or `mode=hybrid` with relevance-order `offset` pagination.
-  Ranked reads automatically incrementally refresh their cache and apply type
-  and window filters before top-k ranking. The explicit index operation is only
-  for prewarming or forced rebuilding.
-
-Note writes and deletes are sidecar persistence events: they do not modify model replay, and their model-issued tool calls and correlated results remain in the active provider prefix. Notes, handoffs, and context-history results are marked as untrusted reference data. Recovery history excludes system messages, hidden reasoning, all `context://` and `sessions://` calls, and their correlated results. Deletion is not secure erasure: the append-only database still contains historical events, but model-facing note and session-history routes do not return the deleted body.
-
-If the model calls `exec("context://rollover", "<optional handoff>")`, the runtime waits until every tool call from that model response has a durable correlated result, then starts the new window. A handoff is bounded to approximately 4,096 tokens. A provider overflow can force one rollover and retry for the current turn.
-
-### Summary strategy and compatibility
-
-The `summary` strategy retains the previous compaction behavior. URI Agent asks the model to summarize older history and appends a checkpoint. Replay then contains:
-
-```text
-frozen system prompt
-+ checkpoint summary of older history
-+ recent history retained at a valid message boundary
-+ events after the checkpoint
-```
-
-Summary generation uses a dedicated prompt without registered tools and treats conversation content as untrusted data. Each tool result contributes at most a 2,000-character head-and-tail preview; an earlier checkpoint receives at most one quarter of the input token budget; and total input is bounded against the remaining context, prioritizing the newest complete messages when necessary. Output is capped at 80% of the configured reserve.
-
-Ordinarily the frozen prompt and capability selections remain unchanged. An
-Agent created or opened with the optional compaction callback receives the
-summary through its plugin after summary generation and before checkpointing.
-The callback may return an `AgentSpecPatch` changing only the system prompt,
-tools, or protocols. URI Agent commits that spec update and the compaction
-checkpoint atomically. Provider, model, thinking, working directory, parent,
-depth, and output cap cannot change. WASM receives this callback as
-`PluginEvent::Compacted`.
-
-Summary checkpoints normally retain complete recent user turns. If one tool-heavy turn exceeds the budget, they may summarize the older prefix while keeping a suffix that never starts with a tool result. Original events remain in SQLite.
-
-Agents with a legacy compaction callback always use `summary`, preserving the callback's summary and atomic spec-patch contract. An Agent whose capability selection omits `context` also falls back to `summary`, because it could not recover after a hard rollover.
-
-Provider overflow errors, responses reporting input beyond the context window, and recoverable `length` stops can trigger one forced checkpoint and retry for the current turn. A `length` stop is recoverable when reported output is below the catalog output limit, or when output usage is unavailable and reported input has reached 99% of the context window. A usable response is preserved before the checkpoint; failed or truncated output does not enter replay. This recovery has a separate retry budget and cannot loop indefinitely.
-
-Run `:compact` to request the active checkpoint strategy manually; it fails when model replay is empty. `:context-strategy` toggles the active session between `rollover` and `summary`; pass either name to select it explicitly. The switch lasts for the current runtime. Automatic checkpoints, their strategy, reserve, and summary-only retained-history budget are configured in [`settings.json`](configuration.md#settings-fields-and-precedence).
+Provider overflow may force one checkpoint and retry for the current turn.
+`:compact` requests the active strategy manually, while `:context-strategy`
+changes it for the current runtime. Automatic behavior and token budgets are
+configured under [settings](configuration.md#settings-fields-and-precedence).

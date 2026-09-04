@@ -65,12 +65,12 @@ supported providers.
 ## Model and provider coverage
 
 URI Agent targets broad compatibility with the pi.dev catalog rather than a
-fixed handful of models. As of 2026-08-30, the catalog coverage is:
+fixed handful of models. As of 2026-09-04, the catalog coverage is:
 
 | Catalog measure | Supported |
 | --- | ---: |
 | API families | 5 of 9 |
-| Model entries | 1,073 of 1,274 (84.2%) |
+| Model entries | 1,132 of 1,337 (84.7%) |
 | Provider IDs | 35 of 39 |
 | Provider IDs with live discovery | 28 of 35 runnable |
 
