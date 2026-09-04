@@ -3,6 +3,8 @@ use crate::model::antigravity::resolve_route;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
+const CODEX_CLIENT_VERSION: &str = "0.153.0";
+
 #[derive(Clone, Debug)]
 pub(super) struct ModelRequestTransform {
     pub(super) model: CatalogModel,
@@ -37,6 +39,18 @@ impl ModelRequestTransform {
                 HeaderName::from_static("openai-beta"),
                 HeaderValue::from_static("responses=experimental"),
             );
+            headers.insert(
+                HeaderName::from_static("version"),
+                HeaderValue::from_static(CODEX_CLIENT_VERSION),
+            );
+        }
+        if matches!(self.model.provider.as_str(), "opencode" | "opencode-go") {
+            headers
+                .entry(http::header::USER_AGENT)
+                .or_insert(HeaderValue::from_static(concat!(
+                    "uri-agent/",
+                    env!("CARGO_PKG_VERSION")
+                )));
         }
         if self.model.api != "anthropic-messages" {
             return;
@@ -79,6 +93,25 @@ impl ModelRequestTransform {
     }
 
     pub(super) fn transform_body_dependent_headers(&self, headers: &mut HeaderMap, body: &[u8]) {
+        if self.model.api == "openai-codex-responses" {
+            headers.remove("x-codex-routing-hint");
+            if let Ok(body) = serde_json::from_slice::<Value>(body)
+                && let Some(model) = body.get("model").and_then(Value::as_str)
+            {
+                let mut hint = format!("model={model}");
+                if let Some(tier) = body
+                    .get("service_tier")
+                    .and_then(Value::as_str)
+                    .filter(|tier| !tier.is_empty())
+                {
+                    hint.push_str(";tier=");
+                    hint.push_str(tier);
+                }
+                if let Ok(value) = HeaderValue::from_str(&hint) {
+                    headers.insert(HeaderName::from_static("x-codex-routing-hint"), value);
+                }
+            }
+        }
         if self.model.provider != "github-copilot" {
             return;
         }
@@ -147,6 +180,14 @@ impl ModelRequestTransform {
         let Some(session_id) = self.session_id.as_deref() else {
             return;
         };
+        let insert = |headers: &mut HeaderMap, name: &'static str| {
+            if let Ok(value) = HeaderValue::from_str(session_id) {
+                headers.insert(HeaderName::from_static(name), value);
+            }
+        };
+        if matches!(self.model.provider.as_str(), "opencode" | "opencode-go") {
+            insert(headers, "x-opencode-session");
+        }
         if self.model.api == "anthropic-messages" {
             if self.compat_bool("sendSessionAffinityHeaders", false)
                 && let Ok(value) = HeaderValue::from_str(session_id)
@@ -173,11 +214,6 @@ impl ModelRequestTransform {
             .compat("sessionAffinityFormat")
             .and_then(Value::as_str)
             .unwrap_or(default);
-        let insert = |headers: &mut HeaderMap, name: &'static str| {
-            if let Ok(value) = HeaderValue::from_str(session_id) {
-                headers.insert(HeaderName::from_static(name), value);
-            }
-        };
         if format == "openrouter" {
             insert(headers, "x-session-id");
         } else {

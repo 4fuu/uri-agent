@@ -116,16 +116,35 @@ impl HttpClientExt for AuthClient {
         let request = self.prepare(req);
         let codex_websocket = self.codex_websocket.clone();
         let antigravity = self.antigravity.clone();
+        let codex_sse = self
+            .transform
+            .as_ref()
+            .is_some_and(|transform| transform.model.api == "openai-codex-responses");
         async move {
-            if let Some(antigravity) = antigravity {
+            let response = if let Some(antigravity) = antigravity {
                 antigravity.send(inner, request).await
             } else if let Some(codex_websocket) = codex_websocket {
                 codex_websocket.send(inner, request).await
             } else {
                 HttpClientExt::send_streaming(&inner, request).await
+            }?;
+            if codex_sse {
+                Ok(terminate_sse_at_eof(response))
+            } else {
+                Ok(response)
             }
         }
     }
+}
+
+fn terminate_sse_at_eof(
+    response: rig::http_client::StreamingResponse,
+) -> rig::http_client::StreamingResponse {
+    let (parts, body) = response.into_parts();
+    let terminator = futures_util::stream::once(async {
+        Ok::<_, rig::http_client::Error>(bytes::Bytes::from_static(b"\n\n"))
+    });
+    http::Response::from_parts(parts, Box::pin(body.chain(terminator)))
 }
 
 pub(crate) struct RigBackend {

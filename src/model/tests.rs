@@ -554,8 +554,12 @@ async fn openrouter_replays_encrypted_reasoning_across_tool_rounds() {
 }
 
 #[test]
-fn codex_request_transform_matches_pi_sse_contract() {
-    let model = codex_model("https://chatgpt.com/backend-api".to_string());
+fn codex_request_transform_matches_current_routing_contract() {
+    let mut model = codex_model("https://chatgpt.com/backend-api".to_string());
+    model.metadata.insert(
+        "samplingParams".to_string(),
+        json!({"service_tier": "priority"}),
+    );
     let session_id = "x".repeat(80);
     let transform = ModelRequestTransform {
         model,
@@ -565,18 +569,22 @@ fn codex_request_transform_matches_pi_sse_contract() {
     let mut headers = HeaderMap::new();
     headers.insert("session_id", HeaderValue::from_static("random-rig-id"));
     transform.transform_headers(&mut headers);
-    let body: Value = serde_json::from_slice(
-        &transform.transform_bytes(bytes::Bytes::from(
-            serde_json::to_vec(&json!({
-                "model": "gpt-5.4",
-                "tools": [{"type": "function", "name": "read"}]
-            }))
-            .unwrap(),
-        )),
-    )
-    .unwrap();
+    let body = transform.transform_bytes(bytes::Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-5.4",
+            "tools": [{"type": "function", "name": "read"}]
+        }))
+        .unwrap(),
+    ));
+    transform.transform_body_dependent_headers(&mut headers, &body);
+    let body: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(headers["openai-beta"], "responses=experimental");
+    assert_eq!(headers["version"], "0.153.0");
+    assert_eq!(
+        headers["x-codex-routing-hint"],
+        "model=gpt-5.4;tier=priority"
+    );
     assert_eq!(headers["session-id"], "x".repeat(64));
     assert_eq!(headers["x-client-request-id"], "x".repeat(64));
     assert!(!headers.contains_key("session_id"));
@@ -590,6 +598,7 @@ fn codex_request_transform_matches_pi_sse_contract() {
     assert_eq!(body["tools"][0]["strict"], Value::Null);
     assert_eq!(body["reasoning"]["effort"], "xhigh");
     assert_eq!(body["reasoning"]["summary"], "auto");
+    assert_eq!(body["service_tier"], "priority");
 
     let off = transformed(
         codex_model("https://chatgpt.com/backend-api".to_string()),
@@ -717,6 +726,8 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
     assert_eq!(headers["chatgpt-account-id"], "account-123");
     assert_eq!(headers["originator"], "pi");
     assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+    assert_eq!(headers["version"], "0.153.0");
+    assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5.4");
     assert_eq!(headers["session-id"], "codex-reuse-session");
     assert_eq!(headers["x-client-request-id"], "codex-reuse-session");
     assert!(
@@ -1042,11 +1053,12 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
             "response": terminal_response
         }),
     ];
-    let mut sse = events
+    let (terminal, preceding) = events.split_last().unwrap();
+    let mut sse = preceding
         .iter()
         .map(|event| format!("data: {event}\n\n"))
         .collect::<String>();
-    sse.push_str("data: [DONE]\n\n");
+    sse.push_str(&format!("data: {terminal}"));
     let (base_url, request_rx, server) = server_once("200 OK", "text/event-stream", sse).await;
     let backend = RigBackend::new(
         &codex_model(base_url),
@@ -1087,6 +1099,8 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
     assert!(request_headers.contains("chatgpt-account-id: account-123"));
     assert!(request_headers.contains("originator: pi"));
     assert!(request_headers.contains("openai-beta: responses=experimental"));
+    assert!(request_headers.contains("version: 0.153.0"));
+    assert!(request_headers.contains("x-codex-routing-hint: model=gpt-5.4"));
     assert!(request_headers.contains("session-id: codex-sse-stream-session"));
     assert!(request_headers.contains("x-client-request-id: codex-sse-stream-session"));
     assert!(!request_headers.contains("session_id:"));
@@ -1564,6 +1578,56 @@ fn completions_cache_control_and_session_affinity_match_pi() {
         "ephemeral"
     );
     assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn opencode_requests_use_stable_session_header_and_preserve_user_agent() {
+    for (provider, api) in [
+        ("opencode", "anthropic-messages"),
+        ("opencode-go", "openai-completions"),
+        ("opencode-go", "openai-responses"),
+    ] {
+        let mut model = catalog_model(api, json!({}));
+        model.provider = provider.to_string();
+        let transform = ModelRequestTransform {
+            model,
+            thinking: ThinkingLevel::Off,
+            session_id: Some("session-1".to_string()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("configured-client/1.0"),
+        );
+
+        transform.transform_headers(&mut headers);
+
+        assert_eq!(headers["x-opencode-session"], "session-1");
+        assert_eq!(headers[http::header::USER_AGENT], "configured-client/1.0");
+    }
+
+    let mut opencode = catalog_model("openai-completions", json!({}));
+    opencode.provider = "opencode".to_string();
+    let transform = ModelRequestTransform {
+        model: opencode,
+        thinking: ThinkingLevel::Off,
+        session_id: Some("session-1".to_string()),
+    };
+    let mut headers = HeaderMap::new();
+    transform.transform_headers(&mut headers);
+    assert_eq!(
+        headers[http::header::USER_AGENT],
+        concat!("uri-agent/", env!("CARGO_PKG_VERSION"))
+    );
+
+    let transform = ModelRequestTransform {
+        model: catalog_model("openai-completions", json!({})),
+        thinking: ThinkingLevel::Off,
+        session_id: Some("session-1".to_string()),
+    };
+    let mut headers = HeaderMap::new();
+    transform.transform_headers(&mut headers);
+    assert!(!headers.contains_key("x-opencode-session"));
 }
 
 #[test]
