@@ -1410,6 +1410,79 @@ fn retry_after_accepts_seconds_and_http_dates() {
 }
 
 #[test]
+fn gpt_6_astra_catalog_supports_api_and_codex_basic_requests() {
+    for (provider, api, base_url, minimal) in [
+        (
+            "openai",
+            "openai-responses",
+            "https://api.openai.com/v1",
+            Value::Null,
+        ),
+        (
+            "openai-codex",
+            "openai-codex-responses",
+            "https://chatgpt.com/backend-api",
+            json!("low"),
+        ),
+    ] {
+        // Pi catalog metadata, including the subscription route's minimal alias.
+        let model: CatalogModel = serde_json::from_value(json!({
+            "id": "gpt-6-astra",
+            "name": "GPT-6 Astra",
+            "provider": provider,
+            "api": api,
+            "baseUrl": base_url,
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": 272000,
+            "maxTokens": 128000,
+            "thinkingLevelMap": {
+                "off": null, "minimal": minimal, "low": "low",
+                "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"
+            }
+        }))
+        .unwrap();
+        assert!(model.supported());
+        assert!(model.accepts_input("text"));
+        assert!(model.accepts_input("image"));
+        assert_eq!(model.context_window(), 272000);
+        assert_eq!(model.max_tokens(), 128000);
+        assert!(!model.supports_thinking_level(ThinkingLevel::Off));
+        assert_eq!(
+            model.supports_thinking_level(ThinkingLevel::Minimal),
+            provider == "openai-codex"
+        );
+
+        for level in [
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
+        ] {
+            assert!(model.supports_thinking_level(level));
+            let body = transformed(
+                model.clone(),
+                level,
+                json!({
+                    "model": model.id,
+                    "stream": true,
+                    "tools": [{"type": "function", "name": "read", "parameters": {
+                        "type": "object", "properties": {"uri": {"type": "string"}}
+                    }}]
+                }),
+            );
+            assert_eq!(body["model"], "gpt-6-astra");
+            assert_eq!(body["reasoning"]["effort"], level.as_str());
+            assert_eq!(body["tools"][0]["name"], "read");
+            assert_eq!(body["store"], false);
+            assert!(body.get("additional_tools").is_none());
+            assert!(body.get("prompt_cache_options").is_none());
+        }
+    }
+}
+
+#[test]
 fn responses_uses_catalog_thinking_map_and_sampling_params() {
     let model = catalog_model(
         "openai-responses",
