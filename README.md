@@ -76,8 +76,9 @@ fixed handful of models. As of 2026-09-04, the catalog coverage is:
 | Provider IDs | 35 of 39 |
 | Provider IDs with live discovery | 28 of 35 runnable |
 
-The supported API families are OpenAI Responses, OpenAI Codex Responses,
-OpenAI Chat Completions, Anthropic Messages, and Google Generative AI. Live
+The current supported API families are OpenAI Responses, OpenAI Codex Responses,
+OpenAI Chat Completions, Anthropic Messages, Google Generative AI, and
+`pi-messages`. Radius and Muse Code support was added after the snapshot above. Live
 provider results are cached per credential and supplement the shared catalog,
 so newly available account models can appear before pi.dev adds them.
 
@@ -87,12 +88,14 @@ integrations for:
 - ChatGPT Codex subscription OAuth and WebSocket transport;
 - Cloudflare AI Gateway with credential-safe endpoint handling;
 - WorkBuddy China browser login and account model discovery;
+- Radius authenticated model discovery and native `pi-messages` transport;
+- Muse Code subscription login and account model discovery;
 - the explicitly experimental Antigravity private protocol; and
 - Abliteration.ai credential-scoped live discovery with static fallback
   models.
 
 URI Agent also supports provider-specific login flows for Anthropic, GitHub
-Copilot, Kimi Coding, xAI, Radius, and OpenRouter.
+Copilot, Kimi Coding, xAI, and OpenRouter.
 
 Catalog contents and account entitlements change; a listed model still requires
 the matching credentials, region, and subscription. See [Models and

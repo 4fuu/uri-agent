@@ -474,6 +474,7 @@ struct DiscoveryCredentialCandidate {
     oauth: bool,
     environment: BTreeMap<String, String>,
     workbuddy: Option<WorkBuddyCatalogCredential>,
+    radius_gateway: Option<String>,
 }
 
 pub struct ConfigManager {
@@ -1112,6 +1113,19 @@ impl ConfigManager {
             .unwrap_or_default()
     }
 
+    pub(crate) async fn radius_gateway(&self) -> String {
+        self.files
+            .lock()
+            .await
+            .auth
+            .0
+            .get("radius")
+            .and_then(|entry| entry.extra.get("gateway"))
+            .and_then(Value::as_str)
+            .unwrap_or("https://radius.pi.dev")
+            .to_string()
+    }
+
     pub async fn set_oauth(&self, provider: &str, token: OauthToken) -> Result<ActiveSettings> {
         let provider = provider.to_string();
         self.update_auth(move |auth| {
@@ -1298,8 +1312,10 @@ async fn discovery_credential_candidates(
 ) -> Vec<DiscoveryCredentialCandidate> {
     let current_provider = selected_provider(files, invocation).0;
     let mut providers = catalog.providers().await;
-    if !providers.iter().any(|provider| provider == "workbuddy") {
-        providers.push("workbuddy".to_string());
+    for provider in ["workbuddy", "radius"] {
+        if !providers.iter().any(|candidate| candidate == provider) {
+            providers.push(provider.to_string());
+        }
     }
     let mut candidates = Vec::new();
     for provider in providers {
@@ -1352,12 +1368,25 @@ async fn discovery_credential_candidates(
         } else {
             None
         };
+        let radius_gateway = (provider == "radius")
+            .then(|| {
+                files
+                    .auth
+                    .0
+                    .get(&provider)?
+                    .extra
+                    .get("gateway")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .flatten();
         candidates.push(DiscoveryCredentialCandidate {
             provider,
             value,
             oauth: credential.kind == AuthKind::Oauth,
             environment: credential.environment,
             workbuddy,
+            radius_gateway,
         });
     }
     candidates
@@ -1395,6 +1424,7 @@ async fn resolve_discovery_credentials(
                     secret,
                     oauth: candidate.oauth,
                     workbuddy: candidate.workbuddy,
+                    radius_gateway: candidate.radius_gateway,
                 },
             );
         }
@@ -1642,10 +1672,14 @@ async fn resolve_model_credential(
 }
 
 fn oauth_token_from_entry(provider: &str, entry: &AuthEntry) -> Result<OauthToken> {
-    let refresh = entry
-        .refresh
-        .clone()
-        .ok_or_else(|| anyhow!("{provider} OAuth credential has no refresh token"))?;
+    let refresh = if provider == "muse-code" {
+        entry.refresh.clone().unwrap_or_default()
+    } else {
+        entry
+            .refresh
+            .clone()
+            .ok_or_else(|| anyhow!("{provider} OAuth credential has no refresh token"))?
+    };
     let access = entry
         .access
         .clone()
@@ -1654,7 +1688,11 @@ fn oauth_token_from_entry(provider: &str, entry: &AuthEntry) -> Result<OauthToke
         kind: "oauth".to_string(),
         refresh,
         access,
-        expires: entry.expires.unwrap_or(0),
+        expires: if provider == "muse-code" {
+            i64::MAX
+        } else {
+            entry.expires.unwrap_or(0)
+        },
         extra: entry.extra.clone(),
     })
 }
@@ -3098,6 +3136,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn muse_credentials_survive_reload_without_refresh_or_account_token_exposure() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::load_for_test(root.path(), root.path())
+            .await
+            .unwrap();
+        let token = OauthToken {
+            kind: "oauth".into(),
+            refresh: String::new(),
+            access: "minted-key".into(),
+            expires: i64::MAX,
+            extra: BTreeMap::from([
+                (
+                    "oauthAccessToken".into(),
+                    Value::String("account-token".into()),
+                ),
+                ("accountId".into(), Value::String("account".into())),
+            ]),
+        };
+        manager.set_oauth("muse-code", token.clone()).await.unwrap();
+        let active = manager
+            .set_model("muse-code", "muse-spark-1.3")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .resolve_model_api_key(&active)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("minted-key")
+        );
+        let manager = ConfigManager::load_for_test(root.path(), root.path())
+            .await
+            .unwrap();
+        assert_eq!(manager.oauth_token("muse-code").await.unwrap(), token);
+        let candidates = discovery_credential_candidates(
+            &*manager.files.lock().await,
+            &manager.catalog,
+            &manager.invocation,
+        )
+        .await;
+        let credentials = resolve_discovery_credentials(candidates, false).await;
+        assert_eq!(credentials["muse-code"].secret, "minted-key");
+        assert!(
+            manager
+                .force_refresh_oauth("muse-code")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(":login")
+        );
+        assert_eq!(manager.oauth_token("muse-code").await.unwrap(), token);
+    }
+
+    #[tokio::test]
+    async fn radius_first_login_discovers_without_catalog_seed_and_preserves_gateway() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::load_for_test(root.path(), root.path())
+            .await
+            .unwrap();
+        manager
+            .set_oauth(
+                "radius",
+                OauthToken {
+                    kind: "oauth".into(),
+                    refresh: "refresh".into(),
+                    access: "radius-token".into(),
+                    expires: i64::MAX,
+                    extra: BTreeMap::from([(
+                        "gateway".into(),
+                        Value::String("https://custom.radius.test".into()),
+                    )]),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!manager.current().await.model_configured());
+        assert_eq!(manager.radius_gateway().await, "https://custom.radius.test");
+        let candidates = discovery_credential_candidates(
+            &*manager.files.lock().await,
+            &manager.catalog,
+            &manager.invocation,
+        )
+        .await;
+        let credentials = resolve_discovery_credentials(candidates, false).await;
+        assert_eq!(credentials["radius"].secret, "radius-token");
+        assert_eq!(
+            credentials["radius"].radius_gateway.as_deref(),
+            Some("https://custom.radius.test")
+        );
+    }
+
+    #[tokio::test]
     async fn provider_api_keys_resolve_saved_and_process_environment_credentials() {
         let root = tempfile::tempdir().unwrap();
         let manager = ConfigManager::load_for_test(root.path(), root.path())
@@ -3362,6 +3493,7 @@ mod tests {
             oauth: false,
             environment: BTreeMap::new(),
             workbuddy: None,
+            radius_gateway: None,
         };
 
         let credentials = resolve_discovery_credentials(vec![candidate()], false).await;
@@ -3388,6 +3520,7 @@ mod tests {
             oauth: false,
             environment: BTreeMap::new(),
             workbuddy: None,
+            radius_gateway: None,
         };
 
         let credentials = resolve_discovery_credentials(

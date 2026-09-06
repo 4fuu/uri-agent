@@ -82,7 +82,7 @@ pub(in crate::oauth) fn start_radius_device(
                 "Open the Radius verification URL and enter the device code.",
             );
             open_url(&verification);
-            device::poll(
+            let mut token = device::poll(
                 json_interval(&value),
                 json_expires(&value),
                 false,
@@ -105,7 +105,11 @@ pub(in crate::oauth) fn start_radius_device(
                     }
                 },
             )
-            .await
+            .await?;
+            token
+                .extra
+                .insert("gateway".to_string(), Value::String(gateway));
+            Ok(token)
         }
         .await;
         let _ = done_tx.send(result);

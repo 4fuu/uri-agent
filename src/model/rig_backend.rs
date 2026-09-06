@@ -362,7 +362,13 @@ impl RigBackend {
             })
             .transpose()?;
         let request_client = AuthClient {
-            inner: reqwest::Client::new(),
+            inner: if model.provider == "muse-code" {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?
+            } else {
+                reqwest::Client::new()
+            },
             strip_x_api_key: anthropic_oauth || strip_x_api_key,
             transform: Some(ModelRequestTransform {
                 model: model.clone(),

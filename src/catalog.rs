@@ -1,4 +1,6 @@
 mod discovery;
+mod muse_code;
+mod radius;
 mod workbuddy;
 
 use crate::config::display_path;
@@ -25,6 +27,7 @@ const REQUEST_CONCURRENCY: usize = 8;
 pub(crate) struct CatalogCredential {
     pub secret: String,
     pub oauth: bool,
+    pub radius_gateway: Option<String>,
     pub workbuddy: Option<WorkBuddyCatalogCredential>,
 }
 
@@ -70,6 +73,7 @@ impl CatalogModel {
                 | "anthropic-messages"
                 | "google-generative-ai"
                 | "antigravity"
+                | "pi-messages"
         )
     }
 
@@ -336,6 +340,14 @@ struct StoreEntry {
 struct DiscoveryStoreEntry {
     models: Vec<CatalogModel>,
     checked_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    succeeded: Option<bool>,
+}
+
+impl DiscoveryStoreEntry {
+    fn succeeded(&self) -> bool {
+        self.succeeded.unwrap_or(!self.models.is_empty())
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -511,7 +523,9 @@ impl ModelCatalog {
             .filter_map(|(provider, credential)| {
                 if !discovery::supports_provider(provider)
                     || !discovery::refresh_enabled(provider)
-                    || (provider != workbuddy::PROVIDER && !base_models.contains_key(provider))
+                    || (provider != workbuddy::PROVIDER
+                        && provider != radius::PROVIDER
+                        && !base_models.contains_key(provider))
                 {
                     return None;
                 }
@@ -559,6 +573,7 @@ impl ModelCatalog {
                         DiscoveryStoreEntry {
                             models,
                             checked_at: now,
+                            succeeded: Some(true),
                         },
                     );
                 }
@@ -567,8 +582,11 @@ impl ModelCatalog {
                     entry.discoveries.insert(
                         fingerprint,
                         DiscoveryStoreEntry {
-                            models: cached.map_or_else(Vec::new, |entry| entry.models),
+                            models: cached
+                                .as_ref()
+                                .map_or_else(Vec::new, |entry| entry.models.clone()),
                             checked_at: now,
+                            succeeded: Some(cached.as_ref().is_some_and(|entry| entry.succeeded())),
                         },
                     );
                 }
@@ -779,11 +797,19 @@ fn merge_catalog(
             continue;
         };
         let models = raw.entry(provider.clone()).or_default();
+        if matches!(provider.as_str(), muse_code::PROVIDER | radius::PROVIDER)
+            && discovered.succeeded()
+        {
+            models.clear();
+        }
         for model in &discovered.models {
             let Ok(value) = serde_json::to_value(model) else {
                 continue;
             };
-            if provider == workbuddy::PROVIDER {
+            if matches!(
+                provider.as_str(),
+                workbuddy::PROVIDER | muse_code::PROVIDER | radius::PROVIDER
+            ) {
                 models.insert(model.id.clone(), value);
             } else {
                 models.entry(model.id.clone()).or_insert(value);
@@ -835,6 +861,14 @@ fn merge_catalog(
                 }
             }
             merge_value(model, patch);
+        }
+    }
+
+    // Muse transport is subscription-owned, not catalog metadata. Keep user
+    // model customization from moving credentials or changing required headers.
+    if let Some(models) = raw.get_mut(muse_code::PROVIDER) {
+        for model in models.values_mut() {
+            muse_code::enforce_transport(model);
         }
     }
 
@@ -1062,6 +1096,7 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
     BTreeMap::from([
         ("abliteration".to_string(), abliteration_models),
         ("antigravity".to_string(), models),
+        (muse_code::PROVIDER.to_string(), muse_code::seeds()),
     ])
 }
 
@@ -1349,6 +1384,7 @@ mod tests {
             CatalogCredential {
                 secret: "configured-key".to_string(),
                 oauth: false,
+                radius_gateway: None,
                 workbuddy: None,
             },
         )]);
@@ -1392,6 +1428,7 @@ mod tests {
             CatalogCredential {
                 secret: "oauth-access".to_string(),
                 oauth: true,
+                radius_gateway: None,
                 workbuddy: Some(WorkBuddyCatalogCredential {
                     session: WorkBuddySession {
                         endpoint: base_url,
@@ -1623,6 +1660,7 @@ mod tests {
                                 discovered("only-a", "Only A"),
                             ],
                             checked_at: 1,
+                            succeeded: None,
                         },
                     ),
                     (
@@ -1630,6 +1668,7 @@ mod tests {
                         DiscoveryStoreEntry {
                             models: vec![discovered("only-b", "Only B")],
                             checked_at: 1,
+                            succeeded: None,
                         },
                     ),
                 ]),
@@ -1647,6 +1686,39 @@ mod tests {
                 .map(|model| (model.id.as_str(), model.name.as_str()))
                 .collect::<Vec<_>>(),
             vec![("only-a", "Only A"), ("shared", "Pi Shared")]
+        );
+    }
+
+    #[test]
+    fn authoritative_empty_rosters_clear_seeds_but_failed_empty_caches_do_not() {
+        let scope = BTreeMap::from([("muse-code".to_string(), "account".to_string())]);
+        let store = |succeeded| {
+            BTreeMap::from([(
+                "muse-code".to_string(),
+                StoreEntry {
+                    discoveries: BTreeMap::from([(
+                        "account".to_string(),
+                        DiscoveryStoreEntry {
+                            models: Vec::new(),
+                            checked_at: 1,
+                            succeeded,
+                        },
+                    )]),
+                    ..StoreEntry::default()
+                },
+            )])
+        };
+
+        assert!(
+            merge_catalog(&store(Some(true)), &ModelsFile::default(), &scope).0["muse-code"]
+                .is_empty()
+        );
+        assert!(
+            !merge_catalog(&store(Some(false)), &ModelsFile::default(), &scope).0["muse-code"]
+                .is_empty()
+        );
+        assert!(
+            !merge_catalog(&store(None), &ModelsFile::default(), &scope).0["muse-code"].is_empty()
         );
     }
 
@@ -1669,6 +1741,7 @@ mod tests {
                     DiscoveryStoreEntry {
                         models: vec![model("Cloud Name")],
                         checked_at: 1,
+                        succeeded: None,
                     },
                 )]),
                 ..StoreEntry::default()

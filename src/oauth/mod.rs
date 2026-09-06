@@ -29,6 +29,7 @@ pub enum OauthProvider {
     OpenAiCodex,
     GitHubCopilot,
     KimiCoding,
+    MuseCode,
     Xai,
     Radius,
 }
@@ -41,7 +42,7 @@ pub struct OauthMethod {
 }
 
 impl OauthProvider {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Antigravity,
         Self::Anthropic,
         Self::WorkBuddy,
@@ -49,6 +50,7 @@ impl OauthProvider {
         Self::OpenAiCodex,
         Self::GitHubCopilot,
         Self::KimiCoding,
+        Self::MuseCode,
         Self::Xai,
         Self::Radius,
     ];
@@ -62,6 +64,7 @@ impl OauthProvider {
             "openai-codex" => Self::OpenAiCodex,
             "github-copilot" => Self::GitHubCopilot,
             "kimi-coding" => Self::KimiCoding,
+            "muse-code" => Self::MuseCode,
             "xai" => Self::Xai,
             "radius" => Self::Radius,
             _ => return None,
@@ -77,6 +80,7 @@ impl OauthProvider {
             Self::OpenAiCodex => "openai-codex",
             Self::GitHubCopilot => "github-copilot",
             Self::KimiCoding => "kimi-coding",
+            Self::MuseCode => "muse-code",
             Self::Xai => "xai",
             Self::Radius => "radius",
         }
@@ -91,6 +95,7 @@ impl OauthProvider {
             Self::OpenAiCodex => "OpenAI Codex",
             Self::GitHubCopilot => "GitHub Copilot",
             Self::KimiCoding => "Kimi Code (subscription)",
+            Self::MuseCode => "Muse Code (subscription)",
             Self::Xai => "xAI (Grok/X subscription)",
             Self::Radius => "Radius",
         }
@@ -139,6 +144,11 @@ impl OauthProvider {
                 id: "oauth",
                 label: "Sign in with Kimi Code",
                 description: "Subscription device-code login",
+            }],
+            Self::MuseCode => &[OauthMethod {
+                id: "oauth",
+                label: "Meta device code",
+                description: "Sign in with a Muse Code subscription",
             }],
             Self::Xai => &[OauthMethod {
                 id: "oauth",
@@ -259,6 +269,7 @@ pub fn start_login(
         OauthProvider::OpenAiCodex => providers::start_codex_browser(),
         OauthProvider::GitHubCopilot => providers::start_github_copilot(extra.get("domain")),
         OauthProvider::KimiCoding => providers::start_kimi(),
+        OauthProvider::MuseCode => providers::start_muse_code(),
         OauthProvider::Xai => providers::start_xai(),
         OauthProvider::Radius if method == "device_code" => {
             providers::start_radius_device(extra.get("gateway").map(String::as_str))
@@ -281,6 +292,9 @@ pub async fn refresh_token(provider: &str, token: &OauthToken) -> Result<OauthTo
         OauthProvider::OpenAiCodex => providers::refresh_codex(&token.refresh).await,
         OauthProvider::GitHubCopilot => providers::refresh_github_copilot(token).await,
         OauthProvider::KimiCoding => providers::refresh_kimi(&token.refresh).await,
+        OauthProvider::MuseCode => {
+            bail!("Muse Code credentials cannot be refreshed; run :login again")
+        }
         OauthProvider::Xai => providers::refresh_xai(&token.refresh).await,
         OauthProvider::Radius => providers::refresh_radius(token).await,
     }?;
@@ -292,7 +306,11 @@ fn normalize_refreshed_token(
     previous: &OauthToken,
     mut refreshed: OauthToken,
 ) -> Result<OauthToken> {
-    if provider != OauthProvider::OpenRouter && refreshed.refresh.is_empty() {
+    if !matches!(
+        provider,
+        OauthProvider::OpenRouter | OauthProvider::MuseCode
+    ) && refreshed.refresh.is_empty()
+    {
         if previous.refresh.is_empty() {
             bail!(
                 "{} OAuth refresh returned no refresh token and the stored credential has none",
@@ -359,7 +377,7 @@ mod tests {
 
     #[test]
     fn pi_oauth_providers_are_registered() {
-        assert_eq!(OauthProvider::ALL.len(), 9);
+        assert_eq!(OauthProvider::ALL.len(), 10);
         assert!(oauth_enabled("antigravity"));
         assert!(oauth_enabled("anthropic"));
         assert!(oauth_enabled("workbuddy"));
@@ -367,6 +385,7 @@ mod tests {
         assert!(oauth_enabled("openai-codex"));
         assert!(oauth_enabled("github-copilot"));
         assert!(oauth_enabled("kimi-coding"));
+        assert!(oauth_enabled("muse-code"));
         assert!(oauth_enabled("xai"));
         assert!(oauth_enabled("radius"));
         assert!(!oauth_enabled("openai"));
@@ -378,6 +397,7 @@ mod tests {
         assert_eq!(OauthProvider::OpenAiCodex.methods().len(), 2);
         assert!(!OauthProvider::OpenAiCodex.offers_api_key());
         assert!(!OauthProvider::Antigravity.offers_api_key());
+        assert!(OauthProvider::MuseCode.offers_api_key());
     }
 
     #[test]
@@ -444,5 +464,22 @@ mod tests {
         assert!(
             normalize_refreshed_token(OauthProvider::OpenRouter, &token, token.clone()).is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn muse_code_force_refresh_requires_a_new_login() {
+        let token = OauthToken {
+            kind: "oauth".into(),
+            access: "minted-model-key".into(),
+            refresh: String::new(),
+            expires: i64::MAX,
+            extra: BTreeMap::from([(
+                "oauthAccessToken".into(),
+                Value::String("meta-account-token".into()),
+            )]),
+        };
+        let error = refresh_token("muse-code", &token).await.unwrap_err();
+        assert!(error.to_string().contains("run :login again"));
+        assert_eq!(token.access, "minted-model-key");
     }
 }

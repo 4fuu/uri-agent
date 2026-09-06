@@ -301,6 +301,7 @@ mod tests {
         let credential = CatalogCredential {
             secret: "oauth-access".to_string(),
             oauth: true,
+            radius_gateway: None,
             workbuddy: Some(WorkBuddyCatalogCredential {
                 session: WorkBuddySession {
                     endpoint: format!("http://{address}/v2"),

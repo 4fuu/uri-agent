@@ -93,6 +93,52 @@ fn test_app() -> App {
     test_app_with_splash(true)
 }
 
+#[test]
+fn radius_and_muse_auth_request_catalog_refresh_without_changing_other_providers() {
+    assert!(refresh_catalog_after_auth("radius"));
+    assert!(refresh_catalog_after_auth("muse-code"));
+    assert!(!refresh_catalog_after_auth("anthropic"));
+    assert!(!refresh_catalog_after_auth("workbuddy"));
+}
+
+#[test]
+fn post_auth_status_distinguishes_background_refresh_and_offline_mode() {
+    assert_eq!(
+        auth_success_message("Logged in with OAuth", "radius", true),
+        "Logged in with OAuth for radius; refreshing model catalog in the background"
+    );
+    assert_eq!(
+        auth_success_message("Saved API key", "muse-code", false),
+        "Saved API key for muse-code; catalog refresh skipped because offline mode is enabled"
+    );
+    assert_eq!(
+        auth_success_message("Saved API key", "anthropic", true),
+        "Saved API key for anthropic"
+    );
+}
+
+#[test]
+fn catalog_refresh_restores_the_unsubmitted_model_highlight() {
+    let model = |id: &str| CatalogModel {
+        id: id.to_string(),
+        name: id.to_uppercase(),
+        api: "openai-responses".to_string(),
+        provider: "radius".to_string(),
+        base_url: String::new(),
+        headers: BTreeMap::new(),
+        metadata: BTreeMap::new(),
+    };
+    let mut selector =
+        ModelSelector::from_models(vec![model("newly-discovered"), model("chosen")], "", "");
+
+    restore_model_selector_highlight(
+        &mut selector,
+        Some(("radius".to_string(), "chosen".to_string())),
+    );
+
+    assert_eq!(selector.selected().unwrap().id, "chosen");
+}
+
 fn apply_event(app: &mut App, sequence: u64, kind: EventKind) {
     app.apply(SessionEvent {
         sequence,

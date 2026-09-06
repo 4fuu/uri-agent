@@ -1163,7 +1163,7 @@ pub(super) async fn apply_action(
             Ok(None)
         }
         Action::StoreApiKey { provider, key } => {
-            store_api_key(app, services, &provider, key).await;
+            store_api_key(app, services, &provider, key, background_tx).await;
             Ok(None)
         }
         Action::StoreCloudflareCredentials {
@@ -4154,11 +4154,58 @@ async fn refresh_workbuddy_models(manager: &ConfigManager, catalog: &ModelCatalo
     Ok(())
 }
 
+pub(super) fn refresh_catalog_after_auth(provider: &str) -> bool {
+    matches!(provider, "radius" | "muse-code")
+}
+
+pub(super) fn auth_success_message(
+    action: &str,
+    provider: &str,
+    networking_enabled: bool,
+) -> String {
+    if refresh_catalog_after_auth(provider) {
+        if networking_enabled {
+            format!("{action} for {provider}; refreshing model catalog in the background")
+        } else {
+            format!(
+                "{action} for {provider}; catalog refresh skipped because offline mode is enabled"
+            )
+        }
+    } else {
+        format!("{action} for {provider}")
+    }
+}
+
+pub(super) fn restore_model_selector_highlight(
+    selector: &mut ModelSelector,
+    highlighted: Option<(String, String)>,
+) {
+    if let Some((provider, model)) = highlighted {
+        selector.select_model(&provider, &model);
+    }
+}
+
+fn start_post_auth_catalog_refresh(
+    app: &mut App,
+    services: &LoopServices,
+    provider: &str,
+    sender: mpsc::UnboundedSender<BackgroundEvent>,
+) {
+    if !refresh_catalog_after_auth(provider) || !services.catalog.networking_enabled() {
+        return;
+    }
+    // Do not wait for an in-flight startup refresh: it may have captured credentials
+    // before this login completed. ConfigManager serializes the actual refreshes.
+    app.catalog_refreshing = true;
+    spawn_catalog_refresh(services, sender, true, true);
+}
+
 pub(super) async fn store_api_key(
     app: &mut App,
     services: &LoopServices,
     provider: &str,
     key: String,
+    background_tx: mpsc::UnboundedSender<BackgroundEvent>,
 ) {
     if key.trim().is_empty() {
         app.set_flash("API key cannot be empty");
@@ -4182,10 +4229,18 @@ pub(super) async fn store_api_key(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    app.set_flash(match result {
-        Ok(()) => format!("Saved API key for {provider}"),
+    let message = match result {
+        Ok(()) => {
+            start_post_auth_catalog_refresh(app, services, provider, background_tx);
+            auth_success_message(
+                "Saved API key",
+                provider,
+                services.catalog.networking_enabled(),
+            )
+        }
         Err(error) => format!("Could not save API key: {error:#}"),
-    });
+    };
+    app.set_flash(message);
 }
 
 pub(super) async fn store_cloudflare_credentials(
@@ -4938,11 +4993,14 @@ pub(super) async fn finish_background(
                     settings.selected = view.1.min(settings.tab.row_count().saturating_sub(1));
                     app.settings = Some(settings);
                 }
-                if let Some(query) = app
-                    .model_selector
-                    .as_ref()
-                    .map(|selector| selector.query().to_string())
-                {
+                if let Some((query, highlighted)) = app.model_selector.as_ref().map(|selector| {
+                    (
+                        selector.query().to_string(),
+                        selector
+                            .selected()
+                            .map(|model| (model.provider.clone(), model.id.clone())),
+                    )
+                }) {
                     let providers = services
                         .manager
                         .model_providers_with_credentials(&active.provider)
@@ -4961,6 +5019,7 @@ pub(super) async fn finish_background(
                     {
                         selector.select_model(&configured.provider, &configured.model);
                     }
+                    restore_model_selector_highlight(&mut selector, highlighted);
                     app.model_selector = Some(selector);
                 }
                 if let Some(hub) = app.model_hub.as_mut() {
@@ -4971,6 +5030,12 @@ pub(super) async fn finish_background(
             }
             .await;
             match result {
+                Ok(report) if report.discovery_failures > 0 || report.pi_failures > 0 => {
+                    app.set_flash(format!(
+                        "Catalog refresh incomplete ({} provider discovery, {} shared catalog failures); credentials remain saved; cached models retained",
+                        report.discovery_failures, report.pi_failures
+                    ));
+                }
                 Ok(report) if announced => {
                     if report.discovered_models > 0 {
                         app.set_flash(format!(
@@ -5018,10 +5083,23 @@ pub(super) async fn finish_background(
                         Ok::<_, anyhow::Error>(())
                     }
                     .await;
-                    app.set_flash(match applied {
-                        Ok(()) => format!("Logged in to {provider} with OAuth"),
+                    let message = match applied {
+                        Ok(()) => {
+                            start_post_auth_catalog_refresh(
+                                app,
+                                services,
+                                &provider,
+                                background_tx,
+                            );
+                            auth_success_message(
+                                "Logged in with OAuth",
+                                &provider,
+                                services.catalog.networking_enabled(),
+                            )
+                        }
                         Err(error) => format!("OAuth succeeded but could not apply: {error:#}"),
-                    });
+                    };
+                    app.set_flash(message);
                 }
                 Err(error) => app.set_flash(format!("OAuth failed: {error:#}")),
             }

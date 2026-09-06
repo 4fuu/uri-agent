@@ -1,4 +1,4 @@
-use super::{CatalogCredential, CatalogModel, workbuddy};
+use super::{CatalogCredential, CatalogModel, muse_code, radius, workbuddy};
 use anyhow::{Context, Result, anyhow, bail};
 use http::header::{ACCEPT, AUTHORIZATION};
 use reqwest::{Client, RequestBuilder, Url};
@@ -14,6 +14,8 @@ enum DiscoveryKind {
     Anthropic,
     Gemini,
     OpenCode,
+    MuseCode,
+    Radius,
     WorkBuddy,
 }
 
@@ -30,6 +32,7 @@ const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("huggingface", DiscoveryKind::OpenAi),
     ("minimax", DiscoveryKind::Anthropic),
     ("minimax-cn", DiscoveryKind::Anthropic),
+    ("muse-code", DiscoveryKind::MuseCode),
     ("moonshotai", DiscoveryKind::OpenAi),
     ("moonshotai-cn", DiscoveryKind::OpenAi),
     ("nvidia", DiscoveryKind::OpenAi),
@@ -40,6 +43,7 @@ const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("qwen-token-plan", DiscoveryKind::OpenAi),
     ("qwen-token-plan-cn", DiscoveryKind::OpenAi),
     ("qwen-token-plan-individual", DiscoveryKind::OpenAi),
+    ("radius", DiscoveryKind::Radius),
     ("together", DiscoveryKind::OpenAi),
     ("xai", DiscoveryKind::OpenAi),
     ("xiaomi", DiscoveryKind::OpenAi),
@@ -83,6 +87,16 @@ pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredent
     hash.update(b"uri-agent-model-discovery\0");
     hash.update(provider.as_bytes());
     hash.update([u8::from(credential.oauth)]);
+    if provider == radius::PROVIDER {
+        hash.update(
+            credential
+                .radius_gateway
+                .as_deref()
+                .unwrap_or(radius::DEFAULT_GATEWAY)
+                .as_bytes(),
+        );
+        hash.update([0]);
+    }
     if let Some(workbuddy) = &credential.workbuddy {
         hash.update(workbuddy.session.endpoint.as_bytes());
         hash.update([u8::from(workbuddy.api_key)]);
@@ -133,6 +147,12 @@ pub(super) async fn discover(
     if kind == DiscoveryKind::WorkBuddy {
         return workbuddy::discover(client, credential).await;
     }
+    if kind == DiscoveryKind::MuseCode {
+        return muse_code::discover(client, credential).await;
+    }
+    if kind == DiscoveryKind::Radius {
+        return radius::discover(client, credential).await;
+    }
     let references = catalog
         .get(provider)
         .ok_or_else(|| anyhow!("provider {provider} has no catalog models"))?;
@@ -144,6 +164,9 @@ pub(super) async fn discover(
         DiscoveryKind::Anthropic => fetch_anthropic(client, endpoint, credential).await?,
         DiscoveryKind::Gemini => fetch_gemini(client, endpoint, credential).await?,
         DiscoveryKind::WorkBuddy => unreachable!("WorkBuddy discovery returned above"),
+        DiscoveryKind::MuseCode | DiscoveryKind::Radius => {
+            unreachable!("provider-owned discovery returned above")
+        }
     };
     Ok(materialize(provider, kind, records, catalog))
 }
@@ -164,7 +187,9 @@ fn discovery_endpoint(
             .iter()
             .find(|model| model.base_url.trim_end_matches('/').ends_with("/v1"))
             .or_else(|| references.first()),
-        DiscoveryKind::WorkBuddy => unreachable!("WorkBuddy has a provider-owned endpoint"),
+        DiscoveryKind::WorkBuddy | DiscoveryKind::MuseCode | DiscoveryKind::Radius => {
+            unreachable!("provider has a provider-owned endpoint")
+        }
         _ => references.first(),
     }
     .map(|model| model.base_url.trim_end_matches('/'))
@@ -181,7 +206,9 @@ fn discovery_endpoint(
                 format!("{base_url}/v1/models")
             }
         }
-        DiscoveryKind::WorkBuddy => unreachable!("WorkBuddy has a provider-owned endpoint"),
+        DiscoveryKind::WorkBuddy | DiscoveryKind::MuseCode | DiscoveryKind::Radius => {
+            unreachable!("provider has a provider-owned endpoint")
+        }
     };
     Url::parse(&endpoint).with_context(|| format!("invalid discovery URL for {provider}"))
 }
@@ -410,6 +437,9 @@ fn materialize_one(
         DiscoveryKind::OpenCode => prefixed
             .map(|model| model.api.as_str())
             .unwrap_or_else(|| open_code_api(provider, &record.id)),
+        DiscoveryKind::MuseCode | DiscoveryKind::Radius | DiscoveryKind::WorkBuddy => {
+            unreachable!("provider-owned discovery does not use generic materialization")
+        }
         _ => single_supported_api(references)?,
     };
     let template = catalog
@@ -621,12 +651,14 @@ mod tests {
 
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
-        assert_eq!(provider_ids().count(), 30);
+        assert_eq!(provider_ids().count(), 32);
         assert!(supports_provider("abliteration"));
         assert!(supports_provider("workbuddy"));
         assert!(!supports_provider("codebuddy"));
         assert!(supports_provider("opencode-go"));
         assert!(supports_provider("google"));
+        assert!(supports_provider("muse-code"));
+        assert!(supports_provider("radius"));
         assert!(!supports_provider("amazon-bedrock"));
         assert!(!supports_provider("openai-codex"));
     }
@@ -636,6 +668,7 @@ mod tests {
         let credential = |secret: &str, uid: &str| CatalogCredential {
             secret: secret.to_string(),
             oauth: true,
+            radius_gateway: None,
             workbuddy: Some(WorkBuddyCatalogCredential {
                 session: WorkBuddySession {
                     endpoint: "https://copilot.tencent.com".to_string(),
@@ -664,6 +697,20 @@ mod tests {
         assert_ne!(
             credential_fingerprint("workbuddy", &first_api_key),
             credential_fingerprint("workbuddy", &second_api_key)
+        );
+    }
+
+    #[test]
+    fn radius_cache_scope_includes_gateway() {
+        let credential = |gateway: &str| CatalogCredential {
+            secret: "same-token".to_string(),
+            oauth: false,
+            radius_gateway: Some(gateway.to_string()),
+            workbuddy: None,
+        };
+        assert_ne!(
+            credential_fingerprint("radius", &credential("https://one.example")),
+            credential_fingerprint("radius", &credential("https://two.example"))
         );
     }
 
@@ -750,6 +797,10 @@ mod tests {
         );
         assert_eq!(open_code_api("opencode-go", "gpt-new"), "openai-responses");
         assert_eq!(
+            open_code_api("opencode-go", "muse-unknown"),
+            "openai-responses"
+        );
+        assert_eq!(
             open_code_api("opencode-go", "glm-new"),
             "openai-completions"
         );
@@ -776,6 +827,7 @@ mod tests {
             &CatalogCredential {
                 secret: "go-test-key".to_string(),
                 oauth: false,
+                radius_gateway: None,
                 workbuddy: None,
             },
             &catalog,
@@ -817,6 +869,7 @@ mod tests {
             &CatalogCredential {
                 secret: "anthropic-test-key".to_string(),
                 oauth: false,
+                radius_gateway: None,
                 workbuddy: None,
             },
             &catalog,
@@ -860,6 +913,7 @@ mod tests {
             &CatalogCredential {
                 secret: "google-test-key".to_string(),
                 oauth: false,
+                radius_gateway: None,
                 workbuddy: None,
             },
             &catalog,

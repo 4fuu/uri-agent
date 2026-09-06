@@ -28,6 +28,7 @@ families:
 - `openai-completions`
 - `anthropic-messages`
 - `google-generative-ai`
+- `pi-messages` (Radius gateway conversations)
 
 The root [README](../README.md#model-and-provider-coverage) publishes the dated
 catalog coverage visible to prospective users. A catalog entry does not
@@ -52,6 +53,39 @@ PI_OFFLINE=1 uri-agent
 ```
 
 ### Provider-specific setup
+
+**Radius.** Browser or device-code login saves the gateway credential, then
+refreshes its authenticated `/v1/config` model directory in the background.
+API-key login triggers the same refresh. Select a model with `:model` after
+refresh; login never chooses a default or replaces your current selection.
+The native `pi-messages` transport supports text, image input, reasoning, tool
+calls, and streamed responses. Custom OAuth gateways retain their saved origin;
+the discovered model endpoint must use that origin. Networking requires HTTPS
+except for loopback development endpoints.
+
+**Muse Code.** Choose **Muse Code (subscription)** in `:login` and complete
+Meta device-code login with an active subscription. URI Agent exchanges the
+Meta account token once for a model API key, saves both in `auth.json`, and
+uses only the model key for inference and discovery at `https://api.meta.ai/v1`.
+An existing subscription model key can also be entered as an API key or supplied
+through `MUSE_CODE_API_KEY`. The subscription endpoint and version header are
+fixed, including when using `models.json` overrides.
+
+Muse credentials have no automatic refresh or client-side expiration. Saved
+keys are reused; revoked credentials require `:login` again. A rate-limited key
+exchange is not automatically retried. Login validates subscription status and
+account identity and retains the returned subscription-window metadata; it does
+not continuously poll or display live subscription quotas.
+
+Muse Spark 1.1–1.3 fallback records include contributor variants, image input,
+reasoning, a 1,048,576-token context window, and up to 131,072 output tokens.
+Successful discovery replaces the fallback list with the account's available
+models, including an empty list. Image-generation and voice models are excluded.
+Failed discovery retains matching cached results, or fallback models when no
+successful account discovery exists.
+
+Radius and Muse login refreshes report failures separately from credential
+storage. Offline mode skips networking; use `:refresh-catalog` after reconnecting.
 
 **Abliteration.ai.** Use provider ID `abliteration`, sign in through `:login`,
 or set `ABLITERATION_API_KEY`; `ABLIT_KEY` is a lower-priority compatibility
@@ -148,6 +182,7 @@ custom identity prefix.
 | `openai-codex` | Browser or device-code login |
 | `github-copilot` | Device-code login, with optional Enterprise domain |
 | `kimi-coding` | Subscription device-code login |
+| `muse-code` | Meta device-code subscription login |
 | `xai` | SuperGrok or X Premium device-code login |
 | `radius` | Browser or device-code login |
 | `parallel`, `exa`, `tinyfish` | Web search and extraction API key |

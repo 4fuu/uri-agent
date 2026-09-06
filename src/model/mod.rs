@@ -9,6 +9,7 @@ mod antigravity;
 mod cloudflare;
 mod codex_websocket;
 mod failure;
+mod pi_messages;
 mod request_transform;
 mod retry;
 mod rig_backend;
@@ -110,6 +111,13 @@ pub async fn configured_backend(
             session_id,
             manager,
         ))
+    } else if model.api == "pi-messages" {
+        Arc::new(pi_messages::PiMessagesBackend::new(
+            model,
+            settings.clone(),
+            session_id,
+            manager,
+        )?)
     } else {
         rig_backend::deferred_backend(model, settings.clone(), session_id, manager)
     };
