@@ -97,6 +97,13 @@ fails.
 Platform API key cannot authenticate the subscription endpoint. WebSocket and
 SSE transport recovery is automatic.
 
+**Fireworks.** Provider models using an OpenAI-compatible API can use
+`FIREWORKS_API_KEY`. When a Fireworks provider has a model catalog entry, URI
+Agent can refresh its `/models` endpoint and merge the discovered models with
+the configured catalog. Anthropic-compatible Fireworks tool-discovery fields
+are not synthesized unless the catalog entry explicitly declares their
+compatibility metadata.
+
 **Cloudflare AI Gateway.** Run `:login` and supply the Cloudflare token, account
 ID, and gateway ID. A blank gateway ID uses `default`. URI Agent constructs the
 gateway endpoint locally and ignores catalog transport and authentication

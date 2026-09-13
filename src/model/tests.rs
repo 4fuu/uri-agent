@@ -605,7 +605,7 @@ fn codex_request_transform_matches_current_routing_contract() {
         ThinkingLevel::Off,
         json!({}),
     );
-    assert!(off.get("reasoning").is_none());
+    assert_eq!(off["reasoning"]["effort"], "off");
 }
 
 #[test]
@@ -1567,6 +1567,47 @@ fn completions_compat_renames_output_cap_and_controls_reasoning() {
     assert!(body.get("max_completion_tokens").is_none());
     assert!(body.get("stream_options").is_none());
     assert_eq!(body["reasoning_effort"], "small");
+}
+
+#[test]
+fn deepseek_v41_flash_uses_its_restricted_wire_contract() {
+    let model = catalog_model(
+        "openai-completions",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": null, "low": "low", "medium": "medium",
+                "high": "high", "max": "max"
+            },
+            "compat": {
+                "maxTokensField": "max_tokens",
+                "requiresAssistantContent": true,
+                "requiresReasoningContentOnAssistantMessages": true,
+                "disallowToolChoice": true
+            }
+        }),
+    );
+    let mut model = model;
+    model.provider = "deepseek".to_string();
+    let body = transformed(
+        model,
+        ThinkingLevel::High,
+        json!({
+            "max_completion_tokens": 4096,
+            "tool_choice": "auto",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "tool_calls": []}
+            ]
+        }),
+    );
+    assert_eq!(body["max_tokens"], 4096);
+    assert!(body.get("max_completion_tokens").is_none());
+    assert!(body.get("tool_choice").is_none());
+    assert_eq!(body["messages"][1]["content"], "");
+    assert_eq!(body["messages"][1]["reasoning_content"], "");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["reasoning_effort"], "high");
 }
 
 #[test]

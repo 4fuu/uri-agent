@@ -27,6 +27,7 @@ const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("cerebras", DiscoveryKind::OpenAi),
     ("workbuddy", DiscoveryKind::WorkBuddy),
     ("deepseek", DiscoveryKind::OpenAi),
+    ("fireworks", DiscoveryKind::OpenAi),
     ("google", DiscoveryKind::Gemini),
     ("groq", DiscoveryKind::OpenAi),
     ("huggingface", DiscoveryKind::OpenAi),
@@ -651,7 +652,7 @@ mod tests {
 
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
-        assert_eq!(provider_ids().count(), 32);
+        assert_eq!(provider_ids().count(), 33);
         assert!(supports_provider("abliteration"));
         assert!(supports_provider("workbuddy"));
         assert!(!supports_provider("codebuddy"));

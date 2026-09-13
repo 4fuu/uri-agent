@@ -1093,11 +1093,52 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
             ),
         ),
     ]);
+    let deepseek_models = BTreeMap::from([
+        (
+            "deepseek-v4.1-flash".to_string(),
+            deepseek_v41_flash_model("deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+        ),
+        (
+            "deepseek-flash".to_string(),
+            deepseek_v41_flash_model("deepseek-flash", "DeepSeek Flash (V4.1 alias)"),
+        ),
+    ]);
     BTreeMap::from([
         ("abliteration".to_string(), abliteration_models),
         ("antigravity".to_string(), models),
+        ("deepseek".to_string(), deepseek_models),
         (muse_code::PROVIDER.to_string(), muse_code::seeds()),
     ])
+}
+
+fn deepseek_v41_flash_model(id: &str, name: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "api": "openai-completions",
+        "provider": "deepseek",
+        "providerName": "DeepSeek",
+        "baseUrl": "https://api.deepseek.com/v1",
+        "reasoning": true,
+        "input": ["text"],
+        "contextWindow": 1_000_000,
+        "maxTokens": 65_536,
+        "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max"
+        },
+        "compat": {
+            "maxTokensField": "max_tokens",
+            "requiresReasoningContentOnAssistantMessages": true,
+            "requiresAssistantContent": true,
+            "disallowToolChoice": true
+        }
+    })
 }
 
 fn abliteration_model(
@@ -1557,6 +1598,29 @@ mod tests {
             large_v2.thinking_level(ThinkingLevel::Medium),
             Some(&Value::String("high".to_string()))
         );
+    }
+
+    #[test]
+    fn deepseek_v41_flash_has_a_canonical_id_and_alias() {
+        let (merged, warnings) =
+            merge_catalog(&BTreeMap::new(), &ModelsFile::default(), &BTreeMap::new());
+        assert!(warnings.is_empty());
+        let models = &merged["deepseek"];
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "deepseek-flash");
+        assert_eq!(models[1].id, "deepseek-v4.1-flash");
+        for model in models {
+            assert_eq!(model.api, "openai-completions");
+            assert_eq!(
+                model.thinking_level(ThinkingLevel::Low),
+                Some(&Value::String("low".into()))
+            );
+            assert_eq!(
+                model.thinking_level(ThinkingLevel::Max),
+                Some(&Value::String("max".into()))
+            );
+            assert_eq!(model.compat("disallowToolChoice"), Some(&Value::Bool(true)));
+        }
     }
 
     #[test]

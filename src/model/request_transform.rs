@@ -345,7 +345,7 @@ impl ModelRequestTransform {
     fn openai_codex_responses(&self, body: &mut Map<String, Value>) {
         self.openai_responses(body);
         if !self.thinking.enabled() {
-            body.remove("reasoning");
+            body.insert("reasoning".to_string(), json!({"effort": "off"}));
         }
         body.insert("stream".to_string(), Value::Bool(true));
         body.insert(
@@ -480,6 +480,7 @@ impl ModelRequestTransform {
             "moonshotai" | "moonshotai-cn" | "together" | "nvidia"
         );
         self.apply_tool_strictness(body, strict_default, Value::Bool(false));
+        self.apply_deepseek_v41_flash_compat(body);
         self.apply_developer_role(body);
         self.apply_openai_cache_control(body);
         self.apply_reasoning_replay_compat(body);
@@ -517,6 +518,25 @@ impl ModelRequestTransform {
             if message.get("role").and_then(Value::as_str) == Some("assistant") {
                 message
                     .entry("reasoning_content")
+                    .or_insert_with(|| Value::String(String::new()));
+            }
+        }
+    }
+
+    fn apply_deepseek_v41_flash_compat(&self, body: &mut Map<String, Value>) {
+        if !self.compat_bool("requiresAssistantContent", false) {
+            return;
+        }
+        if self.compat_bool("disallowToolChoice", false) {
+            body.remove("tool_choice");
+        }
+        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for message in messages.iter_mut().filter_map(Value::as_object_mut) {
+            if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                message
+                    .entry("content")
                     .or_insert_with(|| Value::String(String::new()));
             }
         }
