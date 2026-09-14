@@ -118,6 +118,12 @@ fn post_auth_status_distinguishes_background_refresh_and_offline_mode() {
 }
 
 #[test]
+fn background_catalog_refresh_is_silent_but_announced_refresh_is_not() {
+    assert!(!catalog_refresh_should_announce(false));
+    assert!(catalog_refresh_should_announce(true));
+}
+
+#[test]
 fn catalog_refresh_restores_the_unsubmitted_model_highlight() {
     let model = |id: &str| CatalogModel {
         id: id.to_string(),

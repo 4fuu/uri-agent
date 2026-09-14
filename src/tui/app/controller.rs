@@ -4922,6 +4922,10 @@ fn spawn_catalog_refresh(
     });
 }
 
+pub(super) fn catalog_refresh_should_announce(announced: bool) -> bool {
+    announced
+}
+
 fn start_update_check(sender: mpsc::UnboundedSender<BackgroundEvent>) {
     tokio::spawn(async move {
         let version = crate::update::available_version().await.ok().flatten();
@@ -5030,13 +5034,16 @@ pub(super) async fn finish_background(
             }
             .await;
             match result {
-                Ok(report) if report.discovery_failures > 0 || report.pi_failures > 0 => {
+                Ok(report)
+                    if catalog_refresh_should_announce(announced)
+                        && (report.discovery_failures > 0 || report.pi_failures > 0) =>
+                {
                     app.set_flash(format!(
                         "Catalog refresh incomplete ({} provider discovery, {} shared catalog failures); credentials remain saved; cached models retained",
                         report.discovery_failures, report.pi_failures
                     ));
                 }
-                Ok(report) if announced => {
+                Ok(report) if catalog_refresh_should_announce(announced) => {
                     if report.discovered_models > 0 {
                         app.set_flash(format!(
                             "Model catalogs refreshed; {} provider model(s) discovered",
@@ -5047,7 +5054,10 @@ pub(super) async fn finish_background(
                     }
                 }
                 Ok(_) => {}
-                Err(error) => app.set_flash(format!("Catalog refresh failed: {error:#}")),
+                Err(error) if catalog_refresh_should_announce(announced) => {
+                    app.set_flash(format!("Catalog refresh failed: {error:#}"));
+                }
+                Err(_) => {}
             }
         }
         BackgroundEvent::UpdateCheckFinished(version) => {
