@@ -1494,4 +1494,48 @@ mod tests {
 
         assert!(!leaked_path.exists());
     }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_children_get_a_private_console() {
+        let Some(executable) = find_executable("pwsh") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        // Spawned children must not share the terminal's console: native
+        // programs that read console input would consume or clobber the TUI's
+        // input. CREATE_NO_WINDOW gives the child its own hidden console, so
+        // only the child itself is attached to it. (DETACHED_PROCESS would
+        // remove the console entirely, but pwsh crashes during startup
+        // without one.)
+        let script = r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class UriAgentConsoleProbe {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint GetConsoleProcessList(uint[] processList, uint processCount);
+}
+'@
+$processes = New-Object 'uint[]' 16
+$count = [UriAgentConsoleProbe]::GetConsoleProcessList($processes, 16)
+Write-Output "attached=$count"
+"#;
+        let output = execute(
+            "pwsh",
+            &executable,
+            directory.path(),
+            script,
+            &BTreeMap::new(),
+            Some(Duration::from_secs(60)),
+            None,
+        )
+        .await
+        .expect("the console probe must succeed");
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("attached=1"),
+            "children must get a private console with only themselves attached: {output}"
+        );
+    }
 }

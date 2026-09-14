@@ -94,7 +94,7 @@ pub struct TaskNotice {
 pub enum PromoteBackground {
     Promoted,
     Terminal(TaskRecord),
-    AtCapacity,
+    Missing,
 }
 
 #[derive(Clone, Debug)]
@@ -269,16 +269,19 @@ impl TaskManager {
         record
     }
 
+    /// Promotes a running foreground task to the background.
+    ///
+    /// The capacity limit bounds how many background tasks callers may start
+    /// (see [`TaskManager::allocate_background`]); it deliberately does not
+    /// apply here. The promoted process is already running, and refusing the
+    /// promotion would leave the caller waiting for it unbounded.
     pub async fn promote_background(&self, id: &str) -> PromoteBackground {
         let mut records = self.inner.write().await;
         let Some(record) = records.get(id) else {
-            return PromoteBackground::AtCapacity;
+            return PromoteBackground::Missing;
         };
         if record.status.terminal() {
             return PromoteBackground::Terminal(record.clone());
-        }
-        if active_background_count(&records) >= MAX_BACKGROUND_TASKS {
-            return PromoteBackground::AtCapacity;
         }
         let record = records
             .get_mut(id)
@@ -352,13 +355,8 @@ impl TaskManager {
                     self.remove(&id).await;
                     AutoTask::Terminal(record)
                 }
-                PromoteBackground::AtCapacity => {
-                    let record = self
-                        .wait_until_terminal(&id)
-                        .await
-                        .ok_or_else(|| anyhow::anyhow!("task disappeared: {id}"))?;
-                    self.remove(&id).await;
-                    AutoTask::Terminal(record)
+                PromoteBackground::Missing => {
+                    anyhow::bail!("task disappeared: {id}")
                 }
             }
         };
@@ -860,6 +858,43 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn auto_background_promotes_even_when_capacity_is_full() {
+        let tasks = TaskManager::new();
+        for index in 0..MAX_BACKGROUND_TASKS {
+            tasks
+                .allocate_background("test", format!("filler {index}"))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tasks
+                .allocate_background("test", "over capacity")
+                .await
+                .is_err()
+        );
+
+        let record = tasks.allocate("test", "foreground").await;
+        let id = record.id.clone();
+        let outcome = tasks
+            .run_with_auto_background(record, Duration::from_millis(20), |_| async {
+                time::sleep(Duration::from_secs(5)).await;
+                Ok(b"late".to_vec())
+            })
+            .await
+            .unwrap();
+
+        // The promotion must hand back the running task instead of waiting
+        // for it to terminate; before this behavior existed the call blocked
+        // here until the work finished.
+        let AutoTask::Background(promoted) = outcome else {
+            panic!("a capacity-full promotion must still return the task id");
+        };
+        assert_eq!(promoted, id);
+        assert!(tasks.list().await.iter().any(|entry| entry.id == id));
+        tasks.cancel(&id).await;
     }
 
     #[tokio::test]

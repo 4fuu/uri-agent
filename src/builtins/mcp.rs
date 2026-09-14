@@ -2165,15 +2165,8 @@ where
             foreground.disarm();
             result
         }
-        PromoteBackground::AtCapacity => {
-            let record = context
-                .tasks
-                .wait_until_terminal(&id)
-                .await
-                .ok_or_else(|| anyhow!("MCP task disappeared: {id}"))?;
-            let result = finish_foreground(&context.tasks, record).await;
-            foreground.disarm();
-            result
+        PromoteBackground::Missing => {
+            anyhow::bail!("MCP task disappeared: {id}")
         }
     }
 }

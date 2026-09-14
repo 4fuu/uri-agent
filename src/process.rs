@@ -130,7 +130,18 @@ fn mark_extra_descriptors_close_on_exec(max_descriptor: i32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn configure_command(_command: &mut Command) {}
+fn configure_command(command: &mut Command) {
+    // Give each spawned process tree its own hidden console. Without this the
+    // child would share the terminal's console, letting native programs read
+    // or clobber console input and corrupt the TUI. DETACHED_PROCESS is not
+    // an option: pwsh requires a console and crashes during startup without
+    // one (NullReferenceException in ConsoleHost.Start). With a hidden
+    // console, programs that block waiting for console input cannot be
+    // satisfied; the task timeout or auto-background promotion bounds the
+    // wait while the TUI stays interactive. Redirected stdio handles are
+    // unaffected by the console mode.
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
 
 #[cfg(not(any(unix, windows)))]
 fn configure_command(_command: &mut Command) {}

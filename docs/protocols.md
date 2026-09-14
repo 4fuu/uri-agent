@@ -179,12 +179,18 @@ absolute paths. On Unix, `~` and `~/` expand to the current user's home.
 Shell commands start in the foreground and return their final output directly.
 They run from the startup directory without Bash or PowerShell profile files.
 Each new command receives the latest values from the Agent Environment manager;
-the interactive `:terminal` is separate and does not receive them.
+the interactive `:terminal` is separate and does not receive them. On Windows,
+each spawned process tree receives its own hidden console instead of the
+terminal's console, so commands can neither read nor clobber interactive
+terminal input; a program that waits for console input never receives it and
+keeps running until its timeout or background promotion ends the wait.
 
-Long-running operations may continue as managed tasks without restarting.
-Shell help also supports requesting immediate background execution and setting
-the shared deadline. Cancellation and timeout terminate the owned process tree
-and wait for root-process cleanup.
+Long-running operations may continue as managed tasks without restarting. A
+foreground operation that outlives its grace period moves to the background
+even when the background task limit is already reached. Shell help also
+supports requesting immediate background execution and setting the shared
+deadline. Cancellation and timeout terminate the owned process tree and wait
+for root-process cleanup.
 
 The `tasks` protocol reports `pending`, `running`, `completed`, `failed`, or
 `cancelled` state, exposes bounded live output, preserves complete terminal
