@@ -13,8 +13,8 @@ use tokio::sync::{oneshot, watch};
 const WORKBUDDY_ENDPOINT: &str = "https://copilot.tencent.com";
 const PLATFORM: &str = "workbuddy";
 const PREFIX_PATH: &str = "/plugin";
-const REFERENCE_VERSION: &str = "5.5.3";
-pub(crate) const USER_AGENT: &str = "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1";
+const REFERENCE_VERSION: &str = "5.5.6";
+pub(crate) const USER_AGENT: &str = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_FETCH_TOKEN: i64 = 11217;
@@ -801,8 +801,8 @@ mod tests {
         assert_eq!(default_endpoint("external"), None);
         assert_eq!(default_endpoint("iOA"), None);
         assert_eq!(PLATFORM, "workbuddy");
-        assert_eq!(REFERENCE_VERSION, "5.5.3");
-        assert_eq!(USER_AGENT, "WorkBuddy/5.5.3 WorkBuddy/5.5.3 CLI/2.137.1");
+        assert_eq!(REFERENCE_VERSION, "5.5.6");
+        assert_eq!(USER_AGENT, "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1");
     }
 
     #[test]
