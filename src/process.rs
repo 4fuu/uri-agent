@@ -167,7 +167,7 @@ fn mark_extra_descriptors_close_on_exec(max_descriptor: i32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn configure_command(command: &mut Command) {
+fn configure_command(command: &mut Command, _interruptible: bool) {
     // Give each spawned process tree its own hidden console. Without this the
     // child would share the terminal's console, letting native programs read
     // or clobber console input and corrupt the TUI. DETACHED_PROCESS is not
@@ -181,7 +181,7 @@ fn configure_command(command: &mut Command) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_command(_command: &mut Command) {}
+fn configure_command(_command: &mut Command, _interruptible: bool) {}
 
 #[cfg(windows)]
 mod windows_job {
