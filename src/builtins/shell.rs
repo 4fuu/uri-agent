@@ -627,9 +627,18 @@ async fn execute_with_cancellation(
             (Some(bash_script_input(script)), None)
         }
         (_, true) => {
+            // PowerShell script files are subject to execution policies that
+            // can block `pwsh -File`, so the script text is loaded from the
+            // private file and run through a script block instead — the same
+            // execution shape as the stdin bootstrap, with stdin free for the
+            // program.
             command.args(["-NoLogo", "-NoProfile"]);
             let file = write_script_file(&pwsh_source(script), "ps1")?;
-            command.arg("-File").arg(file.path());
+            let bootstrap = format!(
+                "& ([ScriptBlock]::Create([System.IO.File]::ReadAllText('{}')))",
+                file.path().to_string_lossy().replace('\'', "''")
+            );
+            command.arg("-Command").arg(&bootstrap);
             (None, Some(file))
         }
         _ => {
@@ -1505,7 +1514,12 @@ mod tests {
             .wait("001", Duration::from_secs(30))
             .await
             .unwrap();
-        assert_eq!(record.status, TaskStatus::Completed);
+        assert_eq!(
+            record.status,
+            TaskStatus::Completed,
+            "content: {}",
+            String::from_utf8_lossy(&record.content)
+        );
         let output = String::from_utf8(record.content).unwrap();
         assert!(output.contains("got:hello"), "{output}");
 
@@ -1548,7 +1562,12 @@ mod tests {
             .wait("002", Duration::from_secs(30))
             .await
             .unwrap();
-        assert_eq!(record.status, TaskStatus::Completed);
+        assert_eq!(
+            record.status,
+            TaskStatus::Completed,
+            "content: {}",
+            String::from_utf8_lossy(&record.content)
+        );
         let output = String::from_utf8(record.content).unwrap();
         assert!(output.contains("[abc"), "{output}");
         context.tasks.shutdown().await;
