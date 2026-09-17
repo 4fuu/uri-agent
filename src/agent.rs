@@ -778,6 +778,18 @@ impl AgentHost {
         if legacy_grep {
             crate::builtins::add_legacy_grep(&mut plugins, &self.inner.cwd);
         }
+        if let Some(finder) = crate::builtins::finder::session_plugin(
+            &self.inner.cwd,
+            session.id(),
+            spec.depth(),
+            &session,
+            &self.inner.manager,
+            &self.inner.catalog,
+        )
+        .await?
+        {
+            plugins.add(finder);
+        }
         plugins.add(ContextPlugin::new(context_state.clone()));
         if let Some(state) = &collaboration_state {
             plugins.add(CollaborationPlugin::new(state.clone()));

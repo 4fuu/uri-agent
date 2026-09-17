@@ -49,6 +49,7 @@ existing capability.
 | `collaboration` | `read`, `exec` | Name this session, inspect active participants and model status, and exchange Queue or Steer messages |
 | `sessions` | `read`, `exec` | Compatibility route retained only for sessions whose frozen prompt already used it |
 | `https` | `read` | Search the web and extract HTTPS pages |
+| `finder` | `exec` | Delegate a multi-step lookup to a finder Agent and return its final answer |
 | `tasks` | `read`, `exec` | Inspect, wait for, and cancel managed work |
 | `bash` or `pwsh` | `read`, `exec` | Run shell commands |
 | `wasm_plugin` | `read`, `exec` | Inspect and reload trusted WASM plugins |
@@ -116,6 +117,24 @@ New sessions do not advertise `sessions`. A resumed session whose frozen
 startup prompt already contains that protocol retains `sessions://` as a
 compatibility route, while all new model-facing addresses use
 `context://sessions/...`.
+
+### Delegated search
+
+`finder` runs one delegated lookup per call. The body is a complete
+natural-language question; `finder://<root>` restricts code search to one
+project-relative or absolute directory with the same root rules as `search://`,
+while web reads stay unscoped. Each call starts a depth-2 Agent with read-only
+search, file, web, and task capabilities, a finder system prompt, and the model
+configured for the `finder` role; the reply ceiling is that model's own catalog
+output limit. The calling model receives the finder's final reply directly or
+through a background task after the foreground grace period.
+
+The protocol is registered only for new depth-1 sessions whose `finder` role
+resolves ([Model roles](configuration.md#model-roles-and-plugin-settings)); it
+starts unassigned, so finder is absent until configured. A session that froze
+the protocol keeps it on resume, and calls fail if the role no longer resolves.
+Finder replies are untrusted data from another model. Exact syntax and limits
+live in `finder://help`.
 
 ### Collaboration
 

@@ -367,7 +367,10 @@ invocation.
 ### Model roles and plugin settings
 
 The built-in `small` role starts unassigned. Use `:model-roles` to assign it or
-create custom roles. Global and project assignments are layered by complete
+create custom roles. The built-in `finder` role also starts unassigned; when it
+resolves, new depth-1 sessions register the `finder://` delegated-search
+protocol described in [Protocols, tasks, and output](protocols.md#delegated-search).
+Global and project assignments are layered by complete
 role name:
 
 ```json

@@ -48,6 +48,9 @@ supported providers.
 - **Built-in MCP bridge:** connect stdio and Streamable HTTP servers with
   `:mcp`. Each server becomes an on-demand `<name>-mcp://` protocol, with
   query-first arguments and a complete-JSON fallback for complex schemas.
+- **Delegated finder search:** assign the `finder` model role to let the model
+  hand multi-step questions to a read-only finder Agent across project code and
+  the public web, with slow lookups continuing as background tasks.
 - **ACP editor integration:** use URI Agent from compatible editors through
   stable ACP v1 over stdio. Each session can select its model, and its
   conversation can later reopen in the normal TUI.

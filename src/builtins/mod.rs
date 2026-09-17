@@ -3,6 +3,7 @@ mod apply_patch;
 pub(crate) mod collaboration;
 pub(crate) mod context;
 mod file;
+pub(crate) mod finder;
 mod grep;
 mod history;
 mod https;

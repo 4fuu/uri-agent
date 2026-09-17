@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BUILTIN_MODEL_ROLES: [&str; 1] = ["small"];
+pub const BUILTIN_MODEL_ROLES: [&str; 2] = ["small", "finder"];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
@@ -2751,7 +2751,7 @@ mod tests {
                 .into_iter()
                 .map(|role| role.name)
                 .collect::<Vec<_>>(),
-            ["small", "title"]
+            ["small", "finder", "title"]
         );
         manager
             .set_plugin_setting("terminal-title", "role", Value::String("title".to_string()))
