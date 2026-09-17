@@ -1,4 +1,6 @@
-use super::{CatalogCredential, CatalogModel, muse_code, radius, workbuddy};
+use super::{
+    CatalogCredential, CatalogModel, models_dev::ProtocolHints, muse_code, radius, workbuddy,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use http::header::{ACCEPT, AUTHORIZATION};
 use reqwest::{Client, RequestBuilder, Url};
@@ -142,6 +144,7 @@ pub(super) async fn discover(
     provider: &str,
     credential: &CatalogCredential,
     catalog: &BTreeMap<String, Vec<CatalogModel>>,
+    hints: &ProtocolHints,
 ) -> Result<Vec<CatalogModel>> {
     let kind = discovery_kind(provider)
         .ok_or_else(|| anyhow!("provider {provider} has no model discovery contract"))?;
@@ -169,7 +172,7 @@ pub(super) async fn discover(
             unreachable!("provider-owned discovery returned above")
         }
     };
-    Ok(materialize(provider, kind, records, catalog))
+    Ok(materialize(provider, kind, records, catalog, hints))
 }
 
 fn discovery_kind(provider: &str) -> Option<DiscoveryKind> {
@@ -412,6 +415,7 @@ fn materialize(
     kind: DiscoveryKind,
     records: Vec<DiscoveredModel>,
     catalog: &BTreeMap<String, Vec<CatalogModel>>,
+    hints: &ProtocolHints,
 ) -> Vec<CatalogModel> {
     let references = &catalog[provider];
     let existing = references
@@ -422,7 +426,7 @@ fn materialize(
         .into_iter()
         .filter(|record| !existing.contains(record.id.as_str()))
         .filter(|record| is_generation_model(provider, record))
-        .filter_map(|record| materialize_one(provider, kind, record, references, catalog))
+        .filter_map(|record| materialize_one(provider, kind, record, references, catalog, hints))
         .collect()
 }
 
@@ -432,11 +436,16 @@ fn materialize_one(
     record: DiscoveredModel,
     references: &[CatalogModel],
     catalog: &BTreeMap<String, Vec<CatalogModel>>,
+    hints: &ProtocolHints,
 ) -> Option<CatalogModel> {
     let prefixed = prefix_template(&record.id, references);
     let api = match kind {
-        DiscoveryKind::OpenCode => prefixed
-            .map(|model| model.api.as_str())
+        // A models.dev per-model protocol override is exact, so it outranks
+        // inference from a Pi record of a different model ID, which in turn
+        // outranks the ID-prefix heuristic.
+        DiscoveryKind::OpenCode => hints
+            .api(provider, &record.id)
+            .or_else(|| prefixed.map(|model| model.api.as_str()))
             .unwrap_or_else(|| open_code_api(provider, &record.id)),
         DiscoveryKind::MuseCode | DiscoveryKind::Radius | DiscoveryKind::WorkBuddy => {
             unreachable!("provider-owned discovery does not use generic materialization")
@@ -730,7 +739,13 @@ mod tests {
             name: None,
             raw: serde_json::json!({"id": "glm-5.3-flash"}),
         }];
-        let discovered = materialize("opencode-go", DiscoveryKind::OpenCode, records, &catalog);
+        let discovered = materialize(
+            "opencode-go",
+            DiscoveryKind::OpenCode,
+            records,
+            &catalog,
+            &ProtocolHints::default(),
+        );
         assert_eq!(discovered.len(), 1);
         let model = &discovered[0];
         assert_eq!(model.id, "glm-5.3-flash");
@@ -759,7 +774,13 @@ mod tests {
             raw: serde_json::json!({"id": "glm-5.3-flash"}),
         }];
 
-        let discovered = materialize("zai", DiscoveryKind::OpenAi, records, &catalog);
+        let discovered = materialize(
+            "zai",
+            DiscoveryKind::OpenAi,
+            records,
+            &catalog,
+            &ProtocolHints::default(),
+        );
 
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, "glm-5.3-flash");
@@ -832,6 +853,7 @@ mod tests {
                 workbuddy: None,
             },
             &catalog,
+            &ProtocolHints::default(),
         )
         .await
         .unwrap();
@@ -846,6 +868,125 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer go-test-key\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn models_dev_hints_select_the_protocol_for_unknown_opencode_models() {
+        let (endpoint, server) = model_server(vec![r#"{"data":[{"id":"union-alpha"}]}"#]).await;
+        let glm = model(
+            "opencode-go",
+            "glm-5.3",
+            "GLM-5.3",
+            "openai-completions",
+            &format!("{endpoint}/v1"),
+        );
+        let minimax = model(
+            "opencode-go",
+            "minimax-m3",
+            "MiniMax M3",
+            "anthropic-messages",
+            &endpoint,
+        );
+        let catalog = BTreeMap::from([("opencode-go".to_string(), vec![glm, minimax])]);
+        let hints =
+            ProtocolHints::from_hints(&[("opencode-go", "union-alpha", "anthropic-messages")]);
+
+        let discovered = discover(
+            &Client::new(),
+            "opencode-go",
+            &CatalogCredential {
+                secret: "go-test-key".to_string(),
+                oauth: false,
+                radius_gateway: None,
+                workbuddy: None,
+            },
+            &catalog,
+            &hints,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        let model = &discovered[0];
+        assert_eq!(model.id, "union-alpha");
+        assert_eq!(model.api, "anthropic-messages");
+        // The base URL comes from the same-protocol reference, mirroring the
+        // Pi catalog where OpenCode anthropic models omit the /v1 suffix.
+        assert_eq!(model.base_url, endpoint);
+        assert_eq!(model.name, "union-alpha");
+        assert_eq!(
+            model.metadata["metadataSourceModel"],
+            serde_json::json!("opencode-go/minimax-m3")
+        );
+    }
+
+    #[test]
+    fn models_dev_hints_outrank_prefix_templates() {
+        let glm = model(
+            "opencode-go",
+            "glm-5.3",
+            "GLM-5.3",
+            "openai-completions",
+            "https://opencode.test/zen/go/v1",
+        );
+        let minimax = model(
+            "opencode-go",
+            "minimax-m3",
+            "MiniMax M3",
+            "anthropic-messages",
+            "https://opencode.test/zen/go",
+        );
+        let catalog = BTreeMap::from([("opencode-go".to_string(), vec![glm, minimax])]);
+        let records = vec![DiscoveredModel {
+            id: "glm-5.3-flash".to_string(),
+            name: None,
+            raw: serde_json::json!({"id": "glm-5.3-flash"}),
+        }];
+        let hints =
+            ProtocolHints::from_hints(&[("opencode-go", "glm-5.3-flash", "anthropic-messages")]);
+
+        let discovered = materialize(
+            "opencode-go",
+            DiscoveryKind::OpenCode,
+            records,
+            &catalog,
+            &hints,
+        );
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].api, "anthropic-messages",
+            "an exact models.dev record must not be overruled by Pi family inference"
+        );
+    }
+
+    #[test]
+    fn opencode_models_without_hints_keep_the_heuristic_protocol() {
+        let glm = model(
+            "opencode-go",
+            "glm-5.3",
+            "GLM-5.3",
+            "openai-completions",
+            "https://opencode.test/zen/go/v1",
+        );
+        let catalog = BTreeMap::from([("opencode-go".to_string(), vec![glm])]);
+        let records = vec![DiscoveredModel {
+            id: "union-alpha".to_string(),
+            name: None,
+            raw: serde_json::json!({"id": "union-alpha"}),
+        }];
+
+        let discovered = materialize(
+            "opencode-go",
+            DiscoveryKind::OpenCode,
+            records,
+            &catalog,
+            &ProtocolHints::default(),
+        );
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].api, "openai-completions");
     }
 
     #[tokio::test]
@@ -874,6 +1015,7 @@ mod tests {
                 workbuddy: None,
             },
             &catalog,
+            &ProtocolHints::default(),
         )
         .await
         .unwrap();
@@ -918,6 +1060,7 @@ mod tests {
                 workbuddy: None,
             },
             &catalog,
+            &ProtocolHints::default(),
         )
         .await
         .unwrap();

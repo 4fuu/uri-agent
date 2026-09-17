@@ -1,4 +1,5 @@
 mod discovery;
+mod models_dev;
 mod muse_code;
 mod radius;
 mod workbuddy;
@@ -374,6 +375,7 @@ struct CatalogState {
     store: BTreeMap<String, StoreEntry>,
     user: ModelsFile,
     discovery_scopes: BTreeMap<String, String>,
+    protocol_hints: models_dev::ProtocolHints,
     models: BTreeMap<String, Vec<CatalogModel>>,
     warnings: Vec<String>,
 }
@@ -383,6 +385,8 @@ pub struct ModelCatalog {
     inner: Arc<RwLock<CatalogState>>,
     store_path: PathBuf,
     user_path: PathBuf,
+    models_dev_url: String,
+    models_dev_path: PathBuf,
     client: reqwest::Client,
     providers_url: String,
     offline: bool,
@@ -396,17 +400,21 @@ impl ModelCatalog {
         let store = read_json(&store_path).await?;
         let user = read_json(&user_path).await?;
         let discovery_scopes = BTreeMap::new();
+        let protocol_hints = models_dev::load(directory).await;
         let (models, warnings) = merge_catalog(&store, &user, &discovery_scopes);
         let catalog = Self {
             inner: Arc::new(RwLock::new(CatalogState {
                 store,
                 user,
                 discovery_scopes,
+                protocol_hints,
                 models,
                 warnings,
             })),
             store_path,
             user_path,
+            models_dev_url: models_dev::API_URL.to_string(),
+            models_dev_path: models_dev::cache_path(directory),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(4))
                 .user_agent(concat!("uri-agent/", env!("CARGO_PKG_VERSION")))
@@ -516,7 +524,26 @@ impl ModelCatalog {
         state.user = read_json(&self.user_path).await?;
         let (base_models, warnings) = merge_catalog(&state.store, &state.user, &BTreeMap::new());
         state.warnings.extend(warnings);
+        let mut protocol_hints = state.protocol_hints.clone();
         drop(state);
+
+        // models.dev hints only refine OpenCode discovery, so they refresh
+        // only when an OpenCode credential can consume them. Failures keep
+        // the cached hints without failing the catalog refresh.
+        if credentials
+            .keys()
+            .any(|provider| models_dev::uses_hints(provider))
+        {
+            let _ = models_dev::refresh(
+                &self.client,
+                &self.models_dev_url,
+                &self.models_dev_path,
+                force,
+                &mut protocol_hints,
+                now,
+            )
+            .await;
+        }
 
         let discovery_requests = credentials
             .iter()
@@ -548,9 +575,11 @@ impl ModelCatalog {
             .map(|(provider, credential, fingerprint, cached)| {
                 let client = self.client.clone();
                 let catalog = base_models.clone();
+                let hints = protocol_hints.clone();
                 async move {
                     let result =
-                        discovery::discover(&client, &provider, &credential, &catalog).await;
+                        discovery::discover(&client, &provider, &credential, &catalog, &hints)
+                            .await;
                     (provider, fingerprint, cached, result)
                 }
             })
@@ -606,6 +635,7 @@ impl ModelCatalog {
             }
         }
         write_json(&self.store_path, &state.store).await?;
+        state.protocol_hints = protocol_hints;
         let (models, warnings) = merge_catalog(&state.store, &state.user, &state.discovery_scopes);
         report.discovered_models = models
             .values()
@@ -1439,6 +1469,120 @@ mod tests {
         assert_eq!(report.discovered_models, 0);
         assert!(catalog.warnings().await.is_empty());
         assert!(catalog.model("xai", "grok-4").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn models_dev_hints_refine_opencode_discovery_protocols() {
+        let root = tempfile::tempdir().unwrap();
+        let responses = vec![
+            (200, serde_json::json!(["opencode-go"]).to_string()),
+            (
+                200,
+                serde_json::json!([
+                    {
+                        "id": "glm-5.3",
+                        "name": "GLM-5.3",
+                        "api": "openai-completions",
+                        "baseUrl": "$BASE_URL/v1"
+                    },
+                    {
+                        "id": "minimax-m3",
+                        "name": "MiniMax M3",
+                        "api": "anthropic-messages",
+                        "baseUrl": "$BASE_URL"
+                    }
+                ])
+                .to_string(),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "opencode-go": {"models": {
+                        "union-alpha": {"provider": {"npm": "@ai-sdk/anthropic"}}
+                    }}
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                serde_json::json!({"data": [{"id": "union-alpha"}]}).to_string(),
+            ),
+        ];
+        let (providers_url, server) = catalog_server(responses).await;
+        let mut catalog = ModelCatalog::load(root.path(), false).await.unwrap();
+        catalog.providers_url = providers_url.clone();
+        catalog.models_dev_url = providers_url;
+        let credentials = BTreeMap::from([(
+            "opencode-go".to_string(),
+            CatalogCredential {
+                secret: "go-test-key".to_string(),
+                oauth: false,
+                radius_gateway: None,
+                workbuddy: None,
+            },
+        )]);
+
+        let report = catalog.refresh(true, &credentials).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 4);
+        assert_eq!(report.pi_failures, 0);
+        assert_eq!(report.discovery_failures, 0);
+        assert_eq!(report.discovered_models, 1);
+        let model = catalog.model("opencode-go", "union-alpha").await.unwrap();
+        assert_eq!(model.api, "anthropic-messages");
+        assert!(model.base_url.starts_with("http://127.0.0.1"));
+        // The distilled hint cache and discovery results reload with the
+        // catalog once the credential scope is activated again.
+        let reloaded = ModelCatalog::load(root.path(), false).await.unwrap();
+        reloaded.activate_discovery(&credentials).await;
+        let model = reloaded.model("opencode-go", "union-alpha").await.unwrap();
+        assert_eq!(model.api, "anthropic-messages");
+    }
+
+    #[tokio::test]
+    async fn models_dev_failures_keep_discovery_on_the_heuristic_protocol() {
+        let root = tempfile::tempdir().unwrap();
+        let responses = vec![
+            (200, serde_json::json!(["opencode-go"]).to_string()),
+            (
+                200,
+                serde_json::json!([{
+                    "id": "glm-5.3",
+                    "name": "GLM-5.3",
+                    "api": "openai-completions",
+                    "baseUrl": "$BASE_URL/v1"
+                }])
+                .to_string(),
+            ),
+            (500, "{}".to_string()),
+            (
+                200,
+                serde_json::json!({"data": [{"id": "union-alpha"}]}).to_string(),
+            ),
+        ];
+        let (providers_url, server) = catalog_server(responses).await;
+        let mut catalog = ModelCatalog::load(root.path(), false).await.unwrap();
+        catalog.providers_url = providers_url.clone();
+        catalog.models_dev_url = providers_url;
+        let credentials = BTreeMap::from([(
+            "opencode-go".to_string(),
+            CatalogCredential {
+                secret: "go-test-key".to_string(),
+                oauth: false,
+                radius_gateway: None,
+                workbuddy: None,
+            },
+        )]);
+
+        let report = catalog.refresh(true, &credentials).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(report.pi_failures, 0);
+        assert_eq!(report.discovery_failures, 0);
+        assert!(catalog.warnings().await.is_empty());
+        let model = catalog.model("opencode-go", "union-alpha").await.unwrap();
+        assert_eq!(model.api, "openai-completions");
     }
 
     #[tokio::test]

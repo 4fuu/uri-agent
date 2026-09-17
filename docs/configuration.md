@@ -41,6 +41,15 @@ does not expose another account's discovery results. Pi records win when the
 shared catalog later adds the same provider and model ID. Discovered-only
 records inherit conservative compatibility metadata and omit unverified prices.
 
+For OpenCode and OpenCode Go, discovery also keeps a cached
+[models.dev](https://models.dev) snapshot (`<config>/models-dev.json`) of
+per-model protocol overrides and consults it before URI Agent's own ID
+heuristics, so freshly announced models such as `union-alpha` use
+`anthropic-messages` instead of the default OpenAI protocol. The snapshot is
+advisory: it only selects the request API family for models the Pi catalog has
+not recorded, refreshes with the shared catalog while an OpenCode credential is
+active, and failures keep the previous cache.
+
 Startup loads cached data immediately and refreshes eligible sources in the
 background. Use `:refresh-catalog` or refresh from Model Hub when an immediate
 update is needed. Offline mode disables catalog networking while retaining
@@ -229,6 +238,7 @@ files already present in the new location are kept.
 | `<config>/environment.json` | Agent environment values |
 | `<config>/models.json` | Custom providers, models, headers, and overrides |
 | `<config>/models-store.json` | Generated catalog and discovery cache |
+| `<config>/models-dev.json` | Cached models.dev protocol hints for OpenCode discovery |
 | `<config>/keymap.rhai` | Global keymap overrides |
 | `<config>/mcp.json` | User-scoped MCP servers |
 | `<config>/wasm-plugins/` | Trusted WASM modules |
