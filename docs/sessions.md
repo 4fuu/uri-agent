@@ -96,6 +96,14 @@ accepted prompt persists the frozen context and message together; opening and
 closing an empty session creates no database record. ACP `session/new` follows
 the same boundary and reserves only in-memory state until its first prompt.
 
+## Herdr terminal-multiplexer reporting
+
+[Herdr](https://herdr.dev/) is a terminal multiplexer that runs coding agents in owned panes and tracks each pane's state. It exports `HERDR_ENV`, `HERDR_PANE_ID`, and `HERDR_BIN_PATH` to the processes in its panes. When the TUI starts with that environment, URI Agent automatically reports the visible session's lifecycle to that pane through Herdr's CLI, so the pane appears in Herdr's agent list with authoritative state instead of screen detection.
+
+A model turn that is running, or queued input waiting to start one, reports `working`; otherwise the pane reports `idle`. Each report carries the stable session ID, so Herdr's pane and agent APIs expose which conversation the terminal currently shows; Herdr does not yet know how to resume URI Agent sessions from that reference. Session switches move reporting to the newly visible runtime.
+
+Reporting is best effort and never blocks the conversation: a missing or older Herdr only means missing reports. Process exit releases the reporting source so Herdr stops tracking the pane. The integration stays inactive outside Herdr panes, and ACP mode, background resident mode, and depth-2 child Agents never report.
+
 ## Frozen startup context
 
 Before accepting the first prompt, a session freezes its complete generated

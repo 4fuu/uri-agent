@@ -127,6 +127,10 @@ uri-agent --acpv1
 
 客户端需要为每个会话提供绝对项目目录，同一个 ACP 进程可以为多个项目承载相互独立的会话。兼容的 ACP 客户端可在发送第一条请求前选择已认证的模型和思考级别，且不会修改 URI Agent 的默认设置。第一条请求会使用已分配的会话 ID 完成持久化；客户端释放会话后，可在 TUI 中重新打开。支持的内容、MCP 服务器、生命周期操作和所有权约束见英文文档 [ACP v1](docs/acp.md)。
 
+### 在 Herdr 中运行
+
+[Herdr](https://herdr.dev/) 是面向 coding agent 的终端复用器。TUI 在 Herdr 面板中启动时，会自动向 Herdr 上报 `working`/`idle` 状态和当前会话 ID，面板因此会出现在 Herdr 的 agent 列表中并显示可靠状态。无需任何配置，在 Herdr 之外该集成保持关闭。详见英文文档 [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting)。
+
 ## 文档
 
 | 目标 | 文档 |

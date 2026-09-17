@@ -3,6 +3,7 @@ use clap::Parser;
 use uri_agent::agent::{AgentHandle, AgentHost, AgentSpec};
 use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
+use uri_agent::herdr::HerdrReporter;
 use uri_agent::model::configured_backend;
 use uri_agent::session::{EventKind, SessionChoice};
 use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
@@ -25,6 +26,7 @@ async fn main() -> Result<()> {
         return host.run_background().await;
     }
     let mut terminal = TuiTerminal::new()?;
+    let herdr = HerdrReporter::from_env();
     let mut detached = Vec::<AgentHandle>::new();
     loop {
         let retained = match &config.session {
@@ -35,14 +37,19 @@ async fn main() -> Result<()> {
             SessionChoice::New | SessionChoice::Latest => None,
         };
         let result = match retained {
-            Some(agent) => run_retained_session(&config, agent, &mut terminal).await,
-            None => run_session(&config, &host, &mut terminal).await,
+            Some(agent) => {
+                run_retained_session(&config, agent, &mut terminal, herdr.as_ref()).await
+            }
+            None => run_session(&config, &host, &mut terminal, herdr.as_ref()).await,
         };
         let (outcome, agent) = match result {
             Ok(result) => result,
             Err(error) => {
                 for agent in detached {
                     agent.close().await;
+                }
+                if let Some(reporter) = &herdr {
+                    reporter.shutdown().await;
                 }
                 return Err(error);
             }
@@ -52,6 +59,9 @@ async fn main() -> Result<()> {
                 agent.close().await;
                 for agent in detached {
                     agent.close().await;
+                }
+                if let Some(reporter) = &herdr {
+                    reporter.shutdown().await;
                 }
                 return Ok(());
             }
@@ -66,6 +76,7 @@ async fn run_session(
     config: &Config,
     host: &AgentHost,
     terminal: &mut TuiTerminal,
+    herdr: Option<&HerdrReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
     let initial = config.manager.current().await;
     let requested = match &config.session {
@@ -84,6 +95,9 @@ async fn run_session(
             ),
         )
         .await?;
+    if let Some(reporter) = herdr {
+        reporter.start(agent.services().runtime.clone()).await;
+    }
     let startup_runtime = agent.services().runtime.clone();
     tokio::spawn(async move {
         if startup_runtime.prepare_context().await.is_ok() {
@@ -104,8 +118,9 @@ async fn run_retained_session(
     config: &Config,
     agent: AgentHandle,
     terminal: &mut TuiTerminal,
+    herdr: Option<&HerdrReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
-    let result = run_retained_session_inner(config, agent.clone(), terminal).await;
+    let result = run_retained_session_inner(config, agent.clone(), terminal, herdr).await;
     if result.is_err() {
         agent.close().await;
     }
@@ -116,8 +131,12 @@ async fn run_retained_session_inner(
     config: &Config,
     agent: AgentHandle,
     terminal: &mut TuiTerminal,
+    herdr: Option<&HerdrReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
     let runtime = agent.services().runtime.clone();
+    if let Some(reporter) = herdr {
+        reporter.start(runtime.clone()).await;
+    }
     let session = runtime.session();
     let settings = session.model_settings().await;
     let active = config

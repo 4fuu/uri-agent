@@ -186,6 +186,15 @@ session under its assigned ID; after the client releases it, the session can
 reopen in the TUI. See [ACP v1](docs/acp.md) for supported content, MCP servers,
 lifecycle operations, and ownership constraints.
 
+### Run inside Herdr
+
+[Herdr](https://herdr.dev/) is a terminal multiplexer for coding agents. When
+the TUI starts in a Herdr pane, it automatically reports `working` or `idle`
+state and the active session ID to Herdr, so the pane appears in Herdr's agent
+list with reliable status. No configuration is required, and the integration
+stays inactive outside Herdr. See
+[Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting).
+
 ## Documentation
 
 | Goal | Guide |
