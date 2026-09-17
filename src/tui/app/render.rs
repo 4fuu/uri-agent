@@ -2286,7 +2286,6 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             }
             frame.render_widget(&app.input, composer_area);
             if let Some(position) = composer_cursor_position(frame, &app.input, composer_area) {
-                solid_cursor_cell(frame, &app.input, position);
                 frame.set_cursor_position(position);
                 app.composer_view = composer_view(&app.input, composer_area, position);
             }
@@ -4036,8 +4035,8 @@ pub(super) fn style_input(input: &mut TextArea<'static>, busy: bool, keymap: &Ke
     input.set_placeholder_style(Style::default().fg(MUTED).bg(SURFACE));
     input.set_style(Style::default().fg(TEXT).bg(SURFACE));
     input.set_cursor_line_style(Style::default().fg(TEXT).bg(SURFACE));
-    input.set_cursor_style(Style::default().fg(SURFACE).bg(border));
-    input.set_selection_style(Style::default().fg(TEXT).bg(ACCENT));
+    input.set_cursor_style(Style::default().fg(TEXT).bg(ACCENT));
+    input.set_selection_style(Style::default().fg(SURFACE).bg(ACCENT));
     input.set_wrap_mode(WrapMode::WordOrGlyph);
 }
 
@@ -4214,29 +4213,6 @@ pub(super) fn composer_cursor_position(
         }
     }
     None
-}
-
-/// Repaints a blank caret cell as a solid glyph with symmetric colors.
-///
-/// The textarea renders the caret as a blank cell carrying the cursor
-/// background color. Layers that draw their own cursor by reversing pane
-/// cells, such as herdr on Windows and WSL, or that drop styled blanks,
-/// make that caret invisible: reversing a colored blank moves the color to
-/// the glyph, and a blank glyph paints no ink. A solid glyph with matching
-/// foreground and background keeps the caret visible through both while
-/// looking identical to the colored blank in a plain terminal.
-pub(super) fn solid_cursor_cell(frame: &mut Frame<'_>, input: &TextArea<'_>, position: (u16, u16)) {
-    let Some(color) = input.cursor_style().bg else {
-        return;
-    };
-    let Some(cell) = frame.buffer_mut().cell_mut(position) else {
-        return;
-    };
-    if cell.symbol() != " " {
-        return;
-    }
-    cell.set_symbol("█");
-    cell.set_style(Style::default().fg(color).bg(color));
 }
 
 pub(super) fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
