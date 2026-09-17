@@ -25,6 +25,17 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 const REPORT_SOURCE: &str = "custom:uri-agent";
 const REPORT_AGENT: &str = "uri-agent";
 
+/// Seed the report sequence at the current Unix time in milliseconds so a
+/// restarted process keeps issuing sequence numbers above the ones Herdr
+/// already recorded for this source. Herdr drops reports whose sequence is
+/// not increasing, so a restart from 1 could leave every later report
+/// ignored and the pane stuck on the previous process's last state.
+fn initial_seq() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(1, |since| since.as_millis() as u64)
+}
+
 /// Pane lifecycle state reported to Herdr.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HerdrState {
@@ -105,7 +116,11 @@ impl HerdrTarget {
         .collect()
     }
 
-    fn release_arguments(&self) -> Vec<String> {
+    /// The release sequence must be strictly above the last report sequence:
+    /// Herdr drops a release whose sequence is not newer than the source's
+    /// recorded sequence, and then keeps the pane's agent entry until the
+    /// pane closes.
+    fn release_arguments(&self, seq: u64) -> Vec<String> {
         vec![
             "pane",
             "release-agent",
@@ -114,6 +129,8 @@ impl HerdrTarget {
             REPORT_SOURCE,
             "--agent",
             REPORT_AGENT,
+            "--seq",
+            seq.to_string().as_str(),
         ]
         .into_iter()
         .map(String::from)
@@ -151,7 +168,7 @@ impl HerdrReporter {
             inner: Arc::new(HerdrInner {
                 target,
                 runtime: RwLock::new(None),
-                seq: AtomicU64::new(0),
+                seq: AtomicU64::new(initial_seq()),
                 cancellation: CancellationToken::new(),
                 worker: tokio::sync::Mutex::new(None),
             }),
@@ -181,8 +198,9 @@ impl HerdrReporter {
         if let Some(worker) = self.inner.worker.lock().await.take() {
             let _ = worker.await;
         }
+        let seq = self.inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let child = Command::new(&self.inner.target.bin)
-            .args(self.inner.target.release_arguments())
+            .args(self.inner.target.release_arguments(seq))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -212,7 +230,7 @@ async fn run(inner: Arc<HerdrInner>) {
         let Some(runtime) = inner.current_runtime() else {
             continue;
         };
-        let (working, queued) = runtime.collaboration_snapshot();
+        let (working, queued) = runtime.herdr_snapshot().await;
         let state = HerdrState::from_snapshot(working, queued);
         let session_id = runtime.session().id().to_string();
         if reported
@@ -340,7 +358,7 @@ mod tests {
         assert!(idle.contains(&"--state".to_string()));
         assert!(idle.contains(&"idle".to_string()));
 
-        let release = target.release_arguments();
+        let release = target.release_arguments(8);
         assert_eq!(
             release,
             [
@@ -351,11 +369,17 @@ mod tests {
                 "custom:uri-agent",
                 "--agent",
                 "uri-agent",
+                "--seq",
+                "8",
             ]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>()
         );
+        // A release must carry a sequence above the last report sequence:
+        // Herdr silently drops an unsequenced or stale-sequenced release and
+        // keeps the pane's agent entry until the pane closes.
+        assert!(release.last().is_some_and(|value| value != "7"));
     }
 
     async fn runtime_fixture(

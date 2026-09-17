@@ -644,6 +644,22 @@ impl AgentRuntime {
         (working, queued)
     }
 
+    /// Accurate lifecycle snapshot for Herdr pane reporting. Unlike
+    /// [`Self::collaboration_snapshot`], this waits for the active-turn lock
+    /// instead of guessing `working` when the lock is briefly held, so a
+    /// background reconcile under that lock can never read as a spurious
+    /// turn and flip the pane between states.
+    pub(crate) async fn herdr_snapshot(&self) -> (bool, usize) {
+        let working = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| !turn.handle.is_finished());
+        let queued = self.pending_updates.borrow().len();
+        (working, queued)
+    }
+
     pub fn subscribe_pending_messages(&self) -> watch::Receiver<Vec<PendingMessage>> {
         self.pending_updates.subscribe()
     }
@@ -3860,6 +3876,47 @@ mod tests {
             Some(&Message::user("local second"))
         );
         drop(requests);
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn herdr_snapshot_waits_for_the_turn_lock_instead_of_guessing_working() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            Arc::new(FakeBackend::default()),
+            ModelLimits::default(),
+        )
+        .await;
+        session.persist().await.unwrap();
+
+        // A reconcile under the active-turn lock must not read as a turn:
+        // herdr pane reports flap between busy and idle otherwise. Another
+        // task holds the lock briefly, the way the collaboration worker's
+        // reconcile does.
+        let lock_held = Arc::new(tokio::sync::Notify::new());
+        let holder = {
+            let runtime = runtime.clone();
+            let lock_held = lock_held.clone();
+            tokio::spawn(async move {
+                let guard = runtime.active_turn.lock().await;
+                lock_held.notify_one();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                drop(guard);
+            })
+        };
+        lock_held.notified().await;
+        // The collaboration snapshot intentionally guesses `working` under
+        // the same contention; herdr must not use it.
+        assert_eq!(runtime.collaboration_snapshot(), (true, 0));
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), runtime.herdr_snapshot())
+            .await
+            .expect("herdr snapshot must not hang on the lock");
+        assert_eq!(snapshot, (false, 0));
+        holder.await.unwrap();
+        assert_eq!(runtime.herdr_snapshot().await, (false, 0));
+
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
