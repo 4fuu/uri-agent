@@ -183,6 +183,13 @@ pub trait Protocol: Send + Sync {
     /// Additional protocol help pages that must be read before this protocol's
     /// own help or operations. The protocol's own `<name>://help` remains
     /// mandatory and is read after these shared prerequisites.
+    ///
+    /// Reserve this for help pages that genuinely build on another shared
+    /// page, such as `<name>-mcp` server help on the shared `mcp://help`
+    /// routing page. Never force a dependency for a protocol that is merely
+    /// referenced by this one's results, such as `tasks://` handles: those
+    /// links are chained lazily by the prompts that mention them, which keeps
+    /// the interface loaded on demand.
     fn help_dependencies(&self) -> &[String] {
         &[]
     }

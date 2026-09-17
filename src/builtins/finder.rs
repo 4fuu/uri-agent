@@ -133,7 +133,7 @@ impl Plugin for FinderPlugin {
             owner: SESSION_PROTOCOL_OWNER.to_string(),
             identity: PROTOCOL_NAME.to_string(),
             descriptor: descriptor(),
-            help_dependencies: vec![TASKS_PROTOCOL.to_string()],
+            help_dependencies: Vec::new(),
         }])
     }
 
@@ -154,7 +154,12 @@ impl Plugin for FinderPlugin {
                     record.descriptor.name
                 );
             }
-            if record.help_dependencies != vec![TASKS_PROTOCOL.to_string()] {
+            // Records frozen while finder help still forced the shared
+            // `tasks` page carry that dependency; keep those sessions
+            // resuming and reject anything else.
+            if !record.help_dependencies.is_empty()
+                && record.help_dependencies != vec![TASKS_PROTOCOL.to_string()]
+            {
                 bail!("invalid finder session protocol help dependencies");
             }
         }
@@ -176,7 +181,6 @@ impl Plugin for FinderPlugin {
                 catalog: Arc::clone(&self.catalog),
             }),
             foreground_after: AUTO_BACKGROUND_AFTER,
-            help_dependencies: vec![TASKS_PROTOCOL.to_string()],
         })
     }
 }
@@ -186,7 +190,6 @@ struct FinderProtocol {
     model_roles: PluginModelRoleResolver,
     search: Arc<dyn FinderSearch>,
     foreground_after: Duration,
-    help_dependencies: Vec<String>,
 }
 
 #[async_trait]
@@ -321,10 +324,6 @@ async fn resolve_scope(cwd: &Path, target: &str) -> Result<Option<PathBuf>> {
 impl Protocol for FinderProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         descriptor()
-    }
-
-    fn help_dependencies(&self) -> &[String] {
-        &self.help_dependencies
     }
 
     async fn read(
@@ -488,7 +487,6 @@ mod tests {
             model_roles: PluginModelRoleResolver::new(manager.clone()),
             search,
             foreground_after,
-            help_dependencies: vec![TASKS_PROTOCOL.to_string()],
         }
     }
 
@@ -977,12 +975,6 @@ mod tests {
         resumed
             .services()
             .protocols
-            .read("tasks://help", "")
-            .await
-            .unwrap();
-        resumed
-            .services()
-            .protocols
             .read("finder://help", "")
             .await
             .unwrap();
@@ -1002,5 +994,49 @@ mod tests {
         let fresh = open_root(&host, &workspace, &manager, None).await;
         assert!(!protocol_names(&fresh).iter().any(|name| name == "finder"));
         fresh.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_records_do_not_force_prerequisite_help() {
+        let plugin = record_tests_plugin().await;
+        let records = plugin.session_protocol_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].help_dependencies.is_empty(),
+            "finder help must be readable without reading tasks help first"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_accepts_records_frozen_with_the_legacy_tasks_dependency() {
+        let plugin = record_tests_plugin().await;
+        let mut record = plugin
+            .session_protocol_records()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        plugin
+            .restore_session_protocol_records(&[record.clone()])
+            .unwrap();
+        record.help_dependencies = vec![TASKS_PROTOCOL.to_string()];
+        plugin
+            .restore_session_protocol_records(&[record.clone()])
+            .unwrap();
+        record.help_dependencies = vec!["shell".to_string()];
+        assert!(plugin.restore_session_protocol_records(&[record]).is_err());
+    }
+
+    async fn record_tests_plugin() -> FinderPlugin {
+        let (workspace, _manager) = workspace_with_role(true).await;
+        FinderPlugin {
+            cwd: workspace.path().to_path_buf(),
+            parent_session_id: "parent".to_string(),
+            catalog: Arc::new(
+                ModelCatalog::load(&workspace.path().join("config"), true)
+                    .await
+                    .unwrap(),
+            ),
+        }
     }
 }
