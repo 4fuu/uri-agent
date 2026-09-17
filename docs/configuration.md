@@ -366,17 +366,19 @@ invocation.
 
 ### Model roles and plugin settings
 
-The built-in `small` role starts unassigned. Use `:model-roles` to assign it or
-create custom roles. The built-in `finder` role also starts unassigned; when it
-resolves, new depth-1 sessions register the `finder://` delegated-search
-protocol described in [Protocols, tasks, and output](protocols.md#delegated-search).
-Global and project assignments are layered by complete
-role name:
+Every model role is declared by a plugin and resolved dynamically: `finder`
+backs the `finder://` delegated-search protocol described in
+[Protocols, tasks, and output](protocols.md#delegated-search), `title`
+generates terminal titles, and WASM plugins declare their own roles in the
+manifest. `:model-roles` lists declared roles even while unassigned and is the
+only way to configure them; assigning a model to `finder` registers the
+protocol for new depth-1 sessions. Global and project assignments are layered
+by complete role name:
 
 ```json
 {
   "modelRoles": {
-    "review": {
+    "finder": {
       "provider": "anthropic",
       "model": "claude-sonnet-4-5",
       "thinking": "high"

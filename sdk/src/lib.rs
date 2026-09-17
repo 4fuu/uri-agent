@@ -12,7 +12,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -365,6 +365,11 @@ pub struct PluginManifest {
     pub permissions: PluginPermissions,
     #[serde(default)]
     pub resident: bool,
+    /// Model-role names this plugin resolves through `model_role(name)`.
+    /// Declared roles are assignable through model-role settings even while
+    /// unassigned.
+    #[serde(default)]
+    pub model_roles: Vec<String>,
 }
 
 impl PluginManifest {
@@ -375,6 +380,7 @@ impl PluginManifest {
             model_tools: Vec::new(),
             permissions: PluginPermissions::default(),
             resident: false,
+            model_roles: Vec::new(),
         }
     }
 
@@ -383,6 +389,12 @@ impl PluginManifest {
         tools: impl IntoIterator<Item = ModelToolDescriptor>,
     ) -> Self {
         self.model_tools = tools.into_iter().collect();
+        self
+    }
+
+    /// Declare model-role names this plugin resolves through `model_role`.
+    pub fn with_model_roles(mut self, roles: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.model_roles = roles.into_iter().map(Into::into).collect();
         self
     }
 

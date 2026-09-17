@@ -245,8 +245,11 @@ User-configured model routes are available through
 `uri_agent_plugin_sdk::model_role(name)`. The returned role contains provider,
 model, and resolved thinking values, but no credential. Lookup requires no
 manifest permission, performs no inference, and does not change the active
-conversation model. Role names use only ASCII letters, digits, `-`, and `_`;
-see the model-role settings documentation for global/project precedence.
+conversation model. Declare the names your plugin resolves with
+`.with_model_roles([...])` on the manifest; declared roles are assignable
+through model-role settings even while unassigned. Role names use only ASCII
+letters, digits, `-`, and `_`; see the model-role settings documentation for
+global/project precedence.
 
 Persistent JSON values are available through
 `uri_agent_plugin_sdk::plugin_setting(key)` and
@@ -300,6 +303,7 @@ type ResidentSchedule = BTreeMap<PathBuf, Option<tokio::time::Instant>>;
 struct PluginSet {
     protocols: BTreeMap<String, Arc<dyn Protocol>>,
     model_tools: BTreeMap<String, Arc<dyn ModelTool>>,
+    model_roles: Vec<String>,
     residents: BTreeMap<PathBuf, Arc<WasmResident>>,
     bridges: Vec<HostBridge>,
 }
@@ -1264,6 +1268,10 @@ impl Plugin for WasmPluginManager {
         vec![Self::descriptor()]
     }
 
+    fn model_roles(&self) -> Vec<String> {
+        self.current().model_roles.clone()
+    }
+
     fn permissions(&self) -> Vec<PluginPermission> {
         vec![
             PluginPermission::Environment,
@@ -1410,6 +1418,7 @@ async fn load_plugin_set(
     let mut report = ReloadReport::default();
     let mut claimed = reserved.clone();
     let mut claimed_model_tools = reserved_model_tools.clone();
+    let mut claimed_roles = HashSet::new();
     for path in paths {
         let plugin_name = path
             .file_stem()
@@ -1462,6 +1471,27 @@ async fn load_plugin_set(
             ));
             continue;
         }
+        let mut module_roles = HashSet::new();
+        let role_diagnostic = module.manifest.model_roles.iter().find_map(|name| {
+            if crate::config::validate_model_role_name(name).is_err() {
+                return Some(format!("model role name {name:?} is invalid"));
+            }
+            if !module_roles.insert(name.clone()) {
+                return Some(format!("model role {name:?} is declared twice"));
+            }
+            claimed_roles
+                .contains(name)
+                .then(|| format!("model role {name:?} is already declared"))
+        });
+        if let Some(diagnostic) = role_diagnostic {
+            report
+                .diagnostics
+                .push(format!("{}: {diagnostic}", display_path(&path)));
+            continue;
+        }
+        claimed_roles.extend(module.manifest.model_roles.iter().cloned());
+        set.model_roles
+            .extend(module.manifest.model_roles.iter().cloned());
         report.loaded_files.push(module.path.clone());
         set.bridges.push(module.bridge.clone());
         if let Some(resident) = module.resident() {
@@ -2634,6 +2664,54 @@ mod tests {
         assert_eq!(
             registry.read("model_role://read", "").await.unwrap(),
             r#"{"provider":"example","model":"review-model","thinking":"low"}"#
+        );
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manifest_declared_model_roles_are_listed_and_invalid_declarations_are_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let manifest = |protocol: &str, roles: &str| {
+            format!(
+                r#"{{"abi_version":{ABI_VERSION},"protocols":[{{"name":"{protocol}","description":"Role owner","can_read":true,"can_exec":true}}],"model_tools":[],"permissions":{{"environment":false,"credentials":false}},"model_roles":[{roles}]}}"#
+            )
+        };
+        tokio::fs::write(
+            manager.directory().join("first-owner.wasm"),
+            response_module(&manifest("role_owner", r#""review","draft""#), b""),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("second-duplicate.wasm"),
+            response_module(&manifest("role_conflict", r#""review""#), b""),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("third-invalid.wasm"),
+            response_module(&manifest("role_invalid", r#""bad role""#), b""),
+        )
+        .await
+        .unwrap();
+        let report = manager.reload().await.unwrap();
+        assert_eq!(
+            crate::plugin::Plugin::model_roles(&manager),
+            ["review".to_string(), "draft".to_string()]
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("model role \"review\" is already declared"))
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("model role name \"bad role\" is invalid"))
         );
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }

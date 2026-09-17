@@ -17,22 +17,23 @@ their captured runtime. While resident lifecycle is active, reload shuts down
 old resident instances and starts their replacements before future wakes. The
 directory follows `URI_AGENT_CONFIG_DIR`.
 
-## ABI version 6
+## ABI version 7
 
-Only ABI v6 is accepted. Earlier ABI and the former subagent API have no
+Only ABI v7 is accepted. Earlier ABI and the former subagent API have no
 compatibility path. Every module exports `uri_agent_manifest`; a module with a
 protocol, tool, resident callback, or compaction callback also handles tagged
 requests through `uri_agent_handle`.
 
-The manifest declares protocol and strict typed-tool descriptors, permissions,
-and resident opt-in. Protocols must implement `<protocol>://help`; bodies are
-always strings. Typed tool schemas must be top-level objects with `properties`
-and `additionalProperties: false`. Calls into one module are serialized and its
-memory survives until reload.
+The manifest declares protocol and strict typed-tool descriptors, model-role
+names, permissions, and resident opt-in. Protocols must implement
+`<protocol>://help`; bodies are always strings. Typed tool schemas must be
+top-level objects with `properties` and `additionalProperties: false`. Calls
+into one module are serialized and its memory survives until reload.
 
 ```rust
 PluginManifest::new(protocols)
     .with_model_tools(tools)
+    .with_model_roles(["review"])
     .request_agent_access()
     .request_state_access()
     .with_resident()
@@ -40,9 +41,10 @@ PluginManifest::new(protocols)
 
 Permission methods are source-audit markers, not interactive grants.
 `request_environment_access()` permits `environment_variable`; and
-`request_credentials_access()` permits `provider_api_key`. `model_role` and
-project-overridable `plugin_setting` / `set_plugin_setting` require no manifest
-permission.
+`request_credentials_access()` permits `provider_api_key`. Model roles are
+declared with `with_model_roles`, resolved at call time with `model_role`, and
+need no manifest permission; project-overridable `plugin_setting` /
+`set_plugin_setting` also require no manifest permission.
 
 ## Agent API
 

@@ -4474,10 +4474,10 @@ fn environment_prompts_hide_values_and_return_to_the_manager() {
 }
 
 #[test]
-fn model_hub_labels_role_assignments_and_keeps_role_creation_inline() {
+fn model_hub_labels_role_assignments() {
     let roles = vec![
         crate::config::ModelRoleInfo {
-            name: "small".to_string(),
+            name: "finder".to_string(),
             role: None,
             error: None,
             source: None,
@@ -4503,9 +4503,9 @@ fn model_hub_labels_role_assignments_and_keeps_role_creation_inline() {
     assert!(rendered.contains("MODEL HUB"));
     assert!(rendered.contains("MODELS"));
     assert!(rendered.contains("ROLES"));
-    assert!(rendered.contains("small"));
+    assert!(rendered.contains("finder"));
     assert!(rendered.contains("no model assigned"));
-    assert!(rendered.contains("BUILT-IN"));
+    assert!(rendered.contains("PLUGIN"));
     assert!(rendered.contains("title"));
     assert!(rendered.contains("example/small-model"));
     assert!(rendered.contains("low"));
@@ -4580,19 +4580,17 @@ fn model_hub_labels_role_assignments_and_keeps_role_creation_inline() {
             .is_some_and(|hub| hub.role_flow.is_none())
     );
 
+    // Role creation is gone: roles come from plugin declarations only.
     let add = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
     assert!(matches!(
         handle_models_key(&mut app, add, &key_name(add)),
         Action::Continue
     ));
-    handle_paste(&mut app, "terminal-title".to_string());
-    let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("NEW ROLE terminal-title█"), "{rendered}");
-    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
-    assert!(matches!(
-        handle_models_key(&mut app, enter, &key_name(enter)),
-        Action::OpenRoleModel(role) if role == "terminal-title"
-    ));
+    assert!(
+        app.model_hub
+            .as_ref()
+            .is_some_and(|hub| hub.role_flow.is_none())
+    );
 }
 
 #[test]

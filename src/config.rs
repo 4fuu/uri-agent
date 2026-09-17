@@ -35,7 +35,6 @@ use uuid::Uuid;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BUILTIN_MODEL_ROLES: [&str; 2] = ["small", "finder"];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
@@ -582,15 +581,12 @@ impl ConfigManager {
         Ok(Some(role))
     }
 
-    pub async fn model_roles(&self) -> Result<Vec<ModelRoleInfo>> {
-        let (custom, sources) = {
+    /// List the model roles declared by plugins. Declared names are listed
+    /// even while unassigned; configured names that no plugin declares are
+    /// ignored.
+    pub async fn model_roles(&self, declared: &[String]) -> Result<Vec<ModelRoleInfo>> {
+        let sources = {
             let files = self.files.lock().await;
-            let mut custom = BTreeSet::new();
-            custom.extend(files.global.model_roles.keys().cloned());
-            custom.extend(files.project.model_roles.keys().cloned());
-            for builtin in BUILTIN_MODEL_ROLES {
-                custom.remove(builtin);
-            }
             let mut sources = BTreeMap::new();
             for name in files.global.model_roles.keys() {
                 sources.insert(name.clone(), (ValueSource::Global, false));
@@ -604,21 +600,16 @@ impl ConfigManager {
                     ),
                 );
             }
-            (custom, sources)
+            sources
         };
-        let mut names = BUILTIN_MODEL_ROLES
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        names.extend(custom);
-        let mut roles = Vec::with_capacity(names.len());
-        for name in names {
-            let (role, error) = match self.model_role(&name).await {
+        let mut roles = Vec::with_capacity(declared.len());
+        for name in declared {
+            let (role, error) = match self.model_role(name).await {
                 Ok(role) => (role, None),
                 Err(error) => (None, Some(error.to_string())),
             };
             let (source, overrides_global) = sources
-                .get(&name)
+                .get(name)
                 .cloned()
                 .map_or((None, false), |(source, overrides)| {
                     (Some(source), overrides)
@@ -626,7 +617,7 @@ impl ConfigManager {
             roles.push(ModelRoleInfo {
                 role,
                 error,
-                name,
+                name: name.clone(),
                 source,
                 overrides_global,
             });
@@ -2639,14 +2630,29 @@ mod tests {
         );
         assert_eq!(manager.model_role("missing").await.unwrap(), None);
         assert!(manager.model_role("invalid role").await.is_err());
-        let roles = manager.model_roles().await.unwrap();
+        let roles = manager
+            .model_roles(&["commit".to_string(), "finder".to_string()])
+            .await
+            .unwrap();
+        // Only plugin-declared roles are listed, in declaration order; the
+        // declared `finder` role appears even while unassigned.
+        assert_eq!(
+            roles
+                .iter()
+                .map(|role| role.name.as_str())
+                .collect::<Vec<_>>(),
+            ["commit", "finder"]
+        );
         let commit = roles.iter().find(|role| role.name == "commit").unwrap();
         assert_eq!(commit.source, Some(ValueSource::Project));
         assert!(commit.overrides_global);
+        let finder = roles.iter().find(|role| role.name == "finder").unwrap();
+        assert_eq!(finder.role, None);
+        assert_eq!(finder.source, None);
     }
 
     #[tokio::test]
-    async fn the_small_role_requires_an_independent_model_assignment() {
+    async fn declared_roles_need_an_independent_model_assignment() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("config");
         let project = root.path().join("project");
@@ -2668,33 +2674,32 @@ mod tests {
         let manager = ConfigManager::load_for_test(&directory, &project)
             .await
             .unwrap();
-        assert_eq!(manager.model_role("small").await.unwrap(), None);
-        assert_eq!(manager.model_role("default").await.unwrap(), None);
-        assert_eq!(manager.model_role("large").await.unwrap(), None);
+        // A declared role never falls back to the configured default model.
+        assert_eq!(manager.model_role("finder").await.unwrap(), None);
 
         manager
-            .set_model_role("small", "example", "role-model", ThinkingLevel::Off)
+            .set_model_role("finder", "example", "role-model", ThinkingLevel::Off)
             .await
             .unwrap();
         assert_eq!(
-            manager.model_role("small").await.unwrap(),
+            manager.model_role("finder").await.unwrap(),
             Some(ModelRole {
                 provider: "example".to_string(),
                 model: "role-model".to_string(),
                 thinking: ThinkingLevel::Off,
             })
         );
-        let roles = manager.model_roles().await.unwrap();
-        let small = roles.iter().find(|role| role.name == "small").unwrap();
-        assert_eq!(small.source, Some(ValueSource::Global));
-        assert!(!small.overrides_global);
+        let roles = manager.model_roles(&["finder".to_string()]).await.unwrap();
+        let finder = roles.iter().find(|role| role.name == "finder").unwrap();
+        assert_eq!(finder.source, Some(ValueSource::Global));
+        assert!(!finder.overrides_global);
 
-        assert!(manager.remove_model_role("small").await.unwrap());
-        assert_eq!(manager.model_role("small").await.unwrap(), None);
+        assert!(manager.remove_model_role("finder").await.unwrap());
+        assert_eq!(manager.model_role("finder").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn custom_roles_and_plugin_settings_use_project_precedence() {
+    async fn declared_roles_and_plugin_settings_use_project_precedence() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("config");
         let project = root.path().join("project");
@@ -2710,7 +2715,7 @@ mod tests {
         .unwrap();
         fs::write(
             directory.join("settings.json"),
-            br#"{"defaultProvider":"example","defaultModel":"active-model","pluginSettings":{"terminal-title":{"role":"small","format":{"words":5}}}}"#,
+            br#"{"defaultProvider":"example","defaultModel":"active-model","modelRoles":{"review":{"provider":"example","model":"custom-model"}},"pluginSettings":{"terminal-title":{"role":"small","format":{"words":5}}}}"#,
         )
         .await
         .unwrap();
@@ -2745,14 +2750,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             manager
-                .model_roles()
+                .model_roles(&["finder".to_string(), "title".to_string()])
                 .await
                 .unwrap()
                 .into_iter()
                 .map(|role| role.name)
                 .collect::<Vec<_>>(),
-            ["small", "finder", "title"]
+            ["finder", "title"]
         );
+        // A configured name that no plugin declares stays resolvable by name
+        // but never appears in the listed roles.
+        assert!(manager.model_role("review").await.unwrap().is_some());
         manager
             .set_plugin_setting("terminal-title", "role", Value::String("title".to_string()))
             .await

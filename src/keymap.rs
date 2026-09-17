@@ -112,7 +112,6 @@ map("plugin_panel", "home", "home");
 map("plugin_panel", "end", "end");
 map("plugin_panel", "esc", "close");
 
-map("model_roles", "ctrl+n", "add");
 map("model_roles", "delete", "remove");
 
 map("tasks", "x", "cancel");
@@ -906,10 +905,6 @@ mod tests {
             Some("previous_tab")
         );
         assert_eq!(keymap.action("selector", "down").as_deref(), Some("next"));
-        assert_eq!(
-            keymap.action("model_roles", "ctrl+n").as_deref(),
-            Some("add")
-        );
         assert_eq!(
             keymap.action("model_roles", "delete").as_deref(),
             Some("remove")

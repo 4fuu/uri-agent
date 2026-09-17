@@ -1,5 +1,5 @@
 use crate::agent::{AgentHandle, AgentHost, AgentSpec, CompactionCallback};
-use crate::config::{AgentEnvironment, ConfigManager, ModelRole};
+use crate::config::{AgentEnvironment, ConfigManager, ModelRole, validate_model_role_name};
 use crate::plugin_state::{PluginState, PluginStateScope, PluginStateStore};
 use crate::protocol::{
     ProtocolDescriptor, ProtocolImage, ProtocolRegistry, validate_descriptor,
@@ -54,11 +54,6 @@ pub enum CoreCommand {
 pub enum CommandTarget {
     Core(CoreCommand),
     Panel(String),
-    ModelRole {
-        plugin: String,
-        key: String,
-        default_role: String,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,16 +125,6 @@ impl CommandRegistry {
             if let Some(owner) = self.names.get(name) {
                 bail!("command name or alias {name:?} is already registered by {owner}");
             }
-        }
-        if let CommandTarget::ModelRole {
-            plugin,
-            key,
-            default_role,
-        } = &spec.target
-        {
-            validate_name(plugin)?;
-            validate_name(key)?;
-            validate_name(default_role)?;
         }
         let id = spec.id.clone();
         for name in names {
@@ -228,7 +213,7 @@ fn core_commands() -> Vec<CommandSpec> {
         CommandSpec::new(
             "model-roles",
             "Model roles",
-            "assign models to the small and custom plugin roles",
+            "assign models to plugin-declared roles",
             ["roles"],
             CommandTarget::Core(ModelRoles),
         ),
@@ -1342,6 +1327,13 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Names of the model roles this plugin resolves. Declared roles stay
+    /// assignable through model-role settings even while unassigned, and the
+    /// plugin resolves them dynamically at use time.
+    fn model_roles(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Opt into the process-resident lifecycle used by `uri-agent --background`.
     /// Plugins that return `None` remain ordinary request-driven plugins.
     fn resident(&self) -> Option<Arc<dyn ResidentPlugin>> {
@@ -1521,6 +1513,23 @@ impl PluginRegistry {
             .iter()
             .flat_map(|plugin| plugin.startup_notices())
             .collect()
+    }
+
+    /// Model-role names declared by the linked plugins, in registration order.
+    /// Names are validated and must be declared by at most one plugin.
+    pub fn model_roles(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for plugin in &self.plugins {
+            for name in plugin.model_roles() {
+                validate_model_role_name(&name)?;
+                if !seen.insert(name.clone()) {
+                    bail!("model role is declared more than once: {name}");
+                }
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     pub fn system_prompt_fragments(&self) -> Result<Vec<String>> {
@@ -2011,45 +2020,45 @@ mod tests {
     }
 
     #[test]
-    fn plugin_model_role_commands_validate_their_namespace_key_and_default_role() {
-        let mut registry = CommandRegistry::with_core_commands();
-        registry
-            .register(CommandSpec::new(
-                "terminal-title-model",
-                "Terminal title model",
-                "choose the role used for generated terminal titles",
-                std::iter::empty::<&str>(),
-                CommandTarget::ModelRole {
-                    plugin: "terminal-title".to_string(),
-                    key: "role".to_string(),
-                    default_role: "small".to_string(),
-                },
-            ))
-            .unwrap();
-        assert!(matches!(
-            registry
-                .resolve(":terminal-title-model")
-                .unwrap()
-                .spec
-                .target,
-            CommandTarget::ModelRole { plugin, key, default_role }
-                if plugin == "terminal-title" && key == "role" && default_role == "small"
-        ));
+    fn registry_collects_declared_model_roles_and_rejects_duplicates() {
+        struct RolePlugin(&'static str);
+        impl Plugin for RolePlugin {
+            fn model_roles(&self) -> Vec<String> {
+                vec![self.0.to_string()]
+            }
+            fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
+                Ok(())
+            }
+        }
 
-        let error = registry
-            .register(CommandSpec::new(
-                "invalid-role-setting",
-                "Invalid role setting",
-                "test invalid role settings",
-                std::iter::empty::<&str>(),
-                CommandTarget::ModelRole {
-                    plugin: "invalid setting".to_string(),
-                    key: "role".to_string(),
-                    default_role: "small".to_string(),
-                },
-            ))
-            .unwrap_err();
-        assert!(error.to_string().contains("invalid command name or alias"));
+        let mut plugins = PluginRegistry::new();
+        plugins.add(RolePlugin("finder"));
+        plugins.add(RolePlugin("title"));
+        assert_eq!(
+            plugins.model_roles().unwrap(),
+            ["finder".to_string(), "title".to_string()]
+        );
+
+        let mut duplicate = PluginRegistry::new();
+        duplicate.add(RolePlugin("finder"));
+        duplicate.add(RolePlugin("finder"));
+        assert!(
+            duplicate
+                .model_roles()
+                .unwrap_err()
+                .to_string()
+                .contains("declared more than once")
+        );
+
+        let mut invalid = PluginRegistry::new();
+        invalid.add(RolePlugin("invalid role"));
+        assert!(
+            invalid
+                .model_roles()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid model role name")
+        );
     }
 
     #[tokio::test]

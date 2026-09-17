@@ -1,7 +1,7 @@
 # URI Agent plugin SDK
 
 This crate provides the Rust guest types, exports, and host calls for trusted
-URI Agent Extism plugins. It implements ABI v6 only; older ABI and the former
+URI Agent Extism plugins. It implements ABI v7 only; older ABI and the former
 subagent API are unsupported. Runtime installation and limits are documented
 in [WASM plugins](../docs/plugins.md).
 
@@ -96,7 +96,8 @@ Opt in with `.with_resident()` and handle `PluginEvent::Resident` events:
 `ResidentResponse`; `wake_after_ms` requests another wake. Non-resident plugins
 remain request-driven.
 
-The SDK also exposes dynamic `model_role`, permission-free `plugin_setting` /
+The SDK also exposes `model_role`, which resolves the plugin's declared roles
+(`with_model_roles`) at call time, permission-free `plugin_setting` /
 `set_plugin_setting`, and permission-gated environment and credential calls.
 Permissions are requested with `request_environment_access()` and
 `request_credentials_access()`.

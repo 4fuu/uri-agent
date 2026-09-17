@@ -68,10 +68,10 @@ matches an established reusable boundary.
 ## Linked Rust extensions
 
 A [`Plugin`](../src/plugin.rs) declares prompt fragments, permissions, session
-records, protocols, typed model tools, commands, and generic TUI providers.
-`PluginRegistry` validates declarations against installed capabilities, rejects
-name collisions, and preserves prompt-fragment order before a new session is
-frozen.
+records, protocols, typed model tools, commands, model roles, and generic TUI
+providers. `PluginRegistry` validates declarations against installed
+capabilities, rejects name collisions, and preserves prompt-fragment order
+before a new session is frozen.
 
 Simple string-input operations belong behind `read` or `exec`; structured or
 escape-heavy operations use typed direct tools. Commands join the shared

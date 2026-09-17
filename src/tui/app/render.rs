@@ -3103,7 +3103,7 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             options,
             selected,
         }) => render_model_role_effort(frame, app, sections[2], role, model, options, *selected),
-        Some(ModelRoleFlow::Naming { .. } | ModelRoleFlow::ConfirmRemove { .. }) => {
+        Some(ModelRoleFlow::ConfirmRemove { .. }) => {
             render_model_roles(frame, app, sections[2], false);
         }
         None if active_tab == ModelHubTab::Roles => {
@@ -3287,8 +3287,8 @@ fn role_source_label(role: &ModelRoleInfo) -> String {
         (Some(ValueSource::Project), false) => "PROJECT".to_string(),
         (Some(ValueSource::Global), _) => "GLOBAL".to_string(),
         (Some(source), _) => value_source_label(source),
-        (None, _) if role.name == "small" => "BUILT-IN".to_string(),
-        (None, _) => "UNASSIGNED".to_string(),
+        // Only plugin-declared roles are listed while unassigned.
+        (None, _) => "PLUGIN".to_string(),
     }
 }
 
@@ -3454,16 +3454,6 @@ fn render_model_hub_footer(
         return;
     };
     let (message, style) = match flow {
-        Some(ModelRoleFlow::Naming { value }) => {
-            let hints = action_hints(
-                &app.keymap,
-                &[("text", "confirm", "continue"), ("text", "cancel", "back")],
-            );
-            (
-                format!("NEW ROLE  {value}█  · {hints} · letters, digits, - or _"),
-                Style::default().fg(ACCENT),
-            )
-        }
         Some(ModelRoleFlow::ConfirmRemove {
             role,
             source,
@@ -3518,7 +3508,6 @@ fn render_model_hub_footer(
                 &app.keymap,
                 &[
                     ("models", "confirm", "assign"),
-                    ("model_roles", "add", "add"),
                     ("model_roles", "remove", "remove"),
                     ("models", "next_tab", "models"),
                     ("models", "close", "close"),

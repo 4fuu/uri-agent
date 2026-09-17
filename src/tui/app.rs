@@ -13,7 +13,7 @@ use crate::clipboard;
 use crate::compaction::{ContextAccuracy, Strategy};
 use crate::config::{
     ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, ModelRoleInfo, ValueSource,
-    display_path, validate_environment_name, validate_model_role_name,
+    display_path, validate_environment_name,
 };
 use crate::keymap::{KeyDisplayStyle, KeyStroke, Keymap};
 use crate::model::{
@@ -596,9 +596,6 @@ impl ModelHubTab {
 
 #[derive(Clone)]
 enum ModelRoleFlow {
-    Naming {
-        value: String,
-    },
     PickingModel {
         role: String,
     },
@@ -665,7 +662,6 @@ enum SelectorKind {
     Search,
     Effort { provider: String, model: String },
     Environment { return_to_settings: bool },
-    PluginModelRole { plugin: String, key: String },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

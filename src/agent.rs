@@ -227,6 +227,13 @@ pub struct AgentServices {
     wasm_plugins: WasmPluginManager,
 }
 
+impl AgentServices {
+    /// Model-role names declared by the linked plugins for this process.
+    pub fn declared_model_roles(&self) -> Result<Vec<String>> {
+        self.plugins.model_roles()
+    }
+}
+
 struct AgentInstance {
     services: AgentServices,
     closed: AtomicBool,

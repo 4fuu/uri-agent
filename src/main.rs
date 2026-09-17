@@ -194,6 +194,7 @@ async fn show_session(
     let output = agent.services().output.clone();
     let draft = runtime.session().draft().await;
     let provider_count = config.catalog.providers().await.len();
+    let model_roles = agent.services().declared_model_roles()?;
     let outcome = terminal
         .run(TuiServices {
             runtime: runtime.clone(),
@@ -223,6 +224,7 @@ async fn show_session(
                 key_display: active.key_display,
             },
             draft,
+            model_roles,
         })
         .await;
     match outcome {

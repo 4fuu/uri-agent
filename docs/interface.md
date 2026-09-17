@@ -82,9 +82,9 @@ assignments. Settings separates Model and Agent values, shows their source, and
 marks unsaved changes. Conversation search covers the complete persisted
 transcript, loading older pages before presenting matches.
 
-The terminal-title plugin can use an assigned model role to name the terminal
-after the first prompt. Missing role assignments or generation failures do not
-interrupt the conversation.
+The terminal-title plugin names the terminal after the first prompt when its
+declared `title` model role is assigned. Missing role assignments or generation
+failures do not interrupt the conversation.
 
 Extensions register through the same command, panel, status, completion, and
 submission interfaces, so they do not create a second navigation system.

@@ -123,6 +123,7 @@ fn add_agent_plugins(
     mcp_profile: Option<serde_json::Value>,
 ) {
     plugins.add(model_tools::ProtocolToolsPlugin);
+    plugins.add(finder::FinderRolePlugin);
     plugins.add(agents::AgentsPlugin::new(cwd));
     plugins.add(mcp::McpPlugin::with_session_profile(
         cwd,

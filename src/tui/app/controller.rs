@@ -429,6 +429,9 @@ pub struct TuiServices {
     pub output: Arc<OutputStore>,
     pub info: TuiInfo,
     pub draft: String,
+    /// Model-role names declared by the linked plugins; they stay assignable
+    /// through model-role settings even while unassigned.
+    pub model_roles: Vec<String>,
 }
 
 pub struct TuiTerminal {
@@ -485,6 +488,7 @@ impl TuiTerminal {
             output,
             mut info,
             draft,
+            model_roles,
         } = services;
         info.thinking =
             effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
@@ -527,6 +531,7 @@ impl TuiTerminal {
             environment,
             catalog,
             output,
+            model_roles,
         };
         let outcome = run_loop(
             &mut self.terminal,
@@ -561,6 +566,7 @@ pub(super) struct LoopServices {
     environment: Arc<AgentEnvironment>,
     catalog: Arc<ModelCatalog>,
     output: Arc<OutputStore>,
+    model_roles: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1021,6 +1027,7 @@ pub(super) async fn apply_action(
                 &services.manager,
                 &services.catalog,
                 query,
+                &services.model_roles,
             )
             .await;
             Ok(None)
@@ -1038,6 +1045,7 @@ pub(super) async fn apply_action(
                 &services.manager,
                 &services.catalog,
                 String::new(),
+                &services.model_roles,
             )
             .await;
             if let Some((provider, model)) = selected
@@ -1049,7 +1057,14 @@ pub(super) async fn apply_action(
         }
         Action::OpenModelRoles => {
             app.model_selection_target = ModelSelectionTarget::Conversation;
-            open_model_roles(app, &services.runtime, &services.manager, &services.catalog).await;
+            open_model_roles(
+                app,
+                &services.runtime,
+                &services.manager,
+                &services.catalog,
+                &services.model_roles,
+            )
+            .await;
             Ok(None)
         }
         Action::OpenRoleModel(role) => {
@@ -1058,6 +1073,7 @@ pub(super) async fn apply_action(
                 &services.runtime,
                 &services.manager,
                 &services.catalog,
+                &services.model_roles,
                 role,
             )
             .await;
@@ -1071,7 +1087,7 @@ pub(super) async fn apply_action(
                     app.set_flash(format!("Could not remove model role {role}: {error:#}"))
                 }
             }
-            reload_model_roles(app, &services.manager).await;
+            reload_model_roles(app, &services.manager, &services.model_roles).await;
             Ok(None)
         }
         Action::SaveModelRole {
@@ -1093,7 +1109,7 @@ pub(super) async fn apply_action(
                         hub.role_flow = None;
                         hub.tab = ModelHubTab::Roles;
                     }
-                    reload_model_roles(app, &services.manager).await;
+                    reload_model_roles(app, &services.manager, &services.model_roles).await;
                 }
                 Err(error) => {
                     app.set_flash(format!("Could not save model role {role}: {error:#}"));
@@ -1327,13 +1343,7 @@ pub(super) fn handle_paste(app: &mut App, text: String) {
             }
         }
         Some(Overlay::Models) => {
-            if let Some(ModelRoleFlow::Naming { value }) = app
-                .model_hub
-                .as_mut()
-                .and_then(|hub| hub.role_flow.as_mut())
-            {
-                value.push_str(text.trim());
-            } else if let Some(selector) = app.model_selector.as_mut() {
+            if let Some(selector) = app.model_selector.as_mut() {
                 selector.paste(text.trim());
             }
         }
@@ -1452,14 +1462,6 @@ async fn dispatch_ui_command_with_arguments(
                 }
                 Err(error) => app.set_flash(format!("Plugin panel failed: {error:#}")),
             }
-            return Action::Continue;
-        }
-        CommandTarget::ModelRole {
-            plugin,
-            key,
-            default_role,
-        } => {
-            open_plugin_model_roles(app, services, plugin, key, default_role).await;
             return Action::Continue;
         }
     };
@@ -2140,14 +2142,6 @@ pub(super) fn handle_models_key(app: &mut App, key: KeyEvent, key_name: &str) ->
                     }
                     Action::Continue
                 }
-                Some("add") => {
-                    if let Some(hub) = app.model_hub.as_mut() {
-                        hub.role_flow = Some(ModelRoleFlow::Naming {
-                            value: String::new(),
-                        });
-                    }
-                    Action::Continue
-                }
                 Some("remove") => {
                     let selected = app
                         .model_hub
@@ -2240,56 +2234,6 @@ pub(super) fn handle_models_key(app: &mut App, key: KeyEvent, key_name: &str) ->
     };
 
     match flow {
-        ModelRoleFlow::Naming { .. } => match app.keymap.action("text", key_name).as_deref() {
-            Some("quit") => Action::Quit,
-            Some("cancel") => {
-                if let Some(hub) = app.model_hub.as_mut() {
-                    hub.role_flow = None;
-                }
-                Action::Continue
-            }
-            Some("backspace") => {
-                if let Some(ModelRoleFlow::Naming { value }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    value.pop();
-                }
-                Action::Continue
-            }
-            Some("confirm") => {
-                let role = app
-                    .model_hub
-                    .as_ref()
-                    .and_then(|hub| hub.role_flow.as_ref())
-                    .and_then(|flow| match flow {
-                        ModelRoleFlow::Naming { value } => Some(value.trim().to_string()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                if let Err(error) = validate_model_role_name(&role) {
-                    app.set_flash(format!("Invalid model role name: {error}"));
-                    Action::Continue
-                } else {
-                    Action::OpenRoleModel(role)
-                }
-            }
-            _ => {
-                if let KeyCode::Char(character) = key.code
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                    && let Some(ModelRoleFlow::Naming { value }) = app
-                        .model_hub
-                        .as_mut()
-                        .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    value.push(character);
-                }
-                Action::Continue
-            }
-        },
         ModelRoleFlow::ConfirmRemove { role, .. } => {
             match app.keymap.action("models", key_name).as_deref() {
                 Some("quit") => Action::Quit,
@@ -2608,17 +2552,6 @@ pub(super) async fn confirm_selector(app: &mut App, services: &LoopServices) -> 
         }
         SelectorKind::Environment { return_to_settings } => {
             open_environment_value_prompt(app, item.id, return_to_settings);
-            Action::Continue
-        }
-        SelectorKind::PluginModelRole { plugin, key } => {
-            match services
-                .manager
-                .set_plugin_setting(&plugin, &key, serde_json::Value::String(item.id.clone()))
-                .await
-            {
-                Ok(()) => app.set_flash(format!("{plugin} now uses model role {}", item.id)),
-                Err(error) => app.set_flash(format!("Could not save {plugin}: {error:#}")),
-            }
             Action::Continue
         }
     }
@@ -4352,8 +4285,18 @@ pub(super) async fn open_models(
     manager: &ConfigManager,
     catalog: &ModelCatalog,
     query: String,
+    declared_roles: &[String],
 ) {
-    open_model_hub(app, runtime, manager, catalog, query, ModelHubTab::Models).await;
+    open_model_hub(
+        app,
+        runtime,
+        manager,
+        catalog,
+        query,
+        ModelHubTab::Models,
+        declared_roles,
+    )
+    .await;
 }
 
 pub(super) async fn open_model_roles(
@@ -4361,6 +4304,7 @@ pub(super) async fn open_model_roles(
     runtime: &AgentRuntime,
     manager: &ConfigManager,
     catalog: &ModelCatalog,
+    declared_roles: &[String],
 ) {
     open_model_hub(
         app,
@@ -4369,6 +4313,7 @@ pub(super) async fn open_model_roles(
         catalog,
         String::new(),
         ModelHubTab::Roles,
+        declared_roles,
     )
     .await;
 }
@@ -4380,6 +4325,7 @@ pub(super) async fn open_model_hub(
     catalog: &ModelCatalog,
     query: String,
     tab: ModelHubTab,
+    declared_roles: &[String],
 ) {
     let active = match active_for_runtime(manager, runtime).await {
         Ok(active) => active,
@@ -4395,7 +4341,7 @@ pub(super) async fn open_model_hub(
     if selector.model_count() == 0 && tab == ModelHubTab::Models {
         app.set_flash("No authenticated model providers · use :login");
     }
-    let roles = match manager.model_roles().await {
+    let roles = match manager.model_roles(declared_roles).await {
         Ok(roles) => roles,
         Err(error) => {
             app.set_flash(format!("Could not load model roles: {error:#}"));
@@ -4407,8 +4353,12 @@ pub(super) async fn open_model_hub(
     app.overlay = Some(Overlay::Models);
 }
 
-pub(super) async fn reload_model_roles(app: &mut App, manager: &ConfigManager) {
-    match manager.model_roles().await {
+pub(super) async fn reload_model_roles(
+    app: &mut App,
+    manager: &ConfigManager,
+    declared_roles: &[String],
+) {
+    match manager.model_roles(declared_roles).await {
         Ok(roles) => {
             if let Some(hub) = app.model_hub.as_mut() {
                 hub.roles = roles;
@@ -4420,74 +4370,16 @@ pub(super) async fn reload_model_roles(app: &mut App, manager: &ConfigManager) {
     }
 }
 
-pub(super) async fn open_plugin_model_roles(
-    app: &mut App,
-    services: &LoopServices,
-    plugin: String,
-    key: String,
-    default_role: String,
-) {
-    let selected = services
-        .manager
-        .plugin_setting(&plugin, &key)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| default_role.clone());
-    match services.manager.model_roles().await {
-        Ok(roles) => {
-            app.selector = Some(model_role_selector(
-                SelectorKind::PluginModelRole { plugin, key },
-                roles,
-                Some(&selected),
-            ));
-            app.overlay = Some(Overlay::Selector);
-        }
-        Err(error) => app.set_flash(format!("Could not load model roles: {error:#}")),
-    }
-}
-
-pub(super) fn model_role_selector(
-    kind: SelectorKind,
-    roles: Vec<crate::config::ModelRoleInfo>,
-    selected: Option<&str>,
-) -> SelectorState {
-    let selected_position =
-        selected.and_then(|selected| roles.iter().position(|role| role.name.as_str() == selected));
-    let items = roles
-        .into_iter()
-        .map(|info| {
-            let description = info.error.unwrap_or_else(|| {
-                info.role.map_or_else(
-                    || "no model assigned".to_string(),
-                    |role| format!("{}/{} · {}", role.provider, role.model, role.thinking,),
-                )
-            });
-            SelectorItem {
-                id: info.name.clone(),
-                title: info.name,
-                description,
-                search_text: None,
-            }
-        })
-        .collect();
-    let mut selector = SelectorState::new(kind, "SELECT MODEL ROLE", items);
-    if let Some(position) = selected_position {
-        selector.selected = position;
-    }
-    selector
-}
-
 pub(super) async fn open_models_for_role(
     app: &mut App,
     runtime: &AgentRuntime,
     manager: &ConfigManager,
     catalog: &ModelCatalog,
+    declared_roles: &[String],
     role: String,
 ) {
     if app.model_hub.is_none() || app.model_selector.is_none() {
-        open_model_roles(app, runtime, manager, catalog).await;
+        open_model_roles(app, runtime, manager, catalog, declared_roles).await;
     }
     let active = match active_for_runtime(manager, runtime).await {
         Ok(active) => active,
@@ -5027,7 +4919,7 @@ pub(super) async fn finish_background(
                     app.model_selector = Some(selector);
                 }
                 if let Some(hub) = app.model_hub.as_mut() {
-                    hub.roles = services.manager.model_roles().await?;
+                    hub.roles = services.manager.model_roles(&services.model_roles).await?;
                     hub.selected_role = hub.selected_role.min(hub.roles.len().saturating_sub(1));
                 }
                 Ok::<_, anyhow::Error>(report)
