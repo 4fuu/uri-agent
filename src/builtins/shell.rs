@@ -543,9 +543,11 @@ fn encode_pwsh_script(script: &str) -> String {
     BASE64.encode(pwsh_source(script))
 }
 
-/// Writes an interactive command's script to a private temporary file. The
-/// file is removed when the returned handle drops, after the process settles.
-fn write_script_file(source: &str, extension: &str) -> Result<tempfile::NamedTempFile> {
+/// Writes an interactive command's script to a private temporary file and
+/// returns its path with delete-on-drop semantics. The file handle is closed
+/// before returning: a held-open write handle blocks the Windows shell from
+/// reading the script.
+fn write_script_file(source: &str, extension: &str) -> Result<tempfile::TempPath> {
     use std::io::Write as _;
     let mut file = tempfile::Builder::new()
         .prefix("uri-agent-script-")
@@ -555,7 +557,7 @@ fn write_script_file(source: &str, extension: &str) -> Result<tempfile::NamedTem
     file.write_all(source.as_bytes())
         .and_then(|()| file.flush())
         .context("failed to write the script file for an interactive command")?;
-    Ok(file)
+    Ok(file.into_temp_path())
 }
 
 #[cfg(test)]
@@ -619,7 +621,7 @@ async fn execute_with_cancellation(
         ("bash", true) => {
             command.args(["--noprofile", "--norc"]);
             let file = write_script_file(&bash_script_input(script), "sh")?;
-            command.arg(file.path());
+            command.arg(file.as_os_str());
             (None, Some(file))
         }
         ("bash", false) => {
@@ -636,7 +638,7 @@ async fn execute_with_cancellation(
             let file = write_script_file(&pwsh_source(script), "ps1")?;
             let bootstrap = format!(
                 "& ([ScriptBlock]::Create([System.IO.File]::ReadAllText('{}')))",
-                file.path().to_string_lossy().replace('\'', "''")
+                file.to_string_lossy().replace('\'', "''")
             );
             command.arg("-Command").arg(&bootstrap);
             (None, Some(file))
