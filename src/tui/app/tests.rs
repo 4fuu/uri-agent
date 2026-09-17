@@ -2372,15 +2372,15 @@ fn floats_hug_the_edges_without_side_borders_below_their_minimum_width() {
     let rendered = render_to_string(&mut app, 60, 24);
     let rows = rendered.lines().collect::<Vec<_>>();
     // Without side borders the title hugs the left edge and the border runs
-    // to the right edge; the placeholder starts right after tui-textarea's
-    // one-column caret slot instead of a padded column.
+    // to the right edge; the solid caret slot precedes the placeholder
+    // instead of a padded column.
     assert!(
         rows[16].starts_with(" MESSAGE "),
         "unexpected row: {:?}",
         rows[16]
     );
     assert!(rows[16].ends_with('─'));
-    assert!(rows[17].starts_with(" Ask URI Agent"));
+    assert!(rows[17].starts_with("█Ask URI Agent"));
     assert!(rows[23].starts_with('─'));
 
     app.overlay = Some(Overlay::Command);
@@ -2467,6 +2467,36 @@ fn composer_mouse_click_moves_the_caret_and_drag_selects_editable_text() {
         KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
     );
     assert_eq!(app.draft_text(), "X beta");
+}
+
+#[test]
+fn composer_blank_caret_renders_as_solid_symmetric_cell() {
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Composer);
+    render_to_string(&mut app, 80, 24);
+    let inner = app.composer_view.as_ref().unwrap().inner;
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    terminal
+        .backend_mut()
+        .assert_cursor_position((inner.x, inner.y));
+    let cell = &terminal.backend().buffer()[(inner.x, inner.y)];
+    assert_eq!(cell.symbol(), "█");
+    assert_eq!(cell.fg, ACCENT);
+    assert_eq!(cell.bg, ACCENT);
+
+    app.input.insert_str("hi");
+    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(inner.x, inner.y)].symbol(),
+        "h"
+    );
+    let cell = &terminal.backend().buffer()[(inner.x + 2, inner.y)];
+    assert_eq!(cell.symbol(), "█");
+    assert_eq!(cell.fg, ACCENT);
+    assert_eq!(cell.bg, ACCENT);
 }
 
 #[test]
