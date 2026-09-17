@@ -31,26 +31,25 @@ URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变�
 - **渐进式上下文：**仅在需要时加载协议契约、Skill 资源、内置文档和超长输出。
 - **可扩展工具：**通过内置 Rust 插件和可信 WASM 插件添加协议或有类型工具，无需修改运行时分发逻辑。
 - **内置 MCP 桥接：**使用 `:mcp` 连接 stdio 和 Streamable HTTP 服务器。每个服务器都会成为按需加载的 `<name>-mcp://` 协议；简单参数优先使用查询字符串，复杂参数可使用完整 JSON。
-- **委派式 finder 搜索：**配置 `finder` 模型角色后，模型可以把多步查找问题交给只读的 finder Agent（覆盖项目代码与公共网络）并取回最终答案，较慢的查找会转为后台任务。
 - **ACP 编辑器集成：**通过稳定的 ACP v1 stdio 接口，在兼容的编辑器中使用 URI Agent。每个会话都能选择模型，对话之后还可以在普通 TUI 中重新打开。
 - **广泛模型支持：**直接在模型选择器中使用 pi.dev 目录、模型服务商专属登录和账户模型实时发现。
-- **持久化工作：**让长命令作为受管任务继续运行，并在重启后恢复工作。交互式命令保持 stdin 打开，模型可以回应提示、向 REPL 输入内容并中断运行中的进程。仅追加的 SQLite 会话会保留草稿、固化的启动上下文、有标题的工作笔记，以及上下文滚动或摘要检查点。
-- **会话协作：**多个 URI Agent 进程之间可以相互通信。
+- **持久化工作：**让长命令作为受管任务继续运行，并在重启后恢复工作。仅追加的 SQLite 会话会保留草稿、固化的启动上下文、有标题的工作笔记，以及上下文滚动或摘要检查点。
+- **会话协作：**按名字从一个运行中的会话向本机另一个 URI Agent 进程发送 Prompt 或 Steer 输入。
 - **本地语义检索：**利用随安装包提供的 zvec 和 Model2Vec 资产，按需搜索项目文件和已保存会话。
 - **单一终端工作流：**在同一个对话界面中使用 Queue 与 Steer、网络访问、键盘和鼠标控制、图片输入，以及 `@` 文件和 `@@` 会话引用。
 
 ## 模型和服务商覆盖
 
-URI Agent 的目标是广泛兼容 pi.dev 模型目录，而不是只适配少数固定模型。截至 2026-09-04，目录覆盖如下：
+URI Agent 的目标是广泛兼容 pi.dev 模型目录，而不是只适配少数固定模型。截至 2026-09-17，目录覆盖如下：
 
 | 目录指标 | 已支持 |
 | --- | ---: |
 | API 系列 | 9 个中的 5 个 |
-| 模型条目 | 1,337 个中的 1,132 个（84.7%） |
+| 模型条目 | 1,405 个中的 1,161 个（82.6%） |
 | 服务商 ID | 39 个中的 35 个 |
-| 支持实时发现的服务商 ID | 35 个可用服务商中的 28 个 |
+| 支持实时发现的服务商 ID | 35 个可用服务商中的 29 个 |
 
-当前已支持 OpenAI Responses、OpenAI Codex Responses、OpenAI Chat Completions、Anthropic Messages、Google Generative AI 和 `pi-messages` 六类 API。Radius 和 Muse Code 支持在上述快照之后加入。服务商的实时结果按凭据隔离缓存，并补充共享目录，因此账户中新开放的模型可以在 pi.dev 收录前出现。
+当前已支持 OpenAI Responses、OpenAI Codex Responses、OpenAI Chat Completions、Anthropic Messages、Google Generative AI 和 `pi-messages` 六类 API。服务商的实时结果按凭据隔离缓存，并补充共享目录，因此账户中新开放的模型可以在 pi.dev 收录前出现。
 
 通用目录兼容无法覆盖的能力由专用集成提供：
 
@@ -59,7 +58,6 @@ URI Agent 的目标是广泛兼容 pi.dev 模型目录，而不是只适配少�
 - WorkBuddy 中国站浏览器登录和账户模型发现；
 - Radius 认证模型发现和原生 `pi-messages` 传输；
 - Muse Code 订阅登录和账户模型发现；
-- 明确标记为实验性的 Antigravity 私有协议；
 - Abliteration.ai 按凭据隔离的实时发现和静态后备模型。
 
 URI Agent 还支持 Anthropic、GitHub Copilot、Kimi Coding、xAI 和 OpenRouter 的服务商专属登录流程。
@@ -127,10 +125,6 @@ uri-agent --acpv1
 
 客户端需要为每个会话提供绝对项目目录，同一个 ACP 进程可以为多个项目承载相互独立的会话。兼容的 ACP 客户端可在发送第一条请求前选择已认证的模型和思考级别，且不会修改 URI Agent 的默认设置。第一条请求会使用已分配的会话 ID 完成持久化；客户端释放会话后，可在 TUI 中重新打开。支持的内容、MCP 服务器、生命周期操作和所有权约束见英文文档 [ACP v1](docs/acp.md)。
 
-### 在 Herdr 中运行
-
-[Herdr](https://herdr.dev/) 是面向 coding agent 的终端复用器。TUI 在 Herdr 面板中启动时，会自动向 Herdr 上报 `working`/`idle` 状态和当前会话 ID，面板因此会出现在 Herdr 的 agent 列表中并显示可靠状态。无需任何配置，在 Herdr 之外该集成保持关闭。详见英文文档 [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting)。
-
 ## 文档
 
 | 目标 | 文档 |
@@ -141,6 +135,7 @@ uri-agent --acpv1
 | 了解工具、协议、任务和完整输出 | [Protocols, tasks, and output](docs/protocols.md) |
 | 使用项目指令或 Skills | [Startup context and Skills](docs/context.md) |
 | 恢复会话，或了解协作、笔记、上下文滚动与持久化 | [Sessions and context](docs/sessions.md) |
+| 在 Herdr 终端复用器中上报面板状态 | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
 | 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
 [`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和请求体格式以 `<protocol>://help` 为准；当前生效的界面说明以 `F1` 和 `:help` 为准。

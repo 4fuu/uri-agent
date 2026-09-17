@@ -48,21 +48,16 @@ supported providers.
 - **Built-in MCP bridge:** connect stdio and Streamable HTTP servers with
   `:mcp`. Each server becomes an on-demand `<name>-mcp://` protocol, with
   query-first arguments and a complete-JSON fallback for complex schemas.
-- **Delegated finder search:** assign the `finder` model role to let the model
-  hand multi-step questions to a read-only finder Agent across project code and
-  the public web, with slow lookups continuing as background tasks.
 - **ACP editor integration:** use URI Agent from compatible editors through
   stable ACP v1 over stdio. Each session can select its model, and its
   conversation can later reopen in the normal TUI.
 - **Broad model access:** choose from the pi.dev catalog, use provider-specific
   sign-in, and discover account models without leaving the model selector.
 - **Durable work:** let long commands continue as managed tasks and resume work
-  across restarts. Interactive commands keep their stdin open so the model can
-  answer prompts, feed REPLs, and interrupt running processes. Append-only
-  SQLite sessions preserve drafts, frozen startup context, titled working
-  notes, and rollover or summary checkpoints.
-- **Session collaboration:** multiple URI Agent processes can communicate with
-  each other.
+  across restarts. Append-only SQLite sessions preserve drafts, frozen startup
+  context, titled working notes, and rollover or summary checkpoints.
+- **Session collaboration:** send prompts or steering input from one running
+  session to another local URI Agent process by name.
 - **Local semantic retrieval:** run on-demand semantic and hybrid search across
   project files and saved conversations with bundled zvec and Model2Vec assets.
 - **One terminal workflow:** use Queue and Steer, web access, keyboard and mouse
@@ -72,20 +67,20 @@ supported providers.
 ## Model and provider coverage
 
 URI Agent targets broad compatibility with the pi.dev catalog rather than a
-fixed handful of models. As of 2026-09-04, the catalog coverage is:
+fixed handful of models. As of 2026-09-17, the catalog coverage is:
 
 | Catalog measure | Supported |
 | --- | ---: |
 | API families | 5 of 9 |
-| Model entries | 1,132 of 1,337 (84.7%) |
+| Model entries | 1,161 of 1,405 (82.6%) |
 | Provider IDs | 35 of 39 |
-| Provider IDs with live discovery | 28 of 35 runnable |
+| Provider IDs with live discovery | 29 of 35 runnable |
 
 The current supported API families are OpenAI Responses, OpenAI Codex Responses,
 OpenAI Chat Completions, Anthropic Messages, Google Generative AI, and
-`pi-messages`. Radius and Muse Code support was added after the snapshot above. Live
-provider results are cached per credential and supplement the shared catalog,
-so newly available account models can appear before pi.dev adds them.
+`pi-messages`. Live provider results are cached per credential and supplement
+the shared catalog, so newly available account models can appear before pi.dev
+adds them.
 
 Where generic catalog compatibility is not enough, URI Agent provides dedicated
 integrations for:
@@ -94,8 +89,7 @@ integrations for:
 - Cloudflare AI Gateway with credential-safe endpoint handling;
 - WorkBuddy China browser login and account model discovery;
 - Radius authenticated model discovery and native `pi-messages` transport;
-- Muse Code subscription login and account model discovery;
-- the explicitly experimental Antigravity private protocol; and
+- Muse Code subscription login and account model discovery; and
 - Abliteration.ai credential-scoped live discovery with static fallback
   models.
 
@@ -186,15 +180,6 @@ session under its assigned ID; after the client releases it, the session can
 reopen in the TUI. See [ACP v1](docs/acp.md) for supported content, MCP servers,
 lifecycle operations, and ownership constraints.
 
-### Run inside Herdr
-
-[Herdr](https://herdr.dev/) is a terminal multiplexer for coding agents. When
-the TUI starts in a Herdr pane, it automatically reports `working` or `idle`
-state and the active session ID to Herdr, so the pane appears in Herdr's agent
-list with reliable status. No configuration is required, and the integration
-stays inactive outside Herdr. See
-[Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting).
-
 ## Documentation
 
 | Goal | Guide |
@@ -205,6 +190,7 @@ stays inactive outside Herdr. See
 | Understand tools, protocols, tasks, and complete output | [Protocols, tasks, and output](docs/protocols.md) |
 | Use project instructions or Skills | [Startup context and Skills](docs/context.md) |
 | Resume sessions or understand collaboration, notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
+| Report pane state to the Herdr terminal multiplexer | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
 | Build or audit an extension | [WASM plugins](docs/plugins.md) |
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At
