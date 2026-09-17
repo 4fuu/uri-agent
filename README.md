@@ -57,8 +57,10 @@ supported providers.
 - **Broad model access:** choose from the pi.dev catalog, use provider-specific
   sign-in, and discover account models without leaving the model selector.
 - **Durable work:** let long commands continue as managed tasks and resume work
-  across restarts. Append-only SQLite sessions preserve drafts, frozen startup
-  context, titled working notes, and rollover or summary checkpoints.
+  across restarts. Interactive commands keep their stdin open so the model can
+  answer prompts, feed REPLs, and interrupt running processes. Append-only
+  SQLite sessions preserve drafts, frozen startup context, titled working
+  notes, and rollover or summary checkpoints.
 - **Session collaboration:** multiple URI Agent processes can communicate with
   each other.
 - **Local semantic retrieval:** run on-demand semantic and hybrid search across

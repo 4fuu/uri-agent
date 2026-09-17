@@ -50,8 +50,8 @@ existing capability.
 | `sessions` | `read`, `exec` | Compatibility route retained only for sessions whose frozen prompt already used it |
 | `https` | `read` | Search the web and extract HTTPS pages |
 | `finder` | `exec` | Delegate a multi-step lookup to a finder Agent and return its final answer |
-| `tasks` | `read`, `exec` | Inspect, wait for, and cancel managed work |
-| `bash` or `pwsh` | `read`, `exec` | Run shell commands |
+| `tasks` | `read`, `exec` | Inspect, wait for, feed input to, and cancel managed work |
+| `bash` or `pwsh` | `read`, `exec` | Run shell commands, optionally with runtime input |
 | `wasm_plugin` | `read`, `exec` | Inspect and reload trusted WASM plugins |
 | `<name>-skill` | `read` | Load a discovered [Skill](context.md#skills) and its resources |
 | `mcp` | `read` | Load shared MCP routing and argument help |
@@ -202,7 +202,8 @@ the interactive `:terminal` is separate and does not receive them. On Windows,
 each spawned process tree receives its own hidden console instead of the
 terminal's console, so commands can neither read nor clobber interactive
 terminal input; a program that waits for console input never receives it and
-keeps running until its timeout or background promotion ends the wait.
+keeps running until its timeout or background promotion ends the wait, unless
+the command was started with `interactive=true`.
 
 Long-running operations may continue as managed tasks without restarting. A
 foreground operation that outlives its grace period moves to the background
@@ -211,9 +212,19 @@ supports requesting immediate background execution and setting the shared
 deadline. Cancellation and timeout terminate the owned process tree and wait
 for root-process cleanup.
 
+Shell help also supports `interactive=true` for commands that consume runtime
+input such as prompts, passwords, or REPLs. An interactive command always runs
+as a managed task with its stdin kept open, and its script text is delivered
+through a short-lived private temporary file so stdin stays reserved for the
+program. Input, end-of-file, and interrupt operations for such tasks go
+through the `tasks` protocol. On Unix, interrupt sends SIGINT to the process
+group and the child restores the default SIGINT disposition so scripts can
+trap it; on Windows, interrupt terminates the process tree like cancellation.
+
 The `tasks` protocol reports `pending`, `running`, `completed`, `failed`, or
 `cancelled` state, exposes bounded live output, preserves complete terminal
-output, supports a bounded wait, and cancels active work. Acceptance into the
+output, supports a bounded wait, delivers input to interactive tasks, and
+cancels active work. Acceptance into the
 task manager is not completion. Terminal task records survive session resume;
 their processes do not, so work interrupted by process exit is restored as
 cancelled.

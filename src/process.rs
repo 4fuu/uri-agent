@@ -17,7 +17,19 @@ pub(crate) struct ProcessTree {
 
 impl ProcessTree {
     pub(crate) fn spawn(command: &mut Command) -> io::Result<(Child, Self)> {
-        configure_command(command);
+        Self::spawn_with(command, false)
+    }
+
+    /// Spawns a tree whose root can receive and trap interrupts. POSIX keeps
+    /// an inherited ignored SIGINT across exec, and a signal that starts
+    /// ignored cannot be trapped, so the child resets it to the default
+    /// disposition before exec.
+    pub(crate) fn spawn_interruptible(command: &mut Command) -> io::Result<(Child, Self)> {
+        Self::spawn_with(command, true)
+    }
+
+    fn spawn_with(command: &mut Command, interruptible: bool) -> io::Result<(Child, Self)> {
+        configure_command(command, interruptible);
         let child = command.kill_on_drop(true).spawn()?;
 
         #[cfg(unix)]
@@ -63,6 +75,27 @@ impl ProcessTree {
         windows_job::terminate(&self.job);
     }
 
+    /// Interrupts the tree without the finality of termination: on Unix this
+    /// delivers SIGINT to the process group so interactive programs can trap
+    /// and clean up, while `terminate` stays available afterwards. Windows has
+    /// no group signal, so interruption terminates the tree exactly like
+    /// [`ProcessTree::terminate`].
+    pub(crate) fn interrupt(&self) {
+        #[cfg(unix)]
+        {
+            let process_group = self.process_group.load(Ordering::Acquire);
+            if process_group == 0 {
+                return;
+            }
+            // SAFETY: a negative PID targets only the process group created for
+            // this child immediately before it was spawned.
+            let _ = unsafe { libc::kill(-process_group, libc::SIGINT) };
+        }
+
+        #[cfg(not(unix))]
+        self.terminate();
+    }
+
     pub(crate) async fn terminate_and_wait(&self, child: &mut Child) -> io::Result<ExitStatus> {
         self.terminate();
         // This is a fallback for platforms without a tree primitive and for a
@@ -79,7 +112,7 @@ impl Drop for ProcessTree {
 }
 
 #[cfg(unix)]
-fn configure_command(command: &mut Command) {
+fn configure_command(command: &mut Command, interruptible: bool) {
     use std::os::unix::process::CommandExt;
 
     command.as_std_mut().process_group(0);
@@ -89,12 +122,16 @@ fn configure_command(command: &mut Command) {
     } else {
         1024
     };
-    // SAFETY: process_group and descriptor setup run in the post-fork child.
-    // The closure calls only async-signal-safe syscalls and does not allocate.
+    // SAFETY: process_group, the optional SIGINT reset, and descriptor setup
+    // run in the post-fork child. The closure calls only async-signal-safe
+    // syscalls and does not allocate.
     unsafe {
-        command
-            .as_std_mut()
-            .pre_exec(move || mark_extra_descriptors_close_on_exec(max_descriptor));
+        command.as_std_mut().pre_exec(move || {
+            if interruptible {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+            }
+            mark_extra_descriptors_close_on_exec(max_descriptor)
+        });
     }
 }
 

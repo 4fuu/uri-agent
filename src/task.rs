@@ -6,13 +6,58 @@ use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_BACKGROUND_TASKS: usize = 16;
 const LATEST_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const TASK_INPUT_CHANNEL_CAPACITY: usize = 8;
+pub const TASK_INPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Runtime input delivered to a running task's process stdin.
+#[derive(Debug, PartialEq)]
+pub enum TaskInput {
+    Bytes(Vec<u8>),
+    Close,
+}
+
+/// The manager-side end of a task's input channel. `Closed` remembers an
+/// explicit end-of-file so later sends report that instead of claiming the
+/// task never accepted input.
+#[derive(Clone, Debug)]
+enum TaskInputControl {
+    Open(mpsc::Sender<TaskInput>),
+    Closed,
+}
+
+/// Runtime controls an owning protocol may attach to a task: an input
+/// channel for processes that read stdin, and an interrupt signal distinct
+/// from cancellation.
+#[derive(Clone, Debug, Default)]
+pub struct TaskControls {
+    input: Option<TaskInputControl>,
+    interrupt: Option<CancellationToken>,
+}
+
+impl TaskControls {
+    /// Builds the controls for an interactive task whose process stdin stays
+    /// open. The returned receiver forwards accepted input to that stdin, and
+    /// cancelling the returned token must interrupt the process.
+    pub fn interactive() -> (Self, mpsc::Receiver<TaskInput>, CancellationToken) {
+        let (sender, receiver) = mpsc::channel(TASK_INPUT_CHANNEL_CAPACITY);
+        let interrupt = CancellationToken::new();
+        (
+            Self {
+                input: Some(TaskInputControl::Open(sender)),
+                interrupt: Some(interrupt.clone()),
+            },
+            receiver,
+            interrupt,
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,10 +97,17 @@ pub struct TaskRecord {
     pub content: Vec<u8>,
     pub latest_output: Vec<u8>,
     pub cancellation: CancellationToken,
+    controls: TaskControls,
     terminal_notification: TerminalNotification,
 }
 
 impl TaskRecord {
+    /// Whether the owning protocol registered an interrupt signal, making the
+    /// task a candidate for `interrupt` operations.
+    pub fn interruptible(&self) -> bool {
+        self.controls.interrupt.is_some()
+    }
+
     pub fn terminal_result(self, operation: &str) -> anyhow::Result<Vec<u8>> {
         match self.status {
             TaskStatus::Completed => Ok(self.content),
@@ -202,6 +254,7 @@ impl TaskManager {
                     content: report.content,
                     latest_output,
                     cancellation: CancellationToken::new(),
+                    controls: TaskControls::default(),
                     terminal_notification: TerminalNotification::Delivered,
                 },
             );
@@ -259,6 +312,7 @@ impl TaskManager {
             content: Vec::new(),
             latest_output: Vec::new(),
             cancellation: CancellationToken::new(),
+            controls: TaskControls::default(),
             terminal_notification: if background {
                 TerminalNotification::Pending
             } else {
@@ -439,6 +493,9 @@ impl TaskManager {
             }
             if status.terminal() {
                 record.finished_at = Some(Utc::now());
+                // Terminal tasks never accept more input or interrupts, and
+                // dropping the channel ends a writer still waiting for either.
+                record.controls = TaskControls::default();
             }
             TaskNotice {
                 id: record.id.clone(),
@@ -571,6 +628,82 @@ impl TaskManager {
         }
         record.cancellation.cancel();
         true
+    }
+
+    /// Attaches runtime controls to an allocated task. Interactive shell
+    /// executions call this before their worker starts so input and interrupt
+    /// calls cannot race process startup.
+    pub async fn set_controls(&self, id: &str, controls: TaskControls) {
+        let mut records = self.inner.write().await;
+        if let Some(record) = records.get_mut(id) {
+            record.controls = controls;
+        }
+    }
+
+    /// Delivers runtime input to a running task's process stdin. `Close`
+    /// shuts the channel after the input reaches the task.
+    pub async fn send_input(&self, id: &str, input: TaskInput) -> anyhow::Result<()> {
+        if let TaskInput::Bytes(bytes) = &input
+            && bytes.len() > TASK_INPUT_MAX_BYTES
+        {
+            anyhow::bail!("task input exceeds {TASK_INPUT_MAX_BYTES} bytes; send smaller chunks");
+        }
+        let closes_input = matches!(input, TaskInput::Close);
+        {
+            let records = self.inner.read().await;
+            let Some(record) = records.get(id) else {
+                anyhow::bail!("task not found: {id}");
+            };
+            if record.status.terminal() {
+                anyhow::bail!("task {id} is already {}", record.status.as_str());
+            }
+            match &record.controls.input {
+                Some(TaskInputControl::Open(sender)) => match sender.try_send(input) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!(
+                        "task {id} input buffer is full; wait for the process to consume pending input"
+                    ),
+                    Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!(
+                        "task {id} is no longer reading input; its process may have exited; read(\"tasks://{id}\", \"\") for its current state"
+                    ),
+                },
+                Some(TaskInputControl::Closed) => anyhow::bail!(
+                    "task {id} input is already closed; wait for completion or use exec(\"tasks://{id}/cancel\", \"\")"
+                ),
+                None => anyhow::bail!(
+                    "task {id} does not accept input; rerun the command with interactive=true"
+                ),
+            }
+        }
+        if closes_input {
+            self.close_input(id).await;
+        }
+        Ok(())
+    }
+
+    /// Marks a task's input closed without touching a still-running process;
+    /// the writer that owns the process stdin observes the queued close.
+    async fn close_input(&self, id: &str) {
+        let mut records = self.inner.write().await;
+        if let Some(record) = records.get_mut(id) {
+            record.controls.input = Some(TaskInputControl::Closed);
+        }
+    }
+
+    /// Signals a running interactive task to interrupt its process. Returns
+    /// false when the task is unknown, terminal, or has no interrupt signal.
+    pub async fn interrupt(&self, id: &str) -> bool {
+        let records = self.inner.read().await;
+        let Some(record) = records.get(id) else {
+            return false;
+        };
+        if record.status.terminal() {
+            return false;
+        }
+        record.controls.interrupt.as_ref().is_some_and(|interrupt| {
+            interrupt.cancel();
+            true
+        })
     }
 
     pub async fn shutdown(&self) {
@@ -911,6 +1044,77 @@ mod tests {
         assert_eq!(record.status, TaskStatus::Completed);
         assert!(tasks.list().await.is_empty());
         assert!(tasks.pending_terminal_notifications().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_controls_deliver_input_until_the_task_settles() {
+        let tasks = TaskManager::new();
+        let (controls, mut receiver, interrupt) = TaskControls::interactive();
+        let record = tasks.allocate("bash", "interactive").await;
+        let id = record.id.clone();
+        tasks.set_controls(&id, controls).await;
+
+        assert!(tasks.get(&id).await.unwrap().interruptible());
+        tasks
+            .send_input(&id, TaskInput::Bytes(b"yes\n".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(TaskInput::Bytes(b"yes\n".to_vec()))
+        );
+        assert!(!interrupt.is_cancelled());
+
+        tasks.send_input(&id, TaskInput::Close).await.unwrap();
+        assert_eq!(receiver.recv().await, Some(TaskInput::Close));
+        let closed = tasks
+            .send_input(&id, TaskInput::Bytes(b"more\n".to_vec()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(closed.contains("input is already closed"), "{closed}");
+        assert!(
+            closed.contains(r#"exec("tasks://001/cancel", "")"#),
+            "{closed}"
+        );
+
+        tasks.spawn(record, async { Ok(b"done".to_vec()) }).await;
+        tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
+
+        let settled = tasks
+            .send_input(&id, TaskInput::Bytes(b"late\n".to_vec()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(settled.contains("already completed"), "{settled}");
+        assert!(!tasks.get(&id).await.unwrap().interruptible());
+        assert_eq!(receiver.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn input_without_registered_controls_is_rejected_with_guidance() {
+        let tasks = TaskManager::new();
+        let record = tasks.allocate("bash", "plain").await;
+        let id = record.id.clone();
+
+        let error = tasks
+            .send_input(&id, TaskInput::Bytes(b"x".to_vec()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not accept input")
+                && error.contains("rerun the command with interactive=true"),
+            "{error}"
+        );
+        assert!(!tasks.interrupt(&id).await);
+
+        let oversized = tasks
+            .send_input(&id, TaskInput::Bytes(vec![0; TASK_INPUT_MAX_BYTES + 1]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(oversized.contains("send smaller chunks"), "{oversized}");
     }
 
     #[tokio::test]

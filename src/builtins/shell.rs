@@ -2,7 +2,7 @@ use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, Plu
 use crate::process::{PWSH_STDIN_BOOTSTRAP, ProcessTree};
 use crate::prompts;
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
-use crate::task::{AutoTask, TaskManager};
+use crate::task::{AutoTask, TaskControls, TaskInput, TaskManager};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -12,6 +12,8 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -57,11 +59,28 @@ and `timeout=0` disables the timeout:
 exec("bash://run?timeout=120", "cargo test")
 ```
 
+Commands that need runtime input (confirmation prompts, passwords, REPLs)
+must run with `interactive=true`. Interactive commands are always managed
+background tasks and keep their stdin open:
+
+```text
+exec("bash://run?interactive=true", "mysql -u root -p")
+```
+
+Read current output with `read("tasks://<id>", "")`, then send input with
+`exec("tasks://<id>/send", "yes\n")`; the body is written exactly, so end
+each input line with a newline. Close stdin with
+`exec("tasks://<id>/eof", "")` and interrupt with
+`exec("tasks://<id>/interrupt", "")`. The shared timeout keeps running while
+the command waits for input; use `timeout=0` for an open-ended interactive
+command.
+
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
 the task times out or is cancelled. Background task status, output, and
 cancellation use the unified `tasks://` protocol. Completion is delivered
-automatically, so you MUST NOT poll.
+automatically, so you MUST NOT poll for completion; read a task only when you
+need its current output.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -106,11 +125,28 @@ Foreground and background commands share one execution timeout. `timeout` is
 an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
 and `timeout=0` disables the timeout.
 
+Commands that need runtime input (confirmation prompts, passwords, REPLs)
+must run with `interactive=true`. Interactive commands are always managed
+background tasks and keep their stdin open:
+
+```text
+exec("pwsh://run?interactive=true", "$token = Read-Host 'Token'")
+```
+
+Read current output with `read("tasks://<id>", "")`, then send input with
+`exec("tasks://<id>/send", "yes\n")`; the body is written exactly, so end
+each input line with a newline. Close stdin with
+`exec("tasks://<id>/eof", "")` and interrupt with
+`exec("tasks://<id>/interrupt", "")`. The shared timeout keeps running while
+the command waits for input; use `timeout=0` for an open-ended interactive
+command.
+
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
 the task times out or is cancelled. Background task status, output, and
 cancellation use the unified `tasks://` protocol. Completion is delivered
-automatically, so you MUST NOT poll.
+automatically, so you MUST NOT poll for completion; read a task only when you
+need its current output.
 
 PowerShell source and plain-text output use UTF-8. Command success follows the
 final PowerShell or native command, and native exit codes are preserved.
@@ -128,12 +164,33 @@ exit code or timeout and any output observed before termination.
 struct ShellOptions {
     background: bool,
     timeout: Option<Duration>,
+    interactive: bool,
 }
 
 struct ExecutionControl<'a> {
     timeout: Option<Duration>,
     progress: Option<(&'a TaskManager, &'a str)>,
     cancellation: CancellationToken,
+    input: Option<mpsc::Receiver<TaskInput>>,
+    interrupt: Option<CancellationToken>,
+}
+
+/// Ends the interactive stdin writer on every exit path of an execution,
+/// including error returns, so no writer outlives its process.
+struct AbortWriter(Option<JoinHandle<()>>);
+
+impl AbortWriter {
+    fn none() -> Self {
+        Self(None)
+    }
+}
+
+impl Drop for AbortWriter {
+    fn drop(&mut self) {
+        if let Some(writer) = self.0.take() {
+            writer.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -327,6 +384,12 @@ impl ShellProtocol {
             .environment
             .clone()
             .ok_or_else(|| anyhow!("shell environment is not attached"))?;
+        let (controls, input, interrupt) = if options.interactive {
+            let (controls, input, interrupt) = TaskControls::interactive();
+            (Some(controls), Some(input), Some(interrupt))
+        } else {
+            (None, None, None)
+        };
         let record = if options.background {
             context
                 .tasks
@@ -340,6 +403,11 @@ impl ShellProtocol {
         };
         let id = record.id.clone();
         let tasks = context.tasks.clone();
+        // Controls attach before the worker starts so input and interrupt
+        // calls cannot race process startup.
+        if let Some(controls) = controls {
+            tasks.set_controls(&id, controls).await;
+        }
         let progress_tasks = tasks.clone();
         let progress_id = id.clone();
         let work = move |cancellation| async move {
@@ -354,13 +422,19 @@ impl ShellProtocol {
                     timeout: options.timeout,
                     progress: Some((&progress_tasks, &progress_id)),
                     cancellation,
+                    input,
+                    interrupt,
                 },
             )
             .await
         };
         if options.background {
             tasks.spawn_with_cancellation(record, work).await;
-            return Ok(prompts::task_accepted(&id).into_bytes());
+            return Ok(if options.interactive {
+                prompts::interactive_task_accepted(&id).into_bytes()
+            } else {
+                prompts::task_accepted(&id).into_bytes()
+            });
         }
         match tasks
             .run_with_auto_background(record, auto_background_after, work)
@@ -381,8 +455,10 @@ fn parse_target(target: &str) -> Result<ShellOptions> {
     }
     let mut background = false;
     let mut timeout = DEFAULT_TIMEOUT;
+    let mut interactive = false;
     let mut saw_background = false;
     let mut saw_timeout = false;
+    let mut saw_interactive = false;
     if let Some(query) = query {
         if query.is_empty() {
             bail!("shell query cannot be empty");
@@ -406,14 +482,28 @@ fn parse_target(target: &str) -> Result<ShellOptions> {
                     })?);
                     saw_timeout = true;
                 }
-                "background" | "timeout" => bail!("duplicate shell option: {name}"),
+                "interactive" if !saw_interactive => {
+                    interactive = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => bail!("shell interactive must be true or false"),
+                    };
+                    saw_interactive = true;
+                }
+                "background" | "timeout" | "interactive" => bail!("duplicate shell option: {name}"),
                 _ => bail!("unknown shell option: {name}"),
             }
         }
     }
+    if interactive && saw_background && !background {
+        bail!(
+            "interactive input requires background execution; omit background or use background=true"
+        );
+    }
     Ok(ShellOptions {
-        background,
+        background: background || interactive,
         timeout: (!timeout.is_zero()).then_some(timeout),
+        interactive,
     })
 }
 
@@ -443,11 +533,29 @@ fn bash_script_input(script: &str) -> String {
     format!("{BASH_PREFIX}{script}")
 }
 
-fn encode_pwsh_script(script: &str) -> String {
-    let source = format!(
+fn pwsh_source(script: &str) -> String {
+    format!(
         "{PWSH_UTF8_PREFIX}$global:LASTEXITCODE = $null; $global:__uri_agent_exit_code = 0; . {{\n{script}{PWSH_EXIT_EPILOGUE}\n}} | Out-Default\nexit $global:__uri_agent_exit_code"
-    );
-    BASE64.encode(source)
+    )
+}
+
+fn encode_pwsh_script(script: &str) -> String {
+    BASE64.encode(pwsh_source(script))
+}
+
+/// Writes an interactive command's script to a private temporary file. The
+/// file is removed when the returned handle drops, after the process settles.
+fn write_script_file(source: &str, extension: &str) -> Result<tempfile::NamedTempFile> {
+    use std::io::Write as _;
+    let mut file = tempfile::Builder::new()
+        .prefix("uri-agent-script-")
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .context("failed to create the script file for an interactive command")?;
+    file.write_all(source.as_bytes())
+        .and_then(|()| file.flush())
+        .context("failed to write the script file for an interactive command")?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -470,6 +578,8 @@ async fn execute(
             timeout,
             progress,
             cancellation: CancellationToken::new(),
+            input: None,
+            interrupt: None,
         },
     )
     .await
@@ -487,7 +597,10 @@ async fn execute_with_cancellation(
         timeout,
         progress,
         cancellation,
+        input,
+        interrupt,
     } = control;
+    let interactive = input.is_some();
     let deadline = timeout
         .map(|timeout| {
             Instant::now()
@@ -496,18 +609,39 @@ async fn execute_with_cancellation(
         })
         .transpose()?;
     let mut command = Command::new(executable);
-    let input = if protocol == "bash" {
-        command.args(["--noprofile", "--norc"]);
-        bash_script_input(script)
-    } else {
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            PWSH_STDIN_BOOTSTRAP,
-        ]);
-        encode_pwsh_script(script)
+    // An interactive command runs its script from a private temporary file
+    // because stdin must stay reserved for the running program: a
+    // stdin-delivered bash script would race program input for one pipe, and
+    // the PowerShell bootstrap consumes stdin to EOF before running anything.
+    // `_script_file` must outlive the spawned process; dropping it removes the
+    // file.
+    let (script_input, _script_file) = match (protocol, interactive) {
+        ("bash", true) => {
+            command.args(["--noprofile", "--norc"]);
+            let file = write_script_file(&bash_script_input(script), "sh")?;
+            command.arg(file.path());
+            (None, Some(file))
+        }
+        ("bash", false) => {
+            command.args(["--noprofile", "--norc"]);
+            (Some(bash_script_input(script)), None)
+        }
+        (_, true) => {
+            command.args(["-NoLogo", "-NoProfile"]);
+            let file = write_script_file(&pwsh_source(script), "ps1")?;
+            command.arg("-File").arg(file.path());
+            (None, Some(file))
+        }
+        _ => {
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                PWSH_STDIN_BOOTSTRAP,
+            ]);
+            (Some(encode_pwsh_script(script)), None)
+        }
     };
     command
         .envs(environment)
@@ -515,46 +649,84 @@ async fn execute_with_cancellation(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (mut child, process_tree) = ProcessTree::spawn(&mut command)?;
+    let (mut child, process_tree) = if interactive {
+        ProcessTree::spawn_interruptible(&mut command)
+    } else {
+        ProcessTree::spawn(&mut command)
+    }?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("failed to open shell stdin"))?;
-    enum InputWrite {
-        Complete(std::io::Result<()>),
-        TimedOut,
-        Cancelled,
-    }
-    let write_result = {
-        let write_deadline = time::sleep_until(
-            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
-        );
-        let write = stdin.write_all(input.as_bytes());
-        tokio::pin!(write_deadline);
-        tokio::pin!(write);
-        tokio::select! {
-            biased;
-            _ = &mut write_deadline, if timeout.is_some() => InputWrite::TimedOut,
-            _ = cancellation.cancelled() => InputWrite::Cancelled,
-            result = &mut write => InputWrite::Complete(result),
+    // Interactive commands hand stdin to a dedicated writer so accepted input
+    // reaches the running program while the read loop below observes output.
+    // `_writer_guard` aborts the writer on every exit path of this function.
+    let _writer_guard = if let Some(mut input) = input {
+        let writer_cancellation = cancellation.clone();
+        AbortWriter(Some(tokio::spawn(async move {
+            loop {
+                let message = tokio::select! {
+                    biased;
+                    _ = writer_cancellation.cancelled() => break,
+                    message = input.recv() => message,
+                };
+                match message {
+                    Some(TaskInput::Bytes(bytes)) => {
+                        let written = tokio::select! {
+                            biased;
+                            _ = writer_cancellation.cancelled() => break,
+                            result = stdin.write_all(&bytes) => result,
+                        };
+                        if written.is_err() {
+                            break;
+                        }
+                    }
+                    // An explicit close and a dropped channel both end stdin,
+                    // which the program observes as end-of-file.
+                    Some(TaskInput::Close) | None => break,
+                }
+            }
+        })))
+    } else {
+        enum InputWrite {
+            Complete(std::io::Result<()>),
+            TimedOut,
+            Cancelled,
         }
-    };
-    if !matches!(&write_result, InputWrite::Complete(Ok(()))) {
+        let script = script_input.expect("non-interactive commands carry their script on stdin");
+        let write_result = {
+            let write_deadline = time::sleep_until(
+                deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
+            );
+            let write = stdin.write_all(script.as_bytes());
+            tokio::pin!(write_deadline);
+            tokio::pin!(write);
+            tokio::select! {
+                biased;
+                _ = &mut write_deadline, if timeout.is_some() => InputWrite::TimedOut,
+                _ = cancellation.cancelled() => InputWrite::Cancelled,
+                result = &mut write => InputWrite::Complete(result),
+            }
+        };
+        if !matches!(&write_result, InputWrite::Complete(Ok(()))) {
+            drop(stdin);
+            process_tree.terminate_and_wait(&mut child).await?;
+            match write_result {
+                InputWrite::TimedOut => bail!(
+                    "Command timed out after {}s.",
+                    timeout
+                        .expect("a write timeout requires a configured timeout")
+                        .as_secs()
+                ),
+                InputWrite::Cancelled => bail!("shell command was cancelled"),
+                InputWrite::Complete(Err(error)) => return Err(error.into()),
+                InputWrite::Complete(Ok(())) => unreachable!("successful writes returned above"),
+            }
+        }
         drop(stdin);
-        process_tree.terminate_and_wait(&mut child).await?;
-        match write_result {
-            InputWrite::TimedOut => bail!(
-                "Command timed out after {}s.",
-                timeout
-                    .expect("a write timeout requires a configured timeout")
-                    .as_secs()
-            ),
-            InputWrite::Cancelled => bail!("shell command was cancelled"),
-            InputWrite::Complete(Err(error)) => return Err(error.into()),
-            InputWrite::Complete(Ok(())) => unreachable!("successful writes returned above"),
-        }
-    }
-    drop(stdin);
+        AbortWriter::none()
+    };
 
     let mut stdout = Some(
         child
@@ -575,6 +747,7 @@ async fn execute_with_cancellation(
     let mut status = None;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut interrupted = false;
     let exit_output_drain = time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
     let deadline = time::sleep_until(
         deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)),
@@ -597,6 +770,16 @@ async fn execute_with_cancellation(
             _ = cancellation.cancelled() => {
                 cancelled = true;
                 break;
+            }
+            _ = async {
+                interrupt
+                    .as_ref()
+                    .expect("guarded by the branch condition")
+                    .cancelled()
+                    .await
+            }, if interrupt.is_some() && !interrupted => {
+                interrupted = true;
+                process_tree.interrupt();
             }
             _ = &mut exit_output_drain, if status.is_some() => break,
             result = child.wait(), if status.is_none() => {
@@ -797,18 +980,25 @@ mod tests {
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
+        assert!(PWSH_HELP.contains("`interactive=true`"));
+        assert!(PWSH_HELP.contains("tasks://<id>/send"));
+        assert!(PWSH_HELP.contains("tasks://<id>/eof"));
         assert!(PWSH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
-        assert!(PWSH_HELP.contains("MUST NOT poll"));
+        assert!(PWSH_HELP.contains("MUST NOT poll for completion"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
         assert!(BASH_HELP.contains("`bash://help` and MUST use an empty string body"));
         assert!(BASH_HELP.contains("command body MUST contain at least\none non-whitespace"));
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
+        assert!(BASH_HELP.contains("`interactive=true`"));
+        assert!(BASH_HELP.contains("tasks://<id>/send"));
+        assert!(BASH_HELP.contains("tasks://<id>/eof"));
+        assert!(BASH_HELP.contains("tasks://<id>/interrupt"));
         assert!(BASH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(BASH_HELP.contains("unified `tasks://` protocol"));
-        assert!(BASH_HELP.contains("MUST NOT poll"));
+        assert!(BASH_HELP.contains("MUST NOT poll for completion"));
         assert!(!BASH_HELP.contains("?wait="));
         assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }
@@ -820,6 +1010,7 @@ mod tests {
             ShellOptions {
                 background: false,
                 timeout: Some(DEFAULT_TIMEOUT),
+                interactive: false,
             }
         );
         assert_eq!(
@@ -827,6 +1018,7 @@ mod tests {
             ShellOptions {
                 background: true,
                 timeout: None,
+                interactive: false,
             }
         );
         assert_eq!(
@@ -834,6 +1026,7 @@ mod tests {
             ShellOptions {
                 background: false,
                 timeout: Some(Duration::from_secs(30)),
+                interactive: false,
             }
         );
         assert!(parse_target("run?timeout=not-a-number").is_err());
@@ -841,6 +1034,37 @@ mod tests {
         assert!(parse_target("run?timeout=1&timeout=2").is_err());
         assert!(parse_target("run?other=30").is_err());
         assert!(parse_target("?timeout=30").is_err());
+    }
+
+    #[test]
+    fn shell_interactive_option_implies_background_execution() {
+        assert_eq!(
+            parse_target("run?interactive=true").unwrap(),
+            ShellOptions {
+                background: true,
+                timeout: Some(DEFAULT_TIMEOUT),
+                interactive: true,
+            }
+        );
+        assert_eq!(
+            parse_target("run?interactive=true&background=true&timeout=0").unwrap(),
+            ShellOptions {
+                background: true,
+                timeout: None,
+                interactive: true,
+            }
+        );
+        assert_eq!(
+            parse_target("run?interactive=false").unwrap(),
+            ShellOptions {
+                background: false,
+                timeout: Some(DEFAULT_TIMEOUT),
+                interactive: false,
+            }
+        );
+        assert!(parse_target("run?interactive=true&background=false").is_err());
+        assert!(parse_target("run?interactive=1").is_err());
+        assert!(parse_target("run?interactive=true&interactive=true").is_err());
     }
 
     #[test]
@@ -1214,6 +1438,225 @@ mod tests {
                 .contains("automatic-ok")
         );
         context.tasks.cancel("003").await;
+    }
+
+    #[tokio::test]
+    async fn interactive_commands_receive_input_and_read_end_of_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let (protocol, executable, line_script, bulk_script) = if cfg!(windows) {
+            let Some(executable) = find_executable("pwsh") else {
+                return;
+            };
+            (
+                "pwsh",
+                executable,
+                "$line = [Console]::In.ReadLine(); Write-Output \"got:$line\"",
+                "$text = [Console]::In.ReadToEnd(); Write-Output \"[$text]\"",
+            )
+        } else {
+            let Some(executable) = find_executable("bash") else {
+                return;
+            };
+            (
+                "bash",
+                executable,
+                "IFS= read -r line; printf 'got:%s' \"$line\"",
+                "text=$(cat); printf '[%s]' \"$text\"",
+            )
+        };
+        let mut shell = ShellProtocol::new(protocol, executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
+        let context = ProtocolContext {
+            tasks: TaskManager::new(),
+        };
+        let interactive_uri = format!("{protocol}://run?interactive=true");
+
+        let accepted = shell
+            .exec(
+                ProtocolRequest {
+                    uri: &interactive_uri,
+                    target: "run?interactive=true",
+                    body: line_script,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(accepted.clone())
+                .unwrap()
+                .contains("Interactive task started: tasks://001")
+        );
+        TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://001/send",
+                    target: "001/send",
+                    body: "hello\n",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let record = context
+            .tasks
+            .wait("001", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Completed);
+        let output = String::from_utf8(record.content).unwrap();
+        assert!(output.contains("got:hello"), "{output}");
+
+        let interactive_eof_uri = format!("{protocol}://run?interactive=true&timeout=60");
+        shell
+            .exec(
+                ProtocolRequest {
+                    uri: &interactive_eof_uri,
+                    target: "run?interactive=true&timeout=60",
+                    body: bulk_script,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://002/send",
+                    target: "002/send",
+                    body: "abc\n",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://002/eof",
+                    target: "002/eof",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let record = context
+            .tasks
+            .wait("002", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Completed);
+        let output = String::from_utf8(record.content).unwrap();
+        assert!(output.contains("[abc"), "{output}");
+        context.tasks.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_timeouts_preserve_output_while_waiting_for_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(executable) = find_executable("bash") else {
+            return;
+        };
+        let mut shell = ShellProtocol::new("bash", executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
+        let context = ProtocolContext {
+            tasks: TaskManager::new(),
+        };
+
+        shell
+            .exec(
+                ProtocolRequest {
+                    uri: "bash://run?interactive=true&timeout=1",
+                    target: "run?interactive=true&timeout=1",
+                    body: "printf waiting; IFS= read -r line",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let record = context
+            .tasks
+            .wait("001", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Failed);
+        let output = String::from_utf8(record.content).unwrap();
+        assert!(output.contains("Command timed out after 1s."), "{output}");
+        assert!(output.contains("waiting"), "{output}");
+        context.tasks.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_interrupt_signals_a_trapping_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(executable) = find_executable("bash") else {
+            return;
+        };
+        let mut shell = ShellProtocol::new("bash", executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
+        let context = ProtocolContext {
+            tasks: TaskManager::new(),
+        };
+        let script =
+            "printf ready; trap 'printf trapped; exit 42' INT; while :; do sleep 0.1; done";
+
+        shell
+            .exec(
+                ProtocolRequest {
+                    uri: "bash://run?interactive=true&timeout=60",
+                    target: "run?interactive=true&timeout=60",
+                    body: script,
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        // Wait for the trap to be installed before interrupting.
+        let mut ready = false;
+        for _ in 0..500 {
+            if context
+                .tasks
+                .get("001")
+                .await
+                .is_some_and(|record| record.content.windows(5).any(|window| window == b"ready"))
+            {
+                ready = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready, "the interactive command never reported readiness");
+
+        TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://001/interrupt",
+                    target: "001/interrupt",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap();
+        let record = context
+            .tasks
+            .wait("001", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Failed);
+        let output = String::from_utf8(record.content).unwrap();
+        assert!(output.contains("trapped"), "{output}");
+        assert!(output.contains("Command exited with code 42."), "{output}");
+        context.tasks.shutdown().await;
     }
 
     #[tokio::test]

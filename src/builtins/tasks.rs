@@ -1,6 +1,6 @@
 use crate::plugin::{Plugin, PluginHost};
 use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
-use crate::task::{TaskManager, TaskRecord};
+use crate::task::{TaskInput, TaskManager, TaskRecord};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use std::fmt::Write as _;
@@ -12,8 +12,9 @@ const MAX_WAIT_SECONDS: u64 = 300;
 
 const HELP: &str = r#"# tasks
 
-Inspect and cancel background tasks from every protocol. Every `tasks` read or
-exec call, including `tasks://help`, MUST pass an empty string body.
+Inspect and cancel background tasks from every protocol. Every `tasks` call
+on this page MUST pass an empty string body; interactive input routes are
+documented by the shell protocols.
 
 Read a summary of all background tasks:
 
@@ -79,7 +80,8 @@ impl Protocol for TasksProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
             name: "tasks".to_string(),
-            description: "Inspect and cancel background tasks from every protocol.".to_string(),
+            description: "Inspect, feed input to, and cancel background tasks from every protocol."
+                .to_string(),
             can_read: true,
             can_exec: true,
         }
@@ -103,6 +105,18 @@ impl Protocol for TasksProtocol {
                 "task cancellation requires exec; use exec({:?}, \"\")",
                 request.uri
             ),
+            target if target.ends_with("/send") => bail!(
+                "task input requires exec; use exec({:?}, \"<input>\")",
+                request.uri
+            ),
+            target if target.ends_with("/eof") => bail!(
+                "closing task input requires exec; use exec({:?}, \"\")",
+                request.uri
+            ),
+            target if target.ends_with("/interrupt") => bail!(
+                "task interruption requires exec; use exec({:?}, \"\")",
+                request.uri
+            ),
             target => {
                 require_no_body(request.body, "read", request.uri)?;
                 let (id, wait) = parse_read_target(target)?;
@@ -116,37 +130,111 @@ impl Protocol for TasksProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let Some(id) = request
-            .target
-            .strip_suffix("/cancel")
-            .filter(|id| !id.is_empty() && !id.contains('/'))
-        else {
+        let route = parse_exec_target(request.target).map_err(|error| {
             if matches!(request.target, "help" | "summary")
                 || (!request.target.is_empty()
                     && !request.target.contains('/')
                     && !request.target.contains('?'))
             {
-                bail!(
+                anyhow!(
                     "task inspection requires read; use read({:?}, \"\")",
                     request.uri
-                );
+                )
+            } else {
+                error
             }
-            bail!(r#"task cancellation expects exec("tasks://<id>/cancel", "")"#);
-        };
-        require_no_body(request.body, "exec", request.uri)?;
-        let record = context
-            .tasks
-            .get(id)
-            .await
-            .filter(|record| record.background)
-            .ok_or_else(|| anyhow!("background task not found: {id}"))?;
-        if record.status.terminal() {
-            bail!("task {id} is already {}", record.status.as_str());
+        })?;
+        match route {
+            ExecRoute::Cancel { id } => {
+                require_no_body(request.body, "exec", request.uri)?;
+                let record = context
+                    .tasks
+                    .get(id)
+                    .await
+                    .filter(|record| record.background)
+                    .ok_or_else(|| anyhow!("background task not found: {id}"))?;
+                if record.status.terminal() {
+                    bail!("task {id} is already {}", record.status.as_str());
+                }
+                if !context.tasks.cancel(id).await {
+                    bail!("task {id} is no longer running");
+                }
+                Ok(format!("Cancellation requested for task {id}.").into_bytes())
+            }
+            ExecRoute::Send { id } => {
+                if request.body.is_empty() {
+                    bail!(
+                        "task input requires a nonempty body; to close stdin use exec(\"tasks://{id}/eof\", \"\")"
+                    );
+                }
+                context
+                    .tasks
+                    .send_input(id, TaskInput::Bytes(request.body.as_bytes().to_vec()))
+                    .await?;
+                Ok(format!("Input sent to task {id}.").into_bytes())
+            }
+            ExecRoute::Eof { id } => {
+                require_no_body(request.body, "exec", request.uri)?;
+                context.tasks.send_input(id, TaskInput::Close).await?;
+                Ok(format!(
+                    "Input closed for task {id}; its process now reads end-of-file on stdin."
+                )
+                .into_bytes())
+            }
+            ExecRoute::Interrupt { id } => {
+                require_no_body(request.body, "exec", request.uri)?;
+                let record = context
+                    .tasks
+                    .get(id)
+                    .await
+                    .filter(|record| record.background)
+                    .ok_or_else(|| anyhow!("background task not found: {id}"))?;
+                if record.status.terminal() {
+                    bail!("task {id} is already {}", record.status.as_str());
+                }
+                if !record.interruptible() {
+                    bail!(
+                        "task {id} is not an interactive shell command; use exec(\"tasks://{id}/cancel\", \"\") to terminate it"
+                    );
+                }
+                if !context.tasks.interrupt(id).await {
+                    bail!("task {id} is no longer running");
+                }
+                Ok(format!("Interrupt requested for task {id}.").into_bytes())
+            }
         }
-        if !context.tasks.cancel(id).await {
-            bail!("task {id} is no longer running");
-        }
-        Ok(format!("Cancellation requested for task {id}.").into_bytes())
+    }
+}
+
+enum ExecRoute<'a> {
+    Cancel { id: &'a str },
+    Send { id: &'a str },
+    Eof { id: &'a str },
+    Interrupt { id: &'a str },
+}
+
+fn invalid_exec() -> anyhow::Error {
+    anyhow!(
+        r#"task exec expects exec("tasks://<id>/cancel", ""), exec("tasks://<id>/send", "<input>"), exec("tasks://<id>/eof", ""), or exec("tasks://<id>/interrupt", "")"#
+    )
+}
+
+fn parse_exec_target(target: &str) -> Result<ExecRoute<'_>> {
+    let (route, query) = target
+        .split_once('?')
+        .map_or((target, None), |(route, query)| (route, Some(query)));
+    let Some((id, kind)) = route.split_once('/') else {
+        return Err(invalid_exec());
+    };
+    if id.is_empty() || id.contains('/') {
+        return Err(invalid_exec());
+    }
+    match (kind, query) {
+        ("cancel", None) => Ok(ExecRoute::Cancel { id }),
+        ("send", None) => Ok(ExecRoute::Send { id }),
+        ("eof", None) => Ok(ExecRoute::Eof { id }),
+        ("interrupt", None) => Ok(ExecRoute::Interrupt { id }),
+        _ => Err(invalid_exec()),
     }
 }
 
@@ -291,10 +379,41 @@ mod tests {
         assert!(HELP.contains("tasks://<id>?wait=30"));
         assert!(HELP.contains("tasks://<id>/cancel"));
         assert!(HELP.contains("MUST pass an empty string body"));
+        assert!(HELP.contains("documented by the shell protocols"));
         assert!(HELP.contains("clamped to the nearest bound"));
         assert!(HELP.contains("Operations normally return in their original"));
         assert!(HELP.contains("use one bounded wait; do not poll or rerun the operation"));
         assert!(HELP.contains("At most 16 background tasks"));
+    }
+
+    #[test]
+    fn task_exec_routes_parse_ids_without_extra_queries() {
+        assert!(matches!(
+            parse_exec_target("001/cancel").unwrap(),
+            ExecRoute::Cancel { id: "001" }
+        ));
+        assert!(matches!(
+            parse_exec_target("001/send").unwrap(),
+            ExecRoute::Send { id: "001" }
+        ));
+        assert!(matches!(
+            parse_exec_target("001/eof").unwrap(),
+            ExecRoute::Eof { id: "001" }
+        ));
+        assert!(matches!(
+            parse_exec_target("001/interrupt").unwrap(),
+            ExecRoute::Interrupt { id: "001" }
+        ));
+        for target in [
+            "",
+            "001",
+            "001/status",
+            "001/send?encoding=base64",
+            "/send",
+            "001/send/extra",
+        ] {
+            assert!(parse_exec_target(target).is_err(), "accepted {target}");
+        }
     }
 
     #[test]
@@ -524,5 +643,108 @@ mod tests {
                 .to_string()
                 .contains(r#"retry read("tasks://summary", "")"#)
         );
+    }
+
+    #[tokio::test]
+    async fn input_routes_reject_tasks_without_interactive_controls() {
+        let tasks = TaskManager::new();
+        let record = tasks
+            .allocate_background("bash", "plain background")
+            .await
+            .unwrap();
+        let id = record.id.clone();
+        tasks
+            .spawn(record, async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(Vec::new())
+            })
+            .await;
+        let context = ProtocolContext {
+            tasks: tasks.clone(),
+        };
+        let send = |body: &'static str| {
+            TasksProtocol.exec(
+                ProtocolRequest {
+                    uri: "tasks://001/send",
+                    target: "001/send",
+                    body,
+                },
+                context.clone(),
+            )
+        };
+
+        let error = send("").await.unwrap_err().to_string();
+        assert!(error.contains("nonempty body"), "{error}");
+
+        let error = send("y\n").await.unwrap_err().to_string();
+        assert!(error.contains("does not accept input"), "{error}");
+
+        let error = TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://001/send?encoding=base64",
+                    target: "001/send?encoding=base64",
+                    body: "eWVzCg==",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(r#"exec("tasks://<id>/send", "<input>")"#),
+            "{error}"
+        );
+
+        let error = TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://001/eof",
+                    target: "001/eof",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not accept input"), "{error}");
+
+        let error = TasksProtocol
+            .read(
+                ProtocolRequest {
+                    uri: "tasks://001/interrupt",
+                    target: "001/interrupt",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(r#"exec("tasks://001/interrupt", "")"#),
+            "{error}"
+        );
+
+        let error = TasksProtocol
+            .exec(
+                ProtocolRequest {
+                    uri: "tasks://001/interrupt",
+                    target: "001/interrupt",
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not an interactive shell command"),
+            "{error}"
+        );
+
+        tasks.cancel(&id).await;
+        tasks.shutdown().await;
     }
 }

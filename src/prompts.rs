@@ -67,6 +67,12 @@ pub fn task_accepted(id: &str) -> String {
     )
 }
 
+pub fn interactive_task_accepted(id: &str) -> String {
+    format!(
+        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Send input with exec(\"tasks://{id}/send\", \"<input>\"); the input is written exactly, so end each line with \\n. Close stdin with exec(\"tasks://{id}/eof\", \"\") and interrupt with exec(\"tasks://{id}/interrupt\", \"\"). Read current output with read(\"tasks://{id}\", \"\") and use one bounded wait when the result is needed. Do not poll or rerun the operation."
+    )
+}
+
 pub fn truncated_output(preview: &str, complete_file: &Path) -> String {
     format!(
         "{preview}\n\n[output truncated]\nFull output: file://{}",
@@ -141,5 +147,17 @@ mod tests {
             task_accepted("001"),
             "Background task started: tasks://001\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, read(\"tasks://help\", \"\") if needed, then use one bounded wait. Do not poll or rerun the operation."
         );
+    }
+
+    #[test]
+    fn interactive_task_acceptance_points_to_input_routes() {
+        let message = interactive_task_accepted("002");
+        assert!(message.starts_with("Interactive task started: tasks://002"));
+        assert!(message.contains(r#"exec("tasks://002/send", "<input>")"#));
+        assert!(message.contains("end each line with \\n"));
+        assert!(message.contains(r#"exec("tasks://002/eof", "")"#));
+        assert!(message.contains(r#"exec("tasks://002/interrupt", "")"#));
+        assert!(message.contains(r#"read("tasks://002", "")"#));
+        assert!(message.contains("Do not poll or rerun the operation"));
     }
 }
