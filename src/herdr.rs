@@ -6,9 +6,10 @@
 //! TUI starts with that environment, the reporter publishes the visible
 //! session's `working` or `idle` state and its stable session ID through
 //! Herdr's CLI, so the pane appears in Herdr's agent list with authoritative
-//! state instead of screen detection. Outside Herdr the reporter stays
-//! completely inactive, and reporting failures never affect the
-//! conversation.
+//! state instead of screen detection. A second display source also publishes
+//! the terminal title the interface applies, renaming the pane's agent entry
+//! after the task. Outside Herdr the reporter stays completely inactive, and
+//! reporting failures never affect the conversation.
 
 use crate::runtime::AgentRuntime;
 use std::path::PathBuf;
@@ -17,13 +18,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const REPORT_SOURCE: &str = "custom:uri-agent";
 const REPORT_AGENT: &str = "uri-agent";
+/// Display metadata uses its own source so it never competes with the
+/// lifecycle source for pane authority.
+const DISPLAY_SOURCE: &str = "custom:uri-agent-display";
 
 /// Seed the report sequence at the current Unix time in milliseconds so a
 /// restarted process keeps issuing sequence numbers above the ones Herdr
@@ -136,6 +141,51 @@ impl HerdrTarget {
         .map(String::from)
         .collect()
     }
+
+    /// Publish the session's terminal title as display metadata: the pane's
+    /// agent entry is renamed to the title and the same text is exposed as
+    /// the `summary` token for Herdr sidebar rows. The guard keeps both tied
+    /// to this reporter's lifecycle source, so they disappear with it.
+    fn metadata_arguments(&self, title: &str, seq: u64) -> Vec<String> {
+        vec![
+            "pane",
+            "report-metadata",
+            self.pane.as_str(),
+            "--source",
+            DISPLAY_SOURCE,
+            "--applies-to-source",
+            REPORT_SOURCE,
+            "--display-agent",
+            title,
+            "--token",
+            format!("summary={title}").as_str(),
+            "--seq",
+            seq.to_string().as_str(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    fn metadata_clear_arguments(&self, seq: u64) -> Vec<String> {
+        vec![
+            "pane",
+            "report-metadata",
+            self.pane.as_str(),
+            "--source",
+            DISPLAY_SOURCE,
+            "--applies-to-source",
+            REPORT_SOURCE,
+            "--clear-display-agent",
+            "--clear-token",
+            "summary",
+            "--seq",
+            seq.to_string().as_str(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
 }
 
 /// Reports the TUI's visible session lifecycle to a Herdr pane.
@@ -151,6 +201,8 @@ pub struct HerdrReporter {
 struct HerdrInner {
     target: HerdrTarget,
     runtime: RwLock<Option<Arc<AgentRuntime>>>,
+    title: RwLock<Option<watch::Receiver<String>>>,
+    generation: AtomicU64,
     seq: AtomicU64,
     cancellation: CancellationToken,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -168,6 +220,8 @@ impl HerdrReporter {
             inner: Arc::new(HerdrInner {
                 target,
                 runtime: RwLock::new(None),
+                title: RwLock::new(None),
+                generation: AtomicU64::new(0),
                 seq: AtomicU64::new(initial_seq()),
                 cancellation: CancellationToken::new(),
                 worker: tokio::sync::Mutex::new(None),
@@ -175,15 +229,17 @@ impl HerdrReporter {
         }
     }
 
-    /// Point the reporter at the runtime of the session now shown in the
-    /// pane. Repeated calls swap the watched runtime without restarting the
-    /// reporting worker.
-    pub async fn start(&self, runtime: Arc<AgentRuntime>) {
+    /// Point the reporter at the session now shown in the pane. Repeated
+    /// calls swap the watched runtime and terminal-title receiver without
+    /// restarting the reporting worker.
+    pub async fn start(&self, runtime: Arc<AgentRuntime>, terminal_title: watch::Receiver<String>) {
         *self
             .inner
             .runtime
             .write()
             .expect("herdr runtime lock poisoned") = Some(runtime);
+        *self.inner.title.write().expect("herdr title lock poisoned") = Some(terminal_title);
+        self.inner.generation.fetch_add(1, Ordering::Relaxed);
         let mut worker = self.inner.worker.lock().await;
         if worker.is_none() {
             let inner = self.inner.clone();
@@ -199,15 +255,7 @@ impl HerdrReporter {
             let _ = worker.await;
         }
         let seq = self.inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let child = Command::new(&self.inner.target.bin)
-            .args(self.inner.target.release_arguments(seq))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(mut child) = child {
-            let _ = tokio::time::timeout(RELEASE_TIMEOUT, child.wait()).await;
-        }
+        run_command(&self.inner.target, self.inner.target.release_arguments(seq)).await;
     }
 }
 
@@ -218,14 +266,37 @@ impl HerdrInner {
             .expect("herdr runtime lock poisoned")
             .clone()
     }
+
+    fn current_title(&self) -> Option<String> {
+        self.title
+            .read()
+            .expect("herdr title lock poisoned")
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+    }
 }
 
 async fn run(inner: Arc<HerdrInner>) {
     let mut reported: Option<(HerdrState, String)> = None;
+    let mut reported_title: Option<String> = None;
+    let mut generation = inner.generation.load(Ordering::Relaxed);
     loop {
         tokio::select! {
             () = inner.cancellation.cancelled() => break,
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+        let current = inner.generation.load(Ordering::Relaxed);
+        if current != generation {
+            // A session switch replaced the watched session. Forget its
+            // state and retract its title so the pane does not keep the
+            // previous conversation's name.
+            generation = current;
+            reported = None;
+            if reported_title.take().is_some() {
+                let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let arguments = inner.target.metadata_clear_arguments(seq);
+                run_command(&inner.target, arguments).await;
+            }
         }
         let Some(runtime) = inner.current_runtime() else {
             continue;
@@ -235,17 +306,33 @@ async fn run(inner: Arc<HerdrInner>) {
         let session_id = runtime.session().id().to_string();
         if reported
             .as_ref()
-            .is_some_and(|last| last.0 == state && last.1 == session_id)
+            .is_none_or(|last| last.0 != state || last.1 != session_id)
         {
-            continue;
+            // Herdr ignores stale sequence numbers from one source, so the
+            // strictly increasing counter keeps last-writer-wins even when
+            // two dispatched reports race inside Herdr's CLI.
+            let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let arguments = inner.target.report_arguments(state, &session_id, seq);
+            dispatch(&inner.target, arguments);
+            reported = Some((state, session_id));
         }
-        // Herdr ignores stale sequence numbers from one source, so the
-        // strictly increasing counter keeps last-writer-wins even when two
-        // dispatched reports race inside Herdr's CLI.
+        let title = inner.current_title().filter(|title| !title.is_empty());
+        if title.is_some() && title != reported_title {
+            let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let arguments = inner
+                .target
+                .metadata_arguments(title.as_deref().unwrap_or_default(), seq);
+            dispatch(&inner.target, arguments);
+            reported_title = title;
+        }
+    }
+    // Retract the title before the caller releases the lifecycle source:
+    // the metadata guard only matches while that source still holds pane
+    // authority.
+    if reported_title.is_some() {
         let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let arguments = inner.target.report_arguments(state, &session_id, seq);
-        dispatch(&inner.target, arguments);
-        reported = Some((state, session_id));
+        let arguments = inner.target.metadata_clear_arguments(seq);
+        run_command(&inner.target, arguments).await;
     }
 }
 
@@ -260,6 +347,20 @@ fn dispatch(target: &HerdrTarget, arguments: Vec<String>) {
         tokio::spawn(async move {
             let _ = child.wait().await;
         });
+    }
+}
+
+/// Run one Herdr CLI call to completion. Used where later commands depend on
+/// the effect, such as clearing display metadata before releasing the pane.
+async fn run_command(target: &HerdrTarget, arguments: Vec<String>) {
+    let mut command = Command::new(&target.bin);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = command.spawn() {
+        let _ = tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await;
     }
 }
 
@@ -382,6 +483,57 @@ mod tests {
         assert!(release.last().is_some_and(|value| value != "7"));
     }
 
+    #[test]
+    fn metadata_arguments_rename_through_a_guarded_display_source() {
+        let target = HerdrTarget {
+            bin: PathBuf::from("/bin/herdr"),
+            pane: "w1:p2".to_string(),
+        };
+        let report = target.metadata_arguments("Fix parser recovery", 9);
+        assert_eq!(
+            report,
+            [
+                "pane",
+                "report-metadata",
+                "w1:p2",
+                "--source",
+                "custom:uri-agent-display",
+                "--applies-to-source",
+                "custom:uri-agent",
+                "--display-agent",
+                "Fix parser recovery",
+                "--token",
+                "summary=Fix parser recovery",
+                "--seq",
+                "9",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+        let clear = target.metadata_clear_arguments(10);
+        assert_eq!(
+            clear,
+            [
+                "pane",
+                "report-metadata",
+                "w1:p2",
+                "--source",
+                "custom:uri-agent-display",
+                "--applies-to-source",
+                "custom:uri-agent",
+                "--clear-display-agent",
+                "--clear-token",
+                "summary",
+                "--seq",
+                "10",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
     async fn runtime_fixture(
         database: &std::path::Path,
         cwd: &std::path::Path,
@@ -430,12 +582,20 @@ mod tests {
             bin: PathBuf::from("/nonexistent/herdr"),
             pane: "w1:p1".to_string(),
         });
-        reporter.start(first).await;
+        let (first_title, first_receiver) = watch::channel(String::new());
+        let (_second_title, second_receiver) = watch::channel(String::new());
+        first_title.send("First task".to_string()).unwrap();
+        reporter.start(first, first_receiver).await;
         assert!(reporter.inner.worker.lock().await.is_some());
+        assert_eq!(
+            reporter.inner.current_title().as_deref(),
+            Some("First task")
+        );
 
-        reporter.start(second).await;
+        reporter.start(second, second_receiver).await;
         let current = reporter.inner.current_runtime().unwrap();
         assert_eq!(current.session().id(), "second-session");
+        assert_eq!(reporter.inner.current_title().as_deref(), Some(""));
 
         tokio::time::timeout(Duration::from_secs(2), reporter.shutdown())
             .await

@@ -95,8 +95,11 @@ async fn run_session(
             ),
         )
         .await?;
+    let (terminal_title, title_receiver) = tokio::sync::watch::channel(String::new());
     if let Some(reporter) = herdr {
-        reporter.start(agent.services().runtime.clone()).await;
+        reporter
+            .start(agent.services().runtime.clone(), title_receiver)
+            .await;
     }
     let startup_runtime = agent.services().runtime.clone();
     tokio::spawn(async move {
@@ -111,7 +114,16 @@ async fn run_session(
         .await?;
     let context_window = agent.services().context_window;
     let model_ready = agent.services().model_ready;
-    show_session(config, agent, active, context_window, model_ready, terminal).await
+    show_session(
+        config,
+        agent,
+        active,
+        context_window,
+        model_ready,
+        terminal_title,
+        terminal,
+    )
+    .await
 }
 
 async fn run_retained_session(
@@ -134,8 +146,9 @@ async fn run_retained_session_inner(
     herdr: Option<&HerdrReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
     let runtime = agent.services().runtime.clone();
+    let (terminal_title, title_receiver) = tokio::sync::watch::channel(String::new());
     if let Some(reporter) = herdr {
-        reporter.start(runtime.clone()).await;
+        reporter.start(runtime.clone(), title_receiver).await;
     }
     let session = runtime.session();
     let settings = session.model_settings().await;
@@ -175,7 +188,16 @@ async fn run_retained_session_inner(
     let context_window = limits.context_window;
     runtime.set_backend(backend, Some(limits)).await;
     agent.services().output.set_limit(active.output_limit);
-    show_session(config, agent, active, context_window, model_ready, terminal).await
+    show_session(
+        config,
+        agent,
+        active,
+        context_window,
+        model_ready,
+        terminal_title,
+        terminal,
+    )
+    .await
 }
 
 async fn show_session(
@@ -184,6 +206,7 @@ async fn show_session(
     active: uri_agent::config::ActiveSettings,
     context_window: usize,
     model_ready: bool,
+    terminal_title: tokio::sync::watch::Sender<String>,
     terminal: &mut TuiTerminal,
 ) -> Result<(TuiOutcome, AgentHandle)> {
     let runtime = agent.services().runtime.clone();
@@ -225,6 +248,7 @@ async fn show_session(
             },
             draft,
             model_roles,
+            terminal_title,
         })
         .await;
     match outcome {

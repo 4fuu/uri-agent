@@ -432,6 +432,10 @@ pub struct TuiServices {
     /// Model-role names declared by the linked plugins; they stay assignable
     /// through model-role settings even while unassigned.
     pub model_roles: Vec<String>,
+    /// Receives every terminal title the interface applies, so process-level
+    /// observers can follow the visible session's title without reaching into
+    /// the interface.
+    pub terminal_title: watch::Sender<String>,
 }
 
 pub struct TuiTerminal {
@@ -489,6 +493,7 @@ impl TuiTerminal {
             mut info,
             draft,
             model_roles,
+            terminal_title,
         } = services;
         info.thinking =
             effective_thinking(&catalog, &info.provider, &info.model, info.thinking).await;
@@ -532,6 +537,7 @@ impl TuiTerminal {
             catalog,
             output,
             model_roles,
+            terminal_title,
         };
         let outcome = run_loop(
             &mut self.terminal,
@@ -567,6 +573,7 @@ pub(super) struct LoopServices {
     catalog: Arc<ModelCatalog>,
     output: Arc<OutputStore>,
     model_roles: Vec<String>,
+    terminal_title: watch::Sender<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -4854,7 +4861,8 @@ pub(super) async fn finish_background(
             for effect in effects {
                 match effect {
                     TuiEffect::TerminalTitle(title) => {
-                        let _ = execute!(stdout(), SetTitle(title));
+                        let _ = execute!(stdout(), SetTitle(title.as_str()));
+                        let _ = services.terminal_title.send(title);
                     }
                 }
             }

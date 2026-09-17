@@ -102,6 +102,8 @@ the same boundary and reserves only in-memory state until its first prompt.
 
 A model turn that is running, or queued input waiting to start one, reports `working`; otherwise the pane reports `idle`. Each report carries the stable session ID, so Herdr's pane and agent APIs expose which conversation the terminal currently shows; Herdr does not yet know how to resume URI Agent sessions from that reference. Session switches move reporting to the newly visible runtime.
 
+A second display source publishes the terminal title the interface applies (the terminal-title plugin in [Terminal interface](interface.md) generates it after the first prompt): the pane's agent entry is renamed to the title and the same text is exposed as Herdr's `$summary` token for sidebar rows. The rename is tied to the lifecycle source, and session switches or process exit retract it.
+
 Reporting is best effort and never blocks the conversation: a missing or older Herdr only means missing reports. Process exit releases the reporting source so Herdr stops tracking the pane. The integration stays inactive outside Herdr panes, and ACP mode, background resident mode, and depth-2 child Agents never report.
 
 ## Frozen startup context
