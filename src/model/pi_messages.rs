@@ -169,9 +169,9 @@ impl ModelBackend for PiMessagesBackend {
                     .access;
                 self.attempt(&request, &deltas, &fresh)
                     .await
-                    .map_err(AttemptError::failure)
+                    .map_err(|error| error.failure(&self.model.provider))
             }
-            result => result.map_err(AttemptError::failure),
+            result => result.map_err(|error| error.failure(&self.model.provider)),
         }?;
         if !super::rig_backend::has_usable_assistant_content(&response.content) {
             return Err(ModelFailure::empty_response().into());
@@ -196,12 +196,13 @@ enum AttemptError {
 }
 
 impl AttemptError {
-    fn failure(self) -> anyhow::Error {
+    fn failure(self, provider: &str) -> anyhow::Error {
         match self {
             Self::Setup(error) => error,
             Self::Transport(error) => ModelFailure::from_completion_error(
                 CompletionError::RequestError(Box::new(error)),
                 super::ModelFailurePhase::Request,
+                provider,
             )
             .into(),
             Self::Request(status, headers, body) => ModelFailure::from_completion_error(
@@ -210,11 +211,13 @@ impl AttemptError {
                         .with_headers(Some(Box::new(headers))),
                 ),
                 super::ModelFailurePhase::Request,
+                provider,
             )
             .into(),
             Self::Stream(message) => ModelFailure::from_completion_error(
                 CompletionError::ResponseError(message),
                 super::ModelFailurePhase::Stream,
+                provider,
             )
             .into(),
         }

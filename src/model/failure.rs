@@ -37,7 +37,11 @@ pub(crate) struct ModelFailure {
 }
 
 impl ModelFailure {
-    pub(super) fn from_completion_error(error: CompletionError, phase: ModelFailurePhase) -> Self {
+    pub(super) fn from_completion_error(
+        error: CompletionError,
+        phase: ModelFailurePhase,
+        provider: &str,
+    ) -> Self {
         let status = error.provider_response_status();
         let headers = error.provider_response_headers();
         let provider_request_id = error
@@ -48,7 +52,7 @@ impl ModelFailure {
         let diagnostic = error.provider_response_body().unwrap_or(&message);
         let retry_after =
             parse_retry_after(headers).or_else(|| parse_google_retry_info(diagnostic));
-        let kind = classify_model_failure(&error, status, diagnostic);
+        let kind = classify_model_failure(&error, status, diagnostic, provider);
         Self {
             kind,
             phase,
@@ -132,6 +136,7 @@ fn classify_model_failure(
     error: &CompletionError,
     status: Option<http::StatusCode>,
     diagnostic: &str,
+    provider: &str,
 ) -> ModelFailureKind {
     let diagnostic = diagnostic.to_ascii_lowercase();
     if contains_any(
@@ -173,6 +178,7 @@ fn classify_model_failure(
                 "service unavailable",
                 "temporarily unavailable",
                 "server is overloaded",
+                "currently experiencing high demand",
             ],
         ) {
             return ModelFailureKind::Server;
@@ -188,13 +194,19 @@ fn classify_model_failure(
         Some(http::StatusCode::PAYLOAD_TOO_LARGE) => ModelFailureKind::ContextOverflow,
         Some(status) if status.is_server_error() => ModelFailureKind::Server,
         Some(status) if status.is_client_error() => {
-            if looks_like_context_overflow(&diagnostic) {
+            if looks_like_context_overflow(&diagnostic)
+                || looks_like_cerebras_bodyless_overflow(&diagnostic, provider)
+            {
                 ModelFailureKind::ContextOverflow
             } else {
                 ModelFailureKind::Client
             }
         }
-        _ if looks_like_context_overflow(&diagnostic) => ModelFailureKind::ContextOverflow,
+        _ if looks_like_context_overflow(&diagnostic)
+            || looks_like_cerebras_bodyless_overflow(&diagnostic, provider) =>
+        {
+            ModelFailureKind::ContextOverflow
+        }
         _ if looks_like_timeout(&diagnostic) => ModelFailureKind::Timeout,
         _ if looks_like_network_failure(&diagnostic) => ModelFailureKind::Network,
         _ => match error {
@@ -246,7 +258,17 @@ pub(crate) fn looks_like_context_overflow(message: &str) -> bool {
             "too many tokens",
             "token limit exceeded",
         ],
-    ) || message.starts_with("400 status code (no body)")
+    )
+}
+
+/// Bodyless 400/413 responses only read as context overflow for Cerebras;
+/// other providers return bodyless client errors for unrelated reasons.
+pub(crate) fn looks_like_cerebras_bodyless_overflow(message: &str, provider: &str) -> bool {
+    if provider != "cerebras" {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    message.starts_with("400 status code (no body)")
         || message.starts_with("413 status code (no body)")
 }
 

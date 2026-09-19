@@ -149,6 +149,7 @@ fn terminate_sse_at_eof(
 
 pub(crate) struct RigBackend {
     pub(super) client: RigClient,
+    pub(super) provider: String,
     pub(super) limits: ModelLimits,
     pub(super) accepts_images: bool,
 }
@@ -478,6 +479,7 @@ impl RigBackend {
         };
         Ok(Self {
             client,
+            provider: model.provider.clone(),
             limits,
             accepts_images: model.accepts_input("image"),
         })
@@ -566,17 +568,23 @@ impl ModelBackend for RigBackend {
         }
         let mut response = match &self.client {
             RigClient::OpenAiResponses(model) => {
-                complete_with(model, request, max_tokens, deltas).await
+                complete_with(model, &self.provider, request, max_tokens, deltas).await
             }
             RigClient::OpenAiCodexResponses(model) => {
-                complete_with(model, request, max_tokens, deltas).await
+                complete_with(model, &self.provider, request, max_tokens, deltas).await
             }
             RigClient::OpenAiCompletions(model) => {
-                complete_with(model, request, max_tokens, deltas).await
+                complete_with(model, &self.provider, request, max_tokens, deltas).await
             }
-            RigClient::OpenRouter(model) => complete_with(model, request, max_tokens, deltas).await,
-            RigClient::Anthropic(model) => complete_with(model, request, max_tokens, deltas).await,
-            RigClient::Gemini(model) => complete_with(model, request, max_tokens, deltas).await,
+            RigClient::OpenRouter(model) => {
+                complete_with(model, &self.provider, request, max_tokens, deltas).await
+            }
+            RigClient::Anthropic(model) => {
+                complete_with(model, &self.provider, request, max_tokens, deltas).await
+            }
+            RigClient::Gemini(model) => {
+                complete_with(model, &self.provider, request, max_tokens, deltas).await
+            }
         }?;
         let api = match &self.client {
             RigClient::OpenAiResponses(_) => "openai-responses",
@@ -697,6 +705,7 @@ pub(super) fn normalize_usage_for_api(api: &str, usage: &mut rig::completion::Us
 
 async fn complete_with<M>(
     model: &M,
+    provider: &str,
     request: ModelRequest,
     max_tokens: u64,
     deltas: mpsc::UnboundedSender<ModelDelta>,
@@ -716,16 +725,15 @@ where
     if !request.tools.is_empty() {
         completion = completion.tools(request.tools);
     }
-    let mut stream = completion
-        .stream()
-        .await
-        .map_err(|error| ModelFailure::from_completion_error(error, ModelFailurePhase::Request))?;
+    let mut stream = completion.stream().await.map_err(|error| {
+        ModelFailure::from_completion_error(error, ModelFailurePhase::Request, provider)
+    })?;
     let mut reasoning_deltas = HashSet::new();
     let mut tool_call_names = HashSet::new();
     let mut tool_call_arguments = HashSet::new();
     while let Some(event) = stream.next().await {
         match event.map_err(|error| {
-            ModelFailure::from_completion_error(error, ModelFailurePhase::Stream)
+            ModelFailure::from_completion_error(error, ModelFailurePhase::Stream, provider)
         })? {
             StreamedAssistantContent::Text(text) => {
                 let _ = deltas.send(ModelDelta::Text(text.text));

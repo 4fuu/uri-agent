@@ -9,7 +9,8 @@ use crate::config::{display_path, path_is_within};
 use crate::model::MAX_RETRY_AFTER;
 use crate::model::{
     ModelBackend, ModelDelta, ModelFailure, ModelFailureKind, ModelRequest, ModelResponse,
-    looks_like_context_overflow, model_retry_delay, model_retry_policy, model_retry_reason,
+    looks_like_cerebras_bodyless_overflow, looks_like_context_overflow, model_retry_delay,
+    model_retry_policy, model_retry_reason,
 };
 use crate::plugin::{ModelToolOutput, ModelToolRegistry};
 use crate::protocol::{
@@ -1615,6 +1616,7 @@ impl AgentRuntime {
         let mut steer_ready = false;
         let mut skip_task_notifications = skip_initial_task_notifications;
         let mut loop_guard = ToolCallLoopGuard::default();
+        let provider = self.session.model_settings().await.provider;
         let _ = self.context_state.take_rollover_request().await;
         if self
             .append_reconciled_steer(take_initial_steer, false)
@@ -1660,7 +1662,7 @@ impl AgentRuntime {
                             && is_successful_context_overflow(&response, context_window);
                         break (response, force_post_compaction);
                     }
-                    Err(error) if !overflow_retried && is_context_overflow(&error) => {
+                    Err(error) if !overflow_retried && is_context_overflow(&error, &provider) => {
                         if !self.compaction_settings.read().await.enabled {
                             return Err(error);
                         }
@@ -2360,11 +2362,13 @@ fn summarize_text(text: &str, limit: usize) -> String {
     summary
 }
 
-fn is_context_overflow(error: &anyhow::Error) -> bool {
+fn is_context_overflow(error: &anyhow::Error, provider: &str) -> bool {
     if let Some(failure) = error.downcast_ref::<ModelFailure>() {
         return failure.kind() == ModelFailureKind::ContextOverflow;
     }
-    looks_like_context_overflow(&format!("{error:#}"))
+    let message = format!("{error:#}");
+    looks_like_context_overflow(&message)
+        || looks_like_cerebras_bodyless_overflow(&message, provider)
 }
 
 fn reported_input_tokens(response: &ModelResponse) -> u64 {
@@ -6209,15 +6213,28 @@ mod tests {
 
     #[test]
     fn context_overflow_classifier_excludes_rate_limits() {
-        assert!(is_context_overflow(&anyhow!(
-            "Your input exceeds the context window of this model"
-        )));
-        assert!(is_context_overflow(&anyhow!(
-            "prompt has 200,000 tokens, but the configured context size is 128,000 tokens"
-        )));
-        assert!(!is_context_overflow(&anyhow!(
-            "Throttling error: too many tokens; rate limit exceeded"
-        )));
+        assert!(is_context_overflow(
+            &anyhow!("Your input exceeds the context window of this model"),
+            "test"
+        ));
+        assert!(is_context_overflow(
+            &anyhow!(
+                "prompt has 200,000 tokens, but the configured context size is 128,000 tokens"
+            ),
+            "test"
+        ));
+        assert!(!is_context_overflow(
+            &anyhow!("Throttling error: too many tokens; rate limit exceeded"),
+            "test"
+        ));
+        assert!(is_context_overflow(
+            &anyhow!("400 status code (no body)"),
+            "cerebras"
+        ));
+        assert!(!is_context_overflow(
+            &anyhow!("400 status code (no body)"),
+            "opencode-go"
+        ));
     }
 
     #[test]

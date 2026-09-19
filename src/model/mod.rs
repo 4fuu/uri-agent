@@ -30,7 +30,8 @@ pub(crate) use cloudflare::{
     GATEWAY_ID_METADATA as CLOUDFLARE_GATEWAY_ID_METADATA, PROVIDER as CLOUDFLARE_PROVIDER,
 };
 pub(crate) use failure::{
-    ModelFailure, ModelFailureKind, ModelFailurePhase, looks_like_context_overflow,
+    ModelFailure, ModelFailureKind, ModelFailurePhase, looks_like_cerebras_bodyless_overflow,
+    looks_like_context_overflow,
 };
 #[cfg(test)]
 pub(crate) use retry::MAX_RETRY_AFTER;

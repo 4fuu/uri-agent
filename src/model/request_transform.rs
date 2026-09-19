@@ -1,3 +1,4 @@
+use super::clamp_thinking_level;
 use crate::catalog::{CatalogModel, ThinkingLevel};
 use crate::model::antigravity::resolve_route;
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -948,6 +949,12 @@ impl ModelRequestTransform {
         }
     }
 
+    /// Google thinking levels follow the catalog's `thinkingLevelMap`: the
+    /// requested level is clamped to the nearest supported one and its mapped
+    /// value is sent directly. The family check only selects the wire format
+    /// (`thinkingLevel` for Gemini 3 / Gemma 4 families, `thinkingBudget`
+    /// otherwise); thinking can be disabled with a zero budget only when the
+    /// model actually supports `off`.
     fn google(&self, body: &mut Map<String, Value>) {
         if !self.model.reasoning() {
             return;
@@ -958,38 +965,19 @@ impl ModelRequestTransform {
         let Some(config) = config.as_object_mut() else {
             return;
         };
-        let id = self.model.id.to_ascii_lowercase();
-        let gemini3_pro = is_gemini3_family(&id, "pro");
-        let gemini3_flash = is_gemini3_family(&id, "flash")
-            || matches!(
-                id.as_str(),
-                "gemini-flash-latest" | "gemini-flash-lite-latest"
-            );
-        let gemma4 = id.contains("gemma-4") || id.contains("gemma4");
-        if !self.thinking.enabled() {
-            let thinking = if gemini3_pro {
-                json!({"thinkingLevel": "LOW"})
-            } else if gemini3_flash || gemma4 {
-                json!({"thinkingLevel": "MINIMAL"})
-            } else {
-                json!({"thinkingBudget": 0})
-            };
-            config.insert("thinkingConfig".to_string(), thinking);
+        let thinking = clamp_thinking_level(&self.model, self.thinking);
+        if !thinking.enabled() {
+            config.insert("thinkingConfig".to_string(), json!({"thinkingBudget": 0}));
             return;
         }
-        if gemini3_pro || gemini3_flash || gemma4 {
-            let mapped = self
-                .mapped_level()
-                .as_str()
-                .unwrap_or("high")
-                .to_ascii_lowercase();
-            let level = if gemini3_pro && matches!(mapped.as_str(), "minimal" | "low") {
-                "low"
-            } else if gemini3_pro {
-                "high"
-            } else {
-                mapped.as_str()
-            };
+        if uses_google_thinking_level(&self.model.id) {
+            let level = self
+                .model
+                .thinking_level(thinking)
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_str)
+                .map(|level| level.to_ascii_lowercase())
+                .unwrap_or_else(|| thinking.as_str().to_string());
             config.insert(
                 "thinkingConfig".to_string(),
                 json!({"thinkingLevel": level.to_ascii_uppercase(), "includeThoughts": true}),
@@ -997,7 +985,10 @@ impl ModelRequestTransform {
         } else {
             config.insert(
                 "thinkingConfig".to_string(),
-                json!({"thinkingBudget": self.google_budget(), "includeThoughts": true}),
+                json!({
+                    "thinkingBudget": self.google_budget(thinking),
+                    "includeThoughts": true
+                }),
             );
         }
     }
@@ -1039,7 +1030,7 @@ impl ModelRequestTransform {
         );
     }
 
-    fn google_budget(&self) -> i64 {
+    fn google_budget(&self, thinking: ThinkingLevel) -> i64 {
         let id = self.model.id.as_str();
         let values = if id.contains("2.5-pro") {
             [128, 2_048, 8_192, 32_768]
@@ -1050,7 +1041,7 @@ impl ModelRequestTransform {
         } else {
             return -1;
         };
-        match self.thinking {
+        match thinking {
             ThinkingLevel::Minimal => values[0],
             ThinkingLevel::Low => values[1],
             ThinkingLevel::Medium => values[2],
@@ -1106,6 +1097,18 @@ fn copilot_initiator(body: &[u8]) -> &'static str {
     } else {
         "user"
     }
+}
+
+fn uses_google_thinking_level(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    is_gemini3_family(&id, "pro")
+        || is_gemini3_family(&id, "flash")
+        || matches!(
+            id.as_str(),
+            "gemini-flash-latest" | "gemini-flash-lite-latest"
+        )
+        || id.contains("gemma-4")
+        || id.contains("gemma4")
 }
 
 fn is_gemini3_family(id: &str, family: &str) -> bool {

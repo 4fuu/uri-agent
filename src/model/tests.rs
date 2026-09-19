@@ -1325,7 +1325,7 @@ fn provider_failure_keeps_status_retry_after_and_request_id() {
     )
     .with_response_headers(Some(Box::new(headers)));
 
-    let failure = ModelFailure::from_completion_error(error, ModelFailurePhase::Request);
+    let failure = ModelFailure::from_completion_error(error, ModelFailurePhase::Request, "test");
 
     assert_eq!(failure.kind(), ModelFailureKind::RateLimit);
     assert_eq!(failure.status(), Some(http::StatusCode::TOO_MANY_REQUESTS));
@@ -1340,14 +1340,15 @@ fn quota_and_stream_transport_errors_are_classified_separately() {
         r#"{"error":{"code":"insufficient_quota"}}"#,
     );
     assert_eq!(
-        ModelFailure::from_completion_error(quota, ModelFailurePhase::Request).kind(),
+        ModelFailure::from_completion_error(quota, ModelFailurePhase::Request, "test").kind(),
         ModelFailureKind::Quota
     );
 
     let disconnected = CompletionError::ProviderError(
         "Network connection lost before the terminal event".to_string(),
     );
-    let failure = ModelFailure::from_completion_error(disconnected, ModelFailurePhase::Stream);
+    let failure =
+        ModelFailure::from_completion_error(disconnected, ModelFailurePhase::Stream, "test");
     assert_eq!(failure.kind(), ModelFailureKind::Network);
     assert_eq!(failure.phase(), ModelFailurePhase::Stream);
 }
@@ -1371,9 +1372,49 @@ fn statusless_provider_envelopes_keep_transient_error_types() {
         let failure = ModelFailure::from_completion_error(
             CompletionError::from_provider_body(body),
             ModelFailurePhase::Stream,
+            "test",
         );
         assert_eq!(failure.kind(), expected, "body: {body}");
     }
+}
+
+#[test]
+fn bodyless_overflow_errors_require_cerebras_provider() {
+    for body in ["400 status code (no body)", "413 status code (no body)"] {
+        let classified = |provider: &str| {
+            ModelFailure::from_completion_error(
+                CompletionError::from_http_response(http::StatusCode::BAD_REQUEST, body),
+                ModelFailurePhase::Request,
+                provider,
+            )
+            .kind()
+        };
+        assert_eq!(classified("cerebras"), ModelFailureKind::ContextOverflow);
+        assert_eq!(classified("opencode-go"), ModelFailureKind::Client);
+    }
+    let statusless = |provider: &str| {
+        ModelFailure::from_completion_error(
+            CompletionError::from_provider_body("413 status code (no body)"),
+            ModelFailurePhase::Stream,
+            provider,
+        )
+        .kind()
+    };
+    assert_eq!(statusless("cerebras"), ModelFailureKind::ContextOverflow);
+    assert_eq!(statusless("opencode-go"), ModelFailureKind::Other);
+}
+
+#[test]
+fn azure_peak_demand_errors_are_retryable_server_failures() {
+    let failure = ModelFailure::from_completion_error(
+        CompletionError::from_provider_body(
+            "The system is currently experiencing high demand and cannot process your request.",
+        ),
+        ModelFailurePhase::Request,
+        "azure",
+    );
+    assert_eq!(failure.kind(), ModelFailureKind::Server);
+    assert!(model_retry_policy(failure.kind()).is_some());
 }
 
 #[test]
@@ -2070,6 +2111,64 @@ fn gemini_uses_level_for_v3_and_budget_for_v25() {
     assert_eq!(
         automatic_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
         -1
+    );
+}
+
+#[test]
+fn google_thinking_levels_clamp_to_catalog_support() {
+    let mut pro = catalog_model(
+        "google-generative-ai",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": null,
+                "minimal": null,
+                "low": "low",
+                "medium": "medium",
+                "high": "high"
+            }
+        }),
+    );
+    pro.id = "gemini-3.1-pro-preview".to_string();
+    let off = transformed(pro.clone(), ThinkingLevel::Off, json!({}));
+    assert_eq!(
+        off["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "LOW"
+    );
+    let medium = transformed(pro, ThinkingLevel::Medium, json!({}));
+    assert_eq!(
+        medium["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "MEDIUM"
+    );
+
+    let mut gemma = catalog_model(
+        "google-generative-ai",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {"off": null, "minimal": null, "low": "LOW", "high": "HIGH"}
+        }),
+    );
+    gemma.id = "gemma-4-it".to_string();
+    let body = transformed(gemma, ThinkingLevel::Off, json!({}));
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "LOW"
+    );
+
+    let mut off_supported = catalog_model(
+        "google-generative-ai",
+        json!({"reasoning": true, "thinkingLevelMap": {"off": "off", "high": "high"}}),
+    );
+    off_supported.id = "gemini-3-flash".to_string();
+    let body = transformed(off_supported, ThinkingLevel::Off, json!({}));
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        0
+    );
+    assert!(
+        body["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none()
     );
 }
 
