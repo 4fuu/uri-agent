@@ -47,6 +47,7 @@ const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("qwen-token-plan-cn", DiscoveryKind::OpenAi),
     ("qwen-token-plan-individual", DiscoveryKind::OpenAi),
     ("radius", DiscoveryKind::Radius),
+    ("stepfun", DiscoveryKind::OpenAi),
     ("together", DiscoveryKind::OpenAi),
     ("xai", DiscoveryKind::OpenAi),
     ("xiaomi", DiscoveryKind::OpenAi),
@@ -600,7 +601,14 @@ fn is_generation_model(provider: &str, model: &DiscoveredModel) -> bool {
     {
         return matches!(kind, "chat" | "language" | "text");
     }
+    if provider == "stepfun" {
+        return is_stepfun_plan_model(&id);
+    }
     true
+}
+
+fn is_stepfun_plan_model(id: &str) -> bool {
+    id.starts_with("step-3") || id.starts_with("step-5") || id.starts_with("step-router")
 }
 
 #[cfg(test)]
@@ -661,8 +669,9 @@ mod tests {
 
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
-        assert_eq!(provider_ids().count(), 33);
+        assert_eq!(provider_ids().count(), 34);
         assert!(supports_provider("abliteration"));
+        assert!(supports_provider("stepfun"));
         assert!(supports_provider("workbuddy"));
         assert!(!supports_provider("codebuddy"));
         assert!(supports_provider("opencode-go"));
@@ -805,6 +814,66 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(is_generation_model("openai", &parsed[0]));
         assert!(!is_generation_model("openai", &parsed[1]));
+    }
+
+    #[test]
+    fn stepfun_discovery_keeps_plan_chat_models_and_drops_media() {
+        let parsed = parse_openai_models(serde_json::json!({
+            "data": [
+                {"id": "step-3.5-preview"},
+                {"id": "step-5-flash"},
+                {"id": "step-router-v1"},
+                {"id": "step-1o-turbo-vision"},
+                {"id": "stepaudio-2.5-chat"},
+                {"id": "step-image-edit-2"},
+                {"id": "step-asr"}
+            ]
+        }))
+        .unwrap();
+        let kept = parsed
+            .iter()
+            .filter(|model| is_generation_model("stepfun", model))
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec!["step-3.5-preview", "step-5-flash", "step-router-v1"]
+        );
+    }
+
+    #[test]
+    fn stepfun_unknown_preview_inherits_the_nearest_model_without_copying_price() {
+        let reference = model(
+            "stepfun",
+            "step-5-preview",
+            "Step 5 Preview",
+            "openai-completions",
+            "https://api.stepfun.com/step_plan/v1",
+        );
+        let catalog = BTreeMap::from([("stepfun".to_string(), vec![reference])]);
+        let records = vec![DiscoveredModel {
+            id: "step-5-flash".to_string(),
+            name: None,
+            raw: serde_json::json!({"id": "step-5-flash"}),
+        }];
+        let discovered = materialize(
+            "stepfun",
+            DiscoveryKind::OpenAi,
+            records,
+            &catalog,
+            &ProtocolHints::default(),
+        );
+        assert_eq!(discovered.len(), 1);
+        let model = &discovered[0];
+        assert_eq!(model.id, "step-5-flash");
+        assert_eq!(model.name, "step-5-flash");
+        assert_eq!(model.api, "openai-completions");
+        assert_eq!(model.base_url, "https://api.stepfun.com/step_plan/v1");
+        assert!(!model.metadata.contains_key("cost"));
+        assert_eq!(
+            model.metadata["metadataSourceModel"],
+            "stepfun/step-5-preview"
+        );
     }
 
     #[test]

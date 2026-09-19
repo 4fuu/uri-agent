@@ -1133,11 +1133,74 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
             deepseek_v41_flash_model("deepseek-flash", "DeepSeek Flash (V4.1 alias)"),
         ),
     ]);
+    let stepfun_thinking = serde_json::json!({
+        "off": null, "minimal": "low", "low": "low", "medium": "medium",
+        "high": "high", "xhigh": null, "max": null
+    });
+    let stepfun_models = BTreeMap::from([
+        (
+            "step-3.5-flash".to_string(),
+            stepfun_model(
+                "step-3.5-flash",
+                "Step 3.5 Flash",
+                serde_json::json!(["text"]),
+                262_144,
+                stepfun_thinking.clone(),
+            ),
+        ),
+        (
+            "step-3.5-flash-2603".to_string(),
+            stepfun_model(
+                "step-3.5-flash-2603",
+                "Step 3.5 Flash 2603",
+                serde_json::json!(["text"]),
+                262_144,
+                serde_json::json!({
+                    "off": null, "minimal": "low", "low": "low", "medium": "high",
+                    "high": "high", "xhigh": null, "max": null
+                }),
+            ),
+        ),
+        (
+            "step-3.7-flash".to_string(),
+            stepfun_model(
+                "step-3.7-flash",
+                "Step 3.7 Flash",
+                serde_json::json!(["text", "image"]),
+                262_144,
+                stepfun_thinking.clone(),
+            ),
+        ),
+        (
+            "step-5-preview".to_string(),
+            stepfun_model(
+                "step-5-preview",
+                "Step 5 Preview",
+                serde_json::json!(["text", "image"]),
+                1_000_000,
+                stepfun_thinking,
+            ),
+        ),
+        (
+            "step-router-v1".to_string(),
+            stepfun_model(
+                "step-router-v1",
+                "Step Router V1",
+                serde_json::json!(["text"]),
+                262_144,
+                serde_json::json!({
+                    "off": null, "minimal": "low", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": null, "max": null
+                }),
+            ),
+        ),
+    ]);
     BTreeMap::from([
         ("abliteration".to_string(), abliteration_models),
         ("antigravity".to_string(), models),
         ("deepseek".to_string(), deepseek_models),
         (muse_code::PROVIDER.to_string(), muse_code::seeds()),
+        ("stepfun".to_string(), stepfun_models),
     ])
 }
 
@@ -1167,6 +1230,34 @@ fn deepseek_v41_flash_model(id: &str, name: &str) -> Value {
             "requiresReasoningContentOnAssistantMessages": true,
             "requiresAssistantContent": true,
             "disallowToolChoice": true
+        }
+    })
+}
+
+fn stepfun_model(
+    id: &str,
+    name: &str,
+    input: Value,
+    context_window: u64,
+    thinking_level_map: Value,
+) -> Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "api": "openai-completions",
+        "provider": "stepfun",
+        "providerName": "StepFun",
+        "baseUrl": "https://api.stepfun.com/step_plan/v1",
+        "reasoning": true,
+        "input": input,
+        "contextWindow": context_window,
+        "maxTokens": 65_536,
+        "thinkingLevelMap": thinking_level_map,
+        "compat": {
+            "maxTokensField": "max_tokens",
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "supportsStrictMode": false
         }
     })
 }
@@ -1346,6 +1437,11 @@ pub(crate) fn api_key_environments(provider: &str) -> Vec<String> {
                 "CLOUDFLARE_API_KEY".to_string(),
                 api_key_environment(provider),
             ]
+        }
+        "stepfun" => {
+            // STEPFUN_API_KEY matches OpenCode and the generated conventional
+            // name. STEP_API_KEY remains a lower-priority docs alias.
+            vec!["STEP_API_KEY".to_string(), api_key_environment(provider)]
         }
         _ => vec![api_key_environment(provider)],
     }
@@ -1768,6 +1864,93 @@ mod tests {
     }
 
     #[test]
+    fn stepfun_models_are_built_in_for_the_step_plan_endpoint() {
+        let (merged, warnings) =
+            merge_catalog(&BTreeMap::new(), &ModelsFile::default(), &BTreeMap::new());
+        assert!(warnings.is_empty());
+        let models = &merged["stepfun"];
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "step-3.5-flash",
+                "step-3.5-flash-2603",
+                "step-3.7-flash",
+                "step-5-preview",
+                "step-router-v1"
+            ]
+        );
+
+        for model in models {
+            assert_eq!(model.api, "openai-completions");
+            assert_eq!(model.base_url, "https://api.stepfun.com/step_plan/v1");
+            assert_eq!(
+                model.limits().context_window,
+                if model.id == "step-5-preview" {
+                    1_000_000
+                } else {
+                    262_144
+                }
+            );
+            assert_eq!(model.limits().max_tokens, 65_536);
+            assert!(model.reasoning());
+            assert!(!model.supports_thinking_level(ThinkingLevel::Off));
+            assert!(!model.supports_thinking_level(ThinkingLevel::Xhigh));
+            assert_eq!(
+                model.compat("maxTokensField"),
+                Some(&Value::String("max_tokens".into()))
+            );
+            assert_eq!(model.compat("supportsStore"), Some(&Value::Bool(false)));
+            assert_eq!(
+                model.compat("supportsDeveloperRole"),
+                Some(&Value::Bool(false))
+            );
+            assert_eq!(
+                model.compat("supportsStrictMode"),
+                Some(&Value::Bool(false))
+            );
+        }
+
+        let flash = models
+            .iter()
+            .find(|model| model.id == "step-3.7-flash")
+            .unwrap();
+        assert!(flash.accepts_input("image"));
+        assert_eq!(
+            flash.thinking_level(ThinkingLevel::Medium),
+            Some(&Value::String("medium".into()))
+        );
+
+        let preview = models
+            .iter()
+            .find(|model| model.id == "step-5-preview")
+            .unwrap();
+        assert!(preview.accepts_input("image"));
+        assert_eq!(
+            preview.thinking_level(ThinkingLevel::Medium),
+            Some(&Value::String("medium".into()))
+        );
+
+        let agent = models
+            .iter()
+            .find(|model| model.id == "step-3.5-flash-2603")
+            .unwrap();
+        assert!(!agent.accepts_input("image"));
+        assert_eq!(
+            agent.thinking_level(ThinkingLevel::Medium),
+            Some(&Value::String("high".into()))
+        );
+
+        let router = models
+            .iter()
+            .find(|model| model.id == "step-router-v1")
+            .unwrap();
+        assert!(!router.accepts_input("image"));
+    }
+
+    #[test]
     fn pi_provider_payloads_and_user_overrides_merge_by_model_id() {
         let models = parse_provider_payload(
             "openai",
@@ -1820,6 +2003,10 @@ mod tests {
         assert_eq!(
             api_key_environments("cloudflare-ai-gateway"),
             vec!["CLOUDFLARE_API_KEY", "CLOUDFLARE_API_TOKEN"]
+        );
+        assert_eq!(
+            api_key_environments("stepfun"),
+            vec!["STEP_API_KEY", "STEPFUN_API_KEY"]
         );
         assert_eq!(api_key_environment("my-provider"), "MY_PROVIDER_API_KEY");
 

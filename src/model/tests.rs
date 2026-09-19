@@ -1611,6 +1611,44 @@ fn deepseek_v41_flash_uses_its_restricted_wire_contract() {
 }
 
 #[test]
+fn stepfun_completions_keep_system_role_and_max_tokens() {
+    let mut model = catalog_model(
+        "openai-completions",
+        json!({
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": null, "minimal": "low", "low": "low", "medium": "medium",
+                "high": "high", "xhigh": null, "max": null
+            },
+            "compat": {
+                "maxTokensField": "max_tokens",
+                "supportsStore": false,
+                "supportsDeveloperRole": false,
+                "supportsStrictMode": false
+            }
+        }),
+    );
+    model.provider = "stepfun".to_string();
+    model.base_url = "https://api.stepfun.com/step_plan/v1".to_string();
+    let body = transformed(
+        model,
+        ThinkingLevel::High,
+        json!({
+            "max_completion_tokens": 4096,
+            "store": true,
+            "messages": [{"role": "system", "content": "be brief"}],
+            "tools": [{"type": "function", "function": {"name": "read"}}]
+        }),
+    );
+    assert_eq!(body["max_tokens"], 4096);
+    assert!(body.get("max_completion_tokens").is_none());
+    assert!(body.get("store").is_none());
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body["tools"][0]["function"].get("strict").is_none());
+}
+
+#[test]
 fn completions_compat_maps_vllm_priority() {
     let model = catalog_model("openai-completions", json!({"compat": {"vllmPriority": 0}}));
     let body = transformed(model, ThinkingLevel::Off, json!({}));

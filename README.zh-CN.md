@@ -58,7 +58,8 @@ URI Agent 的目标是广泛兼容 pi.dev 模型目录，而不是只适配少�
 - WorkBuddy 中国站浏览器登录和账户模型发现；
 - Radius 认证模型发现和原生 `pi-messages` 传输；
 - Muse Code 订阅登录和账户模型发现；
-- Abliteration.ai 按凭据隔离的实时发现和静态后备模型。
+- Abliteration.ai 按凭据隔离的实时发现和静态后备模型；
+- StepFun Step Plan API 密钥登录、实时发现和静态后备推理模型。
 
 URI Agent 还支持 Anthropic、GitHub Copilot、Kimi Coding、xAI 和 OpenRouter 的服务商专属登录流程。
 

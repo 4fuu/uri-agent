@@ -101,6 +101,18 @@ or set `ABLITERATION_API_KEY`; `ABLIT_KEY` is a lower-priority compatibility
 alias. Built-in fallback records remain available when live model discovery
 fails.
 
+**StepFun.** Use provider ID `stepfun` for the Step Plan coding endpoint at
+`https://api.stepfun.com/step_plan/v1`. Sign in through `:login` or set
+`STEPFUN_API_KEY`; `STEP_API_KEY` is a lower-priority docs alias. Built-in
+records cover `step-5-preview` (image input, 1M context), `step-3.7-flash`
+(image input), `step-3.5-flash`, `step-3.5-flash-2603`, and `step-router-v1`,
+with `low`/`medium`/`high` reasoning effort. Live discovery refreshes
+`/models` and keeps those chat and reasoning SKUs; audio, image-generation,
+and vision-only models are excluded. Failed discovery retains the built-in
+fallback list. A Step Plan subscription is required. Override `baseUrl` in
+`models.json` only if you need the pay-as-you-go `https://api.stepfun.com/v1`
+endpoint instead.
+
 **ChatGPT Codex.** Models using `openai-codex-responses` require the
 `openai-codex` OAuth entry created by browser or device-code login. An OpenAI
 Platform API key cannot authenticate the subscription endpoint. WebSocket and
@@ -190,6 +202,7 @@ custom identity prefix.
 | Provider ID | Login |
 | --- | --- |
 | `abliteration` | API key |
+| `stepfun` | API key |
 | `cloudflare-ai-gateway` | API token, account ID, and gateway ID |
 | `antigravity` | Experimental Google browser OAuth |
 | `anthropic` | Claude Pro/Max browser OAuth |

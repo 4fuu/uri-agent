@@ -89,9 +89,11 @@ integrations for:
 - Cloudflare AI Gateway with credential-safe endpoint handling;
 - WorkBuddy China browser login and account model discovery;
 - Radius authenticated model discovery and native `pi-messages` transport;
-- Muse Code subscription login and account model discovery; and
+- Muse Code subscription login and account model discovery;
 - Abliteration.ai credential-scoped live discovery with static fallback
-  models.
+  models; and
+- StepFun Step Plan API-key login with live discovery and static fallback
+  reasoning models.
 
 URI Agent also supports provider-specific login flows for Anthropic, GitHub
 Copilot, Kimi Coding, xAI, and OpenRouter.
