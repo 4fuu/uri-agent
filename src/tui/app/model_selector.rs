@@ -167,8 +167,12 @@ impl ModelSelector {
             .enumerate()
             .filter_map(|(index, model)| {
                 let searchable = format!(
-                    "{} {} {} {}",
-                    model.provider, model.id, model.name, model.api
+                    "{} {} {} {} {}",
+                    model.provider,
+                    model.provider_label(),
+                    model.id,
+                    model.name,
+                    model.api
                 )
                 .to_ascii_lowercase();
                 fuzzy_score(&searchable, &query).map(|score| (index, score))
@@ -253,6 +257,22 @@ mod tests {
         selector.backspace();
         selector.push('t');
         assert_eq!(selector.visible_len(), 1);
+    }
+
+    #[test]
+    fn searches_across_the_provider_label() {
+        let mut plan = model("stepfun", "step-5-preview", "Step 5 Preview");
+        plan.metadata
+            .insert("providerName".to_string(), json!("Step Plan"));
+        let mut selector = ModelSelector::from_models(
+            vec![plan, model("openai", "gpt-5", "GPT 5")],
+            "openai",
+            "gpt-5",
+        );
+        selector.paste("step plan");
+        assert_eq!(selector.visible_len(), 1);
+        assert_eq!(selector.selected().unwrap().id, "step-5-preview");
+        assert_eq!(selector.selected().unwrap().provider_label(), "Step Plan");
     }
 
     #[test]

@@ -78,9 +78,12 @@ Common entry points include:
 - `:help` and `:quit` for reference and exit.
 
 Model Hub combines conversation-model selection and plugin model-role
-assignments. Settings separates Model and Agent values, shows their source, and
-marks unsaved changes. Conversation search covers the complete persisted
-transcript, loading older pages before presenting matches.
+assignments. Model rows show the provider display name when the catalog defines
+one (`providerName`, for example Step Plan for `stepfun`) and the provider ID
+otherwise; search matches both forms. Settings separates Model and Agent
+values, shows their source, and marks unsaved changes. Conversation search
+covers the complete persisted transcript, loading older pages before presenting
+matches.
 
 The terminal-title plugin names the terminal after the first prompt when its
 declared `title` model role is assigned. Missing role assignments or generation

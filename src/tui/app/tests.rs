@@ -4474,6 +4474,38 @@ fn environment_prompts_hide_values_and_return_to_the_manager() {
 }
 
 #[test]
+fn model_hub_browser_shows_the_provider_label() {
+    let model: crate::catalog::CatalogModel = serde_json::from_value(serde_json::json!({
+        "id": "step-5-preview",
+        "name": "Step 5 Preview",
+        "api": "openai-completions",
+        "provider": "stepfun",
+        "baseUrl": "https://api.stepfun.com/step_plan/v1",
+        "providerName": "Step Plan",
+        "contextWindow": 1000000,
+        "reasoning": true
+    }))
+    .unwrap();
+    let mut app = test_app();
+    app.model_hub = Some(ModelHubState::new(ModelHubTab::Models, Vec::new()));
+    app.model_selector = Some(ModelSelector::from_models(
+        vec![model],
+        "stepfun",
+        "step-5-preview",
+    ));
+    app.overlay = Some(Overlay::Models);
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("Step 5 Preview"))
+        .expect("model row renders");
+    assert!(row.contains("Step Plan"));
+    assert!(!row.contains("stepfun"));
+    assert!(rendered.contains("stepfun/step-5-preview"));
+}
+
+#[test]
 fn model_hub_labels_role_assignments() {
     let roles = vec![
         crate::config::ModelRoleInfo {

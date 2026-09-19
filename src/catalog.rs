@@ -78,6 +78,17 @@ impl CatalogModel {
         )
     }
 
+    /// The provider name shown to users; the provider ID when no catalog
+    /// source defines one.
+    pub fn provider_label(&self) -> &str {
+        self.metadata
+            .get("providerName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&self.provider)
+    }
+
     pub fn context_window(&self) -> usize {
         self.metadata
             .get("contextWindow")
@@ -1246,7 +1257,7 @@ fn stepfun_model(
         "name": name,
         "api": "openai-completions",
         "provider": "stepfun",
-        "providerName": "StepFun",
+        "providerName": "Step Plan",
         "baseUrl": "https://api.stepfun.com/step_plan/v1",
         "reasoning": true,
         "input": input,
@@ -1885,6 +1896,8 @@ mod tests {
 
         for model in models {
             assert_eq!(model.api, "openai-completions");
+            assert_eq!(model.provider, "stepfun");
+            assert_eq!(model.provider_label(), "Step Plan");
             assert_eq!(model.base_url, "https://api.stepfun.com/step_plan/v1");
             assert_eq!(
                 model.limits().context_window,
@@ -2267,5 +2280,22 @@ mod tests {
         assert_eq!(model.context_window(), 131_072);
         model.metadata.remove("contextWindow");
         assert_eq!(model.context_window(), 128_000);
+    }
+
+    #[test]
+    fn provider_label_prefers_name_metadata_and_falls_back_to_the_id() {
+        let mut model: CatalogModel = serde_json::from_value(serde_json::json!({
+            "id": "one", "name": "One", "api": "openai-responses",
+            "provider": "openai", "baseUrl": "https://example.test/v1",
+            "providerName": "  Step Plan "
+        }))
+        .unwrap();
+        assert_eq!(model.provider_label(), "Step Plan");
+        model
+            .metadata
+            .insert("providerName".to_string(), Value::String("  ".to_string()));
+        assert_eq!(model.provider_label(), "openai");
+        model.metadata.remove("providerName");
+        assert_eq!(model.provider_label(), "openai");
     }
 }

@@ -3241,7 +3241,12 @@ fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: 
                 Style::default().fg(MUTED),
             ),
             Span::styled(
-                list_cell(&model.provider, provider_width, selected, marquee_elapsed),
+                list_cell(
+                    model.provider_label(),
+                    provider_width,
+                    selected,
+                    marquee_elapsed,
+                ),
                 Style::default().fg(MUTED),
             ),
             Span::styled(
