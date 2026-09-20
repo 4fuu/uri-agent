@@ -1,7 +1,7 @@
 use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::ProtocolRegistry;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,8 +29,6 @@ struct ProtocolArguments {
 struct HelpArguments {
     protocols: Vec<String>,
 }
-
-const MAX_HELP_PROTOCOLS: usize = 4;
 
 struct HelpTool;
 
@@ -110,7 +108,6 @@ impl ModelTool for HelpTool {
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 1,
-                        "maxItems": MAX_HELP_PROTOCOLS,
                         "description": "Names of protocols to load from the Available protocols list, for example [\"file\", \"search\"]. Shared prerequisites such as the MCP routing page are included automatically."
                     }
                 },
@@ -127,9 +124,6 @@ impl ModelTool for HelpTool {
     ) -> Result<ModelToolOutput> {
         let arguments: HelpArguments = serde_json::from_value(arguments.clone())
             .map_err(|error| anyhow!("invalid help arguments: {error}"))?;
-        if arguments.protocols.len() > MAX_HELP_PROTOCOLS {
-            bail!("help loads at most {MAX_HELP_PROTOCOLS} protocols per call; split the request");
-        }
         Ok(protocols.load_help(&arguments.protocols).await?.into())
     }
 }
@@ -218,14 +212,10 @@ mod tests {
     }
 
     #[test]
-    fn help_tool_describes_a_bounded_protocol_list() {
+    fn help_tool_describes_a_nonempty_protocol_list() {
         let descriptor = HelpTool.descriptor();
         assert_eq!(descriptor.name, "help");
         assert_eq!(descriptor.parameters["required"], json!(["protocols"]));
-        assert_eq!(
-            descriptor.parameters["properties"]["protocols"]["maxItems"],
-            json!(4)
-        );
         assert_eq!(
             descriptor.parameters["properties"]["protocols"]["minItems"],
             json!(1)
@@ -259,13 +249,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn help_tool_rejects_oversized_and_malformed_requests() {
+    async fn help_tool_rejects_malformed_and_unknown_requests() {
         let (protocols, output) = protocols().await;
+        let oversized: Vec<String> = ('a'..='j').map(|c| c.to_string()).collect();
         let error = HelpTool
-            .execute(&json!({"protocols": ["a", "b", "c", "d", "e"]}), &protocols)
+            .execute(&json!({"protocols": oversized}), &protocols)
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("at most 4"));
+        assert!(format!("{error:#}").contains("unknown protocol: a"));
 
         let error = HelpTool
             .execute(&json!({"protocols": "capture"}), &protocols)

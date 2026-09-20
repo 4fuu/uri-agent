@@ -213,6 +213,9 @@ mod tests {
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<Vec<_>>();
-        assert_eq!(model_tools, ["apply_patch", "exec", "read", "replace"]);
+        assert_eq!(
+            model_tools,
+            ["apply_patch", "exec", "help", "read", "replace"]
+        );
     }
 }

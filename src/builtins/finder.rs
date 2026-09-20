@@ -535,7 +535,8 @@ mod tests {
             "`~user` is not expanded",
             "The root must be an existing directory.",
             "The scope restricts code search only; web reads are unaffected.",
-            "MUST pass an empty string",
+            "MUST pass an empty",
+            "string body; `finder` supports no other reads",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");
@@ -811,7 +812,11 @@ mod tests {
         assert_eq!(spec.working_directory, Path::new("/work"));
         assert_eq!(
             spec.tools,
-            crate::agent::CapabilitySelection::Only(vec!["read".to_string(), "exec".to_string()])
+            crate::agent::CapabilitySelection::Only(vec![
+                "read".to_string(),
+                "exec".to_string(),
+                "help".to_string()
+            ])
         );
         assert_eq!(
             spec.protocols,
@@ -990,7 +995,7 @@ mod tests {
         resumed
             .services()
             .protocols
-            .read("finder://help", "")
+            .load_help(&["finder".to_string()])
             .await
             .unwrap();
         let error = resumed

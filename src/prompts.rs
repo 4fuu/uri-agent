@@ -2,7 +2,7 @@ use crate::config::display_path;
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first read or exec call to any protocol, batching up to four protocol names. The loaded help pages define every valid address, parameter, and body format; shared prerequisites are included automatically and loaded protocols stay loaded for the whole session.";
+pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first read or exec call to any protocol. The loaded help pages define every valid address, parameter, and body format; shared prerequisites are included automatically and loaded protocols stay loaded for the whole session.";
 
 pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol after help has loaded it. Use this for resources, task status, and completed results; the loaded help page defines the valid addresses and the body each read takes.";
 
@@ -148,7 +148,9 @@ mod tests {
                 < prompt.find("Available protocols:").unwrap()
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
-        assert!(prompt.contains("The help tool is the only way to load a protocol."));
+        assert!(prompt.contains(
+            "The help tool is the only way to load a protocol, and a call made before it fails"
+        ));
         assert!(prompt.contains("never guess them from memory"));
         assert!(prompt.contains("help([\"file\"]) — required first call"));
         assert!(prompt.contains(r#"read("file://src/main.rs", "")"#));

@@ -18,11 +18,13 @@ replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`help` loads the model-facing contract pages of one to four named protocols in
-one call. It is the only way to load a contract: `read` and `exec` reject any
-protocol whose contract has not been loaded yet, and the exact `<name>://help`
-address is not readable through `read`. Loaded contracts stay loaded for the
-rest of the session and are restored on resume.
+`help` loads the model-facing contract pages of the named protocols in one
+call; it loads at most the first eight requested names and reports any
+remaining names in the result for a follow-up call. It is the only way to load
+a contract: `read` and `exec` reject any protocol whose contract has not been
+loaded yet, and the exact `<name>://help` address is not readable through
+`read`. Loaded contracts stay loaded for the rest of the session and are
+restored on resume.
 
 `read` and `exec` always require a string body. Use `""` when an operation has
 no body, plain text for textual input, and complete serialized JSON only when a

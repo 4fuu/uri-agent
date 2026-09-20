@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
@@ -427,21 +428,44 @@ impl ProtocolRegistry {
     /// Shared help prerequisites are resolved and included automatically, and
     /// every returned protocol is marked as loaded for the session.
     pub(crate) async fn load_help(&self, requested: &[String]) -> Result<String> {
-        const MAX_HELP_PROTOCOLS: usize = 4;
+        const MAX_HELP_PROTOCOLS: usize = 8;
         if requested.is_empty() {
             bail!("help requires at least one protocol name");
         }
-        if requested.len() > MAX_HELP_PROTOCOLS {
-            bail!("help loads at most {MAX_HELP_PROTOCOLS} protocols per call; split the request");
-        }
-        let ordered = self.resolve_help_order(requested, true).await?;
-        let mut sections = Vec::with_capacity(ordered.len());
-        let mut loaded = Vec::with_capacity(ordered.len());
-        for name in &ordered {
+        let limited = requested.len() > MAX_HELP_PROTOCOLS;
+        let skipped: Vec<String> = if limited {
+            requested[MAX_HELP_PROTOCOLS..]
+                .iter()
+                .map(|name| format!("{name:?}"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let requested = &requested[..requested.len().min(MAX_HELP_PROTOCOLS)];
+        // Resolve each protocol exactly once, dependencies ahead of the
+        // protocols that list them, so dynamic sources are readied once.
+        let mut queue = requested.to_vec();
+        let mut ordered = Vec::<String>::new();
+        let mut resolved = Vec::<Arc<dyn Protocol>>::new();
+        while let Some(name) = queue.first().cloned() {
+            queue.remove(0);
+            if ordered.contains(&name) {
+                continue;
+            }
             let protocol = self
-                .find_protocol(name, true)
+                .find_protocol(&name, true)
                 .await
-                .ok_or_else(|| self.unknown_protocol_error(name, true))?;
+                .ok_or_else(|| self.unknown_protocol_error(&name, true))?;
+            for dependency in protocol.help_dependencies() {
+                if !ordered.contains(dependency) && !queue.contains(dependency) {
+                    queue.push(dependency.clone());
+                }
+            }
+            ordered.push(name);
+            resolved.push(protocol);
+        }
+        let mut sections = Vec::with_capacity(ordered.len());
+        for (name, protocol) in ordered.iter().zip(resolved) {
             let uri = format!("{name}://help");
             let response = protocol
                 .read_output(
@@ -458,41 +482,20 @@ impl ProtocolRegistry {
                 bail!("protocol {name} help must be text-only");
             }
             sections.push(self.output.present(content, name).await?);
-            loaded.push(name.clone());
         }
-        self.help_read.lock().await.extend(loaded);
-        Ok(format!(
+        self.help_read.lock().await.extend(ordered);
+        let mut result = format!(
             "{}\n\nLoaded protocols stay loaded for the rest of the session; use their addresses without calling help again.",
             sections.join("\n\n---\n\n")
-        ))
-    }
-
-    /// Expand requested protocol names into an ordered, deduplicated load
-    /// order with each protocol's shared help prerequisites first.
-    async fn resolve_help_order(
-        &self,
-        requested: &[String],
-        include_dynamic: bool,
-    ) -> Result<Vec<String>> {
-        let mut ordered = Vec::<String>::new();
-        let mut queue = requested.to_vec();
-        while let Some(name) = queue.first().cloned() {
-            queue.remove(0);
-            if ordered.contains(&name) {
-                continue;
-            }
-            let protocol = self
-                .find_protocol(&name, include_dynamic)
-                .await
-                .ok_or_else(|| self.unknown_protocol_error(&name, include_dynamic))?;
-            for dependency in protocol.help_dependencies() {
-                if !ordered.contains(dependency) && !queue.contains(dependency) {
-                    queue.push(dependency.clone());
-                }
-            }
-            ordered.push(name);
+        );
+        if limited {
+            let _ = write!(
+                result,
+                "\n\nhelp loads at most {MAX_HELP_PROTOCOLS} protocols per call; the remaining names were skipped: [{}] — call help again with them.",
+                skipped.join(", ")
+            );
         }
-        Ok(ordered)
+        Ok(result)
     }
 
     fn reject_help_address(&self, name: &str, target: &str) -> Result<()> {
@@ -1118,7 +1121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn help_tool_rejects_help_addresses_and_bounds_batches() {
+    async fn help_tool_rejects_help_addresses_and_empty_batches() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -1146,18 +1149,6 @@ mod tests {
                 .to_string()
                 .contains("at least one protocol name")
         );
-        let too_many = ["a", "b", "c", "d", "e"]
-            .iter()
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>();
-        assert!(
-            registry
-                .load_help(&too_many)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("at most 4")
-        );
         assert!(
             registry
                 .load_help(&["missing".to_string()])
@@ -1165,6 +1156,40 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unknown protocol: missing")
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn help_loads_only_the_first_eight_protocols_when_more_are_requested() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        for name in (1..=9).map(|index| format!("p{index}")) {
+            registry.register(NamedProtocol(name)).unwrap();
+        }
+
+        let requested = (1..=9).map(|index| format!("p{index}")).collect::<Vec<_>>();
+        let help = registry.load_help(&requested).await.unwrap();
+        assert!(help.contains("Loaded protocols stay loaded"));
+        assert!(help.contains(r#"the remaining names were skipped: ["p9"]"#));
+
+        assert_eq!(
+            registry.read("p1://value", "").await.unwrap(),
+            "p1",
+            "the first requested protocol is loaded and unlocked"
+        );
+        assert_eq!(
+            registry.read("p8://value", "").await.unwrap(),
+            "p8",
+            "the eighth requested protocol is loaded and unlocked"
+        );
+        let error = registry.read("p9://value", "").await.unwrap_err();
+        assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
+        assert_eq!(
+            error.to_string(),
+            "Load this protocol first: call help([\"p9\"]) before using p9://."
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
@@ -1312,7 +1337,7 @@ mod tests {
 
         let help = registry.load_help(&["second".to_string()]).await.unwrap();
         assert!(help.contains("second"));
-        assert_eq!(first.ready_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(first.ready_calls.load(Ordering::Relaxed), 1);
         assert_eq!(second.ready_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             registry
