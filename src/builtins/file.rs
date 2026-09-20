@@ -56,7 +56,7 @@ Current working directory: `file://{}`
   Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-Every `file` read, including `file://help`, MUST pass an empty string body.
+Every `file` read MUST pass an empty string body.
 This protocol supports `read` only; it does not support `exec`.
 "#,
         display_path(cwd)
@@ -78,7 +78,7 @@ impl FileProtocol {
     async fn read_request(&self, request: ProtocolRequest<'_>) -> Result<ProtocolReadOutput> {
         if !request.body.is_empty() {
             if request.target == "help" {
-                bail!(r#"file://help requires an empty body; retry read("file://help", "")"#);
+                bail!("file://help requires an empty body");
             }
             if request.target.is_empty() {
                 bail!(

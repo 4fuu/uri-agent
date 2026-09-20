@@ -3,29 +3,35 @@
 URI Agent keeps the initial model interface small and loads operational detail
 only when a capability is needed. This document explains that design and the
 stable behavior shared across protocols. For exact addresses, query fields,
-limits, and examples, read the active `<protocol>://help`; direct-tool schemas
-are authoritative for their arguments.
+limits, and examples, load the protocol's page through the `help` tool;
+direct-tool schemas are authoritative for their arguments.
 
 ## Model interface
 
-Linked built-ins register four tools:
+Linked built-ins register five tools:
 
 ```text
+help(protocols: string[])
 read(uri: string, body: string)
 exec(uri: string, body: string)
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
+`help` loads the model-facing contract pages of one to four named protocols in
+one call. It is the only way to load a contract: `read` and `exec` reject any
+protocol whose contract has not been loaded yet, and the exact `<name>://help`
+address is not readable through `read`. Loaded contracts stay loaded for the
+rest of the session and are restored on resume.
+
 `read` and `exec` always require a string body. Use `""` when an operation has
 no body, plain text for textual input, and complete serialized JSON only when a
 protocol explicitly requires it. Runtime-loaded WASM plugins may add typed
 direct tools.
 
-Before using a protocol, the model must successfully read its exact
-`<protocol>://help` address with an empty body. A protocol may declare ordered
-shared-help prerequisites, but its own help remains mandatory. Successful help
-reads are remembered within the session and restored on resume.
+A protocol may declare shared-help prerequisites; `help` loads them
+automatically ahead of the requested protocol, and using the dependent protocol
+requires those shared pages to be loaded.
 
 Routing is deliberately generic:
 
@@ -44,10 +50,8 @@ existing capability.
 | `uri-agent-docs` | `read` | Read version-matched documentation embedded in the binary |
 | `file` | `read` | Read files, directories, globs, and supported images |
 | `search` | `read`, `exec` | Run ripgrep, semantic, or hybrid project search |
-| `grep` | `read`, `exec` | Compatibility route for resumed sessions whose frozen prompt used `grep://` |
 | `context` | `read`, `exec` | Inspect active context, maintain current-session notes, recover history, and read saved sessions |
 | `collaboration` | `read`, `exec` | Name this session, inspect active participants and model status, and exchange Queue or Steer messages |
-| `sessions` | `read`, `exec` | Compatibility route retained only for sessions whose frozen prompt already used it |
 | `https` | `read` | Search the web and extract HTTPS pages |
 | `finder` | `exec` | Delegate a multi-step lookup to a finder Agent and return its final answer |
 | `tasks` | `read`, `exec` | Inspect, wait for, feed input to, and cancel managed work |
@@ -64,10 +68,11 @@ available.
 ### MCP
 
 Each enabled MCP server recorded for a new session becomes a normalized
-`<name>-mcp` protocol. The shared `mcp://help` page defines common routing and
+`<name>-mcp` protocol. The shared `mcp` help page defines common routing and
 argument encoding; each server help page adds its frozen description, current
-handshake metadata, and server instructions. Connections are lazy and belong
-to one Agent session.
+handshake metadata, and server instructions. Loading a server's help through
+the `help` tool loads the shared page automatically. Connections are lazy and
+belong to one Agent session.
 
 Tool and prompt catalogs remain behind protocol reads, and each operation uses
 the server's current JSON Schema. Simple values can be represented in the URI;
@@ -99,10 +104,6 @@ read("search://src", "ProtocolRequest")
 read("search://src?mode=hybrid&glob=**/*.rs", "credential refresh flow")
 ```
 
-New sessions expose this capability as `search://`. A resumed session whose
-frozen startup prompt used `grep://` retains that address as a compatibility
-route with the same options and `rg` syntax.
-
 `context` exposes bounded recovery information for the active conversation,
 including context usage, titled notes, prior windows, user statements, search,
 and record neighborhoods. Under `context://sessions/...`, it also discovers and
@@ -112,11 +113,7 @@ to the current session. Project scope is the default and broader discovery or
 search scope must be requested explicitly. Exact search needs no index, while
 semantic and hybrid reads maintain disposable scope-specific caches
 automatically. Results are bounded and marked as untrusted reference data.
-
-New sessions do not advertise `sessions`. A resumed session whose frozen
-startup prompt already contains that protocol retains `sessions://` as a
-compatibility route, while all new model-facing addresses use
-`context://sessions/...`.
+All model-facing saved-session addresses use `context://sessions/...`.
 
 ### Delegated search
 
@@ -131,10 +128,9 @@ through a background task after the foreground grace period.
 
 The protocol is registered only for new depth-1 sessions whose `finder` role
 resolves ([Model roles](configuration.md#model-roles-and-plugin-settings)); it
-starts unassigned, so finder is absent until configured. A session that froze
-the protocol keeps it on resume, and calls fail if the role no longer resolves.
+starts unassigned, so finder is absent until configured. The protocol keeps it on resume, and calls fail if the role no longer resolves.
 Finder replies are untrusted data from another model. Exact syntax and limits
-live in `finder://help`.
+live in the finder help page.
 
 ### Collaboration
 
@@ -157,7 +153,7 @@ Acceptance means that the message was committed to the target's durable input
 queue. Collaboration does not start a stopped process, broadcast, transfer
 files, or wait for remote completion. ACP-owned and child Agent sessions do not
 join live collaboration. Exact routes, name rules, options, limits, and the XML
-behavior are defined by `collaboration://help` and
+behavior are defined by the collaboration help page and
 `collaboration://help/send`.
 
 `uri-agent-docs` reads the Markdown files embedded at build time. Start at
@@ -173,8 +169,8 @@ configured, ordinary page reads can still use direct local HTTPS fetching.
 HTML is converted to Markdown, JSON is formatted, and other textual responses
 remain text. Direct fetching does not execute JavaScript or extract PDFs.
 Redirects remain on HTTPS, and returned web content is untrusted. Provider
-options and current limits live in `https://help` and its provider-specific
-help pages.
+options and current limits live in the `https` help page and provider pages
+such as `https://help/parallel`.
 
 ## Editing tools
 

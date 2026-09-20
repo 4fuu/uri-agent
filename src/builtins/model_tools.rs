@@ -1,7 +1,7 @@
 use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::ProtocolRegistry;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,6 +23,16 @@ struct ProtocolArguments {
     uri: String,
     body: String,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelpArguments {
+    protocols: Vec<String>,
+}
+
+const MAX_HELP_PROTOCOLS: usize = 4;
+
+struct HelpTool;
 
 impl ProtocolTool {
     fn new(operation: ProtocolOperation) -> Self {
@@ -56,7 +66,7 @@ impl ModelTool for ProtocolTool {
                     },
                     "body": {
                         "type": "string",
-                        "description": "Protocol-specific string body. Use an empty string when the protocol takes no body; serialize structured protocol input as complete JSON text."
+                        "description": "Protocol-specific string body. Use an empty string when the operation takes no body, plain text for textual input such as a command or a search pattern, and complete serialized JSON text when the protocol requires structured input."
                     }
                 },
                 "required": ["uri", "body"],
@@ -87,21 +97,61 @@ impl ModelTool for ProtocolTool {
     }
 }
 
+#[async_trait]
+impl ModelTool for HelpTool {
+    fn descriptor(&self) -> ModelToolDescriptor {
+        ModelToolDescriptor {
+            name: "help".to_string(),
+            description: prompts::HELP_TOOL_DESCRIPTION.to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "protocols": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": MAX_HELP_PROTOCOLS,
+                        "description": "Names of protocols to load from the Available protocols list, for example [\"file\", \"search\"]. Shared prerequisites such as the MCP routing page are included automatically."
+                    }
+                },
+                "required": ["protocols"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        arguments: &Value,
+        protocols: &ProtocolRegistry,
+    ) -> Result<ModelToolOutput> {
+        let arguments: HelpArguments = serde_json::from_value(arguments.clone())
+            .map_err(|error| anyhow!("invalid help arguments: {error}"))?;
+        if arguments.protocols.len() > MAX_HELP_PROTOCOLS {
+            bail!("help loads at most {MAX_HELP_PROTOCOLS} protocols per call; split the request");
+        }
+        Ok(protocols.load_help(&arguments.protocols).await?.into())
+    }
+}
+
 pub(super) struct ProtocolToolsPlugin;
 
 pub(crate) fn register_protocol_tools(
     registry: &mut crate::plugin::ModelToolRegistry,
 ) -> Result<()> {
     registry.register(ProtocolTool::new(ProtocolOperation::Read))?;
-    registry.register(ProtocolTool::new(ProtocolOperation::Exec))
+    registry.register(ProtocolTool::new(ProtocolOperation::Exec))?;
+    registry.register(HelpTool)
 }
 
 impl Plugin for ProtocolToolsPlugin {
     fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
-        [ProtocolOperation::Read, ProtocolOperation::Exec]
-            .into_iter()
-            .map(|operation| ProtocolTool::new(operation).descriptor())
-            .collect()
+        [
+            ProtocolTool::new(ProtocolOperation::Read).descriptor(),
+            ProtocolTool::new(ProtocolOperation::Exec).descriptor(),
+            HelpTool.descriptor(),
+        ]
+        .to_vec()
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
@@ -167,13 +217,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn help_tool_describes_a_bounded_protocol_list() {
+        let descriptor = HelpTool.descriptor();
+        assert_eq!(descriptor.name, "help");
+        assert_eq!(descriptor.parameters["required"], json!(["protocols"]));
+        assert_eq!(
+            descriptor.parameters["properties"]["protocols"]["maxItems"],
+            json!(4)
+        );
+        assert_eq!(
+            descriptor.parameters["properties"]["protocols"]["minItems"],
+            json!(1)
+        );
+    }
+
     #[tokio::test]
-    async fn protocol_tools_dispatch_string_bodies_without_transforming_empty_input() {
+    async fn help_tool_loads_protocols_and_unlocks_model_calls() {
         let (protocols, output) = protocols().await;
-        ProtocolTool::new(ProtocolOperation::Read)
-            .execute(&json!({"uri": "capture://help", "body": ""}), &protocols)
+        let loaded = HelpTool
+            .execute(&json!({"protocols": ["capture"]}), &protocols)
             .await
             .unwrap();
+        assert!(loaded.output().contains("Loaded protocols stay loaded"));
+
         let read = ProtocolTool::new(ProtocolOperation::Read)
             .execute(&json!({"uri": "capture://value", "body": ""}), &protocols)
             .await
@@ -188,6 +255,23 @@ mod tests {
 
         assert_eq!(read.output(), "read:");
         assert_eq!(exec.output(), "exec:{\"answer\":42}");
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn help_tool_rejects_oversized_and_malformed_requests() {
+        let (protocols, output) = protocols().await;
+        let error = HelpTool
+            .execute(&json!({"protocols": ["a", "b", "c", "d", "e"]}), &protocols)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("at most 4"));
+
+        let error = HelpTool
+            .execute(&json!({"protocols": "capture"}), &protocols)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid help arguments"));
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 

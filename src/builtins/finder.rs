@@ -64,8 +64,8 @@ Unix, `~` and paths beginning with `~/` resolve from the current user's home
 directory; `~user` is not expanded. The root must be an existing directory.
 The scope restricts code search only; web reads are unaffected.
 
-Every other `finder` call, including `finder://help`, MUST pass an empty string
-body.
+Every `finder` call other than the lookup question itself MUST pass an empty
+string body; `finder` supports no other reads.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -263,7 +263,7 @@ fn finder_spec(
         cwd,
         parent_session_id,
     )
-    .with_tools(["read", "exec"])
+    .with_tools(["read", "exec", "help"])
     .with_protocols(["file", "search", TASKS_PROTOCOL, "https"])
     .replace_system_prompt(SYSTEM_PROMPT);
     match max_output_tokens {
@@ -349,13 +349,13 @@ impl Protocol for FinderProtocol {
         match request.target {
             "help" => {
                 if !request.body.is_empty() {
-                    bail!(
-                        "finder help requires an empty body; retry read(\"finder://help\", \"\")"
-                    );
+                    bail!("finder help requires an empty body");
                 }
                 Ok(HELP.as_bytes().to_vec())
             }
-            _ => bail!("finder supports only read(\"finder://help\", \"\")"),
+            _ => bail!(
+                "finder serves its contract through the help tool; pass lookup questions to exec"
+            ),
         }
     }
 
@@ -365,7 +365,7 @@ impl Protocol for FinderProtocol {
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
-            bail!("finder help is read-only; use read(\"finder://help\", \"\")");
+            bail!("finder help is read-only");
         }
         let question = request.body.trim();
         if question.is_empty() {

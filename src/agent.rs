@@ -733,14 +733,6 @@ fn validate_spec(spec: &AgentSpec) -> Result<()> {
     Ok(())
 }
 
-fn frozen_prompt_uses_legacy_sessions(prompt: &str) -> bool {
-    prompt.contains("\n- sessions: ") || prompt.contains("sessions://")
-}
-
-fn frozen_prompt_uses_legacy_grep(prompt: &str) -> bool {
-    prompt.contains("\n- grep: ") || prompt.contains("grep://")
-}
-
 impl AgentHost {
     async fn build_services(
         &self,
@@ -767,24 +759,6 @@ impl AgentHost {
             self.inner.manager.directory(),
             mcp_profile,
         );
-        // TODO: Remove resumed-session `sessions://` compatibility after the migration window.
-        let legacy_sessions = if session.is_new() {
-            false
-        } else {
-            frozen_prompt_uses_legacy_sessions(&session.context().await.system_prompt)
-        };
-        if legacy_sessions {
-            plugins.add(crate::builtins::SessionsPlugin::new(&self.inner.cwd));
-        }
-        // TODO: Remove resumed-session `grep://` compatibility after the migration window.
-        let legacy_grep = if session.is_new() {
-            false
-        } else {
-            frozen_prompt_uses_legacy_grep(&session.context().await.system_prompt)
-        };
-        if legacy_grep {
-            crate::builtins::add_legacy_grep(&mut plugins, &self.inner.cwd);
-        }
         if let Some(finder) = crate::builtins::finder::session_plugin(
             &self.inner.cwd,
             session.id(),
@@ -1046,7 +1020,7 @@ impl RuntimeInitializer for AgentInitializer {
             let report = self.wasm_plugins.initialize().await?;
             if !report.diagnostics.is_empty() {
                 notices.push(format!(
-                    "skipped {} WASM plugin(s); read wasm_plugin://help for diagnostics",
+                    "skipped {} WASM plugin(s); call help([\"wasm_plugin\"]) for diagnostics",
                     report.diagnostics.len()
                 ));
             }
@@ -1076,7 +1050,7 @@ impl RuntimeInitializer for AgentInitializer {
             tokio::spawn(async move {
                 let notice = match wasm_plugins.initialize().await {
                     Ok(report) if !report.diagnostics.is_empty() => Some(format!(
-                        "skipped {} WASM plugin(s); read wasm_plugin://help for diagnostics",
+                        "skipped {} WASM plugin(s); call help([\"wasm_plugin\"]) for diagnostics",
                         report.diagnostics.len()
                     )),
                     Ok(_) => None,
@@ -1164,32 +1138,6 @@ mod tests {
             Path::new("/work"),
         ))
         .unwrap();
-    }
-
-    #[test]
-    fn legacy_sessions_compatibility_comes_only_from_the_frozen_prompt() {
-        assert!(frozen_prompt_uses_legacy_sessions(
-            "Available protocols:\n- sessions: Search saved sessions."
-        ));
-        assert!(frozen_prompt_uses_legacy_sessions(
-            "Use read(\"sessions://recent\", \"\")"
-        ));
-        assert!(!frozen_prompt_uses_legacy_sessions(
-            "Search saved sessions through context."
-        ));
-    }
-
-    #[test]
-    fn legacy_grep_compatibility_comes_only_from_the_frozen_prompt() {
-        assert!(frozen_prompt_uses_legacy_grep(
-            "Available protocols:\n- grep: Search file contents."
-        ));
-        assert!(frozen_prompt_uses_legacy_grep(
-            "Use read(\"grep://src\", \"needle\")"
-        ));
-        assert!(!frozen_prompt_uses_legacy_grep(
-            "Search file contents through search."
-        ));
     }
 
     #[test]
@@ -1325,49 +1273,5 @@ mod tests {
             protocol_names,
         );
         reopened.close().await;
-
-        let legacy_spec = spec.replace_system_prompt(
-            "Legacy frozen prompt\nAvailable protocols:\n- grep: Search file contents.\n- sessions: Search saved sessions.",
-        );
-        let legacy = host.open_root(None, legacy_spec.clone()).await.unwrap();
-        legacy.services().runtime.prepare_context().await.unwrap();
-        legacy.services().runtime.session().persist().await.unwrap();
-        let legacy_id = legacy.session_id().to_string();
-        assert!(
-            !legacy
-                .services()
-                .protocols
-                .descriptors()
-                .iter()
-                .any(|descriptor| descriptor.name == "sessions")
-        );
-        assert!(
-            !legacy
-                .services()
-                .protocols
-                .descriptors()
-                .iter()
-                .any(|descriptor| descriptor.name == "grep")
-        );
-        legacy.close().await;
-
-        let legacy = host.open_root(Some(&legacy_id), legacy_spec).await.unwrap();
-        assert!(
-            legacy
-                .services()
-                .protocols
-                .descriptors()
-                .iter()
-                .any(|descriptor| descriptor.name == "sessions")
-        );
-        assert!(
-            legacy
-                .services()
-                .protocols
-                .descriptors()
-                .iter()
-                .any(|descriptor| descriptor.name == "grep")
-        );
-        legacy.close().await;
     }
 }

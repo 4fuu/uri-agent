@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 fn help(skill_md: &str, skill_directory: &Path, protocol: &str) -> String {
     format!(
-        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read, including its help read, MUST use an empty string\nbody. This protocol supports `read` only; it does not support `exec`.\n",
+        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read MUST use an empty string\nbody. This protocol supports `read` only; it does not support `exec`.\n",
         display_path(skill_directory)
     )
 }
@@ -177,7 +177,7 @@ impl Protocol for SkillProtocol {
         }
         if request.target.is_empty() {
             bail!(
-                r#"skill resource target is required; use read("{}://help", "") for instructions"#,
+                "skill resource target is required; call help([{:?}]) for instructions",
                 self.protocol
             );
         }
@@ -416,7 +416,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(r#"read("code-review-skill://help", "")"#)
+                .contains(r#"call help(["code-review-skill"])"#)
         );
 
         let error = skill

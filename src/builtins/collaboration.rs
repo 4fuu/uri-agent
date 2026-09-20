@@ -281,7 +281,7 @@ impl Protocol for CollaborationPlugin {
                 Ok(format_participant(&participant, self.state.inner.session.id()).into_bytes())
             }
             _ => bail!(
-                r#"collaboration read expects "collaboration://help", "collaboration://help/send", "collaboration://participants", or "collaboration://status/<name-or-id>""#
+                r#"collaboration read expects "collaboration://help/send", "collaboration://participants", or "collaboration://status/<name-or-id>""#
             ),
         }
     }

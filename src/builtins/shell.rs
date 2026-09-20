@@ -35,7 +35,7 @@ const BASH_HELP: &str = r#"# bash
 Run Bash commands. Commands start in the foreground and normally return their
 final result in the same `exec` call.
 
-`read` supports only `bash://help` and MUST use an empty string body. To run a
+`read` supports no shell operations. To run a
 command, call `exec` with `bash://run`; the command body MUST contain at least
 one non-whitespace character:
 
@@ -105,7 +105,7 @@ Prefer modern cross-platform tools such as `rg` and `fd` when available.
 PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
-`read` supports only `pwsh://help` and MUST use an empty string body. To run a
+`read` supports no shell operations. To run a
 command, call `exec` with `pwsh://run`; the command body MUST contain at least
 one non-whitespace character:
 
@@ -334,15 +334,12 @@ impl Protocol for ShellProtocol {
     ) -> Result<Vec<u8>> {
         if request.target != "help" {
             bail!(
-                r#"{0} read supports only help; use read("{0}://help", "") or run a command with exec("{0}://run", "<command>")"#,
+                r#"{0} read supports no shell operations; run a command with exec("{0}://run", "<command>")"#,
                 self.name
             );
         }
         if !request.body.is_empty() {
-            bail!(
-                r#"{0}://help requires an empty body; retry read("{0}://help", "")"#,
-                self.name
-            );
+            bail!("{0}://help requires an empty body", self.name);
         }
         Ok(if self.name == "bash" {
             BASH_HELP
@@ -986,7 +983,7 @@ mod tests {
         assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
-        assert!(PWSH_HELP.contains("`pwsh://help` and MUST use an empty string body"));
+        assert!(PWSH_HELP.contains("`read` supports no shell operations"));
         assert!(PWSH_HELP.contains("command body MUST contain at least\none non-whitespace"));
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
@@ -998,7 +995,7 @@ mod tests {
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
         assert!(PWSH_HELP.contains("MUST NOT poll for completion"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
-        assert!(BASH_HELP.contains("`bash://help` and MUST use an empty string body"));
+        assert!(BASH_HELP.contains("`read` supports no shell operations"));
         assert!(BASH_HELP.contains("command body MUST contain at least\none non-whitespace"));
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));

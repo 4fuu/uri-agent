@@ -762,8 +762,8 @@ mod tests {
         let tool_call = ToolCall::new(
             call_id.clone(),
             ToolFunction::new(
-                "read".to_string(),
-                serde_json::json!({"uri": "file://help"}),
+                "help".to_string(),
+                serde_json::json!({"protocols": ["file"]}),
             ),
         );
         let history = vec![
@@ -776,7 +776,7 @@ mod tests {
                 content: vec![UserContent::tool_result_for(
                     call_id,
                     None,
-                    "read".to_string(),
+                    "help".to_string(),
                     vec![ToolResultContent::text("help output")],
                 )],
             },

@@ -1,8 +1,8 @@
 # WASM plugins
 
 URI Agent loads trusted Extism modules as protocols and typed direct model
-tools. `wasm_plugin://help`, `/load`, and `/author` are the model-facing
-references. Rust authors should use the [SDK guide](../sdk/README.md) and
+tools. The `wasm_plugin` help page plus its `/load` and `/author` sub-pages are
+the model-facing references. Rust authors should use the [SDK guide](../sdk/README.md) and
 [buildable example](../examples/wasm-plugin/).
 
 ## Installation and reload
@@ -25,8 +25,8 @@ protocol, tool, resident callback, or compaction callback also handles tagged
 requests through `uri_agent_handle`.
 
 The manifest declares protocol and strict typed-tool descriptors, model-role
-names, permissions, and resident opt-in. Protocols must implement
-`<protocol>://help`; bodies are always strings. Typed tool schemas must be
+names, permissions, and resident opt-in. Protocols must implement the built-in
+`help` target; bodies are always strings. Typed tool schemas must be
 top-level objects with `properties` and `additionalProperties: false`. Calls
 into one module are serialized and its memory survives until reload.
 
@@ -56,7 +56,7 @@ optional output cap. `SubmitKind` is `Prompt` or `Steer`.
 Steer targets the next model boundary while the Agent is active and is accepted
 as Prompt when the Agent is idle.
 
-Plugin Agents use ordinary `sessions-v3.db` conversations. They require a
+Plugin Agents use ordinary `sessions-v4.db` conversations. They require a
 persisted same-project depth-1 parent and are always depth 2; no depth-2 Agent
 may create another. Provider/model and thinking freeze after the first durably
 accepted submission. Prompt, tools, and protocols are fixed at creation except

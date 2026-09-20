@@ -22,9 +22,9 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 These documents explain stable concepts and cross-cutting behavior. More specific references remain authoritative:
 
 - `uri-agent --help` defines the current command-line interface.
-- The active model-tool schemas define direct-tool arguments; `<protocol>://help` defines a registered protocol's accepted addresses, string body, execution behavior, result routes, and limits.
+- The active model-tool schemas define direct-tool arguments; a protocol's page loaded through the `help` tool defines its accepted addresses, string body, execution behavior, result routes, and limits.
 - `uri-agent-docs://README.md` exposes this documentation embedded in the running binary, independent of its startup working directory.
-- `wasm_plugin://help` publishes active WASM plugin state and routes to separate loading and authoring help pages.
+- The `wasm_plugin` help page publishes active WASM plugin state and routes to separate loading and authoring help pages.
 - `F1` and `:help` show the active command and keymap reference after global and project overrides are applied.
 - The [pi model catalog](https://github.com/earendil-works/pi) plus local `models.json` defines the available providers and models.
 - [`AGENTS.md`](../AGENTS.md) is the concise entry point for coding agents; the [development guide](development.md) contains the detailed repository rules it references.
@@ -36,4 +36,4 @@ These documents explain stable concepts and cross-cutting behavior. More specifi
   from the live catalog when those public figures change.
 - Detailed documents in `docs/` are maintained in English only.
 - Put mutable detail in one authoritative document and link to it instead of copying it.
-- Keep protocol-specific model instructions in `<protocol>://help`; documentation here should explain how the protocol system fits together.
+- Keep protocol-specific model instructions in each protocol's help page; documentation here should explain how the protocol system fits together.

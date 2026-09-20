@@ -2330,10 +2330,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             }
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(fit_panel_title(
-                        " PROTOCOLS · read <name>://help ",
-                        area.width,
-                    )))
+                    .block(block.title(fit_panel_title(" PROTOCOLS · help([name]) ", area.width)))
                     .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,

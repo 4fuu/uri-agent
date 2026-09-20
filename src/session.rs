@@ -25,9 +25,9 @@ use tokio_rusqlite::{
 };
 use uuid::Uuid;
 
-const SESSION_DATABASE_FILE: &str = "sessions-v3.db";
+const SESSION_DATABASE_FILE: &str = "sessions-v4.db";
 const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const RESUME_INDEX_VERSION: u32 = 3;
+const RESUME_INDEX_VERSION: u32 = 4;
 const MAX_EVENT_PAGE: usize = 512;
 const COLLABORATION_PRESENCE_TTL: chrono::Duration = chrono::Duration::seconds(10);
 const RESUME_EVENT_KINDS: &[&str] = &[
@@ -648,7 +648,7 @@ struct ResumeState {
     spec: Option<AgentSpec>,
     has_user: bool,
     successful_help_reads: HashSet<String>,
-    pending_help_reads: HashMap<String, String>,
+    pending_help_reads: HashMap<String, Vec<String>>,
     tasks: HashMap<String, TaskPointers>,
     usage: UsageTotals,
     token_calibration: TokenCalibration,
@@ -3475,16 +3475,17 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             arguments,
         } => {
             state.pending_help_reads.remove(call_id);
-            if name == "read"
-                && let (Some(uri), Some("")) = (
-                    arguments.get("uri").and_then(Value::as_str),
-                    arguments.get("body").and_then(Value::as_str),
-                )
-                && let Ok((protocol, "help")) = crate::protocol::split_address(uri)
+            if name == "help"
+                && let Some(protocols) = arguments.get("protocols").and_then(Value::as_array)
             {
-                state
-                    .pending_help_reads
-                    .insert(call_id.clone(), protocol.to_string());
+                let names = protocols
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !names.is_empty() {
+                    state.pending_help_reads.insert(call_id.clone(), names);
+                }
             }
             state.token_calibration.pending_visible_units = state
                 .token_calibration
@@ -3498,11 +3499,11 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             failed,
             ..
         } => {
-            if let Some(protocol) = state.pending_help_reads.remove(call_id)
-                && name == "read"
+            if let Some(protocols) = state.pending_help_reads.remove(call_id)
+                && name == "help"
                 && !failed
             {
-                state.successful_help_reads.insert(protocol);
+                state.successful_help_reads.extend(protocols);
             }
         }
         EventKind::Task { id, output, .. } => {
@@ -4743,14 +4744,14 @@ mod tests {
             id: Some("assistant-provider-id".into()),
             content: vec![AssistantContent::ToolCall(ToolCall::new(
                 call_id.clone(),
-                ToolFunction::new("read".into(), serde_json::json!({"uri": "file://help"})),
+                ToolFunction::new("help".into(), serde_json::json!({"protocols": ["file"]})),
             ))],
         };
         let tool_result = Message::User {
             content: vec![UserContent::ToolResult(ToolResult {
                 call: call_id,
                 provider: None,
-                name: "read".into(),
+                name: "help".into(),
                 content: vec![ToolResultContent::text("help output")],
             })],
         };
@@ -4920,12 +4921,12 @@ mod tests {
             .append_batch(vec![
                 EventKind::ToolCall {
                     call_id: "help".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"uri":"file://help","body":""}),
+                    name: "help".into(),
+                    arguments: serde_json::json!({"protocols":["file"]}),
                 },
                 EventKind::ToolResult {
                     call_id: "help".into(),
-                    name: "read".into(),
+                    name: "help".into(),
                     output: "ok".into(),
                     failed: false,
                     protocol_help_required: false,
@@ -4953,20 +4954,20 @@ mod tests {
                 },
                 EventKind::ToolCall {
                     call_id: "failed-help".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"uri":"search://help","body":""}),
+                    name: "help".into(),
+                    arguments: serde_json::json!({"protocols":["search"]}),
                 },
                 EventKind::ToolResult {
                     call_id: "failed-help".into(),
-                    name: "read".into(),
+                    name: "help".into(),
                     output: "failed".into(),
                     failed: true,
                     protocol_help_required: false,
                 },
                 EventKind::ToolCall {
                     call_id: "reused".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"uri":"tasks://help","body":""}),
+                    name: "help".into(),
+                    arguments: serde_json::json!({"protocols":["tasks"]}),
                 },
             ])
             .await

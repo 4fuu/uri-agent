@@ -26,7 +26,7 @@ use uri_agent_plugin_sdk::{define_plugin, HandlerRequest, HandlerResult,
 
 fn manifest() -> PluginManifest {
     PluginManifest::new([ProtocolDescriptor::new(
-        "example", "Read example://help before use", true, false)])
+        "example", "Load this plugin's help page before use", true, false)])
 }
 
 fn handle(request: HandlerRequest) -> HandlerResult {
@@ -39,7 +39,8 @@ fn handle(request: HandlerRequest) -> HandlerResult {
 define_plugin!(manifest(), handle);
 ```
 
-Every protocol implements `<protocol>://help`; bodies are strings, including
+Every protocol implements the built-in `help` target; the host serves that
+page through the `help` tool. Bodies are strings, including
 `""` when empty. `read(uri, body)` and `exec(uri, body)` call static built-ins.
 Register structured operations with `with_model_tools([ModelToolDescriptor])`
 and handle `HandlerRequest::ModelTool`; schemas must be strict top-level JSON

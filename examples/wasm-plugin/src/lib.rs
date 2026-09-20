@@ -6,7 +6,7 @@ use uri_agent_plugin_sdk::{
 fn manifest() -> PluginManifest {
     PluginManifest::new([ProtocolDescriptor::new(
         "example",
-        "Example Rust WASM plugin; read example://help before use",
+        "Example Rust WASM plugin; load its help page before use",
         true,
         false,
     )])

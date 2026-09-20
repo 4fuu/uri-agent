@@ -129,9 +129,9 @@ URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
   names are unique.
 - `read` and `exec` always receive a string body. The registry splits only the
   first `://` and passes the opaque remainder and body unchanged.
-- Every protocol implements its mandatory help read. Exact protocol behavior
-  belongs to `<protocol>://help`; implementation, tests, and help change
-  together.
+- Every protocol implements its mandatory help page. Exact protocol behavior
+  belongs to that page, loaded through the `help` tool; implementation, tests,
+  and help change together.
 - Protocol images remain typed model content while retaining a textual
   transcript projection. Text-only models reject image content.
 - System-prompt fragments contain only context required before the first tool
@@ -225,7 +225,7 @@ For documentation-only changes, verify instead:
 - defaults and precedence match source;
 - `README.md` and `README.zh-CN.md` remain equivalent;
 - detailed `docs/` content remains English-only;
-- protocol behavior changes are also reflected in `<protocol>://help`.
+- protocol behavior changes are also reflected in the protocol's help page.
 
 ## Documentation ownership
 

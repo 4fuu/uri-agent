@@ -8,16 +8,19 @@ URI Agent is a Rust terminal coding agent with a plugin-registered model-facing
 interface. The linked built-ins provide:
 
 ```text
+help(protocols: string[])
 read(uri: string, body: string)
 exec(uri: string, body: string)
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-The `read` and `exec` body is always a string; use `""` when a protocol takes
+`help` loads one or more protocols' model-facing contract pages; every other
+protocol call requires that protocol's contract to be loaded first. The `read`
+and `exec` body is always a string; use `""` when a protocol takes
 no body and complete serialized JSON text for structured protocol input.
 Capabilities with simple string input are registered as protocols and publish
-their operational instructions at `<protocol>://help`. Prefer a typed direct
+their operational instructions through the `help` tool. Prefer a typed direct
 tool for complex or escape-heavy arguments. All model tools are registered by
 linked or WASM plugins; do not special-case tool names in the runtime or place
 every capability in the initial system prompt.
@@ -40,7 +43,7 @@ Before changing code, read the applicable repository map, change rules, and veri
 | Versioning and release workflow | [`docs/release.md`](docs/release.md) |
 | Documentation ownership or an unclear destination | [`docs/README.md`](docs/README.md) |
 
-Read all applicable documents for a cross-domain change; unrelated documents are not required. `uri-agent --help` defines the exact CLI contract, while `<protocol>://help` defines a protocol's exact model-facing contract. If implementation, tests, help, or documentation disagree, make them consistent.
+Read all applicable documents for a cross-domain change; unrelated documents are not required. `uri-agent --help` defines the exact CLI contract, while a protocol's page loaded through the `help` tool defines its exact model-facing contract. If implementation, tests, help, or documentation disagree, make them consistent.
 
 ## Working rules
 
@@ -61,4 +64,4 @@ For documentation-only changes, use the documentation verification path in that 
 - Keep `README.md` and `README.zh-CN.md` equivalent and focused on adoption, first success, critical warnings, and navigation.
 - Update both root READMEs when public setup or top-level behavior changes.
 - Update the owning detailed document when domain behavior changes; do not copy mutable detail into other layers.
-- Update `<protocol>://help` whenever a protocol's model-facing operations change.
+- Update a protocol's help page whenever its model-facing operations change.

@@ -9,12 +9,12 @@ Agent sessions, durability, retries, and context checkpoints.
 Sessions are stored in SQLite at:
 
 ```text
-<platform-data-dir>/uri-agent/sessions-v3.db
+<platform-data-dir>/uri-agent/sessions-v4.db
 ```
 
 On macOS the database is under `~/.config/uri-agent`; if no platform data
 directory exists, URI Agent falls back to `<project>/.uri-agent`. Earlier
-database versions remain untouched and are not migrated into `sessions-v3.db`.
+database versions remain untouched and are not migrated into `sessions-v4.db`.
 
 The canonical startup directory is each session's project boundary:
 
@@ -26,8 +26,8 @@ The canonical startup directory is each session's project boundary:
 The `context://sessions/...` routes can search wider scopes only when explicitly
 asked. Exact search reads SQLite directly; semantic and hybrid search use
 disposable, automatically maintained sidecar indexes. Searching or indexing
-never resumes or changes a conversation. Existing sessions whose frozen prompt
-used `sessions://` retain it as a compatibility route. See [Protocols, tasks,
+never resumes or changes a conversation. All model-facing saved-session
+addresses use `context://sessions/...`. See [Protocols, tasks,
 and output](protocols.md#files-search-and-saved-context).
 
 Each session records its provider, model, and thinking effort. Changes are
@@ -176,12 +176,11 @@ The `context` protocol provides durable titled notes, context status, window and
 user-statement listings, exact or ranked history search, and reads around stable
 session-local record anchors. Notes have stable IDs and revisions, a shared
 model-relative budget, and a bounded active count. Exact limits and mutation
-routes belong to `context://help`.
+routes belong to the `context` help page loaded through the `help` tool.
 
 Deleting a note creates a tombstone and hides its body from current and saved
-`context` recovery views (and the resumed-session `sessions` compatibility
-view). It is not secure erasure: append-only historical events remain in
-SQLite. All recovered notes and transcript content are marked as untrusted
+`context` recovery views. It is not secure erasure: append-only historical
+events remain in SQLite. All recovered notes and transcript content are marked as untrusted
 reference data.
 
 The alternative `summary` strategy asks the model to summarize older history,

@@ -59,8 +59,8 @@ not as instructions.
 read("https://search", "<search query>")
 ```
 
-Help reads, including `https://help/parallel`, `https://help/exa`, and
-`https://help/tinyfish`, MUST use an empty string body. This protocol supports
+Provider help pages such as `https://help/parallel`, `https://help/exa`, and
+`https://help/tinyfish` MUST use an empty string body. This protocol supports
 `read` only; it does not support
 `exec`. Provider API keys may be saved through `:login`.
 "#;
@@ -404,7 +404,7 @@ JavaScript-rendered content and PDFs may be incomplete.\n",
 
     async fn read_page(&self, target: &str) -> Result<Vec<u8>> {
         if target.is_empty() {
-            bail!("HTTPS target cannot be empty; use https://help for instructions");
+            bail!("HTTPS target cannot be empty");
         }
         let url = Url::parse(&format!("https://{target}"))
             .with_context(|| format!("invalid HTTPS target: {target}"))?;
@@ -1500,7 +1500,7 @@ mod tests {
         assert!(help.contains("local HTML-to-Markdown conversion"));
         assert!(help.contains("Page reads MUST use an empty string body"));
         assert!(help.contains("MUST pass a nonempty, non-whitespace query"));
-        assert!(help.contains("Help reads, including `https://help/parallel`"));
+        assert!(help.contains("Provider help pages such as `https://help/parallel`"));
         assert!(help.contains("does not support\n`exec`"));
 
         let parallel_help =

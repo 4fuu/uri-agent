@@ -73,9 +73,7 @@ impl Protocol for UriAgentDocsProtocol {
     ) -> Result<Vec<u8>> {
         if !request.body.is_empty() {
             if request.target == "help" {
-                bail!(
-                    r#"uri-agent-docs://help requires an empty body; retry read("uri-agent-docs://help", "")"#
-                );
+                bail!("uri-agent-docs://help requires an empty body");
             }
             bail!(
                 "uri-agent-docs reads require an empty body; retry read({:?}, \"\")",
@@ -89,7 +87,7 @@ impl Protocol for UriAgentDocsProtocol {
             return Ok(content.as_bytes().to_vec());
         }
         bail!(
-            r#"unknown {PROTOCOL_NAME} read target: {}; use read("{PROTOCOL_NAME}://help", "") for the exact filename list"#,
+            r#"unknown {PROTOCOL_NAME} read target: {}; call help(["{PROTOCOL_NAME}"]) for the exact filename list"#,
             request.target
         )
     }

@@ -1789,7 +1789,7 @@ impl AgentRuntime {
                 EventKind::ModelMessage {
                     message: Message::user(format!(
                         "<uri-agent-context-reminder>\n\
-                         This is a host reminder, not a user request. Context window {window_id} has approximately {remaining} tokens remaining. Read context://help if needed, then review context://notes and update durable working state. URI Agent will automatically roll over near the hard limit. After rollover, all records in the current model context are cleared and can only be recovered through context://.\n\
+                         This is a host reminder, not a user request. Context window {window_id} has approximately {remaining} tokens remaining. Call help([\"context\"]) if its contract is not loaded, then review context://notes and update durable working state. URI Agent will automatically roll over near the hard limit. After rollover, all records in the current model context are cleared and can only be recovered through context://.\n\
                          </uri-agent-context-reminder>"
                     )),
                 },
@@ -1819,7 +1819,7 @@ impl AgentRuntime {
             "<uri-agent-context-rollover>\n\
              This is a host-created context boundary, not a new user request. You are now in context window {window_id}; the prior transcript is not loaded. Recoverable records from window {previous_window} remain available through the context protocol.{handoff}\n\
              Before continuing any work, you MUST:\n\
-             1. read(\"context://help\", \"\");\n\
+             1. call help([\"context\"]) to load the context contract;\n\
              2. read context://notes and every active note it lists;\n\
              3. read context://history/users, searching or paging as needed to recover the user's exact requirements; and\n\
              4. inspect context://history/windows and window {previous_window} as needed to recover decisions, evidence, and unfinished work. Use `context://history/around/<record-id>` or a note's `/context` route when an anchor can recover the relevant neighborhood with less reading.\n\
@@ -2572,7 +2572,7 @@ fn task_notification_message(records: &[TaskRecord]) -> String {
         }
         if output_truncated {
             message.push_str(&format!(
-                "\n[Output truncated. If tasks help has not been loaded, read(\"tasks://help\", \"\") first. Then read(\"{uri}\", \"\") once for complete output.]"
+                "\n[Output truncated. If tasks help has not been loaded, call help([\"tasks\"]) first. Then read(\"{uri}\", \"\") once for complete output.]"
             ));
         }
         message.push('\n');
@@ -3146,6 +3146,18 @@ mod tests {
         )
     }
 
+    fn help_call(id: &str, protocols: &[&str]) -> ToolCall {
+        ToolCall::new(
+            ToolCallId::new(id).unwrap(),
+            ToolFunction::new(
+                "help".to_string(),
+                serde_json::json!({
+                    "protocols": protocols
+                }),
+            ),
+        )
+    }
+
     fn exec_call(id: &str, uri: &str, body: &str) -> ToolCall {
         ToolCall::new(
             ToolCallId::new(id).unwrap(),
@@ -3222,7 +3234,7 @@ mod tests {
 
         let message = task_notification_message(&[tasks.get(&id).await.unwrap()]);
 
-        assert!(message.contains(r#"read("tasks://help", "") first"#));
+        assert!(message.contains(r#"call help(["tasks"]) first"#));
         assert!(message.contains(r#"read("tasks://001", "") once for complete output"#));
         tasks.shutdown().await;
     }
@@ -4490,10 +4502,9 @@ mod tests {
         let call = ToolCall::new(
             ToolCallId::new("call-1").unwrap(),
             ToolFunction::new(
-                "read".to_string(),
+                "help".to_string(),
                 serde_json::json!({
-                    "uri": "file://help",
-                    "body": ""
+                    "protocols": ["file"]
                 }),
             ),
         );
@@ -4879,16 +4890,7 @@ mod tests {
                 )),
             )
             .unwrap();
-        let help_call = ToolCall::new(
-            ToolCallId::new("read-help").unwrap(),
-            ToolFunction::new(
-                "read".to_string(),
-                serde_json::json!({
-                    "uri": "file://help",
-                    "body": ""
-                }),
-            ),
-        );
+        let help_call = help_call("load-help", &["file"]);
         let image_call = ToolCall::new(
             ToolCallId::new("read-image").unwrap(),
             ToolFunction::new(
@@ -4933,7 +4935,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             EventKind::ToolResult { name, output, failed: false, .. }
-                if name == "read" && output.contains("# file")
+                if name == "help" && output.contains("# file")
         )));
         assert!(events.iter().any(|event| matches!(
             &event.kind,
@@ -5064,9 +5066,9 @@ mod tests {
         let backend = Arc::new(FakeBackend {
             responses: Mutex::new(VecDeque::from([
                 (
-                    vec![AssistantContent::ToolCall(read_call(
+                    vec![AssistantContent::ToolCall(help_call(
                         "image-help",
-                        "image://help",
+                        &["image"],
                     ))],
                     None,
                 ),
@@ -5198,7 +5200,8 @@ mod tests {
 
         runtime.run_turn("skip help".into()).await.unwrap();
 
-        let expected = "Read \"blocking://help\" with an empty body before using this protocol.";
+        let expected =
+            "Load this protocol first: call help([\"blocking\"]) before using blocking://.";
         let events = session.snapshot().await.unwrap();
         assert!(events.iter().any(|event| matches!(
             &event.kind,
@@ -5273,12 +5276,12 @@ mod tests {
                 },
                 EventKind::ToolCall {
                     call_id: "context-help".to_string(),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({"uri": "context://help", "body": ""}),
+                    name: "help".to_string(),
+                    arguments: serde_json::json!({"protocols": ["context"]}),
                 },
                 EventKind::ToolResult {
                     call_id: "context-help".to_string(),
-                    name: "read".to_string(),
+                    name: "help".to_string(),
                     output: "context help".to_string(),
                     failed: false,
                     protocol_help_required: false,
@@ -5399,10 +5402,7 @@ mod tests {
         let backend = Arc::new(ScriptedBackend {
             responses: Mutex::new(VecDeque::from([
                 Ok(ModelResponse {
-                    content: vec![AssistantContent::ToolCall(read_call(
-                        "help",
-                        "context://help",
-                    ))],
+                    content: vec![AssistantContent::ToolCall(help_call("help", &["context"]))],
                     usage: None,
                     context_tokens: None,
                     finish_reason: Some(FinishReason::ToolCalls),
@@ -6949,7 +6949,7 @@ mod tests {
             responses: Mutex::new(VecDeque::from([
                 Ok(ModelResponse {
                     content: vec![
-                        AssistantContent::ToolCall(read_call("help", "blocking://help")),
+                        AssistantContent::ToolCall(help_call("help", &["blocking"])),
                         AssistantContent::ToolCall(read_call("call-1", "blocking://wait")),
                         AssistantContent::ToolCall(read_call("call-2", "blocking://wait")),
                     ],

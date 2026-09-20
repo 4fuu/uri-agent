@@ -952,7 +952,7 @@ fn records_use_shared_help(records: &[SessionProtocolRecord]) -> bool {
 fn shared_help_descriptor() -> ProtocolDescriptor {
     ProtocolDescriptor {
         name: SHARED_PROTOCOL.to_string(),
-        description: "Shared usage contract for configured *-mcp protocols; read once before any server-specific MCP help"
+        description: "Shared usage contract for configured *-mcp protocols; loads automatically with each server-specific MCP help"
             .to_string(),
         can_read: true,
         can_exec: false,
@@ -1476,7 +1476,7 @@ impl Protocol for McpSharedHelpProtocol {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target != "help" {
-            bail!("mcp:// exposes only mcp://help");
+            bail!("mcp:// exposes no readable routes; use the configured <name>-mcp:// protocols");
         }
         if !request.body.is_empty() {
             bail!("MCP shared help requires an empty body");
@@ -1695,7 +1695,7 @@ impl McpProtocol {
                 .await
             }
             _ => bail!(
-                "unknown MCP read route {path:?}; read {}://help",
+                "unknown MCP read route {path:?}; call help([{:?}]) for this protocol's contract",
                 self.record.descriptor.name
             ),
         }
@@ -1763,8 +1763,9 @@ fn require_empty(query: Option<&str>, body: &str, operation: &str) -> Result<()>
 fn render_shared_help() -> String {
     "# MCP protocols\n\n\
      This is the shared contract for every configured protocol whose name ends in `-mcp`.\n\n\
-     Before using a server protocol, first read `mcp://help` once, then read that server's `<name>-mcp://help`. \
-     The server-specific help contains its frozen description and current handshake metadata without repeating this contract.\n\n\
+     Load a server protocol's contract with the help tool: help([\"<name>-mcp\"]) loads both that \
+     server's contract and this shared contract together. The server-specific help contains its \
+     frozen description and current handshake metadata without repeating this contract.\n\n\
      Routes on each `<name>-mcp://` protocol:\n\n\
      - `read(\"<name>-mcp://tools\", \"\")` — list tools.\n\
      - `read(\"<name>-mcp://tools/<percent-encoded-name>\", \"\")` — inspect a tool schema.\n\
@@ -4128,7 +4129,7 @@ mod tests {
             .await
             .unwrap();
         let help = String::from_utf8(help).unwrap();
-        assert!(help.contains("read `mcp://help` once"));
+        assert!(help.contains("loads both that"));
         assert!(help.contains("<name>-mcp://tools/<percent-encoded-name>"));
         assert!(help.contains("_body=<schema/path>"));
         assert!(help.contains("_json=true"));

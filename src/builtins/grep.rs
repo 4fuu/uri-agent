@@ -28,7 +28,6 @@ const RIPGREP_VERSION: &str = "14.1.1";
 const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 const MAX_INDEX_RETRIES: usize = 3;
 const SEARCH_SCHEME: &str = "search";
-const LEGACY_GREP_SCHEME: &str = "grep";
 
 fn help(cwd: &Path, scheme: &str) -> String {
     format!(
@@ -96,8 +95,7 @@ read("{scheme}://src?mode=hybrid&glob=**/*.rs&limit=10", "authentication flow")
 exec("{scheme}://src?mode=index&glob=**/*.rs", "")
 ```
 
-`{scheme}://help` MUST use an empty string body. `exec` supports only
-`mode=index` with an empty body.
+`exec` supports only `mode=index` with an empty body.
 "#,
         display_path(cwd)
     )
@@ -107,7 +105,6 @@ exec("{scheme}://src?mode=index&glob=**/*.rs", "")
 pub(super) struct GrepProtocol {
     cwd: PathBuf,
     downloads: Option<PluginDownloads>,
-    scheme: &'static str,
 }
 
 impl GrepProtocol {
@@ -115,14 +112,6 @@ impl GrepProtocol {
         Self {
             cwd: cwd.to_path_buf(),
             downloads: None,
-            scheme: SEARCH_SCHEME,
-        }
-    }
-
-    pub(super) fn legacy(cwd: &Path) -> Self {
-        Self {
-            scheme: LEGACY_GREP_SCHEME,
-            ..Self::new(cwd)
         }
     }
 
@@ -144,7 +133,7 @@ impl GrepProtocol {
         let record = context
             .tasks
             .allocate(
-                self.scheme,
+                SEARCH_SCHEME,
                 format!("Search code under {}", display_path(&root)),
             )
             .await;
@@ -195,7 +184,7 @@ impl Plugin for GrepProtocol {
 impl Protocol for GrepProtocol {
     fn descriptor(&self) -> ProtocolDescriptor {
         ProtocolDescriptor {
-            name: self.scheme.to_string(),
+            name: SEARCH_SCHEME.to_string(),
             description: "Search file contents with ripgrep (`rg`) or on-demand semantic and hybrid retrieval.".to_string(),
             can_read: true,
             can_exec: true,
@@ -209,26 +198,22 @@ impl Protocol for GrepProtocol {
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
             if !request.body.is_empty() {
-                bail!(
-                    r#"{}://help requires an empty body; retry read("{}://help", "")"#,
-                    self.scheme,
-                    self.scheme
-                );
+                bail!("{}://help requires an empty body", SEARCH_SCHEME);
             }
-            return Ok(help(&self.cwd, self.scheme).into_bytes());
+            return Ok(help(&self.cwd, SEARCH_SCHEME).into_bytes());
         }
         let (root, query) = request
             .target
             .split_once('?')
             .map_or((request.target, None), |(root, query)| (root, Some(query)));
-        let options = GrepOptions::parse(query, self.scheme)?;
+        let options = GrepOptions::parse(query, SEARCH_SCHEME)?;
         let resolved = resolve_path(&self.cwd, root)?;
-        validate_root(&resolved, self.scheme).await?;
+        validate_root(&resolved, SEARCH_SCHEME).await?;
         match options.mode {
             GrepMode::Exact => {
-                require_search_body(request.body, request.uri, self.scheme)?;
+                require_search_body(request.body, request.uri, SEARCH_SCHEME)?;
                 let downloads = self.downloads.as_ref().ok_or_else(|| {
-                    anyhow!("{} binary download access is not attached", self.scheme)
+                    anyhow!("{} binary download access is not attached", SEARCH_SCHEME)
                 })?;
                 let rg = downloads.ensure(&ripgrep_download()?).await?;
                 run_grep(
@@ -237,14 +222,14 @@ impl Protocol for GrepProtocol {
                     &grep_root_argument(&self.cwd, root, &resolved),
                     request.body,
                     &options,
-                    self.scheme,
+                    SEARCH_SCHEME,
                 )
                 .await
                 .map(String::into_bytes)
             }
             GrepMode::Semantic(mode) => {
-                require_search_body(request.body, request.uri, self.scheme)?;
-                options.validate_semantic(self.scheme)?;
+                require_search_body(request.body, request.uri, SEARCH_SCHEME)?;
+                options.validate_semantic(SEARCH_SCHEME)?;
                 self.run_semantic_grep(
                     resolved,
                     options.glob.clone(),
@@ -259,10 +244,10 @@ impl Protocol for GrepProtocol {
                 if !request.body.is_empty() {
                     bail!(
                         "{} semantic index status requires an empty body",
-                        self.scheme
+                        SEARCH_SCHEME
                     );
                 }
-                options.validate_index_operation(self.scheme)?;
+                options.validate_index_operation(SEARCH_SCHEME)?;
                 let corpus = code_corpus(&self.cwd, &resolved, options.glob.as_deref()).await?;
                 Ok(index_status(&corpus.spec, &corpus.catalog)
                     .await?
@@ -281,17 +266,17 @@ impl Protocol for GrepProtocol {
             .target
             .split_once('?')
             .map_or((request.target, None), |(root, query)| (root, Some(query)));
-        let options = GrepOptions::parse_exec(query, self.scheme)?;
+        let options = GrepOptions::parse_exec(query, SEARCH_SCHEME)?;
         if !request.body.is_empty() {
-            bail!("{} semantic indexing requires an empty body", self.scheme);
+            bail!("{} semantic indexing requires an empty body", SEARCH_SCHEME);
         }
-        options.validate_index_operation(self.scheme)?;
+        options.validate_index_operation(SEARCH_SCHEME)?;
         let resolved = resolve_path(&self.cwd, root)?;
-        validate_root(&resolved, self.scheme).await?;
+        validate_root(&resolved, SEARCH_SCHEME).await?;
         let label = format!("Index code under {}", display_path(&resolved));
         let record = context
             .tasks
-            .allocate_background(self.scheme, label)
+            .allocate_background(SEARCH_SCHEME, label)
             .await?;
         let id = record.id.clone();
         let cwd = self.cwd.clone();
@@ -894,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_help_uses_rg_contract_and_legacy_help_keeps_its_scheme() {
+    async fn search_help_uses_rg_contract() {
         let directory = tempfile::tempdir().unwrap();
         let protocol = GrepProtocol::new(directory.path());
         assert_eq!(protocol.descriptor().name, SEARCH_SCHEME);
@@ -927,26 +912,6 @@ mod tests {
         assert!(help.contains("clamped to 1 through 50"));
         assert!(help.contains("Do not call status or index before a ranked search"));
         assert!(help.contains("continues as one\nmanaged task without restarting"));
-        assert!(help.contains("`search://help` MUST use an empty string body"));
-
-        let legacy = GrepProtocol::legacy(directory.path());
-        assert_eq!(legacy.descriptor().name, LEGACY_GREP_SCHEME);
-        let legacy_help = legacy
-            .read(
-                ProtocolRequest {
-                    uri: "grep://help",
-                    target: "help",
-                    body: "",
-                },
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
-            )
-            .await
-            .unwrap();
-        let legacy_help = String::from_utf8(legacy_help).unwrap();
-        assert!(legacy_help.contains("`grep://help` MUST use an empty string body"));
-        assert!(!legacy_help.contains("search://"));
 
         let error = protocol
             .read(

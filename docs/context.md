@@ -47,16 +47,16 @@ description: Review a change for correctness and regressions.
 
 ### Protocol name and resources
 
-URI Agent lowercases the name, replaces runs of non-ASCII-alphanumeric characters with `-`, and appends `-skill` when absent. The example registers routes such as:
+URI Agent lowercases the name, replaces runs of non-ASCII-alphanumeric characters with `-`, and appends `-skill` when absent. The example registers a help page plus resource routes such as:
 
 ```text
-code-review-skill://help
-code-review-skill://scripts/check.py
+help(["code-review-skill"])
+read("code-review-skill://scripts/check.py", "")
 ```
 
 The first Skill for a normalized protocol name wins. Later duplicates and names that collide with an existing protocol are skipped with a notice.
 
-`<name>-skill://help` reads `SKILL.md`; other targets read files relative to the Skill directory. Absolute targets and paths that escape that directory, including through symlinks, are rejected.
+A Skill protocol's help page is its `SKILL.md`, loaded through the `help` tool; read targets read files relative to the Skill directory. Absolute targets and paths that escape that directory, including through symlinks, are rejected.
 
 ### Frozen session behavior
 

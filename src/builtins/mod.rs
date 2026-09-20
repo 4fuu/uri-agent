@@ -20,7 +20,6 @@ pub use mcp::{
     SessionMcpProfile, SessionMcpServer, SessionMcpTransport, session_profile_owner,
     session_profile_record,
 };
-pub(crate) use sessions::SessionsPlugin;
 pub(crate) const MCP_SESSION_PROFILE_OWNER: &str = mcp::SESSION_PROFILE_OWNER;
 
 use crate::config::display_path;
@@ -110,10 +109,6 @@ pub(crate) fn plugins_with_session_profile(
     add_agent_plugins(&mut plugins, cwd, config_directory, mcp_profile);
     plugins.add(title::TerminalTitlePlugin);
     plugins
-}
-
-pub(crate) fn add_legacy_grep(plugins: &mut PluginRegistry, cwd: &Path) {
-    plugins.add(grep::GrepProtocol::legacy(cwd));
 }
 
 fn add_agent_plugins(

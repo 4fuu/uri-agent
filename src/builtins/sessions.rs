@@ -40,6 +40,7 @@ const DEFAULT_AROUND_COUNT: usize = 10;
 const MAX_AROUND_TOTAL: usize = 50;
 const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 const MAX_INDEX_RETRIES: usize = 3;
+#[cfg(test)]
 const SESSIONS_BASE_URI: &str = "sessions://";
 const CONTEXT_SESSIONS_BASE_URI: &str = "context://sessions/";
 
@@ -116,14 +117,6 @@ pub(crate) struct SessionsPlugin {
 }
 
 impl SessionsPlugin {
-    pub(crate) fn new(cwd: &Path) -> Self {
-        Self {
-            archive: SessionArchive::for_project(cwd),
-            cwd: cwd.to_path_buf(),
-            base_uri: SESSIONS_BASE_URI,
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn with_archive(cwd: &Path, archive: SessionArchive) -> Self {
         Self {
@@ -143,16 +136,6 @@ impl SessionsPlugin {
 
     fn uri(&self, target: &str, parameters: &[(&str, String)]) -> String {
         sessions_uri(self.base_uri, target, parameters)
-    }
-}
-
-impl Plugin for SessionsPlugin {
-    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
-        vec![self.descriptor()]
-    }
-
-    fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        host.protocols.register(self.clone())
     }
 }
 
@@ -1885,29 +1868,17 @@ mod tests {
 
     #[test]
     fn help_documents_exact_session_reads() {
-        let help = help(Path::new("/project"), SESSIONS_BASE_URI);
-        assert!(help.contains("sessions://<session-id>"));
-        assert!(help.contains("sessions://search?scope=all&limit=20\", \"refresh token"));
-        assert!(help.contains("sessions://search?mode=hybrid&limit=10"));
-        assert!(help.contains("exec(\"sessions://index?scope=all\", \"\")"));
+        let help = help(Path::new("/project"), CONTEXT_SESSIONS_BASE_URI);
+        assert!(help.contains("context://sessions/<session-id>"));
+        assert!(help.contains("context://sessions/search?scope=all&limit=20\", \"refresh token"));
+        assert!(help.contains("context://sessions/search?mode=hybrid&limit=10"));
+        assert!(help.contains("exec(\"context://sessions/index?scope=all\", \"\")"));
         assert!(help.contains("mode=semantic"));
         assert!(help.contains("mode=hybrid"));
-        assert!(help.contains("Do not read or execute `sessions://index`"));
+        assert!(help.contains("Do not read or execute `context://sessions/index`"));
         assert!(help.contains("continues as\n  one managed task without restarting"));
-        assert!(help.contains("sessions://<session-id>/around/<record-id>"));
+        assert!(help.contains("context://sessions/<session-id>/around/<record-id>"));
         assert!(help.contains("include_tools=false"));
         assert!(!help.contains("{\\\"query\\\""));
-    }
-
-    #[test]
-    fn plugin_uses_the_protocol_description_without_a_prompt_fragment() {
-        let plugin = SessionsPlugin::new(Path::new("/project"));
-
-        assert_eq!(
-            plugin.descriptor().description,
-            "Search and read bounded saved session history with exact or on-demand semantic retrieval. The user may reference a session with `@@<session-id>`."
-        );
-        assert!(plugin.descriptor().can_exec);
-        assert_eq!(plugin.system_prompt_fragment().unwrap(), None);
     }
 }

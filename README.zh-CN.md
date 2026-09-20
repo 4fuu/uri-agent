@@ -139,7 +139,7 @@ uri-agent --acpv1
 | 在 Herdr 终端复用器中上报面板状态 | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
 | 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
-[`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和请求体格式以 `<protocol>://help` 为准；当前生效的界面说明以 `F1` 和 `:help` 为准。
+[`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和请求体格式以 `help` 工具加载的协议帮助页为准；当前生效的界面说明以 `F1` 和 `:help` 为准。
 
 ## 开发
 

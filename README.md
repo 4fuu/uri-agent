@@ -196,9 +196,9 @@ lifecycle operations, and ownership constraints.
 | Build or audit an extension | [WASM plugins](docs/plugins.md) |
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At
-runtime, `<protocol>://help` is the authoritative reference for a protocol's
-accepted URIs and body shape; `F1` and `:help` show the active interface
-reference.
+runtime, a protocol's page loaded through the `help` tool is the authoritative
+reference for its accepted URIs and body shape; `F1` and `:help` show the
+active interface reference.
 
 ## Development
 

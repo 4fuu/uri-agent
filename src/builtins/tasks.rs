@@ -251,7 +251,7 @@ fn parse_read_target(target: &str) -> Result<(&str, Option<Duration>)> {
         .map_or((target, None), |(id, query)| (id, Some(query)));
     if id.is_empty() || id.contains('/') {
         bail!(
-            r#"tasks read expects read("tasks://help", ""), read("tasks://summary", ""), read("tasks://<id>", ""), or read("tasks://<id>?wait=<seconds>", "")"#
+            r#"tasks read expects read("tasks://summary", ""), read("tasks://<id>", ""), or read("tasks://<id>?wait=<seconds>", "")"#
         );
     }
     let Some(query) = query else {

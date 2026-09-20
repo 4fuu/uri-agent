@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use rig::message::{ImageMediaType, ToolResultContent};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -40,13 +41,13 @@ impl fmt::Display for ProtocolHelpRequired {
         if self.required == self.requested {
             write!(
                 formatter,
-                "Read \"{}://help\" with an empty body before using this protocol.",
-                self.required
+                "Load this protocol first: call help([{:?}]) before using {}://.",
+                self.required, self.required
             )
         } else {
             write!(
                 formatter,
-                "Read \"{}://help\" with an empty body before using {}://.",
+                "Load the shared prerequisite first: call help([{:?}]) before using {}://.",
                 self.required, self.requested
             )
         }
@@ -180,12 +181,12 @@ pub(crate) struct PresentedProtocolRead {
 pub trait Protocol: Send + Sync {
     fn descriptor(&self) -> ProtocolDescriptor;
 
-    /// Additional protocol help pages that must be read before this protocol's
-    /// own help or operations. The protocol's own `<name>://help` remains
-    /// mandatory and is read after these shared prerequisites.
+    /// Additional protocol help pages that must be loaded before this
+    /// protocol's own help or operations. The protocol's own page remains
+    /// mandatory and is loaded after these shared prerequisites.
     ///
     /// Reserve this for help pages that genuinely build on another shared
-    /// page, such as `<name>-mcp` server help on the shared `mcp://help`
+    /// page, such as `<name>-mcp` server help on the shared `mcp://`
     /// routing page. Never force a dependency for a protocol that is merely
     /// referenced by this one's results, such as `tasks://` handles: those
     /// links are chained lazily by the prompts that mention them, which keeps
@@ -422,6 +423,87 @@ impl ProtocolRegistry {
         self.dispatch_exec(uri, body, false, false).await
     }
 
+    /// Load help pages for the requested protocols through the help tool.
+    /// Shared help prerequisites are resolved and included automatically, and
+    /// every returned protocol is marked as loaded for the session.
+    pub(crate) async fn load_help(&self, requested: &[String]) -> Result<String> {
+        const MAX_HELP_PROTOCOLS: usize = 4;
+        if requested.is_empty() {
+            bail!("help requires at least one protocol name");
+        }
+        if requested.len() > MAX_HELP_PROTOCOLS {
+            bail!("help loads at most {MAX_HELP_PROTOCOLS} protocols per call; split the request");
+        }
+        let ordered = self.resolve_help_order(requested, true).await?;
+        let mut sections = Vec::with_capacity(ordered.len());
+        let mut loaded = Vec::with_capacity(ordered.len());
+        for name in &ordered {
+            let protocol = self
+                .find_protocol(name, true)
+                .await
+                .ok_or_else(|| self.unknown_protocol_error(name, true))?;
+            let uri = format!("{name}://help");
+            let response = protocol
+                .read_output(
+                    ProtocolRequest {
+                        uri: &uri,
+                        target: "help",
+                        body: "",
+                    },
+                    self.context.clone(),
+                )
+                .await?;
+            let (content, images) = response.into_parts();
+            if !images.is_empty() {
+                bail!("protocol {name} help must be text-only");
+            }
+            sections.push(self.output.present(content, name).await?);
+            loaded.push(name.clone());
+        }
+        self.help_read.lock().await.extend(loaded);
+        Ok(format!(
+            "{}\n\nLoaded protocols stay loaded for the rest of the session; use their addresses without calling help again.",
+            sections.join("\n\n---\n\n")
+        ))
+    }
+
+    /// Expand requested protocol names into an ordered, deduplicated load
+    /// order with each protocol's shared help prerequisites first.
+    async fn resolve_help_order(
+        &self,
+        requested: &[String],
+        include_dynamic: bool,
+    ) -> Result<Vec<String>> {
+        let mut ordered = Vec::<String>::new();
+        let mut queue = requested.to_vec();
+        while let Some(name) = queue.first().cloned() {
+            queue.remove(0);
+            if ordered.contains(&name) {
+                continue;
+            }
+            let protocol = self
+                .find_protocol(&name, include_dynamic)
+                .await
+                .ok_or_else(|| self.unknown_protocol_error(&name, include_dynamic))?;
+            for dependency in protocol.help_dependencies() {
+                if !ordered.contains(dependency) && !queue.contains(dependency) {
+                    queue.push(dependency.clone());
+                }
+            }
+            ordered.push(name);
+        }
+        Ok(ordered)
+    }
+
+    fn reject_help_address(&self, name: &str, target: &str) -> Result<()> {
+        if target == "help" {
+            bail!(
+                "help pages are loaded with the help tool; call help([{name:?}]) and use the documented addresses"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn restore_help_reads(&self, events: &[SessionEvent]) {
         let mut pending = HashMap::new();
         let mut restored = HashSet::new();
@@ -433,14 +515,18 @@ impl ProtocolRegistry {
                     arguments,
                 } => {
                     pending.remove(call_id);
-                    if name == "read"
-                        && let (Some(uri), Some("")) = (
-                            arguments.get("uri").and_then(|value| value.as_str()),
-                            arguments.get("body").and_then(|value| value.as_str()),
-                        )
-                        && let Ok((protocol, "help")) = split_address(uri)
+                    if name == "help"
+                        && let Some(protocols) =
+                            arguments.get("protocols").and_then(Value::as_array)
                     {
-                        pending.insert(call_id.clone(), protocol.to_string());
+                        let names = protocols
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        if !names.is_empty() {
+                            pending.insert(call_id.clone(), names);
+                        }
                     }
                 }
                 EventKind::ToolResult {
@@ -449,11 +535,11 @@ impl ProtocolRegistry {
                     failed,
                     ..
                 } => {
-                    if let Some(protocol) = pending.remove(call_id)
-                        && name == "read"
+                    if let Some(protocols) = pending.remove(call_id)
+                        && name == "help"
                         && !failed
                     {
-                        restored.insert(protocol);
+                        restored.extend(protocols);
                     }
                 }
                 _ => {}
@@ -463,7 +549,19 @@ impl ProtocolRegistry {
     }
 
     pub async fn restore_help_read_names(&self, protocols: HashSet<String>) {
-        self.help_read.lock().await.extend(protocols);
+        let mut restored = HashSet::new();
+        for name in protocols {
+            restored.insert(name.clone());
+            // Best-effort expansion over statically registered protocols: a
+            // restored session may have loaded shared prerequisites through the
+            // help tool's automatic dependency resolution.
+            if let Some(protocol) = self.protocols.get(&name) {
+                for dependency in protocol.help_dependencies() {
+                    restored.insert(dependency.clone());
+                }
+            }
+        }
+        self.help_read.lock().await.extend(restored);
     }
 
     pub(crate) async fn clear_help_reads(&self) {
@@ -500,6 +598,7 @@ impl ProtocolRegistry {
             bail!("protocol does not support read: {name}");
         }
         if require_help {
+            self.reject_help_address(name, target)?;
             let help_read = self.help_read.lock().await;
             if let Some(dependency) = protocol
                 .help_dependencies()
@@ -508,7 +607,7 @@ impl ProtocolRegistry {
             {
                 return Err(ProtocolHelpRequired::dependency(dependency, name).into());
             }
-            if target != "help" && !help_read.contains(name) {
+            if !help_read.contains(name) {
                 return Err(ProtocolHelpRequired::new(name).into());
             }
         }
@@ -517,9 +616,6 @@ impl ProtocolRegistry {
             .await?;
         let (content, images) = response.into_parts();
         let output = self.output.present(content, name).await?;
-        if require_help && target == "help" && body.is_empty() {
-            self.help_read.lock().await.insert(name.to_string());
-        }
         Ok(PresentedProtocolRead { output, images })
     }
 
@@ -536,6 +632,7 @@ impl ProtocolRegistry {
             .await
             .ok_or_else(|| self.unknown_protocol_error(name, include_dynamic))?;
         if require_help {
+            self.reject_help_address(name, target)?;
             let help_read = self.help_read.lock().await;
             if let Some(dependency) = protocol
                 .help_dependencies()
@@ -551,7 +648,8 @@ impl ProtocolRegistry {
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
             bail!(
-                r#"protocol {name} does not support exec; read("{name}://help", "") for its supported operations"#
+                "protocol {name} does not support exec; call help([{:?}]) and use its documented read operations",
+                name
             );
         }
         let content = protocol
@@ -635,7 +733,7 @@ pub(crate) fn validate_descriptor(descriptor: &ProtocolDescriptor) -> Result<()>
     }
     if !descriptor.can_read {
         bail!(
-            "protocol {} must support read so <protocol>://help is available",
+            "protocol {} must support read so the help tool can load its contract",
             descriptor.name
         );
     }
@@ -884,7 +982,7 @@ mod tests {
             })
             .unwrap();
         let body = r#"["markdown is fine",{"nested":[1,null,true]}]"#;
-        registry.read("capture://help", "").await.unwrap();
+        registry.load_help(&["capture".to_string()]).await.unwrap();
 
         let result = registry
             .read("capture://a://b?not=a url", body)
@@ -916,7 +1014,7 @@ mod tests {
             })
             .unwrap();
         let body = "unchanged";
-        registry.read("capture://help", "").await.unwrap();
+        registry.load_help(&["capture".to_string()]).await.unwrap();
 
         let result = registry.exec("capture://run?wait=30", body).await.unwrap();
 
@@ -975,10 +1073,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["second"]
         );
-        assert_eq!(registry.read("second://help", "").await.unwrap(), "second");
+        registry.load_help(&["second".to_string()]).await.unwrap();
         assert_eq!(
             registry
-                .read("first://help", "")
+                .load_help(&["first".to_string()])
                 .await
                 .unwrap_err()
                 .to_string(),
@@ -988,7 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_model_call_must_read_protocol_help() {
+    async fn first_model_call_must_load_protocol_help() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -1007,19 +1105,72 @@ mod tests {
             assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
             assert_eq!(
                 error.to_string(),
-                "Read \"capture://help\" with an empty body before using this protocol."
+                "Load this protocol first: call help([\"capture\"]) before using capture://."
             );
         }
         assert!(capture.lock().unwrap().is_none());
 
-        registry.read("capture://help", "").await.unwrap();
+        let help = registry.load_help(&["capture".to_string()]).await.unwrap();
+        assert!(help.contains("Loaded protocols stay loaded"));
         assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
         assert_eq!(registry.exec("capture://run", "").await.unwrap(), "ok");
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[tokio::test]
-    async fn shared_help_is_required_before_a_dependent_protocols_own_help() {
+    async fn help_tool_rejects_help_addresses_and_bounds_batches() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(CaptureProtocol {
+                capture: Arc::new(Mutex::new(None)),
+            })
+            .unwrap();
+
+        for error in [
+            registry.read("capture://help", "").await.unwrap_err(),
+            registry.exec("capture://help", "").await.unwrap_err(),
+        ] {
+            assert_eq!(
+                error.to_string(),
+                "help pages are loaded with the help tool; call help([\"capture\"]) and use the documented addresses"
+            );
+        }
+        assert!(
+            registry
+                .load_help(&[])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("at least one protocol name")
+        );
+        let too_many = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            registry
+                .load_help(&too_many)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("at most 4")
+        );
+        assert!(
+            registry
+                .load_help(&["missing".to_string()])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown protocol: missing")
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn shared_help_is_loaded_automatically_before_a_dependent_protocol() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -1045,23 +1196,19 @@ mod tests {
             .select(Some(&["shared".to_string(), "dependent".to_string()]))
             .unwrap();
 
-        let error = registry.read("dependent://help", "").await.unwrap_err();
+        let error = registry.read("dependent://value", "").await.unwrap_err();
         assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
         assert_eq!(
             error.to_string(),
-            "Read \"shared://help\" with an empty body before using dependent://."
+            "Load the shared prerequisite first: call help([\"shared\"]) before using dependent://."
         );
 
-        registry.read("shared://help", "").await.unwrap();
-        assert_eq!(
-            registry
-                .read("dependent://value", "")
-                .await
-                .unwrap_err()
-                .to_string(),
-            "Read \"dependent://help\" with an empty body before using this protocol."
-        );
-        registry.read("dependent://help", "").await.unwrap();
+        let help = registry
+            .load_help(&["dependent".to_string(), "dependent".to_string()])
+            .await
+            .unwrap();
+        assert!(help.contains("shared"));
+        assert!(help.contains("dependent"));
         assert_eq!(
             registry.read("dependent://value", "").await.unwrap(),
             "dependent"
@@ -1070,7 +1217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_help_and_static_calls_do_not_unlock_model_calls() {
+    async fn static_calls_bypass_the_help_gate() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -1081,7 +1228,6 @@ mod tests {
             })
             .unwrap();
 
-        registry.read("capture://help", "unexpected").await.unwrap();
         assert!(
             registry
                 .read("capture://value", "")
@@ -1092,6 +1238,7 @@ mod tests {
         );
         registry.read_static("capture://value", "").await.unwrap();
         registry.exec_static("capture://run", "").await.unwrap();
+        registry.read_static("capture://help", "").await.unwrap();
         assert!(
             registry
                 .read("capture://value", "")
@@ -1120,10 +1267,9 @@ mod tests {
                 at: chrono::Utc::now(),
                 kind: EventKind::ToolCall {
                     call_id: "help-call".to_string(),
-                    name: "read".to_string(),
+                    name: "help".to_string(),
                     arguments: serde_json::json!({
-                        "uri": "capture://help",
-                        "body": ""
+                        "protocols": ["capture"]
                     }),
                 },
             },
@@ -1132,7 +1278,7 @@ mod tests {
                 at: chrono::Utc::now(),
                 kind: EventKind::ToolResult {
                     call_id: "help-call".to_string(),
-                    name: "read".to_string(),
+                    name: "help".to_string(),
                     output: "help".to_string(),
                     failed: false,
                     protocol_help_required: false,
@@ -1164,8 +1310,9 @@ mod tests {
         registry.set_dynamic_source(first.clone()).unwrap();
         registry.set_dynamic_source(second.clone()).unwrap();
 
-        assert_eq!(registry.read("second://help", "").await.unwrap(), "second");
-        assert_eq!(first.ready_calls.load(Ordering::Relaxed), 1);
+        let help = registry.load_help(&["second".to_string()]).await.unwrap();
+        assert!(help.contains("second"));
+        assert_eq!(first.ready_calls.load(Ordering::Relaxed), 0);
         assert_eq!(second.ready_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             registry

@@ -494,7 +494,7 @@ impl Protocol for ContextPlugin {
                     options.types.as_ref(),
                 )
             }
-            "" => bail!(r#"context target is required; read("context://help", "")"#),
+            "" => bail!("context target is required"),
             _ => bail!("unknown context read target: {target}"),
         }?;
         Ok(output.into_bytes())
@@ -565,7 +565,7 @@ impl Protocol for ContextPlugin {
                 require_empty(query, request.body, "context note delete")?;
                 mutate_note(&self.state, NoteMutation::Delete { id: id.to_string() }, "").await?
             }
-            "" => bail!(r#"context target is required; read("context://help", "")"#),
+            "" => bail!("context target is required"),
             _ => bail!("unknown context exec target: {target}"),
         };
         Ok(output.into_bytes())
