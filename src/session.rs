@@ -20,13 +20,14 @@ use tokio_rusqlite::{
     Connection,
     rusqlite::{
         Connection as SqliteConnection, Error as SqliteError, ErrorCode, OpenFlags,
-        OptionalExtension, Transaction, TransactionBehavior, params,
+        OptionalExtension, Transaction, TransactionBehavior, ffi, params,
     },
 };
 use uuid::Uuid;
 
 const SESSION_DATABASE_FILE: &str = "sessions-v4.db";
 const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_WRITE_BEGIN_ATTEMPTS: usize = 3;
 const RESUME_INDEX_VERSION: u32 = 4;
 const MAX_EVENT_PAGE: usize = 512;
 const COLLABORATION_PRESENCE_TTL: chrono::Duration = chrono::Duration::seconds(10);
@@ -2009,41 +2010,42 @@ impl Session {
                 // Immediate: the SELECT below establishes a read snapshot, so
                 // a deferred upgrade to the write lock fails at once with
                 // SQLITE_BUSY whenever another connection commits in between.
-                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute(
-                    "INSERT INTO sessions
-                     (id, created_at, updated_at, cwd, provider, model, thinking,
-                      parent_session_id, depth, head_sequence, draft)
-                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '')",
-                    params![
-                        id,
-                        at,
-                        project,
-                        spec.provider,
-                        spec.model,
-                        spec.thinking.to_string(),
-                        spec.parent_session_id,
-                        i64::from(spec.depth()),
-                        head_sequence,
-                    ],
-                )?;
-                for (sequence, event_at, kind, payload) in stored_events {
+                with_immediate_transaction(db, |transaction| {
                     transaction.execute(
-                        "INSERT INTO events
-                         (session_id, sequence, at, kind, payload_json)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![id, sequence, event_at, kind, payload],
+                        "INSERT INTO sessions
+                         (id, created_at, updated_at, cwd, provider, model, thinking,
+                          parent_session_id, depth, head_sequence, draft)
+                          VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '')",
+                        params![
+                            id,
+                            at,
+                            project,
+                            spec.provider,
+                            spec.model,
+                            spec.thinking.to_string(),
+                            spec.parent_session_id,
+                            i64::from(spec.depth()),
+                            head_sequence,
+                        ],
                     )?;
-                }
-                for (owner, payload) in private_records {
-                    transaction.execute(
-                        "INSERT INTO session_private_records
-                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
-                        params![id, owner, payload],
-                    )?;
-                }
-                transaction.commit()?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                    for (sequence, event_at, kind, payload) in stored_events {
+                        transaction.execute(
+                            "INSERT INTO events
+                             (session_id, sequence, at, kind, payload_json)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![id, sequence, event_at, kind, payload],
+                        )?;
+                    }
+                    for (owner, payload) in private_records {
+                        transaction.execute(
+                            "INSERT INTO session_private_records
+                             (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
+                            params![id, owner, payload],
+                        )?;
+                    }
+                    transaction.commit()?;
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                })
             })
             .await
             .context("cannot persist prepared session")?;
@@ -2704,52 +2706,53 @@ impl Session {
                     // so a deferred upgrade to the write lock fails at once
                     // with SQLITE_BUSY whenever another connection commits in
                     // between.
-                    let transaction =
-                        db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let draft = transaction
-                        .query_row(
-                            "SELECT draft FROM pending_drafts WHERE cwd = ?1",
-                            [&project],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()?
-                        .unwrap_or_default();
-                    transaction.execute(
-                        "INSERT INTO sessions
-                         (id, created_at, updated_at, cwd, provider, model, thinking,
-                          parent_session_id, depth, head_sequence, draft)
-                         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                        params![
-                            id,
-                            at_text,
-                            project,
-                            provider,
-                            model,
-                            thinking,
-                            parent_session_id,
-                            depth,
-                            head_sequence as i64,
-                            draft
-                        ],
-                    )?;
-                    for (sequence, event_at, kind_name, payload) in stored_events {
+                    with_immediate_transaction(db, |transaction| {
+                        let draft = transaction
+                            .query_row(
+                                "SELECT draft FROM pending_drafts WHERE cwd = ?1",
+                                [&project],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?
+                            .unwrap_or_default();
                         transaction.execute(
-                            "INSERT INTO events
-                             (session_id, sequence, at, kind, payload_json)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![id, sequence, event_at, kind_name, payload],
+                            "INSERT INTO sessions
+                             (id, created_at, updated_at, cwd, provider, model, thinking,
+                              parent_session_id, depth, head_sequence, draft)
+                              VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            params![
+                                id,
+                                at_text,
+                                project,
+                                provider,
+                                model,
+                                thinking,
+                                parent_session_id,
+                                depth,
+                                head_sequence as i64,
+                                draft
+                            ],
                         )?;
-                    }
-                    for (owner, payload) in private_records {
-                        transaction.execute(
-                            "INSERT INTO session_private_records
-                             (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
-                            params![id, owner, payload],
-                        )?;
-                    }
-                    transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
-                    transaction.commit()?;
-                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                        for (sequence, event_at, kind_name, payload) in stored_events {
+                            transaction.execute(
+                                "INSERT INTO events
+                                 (session_id, sequence, at, kind, payload_json)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![id, sequence, event_at, kind_name, payload],
+                            )?;
+                        }
+                        for (owner, payload) in private_records {
+                            transaction.execute(
+                                "INSERT INTO session_private_records
+                                 (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
+                                params![id, owner, payload],
+                            )?;
+                        }
+                        transaction
+                            .execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
+                        transaction.commit()?;
+                        Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                    })
                 })
                 .await
                 .context("cannot create session")?;
@@ -2788,39 +2791,40 @@ impl Session {
                 // Immediate: the SELECT below establishes a read snapshot, so
                 // a deferred upgrade to the write lock fails at once with
                 // SQLITE_BUSY whenever another connection commits in between.
-                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let head: i64 = transaction.query_row(
-                    "SELECT head_sequence FROM sessions WHERE id = ?1",
-                    [&id],
-                    |row| row.get(0),
-                )?;
-                if head != expected_head {
-                    return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
-                }
-                for (sequence, kind_name, payload) in stored_events {
-                    transaction.execute(
-                        "INSERT INTO events (session_id, sequence, at, kind, payload_json)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![id, sequence, at_text, kind_name, payload],
+                with_immediate_transaction(db, |transaction| {
+                    let head: i64 = transaction.query_row(
+                        "SELECT head_sequence FROM sessions WHERE id = ?1",
+                        [&id],
+                        |row| row.get(0),
                     )?;
-                }
-                transaction.execute(
-                    "UPDATE sessions
-                     SET updated_at = ?2, head_sequence = ?3,
-                         provider = ?4, model = ?5, thinking = ?6
-                     WHERE id = ?1",
-                    params![id, at_text, head_sequence, provider, model, thinking],
-                )?;
-                if let Some(pending_id) = consume_pending
-                    && transaction.execute(
-                        "DELETE FROM pending_inputs WHERE session_id = ?1 AND id = ?2",
-                        params![id, pending_id],
-                    )? != 1
-                {
-                    return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
-                }
-                transaction.commit()?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                    if head != expected_head {
+                        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+                    }
+                    for (sequence, kind_name, payload) in stored_events {
+                        transaction.execute(
+                            "INSERT INTO events (session_id, sequence, at, kind, payload_json)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![id, sequence, at_text, kind_name, payload],
+                        )?;
+                    }
+                    transaction.execute(
+                        "UPDATE sessions
+                         SET updated_at = ?2, head_sequence = ?3,
+                             provider = ?4, model = ?5, thinking = ?6
+                         WHERE id = ?1",
+                        params![id, at_text, head_sequence, provider, model, thinking],
+                    )?;
+                    if let Some(pending_id) = consume_pending
+                        && transaction.execute(
+                            "DELETE FROM pending_inputs WHERE session_id = ?1 AND id = ?2",
+                            params![id, pending_id],
+                        )? != 1
+                    {
+                        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+                    }
+                    transaction.commit()?;
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                })
             })
             .await
             .context("cannot append session event batch")?;
@@ -3234,6 +3238,46 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
         .await
         .context("cannot initialize session database")?;
     Ok((directory, connection))
+}
+
+/// `BEGIN IMMEDIATE` is the only statement in a session write transaction
+/// that contends with other connections: once it holds the WAL writer lock,
+/// the remaining statements and the commit cannot report the database busy.
+/// Under heavy CPU oversubscription the lock holder can still be descheduled
+/// between its own begin and commit for longer than the busy timeout, which
+/// makes a single attempt fail and lose a whole append batch. A failed begin
+/// owns no locks and leaves no partial state, so retry it a bounded number of
+/// times before surfacing the failure.
+fn with_immediate_transaction<T, F>(
+    db: &mut SqliteConnection,
+    body: F,
+) -> tokio_rusqlite::rusqlite::Result<T>
+where
+    F: FnOnce(Transaction<'_>) -> tokio_rusqlite::rusqlite::Result<T>,
+{
+    let mut attempts = SESSION_WRITE_BEGIN_ATTEMPTS;
+    loop {
+        match db.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(transaction) => return body(transaction),
+            Err(error)
+                if attempts > 1
+                    && matches!(
+                        error,
+                        SqliteError::SqliteFailure(
+                            ffi::Error {
+                                code: ErrorCode::DatabaseBusy,
+                                ..
+                            },
+                            _
+                        )
+                    ) =>
+            {
+                attempts -= 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::Result<()> {
