@@ -306,7 +306,6 @@ mod tests {
                 session: WorkBuddySession {
                     endpoint: format!("http://{address}/v2"),
                     domain: Some("enterprise.example".to_string()),
-                    method: Some("github".to_string()),
                     account: Some(json!({
                         "uid": "user@example.com",
                         "enterpriseId": "enterprise-1",

@@ -1725,7 +1725,6 @@ mod tests {
                     session: WorkBuddySession {
                         endpoint: base_url,
                         domain: Some("enterprise.example".to_string()),
-                        method: Some("github".to_string()),
                         account: Some(serde_json::json!({
                             "uid": "user-1",
                             "enterpriseId": "enterprise-1"

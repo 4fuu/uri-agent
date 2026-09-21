@@ -104,13 +104,15 @@ pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredent
     if let Some(workbuddy) = &credential.workbuddy {
         hash.update(workbuddy.session.endpoint.as_bytes());
         hash.update([u8::from(workbuddy.api_key)]);
-        for value in [
-            workbuddy.session.domain.as_deref(),
-            workbuddy.session.method.as_deref(),
-        ] {
-            hash.update(value.unwrap_or_default().as_bytes());
-            hash.update([0]);
-        }
+        hash.update(
+            workbuddy
+                .session
+                .domain
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hash.update([0]);
         let account_id = workbuddy
             .session
             .account
@@ -692,7 +694,6 @@ mod tests {
                 session: WorkBuddySession {
                     endpoint: "https://copilot.tencent.com".to_string(),
                     domain: Some("copilot.tencent.com".to_string()),
-                    method: Some("github".to_string()),
                     account: Some(serde_json::json!({
                         "uid": uid,
                         "enterpriseId": "enterprise-1"

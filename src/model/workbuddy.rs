@@ -216,8 +216,6 @@ fn model_base_url(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as TEST_BASE64;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -247,7 +245,6 @@ mod tests {
             session: WorkBuddySession {
                 endpoint: "https://enterprise.example/base".to_string(),
                 domain: Some("enterprise.example".to_string()),
-                method: Some("github".to_string()),
                 account: Some(json!({
                     "uid": "user-1",
                     "enterpriseId": "enterprise-1",
@@ -276,24 +273,10 @@ mod tests {
         assert_eq!(headers["x-enterprise-id"], "enterprise-1");
         assert_eq!(headers["x-tenant-id"], "enterprise-1");
         assert_eq!(headers["x-department-info"], "engineering/platform");
-        assert_eq!(headers["x-auth-method"], "github");
-        assert_eq!(headers["x-id-source"], "github");
+        assert!(!headers.contains_key("x-auth-method"));
+        assert!(!headers.contains_key("x-id-source"));
+        assert!(!headers.contains_key("x-userinfo"));
         assert!(!headers.contains_key("x-api-key"));
-        let userinfo: Value = serde_json::from_slice(
-            &TEST_BASE64
-                .decode(headers["x-userinfo"].as_bytes())
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            userinfo,
-            json!({
-                "uin": "user-1",
-                "owner_uin": "enterprise-1",
-                "id_source": "github",
-                "token_source": "github"
-            })
-        );
     }
 
     #[test]

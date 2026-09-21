@@ -1,10 +1,9 @@
 use super::super::util::{open_url, trusted_http_url};
 use super::super::{LoginSetup, OauthDisplay, OauthLogin, OauthToken, channels, set_display};
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{StatusCode, Url};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
@@ -24,7 +23,6 @@ const ACCOUNT_AUTH_RETRIES: usize = 5;
 pub(crate) const ENDPOINT_EXTRA: &str = "workbuddyEndpoint";
 pub(crate) const ENVIRONMENT_EXTRA: &str = "workbuddyEnvironment";
 pub(crate) const DOMAIN_EXTRA: &str = "workbuddyDomain";
-pub(crate) const METHOD_EXTRA: &str = "workbuddyAuthMethod";
 pub(crate) const ACCOUNT_EXTRA: &str = "workbuddyAccount";
 pub(crate) const ACCOUNTS_EXTRA: &str = "workbuddyAccounts";
 const AUTH_EXTRA: &str = "workbuddyAuth";
@@ -37,7 +35,6 @@ pub(crate) const WORKBUDDY_AUTH_TOKEN_VARIABLE: &str = "CODEBUDDY_AUTH_TOKEN";
 pub(crate) struct WorkBuddySession {
     pub endpoint: String,
     pub domain: Option<String>,
-    pub method: Option<String>,
     pub account: Option<Value>,
 }
 
@@ -55,7 +52,6 @@ pub(crate) fn workbuddy_session_from_oauth(
     Ok(WorkBuddySession {
         endpoint: normalize_endpoint(&endpoint)?,
         domain: extra_string(token, DOMAIN_EXTRA),
-        method: extra_string(token, METHOD_EXTRA),
         account: token.extra.get(ACCOUNT_EXTRA).cloned(),
     })
 }
@@ -86,7 +82,6 @@ pub(crate) fn process_workbuddy_session(
     Ok(WorkBuddySession {
         endpoint,
         domain: None,
-        method: None,
         account: None,
     })
 }
@@ -137,7 +132,6 @@ fn apply_session_headers(headers: &mut HeaderMap, session: &WorkBuddySession) ->
     let uid = value_string(account, "uid");
     let enterprise = value_string(account, "enterpriseId");
     let department = value_string(account, "departmentFullName");
-    let id_source = value_string(account, "idSource");
     if let Some(uid) = uid {
         insert_static(headers, "x-user-id", uid, "WorkBuddy user ID")?;
     }
@@ -156,46 +150,6 @@ fn apply_session_headers(headers: &mut HeaderMap, session: &WorkBuddySession) ->
             "x-department-info",
             department,
             "WorkBuddy department",
-        )?;
-    }
-    if let Some(method) = &session.method {
-        insert_static(headers, "x-auth-method", method, "WorkBuddy auth method")?;
-    }
-    if let Some(id_source) = id_source {
-        insert_static(
-            headers,
-            "x-id-source",
-            id_source,
-            "WorkBuddy identity source",
-        )?;
-    }
-    if let Some(uid) = uid
-        && (enterprise.is_some() || id_source.is_some() || session.method.is_some())
-    {
-        let mut userinfo = Map::from_iter([("uin".to_string(), Value::String(uid.to_string()))]);
-        if let Some(enterprise) = enterprise {
-            userinfo.insert(
-                "owner_uin".to_string(),
-                Value::String(enterprise.to_string()),
-            );
-        }
-        if let Some(id_source) = id_source {
-            userinfo.insert(
-                "id_source".to_string(),
-                Value::String(id_source.to_string()),
-            );
-        }
-        if let Some(method) = &session.method {
-            userinfo.insert(
-                "token_source".to_string(),
-                Value::String(method.to_string()),
-            );
-        }
-        insert_static(
-            headers,
-            "x-userinfo",
-            &BASE64.encode(serde_json::to_vec(&userinfo)?),
-            "WorkBuddy encoded user info",
         )?;
     }
     Ok(())
@@ -321,7 +275,6 @@ async fn poll_token(
     state: &str,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<Value> {
-    let domain = endpoint_domain(endpoint)?;
     let url = api_url(
         endpoint,
         &format!("/v2{PREFIX_PATH}/auth/token?state={state}"),
@@ -333,7 +286,6 @@ async fn poll_token(
             client
                 .get(&url)
                 .header("Accept", "application/json")
-                .header("X-Domain", &domain)
                 .header("X-No-Authorization", "true")
                 .header("X-No-User-Id", "true")
                 .header("X-No-Enterprise-Id", "true")
@@ -406,9 +358,6 @@ async fn poll_account(
 }
 
 pub(crate) async fn refresh_token(token: &OauthToken) -> Result<OauthToken> {
-    if token.refresh.is_empty() {
-        bail!("WorkBuddy credential has no refresh token; run :login again");
-    }
     let endpoint = extra_string(token, ENDPOINT_EXTRA)
         .or_else(|| {
             extra_string(token, ENVIRONMENT_EXTRA)
@@ -419,31 +368,51 @@ pub(crate) async fn refresh_token(token: &OauthToken) -> Result<OauthToken> {
     let environment = extra_string(token, ENVIRONMENT_EXTRA).unwrap_or_else(|| "internal".into());
     let domain = extra_string(token, DOMAIN_EXTRA).unwrap_or(endpoint_domain(&endpoint)?);
     let client = http_client()?;
-    let response = client
-        .post(api_url(
-            &endpoint,
-            &format!("/v2{PREFIX_PATH}/auth/token/refresh"),
-        ))
-        .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", token.access))
-        .header("X-Refresh-Token", &token.refresh)
-        .header("X-Auth-Refresh-Source", "plugin")
-        .header("X-Domain", &domain)
-        .json(&json!({}))
-        .send()
-        .await
-        .context("WorkBuddy token refresh failed")?;
-    let reply = ProviderReply::read(response).await?;
-    let mut auth = reply.payload("WorkBuddy token refresh")?;
-    let auth_object = auth
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("WorkBuddy token refresh returned no token"))?;
-    auth_object
-        .entry("domain")
-        .or_insert_with(|| Value::String(domain));
-    auth_object
-        .entry("refreshToken")
-        .or_insert_with(|| Value::String(token.refresh.clone()));
+    let auth = if token.refresh.is_empty() {
+        // The reference WorkBuddy client keeps the current access token for a
+        // session without a refresh token and only refreshes the account
+        // snapshot.
+        let mut auth = token
+            .extra
+            .get(AUTH_EXTRA)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        auth.insert(
+            "accessToken".to_string(),
+            Value::String(token.access.clone()),
+        );
+        auth.insert("refreshToken".to_string(), Value::String(String::new()));
+        auth.insert("domain".to_string(), Value::String(domain));
+        Value::Object(auth)
+    } else {
+        let response = client
+            .post(api_url(
+                &endpoint,
+                &format!("/v2{PREFIX_PATH}/auth/token/refresh"),
+            ))
+            .header("Accept", "application/json")
+            .header("Authorization", format!("Bearer {}", token.access))
+            .header("X-Refresh-Token", &token.refresh)
+            .header("X-Auth-Refresh-Source", "plugin")
+            .header("X-Domain", &domain)
+            .json(&json!({}))
+            .send()
+            .await
+            .context("WorkBuddy token refresh failed")?;
+        let reply = ProviderReply::read(response).await?;
+        let mut auth = reply.payload("WorkBuddy token refresh")?;
+        let auth_object = auth
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("WorkBuddy token refresh returned no token"))?;
+        auth_object
+            .entry("domain")
+            .or_insert_with(|| Value::String(domain));
+        auth_object
+            .entry("refreshToken")
+            .or_insert_with(|| Value::String(token.refresh.clone()));
+        auth
+    };
     let accounts = fetch_accounts(&client, &endpoint, &auth, true).await?;
     let account =
         token.extra.get(ACCOUNT_EXTRA).cloned().ok_or_else(|| {
@@ -518,7 +487,7 @@ fn token_from_session(
     let mut safe_auth = auth.as_object().cloned().unwrap_or_default();
     safe_auth.remove("accessToken");
     safe_auth.remove("refreshToken");
-    let mut extra = BTreeMap::from([
+    let extra = BTreeMap::from([
         (
             ENDPOINT_EXTRA.to_string(),
             Value::String(endpoint.to_string()),
@@ -532,13 +501,6 @@ fn token_from_session(
         (ACCOUNTS_EXTRA.to_string(), Value::Array(accounts)),
         (AUTH_EXTRA.to_string(), Value::Object(safe_auth)),
     ]);
-    if let Some(method) = auth
-        .get("method")
-        .and_then(Value::as_str)
-        .filter(|method| !method.is_empty())
-    {
-        extra.insert(METHOD_EXTRA.to_string(), Value::String(method.to_string()));
-    }
     Ok(OauthToken {
         kind: "oauth".to_string(),
         refresh,
@@ -825,7 +787,8 @@ mod tests {
         assert_eq!(token.access, "access");
         assert_eq!(token.refresh, "refresh");
         assert_eq!(token.extra[DOMAIN_EXTRA], "copilot.tencent.com");
-        assert_eq!(token.extra[METHOD_EXTRA], "github");
+        assert_eq!(token.extra[AUTH_EXTRA]["method"], "github");
+        assert!(!token.extra.contains_key("workbuddyAuthMethod"));
         assert!(token.extra[AUTH_EXTRA].get("accessToken").is_none());
         assert!(token.extra[AUTH_EXTRA].get("refreshToken").is_none());
     }
@@ -964,7 +927,7 @@ mod tests {
             refreshed.extra[ACCOUNT_EXTRA]["departmentFullName"],
             "engineering"
         );
-        assert_eq!(refreshed.extra[METHOD_EXTRA], "github");
+        assert_eq!(refreshed.extra[AUTH_EXTRA]["method"], "github");
         assert!(refreshed.extra[AUTH_EXTRA].get("accessToken").is_none());
         assert!(refreshed.extra[AUTH_EXTRA].get("refreshToken").is_none());
 
@@ -986,5 +949,75 @@ mod tests {
         assert!(accounts.contains("x-requested-with: xmlhttprequest"));
         assert!(accounts.contains("x-product: saas"));
         assert!(accounts.contains(&format!("user-agent: {}", USER_AGENT.to_ascii_lowercase())));
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_refresh_token_keeps_access_and_refreshes_accounts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let body = json!({
+                "code": 0,
+                "data": {
+                    "accounts": [
+                        {
+                            "uid": "current",
+                            "enterpriseId": "one",
+                            "lastLogin": false,
+                            "departmentFullName": "engineering"
+                        }
+                    ]
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let endpoint = format!("http://{address}");
+        let token = OauthToken {
+            kind: "oauth".to_string(),
+            refresh: String::new(),
+            access: "stored-access".to_string(),
+            expires: 0,
+            extra: BTreeMap::from([
+                (ENDPOINT_EXTRA.to_string(), Value::String(endpoint)),
+                (
+                    ENVIRONMENT_EXTRA.to_string(),
+                    Value::String("selfhosted".to_string()),
+                ),
+                (
+                    DOMAIN_EXTRA.to_string(),
+                    Value::String("enterprise.example".to_string()),
+                ),
+                (
+                    ACCOUNT_EXTRA.to_string(),
+                    json!({"uid": "current", "enterpriseId": "one"}),
+                ),
+                (AUTH_EXTRA.to_string(), json!({"tokenType": "Bearer"})),
+            ]),
+        };
+
+        let refreshed = refresh_token(&token).await.unwrap();
+        assert_eq!(refreshed.access, "stored-access");
+        assert!(refreshed.refresh.is_empty());
+        assert_eq!(refreshed.expires, i64::MAX / 4);
+        assert_eq!(
+            refreshed.extra[ACCOUNT_EXTRA]["departmentFullName"],
+            "engineering"
+        );
+        assert_eq!(refreshed.extra[AUTH_EXTRA]["tokenType"], "Bearer");
+        assert!(refreshed.extra[AUTH_EXTRA].get("accessToken").is_none());
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /v2/plugin/accounts http/1.1"));
+        assert!(request.contains("authorization: bearer stored-access"));
+        assert!(request.contains("x-domain: enterprise.example"));
+        assert!(!request.contains("x-refresh-token"));
     }
 }
