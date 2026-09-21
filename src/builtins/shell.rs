@@ -1861,11 +1861,14 @@ mod tests {
         let started_path = directory.path().join("started");
         let release_path = directory.path().join("release");
         let leaked_path = directory.path().join("leaked");
+        // Fork the subshell before the readiness marker: the test drops the
+        // execution as soon as the marker appears, and the process-group kill
+        // must already cover that descendant.
         let command = format!(
-            "printf started > '{}'; (while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & wait",
-            started_path.display(),
+            "(while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & printf started > '{}'; wait",
             release_path.display(),
-            leaked_path.display()
+            leaked_path.display(),
+            started_path.display()
         );
         let executable = find_executable("bash").unwrap();
         let mut shell = ShellProtocol::new("bash", executable, directory.path());
@@ -1887,7 +1890,7 @@ mod tests {
                 Duration::from_secs(60),
             );
             tokio::pin!(execution);
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 if started_path.exists() {
                     break;
                 }
@@ -1898,7 +1901,9 @@ mod tests {
             }
             assert!(started_path.exists());
         }
-        for _ in 0..100 {
+        // Releasing the subshell before the cancelled call settles would let
+        // it finish on its own, so this wait must outlive a slow runner.
+        for _ in 0..1000 {
             if context.tasks.get("001").await.is_none() {
                 break;
             }
@@ -1918,11 +1923,14 @@ mod tests {
         let started_path = directory.path().join("started");
         let release_path = directory.path().join("release");
         let leaked_path = directory.path().join("leaked");
+        // Fork the subshell before the readiness marker: the test drops the
+        // execution as soon as the marker appears, and the process-group kill
+        // must already cover that descendant.
         let command = format!(
-            "printf started > '{}'; (while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & wait",
-            started_path.display(),
+            "(while [ ! -e '{}' ]; do :; done; printf leaked > '{}') & printf started > '{}'; wait",
             release_path.display(),
-            leaked_path.display()
+            leaked_path.display(),
+            started_path.display()
         );
         let executable = find_executable("bash").unwrap();
         let cwd = directory.path().to_path_buf();
