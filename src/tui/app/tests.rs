@@ -4769,6 +4769,41 @@ fn tool_call_and_result_share_one_block() {
 }
 
 #[test]
+fn help_tool_call_lists_loaded_protocol_names() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "help-call".to_string(),
+            name: "help".to_string(),
+            arguments: serde_json::json!({"protocols": ["file", "search"]}),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "help-call".to_string(),
+            name: "help".to_string(),
+            output: "file contract\n\n---\n\nsearch contract".to_string(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+    assert_eq!(app.blocks[0].title, "Loaded help: file, search");
+
+    let collapsed = render_to_string(&mut app, 100, 24);
+    assert!(collapsed.contains("✓ Loaded help: file, search"));
+    assert!(!collapsed.contains("2 items"));
+
+    app.toggle_selected();
+    let expanded = render_to_string(&mut app, 100, 24);
+    assert!(expanded.contains("protocols: file, search"));
+    assert!(!expanded.contains("2 items"));
+}
+
+#[test]
 fn full_tool_documents_render_status_input_and_output_as_markdown() {
     let mut app = test_app();
     apply_event(
@@ -4983,6 +5018,17 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
             &serde_json::json!({"path": r"\\?\C:\Users\4fu\project\src\main.rs"})
         ),
         r"Edited C:\Users\4fu\project\src\main.rs"
+    );
+    assert_eq!(
+        tool_title(
+            "help",
+            &serde_json::json!({"protocols": ["file", "search"]})
+        ),
+        "Loaded help: file, search"
+    );
+    assert_eq!(
+        tool_title("help", &serde_json::json!({"protocols": []})),
+        "help"
     );
     assert_eq!(
         tool_title(

@@ -286,6 +286,22 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             single_line_preview(&display_path(Path::new(path)), 72)
         );
     }
+    if name == "help" {
+        let names = arguments
+            .get("protocols")
+            .and_then(serde_json::Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if names.is_empty() {
+            return name.to_string();
+        }
+        return format!("Loaded help: {}", single_line_preview(&names, 64));
+    }
     let action = match name {
         "read" => "Read",
         "exec" => "Ran",
@@ -443,6 +459,15 @@ fn argument_summary(name: &str, value: &serde_json::Value) -> String {
         && let Some(path) = value.as_str()
     {
         single_line_preview(&display_path(Path::new(path)), 72)
+    } else if name == "protocols"
+        && let Some(list) = value.as_array()
+    {
+        let names = list
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        single_line_preview(&names, 72)
     } else {
         json_value_summary(value)
     }
