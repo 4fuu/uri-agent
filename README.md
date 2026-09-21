@@ -14,20 +14,21 @@ contracts, instructions, and resources only when selected, much like Skills in
 other agents. At first, the model sees only each tool's compact name and
 description.
 
-Four built-in tools give the model a compact interface for reading, executing,
-and editing:
+Five built-in tools give the model a compact interface for loading, reading,
+executing, and editing:
 
 ```text
+help(protocols: string[])
 read(uri: string, body: string)
 exec(uri: string, body: string)
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`read` and `exec` always take string bodies and route them through URI
-protocols; use `""` when a body is empty. Typed tools handle structured or
-escape-heavy arguments. Trusted WASM plugins can add protocols and typed tools
-at runtime.
+`help` loads protocol contracts on demand. `read` and `exec` always take
+string bodies and route them through URI protocols; use `""` when a body is
+empty. Typed tools handle structured or escape-heavy arguments. Trusted WASM
+plugins can add protocols and typed tools at runtime.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols, and enabled WASM
