@@ -60,7 +60,11 @@ database.
 
 Submissions are `Prompt` or `Steer`. Prompt starts an idle Agent or queues a new
 turn. Steer targets the next model boundary while an Agent is active and acts
-as Prompt when it is idle. Accepted input is durable until delivered.
+as Prompt when it is idle. Accepted input is durable until delivered. When a
+turn fails before its user turn boundary is persisted, the failure is appended
+to the transcript as an `Error` event while the undelivered input returns to
+the pending queue for retry, so frontends that follow session events observe
+the turn ending instead of waiting forever.
 
 ## Cross-process collaboration
 

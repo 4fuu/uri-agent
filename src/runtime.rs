@@ -1369,59 +1369,57 @@ impl AgentRuntime {
         if prompt.is_empty() {
             return Ok(());
         }
-        self.prepare_context().await?;
-        let backend = match self.backend.read().await.clone() {
-            Some(backend) => backend,
-            None => {
-                let text = "no credential configured; press :login";
+        // Failures before the user turn boundary is persisted must still
+        // reach the transcript: frontends track turn state through session
+        // events, and an undelivered input is restored to the pending queue
+        // without emitting any other event they could observe.
+        let started = async {
+            self.prepare_context().await?;
+            let backend = self
+                .backend
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("no credential configured; press :login"))?;
+            backend.prepare().await?;
+            let content = match prepared_content {
+                Some(content) => {
+                    if content
+                        .iter()
+                        .any(|item| matches!(item, UserContent::Image(_)))
+                        && !backend.accepts_image_input()
+                    {
+                        bail!("the active model does not accept image input");
+                    }
+                    content
+                }
+                None => {
+                    self.user_content(prompt, clipboard_images, backend.as_ref())
+                        .await?
+                }
+            };
+            self.compact_with(Some(backend.as_ref()), false, false, cancel)
+                .await?;
+            self.append_user_input(
+                prompt.to_string(),
+                content,
+                false,
+                delivery.visible,
+                delivery.pending_id,
+            )
+            .await?;
+            Ok::<Arc<dyn ModelBackend>, anyhow::Error>(backend)
+        };
+        let backend = match started.await {
+            Ok(backend) => backend,
+            Err(error) => {
+                let text = format!("{error:#}");
                 self.session
-                    .append(EventKind::Error {
-                        text: text.to_string(),
-                    })
+                    .append(EventKind::Error { text: text.clone() })
                     .await?;
                 return Err(anyhow!(text));
             }
         };
-        backend.prepare().await?;
-        let content = match prepared_content {
-            Some(content) => {
-                if content
-                    .iter()
-                    .any(|item| matches!(item, UserContent::Image(_)))
-                    && !backend.accepts_image_input()
-                {
-                    let text = "the active model does not accept image input".to_string();
-                    self.session
-                        .append(EventKind::Error { text: text.clone() })
-                        .await?;
-                    return Err(anyhow!(text));
-                }
-                content
-            }
-            None => match self
-                .user_content(prompt, clipboard_images, backend.as_ref())
-                .await
-            {
-                Ok(content) => content,
-                Err(error) => {
-                    let text = format!("{error:#}");
-                    self.session
-                        .append(EventKind::Error { text: text.clone() })
-                        .await?;
-                    return Err(anyhow!(text));
-                }
-            },
-        };
-        self.compact_with(Some(backend.as_ref()), false, false, cancel)
-            .await?;
-        self.append_user_input(
-            prompt.to_string(),
-            content,
-            false,
-            delivery.visible,
-            delivery.pending_id,
-        )
-        .await?;
         self.tasks
             .mark_terminal_notifications_delivered(delivery.task_notification_ids)
             .await;
@@ -2867,6 +2865,28 @@ mod tests {
         }
     }
 
+    struct FlakyPrepareBackend {
+        prepare_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelBackend for FlakyPrepareBackend {
+        async fn prepare(&self) -> Result<()> {
+            if self.prepare_calls.fetch_add(1, Ordering::Relaxed) > 0 {
+                bail!("credential resolution flaked");
+            }
+            Ok(())
+        }
+
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _deltas: mpsc::UnboundedSender<ModelDelta>,
+        ) -> Result<ModelResponse> {
+            text_response("unreachable")
+        }
+    }
+
     fn fake_usage() -> Usage {
         Usage {
             input_tokens: 1_000,
@@ -3102,6 +3122,44 @@ mod tests {
                 .to_string()
                 .contains("the active turn has already finished")
         );
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn pre_delivery_turn_failure_persists_error_and_restores_pending_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (runtime, session, output_directory) = test_runtime(
+            workspace.path(),
+            Arc::new(FlakyPrepareBackend {
+                prepare_calls: AtomicUsize::new(0),
+            }),
+            ModelLimits::default(),
+        )
+        .await;
+        let mut completions = runtime.subscribe_turn_completions();
+        runtime.start_turn("first message".into()).await.unwrap();
+        wait_for_turn(runtime.as_ref()).await;
+
+        // The undelivered input stays durably queued for retry.
+        let pending = runtime.pending_messages().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "first message");
+
+        // The failure reaches the transcript so frontends that track turn
+        // state through session events leave their busy state instead of
+        // waiting forever for a turn that already ended.
+        let events = session.snapshot().await.unwrap();
+        assert!(
+            matches!(events.last().map(|event| &event.kind), Some(EventKind::Error { text }) if text
+                .contains("credential resolution flaked"))
+        );
+
+        let completion = tokio::time::timeout(Duration::from_secs(10), completions.recv())
+            .await
+            .expect("turn completion should arrive")
+            .unwrap();
+        assert!(matches!(completion.outcome, TurnOutcome::Failed(_)));
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
