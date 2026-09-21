@@ -27,12 +27,11 @@ fn help() -> String {
         r#"# uri-agent-docs
 
 Read the version-matched URI Agent documentation embedded in this binary.
-The documents are available regardless of the startup working directory.
 
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
 - Targets are exact, case-sensitive filenames and do not accept paths or query parameters.
-- Pass an empty string body. This protocol does not support `exec`.
+- Pass an empty string body.
 
 Available documents:
 "#,

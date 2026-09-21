@@ -2,11 +2,11 @@ use crate::config::display_path;
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first read or exec call to any protocol. The loaded help pages define every valid address, parameter, and body format; shared prerequisites are included automatically and loaded protocols stay loaded for the whole session.";
+pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first read or exec call to any protocol.";
 
-pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol after help has loaded it. Use this for resources, task status, and completed results; the loaded help page defines the valid addresses and the body each read takes.";
+pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol. Use this for resources, task status, and completed results.";
 
-pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol after help has loaded it. The loaded help page defines the valid operations and body formats. Operations normally return their final result directly. Long-running operations may become managed background tasks whose completion is delivered automatically; use the tasks protocol to inspect or cancel them.";
+pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Operations normally return their final result directly. Long-running operations may become managed background tasks whose completion is delivered automatically.";
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
@@ -24,18 +24,22 @@ pub fn system_prompt(
          Available direct tools:\n",
     );
 
-    write_entries(&mut prompt, tools);
+    let mut tools = tools.to_vec();
+    tools.sort_by(|left, right| {
+        tool_order(&left.name)
+            .cmp(&tool_order(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    write_entries(&mut prompt, &tools);
     prompt.push_str("\nAvailable protocols:\n");
     write_entries(&mut prompt, protocols);
     prompt.push_str(
-        "\nUse a direct tool when its typed arguments match the operation. Use read or exec for capabilities exposed as protocols.\n\n\
+        "\nChoose a direct tool or a protocol as appropriate for the operation.\n\n\
          Protocol rules:\n\
-         - Load help first. Before the first read or exec call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call. The help tool is the only way to load a protocol, and a call made before it fails with an error that repeats this instruction.\n\
-         - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them from memory, from other tools, or from URL conventions.\n\
-         - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values without including the angle brackets.\n\
-         - The read and exec body is always a string. Pass \"\" when the operation takes no body, pass plain text for textual input such as a command or a search pattern, and pass complete serialized JSON text when the protocol requires structured input.\n",
+         - Load help first. Before the first read or exec call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
+         - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
+         - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n",
     );
-    prompt.push_str(&protocol_examples(protocols));
     prompt.push_str(
         "\nOperating rules:\n\
          - For clear requests, inspect relevant sources, carry the work through, and verify the result.\n\
@@ -68,37 +72,17 @@ fn write_entries(prompt: &mut String, entries: &[PromptEntry]) {
     }
 }
 
-/// Example first calls that reference only protocols this session actually
-/// has. The generic prompt stays free of hardcoded protocol names.
-fn protocol_examples(protocols: &[PromptEntry]) -> String {
-    let listed = |name: &str| protocols.iter().any(|entry| entry.name == name);
-    let mut names = Vec::new();
-    let mut lines = Vec::new();
-    if listed("file") {
-        names.push("file");
-        lines.push(
-            "read(\"file://src/main.rs\", \"\") — allowed only after help loaded file".to_string(),
-        );
+/// Presentation order for the core direct tools in the system prompt; any
+/// other tool sorts after them alphabetically.
+fn tool_order(name: &str) -> usize {
+    match name {
+        "help" => 0,
+        "read" => 1,
+        "exec" => 2,
+        "replace" => 3,
+        "apply_patch" => 4,
+        _ => 5,
     }
-    if listed("search") {
-        names.push("search");
-        lines.push(
-            "read(\"search://src\", \"credential refresh flow\") — allowed only after help loaded search; the body is the plain text search pattern"
-                .to_string(),
-        );
-    }
-    if lines.is_empty() {
-        return String::new();
-    }
-    let list = names
-        .iter()
-        .map(|name| format!("{name:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "\nExample of first use in a new session:\nhelp([{list}]) — required first call, loads every contract in one call\n{}\n",
-        lines.join("\n")
-    )
 }
 
 pub fn task_accepted(id: &str) -> String {
@@ -138,7 +122,6 @@ mod tests {
             &[],
         );
         assert!(prompt.starts_with("You are a general-purpose agent running in URI Agent."));
-        assert!(prompt.contains("body is always a string"));
         assert!(
             prompt.contains("Available direct tools:\n- read: Read through a registered protocol.")
         );
@@ -148,12 +131,8 @@ mod tests {
                 < prompt.find("Available protocols:").unwrap()
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
-        assert!(prompt.contains(
-            "The help tool is the only way to load a protocol, and a call made before it fails"
-        ));
-        assert!(prompt.contains("never guess them from memory"));
-        assert!(prompt.contains("help([\"file\"]) — required first call"));
-        assert!(prompt.contains(r#"read("file://src/main.rs", "")"#));
+        assert!(prompt.contains("never guess them."));
+        assert!(prompt.contains("Choose a direct tool or a protocol as appropriate"));
         assert!(prompt.contains("Operating rules:\n- For clear requests"));
         assert!(prompt.contains("Treat user reports and proposed causes as claims to check"));
         assert!(prompt.contains("Make the smallest complete change"));
@@ -164,47 +143,48 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_examples_reference_only_listed_protocols() {
-        let without_examples = system_prompt(
-            &[PromptEntry {
-                name: "read".to_string(),
-                description: "Read resources.".to_string(),
-            }],
-            &[PromptEntry {
-                name: "context".to_string(),
-                description: "Inspect context.".to_string(),
-            }],
-            &[],
-        );
-        assert!(!without_examples.contains("file://"));
-        assert!(!without_examples.contains("search://"));
-        assert!(!without_examples.contains("Example of first use"));
-
-        let with_search = system_prompt(
-            &[PromptEntry {
-                name: "read".to_string(),
-                description: "Read resources.".to_string(),
-            }],
+    fn system_prompt_lists_core_tools_in_preferred_order() {
+        let prompt = system_prompt(
             &[
                 PromptEntry {
-                    name: "file".to_string(),
-                    description: "Read files.".to_string(),
+                    name: "replace".to_string(),
+                    description: "Replace.".to_string(),
                 },
                 PromptEntry {
-                    name: "search".to_string(),
-                    description: "Search contents.".to_string(),
+                    name: "exec".to_string(),
+                    description: "Execute.".to_string(),
+                },
+                PromptEntry {
+                    name: "apply_patch".to_string(),
+                    description: "Patch.".to_string(),
+                },
+                PromptEntry {
+                    name: "help".to_string(),
+                    description: "Load contracts.".to_string(),
+                },
+                PromptEntry {
+                    name: "read".to_string(),
+                    description: "Read.".to_string(),
+                },
+                PromptEntry {
+                    name: "a-wasm-tool".to_string(),
+                    description: "Dynamic.".to_string(),
                 },
             ],
             &[],
+            &[],
         );
-        assert!(with_search.contains("help([\"file\", \"search\"])"));
-        assert!(with_search.contains(
-            r#"read("search://src", "credential refresh flow") — allowed only after help loaded search"#
-        ));
-        assert!(
-            with_search.find("Example of first use").unwrap()
-                < with_search.find("Operating rules:").unwrap()
-        );
+
+        let positions = [
+            "- help:",
+            "- read:",
+            "- exec:",
+            "- replace:",
+            "- apply_patch:",
+        ]
+        .map(|marker| prompt.find(marker).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(prompt.find("- apply_patch:").unwrap() < prompt.find("- a-wasm-tool:").unwrap());
     }
 
     #[test]

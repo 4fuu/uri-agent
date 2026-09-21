@@ -61,11 +61,11 @@ the goal, any known identifiers or paths, and what kind of answer is wanted.
 Use `finder://<root>` to restrict code search to a project-relative or absolute
 directory. The root may be empty: `finder://` searches the whole project. On
 Unix, `~` and paths beginning with `~/` resolve from the current user's home
-directory; `~user` is not expanded. The root must be an existing directory.
-The scope restricts code search only; web reads are unaffected.
+directory; `~user` is not expanded. The scope restricts code search only; web
+reads are unaffected.
 
 The lookup question goes in the `exec` body. Every other `finder` call MUST
-pass an empty string body; `finder` supports no other reads.
+pass an empty string body.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -533,10 +533,9 @@ mod tests {
             "one complete natural-language question",
             "restrict code search to a project-relative or absolute",
             "`~user` is not expanded",
-            "The root must be an existing directory.",
-            "The scope restricts code search only; web reads are unaffected.",
+            "The scope restricts code search only; web\nreads are unaffected.",
             "The lookup question goes in the `exec` body. Every other `finder` call MUST",
-            "pass an empty string body; `finder` supports no other reads",
+            "pass an empty string body.",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");

@@ -1768,8 +1768,7 @@ fn render_shared_help() -> String {
     "# MCP protocols\n\n\
      This is the shared contract for every configured protocol whose name ends in `-mcp`.\n\n\
      Load a server protocol's contract with the help tool: help([\"<name>-mcp\"]) loads both that \
-     server's contract and this shared contract together. The server-specific help contains its \
-     frozen description and current handshake metadata without repeating this contract.\n\n\
+     server's contract and this shared contract together.\n\n\
      Routes on each `<name>-mcp://` protocol:\n\n\
      - `read(\"<name>-mcp://tools\", \"\")` — list tools.\n\
      - `read(\"<name>-mcp://tools/<percent-encoded-name>\", \"\")` — inspect a tool schema.\n\

@@ -107,7 +107,7 @@ defaults to 20 and is clamped to 1 through 50.
 - `exec("context://notes/<id>/delete", "")` tombstones a note. Its ID, title, revision metadata, and anchors remain, but its content can no longer be read.
 - `exec("context://rollover", "<optional bounded handoff>")` requests a fresh context window when the active strategy is `rollover`; the handoff is limited to 4,096 estimated tokens. It starts after every tool result from the current model response is durably paired.
 
-Titles are required, single-line, and at most 120 characters. At most 20 notes may be active. A note has no separate content limit, but all current titles and content share a hard budget of at most 20% of the model context after fixed context and safety headroom. Writes warn at 15% and reject growth beyond the hard budget; shrinking replacements and deletes remain available. IDs are never reused.
+Titles are required, single-line, and at most 120 characters. At most 20 notes may be active. A note has no separate content limit, but all current titles and content share a hard budget of at most 20% of the model context. Writes warn at 15% and reject growth beyond the hard budget; shrinking replacements and deletes remain available.
 
 Note writes and deletes are sidecar state: they do not remove or rewrite messages, tool calls, or tool results in the active model context. Calls to `context://` and their results are omitted from recoverable history so deleted note content cannot be reconstructed and history searches do not recursively change their corpus. A deleted note's content remains unavailable, but its revision anchors and ordinary records around them remain readable.
 

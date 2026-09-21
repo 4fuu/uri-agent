@@ -85,8 +85,7 @@ exec("{scheme}://<root>?mode=index&glob=<pattern>", "")
 
 Indexing follows standard ignore files, skips binary/non-UTF-8 files and files
 larger than 1 MiB, and chunks readable text into line-ranged fragments. Results
-show the actual matching fragment with its precise line range. Index data is a
-private rebuildable cache; source files are never changed.
+show the actual matching fragment with its precise line range.
 
 Examples:
 

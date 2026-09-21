@@ -46,11 +46,11 @@ impl ModelTool for ReplaceTool {
     fn descriptor(&self) -> ModelToolDescriptor {
         ModelToolDescriptor {
             name: "replace".to_string(),
-            description: "Replace one exact text match in a UTF-8 file atomically. Relative paths resolve from the startup working directory. On Unix, `~` and paths beginning with `~/` resolve from the current user's home directory; `~user` is not expanded. The old text must be nonempty and occur exactly once; missing or ambiguous matches leave the file unchanged.".to_string(),
+            description: "Replace one exact text match in a UTF-8 file atomically. Relative paths resolve from the startup working directory. The old text must be nonempty and occur exactly once; missing or ambiguous matches leave the file unchanged.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path relative to the startup working directory, or an absolute path; on Unix, ~ and paths beginning with ~/ resolve from the current user's home directory."},
+                    "path": {"type": "string", "description": "File path."},
                     "old_text": {"type": "string", "description": "Exact nonempty text to replace. Must occur once."},
                     "new_text": {"type": "string", "description": "Replacement text."}
                 },
@@ -155,7 +155,7 @@ mod tests {
             tool.descriptor().parameters["properties"]["path"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("paths beginning with ~/")
+                == "File path."
         );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }

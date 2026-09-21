@@ -485,8 +485,7 @@ authorization. Do not create this envelope yourself.
 
 A successful call means the target process was active and the message was
 durably accepted. It does not mean that the target has read or completed it.
-Stopped processes are not started automatically. Messages are limited to 32
-KiB. Self-send and broadcast are not supported.
+Messages are limited to 32 KiB. Self-send and broadcast are not supported.
 
 Every delivered message includes the host-injected stable source session ID.
 Use `context://sessions/<source-session-id>` or

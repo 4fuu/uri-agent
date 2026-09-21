@@ -51,8 +51,6 @@ Relative paths resolve from the startup working directory; absolute paths are ac
 
 Matching first tries exact lines, then tolerates surrounding whitespace and common Unicode variants of spaces, dashes, and quotes. CRLF and LF files both match; original line endings and BOM are preserved.
 
-The output summarizes submitted operations as `A` (Add File), `M` (Update File, including moves), or `D` (Delete File), with added and removed line counts. An update without `*** Move to` that leaves content unchanged prints `= <path> (unchanged)`. If the complete in-memory plan matches the original files, the output starts with `Patch made no changes:` and lists the touched paths as unchanged; recheck the patch before continuing.
-
 Parsing and planning failures leave files unchanged. If writing fails after some changes, URI Agent attempts to roll them back and reports any rollback failure."#;
 
 #[derive(Clone)]
@@ -458,6 +456,7 @@ async fn apply_patch(cwd: &Path, patch: &str) -> Result<String> {
         for path in touched {
             output.push_str(&format!("= {} (unchanged)\n", display_path(&path)));
         }
+        output.push_str("Recheck the patch before continuing.\n");
         return Ok(output);
     }
 
@@ -838,12 +837,6 @@ mod tests {
             descriptor.parameters["properties"]["patch"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("output starts with `Patch made no changes:`")
-        );
-        assert!(
-            descriptor.parameters["properties"]["patch"]["description"]
-                .as_str()
-                .unwrap()
                 .contains("A chunk containing only `+` lines appends at EOF")
         );
         let _ = fs::remove_dir_all(output_store.directory()).await;
@@ -951,7 +944,7 @@ mod tests {
 *** End Patch"#;
         assert_eq!(
             apply_patch(directory.path(), noop_only).await.unwrap(),
-            "Patch made no changes:\n= same.txt (unchanged)\n"
+            "Patch made no changes:\n= same.txt (unchanged)\nRecheck the patch before continuing.\n"
         );
     }
 
@@ -966,7 +959,7 @@ mod tests {
 
         assert_eq!(
             apply_patch(directory.path(), patch).await.unwrap(),
-            "Patch made no changes:\n= temporary.txt (unchanged)\n"
+            "Patch made no changes:\n= temporary.txt (unchanged)\nRecheck the patch before continuing.\n"
         );
         assert!(!directory.path().join("temporary.txt").exists());
     }

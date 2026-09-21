@@ -80,8 +80,7 @@ remain owned by this execution and are terminated when the root shell exits or
 the task times out or is cancelled. Background task status, output, and
 cancellation use the unified `tasks://` protocol; load its contract with
 `help(["tasks"])` before the first such call. Completion is delivered
-automatically, so you MUST NOT poll for completion; read a task only when you
-need its current output.
+automatically; read a task only when you need its current output.
 
 User-managed Agent environment variables are injected into every command. Use
 secret values by name and do not print them unless the user explicitly asks.
@@ -147,8 +146,7 @@ remain owned by this execution and are terminated when the root shell exits or
 the task times out or is cancelled. Background task status, output, and
 cancellation use the unified `tasks://` protocol; load its contract with
 `help(["tasks"])` before the first such call. Completion is delivered
-automatically, so you MUST NOT poll for completion; read a task only when you
-need its current output.
+automatically; read a task only when you need its current output.
 
 PowerShell source and plain-text output use UTF-8. Command success follows the
 final PowerShell or native command, and native exit codes are preserved.
@@ -995,7 +993,6 @@ mod tests {
         assert!(PWSH_HELP.contains("tasks://<id>/eof"));
         assert!(PWSH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
-        assert!(PWSH_HELP.contains("MUST NOT poll for completion"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
         assert!(BASH_HELP.contains("`read` supports no shell operations"));
         assert!(BASH_HELP.contains("command body MUST contain at least\none non-whitespace"));
@@ -1008,7 +1005,6 @@ mod tests {
         assert!(BASH_HELP.contains("tasks://<id>/interrupt"));
         assert!(BASH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(BASH_HELP.contains("unified `tasks://` protocol"));
-        assert!(BASH_HELP.contains("MUST NOT poll for completion"));
         assert!(!BASH_HELP.contains("?wait="));
         assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }

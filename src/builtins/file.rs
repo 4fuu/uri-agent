@@ -60,7 +60,6 @@ Current working directory: `file://{}`
 - Full outputs saved by the system are exposed as `file://` addresses.
 
 Every `file` read MUST pass an empty string body.
-This protocol supports `read` only; it does not support `exec`.
 "#,
         display_path(cwd)
     )
@@ -738,7 +737,6 @@ mod tests {
         assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("Every `file` read"));
         assert!(help.contains("MUST pass an empty string body"));
-        assert!(help.contains("does not support `exec`"));
     }
 
     #[test]
