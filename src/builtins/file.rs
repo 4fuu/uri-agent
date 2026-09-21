@@ -45,13 +45,16 @@ Current working directory: `file://{}`
 - Add `?tail=<count>` to efficiently read the last lines of a text file. The
   maximum is 2000. `tail` cannot be combined with `offset`, `limit`, or `glob`.
 - Add `?line_numbers=true` to prefix file content with its original one-based
-  line numbers. Line numbers are disabled by default.
+  line numbers. Line numbers are disabled by default and cannot be combined
+  with `glob`.
 - Add `?glob=<pattern>` to a directory address to list matching files
   recursively with standard ignore rules. Patterns are relative to that
   directory; for example, `file://src?glob=**/*.rs`. A glob scans at most
   50000 files; narrow the root for larger trees.
-- Query values use standard percent-encoding.
-- Unknown, duplicate, malformed, or invalid query parameters are rejected.
+- Query values use form encoding: percent escapes and `+` as space. The path
+  portion is never percent-decoded.
+- Unknown, duplicate, malformed, or invalid query parameters are rejected;
+  out-of-range numeric values are clamped to their bounds.
 - Paginated file, directory, and glob reads return an exact `Next:` address.
   Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
@@ -719,12 +722,18 @@ mod tests {
         assert!(help.contains("`?tail=<count>`"));
         assert!(help.contains("`tail` cannot be combined with `offset`, `limit`, or `glob`"));
         assert!(help.contains("`?line_numbers=true`"));
-        assert!(help.contains("Line numbers are disabled by default."));
+        assert!(help.contains("Line numbers are disabled by default and cannot be combined"));
+        assert!(help.contains("with `glob`."));
         assert!(help.contains("PNG, JPEG, GIF, and WebP"));
         assert!(help.contains("Image reads do not accept query"));
         assert!(help.contains("`?glob=<pattern>`"));
-        assert!(help.contains("standard percent-encoding"));
-        assert!(help.contains("Unknown, duplicate, malformed, or invalid query parameters"));
+        assert!(help.contains("form encoding: percent escapes and `+` as space"));
+        assert!(help.contains("The path\n  portion is never percent-decoded"));
+        assert!(
+            help.contains(
+                "Unknown, duplicate, malformed, or invalid query parameters are rejected;"
+            )
+        );
         assert!(help.contains("paths beginning with\n  `~/` resolve"));
         assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("Every `file` read"));

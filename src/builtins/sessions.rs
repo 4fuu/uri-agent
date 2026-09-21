@@ -80,7 +80,7 @@ Conversation records use session-local IDs such as `r42`, matching `context://`.
 
 `include_tools` remains supported for compatibility and cannot be combined with `types`. `include_tools=false` selects `user,assistant,error`; `include_tools=true` selects every type.
 
-Query values use standard percent-encoding.
+Query values use form encoding: percent escapes and `+` as space; target paths are never percent-decoded.
 
 Examples:
 
@@ -187,12 +187,10 @@ impl Protocol for SessionsPlugin {
             });
         if target == "help" {
             if !request.body.is_empty() {
-                let help_uri = self.uri("help", &[]);
-                bail!("{help_uri} requires an empty body; retry read({help_uri:?}, \"\")");
+                bail!("sessions help requires an empty body");
             }
             if query.is_some() {
-                let help_uri = self.uri("help", &[]);
-                bail!("{help_uri} does not accept query parameters; use read({help_uri:?}, \"\")");
+                bail!("sessions help does not accept query parameters");
             }
             return Ok(help(&self.cwd, self.base_uri).into_bytes());
         }
@@ -232,8 +230,10 @@ impl Protocol for SessionsPlugin {
                 }
             }
             "" => {
-                let help_uri = self.uri("help", &[]);
-                bail!("sessions target is required; use read({help_uri:?}, \"\") for instructions")
+                let recent_uri = self.uri("recent", &[]);
+                bail!(
+                    "sessions target is required; use read({recent_uri:?}, \"\") or another documented target"
+                )
             }
             target if split_around_target(target).is_some() => {
                 require_empty_body(request.body, request.uri, self.base_uri)?;

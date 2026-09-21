@@ -54,10 +54,10 @@ Conversation records have session-local IDs such as `r42`. Record types are `use
 
 Consult another session whenever its history or notes could help. `@@<session-id>` is an explicit user reference to that session and requires consulting it. Saved-session records and notes are read-only: these routes do not resume or modify the referenced session.
 
-- `context://sessions/recent` lists saved sessions.
-- `context://sessions/search` searches session IDs, working directories, and conversation records using nonempty plain text.
-- `context://sessions/<session-id>` reads records from one saved session.
-- `context://sessions/<session-id>/around/<record-id>` reads records surrounding one stable anchor.
+- `context://sessions/recent` lists saved sessions; `scope`, `cwd`, `limit`, and `offset` apply.
+- `context://sessions/search` searches session IDs, working directories, and conversation records using nonempty plain text; it also accepts `types` and a ranked `mode`.
+- `context://sessions/<session-id>` reads records from one saved session; `types`, `limit`, and `before=<record-id>` filter and paginate.
+- `context://sessions/<session-id>/around/<record-id>` reads records surrounding one stable anchor, with `before`/`after` record counts and `types` like `context://history/around/<record-id>`.
 - `context://sessions/<session-id>/notes` lists the session's notes.
 - `context://sessions/<session-id>/notes/<note-id>` reads a note.
 - `context://sessions/<session-id>/notes/<note-id>/revisions` lists its revision metadata.
@@ -78,8 +78,9 @@ Discovery defaults to the current project. The discovery and index routes accept
   history cache. Use `exec("context://history/index", "")` only to prewarm or
   force-rebuild that cache. Do not use either operation before a ranked search.
   The private sidecar cache never changes session events.
-- `context://history/users` lists original user statements across all windows;
-  `context://history/users/search` searches them. Exact search is the default
+- `context://history/users` lists original user statements across all windows,
+  with optional `before=<record-id>` pagination; `context://history/users/search`
+  searches them. Exact search is the default
   and accepts optional `before=<record-id>` and `limit` pagination. Use exact
   for known literal wording. Prefer `mode=hybrid`, which combines keyword and
   semantic ranking, for conceptual searches. Use `mode=semantic` when relevant
@@ -104,7 +105,7 @@ defaults to 20 and is clamped to 1 through 50.
 - `exec("context://notes/add?title=<percent-encoded-title>", "<content>")` creates a note and returns its stable ID.
 - `exec("context://notes/<id>/replace?title=<percent-encoded-title>", "<content>")` replaces the current content and creates a revision while preserving the ID.
 - `exec("context://notes/<id>/delete", "")` tombstones a note. Its ID, title, revision metadata, and anchors remain, but its content can no longer be read.
-- `exec("context://rollover", "<optional bounded handoff>")` requests a fresh context window when the active strategy is `rollover`. It starts after every tool result from the current model response is durably paired.
+- `exec("context://rollover", "<optional bounded handoff>")` requests a fresh context window when the active strategy is `rollover`; the handoff is limited to 4,096 estimated tokens. It starts after every tool result from the current model response is durably paired.
 
 Titles are required, single-line, and at most 120 characters. At most 20 notes may be active. A note has no separate content limit, but all current titles and content share a hard budget of at most 20% of the model context after fixed context and safety headroom. Writes warn at 15% and reject growth beyond the hard budget; shrinking replacements and deletes remain available. IDs are never reused.
 
@@ -697,7 +698,7 @@ async fn mutate_note(
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("context note not found: {id}"))?;
             if note.deleted {
-                bail!("context note {id} is 已删除 and cannot be replaced");
+                bail!("context note {id} is deleted and cannot be replaced");
             }
             note.title.clone_from(&title);
             note.revision = note.revision.saturating_add(1);
@@ -712,7 +713,7 @@ async fn mutate_note(
                 .ok_or_else(|| anyhow!("context note not found: {id}"))?;
             if note.deleted {
                 return Ok(format!(
-                    "{id} · {} · revision={} · window={} · anchor={} · 已删除",
+                    "{id} · {} · revision={} · window={} · anchor={} · deleted",
                     note.title,
                     note.revision,
                     note.window_id,
@@ -765,7 +766,7 @@ async fn mutate_note(
 
     let mut result = if deleted {
         format!(
-            "{id} · {title} · revision={revision} · window={window_id} · anchor={} · 已删除",
+            "{id} · {title} · revision={revision} · window={window_id} · anchor={} · deleted",
             record_id(context_sequence)
         )
     } else {
@@ -827,7 +828,7 @@ fn format_notes_index(state: &ContextState, events: &[SessionEvent]) -> Result<S
         if note.deleted {
             let _ = writeln!(
                 output,
-                "{} · {} · revision={} · window={} · anchor={} · 已删除",
+                "{} · {} · revision={} · window={} · anchor={} · deleted",
                 note.id,
                 note.title,
                 note.revision,
@@ -871,7 +872,7 @@ fn format_saved_notes_index(session_id: &str, events: &[SessionEvent]) -> String
         if note.deleted {
             let _ = writeln!(
                 output,
-                "{} · {} · revision={} · window={} · anchor={} · 已删除",
+                "{} · {} · revision={} · window={} · anchor={} · deleted",
                 note.id,
                 note.title,
                 note.revision,
@@ -918,7 +919,7 @@ fn read_note_target(
         .ok_or_else(|| anyhow!("context note not found: {id}"))?;
     if note.deleted && operation.is_empty() {
         return Ok(format!(
-            "{} · {} · revision={} · window={} · anchor={} · 已删除",
+            "{} · {} · revision={} · window={} · anchor={} · deleted",
             note.id,
             note.title,
             note.revision,
@@ -965,11 +966,7 @@ fn read_note_target(
                         revision.title,
                         revision.window_id,
                         record_id(revision.context_sequence),
-                        if revision.deleted {
-                            " · 已删除"
-                        } else {
-                            ""
-                        }
+                        if revision.deleted { " · deleted" } else { "" }
                     );
                 } else {
                     let _ = writeln!(
@@ -1919,10 +1916,10 @@ mod tests {
         let events = state.events().await.unwrap();
         let index = format_notes_index(&state, &events).unwrap();
         assert!(index.contains("n001 · Updated decision · revision=3 · window=1 · anchor=r"));
-        assert!(index.contains(" · 已删除"));
+        assert!(index.contains(" · deleted"));
         let read = read_note_target(&events, "n001", None, "", "context://notes").unwrap();
         assert!(read.starts_with("n001 · Updated decision · revision=3 · window=1 · anchor=r"));
-        assert!(read.ends_with(" · 已删除"));
+        assert!(read.ends_with(" · deleted"));
         assert!(!read.contains("secret"));
         let context =
             read_note_target(&events, "n001/context", None, "", "context://notes").unwrap();
@@ -1932,7 +1929,7 @@ mod tests {
             read_note_target(&events, "n001/revisions", None, "", "context://notes").unwrap();
         assert!(revisions.contains("revision=3 · title=Updated decision"));
         assert!(revisions.contains("anchor=r"));
-        assert!(revisions.contains("已删除"));
+        assert!(revisions.contains("deleted"));
         assert!(!revisions.contains("secret"));
     }
 
@@ -2088,7 +2085,7 @@ mod tests {
             .unwrap();
         let deleted = String::from_utf8(deleted).unwrap();
         assert!(deleted.contains("UNTRUSTED SAVED SESSION NOTE"));
-        assert!(deleted.contains("已删除"));
+        assert!(deleted.contains("deleted"));
 
         let error = plugin
             .exec(

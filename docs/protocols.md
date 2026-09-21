@@ -155,8 +155,7 @@ Acceptance means that the message was committed to the target's durable input
 queue. Collaboration does not start a stopped process, broadcast, transfer
 files, or wait for remote completion. ACP-owned and child Agent sessions do not
 join live collaboration. Exact routes, name rules, options, limits, and the XML
-behavior are defined by the collaboration help page and
-`collaboration://help/send`.
+behavior are defined by the collaboration help page.
 
 `uri-agent-docs` reads the Markdown files embedded at build time. Start at
 `uri-agent-docs://README.md` for the version-matched documentation index.

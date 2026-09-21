@@ -109,7 +109,7 @@ pub fn task_accepted(id: &str) -> String {
 
 pub fn interactive_task_accepted(id: &str) -> String {
     format!(
-        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Send input with exec(\"tasks://{id}/send\", \"<input>\"); the input is written exactly, so end each line with \\n. Close stdin with exec(\"tasks://{id}/eof\", \"\") and interrupt with exec(\"tasks://{id}/interrupt\", \"\"). Read current output with read(\"tasks://{id}\", \"\") and use one bounded wait when the result is needed. Do not poll or rerun the operation."
+        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with exec(\"tasks://{id}/send\", \"<input>\"); the input is written exactly, so end each line with \\n. Close stdin with exec(\"tasks://{id}/eof\", \"\") and interrupt with exec(\"tasks://{id}/interrupt\", \"\"). Read current output with read(\"tasks://{id}\", \"\") and use one bounded wait when the result is needed. Do not poll or rerun the operation."
     )
 }
 
@@ -239,6 +239,7 @@ mod tests {
     fn interactive_task_acceptance_points_to_input_routes() {
         let message = interactive_task_accepted("002");
         assert!(message.starts_with("Interactive task started: tasks://002"));
+        assert!(message.contains(r#"help(["tasks"])"#));
         assert!(message.contains(r#"exec("tasks://002/send", "<input>")"#));
         assert!(message.contains("end each line with \\n"));
         assert!(message.contains(r#"exec("tasks://002/eof", "")"#));

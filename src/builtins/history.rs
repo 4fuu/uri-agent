@@ -243,7 +243,9 @@ pub(super) fn record_id(sequence: u64) -> String {
 pub(super) fn parse_record_id(value: &str) -> Result<u64> {
     let value = value.strip_prefix('r').unwrap_or(value);
     if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
-        return Err(anyhow!("record ID must use the form r<number>"));
+        return Err(anyhow!(
+            "record ID must use the form r<number> or a bare <number>"
+        ));
     }
     value
         .parse()

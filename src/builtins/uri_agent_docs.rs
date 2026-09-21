@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 const PROTOCOL_NAME: &str = "uri-agent-docs";
 const DOCUMENTS: &[(&str, &str)] = &[
     ("README.md", include_str!("../../docs/README.md")),
+    ("acp.md", include_str!("../../docs/acp.md")),
     (
         "configuration.md",
         include_str!("../../docs/configuration.md"),
@@ -123,6 +124,26 @@ mod tests {
         let help = String::from_utf8(read("help").await.unwrap()).unwrap();
         for (name, _) in DOCUMENTS {
             assert!(help.contains(&format!("`{name}`")));
+        }
+    }
+
+    #[tokio::test]
+    async fn every_document_linked_by_the_index_is_readable() {
+        let index = String::from_utf8(read("README.md").await.unwrap()).unwrap();
+        let mut linked = Vec::new();
+        let mut rest = index.as_str();
+        while let Some(position) = rest.find("](") {
+            rest = &rest[position + 2..];
+            let target = rest.split(')').next().unwrap_or_default();
+            if target.ends_with(".md") && !target.contains('/') {
+                linked.push(target.to_string());
+            }
+        }
+        assert!(!linked.is_empty(), "index links no documents");
+        for target in linked {
+            read(&target).await.unwrap_or_else(|error| {
+                panic!("index links unreadable document {target}: {error}")
+            });
         }
     }
 

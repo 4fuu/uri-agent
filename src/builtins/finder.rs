@@ -64,8 +64,8 @@ Unix, `~` and paths beginning with `~/` resolve from the current user's home
 directory; `~user` is not expanded. The root must be an existing directory.
 The scope restricts code search only; web reads are unaffected.
 
-Every `finder` call other than the lookup question itself MUST pass an empty
-string body; `finder` supports no other reads.
+The lookup question goes in the `exec` body. Every other `finder` call MUST
+pass an empty string body; `finder` supports no other reads.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -535,8 +535,8 @@ mod tests {
             "`~user` is not expanded",
             "The root must be an existing directory.",
             "The scope restricts code search only; web reads are unaffected.",
-            "MUST pass an empty",
-            "string body; `finder` supports no other reads",
+            "The lookup question goes in the `exec` body. Every other `finder` call MUST",
+            "pass an empty string body; `finder` supports no other reads",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");

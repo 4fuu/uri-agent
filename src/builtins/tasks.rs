@@ -12,9 +12,10 @@ const MAX_WAIT_SECONDS: u64 = 300;
 
 const HELP: &str = r#"# tasks
 
-Inspect and cancel background tasks from every protocol. Every `tasks` call
-on this page MUST pass an empty string body; interactive input routes are
-documented by the shell protocols.
+Inspect and cancel background tasks from every protocol. Every `tasks`
+operation documented on this page requires an empty string body; interactive
+input routes, whose bodies carry the input text, are documented by the shell
+protocols.
 
 Read a summary of all background tasks:
 
@@ -261,7 +262,11 @@ fn parse_read_target(target: &str) -> Result<(&str, Option<Duration>)> {
         .strip_prefix("wait=")
         .and_then(|value| value.parse::<u64>().ok())
         .map(|seconds| seconds.clamp(1, MAX_WAIT_SECONDS))
-        .ok_or_else(|| anyhow!("task wait must be an integer number of seconds"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "tasks read queries support only wait=<seconds> with an integer number of seconds"
+            )
+        })?;
     Ok((id, Some(Duration::from_secs(seconds))))
 }
 
@@ -378,8 +383,8 @@ mod tests {
         assert!(HELP.contains("tasks://<id>"));
         assert!(HELP.contains("tasks://<id>?wait=30"));
         assert!(HELP.contains("tasks://<id>/cancel"));
-        assert!(HELP.contains("MUST pass an empty string body"));
-        assert!(HELP.contains("documented by the shell protocols"));
+        assert!(HELP.contains("requires an empty string body"));
+        assert!(HELP.contains("documented by the shell\nprotocols"));
         assert!(HELP.contains("clamped to the nearest bound"));
         assert!(HELP.contains("Operations normally return in their original"));
         assert!(HELP.contains("use one bounded wait; do not poll or rerun the operation"));

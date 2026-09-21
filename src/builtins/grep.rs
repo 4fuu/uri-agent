@@ -38,7 +38,8 @@ retrieval.
 
 Current working directory: `{scheme}://{}`
 
-Search reads MUST pass a nonempty search pattern in the string body. Use
+Search reads other than `mode=status` MUST pass a nonempty search pattern in
+the string body; `mode=status` requires an empty body. Use
 `{scheme}://<root>` for a project-relative or absolute file/directory root. The
 root may be empty: `{scheme}://` searches the current working directory. On Unix, `~`
 and paths beginning with `~/` resolve from the current user's home directory;
@@ -48,13 +49,15 @@ Optional query parameters:
 
 - `mode=exact` (the default) uses ripgrep (`rg`). Patterns use `rg`
   regular-expression syntax unless `literal=true` is set. Use this mode for
-  known identifiers, paths, syntax, or literal wording.
+  known identifiers, paths, syntax, or literal wording. Exact results are
+  `path:line:text` lines; an output ending with `[match limit reached: <limit>]`
+  covers only the first `limit` matches.
 - `mode=hybrid` combines keyword and semantic ranking. Prefer it for conceptual
   searches.
 - `mode=semantic` prioritizes meaning over shared wording. Use it when relevant
   results are likely to use different wording from the query.
 - `mode=status` reports whether the selected root's semantic cache is current;
-  its body must be empty.
+  its body must be empty and it accepts no parameters other than `glob`.
 - `glob=<pattern>` filters searched paths using `rg` glob syntax.
 - If `rg` rejects a regular expression, the protocol retries it as literal
   text.
@@ -95,7 +98,8 @@ read("{scheme}://src?mode=hybrid&glob=**/*.rs&limit=10", "authentication flow")
 exec("{scheme}://src?mode=index&glob=**/*.rs", "")
 ```
 
-`exec` supports only `mode=index` with an empty body.
+`exec` supports only `mode=index` (optionally with `glob`) with an empty body;
+status and index accept no other parameters.
 "#,
         display_path(cwd)
     )

@@ -78,7 +78,8 @@ command.
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
 the task times out or is cancelled. Background task status, output, and
-cancellation use the unified `tasks://` protocol. Completion is delivered
+cancellation use the unified `tasks://` protocol; load its contract with
+`help(["tasks"])` before the first such call. Completion is delivered
 automatically, so you MUST NOT poll for completion; read a task only when you
 need its current output.
 
@@ -144,7 +145,8 @@ command.
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
 the task times out or is cancelled. Background task status, output, and
-cancellation use the unified `tasks://` protocol. Completion is delivered
+cancellation use the unified `tasks://` protocol; load its contract with
+`help(["tasks"])` before the first such call. Completion is delivered
 automatically, so you MUST NOT poll for completion; read a task only when you
 need its current output.
 

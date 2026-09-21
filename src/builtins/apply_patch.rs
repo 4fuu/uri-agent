@@ -44,7 +44,7 @@ Operation rules:
 - `*** Move to: <new path>` is optional and may appear only immediately after an Update File header, before the first `@@`.
 - Every line inside an update chunk must start with exactly one patch marker: a space for unchanged context, `-` for removed content, or `+` for added content. Preserve the file's indentation after that marker.
 - Include at least three unchanged context lines before and after a change when available. Use more context or an `@@ <landmark>` when similar code appears more than once.
-- A chunk containing only `+` lines appends at EOF. To insert inside an existing file, include unchanged context that anchors the insertion.
+- A chunk containing only `+` lines appends at EOF even when it has an `@@ <landmark>`. To insert inside an existing file, include unchanged context that anchors the insertion.
 - Put `*** End of File` after a chunk only when that chunk must match at EOF.
 
 Relative paths resolve from the startup working directory; absolute paths are accepted. On Unix, `~` and paths beginning with `~/` resolve from the current user's home directory; `~user` is not expanded.
