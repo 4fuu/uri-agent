@@ -1690,6 +1690,43 @@ fn stepfun_completions_keep_system_role_and_max_tokens() {
 }
 
 #[test]
+fn completions_strict_mode_requires_catalog_opt_in() {
+    let mut model = catalog_model("openai-completions", json!({}));
+    model.provider = "local-openai".to_string();
+    let body = transformed(
+        model,
+        ThinkingLevel::Off,
+        json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "read"}},
+                {"type": "function", "function": {"name": "exec", "strict": false}}
+            ]
+        }),
+    );
+    for tool in body["tools"].as_array().unwrap() {
+        assert!(tool["function"].get("strict").is_none());
+    }
+}
+
+#[test]
+fn completions_strict_mode_opt_in_keeps_strict_field() {
+    let model = catalog_model(
+        "openai-completions",
+        json!({"compat": {"supportsStrictMode": true}}),
+    );
+    let body = transformed(
+        model,
+        ThinkingLevel::Off,
+        json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "read"}}]
+        }),
+    );
+    assert_eq!(body["tools"][0]["function"]["strict"], false);
+}
+
+#[test]
 fn completions_compat_maps_vllm_priority() {
     let model = catalog_model("openai-completions", json!({"compat": {"vllmPriority": 0}}));
     let body = transformed(model, ThinkingLevel::Off, json!({}));

@@ -476,11 +476,9 @@ impl ModelRequestTransform {
         if !self.compat_bool("supportsTemperature", true) {
             body.remove("temperature");
         }
-        let strict_default = !matches!(
-            self.model.provider.as_str(),
-            "moonshotai" | "moonshotai-cn" | "together" | "nvidia"
-        );
-        self.apply_tool_strictness(body, strict_default, Value::Bool(false));
+        // OpenAI compatibility alone does not imply the endpoint accepts the
+        // strict tool field; only catalog compat metadata opts in per model.
+        self.apply_tool_strictness(body, false, Value::Bool(false));
         self.apply_deepseek_v41_flash_compat(body);
         self.apply_developer_role(body);
         self.apply_openai_cache_control(body);
