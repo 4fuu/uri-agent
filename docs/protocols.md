@@ -189,6 +189,7 @@ and argument contract.
 
 Both tools resolve relative paths from the startup directory and accept
 absolute paths. On Unix, `~` and `~/` expand to the current user's home.
+Symbolic-link paths are rejected.
 
 ## Shell execution and managed tasks
 

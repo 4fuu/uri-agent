@@ -50,7 +50,7 @@ impl ModelTool for ReplaceTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Project-relative or absolute file path; on Unix, ~ and paths beginning with ~/ resolve from the current user's home directory."},
+                    "path": {"type": "string", "description": "Path relative to the startup working directory, or an absolute path; on Unix, ~ and paths beginning with ~/ resolve from the current user's home directory."},
                     "old_text": {"type": "string", "description": "Exact nonempty text to replace. Must occur once."},
                     "new_text": {"type": "string", "description": "Replacement text."}
                 },
@@ -79,6 +79,17 @@ impl ModelTool for ReplaceTool {
 async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()> {
     if old_text.is_empty() {
         bail!("old_text cannot be empty");
+    }
+
+    if fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "replace paths cannot be symbolic links: {}",
+            display_path(path)
+        );
     }
 
     let original = fs::read_to_string(path)
@@ -165,6 +176,24 @@ mod tests {
         let ambiguous = replace_exact(&path, "aa", "x").await.unwrap_err();
         assert!(ambiguous.to_string().contains("more than once"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), "aaa");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_replace_rejects_symbolic_link_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.txt");
+        fs::write(&target, "alpha beta\n").await.unwrap();
+        let link = directory.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        let error = replace_exact(&link, "beta", "gamma").await.unwrap_err();
+
+        assert!(error.to_string().contains("symbolic links"));
+        assert_eq!(fs::read_to_string(&target).await.unwrap(), "alpha beta\n");
+        assert!(fs::symlink_metadata(&link).await.unwrap().is_symlink());
     }
 
     #[tokio::test]
