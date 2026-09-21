@@ -2006,7 +2006,10 @@ impl Session {
             .collect::<Result<Vec<_>>>()?;
         self.connection
             .call(move |db| {
-                let transaction = db.transaction()?;
+                // Immediate: the SELECT below establishes a read snapshot, so
+                // a deferred upgrade to the write lock fails at once with
+                // SQLITE_BUSY whenever another connection commits in between.
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute(
                     "INSERT INTO sessions
                      (id, created_at, updated_at, cwd, provider, model, thinking,
@@ -2697,7 +2700,12 @@ impl Session {
                 .sequence;
             self.connection
                 .call(move |db| {
-                    let transaction = db.transaction()?;
+                    // Immediate: the SELECT below establishes a read snapshot,
+                    // so a deferred upgrade to the write lock fails at once
+                    // with SQLITE_BUSY whenever another connection commits in
+                    // between.
+                    let transaction =
+                        db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                     let draft = transaction
                         .query_row(
                             "SELECT draft FROM pending_drafts WHERE cwd = ?1",
@@ -2777,7 +2785,10 @@ impl Session {
             .sequence as i64;
         self.connection
             .call(move |db| {
-                let transaction = db.transaction()?;
+                // Immediate: the SELECT below establishes a read snapshot, so
+                // a deferred upgrade to the write lock fails at once with
+                // SQLITE_BUSY whenever another connection commits in between.
+                let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let head: i64 = transaction.query_row(
                     "SELECT head_sequence FROM sessions WHERE id = ?1",
                     [&id],
@@ -3997,6 +4008,55 @@ mod tests {
             latest_api_usage,
             after_compaction: latest_compaction.is_some(),
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_across_connections_never_fail_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let first = session(&path, Some("concurrent-a")).await;
+        let second = session(&path, Some("concurrent-b")).await;
+        // Each append reads head_sequence before writing inside one
+        // transaction. With a deferred transaction a commit on the other
+        // connection landing in that window upgrades from a stale snapshot
+        // and fails at once with SQLITE_BUSY, which busy_timeout cannot
+        // resolve. Immediate transactions take the write lock first, so
+        // concurrent appends queue through the busy timeout instead.
+        let rounds = 3000;
+        let baseline_first = first.snapshot().await.unwrap().len();
+        let baseline_second = second.snapshot().await.unwrap().len();
+        let task_first = first.clone();
+        let task_second = second.clone();
+        let a = tokio::spawn(async move {
+            for round in 0..rounds {
+                task_first
+                    .append(EventKind::User {
+                        text: format!("a{round}"),
+                    })
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let b = tokio::spawn(async move {
+            for round in 0..rounds {
+                task_second
+                    .append(EventKind::User {
+                        text: format!("b{round}"),
+                    })
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        assert_eq!(
+            first.snapshot().await.unwrap().len(),
+            baseline_first + rounds
+        );
+        assert_eq!(
+            second.snapshot().await.unwrap().len(),
+            baseline_second + rounds
+        );
     }
 
     #[tokio::test]
