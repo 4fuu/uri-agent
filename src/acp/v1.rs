@@ -18,11 +18,11 @@ use agent_client_protocol::schema::v1::{
     LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
     ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption, SessionInfo,
-    SessionListCapabilities, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UsageUpdate,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionConfigValueId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent as AcpAgent, Client as AcpClient, ConnectTo, ConnectionTo, Dispatch, Error as AcpError,
@@ -567,7 +567,10 @@ impl AcpV1State {
             ));
         }
         let config_id = request.config_id.0.as_ref();
-        let value = request.value.0.as_ref();
+        let value = match &request.value {
+            SessionConfigOptionValue::ValueId { value } => value.0.as_ref(),
+            _ => return Err(invalid_params("ACP model option must be a string value")),
+        };
         let mut state = session.state.lock().await;
         let config_options = match &mut *state {
             AcpSessionState::Pending(pending) => {
@@ -998,8 +1001,10 @@ fn thinking_config_option(
     .category(SessionConfigOptionCategory::ThoughtLevel)
 }
 
-fn model_value(provider: &str, model: &str) -> String {
-    serde_json::to_string(&[provider, model]).expect("model IDs are serializable")
+fn model_value(provider: &str, model: &str) -> SessionConfigValueId {
+    SessionConfigValueId::new(
+        serde_json::to_string(&[provider, model]).expect("model IDs are serializable"),
+    )
 }
 
 fn decode_model_value(value: &str) -> agent_client_protocol::Result<(String, String)> {
@@ -2064,7 +2069,7 @@ mod tests {
                 assert_eq!(options.len(), 1);
                 assert_eq!(
                     model.current_value.0.as_ref(),
-                    model_value("acp-beta", "beta/model")
+                    model_value("acp-beta", "beta/model").0.as_ref()
                 );
                 connection
                     .send_request(CloseSessionRequest::new(session_id))
