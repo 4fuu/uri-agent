@@ -10,7 +10,7 @@ pub struct Pkce {
 
 pub fn generate_pkce() -> Result<Pkce> {
     let mut bytes = [0_u8; 32];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|error| anyhow!("cannot generate PKCE verifier: {error}"))?;
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let digest = Sha256::digest(verifier.as_bytes());

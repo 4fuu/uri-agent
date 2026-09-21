@@ -18,7 +18,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use fs2::FileExt;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock,
     GetPromptRequestParams, GetPromptResult, Implementation, JsonObject, Prompt, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResult, ResourceContents, Tool,
 };
@@ -968,7 +968,7 @@ struct McpStatusSnapshot {
     failed: usize,
 }
 
-type McpService = RunningService<RoleClient, ClientInfo>;
+type McpService = RunningService<RoleClient, ClientConfig>;
 
 struct McpConnection {
     config: McpServerConfig,
@@ -1361,8 +1361,8 @@ impl McpRuntime {
     }
 }
 
-fn mcp_client_info() -> ClientInfo {
-    ClientInfo::new(
+fn mcp_client_info() -> ClientConfig {
+    ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("uri-agent", env!("CARGO_PKG_VERSION")),
     )

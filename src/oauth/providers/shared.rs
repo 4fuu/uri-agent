@@ -127,7 +127,7 @@ impl FormUrlEncoded for reqwest::RequestBuilder {
 
 pub(super) fn random_hex(bytes: usize) -> Result<String> {
     let mut buffer = vec![0_u8; bytes];
-    getrandom::getrandom(&mut buffer)
+    getrandom::fill(&mut buffer)
         .map_err(|error| anyhow!("cannot generate OAuth state: {error}"))?;
     Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }

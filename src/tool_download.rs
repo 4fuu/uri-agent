@@ -122,7 +122,7 @@ impl BinaryDownloader {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = crate::hex_lower(&Sha256::digest(&bytes));
         if !digest.eq_ignore_ascii_case(spec.sha256) {
             bail!(
                 "checksum mismatch for {} {}: expected {}, got {}",

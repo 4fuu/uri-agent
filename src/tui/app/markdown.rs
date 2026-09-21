@@ -127,6 +127,11 @@ impl Writer {
             Event::FootnoteReference(label) => {
                 self.text(&format!("[{label}]"), Style::default().fg(MUTED));
             }
+            // Math events only occur with the opt-in ENABLE_MATH option; render
+            // them as plain text so the match stays exhaustive.
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                self.text(&text, self.style());
+            }
             Event::TaskListMarker(done) => {
                 let marker = if done { "☑ " } else { "☐ " };
                 if !self.line_open && self.pending_marker.is_some() {
@@ -150,7 +155,7 @@ impl Writer {
                 self.push_style(style);
                 self.text(&format!("{} ", "#".repeat(level as usize)), style);
             }
-            Tag::BlockQuote => {
+            Tag::BlockQuote(_) => {
                 self.start_block();
                 self.blockquotes += 1;
             }
@@ -217,6 +222,10 @@ impl Writer {
             Tag::FootnoteDefinition(_) | Tag::HtmlBlock | Tag::MetadataBlock(_) => {
                 self.start_block();
             }
+            Tag::DefinitionList | Tag::DefinitionListTitle | Tag::DefinitionListDefinition => {
+                self.start_block();
+            }
+            Tag::Superscript | Tag::Subscript => {}
         }
     }
 
@@ -231,7 +240,7 @@ impl Writer {
                 self.pop_style();
                 self.needs_blank = true;
             }
-            TagEnd::BlockQuote => {
+            TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.blockquotes = self.blockquotes.saturating_sub(1);
                 self.needs_blank = true;
@@ -271,6 +280,13 @@ impl Writer {
                 self.flush_line();
                 self.needs_blank = true;
             }
+            TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition => {
+                self.flush_line();
+                self.needs_blank = true;
+            }
+            TagEnd::Superscript | TagEnd::Subscript => {}
         }
     }
 

@@ -929,7 +929,7 @@ fn resume_checksum(session_id: &str, through: u64, payload: &str) -> String {
     digest.update(session_id.as_bytes());
     digest.update(through.to_be_bytes());
     digest.update(payload.as_bytes());
-    format!("{:x}", digest.finalize())
+    crate::hex_lower(&digest.finalize())
 }
 
 fn persist_rebuilt_resume_index(

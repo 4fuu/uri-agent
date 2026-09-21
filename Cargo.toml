@@ -20,53 +20,53 @@ agent-client-protocol = "=1.0.0"
 anyhow = "1"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
-dirs = "6"
+dirs = "7"
 extism = { version = "1.21", default-features = false, features = ["http", "register-filesystem", "register-http", "wasmtime-default-features"] }
 flate2 = "1"
 form_urlencoded = "1"
 fs2 = "0.4"
 futures-util = "0.3"
-getrandom = "0.2"
+getrandom = "0.4"
 half = "=2.6.0"
 html-to-markdown-rs = { version = "3.9.2", default-features = false }
 http = "1"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
 portable-pty = "0.9"
-pulldown-cmark = { version = "0.10", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 reqwest = { version = "0.13", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls"] }
 rig = { package = "rig-core", version = "=0.42.0" }
-rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest"] }
 rhai = { version = "1", features = ["sync"] }
-safetensors = "=0.6.2"
+safetensors = "=0.8.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 shell-words = "1"
 tar = "0.4"
 tempfile = "3"
 textwrap = "0.16"
-tokenizers = { version = "=0.22.1", default-features = false, features = ["onig"] }
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-rusqlite = { version = "0.7", features = ["bundled"] }
+tokio-rusqlite = { version = "0.8", features = ["bundled"] }
 tui-term = "0.3"
-tui-textarea = { package = "tui-textarea-2", version = "0.9" }
+tui-textarea = { package = "tui-textarea-2", version = "0.13" }
 unicode-general-category = "1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 uri-agent-plugin-sdk = { version = "=2026.921.0", path = "sdk" }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 vt100 = "0.16"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 zvec-rust = "=0.7.0"
 
 [target.'cfg(unix)'.dependencies]

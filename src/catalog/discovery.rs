@@ -139,7 +139,7 @@ pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredent
     } else {
         hash.update(credential.secret.as_bytes());
     }
-    format!("sha256-{:x}", hash.finalize())
+    format!("sha256-{}", crate::hex_lower(&hash.finalize()))
 }
 
 pub(super) async fn discover(

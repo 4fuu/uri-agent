@@ -27,3 +27,8 @@ mod tool_download;
 pub mod tui;
 mod update;
 pub mod wasm_plugin;
+
+/// Lowercase hexadecimal encoding for digest and checksum bytes.
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}

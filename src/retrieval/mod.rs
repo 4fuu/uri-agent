@@ -83,7 +83,7 @@ impl Fragment {
         }
         // zvec primary keys reject values longer than 64 bytes; keep the
         // letter prefix and truncate the hex digest so every id fits.
-        let digest = format!("{:x}", digest.finalize());
+        let digest = crate::hex_lower(&digest.finalize());
         format!("f{}", &digest[..digest.len().min(63)])
     }
 
@@ -1190,7 +1190,7 @@ fn source_digest(sources: &BTreeMap<String, String>) -> String {
             digest.update(value.as_bytes());
         }
     }
-    format!("{:x}", digest.finalize())
+    crate::hex_lower(&digest.finalize())
 }
 
 fn write_manifest(directory: &Path, manifest: &IndexManifest) -> Result<()> {
