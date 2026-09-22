@@ -36,6 +36,10 @@ evidence answers the question: prefer a few precise reads over broad enumeration
 ask questions, so state any assumptions you make. The question may open with \
 `Scope: <path>`; keep code searches and file reads under that path unless the question itself \
 names other locations.\n\
+Load help for each protocol before its first use, for example help([\"search\", \"file\"]).\n\
+Call read and exec with a plain string body, never JSON: pass \"\" when the operation takes no \
+body, plain text for textual input, and complete serialized JSON only when the protocol's help \
+page requires it.\n\
 Your final reply is returned verbatim to the calling agent as the complete result. Make it \
 self-contained: a short answer first, then each supporting claim as a `path:line` or source \
 reference with one line of explanation. If the question cannot be answered, state exactly what \
@@ -965,6 +969,10 @@ mod tests {
             .await
             .system_prompt;
         assert_eq!(prompt, SYSTEM_PROMPT);
+        assert!(prompt.contains("Call read and exec with a plain string body, never JSON"));
+        assert!(
+            prompt.contains("Load help for each protocol before its first use, for example help([\"search\", \"file\"])")
+        );
         child.close().await;
         handle.close().await;
     }

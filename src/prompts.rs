@@ -35,10 +35,12 @@ pub fn system_prompt(
     write_entries(&mut prompt, protocols);
     prompt.push_str(
         "\nChoose a direct tool or a protocol as appropriate for the operation.\n\n\
+         Direct tools are called by name; protocols are not tools, so invoke one by calling read or exec with its <protocol>:// address.\n\n\
          Protocol rules:\n\
          - Load help first. Before the first read or exec call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
          - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
-         - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n",
+         - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n\
+         - The body of read and exec is always a plain string, never JSON: use \"\" when an operation takes no body, plain text for textual input, and complete serialized JSON text only when a protocol's help page explicitly requires it.\n",
     );
     prompt.push_str(
         "\nOperating rules:\n\
@@ -132,7 +134,23 @@ mod tests {
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
         assert!(prompt.contains("never guess them."));
+        assert!(
+            prompt.contains(
+                "The body of read and exec is always a plain string, never JSON: use \"\""
+            )
+        );
+        assert!(prompt.contains(
+            "complete serialized JSON text only when a protocol's help page explicitly requires it."
+        ));
         assert!(prompt.contains("Choose a direct tool or a protocol as appropriate"));
+        assert!(prompt.contains(
+            "Direct tools are called by name; protocols are not tools, so invoke one by calling \
+             read or exec with its <protocol>:// address."
+        ));
+        assert!(
+            prompt.find("Direct tools are called by name;").unwrap()
+                < prompt.find("Protocol rules:").unwrap()
+        );
         assert!(prompt.contains("Operating rules:\n- For clear requests"));
         assert!(prompt.contains("Treat user reports and proposed causes as claims to check"));
         assert!(prompt.contains("Make the smallest complete change"));
