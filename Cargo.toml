@@ -67,7 +67,7 @@ uri-agent-plugin-sdk = { version = "=2026.922.0", path = "sdk" }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 vt100 = "0.16"
 zip = { version = "8", default-features = false, features = ["deflate"] }
-zvec-rust = "=0.7.2"
+zvec-rust = "=0.7.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

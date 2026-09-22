@@ -12,25 +12,25 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-ZVEC_VERSION = "0.7.2"
+ZVEC_VERSION = "0.7.0"
 ZVEC_ARCHIVES = {
-    "x86_64-unknown-linux-gnu": "123bde64ed8baae5ea813907af5ab3575113281eb81fca5310f28a0fe4ffb92b",
-    "aarch64-unknown-linux-gnu": "7c8add821bc247ecdb7a688d456ae60f4dca91078e942084300757bf2d9d91fb",
-    "aarch64-apple-darwin": "5fd12d7659b495bf6b06ba173876e400dae1dc19d5e04e8468381c82867ea47f",
-    "x86_64-pc-windows-msvc": "13e416efbe72730329a61a74eccb1e8c32c7dbd203bcd1dc7c325ee52b8cfc0a",
+    "x86_64-unknown-linux-gnu": "7e9adbeadc42c772665efed45112220aa895d3f7963fa03c016102f2f414c37f",
+    "aarch64-unknown-linux-gnu": "0195a85f07370d7bcbf26f990bf794e31430e00224c8b9303d43ea677db6f77d",
+    "aarch64-apple-darwin": "59c41dcbaab69b9fbcf3ca0f1997f58f189a025657fd09a464dca199107cdeb2",
+    "x86_64-pc-windows-msvc": "d8fe5585ad83066038f6e60990fe6e69528637a58fffc5024ca211c187a9d49a",
 }
 ZVEC_FILES = {
     "x86_64-unknown-linux-gnu": (
-        ("libzvec_c_api.so", "58381ac7b12afd5eeae3dc10325914a28fc3157061291bb693a9ed757d815b8a"),
+        ("libzvec_c_api.so", "89eac719eb426a2066d2104e5b1199aa83ec18eaa4c31c7797b9bf469904cfd5"),
     ),
     "aarch64-unknown-linux-gnu": (
-        ("libzvec_c_api.so", "abadfd17a6e8aa648d77dc48816cfc965da5de3cf5ac2f42db15c1a89e8351b5"),
+        ("libzvec_c_api.so", "621af6ba8249ce44dc17fb05da6c51c723cc466843e7f46ee44a40bd7eee1169"),
     ),
     "aarch64-apple-darwin": (
-        ("libzvec_c_api.dylib", "06f183bf51ebd8b460fd0415f6b39c2556bdd6ef63a270efa35bdf76154512e2"),
+        ("libzvec_c_api.dylib", "c9e4bf9387ef7261a284de407ec7e48ac9a48309d8daaa4c5ed85a8fa5bb4763"),
     ),
     "x86_64-pc-windows-msvc": (
-        ("zvec_c_api.dll", "d846eeb9e84a1409bdd38723b1275bb2968468d98ef04fdb8f0b26682f17382e"),
+        ("zvec_c_api.dll", "3745106b3beee6be2d50ca678b46d3f0289afb5136ff51e1d1ec037a27b29e4a"),
         ("zvec_c_api.lib", "404d08fc55680a1bbc4351041826d5b643ebeb1767ad19931cb9e077aa24f7f7"),
     ),
 }
@@ -46,8 +46,8 @@ FILES = (
     # The model revision declares MIT but contains no separate LICENSE file.
     ("retrieval/models/potion-code-16M-v2/LICENSE", "https://raw.githubusercontent.com/MinishLab/model2vec/f16a2cee72e4ba9637f4b5ca31774658f1f292c3/LICENSE", "b0214f148eceae739f916209e78cfe15712c4b810c8bc9d44b6c2d1d1616aab6"),
     ("retrieval/licenses/zvec-LICENSE", f"https://raw.githubusercontent.com/zvec-ai/zvec-rust/v{ZVEC_VERSION}/LICENSE", "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"),
-    # zvec-rust's v0.7.2 submodule points at this exact zvec core commit.
-    ("retrieval/licenses/zvec-NOTICE", "https://raw.githubusercontent.com/alibaba/zvec/1ab7975dfc2d2160054bafff614831b7099cd930/NOTICE", "332b1a498b446fab1232b671c2ba74102fc563c198dc6f53980d1282075958ad"),
+    # zvec-rust's v0.7.0 submodule points at this exact zvec core commit.
+    ("retrieval/licenses/zvec-NOTICE", "https://raw.githubusercontent.com/alibaba/zvec/8321c1314a559fd5f909e92498f43e5194bf9b99/NOTICE", "332b1a498b446fab1232b671c2ba74102fc563c198dc6f53980d1282075958ad"),
 )
 
 

@@ -7589,9 +7589,9 @@ dependencies = [
 
 [[package]]
 name = "zvec-rust"
-version = "0.7.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "572509c7f611c4d8c278919273c586028ebb1d718ed2a64cf0f9407026be14e6"
+checksum = "09da6c0c29360b764d54f8d4107174f1fb60921d25387fd433f263ec4bf19e5a"
 dependencies = [
  "zvec-rust-sys",
 ]
