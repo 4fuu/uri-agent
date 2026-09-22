@@ -68,6 +68,10 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 vt100 = "0.16"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 zvec-rust = "=0.7.0"
+# The sys crate must track the zvec-rust pin and the ZVEC_VERSION in
+# scripts/prepare-retrieval-assets.py so the linked library matches the
+# prebuilt native assets shipped in release archives.
+zvec-rust-sys = "=0.7.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

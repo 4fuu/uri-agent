@@ -39,7 +39,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, windows-2025]
+        include:
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out source
@@ -50,6 +54,12 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: tests
+      - name: Prepare fixed retrieval assets
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python3 scripts/prepare-retrieval-assets.py --target ${{ matrix.target }} --output "$RUNNER_TEMP/stage"
+          echo "$RUNNER_TEMP/stage" >> "$GITHUB_PATH"
       - name: Run platform-sensitive tests
         shell: bash
         run: |

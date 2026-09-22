@@ -1,0 +1,378 @@
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push less than a minute ago
+
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 1 minute ago
+
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 1 minute ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run cargo fmt --check
+  * Run cargo clippy --all-targets --all-features -- -D warnings
+  * Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 2 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run cargo fmt --check
+  * Run cargo clippy --all-targets --all-features -- -D warnings
+  * Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 2 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  * Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  * Run cargo clippy --all-targets --all-features -- -D warnings
+  * Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 3 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  * Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 3 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  * Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 4 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  * Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 5 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  ✓ Run cargo test
+  * Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 5 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* platform-test (macos-26) (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+* test (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  ✓ Run cargo test
+  ✓ Run cargo check
+  * Post Cache Rust dependencies
+  * Post Check out source
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 6 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+✓ platform-test (macos-26) in 4m32s (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run platform-sensitive tests
+  ✓ Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
+✓ test in 4m21s (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  ✓ Run cargo test
+  ✓ Run cargo check
+  ✓ Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
+Refreshing run status every 30 seconds. Press Ctrl+C to quit.
+
+* main CI · 35687037573
+Triggered via push about 6 minutes ago
+
+JOBS
+* platform-test (windows-2025) (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  * Run platform-sensitive tests
+  * Post Cache Rust dependencies
+  * Post Check out source
+✓ platform-test (macos-26) in 4m32s (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run platform-sensitive tests
+  ✓ Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
+✓ test in 4m21s (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  ✓ Run cargo test
+  ✓ Run cargo check
+  ✓ Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
+X main CI · 35687037573
+Triggered via push about 7 minutes ago
+
+JOBS
+X platform-test (windows-2025) in 5m41s (ID 106616237131)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  X Run platform-sensitive tests
+  - Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
+✓ platform-test (macos-26) in 4m32s (ID 106616237376)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run platform-sensitive tests
+  ✓ Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
+✓ test in 4m21s (ID 106616237488)
+  ✓ Set up job
+  ✓ Check out source
+  ✓ Install stable Rust
+  ✓ Cache Rust dependencies
+  ✓ Run cargo fmt --check
+  ✓ Run cargo clippy --all-targets --all-features -- -D warnings
+  ✓ Run cargo test
+  ✓ Run cargo check
+  ✓ Post Cache Rust dependencies
+  ✓ Post Check out source
+  ✓ Complete job
