@@ -542,32 +542,52 @@ impl AgentRuntime {
             .expect("context usage lock poisoned")
     }
 
-    pub async fn refresh_context_estimate(&self) {
-        let Ok(system_prompt) = self.system_prompt().await else {
-            return;
-        };
+    async fn build_model_request(&self) -> Result<ModelRequest> {
+        let system = self.system_prompt().await?;
         let model = self.session.model_settings().await;
-        let context = self
+        let tools = self.model_tools.definitions();
+        let (history, usage) = self
             .session
-            .model_context(&model.provider, &model.model)
+            .with_model_history(&model.provider, &model.model, |history, latest, after| {
+                let usage = compaction::context_usage(&system, history, &tools, latest, after);
+                (history.to_vec(), usage)
+            })
             .await;
-        let usage = compaction::context_usage(
-            &system_prompt,
-            &context.history,
-            &self.model_tools.definitions(),
-            context.latest_api_usage,
-            context.after_compaction,
-        );
         *self
             .context_usage
             .write()
             .expect("context usage lock poisoned") = usage;
         let context_window = self.limits.read().await.context_window.max(1);
-        let base_context_tokens = compaction::estimate_request_tokens(
-            &system_prompt,
-            &[],
-            &self.model_tools.definitions(),
-        );
+        let base_context_tokens = compaction::estimate_request_tokens(&system, &[], &tools);
+        self.context_state
+            .update_meter(context_window, base_context_tokens, usage);
+        Ok(ModelRequest {
+            system,
+            history,
+            tools,
+            estimated_context: usage.tokens,
+            max_output_tokens: *self.max_output_tokens.read().await,
+        })
+    }
+
+    pub async fn refresh_context_estimate(&self) {
+        let Ok(system) = self.system_prompt().await else {
+            return;
+        };
+        let model = self.session.model_settings().await;
+        let tools = self.model_tools.definitions();
+        let usage = self
+            .session
+            .with_model_history(&model.provider, &model.model, |history, latest, after| {
+                compaction::context_usage(&system, history, &tools, latest, after)
+            })
+            .await;
+        *self
+            .context_usage
+            .write()
+            .expect("context usage lock poisoned") = usage;
+        let context_window = self.limits.read().await.context_window.max(1);
+        let base_context_tokens = compaction::estimate_request_tokens(&system, &[], &tools);
         self.context_state
             .update_meter(context_window, base_context_tokens, usage);
     }
@@ -1799,7 +1819,7 @@ impl AgentRuntime {
     }
 
     async fn rollover_context(&self, handoff: &str, manual: bool) -> Result<bool> {
-        if self.session.model_history().await.is_empty() {
+        if !self.session.has_model_history().await {
             return Ok(false);
         }
         let previous_window = self.session.context_window_id().await;
@@ -2096,15 +2116,7 @@ impl AgentRuntime {
         backend: &dyn ModelBackend,
         cancel: &mut watch::Receiver<Option<TurnCancellation>>,
     ) -> Result<ModelResponse> {
-        self.refresh_context_estimate().await;
-        let history = self.session.model_history().await;
-        let request = ModelRequest {
-            system: self.system_prompt().await?,
-            history,
-            tools: self.model_tools.definitions(),
-            estimated_context: self.context_usage().tokens,
-            max_output_tokens: *self.max_output_tokens.read().await,
-        };
+        let request = self.build_model_request().await?;
         let (deltas, mut receiver) = mpsc::unbounded_channel();
         let completion = backend.complete(request, deltas);
         tokio::pin!(completion);

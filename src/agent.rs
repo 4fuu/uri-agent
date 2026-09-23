@@ -17,7 +17,6 @@ use crate::task::TaskManager;
 use crate::wasm_plugin::WasmPluginManager;
 use anyhow::Result;
 use async_trait::async_trait;
-use rig::message::{AssistantContent, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -306,24 +305,8 @@ impl AgentHandle {
             .services
             .runtime
             .session()
-            .model_history()
+            .last_assistant_text()
             .await
-            .into_iter()
-            .rev()
-            .find_map(|message| match message {
-                Message::Assistant { content, .. } => {
-                    let text = content
-                        .into_iter()
-                        .filter_map(|content| match content {
-                            AssistantContent::Text(text) => Some(text.text),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!text.is_empty()).then_some(text)
-                }
-                _ => None,
-            })
     }
 
     pub async fn cancel(&self) -> bool {

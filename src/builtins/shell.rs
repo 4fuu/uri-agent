@@ -902,10 +902,28 @@ async fn execute_with_cancellation(
 fn append_process_output(result: &mut Vec<u8>, stdout: &[u8], stderr: &[u8], empty_marker: bool) {
     if stdout.is_empty() && stderr.is_empty() {
         if empty_marker {
+            result.reserve(b"(no output)".len());
             result.extend_from_slice(b"(no output)");
         }
         return;
     }
+    // Reserve the final shape once instead of repeatedly growing the result
+    // while a large stdout/stderr pair is being assembled.
+    let separator_len = if result.is_empty() { 0 } else { b"\n\n".len() };
+    let additional = match (stdout.is_empty(), stderr.is_empty()) {
+        (false, true) => separator_len + stdout.len(),
+        (true, false) => separator_len + b"stderr:\n".len() + stderr.len(),
+        (false, false) => {
+            separator_len
+                + b"stdout:\n".len()
+                + stdout.len()
+                + if stdout.ends_with(b"\n") { 0 } else { 1 }
+                + b"\n\nstderr:\n".len()
+                + stderr.len()
+        }
+        (true, true) => unreachable!("empty streams returned above"),
+    };
+    result.reserve(additional);
     if !result.is_empty() {
         result.extend_from_slice(b"\n\n");
     }

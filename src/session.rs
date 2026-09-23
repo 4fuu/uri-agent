@@ -6,7 +6,7 @@ use crate::skill::SkillSnapshot;
 use crate::task::{TaskReport, TaskStatus};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use rig::message::{Message, UserContent};
+use rig::message::{AssistantContent, Message, UserContent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -698,6 +698,22 @@ struct UsageBaseline {
     model: String,
 }
 
+fn latest_api_usage(replay: &ReplayState, provider: &str, model: &str) -> Option<(usize, usize)> {
+    replay
+        .usage_before_assistant
+        .iter()
+        .enumerate()
+        .filter_map(|(index, usage)| {
+            let usage = usage.as_ref()?;
+            (usage.context
+                && usage.total > 0
+                && (provider.is_empty() || usage.provider.is_empty() || usage.provider == provider)
+                && (model.is_empty() || usage.model.is_empty() || usage.model == model))
+                .then_some((index, usage.total))
+        })
+        .next_back()
+}
+
 struct RestoredState {
     context: Option<SessionContext>,
     derived: ResumeState,
@@ -960,6 +976,7 @@ fn persist_rebuilt_resume_index(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct ModelContext {
     pub history: Vec<Message>,
@@ -1322,6 +1339,7 @@ impl Session {
                 "session {id} has no frozen context and cannot be resumed"
             ));
         }
+        let retain_event_tail = derived.latest_compaction_sequence.is_some();
         let (events, _) = broadcast::channel(512);
         let session = Self {
             id,
@@ -1332,7 +1350,13 @@ impl Session {
             database_path,
             connection,
             state: Arc::new(Mutex::new(State {
-                events: existing,
+                // A resumed uncheckpointed session reads its event pages from
+                // SQLite. Keep the bounded tail for checkpointed resumes.
+                events: if created_session || retain_event_tail {
+                    existing
+                } else {
+                    Vec::new()
+                },
                 persisted: !created_session,
                 head_sequence,
                 spec,
@@ -2050,6 +2074,9 @@ impl Session {
             .await
             .context("cannot persist prepared session")?;
         state.persisted = true;
+        if state.derived.latest_compaction_sequence.is_none() {
+            state.events = Vec::new();
+        }
         Ok(())
     }
 
@@ -2465,27 +2492,55 @@ impl Session {
     }
 
     pub async fn model_history(&self) -> Vec<Message> {
-        self.model_context("", "").await.history
+        self.state.lock().await.replay.history.clone()
     }
 
+    pub(crate) async fn has_model_history(&self) -> bool {
+        !self.state.lock().await.replay.history.is_empty()
+    }
+
+    pub async fn last_assistant_text(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state
+            .replay
+            .history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::Assistant { content, .. } => {
+                    let text = content
+                        .iter()
+                        .filter_map(|content| match content {
+                            AssistantContent::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.is_empty()).then_some(text)
+                }
+                _ => None,
+            })
+    }
+
+    pub(crate) async fn with_model_history<R>(
+        &self,
+        provider: &str,
+        model: &str,
+        f: impl FnOnce(&[Message], Option<(usize, usize)>, bool) -> R,
+    ) -> R {
+        let state = self.state.lock().await;
+        let latest_api_usage = latest_api_usage(&state.replay, provider, model);
+        f(
+            &state.replay.history,
+            latest_api_usage,
+            state.replay.after_compaction,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) async fn model_context(&self, provider: &str, model: &str) -> ModelContext {
         let state = self.state.lock().await;
-        let latest_api_usage = state
-            .replay
-            .usage_before_assistant
-            .iter()
-            .enumerate()
-            .filter_map(|(index, usage)| {
-                let usage = usage.as_ref()?;
-                (usage.context
-                    && usage.total > 0
-                    && (provider.is_empty()
-                        || usage.provider.is_empty()
-                        || usage.provider == provider)
-                    && (model.is_empty() || usage.model.is_empty() || usage.model == model))
-                    .then_some((index, usage.total))
-            })
-            .next_back();
+        let latest_api_usage = latest_api_usage(&state.replay, provider, model);
         ModelContext {
             history: state.replay.history.clone(),
             latest_api_usage,
@@ -2759,6 +2814,12 @@ impl Session {
             state.persisted = true;
             state.spec = next_spec;
             let checkpoint = apply_committed_events(&mut state, &events, true);
+            // Without a checkpoint, SQLite is the only history source needed
+            // after persistence. A checkpointed session deliberately keeps
+            // its small post-checkpoint tail for the existing resume path.
+            if state.derived.latest_compaction_sequence.is_none() {
+                state.events = Vec::new();
+            }
             self.publish_persisted(&events);
             drop(state);
             if let Some((through, payload)) = checkpoint {
@@ -2830,6 +2891,11 @@ impl Session {
             .context("cannot append session event batch")?;
         state.spec = next_spec;
         let checkpoint = apply_committed_events(&mut state, &events, true);
+        // Do not retain an unbounded copy of an uncheckpointed transcript.
+        // Checkpointed sessions retain only their bounded post-checkpoint tail.
+        if state.derived.latest_compaction_sequence.is_none() {
+            state.events = Vec::new();
+        }
         self.publish_persisted(&events);
         drop(state);
         if let Some((through, payload)) = checkpoint {
@@ -3816,6 +3882,47 @@ mod tests {
             .await
             .unwrap();
         session
+    }
+
+    #[tokio::test]
+    async fn persisted_session_releases_staged_events_after_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let opened = session(&path, Some("release-events")).await;
+        assert!(!opened.state.lock().await.events.is_empty());
+
+        opened
+            .append(EventKind::User {
+                text: "persist me".into(),
+            })
+            .await
+            .unwrap();
+        let state = opened.state.lock().await;
+        assert!(state.events.is_empty());
+        assert_eq!(state.events.capacity(), 0);
+        drop(state);
+
+        opened
+            .append(EventKind::Notice {
+                text: "still readable".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(opened.state.lock().await.events.capacity(), 0);
+        let snapshot = opened.snapshot().await.unwrap();
+        assert!(snapshot.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Notice { text } if text == "still readable"
+        )));
+        drop(opened);
+
+        let resumed = session(&path, Some("release-events")).await;
+        assert_eq!(resumed.state.lock().await.events.capacity(), 0);
+        assert_eq!(resumed.snapshot().await.unwrap(), snapshot);
+
+        let prepared = session(&path, Some("prepared-release")).await;
+        prepared.persist().await.unwrap();
+        assert_eq!(prepared.state.lock().await.events.capacity(), 0);
     }
 
     #[tokio::test]

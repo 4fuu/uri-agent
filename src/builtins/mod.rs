@@ -25,6 +25,7 @@ pub(crate) const MCP_SESSION_PROFILE_OWNER: &str = mcp::SESSION_PROFILE_OWNER;
 use crate::config::display_path;
 use crate::plugin::PluginRegistry;
 use anyhow::{Context, Result, anyhow};
+use std::borrow::Cow;
 use std::path::Path;
 use tokio::fs;
 use uuid::Uuid;
@@ -93,7 +94,26 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
     if !text.contains('\r') {
         return text.to_string();
     }
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    if text.contains("\r\n") {
+        let mut normalized = text.replace("\r\n", "\n");
+        if normalized.contains('\r') {
+            normalized = normalized.replace('\r', "\n");
+        }
+        normalized
+    } else {
+        text.replace('\r', "\n")
+    }
+}
+
+/// Return a normalized view without allocating when the input already uses
+/// LF line endings. Read-only file paths can keep the decoded source buffer
+/// alive while they build their bounded response.
+pub(super) fn normalized_line_view(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(normalize_line_endings(text))
+    }
 }
 
 pub fn plugins(cwd: &Path, config_directory: &Path) -> PluginRegistry {
@@ -185,6 +205,13 @@ mod tests {
 
         let no_final_newline = EditableText::new("one\r\ntwo");
         assert_eq!(no_final_newline.restore("one\nTWO\n\n"), "one\r\nTWO");
+    }
+
+    #[test]
+    fn normalized_line_view_avoids_lf_copy_but_normalizes_crlf() {
+        let lf = "one\ntwo\n";
+        assert!(matches!(normalized_line_view(lf), Cow::Borrowed(_)));
+        assert_eq!(normalized_line_view("one\r\ntwo\r"), "one\ntwo\n");
     }
 
     #[test]

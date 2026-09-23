@@ -3037,6 +3037,8 @@ fn unchanged_large_transcript_materializes_only_the_viewport() {
     }
     render_to_string(&mut app, 80, 14);
     assert_eq!(app.transcript_render_stats.rendered_blocks, 400);
+    assert!(app.blocks[0].render_cache.borrow().is_none());
+    assert!(app.blocks.last().unwrap().render_cache.borrow().is_some());
 
     render_to_string(&mut app, 80, 14);
     assert_eq!(app.transcript_render_stats.rendered_blocks, 0);

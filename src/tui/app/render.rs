@@ -1,6 +1,11 @@
 use super::*;
 use std::borrow::Cow;
 
+// Render caches are an optimization, not transcript state. Keep a small
+// neighborhood around the viewport so a long session does not retain a
+// second rendered copy of every historical block.
+const TRANSCRIPT_CACHE_CONTEXT_BLOCKS: usize = 64;
+
 pub(super) fn block_document(block: &DisplayBlock) -> String {
     block_document_with_level(block, 1)
 }
@@ -1215,6 +1220,7 @@ pub(super) fn render_transcript(
         app.transcript_offset = app.transcript_offset.min(reading_end);
     }
     app.transcript_center_selected = false;
+    trim_transcript_render_caches(app);
     let offset = app.transcript_offset;
     let (visible, mut visible_row_separators, block_for_row, user_surface_for_row) =
         materialize_transcript_viewport(
@@ -1257,6 +1263,36 @@ pub(super) fn render_transcript(
         }
     }
     visible_row_separators
+}
+
+fn trim_transcript_render_caches(app: &mut App) {
+    if app.transcript_layout.blocks.is_empty() || app.transcript_height == 0 {
+        return;
+    }
+    let offset = app.transcript_offset;
+    let end = offset.saturating_add(app.transcript_height);
+    let entries = &app.transcript_layout.blocks;
+    let first = entries.partition_point(|entry| {
+        entry.block_start + entry.block_rows + usize::from(entry.user_padding) <= offset
+    });
+    let last = entries
+        .partition_point(|entry| entry.start < end)
+        .max(first);
+    let keep_start = entries
+        .get(first.saturating_sub(TRANSCRIPT_CACHE_CONTEXT_BLOCKS))
+        .map_or(0, |entry| entry.index);
+    let keep_end = entries
+        .get(
+            (last + TRANSCRIPT_CACHE_CONTEXT_BLOCKS)
+                .min(entries.len())
+                .saturating_sub(1),
+        )
+        .map_or(app.blocks.len(), |entry| entry.index + 1);
+    for (index, block) in app.blocks.iter_mut().enumerate() {
+        if index < keep_start || index >= keep_end {
+            *block.render_cache.borrow_mut() = None;
+        }
+    }
 }
 
 pub(super) fn rebuild_transcript_layout(
@@ -1332,6 +1368,13 @@ pub(super) fn rebuild_transcript_layout(
         #[cfg(not(test))]
         let _ = rendered;
         row += block_rows + usize::from(user_padding);
+        // A full rebuild computes row counts for every block. Release older
+        // render rows as we go so the first frame does not briefly retain a
+        // cache for the entire transcript.
+        if dirty_from == 0 && index >= TRANSCRIPT_CACHE_CONTEXT_BLOCKS {
+            let expired = index - TRANSCRIPT_CACHE_CONTEXT_BLOCKS;
+            *app.blocks[expired].render_cache.borrow_mut() = None;
+        }
         app.transcript_layout.blocks.push(TranscriptLayoutBlock {
             index,
             start,

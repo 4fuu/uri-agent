@@ -88,7 +88,10 @@ impl OutputStore {
     pub async fn present(&self, content: Vec<u8>, hint: &str) -> Result<String> {
         let limit = self.limit();
         if content.len() <= limit {
-            return Ok(String::from_utf8_lossy(&content).into_owned());
+            return Ok(match String::from_utf8(content) {
+                Ok(content) => content,
+                Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+            });
         }
 
         let content_bytes = content.len();
@@ -232,6 +235,17 @@ mod tests {
         );
         assert!(directory.exists());
         let _ = fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn present_preserves_lossy_utf8_for_invalid_content() {
+        let store = OutputStore::new(&format!("utf8{}", uuid::Uuid::now_v7().simple()), 16)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.present(vec![b'a', 0xff, b'b'], "test").await.unwrap(),
+            "a�b"
+        );
     }
 
     #[tokio::test]

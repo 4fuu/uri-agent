@@ -1,4 +1,4 @@
-use super::{EditableText, normalize_line_endings};
+use super::normalized_line_view;
 use crate::config::display_path;
 use crate::plugin::{
     Plugin, PluginHost, TuiCompletionContext, TuiCompletionItem, TuiCompletionProvider,
@@ -511,8 +511,9 @@ async fn read_file(
         ));
     }
     let content = String::from_utf8_lossy(&content);
-    let content = EditableText::new(&content);
-    let lines = content.normalized().lines().collect::<Vec<_>>();
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let content = normalized_line_view(content);
+    let lines = content.lines().collect::<Vec<_>>();
     let start = range.offset.saturating_sub(1).min(lines.len());
     let end = start.saturating_add(range.limit).min(lines.len());
     let mut output = String::new();
@@ -566,7 +567,7 @@ async fn read_file_tail(
     } else {
         &content
     };
-    let content = normalize_line_endings(content);
+    let content = normalized_line_view(content);
     let lines = content.lines().collect::<Vec<_>>();
     let first_line = tail
         .total_lines
