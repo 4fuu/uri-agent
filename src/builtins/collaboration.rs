@@ -260,7 +260,7 @@ impl Protocol for CollaborationPlugin {
         }
         let Some(target) = target.strip_prefix("send/") else {
             bail!(
-                "collaboration exec expects `*** Exec: collaboration://name` with the name in the `*** Body:` section, or `*** Exec: collaboration://send/<name-or-id>?delivery=queue|steer` with the message in the `*** Body:` section"
+                "collaboration exec expects `*** Exec: collaboration://name` with the name in the request body, or `*** Exec: collaboration://send/<name-or-id>?delivery=queue|steer` with the message in the request body"
             );
         };
         if target.is_empty() || target.contains('/') {
@@ -427,7 +427,6 @@ about, such as `Nightingale`, `Ferris`, or `Crane`:
 ```text
 *** Begin Request
 *** Exec: collaboration://name
-*** Body:
 Ferris
 *** End Request
 ```
@@ -469,20 +468,18 @@ also report that a saved session is offline:
 ## Sending messages
 
 Send a plain-text message to one active URI Agent participant. Put the message
-itself directly in the `*** Body:` section; do not wrap it in JSON or XML.
+itself directly in the request body; do not wrap it in JSON or XML.
 Identify the target
 by its current human name or stable session ID, without an `@` prefix:
 
 ```text
 *** Begin Request
 *** Exec: collaboration://send/Crane?delivery=queue
-*** Body:
 Review the parser changes and report risks.
 *** End Request
 
 *** Begin Request
 *** Exec: collaboration://send/<session-id>?delivery=steer&reply=requested
-*** Body:
 Check this failing test now.
 *** End Request
 ```

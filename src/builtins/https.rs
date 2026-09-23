@@ -52,20 +52,19 @@ through the first logged-in provider, which receives the query or target URL;
 page reads use direct local fetching only when no provider is logged in.
 
 - Read `https://<host>/<path>` to extract an HTTPS resource as Markdown or text.
-  Page reads take no body; omit the `*** Body:` section.
-- Read `https://search` with the search query in the `*** Body:` section. Search
+  Page reads take no body; leave no lines between the operation line and `*** End Request`.
+- Read `https://search` with the search query in the request body. Search
   reads MUST pass a nonempty, non-whitespace query:
 
 ```text
 *** Begin Request
 *** Read: https://search
-*** Body:
 <search query>
 *** End Request
 ```
 
 Provider help pages such as `https://help/parallel`, `https://help/exa`, and
-`https://help/tinyfish` take no body; omit the `*** Body:` section.
+`https://help/tinyfish` take no body; leave no lines between the operation line and `*** End Request`.
 "#;
 
 const PARALLEL_COMMON_HELP: &str = r#"Common Parallel search options:
@@ -73,13 +72,11 @@ const PARALLEL_COMMON_HELP: &str = r#"Common Parallel search options:
 ```text
 *** Begin Request
 *** Read: https://search?limit=10&mode=basic
-*** Body:
 <search query>
 *** End Request
 
 *** Begin Request
 *** Read: https://search?after_date=2026-01-01&include_domain=example.com
-*** Body:
 <search query>
 *** End Request
 ```
@@ -94,13 +91,11 @@ const EXA_COMMON_HELP: &str = r#"Common Exa search options:
 ```text
 *** Begin Request
 *** Read: https://search?limit=10&type=auto
-*** Body:
 <search query>
 *** End Request
 
 *** Begin Request
 *** Read: https://search?category=news&start_published_date=2026-01-01
-*** Body:
 <search query>
 *** End Request
 ```
@@ -115,13 +110,11 @@ const TINYFISH_COMMON_HELP: &str = r#"Common TinyFish search options:
 ```text
 *** Begin Request
 *** Read: https://search?limit=10&domain_type=news
-*** Body:
 <search query>
 *** End Request
 
 *** Begin Request
 *** Read: https://search?recency_minutes=60&location=us&language=en
-*** Body:
 <search query>
 *** End Request
 ```
@@ -140,7 +133,6 @@ options apply when Parallel is the first logged-in provider.
 ```text
 *** Begin Request
 *** Read: https://search?provider=parallel&mode=advanced&limit=10
-*** Body:
 <objective>
 *** End Request
 ```
@@ -180,7 +172,6 @@ apply when Exa is the first logged-in provider.
 ```text
 *** Begin Request
 *** Read: https://search?provider=exa&type=auto&limit=10
-*** Body:
 <search query>
 *** End Request
 ```
@@ -220,7 +211,6 @@ options apply when TinyFish is the first logged-in provider.
 ```text
 *** Begin Request
 *** Read: https://search?provider=tinyfish&limit=10
-*** Body:
 <search query>
 *** End Request
 ```
@@ -641,7 +631,7 @@ impl Protocol for HttpsProtocol {
 fn require_empty_body(body: &str, uri: &str) -> Result<()> {
     if !body.is_empty() {
         bail!(
-            r#"this HTTPS read takes no body; retry with a `*** Read: {uri}` request; to search the web, use a `*** Read: https://search` request with the query in the `*** Body:` section"#
+            r#"this HTTPS read takes no body; retry with a `*** Read: {uri}` request; to search the web, use a `*** Read: https://search` request with the query in the request body"#
         );
     }
     Ok(())
@@ -658,10 +648,9 @@ impl SearchInput {
         let query = body.trim();
         if query.is_empty() {
             bail!(
-                "https://search requires a nonempty `*** Body:` section; correct form:\n\
+                "https://search requires a nonempty request body; correct form:\n\
                  *** Begin Request\n\
                  *** Read: https://search\n\
-                 *** Body:\n\
                  <search query>\n\
                  *** End Request"
             );
@@ -1547,7 +1536,7 @@ mod tests {
         assert!(help.contains("ask them to run `:login`"));
         assert!(help.contains("local HTTPS fetcher"));
         assert!(help.contains("local HTML-to-Markdown conversion"));
-        assert!(help.contains("Page reads take no body; omit the `*** Body:` section"));
+        assert!(help.contains("Page reads take no body; leave no lines between the operation line and `*** End Request`"));
         assert!(help.contains("MUST pass a nonempty, non-whitespace query"));
         assert!(help.contains("Provider help pages such as `https://help/parallel`"));
 
@@ -1581,12 +1570,12 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires a nonempty `*** Body:` section")
+                .contains("requires a nonempty request body")
         );
         assert!(
             error
                 .to_string()
-                .contains("*** Read: https://search\n*** Body:\n<search query>")
+                .contains("*** Read: https://search\n<search query>")
         );
 
         let error = require_empty_body("objective", "https://example.com/page").unwrap_err();

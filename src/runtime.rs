@@ -3220,7 +3220,7 @@ mod tests {
             ToolFunction::new(
                 "protocol".to_string(),
                 serde_json::json!({
-                    "request": format!("*** Begin Request\n*** Exec: {uri}\n*** Body:\n{body}\n*** End Request")
+                    "request": format!("*** Begin Request\n*** Exec: {uri}\n{body}\n*** End Request")
                 }),
             ),
         )

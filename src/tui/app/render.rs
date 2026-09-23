@@ -241,7 +241,7 @@ fn longest_backtick_run(value: &str) -> usize {
 }
 
 /// Parses the `protocol` tool's fixed request format for display only: the
-/// `*** Read:`/`*** Exec:` verb, the address, and the raw `*** Body:` text.
+/// `*** Read:`/`*** Exec:` verb, the address, and the raw request body.
 struct ProtocolRequest<'a> {
     operation: &'a str,
     uri: &'a str,
@@ -250,34 +250,52 @@ struct ProtocolRequest<'a> {
 
 fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolRequest<'_>> {
     let request = arguments.get("request")?.as_str()?;
-    let mut lines = request.split_inclusive('\n');
-    if lines.next()?.trim_end() != "*** Begin Request" {
+    let mut offset = 0;
+    let begin = next_request_line(request, &mut offset)?;
+    if begin.trim_end() != "*** Begin Request" {
         return None;
     }
-    let operation_line = lines.next()?.trim_end();
+    let operation_line = next_request_line(request, &mut offset)?.trim_end();
     let (verb, uri) = operation_line.strip_prefix("*** ")?.split_once(' ')?;
     let operation = verb.strip_suffix(':').unwrap_or(verb);
     if !matches!(operation, "Read" | "Exec") || uri.is_empty() {
         return None;
     }
-    let body = request
-        .find("*** Body:\n")
-        .or_else(|| request.find("*** Body:\r\n"))
-        .map(|index| {
-            let after = request[index..]
-                .split_once('\n')
-                .map(|(_, rest)| rest)
-                .unwrap_or_default();
-            let after = after.trim_end_matches(['\n', '\r']);
-            let after = after.strip_suffix("*** End Request").unwrap_or(after);
-            after.trim_end_matches(['\n', '\r'])
-        })
-        .unwrap_or_default();
+    let mut body = request.get(offset..).unwrap_or("");
+    if let Some(rest) = strip_legacy_body_header(body) {
+        body = rest;
+    }
     Some(ProtocolRequest {
         operation,
         uri,
-        body,
+        body: strip_end_request(body),
     })
+}
+
+fn next_request_line<'a>(text: &'a str, offset: &mut usize) -> Option<&'a str> {
+    let rest = text.get(*offset..)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (line, consumed) = match rest.split_once('\n') {
+        Some((line, _)) => (line, line.len() + 1),
+        None => (rest, rest.len()),
+    };
+    *offset += consumed;
+    Some(line)
+}
+
+fn strip_legacy_body_header(body: &str) -> Option<&str> {
+    let (line, rest) = body.split_once('\n').unwrap_or((body, ""));
+    (line.trim_end_matches(['\r', ' ', '\t']) == "*** Body:").then_some(rest)
+}
+
+fn strip_end_request(body: &str) -> &str {
+    let trimmed = body.trim_end_matches(['\n', '\r']);
+    trimmed
+        .strip_suffix("*** End Request")
+        .unwrap_or(trimmed)
+        .trim_end_matches(['\n', '\r'])
 }
 
 pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {

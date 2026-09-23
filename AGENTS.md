@@ -18,9 +18,11 @@ apply_patch(patch: string)
 protocol call requires that protocol's contract to be loaded first. The `read`
 and `exec` tools are merged into `protocol`, which takes one fixed-format
 request string: a `*** Begin Request` line, one `*** Read: <address>` or
-`*** Exec: <address>` line, an optional `*** Body:` section whose lines run
-verbatim to a `*** End Request` line, and nothing else. A protocol that needs
-structured input takes complete serialized JSON as that raw body text.
+`*** Exec: <address>` line, optional raw body lines, and a `*** End Request`
+line. The lines between the operation line and `*** End Request` are the body
+and are never escaped. A leading `*** Body:` line is still accepted and ignored.
+A protocol that needs structured input takes complete serialized JSON as that
+raw body text.
 Capabilities with simple string input are registered as protocols and publish
 their operational instructions through the `help` tool. Prefer a typed direct
 tool for complex or escape-heavy arguments. All model tools are registered by

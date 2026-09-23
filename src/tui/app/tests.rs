@@ -5059,6 +5059,15 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     );
     assert_eq!(
         tool_title(
+            "protocol",
+            &serde_json::json!({
+                "request": "*** Begin Request\n*** Exec: pwsh://run\nGet-ChildItem\n*** End Request"
+            })
+        ),
+        "$ Get-ChildItem"
+    );
+    assert_eq!(
+        tool_title(
             "apply_patch",
             &serde_json::json!({
                 "patch": "*** Begin Patch\n*** Update File: src/tui.rs\n*** Update File: Cargo.toml\n*** End Patch"

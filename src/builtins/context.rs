@@ -88,7 +88,7 @@ Discovery defaults to the current project. The discovery and index routes accept
   and `limit`.
 - `context://history/<window-id>` reads the newest records in one window. Optional `types`, `before=<record-id>`, and `limit` filter and paginate.
 - `context://history/search` searches records across all windows using the
-  nonempty plain-text `*** Body:` section; optional `window=<window-id>` narrows the search.
+  nonempty plain-text request body; optional `window=<window-id>` narrows the search.
   Exact search accepts optional `types`, `before=<record-id>`, and `limit`;
   semantic and hybrid modes accept `types`, `offset`, and `limit`.
 
@@ -102,10 +102,10 @@ defaults to 20 and is clamped to 1 through 50.
   `tasks://` instruction once. Do not submit the same search again to retrieve
   task output.
 - `context://history/around/<record-id>` reads records surrounding one anchor. Optional `before` and `after` are record counts and default to 10 each; their sum must not exceed 50. Optional `types` filters the result.
-- `*** Exec: context://notes/add?title=<percent-encoded-title>` with the note content in the `*** Body:` section creates a note and returns its stable ID.
-- `*** Exec: context://notes/<id>/replace?title=<percent-encoded-title>` with the replacement content in the `*** Body:` section replaces the current content and creates a revision while preserving the ID.
+- `*** Exec: context://notes/add?title=<percent-encoded-title>` with the note content in the request body creates a note and returns its stable ID.
+- `*** Exec: context://notes/<id>/replace?title=<percent-encoded-title>` with the replacement content in the request body replaces the current content and creates a revision while preserving the ID.
 - `*** Exec: context://notes/<id>/delete` tombstones a note. Its ID, title, revision metadata, and anchors remain, but its content can no longer be read.
-- `*** Exec: context://rollover` with an optional bounded handoff in the `*** Body:` section requests a fresh context window when the active strategy is `rollover`; the handoff is limited to 4,096 estimated tokens. It starts after every tool result from the current model response is durably paired.
+- `*** Exec: context://rollover` with an optional bounded handoff in the request body requests a fresh context window when the active strategy is `rollover`; the handoff is limited to 4,096 estimated tokens. It starts after every tool result from the current model response is durably paired.
 
 Titles are required, single-line, and at most 120 characters. At most 20 notes may be active. A note has no separate content limit, but all current titles and content share a hard budget of at most 20% of the model context. Writes warn at 15% and reject growth beyond the hard budget; shrinking replacements and deletes remain available.
 
@@ -1451,7 +1451,7 @@ async fn semantic_history_search(
         if query.is_empty() {
             output.push_str("*** End Request");
         } else {
-            let _ = write!(output, "*** Body:\n{query}\n*** End Request");
+            let _ = write!(output, "{query}\n*** End Request");
         }
     }
     Ok(output.trim_end().to_string())
@@ -1545,7 +1545,7 @@ where
             if next.body.is_empty() {
                 output.push_str("*** End Request");
             } else {
-                let _ = write!(output, "*** Body:\n{}\n*** End Request", next.body);
+                let _ = write!(output, "{}\n*** End Request", next.body);
             }
         } else {
             output.push_str("\nEarlier records omitted by the route's bounded result.");
@@ -2412,7 +2412,7 @@ mod tests {
         assert!(search.contains("searchable user requirement"));
         assert!(!search.contains("keep the exact user requirements"));
         assert!(search.contains("*** Read: context://history/users/search?before=r"));
-        assert!(search.contains("&limit=1\n*** Body:\nuser requirement\n*** End Request"));
+        assert!(search.contains("&limit=1\nuser requirement\n*** End Request"));
 
         let across_windows = format_history_search(
             &events,

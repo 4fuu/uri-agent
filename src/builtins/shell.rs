@@ -36,13 +36,12 @@ Run Bash commands. Commands start in the foreground and normally return their
 final result in the same `protocol` tool call.
 
 `*** Read:` requests support no shell operations. To run a
-command, use an `*** Exec: bash://run` request whose `*** Body:` section MUST
+command, use an `*** Exec: bash://run` request whose request body MUST
 contain at least one non-whitespace character:
 
 ```text
 *** Begin Request
 *** Exec: bash://run
-*** Body:
 cargo test
 *** End Request
 ```
@@ -54,7 +53,6 @@ restarting it. Use `background=true` to return a task immediately:
 ```text
 *** Begin Request
 *** Exec: bash://run?background=true
-*** Body:
 cargo test
 *** End Request
 ```
@@ -66,7 +64,6 @@ and `timeout=0` disables the timeout:
 ```text
 *** Begin Request
 *** Exec: bash://run?timeout=120
-*** Body:
 cargo test
 *** End Request
 ```
@@ -78,13 +75,12 @@ background tasks and keep their stdin open:
 ```text
 *** Begin Request
 *** Exec: bash://run?interactive=true
-*** Body:
 mysql -u root -p
 *** End Request
 ```
 
 Read current output with a `*** Read: tasks://<id>` request, then send input
-with an `*** Exec: tasks://<id>/send` request whose `*** Body:` section carries
+with an `*** Exec: tasks://<id>/send` request whose request body carries
 the input text; the input is written exactly, so end each input line with a
 newline. Close stdin with an `*** Exec: tasks://<id>/eof` request and interrupt
 with an `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
@@ -121,14 +117,18 @@ Prefer modern cross-platform tools such as `rg` and `fd` when available.
 PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
+Native commands such as `gh`, `git`, and `cargo` do not accept PowerShell
+common parameters (`-OutVariable`, `-ErrorAction`, `-ErrorVariable`). Pass
+their own flags only, and capture output with variables, `$LASTEXITCODE`,
+or redirection.
+
 `*** Read:` requests support no shell operations. To run a
-command, use an `*** Exec: pwsh://run` request whose `*** Body:` section MUST
+command, use an `*** Exec: pwsh://run` request whose request body MUST
 contain at least one non-whitespace character:
 
 ```text
 *** Begin Request
 *** Exec: pwsh://run
-*** Body:
 Get-ChildItem -Path . -Force
 *** End Request
 ```
@@ -140,7 +140,6 @@ restarting it. Use `background=true` to return a task immediately:
 ```text
 *** Begin Request
 *** Exec: pwsh://run?background=true
-*** Body:
 cargo test
 *** End Request
 ```
@@ -156,13 +155,12 @@ background tasks and keep their stdin open:
 ```text
 *** Begin Request
 *** Exec: pwsh://run?interactive=true
-*** Body:
 $token = Read-Host 'Token'
 *** End Request
 ```
 
 Read current output with a `*** Read: tasks://<id>` request, then send input
-with an `*** Exec: tasks://<id>/send` request whose `*** Body:` section carries
+with an `*** Exec: tasks://<id>/send` request whose request body carries
 the input text; the input is written exactly, so end each input line with a
 newline. Close stdin with an `*** Exec: tasks://<id>/eof` request and interrupt
 with an `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
@@ -1011,8 +1009,9 @@ mod tests {
         assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
+        assert!(PWSH_HELP.contains("do not accept PowerShell\ncommon parameters"));
         assert!(PWSH_HELP.contains("`*** Read:` requests support no shell operations"));
-        assert!(PWSH_HELP.contains("section MUST\ncontain at least one non-whitespace"));
+        assert!(PWSH_HELP.contains("request body MUST\ncontain at least one non-whitespace"));
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
@@ -1023,7 +1022,7 @@ mod tests {
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
         assert!(BASH_HELP.contains("`*** Read:` requests support no shell operations"));
-        assert!(BASH_HELP.contains("section MUST\ncontain at least one non-whitespace"));
+        assert!(BASH_HELP.contains("request body MUST\ncontain at least one non-whitespace"));
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));

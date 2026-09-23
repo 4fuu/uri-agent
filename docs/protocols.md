@@ -26,12 +26,14 @@ it. Loaded contracts stay loaded for the rest of the session and are
 restored on resume.
 
 `protocol` calls use one fixed request format: a `*** Begin Request` line, one
-`*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, an
-optional `*** Body:` section whose lines run verbatim to a `*** End Request`
-line, and nothing else. Omit the body section when the operation takes no body;
-complete serialized JSON is the raw text after `*** Body:` only when a protocol
-explicitly requires it. Runtime-loaded WASM plugins may add typed
-direct tools.
+`*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line,
+optional raw body lines, and a `*** End Request` line. Every line between the
+operation line and `*** End Request` is the request body and is passed
+verbatim. Leave no lines there when the operation takes no body. Complete
+serialized JSON is that body only when a protocol explicitly requires it. The
+four structural lines must match byte for byte. A leading `*** Body:` line is
+still accepted and ignored so earlier requests keep working; new requests
+should not include it. Runtime-loaded WASM plugins may add typed direct tools.
 
 A protocol may declare shared-help prerequisites; `help` loads them
 automatically ahead of the requested protocol, and using the dependent protocol
@@ -106,13 +108,11 @@ when relevant text is likely to use different wording.
 ```text
 *** Begin Request
 *** Read: search://src
-*** Body:
 ProtocolRequest
 *** End Request
 
 *** Begin Request
 *** Read: search://src?mode=hybrid&glob=**/*.rs
-*** Body:
 credential refresh flow
 *** End Request
 ```
@@ -130,7 +130,7 @@ All model-facing saved-session addresses use `context://sessions/...`.
 
 ### Delegated search
 
-`finder` runs one delegated lookup per call. The `*** Body:` section is a complete
+`finder` runs one delegated lookup per call. The request body is a complete
 natural-language question; `finder://<root>` restricts code search to one
 project-relative or absolute directory with the same root rules as `search://`,
 while web reads stay unscoped. Each call starts a depth-2 Agent with read-only
@@ -154,7 +154,7 @@ session ID, working directory, bounded first-request summary, provider/model,
 `idle` or `working` status, queue depth, and last heartbeat. Names resolve only
 while active; stable IDs remain suitable for `context://sessions/...` reads.
 
-Messages use a plain-text `*** Body:` section and target one active name or
+Messages use a plain-text request body and target one active name or
 session ID.
 `queue` durably schedules a later turn, while `steer` targets the next model
 boundary and becomes a queued turn if the target is idle. The host wraps the

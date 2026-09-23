@@ -31,7 +31,7 @@ Read the version-matched URI Agent documentation embedded in this binary.
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
 - Targets are exact, case-sensitive filenames and do not accept paths or query parameters.
-- These reads take no body; omit the `*** Body:` section.
+- These reads take no body; leave no lines between the operation line and `*** End Request`.
 
 Available documents:
 "#,

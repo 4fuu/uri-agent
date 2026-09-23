@@ -13,7 +13,7 @@ const MAX_WAIT_SECONDS: u64 = 300;
 const HELP: &str = r#"# tasks
 
 Inspect and cancel background tasks from every protocol. Every `tasks`
-operation documented on this page takes no body; omit the `*** Body:` section.
+operation documented on this page takes no body; leave no lines between the operation line and `*** End Request`.
 Interactive input routes, whose bodies carry the input text, are documented by
 the shell protocols.
 
@@ -112,7 +112,7 @@ impl Protocol for TasksProtocol {
                 request.uri
             ),
             target if target.ends_with("/send") => bail!(
-                "task input requires exec; use an `*** Exec: {}` request with the input in the `*** Body:` section",
+                "task input requires exec; use an `*** Exec: {}` request with the input in the request body",
                 request.uri
             ),
             target if target.ends_with("/eof") => bail!(
@@ -170,7 +170,7 @@ impl Protocol for TasksProtocol {
             ExecRoute::Send { id } => {
                 if request.body.is_empty() {
                     bail!(
-                        "task input requires a nonempty `*** Body:` section; to close stdin use an `*** Exec: tasks://{id}/eof` request"
+                        "task input requires a nonempty request body; to close stdin use an `*** Exec: tasks://{id}/eof` request"
                     );
                 }
                 context
@@ -221,7 +221,7 @@ enum ExecRoute<'a> {
 
 fn invalid_exec() -> anyhow::Error {
     anyhow!(
-        "task exec expects `*** Exec: tasks://<id>/cancel`, `*** Exec: tasks://<id>/send` with the input in the `*** Body:` section, `*** Exec: tasks://<id>/eof`, or `*** Exec: tasks://<id>/interrupt`"
+        "task exec expects `*** Exec: tasks://<id>/cancel`, `*** Exec: tasks://<id>/send` with the input in the request body, `*** Exec: tasks://<id>/eof`, or `*** Exec: tasks://<id>/interrupt`"
     )
 }
 
@@ -392,7 +392,9 @@ mod tests {
         assert!(HELP.contains("tasks://<id>"));
         assert!(HELP.contains("tasks://<id>?wait=30"));
         assert!(HELP.contains("tasks://<id>/cancel"));
-        assert!(HELP.contains("takes no body; omit the `*** Body:` section"));
+        assert!(HELP.contains(
+            "takes no body; leave no lines between the operation line and `*** End Request`"
+        ));
         assert!(HELP.contains("documented by\nthe shell protocols"));
         assert!(HELP.contains("clamped to the nearest bound"));
         assert!(HELP.contains("Operations normally return in their original"));
@@ -682,7 +684,7 @@ mod tests {
         };
 
         let error = send("").await.unwrap_err().to_string();
-        assert!(error.contains("nonempty `*** Body:` section"), "{error}");
+        assert!(error.contains("nonempty request body"), "{error}");
 
         let error = send("y\n").await.unwrap_err().to_string();
         assert!(error.contains("does not accept input"), "{error}");

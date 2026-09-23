@@ -57,12 +57,11 @@ Start one lookup:
 ```text
 *** Begin Request
 *** Exec: finder://
-*** Body:
 Where is the JWT signature verified, and which failures can it report?
 *** End Request
 ```
 
-The `*** Body:` section MUST contain one complete natural-language question, not
+The request body MUST contain one complete natural-language question, not
 keywords. Include the goal, any known identifiers or paths, and what kind of
 answer is wanted.
 
@@ -72,8 +71,8 @@ Unix, `~` and paths beginning with `~/` resolve from the current user's home
 directory; `~user` is not expanded. The scope restricts code search only; web
 reads are unaffected.
 
-The lookup question goes in the `*** Body:` section. Every other `finder` call
-takes no body; omit the `*** Body:` section.
+The lookup question goes in the request body. Every other `finder` call
+takes no body; leave no lines between the operation line and `*** End Request`.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -542,8 +541,8 @@ mod tests {
             "restrict code search to a project-relative or absolute",
             "`~user` is not expanded",
             "The scope restricts code search only; web\nreads are unaffected.",
-            "The lookup question goes in the `*** Body:` section. Every other `finder` call",
-            "takes no body; omit the `*** Body:` section.",
+            "The lookup question goes in the request body. Every other `finder` call",
+            "takes no body; leave no lines between the operation line and `*** End Request`.",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");

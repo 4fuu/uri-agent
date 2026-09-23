@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 const BEGIN_LINE: &str = "*** Begin Request";
 const END_LINE: &str = "*** End Request";
-const BODY_LINE: &str = "*** Body:";
+const LEGACY_BODY_LINE: &str = "*** Body:";
 const CORRECT_FORM: &str = "*** Begin Request\n*** Read: <protocol>://<target>\n*** End Request";
 
 #[derive(Clone, Copy, Debug)]
@@ -45,13 +45,13 @@ struct ParsedRequest {
 /// ```text
 /// *** Begin Request
 /// *** Read: <protocol>://<target>
-/// *** Body:
 /// <raw body lines>
 /// *** End Request
 /// ```
 ///
-/// The `*** Body:` section is optional; its lines run verbatim to
-/// `*** End Request` and are never escaped.
+/// Every line between the operation line and `*** End Request` is the raw
+/// body, passed verbatim and never escaped. A leading `*** Body:` line is
+/// ignored so requests written for the earlier format still parse.
 fn parse_request(request: &str) -> Result<ParsedRequest> {
     let mut lines = request.split_inclusive('\n');
     let first = lines.next().unwrap_or_default();
@@ -62,8 +62,8 @@ fn parse_request(request: &str) -> Result<ParsedRequest> {
     }
     let (operation, uri) = parse_operation_line(lines.next().unwrap_or_default())?;
     let mut body = String::new();
-    let mut in_body = false;
     let mut ended = false;
+    let mut at_body_start = true;
     for line in lines {
         let trimmed = trim_structural(line);
         if ended {
@@ -72,27 +72,16 @@ fn parse_request(request: &str) -> Result<ParsedRequest> {
             }
             continue;
         }
-        if !in_body && trimmed == BODY_LINE {
-            in_body = true;
-            continue;
-        }
         if trimmed == END_LINE {
             ended = true;
             continue;
         }
-        if in_body {
-            body.push_str(line);
+        if at_body_start && trimmed == LEGACY_BODY_LINE {
+            at_body_start = false;
             continue;
         }
-        bail!(
-            "invalid protocol request: expected `{BODY_LINE}` or `{END_LINE}` after the \
-             `*** Read:`/`*** Exec:` line; correct form:\n\
-             *** Begin Request\n\
-             *** Exec: pwsh://run\n\
-             *** Body:\n\
-             <command>\n\
-             *** End Request"
-        );
+        at_body_start = false;
+        body.push_str(line);
     }
     if !ended {
         bail!("invalid protocol request: missing `{END_LINE}`");
@@ -149,7 +138,7 @@ impl ModelTool for ProtocolTool {
                 "properties": {
                     "request": {
                         "type": "string",
-                        "description": "Fixed-format request: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, an optional `*** Body:` line followed by raw body lines, and a `*** End Request` line. Omit the `*** Body:` section when the operation takes no body; when a protocol's help page requires a JSON body, that JSON is the raw text after `*** Body:`. Examples:\n\n*** Begin Request\n*** Read: file://src/main.rs\n*** End Request\n\n*** Begin Request\n*** Exec: pwsh://run\n*** Body:\ncargo test\n*** End Request\n\nOnly the lines `*** Begin Request`, `*** Read:`, `*** Exec:`, `*** Body:`, and `*** End Request` are structural; every other line is body content passed verbatim."
+                        "description": "Fixed-format request: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional raw body lines, and a `*** End Request` line. The lines between the operation line and `*** End Request` are the request body, passed verbatim and never escaped. Leave no lines there when the operation takes no body. When a protocol's help page requires JSON, that JSON is the request body. The four structural lines must match byte for byte. Invoke every registered protocol only through this tool with its `<protocol>://` address; a protocol loaded through `help` never becomes a callable tool under its own name. Examples:\n\n*** Begin Request\n*** Read: file://src/main.rs\n*** End Request\n\n*** Begin Request\n*** Exec: pwsh://run\ncargo test\n*** End Request\n\nOnly the lines `*** Begin Request`, `*** Read:`, `*** Exec:`, and `*** End Request` are structural; every other line is body content passed verbatim."
                     }
                 },
                 "required": ["request"],
@@ -290,21 +279,28 @@ mod tests {
             "*** Begin Request",
             "*** Read: <protocol>://<target>",
             "*** Exec: <protocol>://<target>",
-            "*** Body:",
             "*** End Request",
+            "optional raw body lines",
         ] {
             assert!(
                 descriptor.description.contains(fragment),
                 "description is missing: {fragment}"
             );
         }
+        assert!(
+            !descriptor.description.contains("*** Body:"),
+            "the tool description should not teach the retired body header"
+        );
         let request_description = descriptor.parameters["properties"]["request"]["description"]
             .as_str()
             .expect("the request parameter keeps its description");
         for fragment in [
-            "Omit the `*** Body:` section when the operation takes no body",
-            "that JSON is the raw text after `*** Body:`",
+            "Leave no lines there when the operation takes no body",
+            "that JSON is the request body",
             "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request",
+            "*** Begin Request\n*** Exec: pwsh://run\ncargo test\n*** End Request",
+            "must match byte for byte",
+            "never becomes a callable tool under its own name",
         ] {
             assert!(
                 request_description.contains(fragment),
@@ -325,11 +321,22 @@ mod tests {
 
     #[test]
     fn parse_request_keeps_multiline_bodies_verbatim() {
-        let request = "*** Begin Request\n*** Exec: pwsh://run\n*** Body:\nline one\n\nline \"three\"\n*** End Request";
+        let request =
+            "*** Begin Request\n*** Exec: pwsh://run\nline one\n\nline \"three\"\n*** End Request";
         let parsed = parse_request(request).unwrap();
         assert!(matches!(parsed.operation, ProtocolOperation::Exec));
         assert_eq!(parsed.uri, "pwsh://run");
         assert_eq!(parsed.body, "line one\n\nline \"three\"");
+    }
+
+    #[test]
+    fn parse_request_ignores_a_legacy_body_header() {
+        let parsed = parse_request(
+            "*** Begin Request\r\n*** Exec: pwsh://run\r\n*** Body:\r\nline one\r\n*** End Request\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.uri, "pwsh://run");
+        assert_eq!(parsed.body, "line one");
     }
 
     #[test]
@@ -344,11 +351,13 @@ mod tests {
 
     #[test]
     fn parse_request_treats_a_newline_only_body_as_empty() {
-        let parsed = parse_request(
+        for request in [
+            "*** Begin Request\n*** Read: search://src\n\n*** End Request",
             "*** Begin Request\n*** Read: search://src\n*** Body:\n\n*** End Request",
-        )
-        .unwrap();
-        assert!(parsed.body.is_empty());
+        ] {
+            let parsed = parse_request(request).unwrap();
+            assert!(parsed.body.is_empty(), "{request:?}");
+        }
     }
 
     #[test]
@@ -357,7 +366,6 @@ mod tests {
             "",
             "read file://src/main.rs",
             "*** Begin Request\n*** Read file://src/main.rs\n*** End Request",
-            "*** Begin Request\n*** Exec: pwsh://run\ngit status\n*** End Request",
             "*** Begin Request\n*** Read:\n*** End Request",
             "*** Begin Request\n*** Read: file://a\n",
             "*** Begin Request\n*** Read: file://a\n*** End Request\ntrailing",
@@ -399,7 +407,7 @@ mod tests {
             .unwrap();
         let exec = ProtocolTool
             .execute(
-                &json!({"request": "*** Begin Request\n*** Exec: capture://value\n*** Body:\n{\"answer\":42}\n*** End Request"}),
+                &json!({"request": "*** Begin Request\n*** Exec: capture://value\n{\"answer\":42}\n*** End Request"}),
                 &protocols,
             )
             .await

@@ -39,7 +39,7 @@ retrieval.
 Current working directory: `{scheme}://{}`
 
 Search reads other than `mode=status` MUST pass a nonempty search pattern in
-the `*** Body:` section; `mode=status` takes no body. Use
+the request body; `mode=status` takes no body. Use
 `{scheme}://<root>` for a project-relative or absolute file/directory root. The
 root may be empty: `{scheme}://` searches the current working directory. On Unix, `~`
 and paths beginning with `~/` resolve from the current user's home directory;
@@ -94,25 +94,21 @@ Examples:
 ```text
 *** Begin Request
 *** Read: {scheme}://src?glob=**/*.rs&limit=100
-*** Body:
 ProtocolRequest
 *** End Request
 
 *** Begin Request
 *** Read: {scheme}://src/tui/app.rs
-*** Body:
 fn push(
 *** End Request
 
 *** Begin Request
 *** Read: {scheme}://?literal=true&ignore_case=true
-*** Body:
 exact text
 *** End Request
 
 *** Begin Request
 *** Read: {scheme}://src?mode=hybrid&glob=**/*.rs&limit=10
-*** Body:
 authentication flow
 *** End Request
 
@@ -121,8 +117,8 @@ authentication flow
 *** End Request
 ```
 
-`exec` supports only `mode=index` (optionally with `glob`) with no
-`*** Body:` section;
+`exec` supports only `mode=index` (optionally with `glob`) and takes no
+request body;
 status and index accept no other parameters.
 "#,
         display_path(cwd)
@@ -519,10 +515,9 @@ impl GrepOptions {
 fn require_search_body(body: &str, uri: &str, scheme: &str) -> Result<()> {
     if body.is_empty() {
         bail!(
-            "{scheme} requires a nonempty search pattern in the `*** Body:` section; correct form:\n\
+            "{scheme} requires a nonempty search pattern in the request body; correct form:\n\
              *** Begin Request\n\
              *** Read: {uri}\n\
-             *** Body:\n\
              <pattern>\n\
              *** End Request"
         );
@@ -937,7 +932,7 @@ mod tests {
         assert!(help.contains("uses ripgrep (`rg`)"));
         assert!(help.contains("Patterns use `rg`\n  regular-expression syntax"));
         assert!(help.contains("retries it as literal\n  text"));
-        assert!(help.contains("*** Read: search://src/tui/app.rs\n*** Body:\nfn push("));
+        assert!(help.contains("*** Read: search://src/tui/app.rs\nfn push("));
         assert!(!help.contains("grep://"));
         assert!(help.contains("Prefer it for conceptual\n  searches"));
         assert!(help.contains("values are clamped to 0 through 20"));
@@ -961,7 +956,7 @@ mod tests {
             .unwrap_err();
         let error = error.to_string();
         assert!(error.contains("nonempty search pattern"));
-        assert!(error.contains("*** Read: search://\n*** Body:\n<pattern>"));
+        assert!(error.contains("*** Read: search://\n<pattern>"));
     }
 
     #[test]

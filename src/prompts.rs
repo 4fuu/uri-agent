@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first call to any protocol.";
 
-pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with a fixed request format: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, an optional `*** Body:` line whose following lines are the raw verbatim body, and a `*** End Request` line. Omit the `*** Body:` section when the operation takes no body. Only `*** Begin Request`, `*** Read:`, `*** Exec:`, `*** Body:`, and `*** End Request` lines are structural; every other line is body content.";
+pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with a fixed request format: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional raw body lines, and a `*** End Request` line. Leave no lines between the operation line and `*** End Request` when the operation takes no body. Only `*** Begin Request`, `*** Read:`, `*** Exec:`, and `*** End Request` are structural; every other line is body content passed verbatim.";
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
@@ -92,7 +92,7 @@ pub fn task_accepted(id: &str) -> String {
 
 pub fn interactive_task_accepted(id: &str) -> String {
     format!(
-        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with:\n\n*** Begin Request\n*** Exec: tasks://{id}/send\n*** Body:\n<input>\n*** End Request\n\nThe input is written exactly, so end each line with \\n. Close stdin with an `*** Exec: tasks://{id}/eof` request and interrupt with an `*** Exec: tasks://{id}/interrupt` request. Read current output with a `*** Read: tasks://{id}` request and use one bounded wait when the result is needed. Do not poll or rerun the operation."
+        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with:\n\n*** Begin Request\n*** Exec: tasks://{id}/send\n<input>\n*** End Request\n\nThe input is written exactly, so end each line with \\n. Close stdin with an `*** Exec: tasks://{id}/eof` request and interrupt with an `*** Exec: tasks://{id}/interrupt` request. Read current output with a `*** Read: tasks://{id}` request and use one bounded wait when the result is needed. Do not poll or rerun the operation."
     )
 }
 
@@ -225,7 +225,8 @@ mod tests {
         assert!(message.starts_with("Interactive task started: tasks://002"));
         assert!(message.contains(r#"help(["tasks"])"#));
         assert!(message.contains("*** Exec: tasks://002/send"));
-        assert!(message.contains("*** Body:"));
+        assert!(message.contains("<input>"));
+        assert!(!message.contains("*** Body:"));
         assert!(message.contains("end each line with \\n"));
         assert!(message.contains("*** Exec: tasks://002/eof"));
         assert!(message.contains("*** Exec: tasks://002/interrupt"));

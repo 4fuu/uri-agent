@@ -92,7 +92,7 @@ Last reload diagnostics: {diagnostics}
 - Reload the plugin directory with an `*** Exec: wasm_plugin://reload` request.
   You MUST read `wasm_plugin://help/load` before changing plugin files or calling reload.
 
-Every `wasm_plugin` read and exec call takes no body; omit the `*** Body:` section.
+Every `wasm_plugin` read and exec call takes no body; leave no lines between the operation line and `*** End Request`.
 "#,
         directory = display_path(directory),
     )
@@ -2485,7 +2485,7 @@ mod tests {
         assert!(help.contains("wasm_plugin://help/load"));
         assert!(help.contains("wasm_plugin://help/author"));
         assert!(help.contains("MUST read `wasm_plugin://help/load`"));
-        assert!(help.contains("read and exec call takes no body; omit the `*** Body:` section"));
+        assert!(help.contains("read and exec call takes no body; leave no lines between the operation line and `*** End Request`"));
         assert!(!help.contains("cargo build"));
         assert!(!help.contains("ModelToolDescriptor"));
 
