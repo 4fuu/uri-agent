@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 const BEGIN_LINE: &str = "*** Begin Request";
 const END_LINE: &str = "*** End Request";
 const LEGACY_BODY_LINE: &str = "*** Body:";
-const CORRECT_FORM: &str = "*** Begin Request\n*** Read: <protocol>://<target>\n*** End Request";
+const CORRECT_FORM: &str = "*** Begin Request\n*** Read: <protocol>://<target>\n<optional body lines; omit this line when there is no body>\n*** End Request";
 
 #[derive(Clone, Copy, Debug)]
 enum ProtocolOperation {
@@ -70,7 +70,9 @@ fn parse_request(request: &str) -> Result<ParsedRequest> {
         .iter()
         .rposition(|line| trim_structural(line) == END_LINE)
     else {
-        bail!("invalid protocol request: missing `{END_LINE}`");
+        bail!(
+            "invalid protocol request: missing `{END_LINE}`; append the final marker after the operation line and all body lines; correct form:\n{CORRECT_FORM}"
+        );
     };
     if rest[end + 1..]
         .iter()
@@ -416,6 +418,15 @@ mod tests {
                 "{request:?} produced {error:#}"
             );
         }
+
+        let error = parse_request("*** Begin Request\n*** Read: file://a\n").unwrap_err();
+        assert!(error.to_string().contains(CORRECT_FORM));
+
+        let error =
+            parse_request("*** Begin Request\n*** Exec: file://a\nbody line\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("all body lines"));
+        assert!(message.contains("<optional body lines"));
     }
 
     #[test]

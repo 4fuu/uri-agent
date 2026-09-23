@@ -37,6 +37,7 @@ pub fn system_prompt(
          Protocol rules:\n\
          - Load help first. Before the first call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
          - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
+         - Protocol request format: `*** Begin Request`, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional body lines, then a final `*** End Request` line. The closing line is required even when the operation takes no body.\n\
          - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n",
     );
     prompt.push_str(
@@ -130,6 +131,12 @@ mod tests {
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
         assert!(prompt.contains("never guess them."));
+        assert!(prompt.contains("Protocol request format: `*** Begin Request`"));
+        assert!(prompt.contains(
+            "one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line"
+        ));
+        assert!(prompt.contains("then a final `*** End Request` line"));
+        assert!(prompt.contains("even when the operation takes no body"));
         assert!(prompt.contains("Choose a direct tool or a protocol as appropriate"));
         assert!(prompt.contains(
             "Direct tools are called by name. Protocols are not tools: call them through the \
