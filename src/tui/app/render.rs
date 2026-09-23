@@ -105,6 +105,7 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
         }
         return;
     }
+    let protocol_request_consumed = parse_protocol_request(&tool.arguments).is_some();
     if let Some(body) = tool_body_text(&tool.arguments)
         && !body.is_empty()
     {
@@ -138,7 +139,10 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
     };
     let remaining = arguments
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "uri" | "body"))
+        .filter(|(name, _)| {
+            !matches!(name.as_str(), "uri" | "body")
+                && !(protocol_request_consumed && *name == "request")
+        })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
     if remaining.is_empty() {

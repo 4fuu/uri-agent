@@ -4835,6 +4835,7 @@ fn full_tool_documents_render_status_input_and_output_as_markdown() {
     assert!(body.contains("```bash\nprintf done\n```"));
     assert!(body.contains("## Result"));
     assert!(!body.contains("shell-call"));
+    assert!(!body.contains("\"request\""));
 
     app.skip_splash();
     let backend = TestBackend::new(100, 30);
@@ -4875,6 +4876,61 @@ fn full_tool_documents_render_status_input_and_output_as_markdown() {
                         .all(|cell| cell.fg == MUTED && cell.modifier.contains(Modifier::ITALIC))
             })
     );
+}
+
+#[test]
+fn protocol_tool_documents_do_not_repeat_the_request_as_input_json() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "read-call".to_string(),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({
+                "request": "*** Begin Request\n*** Read: file://docs\n*** Body:\n{\"path\": \"docs\"}\n*** End Request"
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "read-call".to_string(),
+            name: "protocol".to_string(),
+            output: "documentation".to_string(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+    let document = block_document(&app.blocks[0]);
+    assert!(document.contains("**Target:** `file://docs`"));
+    assert_eq!(document.matches("## Input").count(), 1);
+    assert!(document.contains("\"path\": \"docs\""));
+    assert!(!document.contains("\"request\""));
+
+    apply_event(
+        &mut app,
+        3,
+        EventKind::ToolCall {
+            call_id: "malformed-call".to_string(),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({"request": "not a protocol request"}),
+        },
+    );
+    apply_event(
+        &mut app,
+        4,
+        EventKind::ToolResult {
+            call_id: "malformed-call".to_string(),
+            name: "protocol".to_string(),
+            output: "Error: malformed request".to_string(),
+            failed: true,
+            protocol_help_required: false,
+        },
+    );
+    let malformed = block_document(&app.blocks[1]);
+    assert!(malformed.contains("\"request\": \"not a protocol request\""));
 }
 
 #[test]
