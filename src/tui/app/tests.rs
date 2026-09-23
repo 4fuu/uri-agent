@@ -6618,3 +6618,68 @@ fn cloudflare_login_collects_all_credentials_before_saving() {
             && gateway_id == CLOUDFLARE_DEFAULT_GATEWAY_ID
     ));
 }
+
+#[test]
+fn welcome_hints_drop_trailing_entries_before_the_brand_box_clips_them() {
+    let ladder = [
+        // Full line needs 35 columns inside a box one column narrower.
+        (40, "Space compose · : commands · ? help"),
+        (27, "Space compose · : commands"),
+        (14, "Space compose"),
+    ];
+    for (width, hints) in ladder {
+        let mut app = test_app();
+        app.skip_splash();
+        let rendered = render_to_string(&mut app, width, 16);
+        assert!(
+            rendered.contains(hints),
+            "width {width} should show {hints:?}: {rendered}"
+        );
+    }
+
+    // Nothing fits, so the hint line disappears instead of showing a stub.
+    let mut app = test_app();
+    app.skip_splash();
+    let rendered = render_to_string(&mut app, 12, 16);
+    assert!(!rendered.contains("Space compose"), "{rendered}");
+}
+
+#[test]
+fn brand_wordmark_stays_inside_narrow_terminals() {
+    // The wordmark is a 17 pixel bitmap drawn two cells per pixel, so a brand
+    // box narrower than 34 columns used to clip the trailing letter.
+    for width in [12u16, 20, 26, 33, 34, 60] {
+        let mut app = test_app();
+        app.started -= Duration::from_secs(2);
+        let backend = TestBackend::new(width, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_brand(frame, &mut app, Rect::new(0, 0, width, 12), true))
+            .unwrap();
+        let splash = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_brand_complete(&splash, width, "splash");
+
+        app.skip_splash();
+        let welcome = render_to_string(&mut app, width, 12);
+        assert_brand_complete(&welcome, width, "welcome");
+    }
+}
+
+fn assert_brand_complete(rendered: &str, width: u16, screen: &str) {
+    // The shimmer alternates two glyphs for the same pixel, so compare the
+    // mark shape rather than the exact frame.
+    let rendered = rendered.replace('▓', "█");
+    for row in animation::wordmark(0.0, width as usize) {
+        let row = row.replace('▓', "█");
+        assert!(
+            rendered.contains(&row),
+            "{screen} at {width} columns is missing wordmark row {row:?}"
+        );
+    }
+}

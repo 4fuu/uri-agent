@@ -733,11 +733,12 @@ pub(super) fn wordmark_box(area: Rect) -> Rect {
 
 pub(super) fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, splash: bool) {
     let brand_area = wordmark_box(area);
+    let width = brand_area.width as usize;
     let progress = (app.started.elapsed().as_secs_f32() / SPLASH_DURATION.as_secs_f32()) * 1.25;
     let mut lines = if splash && progress < 1.0 {
-        animation::wordmark_reveal(app.animation_phase, progress)
+        animation::wordmark_reveal(app.animation_phase, progress, width)
     } else {
-        animation::wordmark(app.animation_phase)
+        animation::wordmark(app.animation_phase, width)
     }
     .into_iter()
     .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
@@ -787,11 +788,10 @@ pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ),
         model,
         Line::default(),
-        Line::styled(
-            single_line_preview(&hints, width.saturating_sub(1)),
-            Style::default().fg(MUTED),
-        ),
     ];
+    if let Some(hints) = fitted_hints(&hints, width.saturating_sub(1)) {
+        lines.push(Line::styled(hints, Style::default().fg(MUTED)));
+    }
     if let Some(version) = &app.available_update {
         lines.push(Line::styled(
             single_line_preview(
@@ -802,6 +802,18 @@ pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ));
     }
     lines
+}
+
+/// Welcome hints degrade like the footer's task indicator: keep the whole line
+/// while it fits the brand box, drop trailing hints as the box narrows, and
+/// omit the line instead of truncating a hint mid-label.
+fn fitted_hints(hints: &str, width: usize) -> Option<String> {
+    const SEPARATOR: &str = " · ";
+    let items = hints.split(SEPARATOR).collect::<Vec<_>>();
+    (1..=items.len())
+        .rev()
+        .map(|kept| items[..kept].join(SEPARATOR))
+        .find(|line| !line.is_empty() && line.width() <= width)
 }
 
 /// Minimal conversation footer. Live activity follows the model while project,

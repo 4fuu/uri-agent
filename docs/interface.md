@@ -11,7 +11,10 @@ and extension commands.
 An empty conversation shows the project, active model and thinking effort, and
 entry points for composing, commands, and help. If no model is configured, it
 prompts for `:login`. When networking is enabled, the welcome view may also
-report a newer URI Agent release without blocking startup.
+report a newer URI Agent release without blocking startup. The wordmark and
+these lines follow the terminal width, so a narrow window never clips them: the
+wordmark draws fewer cells per pixel or falls back to its name, and the
+entry-point hints drop trailing entries before the line disappears.
 
 After the first record, the footer shows model, effort, and context usage. It
 also exposes active background-task count; `:tasks` opens the task manager.
