@@ -2570,7 +2570,7 @@ fn task_notification_message(records: &[TaskRecord]) -> String {
         }
         if output_truncated {
             message.push_str(&format!(
-                "\n[Output truncated. If tasks help has not been loaded, call help([\"tasks\"]) first. Then read(\"{uri}\", \"\") once for complete output.]"
+                "\n[Output truncated. If tasks help has not been loaded, call help([\"tasks\"]) first. Then read the complete output once with:\n*** Begin Request\n*** Read: {uri}\n*** End Request]"
             ));
         }
         message.push('\n');
@@ -3169,10 +3169,9 @@ mod tests {
             content: vec![AssistantContent::ToolCall(ToolCall::new(
                 ToolCallId::new(id).unwrap(),
                 ToolFunction::new(
-                    "read".to_string(),
+                    "protocol".to_string(),
                     serde_json::json!({
-                        "uri": "missing://help",
-                        "body": ""
+                        "request": "*** Begin Request\n*** Read: missing://help\n*** End Request"
                     }),
                 ),
             ))],
@@ -3195,10 +3194,9 @@ mod tests {
         ToolCall::new(
             ToolCallId::new(id).unwrap(),
             ToolFunction::new(
-                "read".to_string(),
+                "protocol".to_string(),
                 serde_json::json!({
-                    "uri": uri,
-                    "body": ""
+                    "request": format!("*** Begin Request\n*** Read: {uri}\n*** End Request")
                 }),
             ),
         )
@@ -3220,10 +3218,9 @@ mod tests {
         ToolCall::new(
             ToolCallId::new(id).unwrap(),
             ToolFunction::new(
-                "exec".to_string(),
+                "protocol".to_string(),
                 serde_json::json!({
-                    "uri": uri,
-                    "body": body
+                    "request": format!("*** Begin Request\n*** Exec: {uri}\n*** Body:\n{body}\n*** End Request")
                 }),
             ),
         )
@@ -3293,7 +3290,7 @@ mod tests {
         let message = task_notification_message(&[tasks.get(&id).await.unwrap()]);
 
         assert!(message.contains(r#"call help(["tasks"]) first"#));
-        assert!(message.contains(r#"read("tasks://001", "") once for complete output"#));
+        assert!(message.contains("*** Read: tasks://001\n*** End Request"));
         tasks.shutdown().await;
     }
 
@@ -4952,10 +4949,9 @@ mod tests {
         let image_call = ToolCall::new(
             ToolCallId::new("read-image").unwrap(),
             ToolFunction::new(
-                "read".to_string(),
+                "protocol".to_string(),
                 serde_json::json!({
-                    "uri": "file://screenshot.png",
-                    "body": ""
+                    "request": "*** Begin Request\n*** Read: file://screenshot.png\n*** End Request"
                 }),
             ),
         );
@@ -4998,7 +4994,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             &event.kind,
             EventKind::ToolResult { name, output, failed: false, .. }
-                if name == "read" && output.contains("image/png")
+                if name == "protocol" && output.contains("image/png")
         )));
         assert!(matches!(
             events.last().map(|event| &event.kind),
@@ -5926,7 +5922,7 @@ mod tests {
                     system_prompt: Some(SystemPromptUpdate::Append(
                         "post-compaction instruction".to_string(),
                     )),
-                    tools: Some(CapabilitySelection::Only(vec!["read".to_string()])),
+                    tools: Some(CapabilitySelection::Only(vec!["protocol".to_string()])),
                     protocols: Some(CapabilitySelection::Only(Vec::new())),
                 }),
                 failure: None,
@@ -5950,7 +5946,7 @@ mod tests {
         );
         assert_eq!(
             spec.tools,
-            CapabilitySelection::Only(vec!["read".to_string()])
+            CapabilitySelection::Only(vec!["protocol".to_string()])
         );
         assert_eq!(spec.protocols, CapabilitySelection::Only(Vec::new()));
         assert_eq!(

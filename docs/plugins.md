@@ -8,7 +8,8 @@ the model-facing references. Rust authors should use the [SDK guide](../sdk/READ
 ## Installation and reload
 
 Place non-hidden regular `.wasm` files directly in
-`<config>/wasm-plugins/`, then run `exec("wasm_plugin://reload", "")`. There is
+`<config>/wasm-plugins/`, then reload with an `*** Exec: wasm_plugin://reload`
+request. There is
 no package manager, plugin setting, or CLI installation flag. Reload validates
 the complete directory in stable order and atomically replaces the dynamic
 protocol/tool set; a directory failure leaves the old set active, while invalid

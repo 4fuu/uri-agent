@@ -501,8 +501,8 @@ fn reasoning_folds_when_streaming_advances_to_text_or_a_tool() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolCall {
             call_id: "call".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"uri": "file://src/tui.rs"}),
+            name: "protocol".into(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"}),
         },
     });
     assert!(!tool_app.blocks[0].expanded);
@@ -531,8 +531,8 @@ fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
         2,
         EventKind::ToolCall {
             call_id: "call-1".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"uri": "file://src/tui.rs"}),
+            name: "protocol".into(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"}),
         },
     );
     apply_event(
@@ -540,7 +540,7 @@ fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
         3,
         EventKind::ToolResult {
             call_id: "call-1".into(),
-            name: "read".into(),
+            name: "protocol".into(),
             output: "source".into(),
             failed: false,
             protocol_help_required: false,
@@ -4730,8 +4730,8 @@ fn tool_call_and_result_share_one_block() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolCall {
             call_id: "call-1".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::json!({"uri": "file://src/main.rs"}),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request"}),
         },
     });
     app.apply(SessionEvent {
@@ -4739,7 +4739,7 @@ fn tool_call_and_result_share_one_block() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolResult {
             call_id: "call-1".to_string(),
-            name: "read".to_string(),
+            name: "protocol".to_string(),
             output: "complete tool output".to_string(),
             failed: false,
             protocol_help_required: false,
@@ -4811,10 +4811,9 @@ fn full_tool_documents_render_status_input_and_output_as_markdown() {
         1,
         EventKind::ToolCall {
             call_id: "shell-call".to_string(),
-            name: "exec".to_string(),
+            name: "protocol".to_string(),
             arguments: serde_json::json!({
-                "uri": "bash://run",
-                "body": "printf done"
+                "request": "*** Begin Request\n*** Exec: bash://run\n*** Body:\nprintf done\n*** End Request"
             }),
         },
     );
@@ -4823,7 +4822,7 @@ fn full_tool_documents_render_status_input_and_output_as_markdown() {
         2,
         EventKind::ToolResult {
             call_id: "shell-call".to_string(),
-            name: "exec".to_string(),
+            name: "protocol".to_string(),
             output: "done".to_string(),
             failed: false,
             protocol_help_required: false,
@@ -4936,8 +4935,8 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
         1,
         EventKind::ToolCall {
             call_id: "failed-call".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::json!({"uri": "file://missing", "body": ""}),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://missing\n*** End Request"}),
         },
     );
     assert!(block_document(&app.blocks[0]).contains("**• Running**"));
@@ -4947,7 +4946,7 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
         2,
         EventKind::ToolResult {
             call_id: "failed-call".to_string(),
-            name: "read".to_string(),
+            name: "protocol".to_string(),
             output: "Error: file not found".to_string(),
             failed: true,
             protocol_help_required: false,
@@ -4964,8 +4963,8 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
         3,
         EventKind::ToolCall {
             call_id: "empty-call".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::json!({"uri": "file://empty", "body": ""}),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://empty\n*** End Request"}),
         },
     );
     apply_event(
@@ -4973,7 +4972,7 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
         4,
         EventKind::ToolResult {
             call_id: "empty-call".to_string(),
-            name: "read".to_string(),
+            name: "protocol".to_string(),
             output: String::new(),
             failed: false,
             protocol_help_required: false,
@@ -4988,18 +4987,17 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
 fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     assert_eq!(
         tool_title(
-            "exec",
+            "protocol",
             &serde_json::json!({
-                "uri": "bash://run",
-                "body": "cargo test\necho done"
+                "request": "*** Begin Request\n*** Exec: bash://run\n*** Body:\ncargo test\necho done\n*** End Request"
             })
         ),
         "$ cargo test"
     );
     assert_eq!(
         tool_title(
-            "exec",
-            &serde_json::json!({"uri": "bash://run", "body": "test command"})
+            "protocol",
+            &serde_json::json!({"request": "*** Begin Request\n*** Exec: bash://run\n*** Body:\ntest command\n*** End Request"})
         ),
         "$ test command"
     );
@@ -5032,9 +5030,12 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     );
     assert_eq!(
         tool_title(
-            "read",
+            "protocol",
             &serde_json::json!({
-                "uri": r"file://\\?\C:\Users\4fu\project\src\main.rs?offset=1"
+                "request": format!(
+                    "*** Begin Request\n*** Read: {}\n*** End Request",
+                    r"file://\\?\C:\Users\4fu\project\src\main.rs?offset=1"
+                )
             })
         ),
         r"Read C:\Users\4fu\project\src\main.rs?offset=1"
@@ -5086,8 +5087,8 @@ fn activity_status_follows_stream_events() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolCall {
             call_id: "call".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::json!({"uri": "file://src/main.rs"}),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request"}),
         },
     });
     assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
@@ -5304,8 +5305,8 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolCall {
             call_id: "old".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"uri": "file://old.rs"}),
+            name: "protocol".into(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://old.rs\n*** End Request"}),
         },
     });
     app.apply(SessionEvent {
@@ -5313,7 +5314,7 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolResult {
             call_id: "old".into(),
-            name: "read".into(),
+            name: "protocol".into(),
             output: "done".into(),
             failed: false,
             protocol_help_required: false,
@@ -5324,8 +5325,8 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
         at: chrono::Utc::now(),
         kind: EventKind::ToolCall {
             call_id: "current".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"uri": "file://current.rs"}),
+            name: "protocol".into(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://current.rs\n*** End Request"}),
         },
     });
     app.selected_block = 1;
@@ -5836,15 +5837,14 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
     for index in 0..70 {
         giant.push(EventKind::ToolCall {
             call_id: format!("giant-{index}"),
-            name: "read".into(),
+            name: "protocol".into(),
             arguments: serde_json::json!({
-                "uri": format!("file://giant-{index}"),
-                "body": ""
+                "request": format!("*** Begin Request\n*** Read: file://giant-{index}\n*** End Request")
             }),
         });
         giant.push(EventKind::ToolResult {
             call_id: format!("giant-{index}"),
-            name: "read".into(),
+            name: "protocol".into(),
             output: format!("result {index}"),
             failed: false,
             protocol_help_required: false,
@@ -5867,8 +5867,8 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
         },
         EventKind::ToolCall {
             call_id: "current-tool".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"uri": "file://current", "body": ""}),
+            name: "protocol".into(),
+            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://current\n*** End Request"}),
         },
     ];
     opened
@@ -5888,7 +5888,7 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
         .append_batch(vec![
             EventKind::ToolResult {
                 call_id: "current-tool".into(),
-                name: "read".into(),
+                name: "protocol".into(),
                 output: "current result".into(),
                 failed: false,
                 protocol_help_required: false,
@@ -6301,12 +6301,12 @@ async fn global_history_actions_load_the_complete_session_before_navigating() {
             },
             EventKind::ToolCall {
                 call_id: "old-tool".into(),
-                name: "read".into(),
-                arguments: serde_json::json!({"uri": "file://old", "body": ""}),
+                name: "protocol".into(),
+                arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://old\n*** End Request"}),
             },
             EventKind::ToolResult {
                 call_id: "old-tool".into(),
-                name: "read".into(),
+                name: "protocol".into(),
                 output: "searchable old result".into(),
                 failed: false,
                 protocol_help_required: false,

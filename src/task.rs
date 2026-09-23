@@ -664,11 +664,11 @@ impl TaskManager {
                         "task {id} input buffer is full; wait for the process to consume pending input"
                     ),
                     Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!(
-                        "task {id} is no longer reading input; its process may have exited; read(\"tasks://{id}\", \"\") for its current state"
+                        "task {id} is no longer reading input; its process may have exited; read its current state with a `*** Read: tasks://{id}` request"
                     ),
                 },
                 Some(TaskInputControl::Closed) => anyhow::bail!(
-                    "task {id} input is already closed; wait for completion or use exec(\"tasks://{id}/cancel\", \"\")"
+                    "task {id} input is already closed; wait for completion or use an `*** Exec: tasks://{id}/cancel` request"
                 ),
                 None => anyhow::bail!(
                     "task {id} does not accept input; rerun the command with interactive=true"
@@ -1074,7 +1074,7 @@ mod tests {
             .to_string();
         assert!(closed.contains("input is already closed"), "{closed}");
         assert!(
-            closed.contains(r#"exec("tasks://001/cancel", "")"#),
+            closed.contains("`*** Exec: tasks://001/cancel` request"),
             "{closed}"
         );
 

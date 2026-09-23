@@ -59,7 +59,7 @@ Current working directory: `file://{}`
   Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-Every `file` read MUST pass an empty string body.
+Every `file` read takes no body; omit the `*** Body:` section.
 "#,
         display_path(cwd)
     )
@@ -84,11 +84,14 @@ impl FileProtocol {
             }
             if request.target.is_empty() {
                 bail!(
-                    r#"file reads require an empty body; put the path in the URI, for example read("file://<path>", "")"#
+                    "file reads take no body; put the path in the URI, for example:\n\
+                     *** Begin Request\n\
+                     *** Read: file://<path>\n\
+                     *** End Request"
                 );
             }
             bail!(
-                "file reads require an empty body; retry read({:?}, \"\")",
+                "file reads take no body; retry with a `*** Read: {}` request",
                 request.uri
             );
         }
@@ -736,7 +739,7 @@ mod tests {
         assert!(help.contains("paths beginning with\n  `~/` resolve"));
         assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("Every `file` read"));
-        assert!(help.contains("MUST pass an empty string body"));
+        assert!(help.contains("takes no body; omit the `*** Body:` section"));
     }
 
     #[test]
@@ -798,7 +801,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains(r#"read("file://<path>", "")"#));
+        assert!(error.to_string().contains("*** Read: file://<path>"));
     }
 
     #[test]

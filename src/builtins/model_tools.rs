@@ -1,27 +1,28 @@
 use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::prompts;
 use crate::protocol::ProtocolRegistry;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy)]
+const BEGIN_LINE: &str = "*** Begin Request";
+const END_LINE: &str = "*** End Request";
+const BODY_LINE: &str = "*** Body:";
+const CORRECT_FORM: &str = "*** Begin Request\n*** Read: <protocol>://<target>\n*** End Request";
+
+#[derive(Clone, Copy, Debug)]
 enum ProtocolOperation {
     Read,
     Exec,
 }
 
-#[derive(Clone)]
-struct ProtocolTool {
-    operation: ProtocolOperation,
-}
+struct ProtocolTool;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProtocolArguments {
-    uri: String,
-    body: String,
+    request: String,
 }
 
 #[derive(Deserialize)]
@@ -32,42 +33,126 @@ struct HelpArguments {
 
 struct HelpTool;
 
-impl ProtocolTool {
-    fn new(operation: ProtocolOperation) -> Self {
-        Self { operation }
-    }
+#[derive(Debug)]
+struct ParsedRequest {
+    operation: ProtocolOperation,
+    uri: String,
+    body: String,
+}
 
-    fn name(&self) -> &'static str {
-        match self.operation {
-            ProtocolOperation::Read => "read",
-            ProtocolOperation::Exec => "exec",
+/// Parses the fixed protocol request format:
+///
+/// ```text
+/// *** Begin Request
+/// *** Read: <protocol>://<target>
+/// *** Body:
+/// <raw body lines>
+/// *** End Request
+/// ```
+///
+/// The `*** Body:` section is optional; its lines run verbatim to
+/// `*** End Request` and are never escaped.
+fn parse_request(request: &str) -> Result<ParsedRequest> {
+    let mut lines = request.split_inclusive('\n');
+    let first = lines.next().unwrap_or_default();
+    if trim_structural(first) != BEGIN_LINE {
+        bail!(
+            "invalid protocol request: the first line must be `{BEGIN_LINE}`; correct form:\n{CORRECT_FORM}"
+        );
+    }
+    let (operation, uri) = parse_operation_line(lines.next().unwrap_or_default())?;
+    let mut body = String::new();
+    let mut in_body = false;
+    let mut ended = false;
+    for line in lines {
+        let trimmed = trim_structural(line);
+        if ended {
+            if !trimmed.is_empty() {
+                bail!("invalid protocol request: unexpected text after `{END_LINE}`");
+            }
+            continue;
+        }
+        if !in_body && trimmed == BODY_LINE {
+            in_body = true;
+            continue;
+        }
+        if trimmed == END_LINE {
+            ended = true;
+            continue;
+        }
+        if in_body {
+            body.push_str(line);
+            continue;
+        }
+        bail!(
+            "invalid protocol request: expected `{BODY_LINE}` or `{END_LINE}` after the \
+             `*** Read:`/`*** Exec:` line; correct form:\n\
+             *** Begin Request\n\
+             *** Exec: pwsh://run\n\
+             *** Body:\n\
+             <command>\n\
+             *** End Request"
+        );
+    }
+    if !ended {
+        bail!("invalid protocol request: missing `{END_LINE}`");
+    }
+    // The newline that terminates the last body line belongs to the format,
+    // not to the body.
+    if let Some(stripped) = body.strip_suffix('\n') {
+        body.truncate(stripped.len());
+        if body.ends_with('\r') {
+            body.pop();
         }
     }
+    if body
+        .chars()
+        .all(|character| character == '\n' || character == '\r')
+    {
+        body.clear();
+    }
+    Ok(ParsedRequest {
+        operation,
+        uri,
+        body,
+    })
+}
+
+fn parse_operation_line(line: &str) -> Result<(ProtocolOperation, String)> {
+    let trimmed = trim_structural(line);
+    for (prefix, operation) in [
+        ("*** Read: ", ProtocolOperation::Read),
+        ("*** Exec: ", ProtocolOperation::Exec),
+    ] {
+        if let Some(uri) = trimmed.strip_prefix(prefix) {
+            return Ok((operation, uri.to_string()));
+        }
+    }
+    bail!(
+        "invalid protocol request: the second line must be `*** Read: <protocol>://<target>` or \
+         `*** Exec: <protocol>://<target>`; correct form:\n{CORRECT_FORM}"
+    )
+}
+
+fn trim_structural(line: &str) -> &str {
+    line.trim_end_matches(['\n', '\r', ' ', '\t'])
 }
 
 #[async_trait]
 impl ModelTool for ProtocolTool {
     fn descriptor(&self) -> ModelToolDescriptor {
         ModelToolDescriptor {
-            name: self.name().to_string(),
-            description: match self.operation {
-                ProtocolOperation::Read => prompts::READ_TOOL_DESCRIPTION,
-                ProtocolOperation::Exec => prompts::EXEC_TOOL_DESCRIPTION,
-            }
-            .to_string(),
+            name: "protocol".to_string(),
+            description: prompts::PROTOCOL_TOOL_DESCRIPTION.to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "uri": {
+                    "request": {
                         "type": "string",
-                        "description": "Protocol address in the custom form <protocol>://<opaque-target>. It is not an RFC URL and is passed to the selected protocol unchanged."
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Protocol-specific string body. Use an empty string when the operation takes no body, plain text for textual input such as a command or a search pattern, and complete serialized JSON text when the protocol requires structured input."
+                        "description": "Fixed-format request: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, an optional `*** Body:` line followed by raw body lines, and a `*** End Request` line. Omit the `*** Body:` section when the operation takes no body; when a protocol's help page requires a JSON body, that JSON is the raw text after `*** Body:`. Examples:\n\n*** Begin Request\n*** Read: file://src/main.rs\n*** End Request\n\n*** Begin Request\n*** Exec: pwsh://run\n*** Body:\ncargo test\n*** End Request\n\nOnly the lines `*** Begin Request`, `*** Read:`, `*** Exec:`, `*** Body:`, and `*** End Request` are structural; every other line is body content passed verbatim."
                     }
                 },
-                "required": ["uri", "body"],
+                "required": ["request"],
                 "additionalProperties": false
             }),
         }
@@ -79,16 +164,15 @@ impl ModelTool for ProtocolTool {
         protocols: &ProtocolRegistry,
     ) -> Result<ModelToolOutput> {
         let arguments: ProtocolArguments = serde_json::from_value(arguments.clone())
-            .map_err(|error| anyhow!("invalid {} arguments: {error}", self.name()))?;
-        match self.operation {
+            .map_err(|error| anyhow!("invalid protocol arguments: {error}"))?;
+        let parsed = parse_request(&arguments.request)?;
+        match parsed.operation {
             ProtocolOperation::Read => {
-                let result = protocols
-                    .read_for_model(&arguments.uri, &arguments.body)
-                    .await?;
+                let result = protocols.read_for_model(&parsed.uri, &parsed.body).await?;
                 Ok(ModelToolOutput::new(result.output, result.images))
             }
             ProtocolOperation::Exec => protocols
-                .exec(&arguments.uri, &arguments.body)
+                .exec(&parsed.uri, &parsed.body)
                 .await
                 .map(Into::into),
         }
@@ -133,19 +217,13 @@ pub(super) struct ProtocolToolsPlugin;
 pub(crate) fn register_protocol_tools(
     registry: &mut crate::plugin::ModelToolRegistry,
 ) -> Result<()> {
-    registry.register(ProtocolTool::new(ProtocolOperation::Read))?;
-    registry.register(ProtocolTool::new(ProtocolOperation::Exec))?;
+    registry.register(ProtocolTool)?;
     registry.register(HelpTool)
 }
 
 impl Plugin for ProtocolToolsPlugin {
     fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
-        [
-            ProtocolTool::new(ProtocolOperation::Read).descriptor(),
-            ProtocolTool::new(ProtocolOperation::Exec).descriptor(),
-            HelpTool.descriptor(),
-        ]
-        .to_vec()
+        [ProtocolTool.descriptor(), HelpTool.descriptor()].to_vec()
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
@@ -200,13 +278,94 @@ mod tests {
     }
 
     #[test]
-    fn protocol_tools_require_a_plain_string_body() {
-        for operation in [ProtocolOperation::Read, ProtocolOperation::Exec] {
-            let descriptor = ProtocolTool::new(operation).descriptor();
-            assert_eq!(descriptor.parameters["required"], json!(["uri", "body"]));
-            assert_eq!(
-                descriptor.parameters["properties"]["body"]["type"],
-                "string"
+    fn protocol_tool_describes_the_fixed_request_format() {
+        let descriptor = ProtocolTool.descriptor();
+        assert_eq!(descriptor.name, "protocol");
+        assert_eq!(descriptor.parameters["required"], json!(["request"]));
+        assert_eq!(
+            descriptor.parameters["properties"]["request"]["type"],
+            "string"
+        );
+        for fragment in [
+            "*** Begin Request",
+            "*** Read: <protocol>://<target>",
+            "*** Exec: <protocol>://<target>",
+            "*** Body:",
+            "*** End Request",
+        ] {
+            assert!(
+                descriptor.description.contains(fragment),
+                "description is missing: {fragment}"
+            );
+        }
+        let request_description = descriptor.parameters["properties"]["request"]["description"]
+            .as_str()
+            .expect("the request parameter keeps its description");
+        for fragment in [
+            "Omit the `*** Body:` section when the operation takes no body",
+            "that JSON is the raw text after `*** Body:`",
+            "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request",
+        ] {
+            assert!(
+                request_description.contains(fragment),
+                "request description is missing: {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_request_reads_without_a_body_section() {
+        let parsed =
+            parse_request("*** Begin Request\n*** Read: file://src/main.rs\n*** End Request")
+                .unwrap();
+        assert!(matches!(parsed.operation, ProtocolOperation::Read));
+        assert_eq!(parsed.uri, "file://src/main.rs");
+        assert!(parsed.body.is_empty());
+    }
+
+    #[test]
+    fn parse_request_keeps_multiline_bodies_verbatim() {
+        let request = "*** Begin Request\n*** Exec: pwsh://run\n*** Body:\nline one\n\nline \"three\"\n*** End Request";
+        let parsed = parse_request(request).unwrap();
+        assert!(matches!(parsed.operation, ProtocolOperation::Exec));
+        assert_eq!(parsed.uri, "pwsh://run");
+        assert_eq!(parsed.body, "line one\n\nline \"three\"");
+    }
+
+    #[test]
+    fn parse_request_accepts_crlf_lines_and_spaces_in_the_uri() {
+        let parsed = parse_request(
+            "*** Begin Request\r\n*** Read: file://my docs/a.md\r\n*** End Request\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.uri, "file://my docs/a.md");
+        assert!(parsed.body.is_empty());
+    }
+
+    #[test]
+    fn parse_request_treats_a_newline_only_body_as_empty() {
+        let parsed = parse_request(
+            "*** Begin Request\n*** Read: search://src\n*** Body:\n\n*** End Request",
+        )
+        .unwrap();
+        assert!(parsed.body.is_empty());
+    }
+
+    #[test]
+    fn parse_request_rejects_malformed_requests() {
+        for request in [
+            "",
+            "read file://src/main.rs",
+            "*** Begin Request\n*** Read file://src/main.rs\n*** End Request",
+            "*** Begin Request\n*** Exec: pwsh://run\ngit status\n*** End Request",
+            "*** Begin Request\n*** Read:\n*** End Request",
+            "*** Begin Request\n*** Read: file://a\n",
+            "*** Begin Request\n*** Read: file://a\n*** End Request\ntrailing",
+        ] {
+            let error = parse_request(request).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid protocol request"),
+                "{request:?} produced {error:#}"
             );
         }
     }
@@ -231,13 +390,16 @@ mod tests {
             .unwrap();
         assert!(loaded.output().contains("Loaded protocols stay loaded"));
 
-        let read = ProtocolTool::new(ProtocolOperation::Read)
-            .execute(&json!({"uri": "capture://value", "body": ""}), &protocols)
+        let read = ProtocolTool
+            .execute(
+                &json!({"request": "*** Begin Request\n*** Read: capture://value\n*** End Request"}),
+                &protocols,
+            )
             .await
             .unwrap();
-        let exec = ProtocolTool::new(ProtocolOperation::Exec)
+        let exec = ProtocolTool
             .execute(
-                &json!({"uri": "capture://value", "body": "{\"answer\":42}"}),
+                &json!({"request": "*** Begin Request\n*** Exec: capture://value\n*** Body:\n{\"answer\":42}\n*** End Request"}),
                 &protocols,
             )
             .await
@@ -267,18 +429,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_tools_reject_non_string_body_arguments() {
+    async fn protocol_tool_rejects_malformed_requests() {
         let (protocols, output) = protocols().await;
-        let error = ProtocolTool::new(ProtocolOperation::Read)
-            .execute(
-                &json!({"uri": "capture://value", "body": {"answer": 42}}),
-                &protocols,
-            )
+        let error = ProtocolTool
+            .execute(&json!({"request": "read capture://value"}), &protocols)
             .await
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("invalid read arguments"));
-        assert!(format!("{error:#}").contains("string"));
+        assert!(format!("{error:#}").contains("invalid protocol request"));
+
+        let error = ProtocolTool
+            .execute(&json!({"request": 42}), &protocols)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("invalid protocol arguments"));
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 }

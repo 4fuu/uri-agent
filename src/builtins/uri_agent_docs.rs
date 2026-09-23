@@ -31,7 +31,7 @@ Read the version-matched URI Agent documentation embedded in this binary.
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
 - Targets are exact, case-sensitive filenames and do not accept paths or query parameters.
-- Pass an empty string body.
+- These reads take no body; omit the `*** Body:` section.
 
 Available documents:
 "#,
@@ -76,7 +76,7 @@ impl Protocol for UriAgentDocsProtocol {
                 bail!("uri-agent-docs://help requires an empty body");
             }
             bail!(
-                "uri-agent-docs reads require an empty body; retry read({:?}, \"\")",
+                "uri-agent-docs reads take no body; retry with a `*** Read: {}` request",
                 request.uri
             );
         }

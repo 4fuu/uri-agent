@@ -89,10 +89,10 @@ Last reload diagnostics: {diagnostics}
 
 - Read `wasm_plugin://help/load` for loading, updating, removing, and reloading plugins.
 - Read `wasm_plugin://help/author` for the SDK, ABI, protocols, direct tools, and permissions.
-- Call `exec("wasm_plugin://reload", "")` to reload the plugin directory.
+- Reload the plugin directory with an `*** Exec: wasm_plugin://reload` request.
   You MUST read `wasm_plugin://help/load` before changing plugin files or calling reload.
 
-Every `wasm_plugin` read and exec call MUST pass an empty string body.
+Every `wasm_plugin` read and exec call takes no body; omit the `*** Body:` section.
 "#,
         directory = display_path(directory),
     )
@@ -125,7 +125,7 @@ Plugin directory: `{directory}`
    then rename it to `<name>.wasm` in the same directory. The rename is the
    atomic enable step. Hidden files, nested files, and files that do not end in
    `.wasm` are ignored.
-5. Call `exec("wasm_plugin://reload", "")`. The call returns after reload builds a
+5. Reload with an `*** Exec: wasm_plugin://reload` request. The call returns after reload builds a
    complete replacement protocol and direct-tool set and swaps it into the running agent.
    Existing calls keep their old runtime until they finish. Invalid or
    conflicting modules are skipped and reported.
@@ -1331,7 +1331,7 @@ impl Protocol for WasmPluginManager {
             "help" => {}
             _ => {
                 bail!(
-                    r#"unknown wasm_plugin read target; use read("wasm_plugin://help/load", "") or read("wasm_plugin://help/author", "")"#
+                    "unknown wasm_plugin read target; use `*** Read: wasm_plugin://help/load` or `*** Read: wasm_plugin://help/author`"
                 )
             }
         }
@@ -1374,11 +1374,11 @@ impl Protocol for WasmPluginManager {
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target != "reload" {
-            bail!(r#"unknown wasm_plugin operation; use exec("wasm_plugin://reload", "")"#);
+            bail!("unknown wasm_plugin operation; use an `*** Exec: wasm_plugin://reload` request");
         }
         if !request.body.is_empty() {
             bail!(
-                r#"wasm_plugin://reload requires an empty body; retry exec("wasm_plugin://reload", "")"#
+                "wasm_plugin://reload takes no body; retry with an `*** Exec: wasm_plugin://reload` request"
             );
         }
         Ok(self.reload().await?.render().into_bytes())
@@ -2485,7 +2485,7 @@ mod tests {
         assert!(help.contains("wasm_plugin://help/load"));
         assert!(help.contains("wasm_plugin://help/author"));
         assert!(help.contains("MUST read `wasm_plugin://help/load`"));
-        assert!(help.contains("read and exec call MUST pass an empty string body"));
+        assert!(help.contains("read and exec call takes no body; omit the `*** Body:` section"));
         assert!(!help.contains("cargo build"));
         assert!(!help.contains("ModelToolDescriptor"));
 

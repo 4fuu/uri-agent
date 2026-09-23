@@ -50,6 +50,9 @@ fn tool_document(block: &DisplayBlock, tool: &ToolDisplay, level: usize) -> Stri
 }
 
 fn tool_target(tool: &ToolDisplay) -> Option<Cow<'_, str>> {
+    if let Some(parsed) = parse_protocol_request(&tool.arguments) {
+        return Some(display_tool_uri(parsed.uri));
+    }
     if let Some(uri) = tool
         .arguments
         .get("uri")
@@ -106,7 +109,9 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
         && !body.is_empty()
     {
         let protocol = tool_protocol(&tool.arguments);
-        let (label, language) = if tool.name == "exec" {
+        let (label, language) = if parse_protocol_request(&tool.arguments)
+            .is_some_and(|parsed| parsed.operation == "Exec")
+        {
             match protocol.as_deref() {
                 Some("bash") => ("Command", "bash"),
                 Some("pwsh") => ("Command", "powershell"),
@@ -231,17 +236,74 @@ fn longest_backtick_run(value: &str) -> usize {
         .unwrap_or_default()
 }
 
+/// Parses the `protocol` tool's fixed request format for display only: the
+/// `*** Read:`/`*** Exec:` verb, the address, and the raw `*** Body:` text.
+struct ProtocolRequest<'a> {
+    operation: &'a str,
+    uri: &'a str,
+    body: &'a str,
+}
+
+fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolRequest<'_>> {
+    let request = arguments.get("request")?.as_str()?;
+    let mut lines = request.split_inclusive('\n');
+    if lines.next()?.trim_end() != "*** Begin Request" {
+        return None;
+    }
+    let operation_line = lines.next()?.trim_end();
+    let (verb, uri) = operation_line.strip_prefix("*** ")?.split_once(' ')?;
+    let operation = verb.strip_suffix(':').unwrap_or(verb);
+    if !matches!(operation, "Read" | "Exec") || uri.is_empty() {
+        return None;
+    }
+    let body = request
+        .find("*** Body:\n")
+        .or_else(|| request.find("*** Body:\r\n"))
+        .map(|index| {
+            let after = request[index..]
+                .split_once('\n')
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            let after = after.trim_end_matches(['\n', '\r']);
+            let after = after.strip_suffix("*** End Request").unwrap_or(after);
+            after.trim_end_matches(['\n', '\r'])
+        })
+        .unwrap_or_default();
+    Some(ProtocolRequest {
+        operation,
+        uri,
+        body,
+    })
+}
+
 pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
-    let uri = arguments.get("uri")?.as_str()?;
+    let uri = match parse_protocol_request(arguments) {
+        Some(parsed) => parsed.uri.to_string(),
+        None => arguments.get("uri")?.as_str()?.to_string(),
+    };
     let separator = uri.find("://").or_else(|| uri.find(':'))?;
     (separator > 0).then(|| uri[..separator].to_string())
 }
 
 fn tool_body_text(arguments: &serde_json::Value) -> Option<&str> {
+    if let Some(parsed) = parse_protocol_request(arguments) {
+        return Some(parsed.body);
+    }
     arguments.get("body")?.as_str()
 }
 
 fn tool_body(arguments: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
+    if let Some(parsed) = parse_protocol_request(arguments) {
+        if parsed.body.is_empty() {
+            return None;
+        }
+        return serde_json::from_str(parsed.body)
+            .ok()
+            .map(Cow::Owned)
+            .or(Some(Cow::Owned(serde_json::Value::String(
+                parsed.body.to_string(),
+            ))));
+    }
     let body = arguments.get("body")?;
     let Some(value) = body.as_str() else {
         return Some(Cow::Borrowed(body));
@@ -302,27 +364,30 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
         }
         return format!("Loaded help: {}", single_line_preview(&names, 64));
     }
-    let action = match name {
-        "read" => "Read",
-        "exec" => "Ran",
+    let (action, uri, body) = match name {
+        "protocol" => {
+            let Some(parsed) = parse_protocol_request(arguments) else {
+                return name.to_string();
+            };
+            let action = if parsed.operation == "Exec" {
+                "Ran"
+            } else {
+                "Read"
+            };
+            (action, parsed.uri, parsed.body)
+        }
         _ => return name.to_string(),
-    };
-    let Some(uri) = arguments.get("uri").and_then(serde_json::Value::as_str) else {
-        return action.to_string();
     };
     let uri = display_tool_uri(uri);
     let uri = uri.as_ref();
     let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
-    if name == "exec"
-        && matches!(protocol, "bash" | "pwsh")
-        && let Some(command) = tool_body_text(arguments)
-    {
+    if action == "Ran" && matches!(protocol, "bash" | "pwsh") && !body.is_empty() {
         return format!(
             "$ {}",
-            single_line_preview(command.lines().next().unwrap_or_default(), 76)
+            single_line_preview(body.lines().next().unwrap_or_default(), 76)
         );
     }
-    if name == "read" && protocol == "file" {
+    if action == "Read" && protocol == "file" {
         return format!("Read {}", single_line_preview(target, 76));
     }
     if target == "help" {
@@ -354,7 +419,9 @@ pub(super) fn tool_detail_lines(
 ) -> (Vec<(String, Color)>, usize) {
     let mut logical = Vec::new();
     if let Some(tool) = &block.tool {
-        if let Some(uri) = tool
+        if let Some(parsed) = parse_protocol_request(&tool.arguments) {
+            logical.push((format!("↳ {}", parsed.uri), MUTED));
+        } else if let Some(uri) = tool
             .arguments
             .get("uri")
             .and_then(serde_json::Value::as_str)
@@ -404,7 +471,7 @@ pub(super) fn tool_argument_details(
 ) {
     if let Some(fields) = arguments.as_object() {
         for (key, value) in fields {
-            if matches!(key.as_str(), "uri" | "body") {
+            if matches!(key.as_str(), "uri" | "body" | "request") {
                 continue;
             }
             if key == "patch"

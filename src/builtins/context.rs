@@ -62,7 +62,7 @@ Consult another session whenever its history or notes could help. `@@<session-id
 - `context://sessions/<session-id>/notes/<note-id>` reads a note.
 - `context://sessions/<session-id>/notes/<note-id>/revisions` lists its revision metadata.
 - `context://sessions/<session-id>/notes/<note-id>/context` reads records around a selected revision anchor.
-- Reading `context://sessions/index` diagnoses the saved-session search cache. Use `exec("context://sessions/index", "")` only to prewarm or rebuild that private cache; it never modifies a session.
+- Reading `context://sessions/index` diagnoses the saved-session search cache. Use an `*** Exec: context://sessions/index` request only to prewarm or rebuild that private cache; it never modifies a session.
 
 Discovery defaults to the current project. The discovery and index routes accept `scope=project` or `scope=all`; `cwd` is available with `scope=all`. Results document their pagination options.
 
@@ -75,7 +75,7 @@ Discovery defaults to the current project. The discovery and index routes accept
 - `context://notes/<id>/context` reads records around a selected revision anchor, including for a deleted note. Optional `revision`, `before`, `after`, and `types` select the revision and surrounding records.
 - `context://history/windows` lists context-window IDs and record-ID ranges.
 - Reading `context://history/index` diagnoses the current session's semantic
-  history cache. Use `exec("context://history/index", "")` only to prewarm or
+  history cache. Use an `*** Exec: context://history/index` request only to prewarm or
   force-rebuild that cache. Do not use either operation before a ranked search.
   The private sidecar cache never changes session events.
 - `context://history/users` lists original user statements across all windows,
@@ -88,7 +88,7 @@ Discovery defaults to the current project. The discovery and index routes accept
   and `limit`.
 - `context://history/<window-id>` reads the newest records in one window. Optional `types`, `before=<record-id>`, and `limit` filter and paginate.
 - `context://history/search` searches records across all windows using the
-  nonempty plain-text body; optional `window=<window-id>` narrows the search.
+  nonempty plain-text `*** Body:` section; optional `window=<window-id>` narrows the search.
   Exact search accepts optional `types`, `before=<record-id>`, and `limit`;
   semantic and hybrid modes accept `types`, `offset`, and `limit`.
 
@@ -102,10 +102,10 @@ defaults to 20 and is clamped to 1 through 50.
   `tasks://` instruction once. Do not submit the same search again to retrieve
   task output.
 - `context://history/around/<record-id>` reads records surrounding one anchor. Optional `before` and `after` are record counts and default to 10 each; their sum must not exceed 50. Optional `types` filters the result.
-- `exec("context://notes/add?title=<percent-encoded-title>", "<content>")` creates a note and returns its stable ID.
-- `exec("context://notes/<id>/replace?title=<percent-encoded-title>", "<content>")` replaces the current content and creates a revision while preserving the ID.
-- `exec("context://notes/<id>/delete", "")` tombstones a note. Its ID, title, revision metadata, and anchors remain, but its content can no longer be read.
-- `exec("context://rollover", "<optional bounded handoff>")` requests a fresh context window when the active strategy is `rollover`; the handoff is limited to 4,096 estimated tokens. It starts after every tool result from the current model response is durably paired.
+- `*** Exec: context://notes/add?title=<percent-encoded-title>` with the note content in the `*** Body:` section creates a note and returns its stable ID.
+- `*** Exec: context://notes/<id>/replace?title=<percent-encoded-title>` with the replacement content in the `*** Body:` section replaces the current content and creates a revision while preserving the ID.
+- `*** Exec: context://notes/<id>/delete` tombstones a note. Its ID, title, revision metadata, and anchors remain, but its content can no longer be read.
+- `*** Exec: context://rollover` with an optional bounded handoff in the `*** Body:` section requests a fresh context window when the active strategy is `rollover`; the handoff is limited to 4,096 estimated tokens. It starts after every tool result from the current model response is durably paired.
 
 Titles are required, single-line, and at most 120 characters. At most 20 notes may be active. A note has no separate content limit, but all current titles and content share a hard budget of at most 20% of the model context. Writes warn at 15% and reject growth beyond the hard budget; shrinking replacements and deletes remain available.
 
@@ -946,7 +946,7 @@ fn read_note_target(
             if let Some(offset) = next {
                 let _ = write!(
                     output,
-                    "\n\nNext: read(\"{base_uri}/{}?offset={offset}&limit={}\", \"\")",
+                    "\n\nNext:\n*** Begin Request\n*** Read: {base_uri}/{}?offset={offset}&limit={}\n*** End Request",
                     note.id, limit
                 );
             }
@@ -1447,12 +1447,12 @@ async fn semantic_history_search(
         serializer.append_pair("offset", &next.to_string());
         serializer.append_pair("limit", &limit.to_string());
         let uri = format!("context://{target}?{}", serializer.finish());
-        let _ = write!(
-            output,
-            "\nNext: read({}, {})",
-            serde_json::to_string(&uri)?,
-            serde_json::to_string(query)?
-        );
+        let _ = write!(output, "\nNext:\n*** Begin Request\n*** Read: {uri}\n");
+        if query.is_empty() {
+            output.push_str("*** End Request");
+        } else {
+            let _ = write!(output, "*** Body:\n{query}\n*** End Request");
+        }
     }
     Ok(output.trim_end().to_string())
 }
@@ -1537,11 +1537,16 @@ where
     }
     if start > 0 {
         if let Some(next) = continuation(selected[0].sequence, limit) {
-            let uri = serde_json::to_string(&next.uri)
-                .expect("serializing a context continuation URI cannot fail");
-            let body = serde_json::to_string(&next.body)
-                .expect("serializing a context continuation body cannot fail");
-            let _ = write!(output, "\nEarlier: read({uri}, {body})");
+            let _ = write!(
+                output,
+                "\nEarlier:\n*** Begin Request\n*** Read: {}\n",
+                next.uri
+            );
+            if next.body.is_empty() {
+                output.push_str("*** End Request");
+            } else {
+                let _ = write!(output, "*** Body:\n{}\n*** End Request", next.body);
+            }
         } else {
             output.push_str("\nEarlier records omitted by the route's bounded result.");
         }
@@ -1949,11 +1954,11 @@ mod tests {
 
         let upper =
             read_note_target(&events, "n001", Some("limit=8000"), "", "context://notes").unwrap();
-        assert!(upper.contains("?offset=7000&limit=7000\", \"\")"));
+        assert!(upper.contains("?offset=7000&limit=7000\n*** End Request"));
 
         let lower =
             read_note_target(&events, "n001", Some("limit=0"), "", "context://notes").unwrap();
-        assert!(lower.contains("?offset=1&limit=1\", \"\")"));
+        assert!(lower.contains("?offset=1&limit=1\n*** End Request"));
     }
 
     #[tokio::test]
@@ -2145,7 +2150,7 @@ mod tests {
             .unwrap();
         let archived = String::from_utf8(archived).unwrap();
         assert!(archived.contains("literal sessions:// must remain unchanged"));
-        assert!(archived.contains("Earlier: read(\"context://sessions/context-test?"));
+        assert!(archived.contains("*** Read: context://sessions/context-test?"));
 
         let error = plugin
             .read(
@@ -2399,15 +2404,15 @@ mod tests {
         let latest = format_user_history(&events, None, Some(1)).unwrap();
         assert!(latest.contains("searchable user requirement"));
         assert!(!latest.contains("keep the exact user requirements"));
-        assert!(latest.contains("Earlier: read(\"context://history/users?before=r"));
-        assert!(latest.contains("&limit=1\", \"\")"));
+        assert!(latest.contains("*** Read: context://history/users?before=r"));
+        assert!(latest.contains("&limit=1\n*** End Request"));
 
         let search =
             format_user_history_search(&events, "user requirement", None, Some(1)).unwrap();
         assert!(search.contains("searchable user requirement"));
         assert!(!search.contains("keep the exact user requirements"));
-        assert!(search.contains("Earlier: read(\"context://history/users/search?before=r"));
-        assert!(search.contains("&limit=1\", \"user requirement\")"));
+        assert!(search.contains("*** Read: context://history/users/search?before=r"));
+        assert!(search.contains("&limit=1\n*** Body:\nuser requirement\n*** End Request"));
 
         let across_windows = format_history_search(
             &events,
@@ -2533,7 +2538,7 @@ mod tests {
             assert!(help.contains(route), "missing saved-session route {route}");
         }
         assert!(!help.contains("sessions://"));
-        assert!(help.contains("exec(\"context://history/index\", \"\")"));
+        assert!(help.contains("*** Exec: context://history/index"));
         assert!(help.contains("mode=semantic"));
         assert!(help.contains("mode=hybrid"));
         assert!(help.contains("Do not use either operation before a ranked search"));

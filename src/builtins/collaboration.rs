@@ -223,7 +223,9 @@ impl Protocol for CollaborationPlugin {
                 self.state.ensure_presence().await?;
                 let target = target.trim_start_matches("status/");
                 if target.is_empty() || target.contains('/') {
-                    bail!(r#"status expects read("collaboration://status/<name-or-id>", "")"#)
+                    bail!(
+                        "status expects a `*** Read: collaboration://status/<name-or-id>` request"
+                    )
                 }
                 let all_projects = parse_scope(query)?;
                 let participant = self
@@ -236,7 +238,7 @@ impl Protocol for CollaborationPlugin {
                 Ok(format_participant(&participant, self.state.inner.session.id()).into_bytes())
             }
             _ => bail!(
-                r#"collaboration read expects "collaboration://participants" or "collaboration://status/<name-or-id>""#
+                "collaboration read expects `*** Read: collaboration://participants` or `*** Read: collaboration://status/<name-or-id>`"
             ),
         }
     }
@@ -258,7 +260,7 @@ impl Protocol for CollaborationPlugin {
         }
         let Some(target) = target.strip_prefix("send/") else {
             bail!(
-                r#"collaboration exec expects exec("collaboration://name", "<human name>") or exec("collaboration://send/<name-or-id>?delivery=queue|steer", "<message>")"#
+                "collaboration exec expects `*** Exec: collaboration://name` with the name in the `*** Body:` section, or `*** Exec: collaboration://send/<name-or-id>?delivery=queue|steer` with the message in the `*** Body:` section"
             );
         };
         if target.is_empty() || target.contains('/') {
@@ -423,7 +425,11 @@ Before collaborating, choose a short human name that another agent can reason
 about, such as `Nightingale`, `Ferris`, or `Crane`:
 
 ```text
-exec("collaboration://name", "Ferris")
+*** Begin Request
+*** Exec: collaboration://name
+*** Body:
+Ferris
+*** End Request
 ```
 
 Names are 1 to 40 characters, must contain a Unicode letter or number, may
@@ -438,27 +444,47 @@ working directories, model status, provider/model, queue depth, and bounded
 task summaries:
 
 ```text
-read("collaboration://participants", "")
-read("collaboration://participants?scope=all", "")
+*** Begin Request
+*** Read: collaboration://participants
+*** End Request
+
+*** Begin Request
+*** Read: collaboration://participants?scope=all
+*** End Request
 ```
 
 Inspect one participant by current name or stable ID. An exact stable ID can
 also report that a saved session is offline:
 
 ```text
-read("collaboration://status/Nightingale", "")
-read("collaboration://status/<session-id>?scope=all", "")
+*** Begin Request
+*** Read: collaboration://status/Nightingale
+*** End Request
+
+*** Begin Request
+*** Read: collaboration://status/<session-id>?scope=all
+*** End Request
 ```
 
 ## Sending messages
 
 Send a plain-text message to one active URI Agent participant. Put the message
-itself directly in the body; do not wrap it in JSON or XML. Identify the target
+itself directly in the `*** Body:` section; do not wrap it in JSON or XML.
+Identify the target
 by its current human name or stable session ID, without an `@` prefix:
 
 ```text
-exec("collaboration://send/Crane?delivery=queue", "Review the parser changes and report risks.")
-exec("collaboration://send/<session-id>?delivery=steer&reply=requested", "Check this failing test now.")
+*** Begin Request
+*** Exec: collaboration://send/Crane?delivery=queue
+*** Body:
+Review the parser changes and report risks.
+*** End Request
+
+*** Begin Request
+*** Exec: collaboration://send/<session-id>?delivery=steer&reply=requested
+*** Body:
+Check this failing test now.
+*** End Request
 ```
 
 Options:

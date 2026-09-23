@@ -52,23 +52,36 @@ through the first logged-in provider, which receives the query or target URL;
 page reads use direct local fetching only when no provider is logged in.
 
 - Read `https://<host>/<path>` to extract an HTTPS resource as Markdown or text.
-  Page reads MUST use an empty string body.
-- Read `https://search` with the search query as the string body. Search reads
-  MUST pass a nonempty, non-whitespace query:
+  Page reads take no body; omit the `*** Body:` section.
+- Read `https://search` with the search query in the `*** Body:` section. Search
+  reads MUST pass a nonempty, non-whitespace query:
 
 ```text
-read("https://search", "<search query>")
+*** Begin Request
+*** Read: https://search
+*** Body:
+<search query>
+*** End Request
 ```
 
 Provider help pages such as `https://help/parallel`, `https://help/exa`, and
-`https://help/tinyfish` MUST use an empty string body.
+`https://help/tinyfish` take no body; omit the `*** Body:` section.
 "#;
 
 const PARALLEL_COMMON_HELP: &str = r#"Common Parallel search options:
 
 ```text
-read("https://search?limit=10&mode=basic", "<search query>")
-read("https://search?after_date=2026-01-01&include_domain=example.com", "<search query>")
+*** Begin Request
+*** Read: https://search?limit=10&mode=basic
+*** Body:
+<search query>
+*** End Request
+
+*** Begin Request
+*** Read: https://search?after_date=2026-01-01&include_domain=example.com
+*** Body:
+<search query>
+*** End Request
 ```
 
 `limit` is 1-20. `mode` is `turbo`, `fast`, `basic`, or `advanced` and defaults
@@ -79,8 +92,17 @@ search. Read `https://help/parallel` for all supported Parallel options.
 const EXA_COMMON_HELP: &str = r#"Common Exa search options:
 
 ```text
-read("https://search?limit=10&type=auto", "<search query>")
-read("https://search?category=news&start_published_date=2026-01-01", "<search query>")
+*** Begin Request
+*** Read: https://search?limit=10&type=auto
+*** Body:
+<search query>
+*** End Request
+
+*** Begin Request
+*** Read: https://search?category=news&start_published_date=2026-01-01
+*** Body:
+<search query>
+*** End Request
 ```
 
 `limit` is 1-20. `type` defaults to `auto`. `category`, publication dates,
@@ -91,8 +113,17 @@ repeated `include_domain`, and `location` narrow the search. Read
 const TINYFISH_COMMON_HELP: &str = r#"Common TinyFish search options:
 
 ```text
-read("https://search?limit=10&domain_type=news", "<search query>")
-read("https://search?recency_minutes=60&location=us&language=en", "<search query>")
+*** Begin Request
+*** Read: https://search?limit=10&domain_type=news
+*** Body:
+<search query>
+*** End Request
+
+*** Begin Request
+*** Read: https://search?recency_minutes=60&location=us&language=en
+*** Body:
+<search query>
+*** End Request
 ```
 
 `limit` is 1-20 and fetches additional pages when needed. `domain_type`
@@ -107,7 +138,11 @@ Use `provider=parallel` to select Parallel explicitly. Without `provider`, these
 options apply when Parallel is the first logged-in provider.
 
 ```text
-read("https://search?provider=parallel&mode=advanced&limit=10", "<objective>")
+*** Begin Request
+*** Read: https://search?provider=parallel&mode=advanced&limit=10
+*** Body:
+<objective>
+*** End Request
 ```
 
 Search options:
@@ -143,7 +178,11 @@ Use `provider=exa` to select Exa explicitly. Without `provider`, these options
 apply when Exa is the first logged-in provider.
 
 ```text
-read("https://search?provider=exa&type=auto&limit=10", "<search query>")
+*** Begin Request
+*** Read: https://search?provider=exa&type=auto&limit=10
+*** Body:
+<search query>
+*** End Request
 ```
 
 Search options:
@@ -179,7 +218,11 @@ Use `provider=tinyfish` to select TinyFish explicitly. Without `provider`, these
 options apply when TinyFish is the first logged-in provider.
 
 ```text
-read("https://search?provider=tinyfish&limit=10", "<search query>")
+*** Begin Request
+*** Read: https://search?provider=tinyfish&limit=10
+*** Body:
+<search query>
+*** End Request
 ```
 
 Search options:
@@ -598,7 +641,7 @@ impl Protocol for HttpsProtocol {
 fn require_empty_body(body: &str, uri: &str) -> Result<()> {
     if !body.is_empty() {
         bail!(
-            r#"this HTTPS read requires an empty body; retry read({uri:?}, ""); to search the web, use read("https://search", "<search query>")"#
+            r#"this HTTPS read takes no body; retry with a `*** Read: {uri}` request; to search the web, use a `*** Read: https://search` request with the query in the `*** Body:` section"#
         );
     }
     Ok(())
@@ -615,7 +658,12 @@ impl SearchInput {
         let query = body.trim();
         if query.is_empty() {
             bail!(
-                r#"https://search requires a nonempty string body; use read("https://search", "<search query>")"#
+                "https://search requires a nonempty `*** Body:` section; correct form:\n\
+                 *** Begin Request\n\
+                 *** Read: https://search\n\
+                 *** Body:\n\
+                 <search query>\n\
+                 *** End Request"
             );
         }
         let query = query.to_string();
@@ -1499,7 +1547,7 @@ mod tests {
         assert!(help.contains("ask them to run `:login`"));
         assert!(help.contains("local HTTPS fetcher"));
         assert!(help.contains("local HTML-to-Markdown conversion"));
-        assert!(help.contains("Page reads MUST use an empty string body"));
+        assert!(help.contains("Page reads take no body; omit the `*** Body:` section"));
         assert!(help.contains("MUST pass a nonempty, non-whitespace query"));
         assert!(help.contains("Provider help pages such as `https://help/parallel`"));
 
@@ -1533,19 +1581,19 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requires a nonempty string body")
+                .contains("requires a nonempty `*** Body:` section")
         );
         assert!(
             error
                 .to_string()
-                .contains(r#"read("https://search", "<search query>")"#)
+                .contains("*** Read: https://search\n*** Body:\n<search query>")
         );
 
         let error = require_empty_body("objective", "https://example.com/page").unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains(r#"retry read("https://example.com/page", "")"#)
+                .contains("retry with a `*** Read: https://example.com/page` request")
         );
 
         manager

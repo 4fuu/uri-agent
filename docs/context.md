@@ -51,7 +51,10 @@ URI Agent lowercases the name, replaces runs of non-ASCII-alphanumeric character
 
 ```text
 help(["code-review-skill"])
-read("code-review-skill://scripts/check.py", "")
+
+*** Begin Request
+*** Read: code-review-skill://scripts/check.py
+*** End Request
 ```
 
 The first Skill for a normalized protocol name wins. Later duplicates and names that collide with an existing protocol are skipped with a notice.

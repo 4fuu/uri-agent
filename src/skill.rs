@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 fn help(skill_md: &str, skill_directory: &Path, protocol: &str) -> String {
     format!(
-        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read MUST use an empty string\nbody.\n",
+        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read takes no body; omit the `*** Body:` section.\n",
         display_path(skill_directory)
     )
 }
@@ -145,18 +145,18 @@ impl Protocol for SkillProtocol {
         if !request.body.is_empty() {
             if request.target == "help" {
                 bail!(
-                    r#"skill help requires an empty body; retry read({:?}, "")"#,
+                    "skill help takes no body; retry with a `*** Read: {}` request",
                     request.uri
                 );
             }
             if request.target.is_empty() {
                 bail!(
-                    r#"skill reads require an empty body; put the relative resource path in the URI, for example read("{}://<relative-path>", "")"#,
+                    "skill reads take no body; put the relative resource path in the URI, for example `*** Read: {}://<relative-path>`",
                     self.protocol
                 );
             }
             bail!(
-                "skill reads require an empty body; retry read({:?}, \"\")",
+                "skill reads take no body; retry with a `*** Read: {}` request",
                 request.uri
             );
         }
@@ -387,7 +387,7 @@ mod tests {
         assert!(help.contains("code-review-skill://<relative-path>"));
         assert!(help.contains("relative to this Skill directory"));
         assert!(help.contains("Every `code-review-skill` read"));
-        assert!(help.contains("MUST use an empty string\nbody"));
+        assert!(help.contains("takes no body; omit the `*** Body:` section"));
         let resource = skill
             .read(
                 ProtocolRequest {

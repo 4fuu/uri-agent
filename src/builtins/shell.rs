@@ -33,14 +33,18 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BASH_HELP: &str = r#"# bash
 
 Run Bash commands. Commands start in the foreground and normally return their
-final result in the same `exec` call.
+final result in the same `protocol` tool call.
 
-`read` supports no shell operations. To run a
-command, call `exec` with `bash://run`; the command body MUST contain at least
-one non-whitespace character:
+`*** Read:` requests support no shell operations. To run a
+command, use an `*** Exec: bash://run` request whose `*** Body:` section MUST
+contain at least one non-whitespace character:
 
 ```text
-exec("bash://run", "cargo test")
+*** Begin Request
+*** Exec: bash://run
+*** Body:
+cargo test
+*** End Request
 ```
 
 If a foreground command is still running after about 60 seconds, URI Agent
@@ -48,7 +52,11 @@ automatically converts the same process into a background task without
 restarting it. Use `background=true` to return a task immediately:
 
 ```text
-exec("bash://run?background=true", "cargo test")
+*** Begin Request
+*** Exec: bash://run?background=true
+*** Body:
+cargo test
+*** End Request
 ```
 
 Foreground and background commands share one execution timeout. `timeout` is
@@ -56,7 +64,11 @@ an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
 and `timeout=0` disables the timeout:
 
 ```text
-exec("bash://run?timeout=120", "cargo test")
+*** Begin Request
+*** Exec: bash://run?timeout=120
+*** Body:
+cargo test
+*** End Request
 ```
 
 Commands that need runtime input (confirmation prompts, passwords, REPLs)
@@ -64,16 +76,20 @@ must run with `interactive=true`. Interactive commands are always managed
 background tasks and keep their stdin open:
 
 ```text
-exec("bash://run?interactive=true", "mysql -u root -p")
+*** Begin Request
+*** Exec: bash://run?interactive=true
+*** Body:
+mysql -u root -p
+*** End Request
 ```
 
-Read current output with `read("tasks://<id>", "")`, then send input with
-`exec("tasks://<id>/send", "yes\n")`; the body is written exactly, so end
-each input line with a newline. Close stdin with
-`exec("tasks://<id>/eof", "")` and interrupt with
-`exec("tasks://<id>/interrupt", "")`. The shared timeout keeps running while
-the command waits for input; use `timeout=0` for an open-ended interactive
-command.
+Read current output with a `*** Read: tasks://<id>` request, then send input
+with an `*** Exec: tasks://<id>/send` request whose `*** Body:` section carries
+the input text; the input is written exactly, so end each input line with a
+newline. Close stdin with an `*** Exec: tasks://<id>/eof` request and interrupt
+with an `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
+running while the command waits for input; use `timeout=0` for an open-ended
+interactive command.
 
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
@@ -93,7 +109,7 @@ exit code or timeout and any output observed before termination.
 const PWSH_HELP: &str = r#"# pwsh
 
 Run PowerShell 7 commands. Commands start in the foreground and normally return
-their final result in the same `exec` call.
+their final result in the same `protocol` tool call.
 
 Write PowerShell 7 syntax rather than Unix shell syntax. Use multiline commands
 with normal indentation when they improve readability; do not collapse them
@@ -105,12 +121,16 @@ Prefer modern cross-platform tools such as `rg` and `fd` when available.
 PowerShell recursive searches do not honor `.gitignore`, so bound search paths,
 depth, and output tightly.
 
-`read` supports no shell operations. To run a
-command, call `exec` with `pwsh://run`; the command body MUST contain at least
-one non-whitespace character:
+`*** Read:` requests support no shell operations. To run a
+command, use an `*** Exec: pwsh://run` request whose `*** Body:` section MUST
+contain at least one non-whitespace character:
 
 ```text
-exec("pwsh://run", "Get-ChildItem -Path . -Force")
+*** Begin Request
+*** Exec: pwsh://run
+*** Body:
+Get-ChildItem -Path . -Force
+*** End Request
 ```
 
 If a foreground command is still running after about 60 seconds, URI Agent
@@ -118,7 +138,11 @@ automatically converts the same process into a background task without
 restarting it. Use `background=true` to return a task immediately:
 
 ```text
-exec("pwsh://run?background=true", "cargo test")
+*** Begin Request
+*** Exec: pwsh://run?background=true
+*** Body:
+cargo test
+*** End Request
 ```
 
 Foreground and background commands share one execution timeout. `timeout` is
@@ -130,16 +154,20 @@ must run with `interactive=true`. Interactive commands are always managed
 background tasks and keep their stdin open:
 
 ```text
-exec("pwsh://run?interactive=true", "$token = Read-Host 'Token'")
+*** Begin Request
+*** Exec: pwsh://run?interactive=true
+*** Body:
+$token = Read-Host 'Token'
+*** End Request
 ```
 
-Read current output with `read("tasks://<id>", "")`, then send input with
-`exec("tasks://<id>/send", "yes\n")`; the body is written exactly, so end
-each input line with a newline. Close stdin with
-`exec("tasks://<id>/eof", "")` and interrupt with
-`exec("tasks://<id>/interrupt", "")`. The shared timeout keeps running while
-the command waits for input; use `timeout=0` for an open-ended interactive
-command.
+Read current output with a `*** Read: tasks://<id>` request, then send input
+with an `*** Exec: tasks://<id>/send` request whose `*** Body:` section carries
+the input text; the input is written exactly, so end each input line with a
+newline. Close stdin with an `*** Exec: tasks://<id>/eof` request and interrupt
+with an `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
+running while the command waits for input; use `timeout=0` for an open-ended
+interactive command.
 
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
@@ -334,7 +362,7 @@ impl Protocol for ShellProtocol {
     ) -> Result<Vec<u8>> {
         if request.target != "help" {
             bail!(
-                r#"{0} read supports no shell operations; run a command with exec("{0}://run", "<command>")"#,
+                r#"{0} read supports no shell operations; run a command with an `*** Exec: {0}://run` request"#,
                 self.name
             );
         }
@@ -369,7 +397,7 @@ impl ShellProtocol {
     ) -> Result<Vec<u8>> {
         let options = parse_target(request.target).with_context(|| {
             format!(
-                r#"invalid {0} exec; use exec("{0}://run", "<command>")"#,
+                r#"invalid {0} exec; use an `*** Exec: {0}://run` request"#,
                 self.name
             )
         })?;
@@ -507,7 +535,7 @@ fn parse_target(target: &str) -> Result<ShellOptions> {
 fn command_from_body<'a>(body: &'a str, protocol: &str) -> Result<&'a str> {
     if body.trim().is_empty() {
         bail!(
-            r#"{protocol} command body must contain a non-whitespace character; use exec("{protocol}://run", "<command>")"#
+            r#"{protocol} command body must contain a non-whitespace character; use an `*** Exec: {protocol}://run` request"#
         );
     }
     Ok(body)
@@ -983,8 +1011,8 @@ mod tests {
         assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
-        assert!(PWSH_HELP.contains("`read` supports no shell operations"));
-        assert!(PWSH_HELP.contains("command body MUST contain at least\none non-whitespace"));
+        assert!(PWSH_HELP.contains("`*** Read:` requests support no shell operations"));
+        assert!(PWSH_HELP.contains("section MUST\ncontain at least one non-whitespace"));
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
         assert!(PWSH_HELP.contains("`background=true`"));
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
@@ -994,8 +1022,8 @@ mod tests {
         assert!(PWSH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
         assert!(PWSH_HELP.contains("Agent environment variables are injected"));
-        assert!(BASH_HELP.contains("`read` supports no shell operations"));
-        assert!(BASH_HELP.contains("command body MUST contain at least\none non-whitespace"));
+        assert!(BASH_HELP.contains("`*** Read:` requests support no shell operations"));
+        assert!(BASH_HELP.contains("section MUST\ncontain at least one non-whitespace"));
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
         assert!(BASH_HELP.contains("`background=true`"));
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
@@ -1104,7 +1132,7 @@ mod tests {
         assert!(
             read_error
                 .to_string()
-                .contains(r#"exec("bash://run", "<command>")"#)
+                .contains("`*** Exec: bash://run` request")
         );
 
         let exec_error = shell
@@ -1118,7 +1146,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(format!("{exec_error:#}").contains(r#"exec("bash://run", "<command>")"#));
+        assert!(format!("{exec_error:#}").contains("`*** Exec: bash://run` request"));
 
         let body_error = shell
             .exec(

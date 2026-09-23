@@ -1453,7 +1453,7 @@ impl EventProjector {
                 arguments,
             } => self.send(SessionUpdate::ToolCall(
                 ToolCall::new(call_id.clone(), tool_title(name, arguments))
-                    .kind(tool_kind(name))
+                    .kind(tool_kind(name, arguments))
                     .status(ToolCallStatus::InProgress)
                     .raw_input(arguments.clone()),
             )),
@@ -1557,6 +1557,14 @@ fn acp_image_content(image: &rig::message::Image) -> Option<ImageContent> {
 }
 
 fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
+    if name == "protocol"
+        && let Some(request) = arguments.get("request").and_then(serde_json::Value::as_str)
+    {
+        let operation = request.lines().nth(1).unwrap_or_default().trim_end();
+        if !operation.is_empty() {
+            return format!("protocol {operation}");
+        }
+    }
     if arguments.is_null() || arguments.as_object().is_some_and(serde_json::Map::is_empty) {
         name.to_string()
     } else {
@@ -1564,10 +1572,19 @@ fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     }
 }
 
-fn tool_kind(name: &str) -> ToolKind {
+fn tool_kind(name: &str, arguments: &serde_json::Value) -> ToolKind {
     match name {
-        "read" => ToolKind::Read,
-        "exec" => ToolKind::Execute,
+        "protocol" => {
+            let request = arguments
+                .get("request")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if request.contains("*** Exec:") {
+                ToolKind::Execute
+            } else {
+                ToolKind::Read
+            }
+        }
         "replace" | "apply_patch" => ToolKind::Edit,
         _ => ToolKind::Other,
     }

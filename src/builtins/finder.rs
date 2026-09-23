@@ -37,9 +37,8 @@ ask questions, so state any assumptions you make. The question may open with \
 `Scope: <path>`; keep code searches and file reads under that path unless the question itself \
 names other locations.\n\
 Load help for each protocol before its first use, for example help([\"search\", \"file\"]).\n\
-Call read and exec with a plain string body, never JSON: pass \"\" when the operation takes no \
-body, plain text for textual input, and complete serialized JSON only when the protocol's help \
-page requires it.\n\
+Call protocols with the protocol tool; its `request` parameter defines the fixed request \
+format.\n\
 Your final reply is returned verbatim to the calling agent as the complete result. Make it \
 self-contained: a short answer first, then each supporting claim as a `path:line` or source \
 reference with one line of explanation. If the question cannot be answered, state exactly what \
@@ -56,11 +55,16 @@ read-only capabilities; it cannot modify anything.
 Start one lookup:
 
 ```text
-exec("finder://", "Where is the JWT signature verified, and which failures can it report?")
+*** Begin Request
+*** Exec: finder://
+*** Body:
+Where is the JWT signature verified, and which failures can it report?
+*** End Request
 ```
 
-The body MUST be one complete natural-language question, not keywords. Include
-the goal, any known identifiers or paths, and what kind of answer is wanted.
+The `*** Body:` section MUST contain one complete natural-language question, not
+keywords. Include the goal, any known identifiers or paths, and what kind of
+answer is wanted.
 
 Use `finder://<root>` to restrict code search to a project-relative or absolute
 directory. The root may be empty: `finder://` searches the whole project. On
@@ -68,8 +72,8 @@ Unix, `~` and paths beginning with `~/` resolve from the current user's home
 directory; `~user` is not expanded. The scope restricts code search only; web
 reads are unaffected.
 
-The lookup question goes in the `exec` body. Every other `finder` call MUST
-pass an empty string body.
+The lookup question goes in the `*** Body:` section. Every other `finder` call
+takes no body; omit the `*** Body:` section.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -267,7 +271,7 @@ fn finder_spec(
         cwd,
         parent_session_id,
     )
-    .with_tools(["read", "exec", "help"])
+    .with_tools(["protocol", "help"])
     .with_protocols(["file", "search", TASKS_PROTOCOL, "https"])
     .replace_system_prompt(SYSTEM_PROMPT);
     match max_output_tokens {
@@ -533,13 +537,13 @@ mod tests {
         assert!(descriptor.can_exec);
         assert_eq!(descriptor.description, DESCRIPTION);
         for fragment in [
-            "exec(\"finder://\"",
+            "*** Exec: finder://",
             "one complete natural-language question",
             "restrict code search to a project-relative or absolute",
             "`~user` is not expanded",
             "The scope restricts code search only; web\nreads are unaffected.",
-            "The lookup question goes in the `exec` body. Every other `finder` call MUST",
-            "pass an empty string body.",
+            "The lookup question goes in the `*** Body:` section. Every other `finder` call",
+            "takes no body; omit the `*** Body:` section.",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");
@@ -816,8 +820,7 @@ mod tests {
         assert_eq!(
             spec.tools,
             crate::agent::CapabilitySelection::Only(vec![
-                "read".to_string(),
-                "exec".to_string(),
+                "protocol".to_string(),
                 "help".to_string()
             ])
         );
@@ -969,7 +972,7 @@ mod tests {
             .await
             .system_prompt;
         assert_eq!(prompt, SYSTEM_PROMPT);
-        assert!(prompt.contains("Call read and exec with a plain string body, never JSON"));
+        assert!(prompt.contains("Call protocols with the protocol tool; its `request` parameter"));
         assert!(
             prompt.contains("Load help for each protocol before its first use, for example help([\"search\", \"file\"])")
         );

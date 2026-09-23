@@ -39,7 +39,7 @@ retrieval.
 Current working directory: `{scheme}://{}`
 
 Search reads other than `mode=status` MUST pass a nonempty search pattern in
-the string body; `mode=status` requires an empty body. Use
+the `*** Body:` section; `mode=status` takes no body. Use
 `{scheme}://<root>` for a project-relative or absolute file/directory root. The
 root may be empty: `{scheme}://` searches the current working directory. On Unix, `~`
 and paths beginning with `~/` resolve from the current user's home directory;
@@ -57,7 +57,7 @@ Optional query parameters:
 - `mode=semantic` prioritizes meaning over shared wording. Use it when relevant
   results are likely to use different wording from the query.
 - `mode=status` reports whether the selected root's semantic cache is current;
-  its body must be empty and it accepts no parameters other than `glob`.
+  it takes no body and accepts no parameters other than `glob`.
 - `glob=<pattern>` filters searched paths using `rg` glob syntax.
 - If `rg` rejects a regular expression, the protocol retries it as literal
   text.
@@ -76,11 +76,13 @@ completion marks the output as truncated, follow its `tasks://` instruction
 once. Do not submit the same search again to retrieve task output.
 
 Do not call status or index before a ranked search. Use `mode=status` only to
-diagnose the cache. Use `exec` only to prewarm or force-rebuild that exact
-root/glob cache:
+diagnose the cache. Use an `*** Exec:` request only to prewarm or force-rebuild
+that exact root/glob cache:
 
 ```text
-exec("{scheme}://<root>?mode=index&glob=<pattern>", "")
+*** Begin Request
+*** Exec: {scheme}://<root>?mode=index&glob=<pattern>
+*** End Request
 ```
 
 Indexing follows standard ignore files, skips binary/non-UTF-8 files and files
@@ -90,14 +92,37 @@ show the actual matching fragment with its precise line range.
 Examples:
 
 ```text
-read("{scheme}://src?glob=**/*.rs&limit=100", "ProtocolRequest")
-read("{scheme}://src/tui/app.rs", "fn push(")
-read("{scheme}://?literal=true&ignore_case=true", "exact text")
-read("{scheme}://src?mode=hybrid&glob=**/*.rs&limit=10", "authentication flow")
-exec("{scheme}://src?mode=index&glob=**/*.rs", "")
+*** Begin Request
+*** Read: {scheme}://src?glob=**/*.rs&limit=100
+*** Body:
+ProtocolRequest
+*** End Request
+
+*** Begin Request
+*** Read: {scheme}://src/tui/app.rs
+*** Body:
+fn push(
+*** End Request
+
+*** Begin Request
+*** Read: {scheme}://?literal=true&ignore_case=true
+*** Body:
+exact text
+*** End Request
+
+*** Begin Request
+*** Read: {scheme}://src?mode=hybrid&glob=**/*.rs&limit=10
+*** Body:
+authentication flow
+*** End Request
+
+*** Begin Request
+*** Exec: {scheme}://src?mode=index&glob=**/*.rs
+*** End Request
 ```
 
-`exec` supports only `mode=index` (optionally with `glob`) with an empty body;
+`exec` supports only `mode=index` (optionally with `glob`) with no
+`*** Body:` section;
 status and index accept no other parameters.
 "#,
         display_path(cwd)
@@ -494,7 +519,12 @@ impl GrepOptions {
 fn require_search_body(body: &str, uri: &str, scheme: &str) -> Result<()> {
     if body.is_empty() {
         bail!(
-            "{scheme} requires a nonempty search pattern in the body; use read({uri:?}, \"<pattern>\")"
+            "{scheme} requires a nonempty search pattern in the `*** Body:` section; correct form:\n\
+             *** Begin Request\n\
+             *** Read: {uri}\n\
+             *** Body:\n\
+             <pattern>\n\
+             *** End Request"
         );
     }
     Ok(())
@@ -907,7 +937,7 @@ mod tests {
         assert!(help.contains("uses ripgrep (`rg`)"));
         assert!(help.contains("Patterns use `rg`\n  regular-expression syntax"));
         assert!(help.contains("retries it as literal\n  text"));
-        assert!(help.contains(r#"read("search://src/tui/app.rs", "fn push(")"#));
+        assert!(help.contains("*** Read: search://src/tui/app.rs\n*** Body:\nfn push("));
         assert!(!help.contains("grep://"));
         assert!(help.contains("Prefer it for conceptual\n  searches"));
         assert!(help.contains("values are clamped to 0 through 20"));
@@ -931,7 +961,7 @@ mod tests {
             .unwrap_err();
         let error = error.to_string();
         assert!(error.contains("nonempty search pattern"));
-        assert!(error.contains(r#"read("search://", "<pattern>")"#));
+        assert!(error.contains("*** Read: search://\n*** Body:\n<pattern>"));
     }
 
     #[test]

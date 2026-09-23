@@ -2,11 +2,9 @@ use crate::config::display_path;
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first read or exec call to any protocol.";
+pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first call to any protocol.";
 
-pub const READ_TOOL_DESCRIPTION: &str = "Read through a registered protocol. Use this for resources, task status, and completed results.";
-
-pub const EXEC_TOOL_DESCRIPTION: &str = "Execute through a registered protocol. Operations normally return their final result directly. Long-running operations may become managed background tasks whose completion is delivered automatically.";
+pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with a fixed request format: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, an optional `*** Body:` line whose following lines are the raw verbatim body, and a `*** End Request` line. Omit the `*** Body:` section when the operation takes no body. Only `*** Begin Request`, `*** Read:`, `*** Exec:`, `*** Body:`, and `*** End Request` lines are structural; every other line is body content.";
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
@@ -35,12 +33,12 @@ pub fn system_prompt(
     write_entries(&mut prompt, protocols);
     prompt.push_str(
         "\nChoose a direct tool or a protocol as appropriate for the operation.\n\n\
-         Direct tools are called by name; protocols are not tools, so invoke one by calling read or exec with its <protocol>:// address.\n\n\
+         Direct tools are called by name; protocols are not tools, so invoke one by calling the protocol tool with its <protocol>:// address.\n\n\
          Protocol rules:\n\
-         - Load help first. Before the first read or exec call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
+         - Load help first. Before the first call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
          - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
          - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n\
-         - The body of read and exec is always a plain string, never JSON: use \"\" when an operation takes no body, plain text for textual input, and complete serialized JSON text only when a protocol's help page explicitly requires it.\n",
+         - Call protocols with the protocol tool; its `request` parameter defines the fixed request format.\n",
     );
     prompt.push_str(
         "\nOperating rules:\n\
@@ -79,8 +77,7 @@ fn write_entries(prompt: &mut String, entries: &[PromptEntry]) {
 fn tool_order(name: &str) -> usize {
     match name {
         "help" => 0,
-        "read" => 1,
-        "exec" => 2,
+        "protocol" => 1,
         "replace" => 3,
         "apply_patch" => 4,
         _ => 5,
@@ -95,7 +92,7 @@ pub fn task_accepted(id: &str) -> String {
 
 pub fn interactive_task_accepted(id: &str) -> String {
     format!(
-        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with exec(\"tasks://{id}/send\", \"<input>\"); the input is written exactly, so end each line with \\n. Close stdin with exec(\"tasks://{id}/eof\", \"\") and interrupt with exec(\"tasks://{id}/interrupt\", \"\"). Read current output with read(\"tasks://{id}\", \"\") and use one bounded wait when the result is needed. Do not poll or rerun the operation."
+        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with:\n\n*** Begin Request\n*** Exec: tasks://{id}/send\n*** Body:\n<input>\n*** End Request\n\nThe input is written exactly, so end each line with \\n. Close stdin with an `*** Exec: tasks://{id}/eof` request and interrupt with an `*** Exec: tasks://{id}/interrupt` request. Read current output with a `*** Read: tasks://{id}` request and use one bounded wait when the result is needed. Do not poll or rerun the operation."
     )
 }
 
@@ -114,8 +111,8 @@ mod tests {
     fn system_prompt_separates_direct_tools_from_protocols() {
         let prompt = system_prompt(
             &[PromptEntry {
-                name: "read".to_string(),
-                description: "Read through a\nregistered protocol.".to_string(),
+                name: "protocol".to_string(),
+                description: "Call a registered\nprotocol.".to_string(),
             }],
             &[PromptEntry {
                 name: "file".to_string(),
@@ -125,7 +122,7 @@ mod tests {
         );
         assert!(prompt.starts_with("You are a general-purpose agent running in URI Agent."));
         assert!(
-            prompt.contains("Available direct tools:\n- read: Read through a registered protocol.")
+            prompt.contains("Available direct tools:\n- protocol: Call a registered protocol.")
         );
         assert!(prompt.contains("- file: Read files."));
         assert!(
@@ -134,18 +131,13 @@ mod tests {
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
         assert!(prompt.contains("never guess them."));
-        assert!(
-            prompt.contains(
-                "The body of read and exec is always a plain string, never JSON: use \"\""
-            )
-        );
         assert!(prompt.contains(
-            "complete serialized JSON text only when a protocol's help page explicitly requires it."
+            "Call protocols with the protocol tool; its `request` parameter defines the fixed request format."
         ));
         assert!(prompt.contains("Choose a direct tool or a protocol as appropriate"));
         assert!(prompt.contains(
             "Direct tools are called by name; protocols are not tools, so invoke one by calling \
-             read or exec with its <protocol>:// address."
+             the protocol tool with its <protocol>:// address."
         ));
         assert!(
             prompt.find("Direct tools are called by name;").unwrap()
@@ -169,8 +161,8 @@ mod tests {
                     description: "Replace.".to_string(),
                 },
                 PromptEntry {
-                    name: "exec".to_string(),
-                    description: "Execute.".to_string(),
+                    name: "protocol".to_string(),
+                    description: "Call protocols.".to_string(),
                 },
                 PromptEntry {
                     name: "apply_patch".to_string(),
@@ -193,14 +185,8 @@ mod tests {
             &[],
         );
 
-        let positions = [
-            "- help:",
-            "- read:",
-            "- exec:",
-            "- replace:",
-            "- apply_patch:",
-        ]
-        .map(|marker| prompt.find(marker).unwrap());
+        let positions = ["- help:", "- protocol:", "- replace:", "- apply_patch:"]
+            .map(|marker| prompt.find(marker).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(prompt.find("- apply_patch:").unwrap() < prompt.find("- a-wasm-tool:").unwrap());
     }
@@ -238,11 +224,12 @@ mod tests {
         let message = interactive_task_accepted("002");
         assert!(message.starts_with("Interactive task started: tasks://002"));
         assert!(message.contains(r#"help(["tasks"])"#));
-        assert!(message.contains(r#"exec("tasks://002/send", "<input>")"#));
+        assert!(message.contains("*** Exec: tasks://002/send"));
+        assert!(message.contains("*** Body:"));
         assert!(message.contains("end each line with \\n"));
-        assert!(message.contains(r#"exec("tasks://002/eof", "")"#));
-        assert!(message.contains(r#"exec("tasks://002/interrupt", "")"#));
-        assert!(message.contains(r#"read("tasks://002", "")"#));
+        assert!(message.contains("*** Exec: tasks://002/eof"));
+        assert!(message.contains("*** Exec: tasks://002/interrupt"));
+        assert!(message.contains("*** Read: tasks://002"));
         assert!(message.contains("Do not poll or rerun the operation"));
     }
 }

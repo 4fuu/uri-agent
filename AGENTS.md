@@ -9,16 +9,18 @@ interface. The linked built-ins provide:
 
 ```text
 help(protocols: string[])
-read(uri: string, body: string)
-exec(uri: string, body: string)
+protocol(request: string)
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
 `help` loads one or more protocols' model-facing contract pages; every other
 protocol call requires that protocol's contract to be loaded first. The `read`
-and `exec` body is always a string; use `""` when a protocol takes
-no body and complete serialized JSON text for structured protocol input.
+and `exec` tools are merged into `protocol`, which takes one fixed-format
+request string: a `*** Begin Request` line, one `*** Read: <address>` or
+`*** Exec: <address>` line, an optional `*** Body:` section whose lines run
+verbatim to a `*** End Request` line, and nothing else. A protocol that needs
+structured input takes complete serialized JSON as that raw body text.
 Capabilities with simple string input are registered as protocols and publish
 their operational instructions through the `help` tool. Prefer a typed direct
 tool for complex or escape-heavy arguments. All model tools are registered by
