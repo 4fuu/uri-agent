@@ -222,7 +222,7 @@ impl SessionArchive {
                          ORDER BY sequence ASC LIMIT 1),
                         (SELECT COUNT(*) FROM events
                          WHERE events.session_id = sessions.id AND kind = 'user')
-                     FROM sessions
+                     FROM sessions WHERE depth = 1
                      ORDER BY updated_at DESC, id DESC",
                 )?;
                 let rows = statement.query_map([], |row| {
@@ -6067,7 +6067,7 @@ mod tests {
         );
         child_spec.assign_depth(2);
         let child = Session::open_at_with_spec(
-            path,
+            path.clone(),
             Some("child-agent"),
             temp.path(),
             child_spec,
@@ -6096,6 +6096,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["root-agent"]
         );
+        let archive = SessionArchive::at(path, temp.path());
+        assert_eq!(
+            archive
+                .list_for_project()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["root-agent"]
+        );
+        assert_eq!(
+            archive
+                .list_all()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ["root-agent"]
+        );
+        assert!(archive.load("child-agent").await.unwrap().is_some());
         let stored: (i64, Option<String>) = child
             .connection
             .call(|db| {

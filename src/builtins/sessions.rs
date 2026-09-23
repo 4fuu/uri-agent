@@ -1886,6 +1886,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_completions_list_only_root_conversations() {
+        let (directory, project, archive, _plugin) = fixture().await;
+        let cwd = project
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let payload = serde_json::to_string(&EventKind::User {
+            text: "Design refresh token rotation".to_string(),
+        })
+        .unwrap();
+        let connection =
+            tokio_rusqlite::rusqlite::Connection::open(directory.path().join("sessions.db"))
+                .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (id, created_at, updated_at, cwd, provider, model, thinking,
+                  parent_session_id, depth, head_sequence, draft)
+                 VALUES ('title-child', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                         ?1, 'test', 'model', 'off', 'session-one', 2, 1, '')",
+                [&cwd],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (session_id, sequence, at, kind, payload_json)
+                 VALUES ('title-child', 1, '2026-01-01T00:00:00Z', 'user', ?1)",
+                [&payload],
+            )
+            .unwrap();
+        drop(connection);
+
+        let provider = SessionCompletionProvider { archive };
+        let completions = provider
+            .complete(&TuiCompletionContext {
+                cwd: project,
+                session_id: "current".to_string(),
+                lines: vec!["Continue @@".to_string()],
+                cursor: TuiTextPosition {
+                    line: 0,
+                    column: 11,
+                },
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(completions.items.len(), 1);
+        assert_eq!(completions.items[0].insert_text, "@@session-one ");
+    }
+
+    #[tokio::test]
     async fn archive_discovery_does_not_create_a_missing_database() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
