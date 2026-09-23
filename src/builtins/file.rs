@@ -42,6 +42,9 @@ Current working directory: `file://{}`
   one-based starting line or directory-entry position, and `<count>` is the
   maximum number of lines or entries to return. The default is 200 and the
   maximum is 2000.
+- Query parameters use `=` between the name and value, not `>` or `<`. Angle
+  brackets in examples are placeholders; for example, use
+  `file://src/builtins/shell.rs?offset=1&limit=100`.
 - Add `?tail=<count>` to efficiently read the last lines of a text file. The
   maximum is 2000. `tail` cannot be combined with `offset`, `limit`, or `glob`.
 - Add `?line_numbers=true` to prefix file content with its original one-based
@@ -721,6 +724,10 @@ mod tests {
         assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
         assert!(help.contains("`file://<path>`"));
         assert!(help.contains("`?offset=<line>&limit=<count>`"));
+        assert!(
+            help.contains("Query parameters use `=` between the name and value, not `>` or `<`.")
+        );
+        assert!(help.contains("file://src/builtins/shell.rs?offset=1&limit=100"));
         assert!(help.contains("`?tail=<count>`"));
         assert!(help.contains("`tail` cannot be combined with `offset`, `limit`, or `glob`"));
         assert!(help.contains("`?line_numbers=true`"));
