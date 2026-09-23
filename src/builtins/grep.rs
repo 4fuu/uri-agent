@@ -117,9 +117,8 @@ authentication flow
 *** End Request
 ```
 
-`exec` supports only `mode=index` (optionally with `glob`) and takes no
-request body;
-status and index accept no other parameters.
+`*** Exec:` requests support only `mode=index` (optionally with `glob`) and
+take no request body; `status` and `index` accept no other parameters.
 "#,
         display_path(cwd)
     )
@@ -940,6 +939,7 @@ mod tests {
         assert!(help.contains("clamped to 1 through 50"));
         assert!(help.contains("Do not call status or index before a ranked search"));
         assert!(help.contains("continues as one\nmanaged task without restarting"));
+        assert!(help.contains("`*** Exec:` requests support only `mode=index`"));
 
         let error = protocol
             .read(

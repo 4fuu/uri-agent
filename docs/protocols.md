@@ -27,11 +27,14 @@ restored on resume.
 
 `protocol` calls use one fixed request format: a `*** Begin Request` line, one
 `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line,
-optional raw body lines, and a `*** End Request` line. Every line between the
-operation line and `*** End Request` is the request body and is passed
-verbatim. Leave no lines there when the operation takes no body. Complete
-serialized JSON is that body only when a protocol explicitly requires it. The
-four structural lines must match byte for byte. A leading `*** Body:` line is
+optional raw body lines, and a `*** End Request` line. The request ends at the
+last `*** End Request` line; the lines between the operation line and it are
+the request body and are passed verbatim, so a body line exactly matching
+`*** End Request` can be sent. The newline before the final `*** End Request`
+line belongs to the request format, so one extra empty line before it ends the
+body with a newline. Omit the body when the operation takes no body. Complete
+serialized JSON is that body only when a protocol explicitly requires it.
+Structural lines must match exactly. A leading `*** Body:` line is
 still accepted and ignored so earlier requests keep working; new requests
 should not include it. Runtime-loaded WASM plugins may add typed direct tools.
 

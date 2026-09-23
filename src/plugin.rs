@@ -905,15 +905,36 @@ impl ModelToolRegistry {
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(name))
         {
-            bail!("unknown model tool: {name}");
+            return Err(unknown_model_tool(name, protocols));
         }
         let tool = self
             .tools
             .get(name)
             .cloned()
             .or_else(|| self.dynamic.as_ref().and_then(|source| source.tool(name)));
-        let tool = tool.ok_or_else(|| anyhow::anyhow!("unknown model tool: {name}"))?;
+        let tool = tool.ok_or_else(|| unknown_model_tool(name, protocols))?;
         tool.execute(arguments, protocols).await
+    }
+}
+
+/// Error for a name that is not a registered model tool. `read` and `exec`
+/// were separate model tools before they merged into `protocol`, so calls
+/// replayed from sessions recorded before that merge, and protocol names
+/// mistaken for tool names, get routing guidance instead of a bare
+/// rejection.
+fn unknown_model_tool(name: &str, protocols: &ProtocolRegistry) -> anyhow::Error {
+    let is_protocol = protocols
+        .descriptors()
+        .iter()
+        .any(|descriptor| descriptor.name == name);
+    if matches!(name, "read" | "exec") || is_protocol {
+        anyhow::anyhow!(
+            "unknown model tool: {name}; protocols are not tools: call it through the \
+             `protocol` tool with its <protocol>:// address, using the request format its \
+             `request` parameter defines"
+        )
+    } else {
+        anyhow::anyhow!("unknown model tool: {name}")
     }
 }
 
@@ -2488,6 +2509,35 @@ mod tests {
                 .to_string(),
             "unknown model tool: first"
         );
+        let _ = tokio::fs::remove_dir_all(output).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_model_tool_errors_route_protocols_through_the_protocol_tool() {
+        let (mut protocols, model_tools, _commands, _tui, output) = empty_host().await;
+        protocols
+            .register(DeclaredProtocolPlugin {
+                declares_protocol: true,
+            })
+            .unwrap();
+
+        for name in ["read", "exec", "declared"] {
+            let error = model_tools
+                .dispatch(name, &serde_json::json!({}), &protocols)
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("unknown model tool"), "{name}: {error}");
+            assert!(
+                error.contains("call it through the `protocol` tool"),
+                "{name}: {error}"
+            );
+        }
+        let error = model_tools
+            .dispatch("missing", &serde_json::json!({}), &protocols)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unknown model tool: missing");
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 

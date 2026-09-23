@@ -24,11 +24,11 @@ replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`help` loads protocol contracts on demand. `read` and `exec` always take
-The `protocol` tool routes one fixed-format request string through URI
-protocols; a protocol that needs structured input takes complete serialized
-JSON as the raw body text. Typed tools handle structured or escape-heavy
-arguments. Trusted WASM plugins can add protocols and typed tools at runtime.
+`help` loads protocol contracts on demand. The `protocol` tool routes one
+fixed-format request string through URI protocols; a protocol that needs
+structured input takes complete serialized JSON as the raw body text. Typed
+tools handle structured or escape-heavy arguments. Trusted WASM plugins can
+add protocols and typed tools at runtime.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols, and enabled WASM

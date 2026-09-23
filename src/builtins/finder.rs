@@ -72,7 +72,7 @@ directory; `~user` is not expanded. The scope restricts code search only; web
 reads are unaffected.
 
 The lookup question goes in the request body. Every other `finder` call
-takes no body; leave no lines between the operation line and `*** End Request`.
+takes no body.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -542,7 +542,7 @@ mod tests {
             "`~user` is not expanded",
             "The scope restricts code search only; web\nreads are unaffected.",
             "The lookup question goes in the request body. Every other `finder` call",
-            "takes no body; leave no lines between the operation line and `*** End Request`.",
+            "takes no body.",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");

@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first call to any protocol.";
 
-pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with a fixed request format: a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional raw body lines, and a `*** End Request` line. Leave no lines between the operation line and `*** End Request` when the operation takes no body. Only `*** Begin Request`, `*** Read:`, `*** Exec:`, and `*** End Request` are structural; every other line is body content passed verbatim.";
+pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with its `<protocol>://` address; the `request` parameter defines the fixed request format.";
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
@@ -33,12 +33,11 @@ pub fn system_prompt(
     write_entries(&mut prompt, protocols);
     prompt.push_str(
         "\nChoose a direct tool or a protocol as appropriate for the operation.\n\n\
-         Direct tools are called by name; protocols are not tools, so invoke one by calling the protocol tool with its <protocol>:// address.\n\n\
+         Direct tools are called by name. Protocols are not tools: call them through the `protocol` tool with their <protocol>:// address, using the request format its `request` parameter defines.\n\n\
          Protocol rules:\n\
          - Load help first. Before the first call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
          - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
-         - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n\
-         - Call protocols with the protocol tool; its `request` parameter defines the fixed request format.\n",
+         - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n",
     );
     prompt.push_str(
         "\nOperating rules:\n\
@@ -92,7 +91,7 @@ pub fn task_accepted(id: &str) -> String {
 
 pub fn interactive_task_accepted(id: &str) -> String {
     format!(
-        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with:\n\n*** Begin Request\n*** Exec: tasks://{id}/send\n<input>\n*** End Request\n\nThe input is written exactly, so end each line with \\n. Close stdin with an `*** Exec: tasks://{id}/eof` request and interrupt with an `*** Exec: tasks://{id}/interrupt` request. Read current output with a `*** Read: tasks://{id}` request and use one bounded wait when the result is needed. Do not poll or rerun the operation."
+        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with:\n\n*** Begin Request\n*** Exec: tasks://{id}/send\n<input>\n*** End Request\n\nThe input is written exactly, except that the newline before the final `*** End Request` belongs to the request format and is not sent; add one extra empty line before it to end input with a newline. Close stdin with an `*** Exec: tasks://{id}/eof` request and interrupt with an `*** Exec: tasks://{id}/interrupt` request. Read current output with a `*** Read: tasks://{id}` request and use one bounded wait when the result is needed. Do not poll or rerun the operation."
     )
 }
 
@@ -131,16 +130,14 @@ mod tests {
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
         assert!(prompt.contains("never guess them."));
-        assert!(prompt.contains(
-            "Call protocols with the protocol tool; its `request` parameter defines the fixed request format."
-        ));
         assert!(prompt.contains("Choose a direct tool or a protocol as appropriate"));
         assert!(prompt.contains(
-            "Direct tools are called by name; protocols are not tools, so invoke one by calling \
-             the protocol tool with its <protocol>:// address."
+            "Direct tools are called by name. Protocols are not tools: call them through the \
+             `protocol` tool with their <protocol>:// address, using the request format its \
+             `request` parameter defines."
         ));
         assert!(
-            prompt.find("Direct tools are called by name;").unwrap()
+            prompt.find("Direct tools are called by name.").unwrap()
                 < prompt.find("Protocol rules:").unwrap()
         );
         assert!(prompt.contains("Operating rules:\n- For clear requests"));
@@ -227,7 +224,10 @@ mod tests {
         assert!(message.contains("*** Exec: tasks://002/send"));
         assert!(message.contains("<input>"));
         assert!(!message.contains("*** Body:"));
-        assert!(message.contains("end each line with \\n"));
+        assert!(message.contains(
+            "the newline before the final `*** End Request` belongs to the request format and is not sent"
+        ));
+        assert!(message.contains("add one extra empty line before it to end input with a newline"));
         assert!(message.contains("*** Exec: tasks://002/eof"));
         assert!(message.contains("*** Exec: tasks://002/interrupt"));
         assert!(message.contains("*** Read: tasks://002"));

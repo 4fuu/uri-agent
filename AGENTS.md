@@ -19,8 +19,9 @@ protocol call requires that protocol's contract to be loaded first. The `read`
 and `exec` tools are merged into `protocol`, which takes one fixed-format
 request string: a `*** Begin Request` line, one `*** Read: <address>` or
 `*** Exec: <address>` line, optional raw body lines, and a `*** End Request`
-line. The lines between the operation line and `*** End Request` are the body
-and are never escaped. A leading `*** Body:` line is still accepted and ignored.
+line. The request ends at the last `*** End Request` line; the lines between
+the operation line and it are the body and are never escaped. A leading
+`*** Body:` line is still accepted and ignored.
 A protocol that needs structured input takes complete serialized JSON as that
 raw body text.
 Capabilities with simple string input are registered as protocols and publish

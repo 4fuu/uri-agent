@@ -59,7 +59,7 @@ Current working directory: `file://{}`
   Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-Every `file` read takes no body; leave no lines between the operation line and `*** End Request`.
+Every `file` read takes no body.
 "#,
         display_path(cwd)
     )
@@ -739,9 +739,7 @@ mod tests {
         assert!(help.contains("paths beginning with\n  `~/` resolve"));
         assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("Every `file` read"));
-        assert!(help.contains(
-            "takes no body; leave no lines between the operation line and `*** End Request`"
-        ));
+        assert!(help.contains("Every `file` read takes no body."));
     }
 
     #[test]

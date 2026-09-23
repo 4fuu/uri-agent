@@ -81,9 +81,11 @@ mysql -u root -p
 
 Read current output with a `*** Read: tasks://<id>` request, then send input
 with an `*** Exec: tasks://<id>/send` request whose request body carries
-the input text; the input is written exactly, so end each input line with a
-newline. Close stdin with an `*** Exec: tasks://<id>/eof` request and interrupt
-with an `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
+the input text; the input is written exactly, except that the newline before
+the final `*** End Request` belongs to the request format and is not sent, so
+add one extra empty line before it to end input with a newline. Close
+stdin with an `*** Exec: tasks://<id>/eof` request and interrupt with an
+`*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
 running while the command waits for input; use `timeout=0` for an open-ended
 interactive command.
 
@@ -161,9 +163,11 @@ $token = Read-Host 'Token'
 
 Read current output with a `*** Read: tasks://<id>` request, then send input
 with an `*** Exec: tasks://<id>/send` request whose request body carries
-the input text; the input is written exactly, so end each input line with a
-newline. Close stdin with an `*** Exec: tasks://<id>/eof` request and interrupt
-with an `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
+the input text; the input is written exactly, except that the newline before
+the final `*** End Request` belongs to the request format and is not sent, so
+add one extra empty line before it to end input with a newline. Close
+stdin with an `*** Exec: tasks://<id>/eof` request and interrupt with an
+`*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
 running while the command waits for input; use `timeout=0` for an open-ended
 interactive command.
 
@@ -1017,6 +1021,13 @@ mod tests {
         assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
         assert!(PWSH_HELP.contains("`interactive=true`"));
         assert!(PWSH_HELP.contains("tasks://<id>/send"));
+        assert!(PWSH_HELP.contains(
+            "the newline before\nthe final `*** End Request` belongs to the request format and is not sent"
+        ));
+        assert!(
+            PWSH_HELP
+                .contains("so\nadd one extra empty line before it to end input with a newline")
+        );
         assert!(PWSH_HELP.contains("tasks://<id>/eof"));
         assert!(PWSH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
@@ -1028,6 +1039,13 @@ mod tests {
         assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
         assert!(BASH_HELP.contains("`interactive=true`"));
         assert!(BASH_HELP.contains("tasks://<id>/send"));
+        assert!(BASH_HELP.contains(
+            "the newline before\nthe final `*** End Request` belongs to the request format and is not sent"
+        ));
+        assert!(
+            BASH_HELP
+                .contains("so\nadd one extra empty line before it to end input with a newline")
+        );
         assert!(BASH_HELP.contains("tasks://<id>/eof"));
         assert!(BASH_HELP.contains("tasks://<id>/interrupt"));
         assert!(BASH_HELP.contains("Child processes\nremain owned by this execution"));

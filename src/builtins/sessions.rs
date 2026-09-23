@@ -76,7 +76,7 @@ Conversation records use session-local IDs such as `r42`, matching `context://`.
   diagnoses the selected cache. Executing it only prewarms or force-rebuilds
   that cache. Both routes accept `scope` and `cwd` like discovery. The private
   sidecar cache never modifies a session.
-- `{base_uri}<session-id>` reads the newest records from one exact session. Query parameters accept `types`, `limit` (clamped to 1..50), and `before=<record-id>`. It takes no body; leave no lines between the operation line and `*** End Request`.
+- `{base_uri}<session-id>` reads the newest records from one exact session. Query parameters accept `types`, `limit` (clamped to 1..50), and `before=<record-id>`. It takes no body.
 - `{base_uri}<session-id>/around/<record-id>` reads records around one anchor. Optional `before` and `after` are record counts and default to 10 each; their sum must not exceed 50. Optional `types` filters the result.
 
 `include_tools` remains supported for compatibility and cannot be combined with `types`. `include_tools=false` selects `user,assistant,error`; `include_tools=true` selects every type.

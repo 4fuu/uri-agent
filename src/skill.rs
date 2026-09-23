@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 fn help(skill_md: &str, skill_directory: &Path, protocol: &str) -> String {
     format!(
-        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read takes no body; leave no lines between the operation line and `*** End Request`.\n",
+        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read takes no body.\n",
         display_path(skill_directory)
     )
 }
@@ -387,9 +387,7 @@ mod tests {
         assert!(help.contains("code-review-skill://<relative-path>"));
         assert!(help.contains("relative to this Skill directory"));
         assert!(help.contains("Every `code-review-skill` read"));
-        assert!(help.contains(
-            "takes no body; leave no lines between the operation line and `*** End Request`"
-        ));
+        assert!(help.contains("Every `code-review-skill` read takes no body."));
         let resource = skill
             .read(
                 ProtocolRequest {

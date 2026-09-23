@@ -13,9 +13,8 @@ const MAX_WAIT_SECONDS: u64 = 300;
 const HELP: &str = r#"# tasks
 
 Inspect and cancel background tasks from every protocol. Every `tasks`
-operation documented on this page takes no body; leave no lines between the operation line and `*** End Request`.
-Interactive input routes, whose bodies carry the input text, are documented by
-the shell protocols.
+operation documented on this page takes no body. Interactive input routes,
+whose bodies carry the input text, are documented by the shell protocols.
 
 Read a summary of all background tasks:
 
@@ -392,10 +391,8 @@ mod tests {
         assert!(HELP.contains("tasks://<id>"));
         assert!(HELP.contains("tasks://<id>?wait=30"));
         assert!(HELP.contains("tasks://<id>/cancel"));
-        assert!(HELP.contains(
-            "takes no body; leave no lines between the operation line and `*** End Request`"
-        ));
-        assert!(HELP.contains("documented by\nthe shell protocols"));
+        assert!(HELP.contains("takes no body. Interactive input routes"));
+        assert!(HELP.contains("documented by the shell protocols"));
         assert!(HELP.contains("clamped to the nearest bound"));
         assert!(HELP.contains("Operations normally return in their original"));
         assert!(HELP.contains("use one bounded wait; do not poll or rerun the operation"));

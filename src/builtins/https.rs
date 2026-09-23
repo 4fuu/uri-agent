@@ -52,7 +52,7 @@ through the first logged-in provider, which receives the query or target URL;
 page reads use direct local fetching only when no provider is logged in.
 
 - Read `https://<host>/<path>` to extract an HTTPS resource as Markdown or text.
-  Page reads take no body; leave no lines between the operation line and `*** End Request`.
+  Page reads take no body.
 - Read `https://search` with the search query in the request body. Search
   reads MUST pass a nonempty, non-whitespace query:
 
@@ -64,7 +64,7 @@ page reads use direct local fetching only when no provider is logged in.
 ```
 
 Provider help pages such as `https://help/parallel`, `https://help/exa`, and
-`https://help/tinyfish` take no body; leave no lines between the operation line and `*** End Request`.
+`https://help/tinyfish` take no body.
 "#;
 
 const PARALLEL_COMMON_HELP: &str = r#"Common Parallel search options:
@@ -1536,7 +1536,7 @@ mod tests {
         assert!(help.contains("ask them to run `:login`"));
         assert!(help.contains("local HTTPS fetcher"));
         assert!(help.contains("local HTML-to-Markdown conversion"));
-        assert!(help.contains("Page reads take no body; leave no lines between the operation line and `*** End Request`"));
+        assert!(help.contains("Page reads take no body."));
         assert!(help.contains("MUST pass a nonempty, non-whitespace query"));
         assert!(help.contains("Provider help pages such as `https://help/parallel`"));
 
