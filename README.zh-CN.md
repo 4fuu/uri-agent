@@ -10,17 +10,16 @@
 
 URI Agent 是一个可扩展的终端编程 Agent，让模型上下文集中在当前任务上。工具通过 URI 协议按需加载完整契约、指令和资源，使用方式与其他 Agent 中的 Skills 类似。模型起初只看到每个工具的精简名称和描述。
 
-五个内置工具为模型提供精简的加载、读取、执行和编辑接口：
+四个内置工具为模型提供精简的加载、读取、执行和编辑接口：
 
 ```text
 help(protocols: string[])
-read(uri: string, body: string)
-exec(uri: string, body: string)
+protocol(request: string)
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`help` 按需加载协议契约。`read` 和 `exec` 始终使用字符串请求体，并通过 URI 协议路由；没有内容时传 `""`。结构复杂或需要大量转义的参数由有类型工具处理。可信 WASM 插件可以在运行时添加协议和有类型工具。
+`help` 按需加载协议契约。`protocol` 工具通过 URI 协议路由一条固定格式的请求字符串；需要结构化输入的协议以完整序列化 JSON 作为原始请求体。结构复杂或需要大量转义的参数由有类型工具处理。可信 WASM 插件可以在运行时添加协议和有类型工具。
 
 > [!WARNING]
 > URI Agent 不提供沙箱。文件与 Shell 协议以及已启用的 WASM 插件都拥有 `uri-agent` 进程的用户权限。请只使用可信的项目、配置和插件。

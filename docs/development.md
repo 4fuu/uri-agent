@@ -73,7 +73,8 @@ providers. `PluginRegistry` validates declarations against installed
 capabilities, rejects name collisions, and preserves prompt-fragment order
 before a new session is frozen.
 
-Simple string-input operations belong behind `read` or `exec`; structured or
+Simple string-input operations belong behind the `protocol` tool's `read` and
+`exec` request lines; structured or
 escape-heavy operations use typed direct tools. Commands join the shared
 registry, and extension UI returns semantic state for generic panels, status,
 composer completion, or submission effects. Keep operational behavior in those
@@ -127,7 +128,7 @@ URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
   special-case tool names.
 - Every tool is declared and installed by a plugin. Protocol names and tool
   names are unique.
-- `read` and `exec` always receive a string body. The registry splits only the
+- `protocol` calls always receive a string body. The registry splits only the
   first `://` and passes the opaque remainder and body unchanged.
 - Every protocol implements its mandatory help page. Exact protocol behavior
   belongs to that page, loaded through the `help` tool; implementation, tests,
