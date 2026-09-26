@@ -4,7 +4,7 @@ use crate::model::antigravity::resolve_route;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
-const CODEX_CLIENT_VERSION: &str = "0.153.0";
+const CODEX_CLIENT_VERSION: &str = "0.155.1";
 
 #[derive(Clone, Debug)]
 pub(super) struct ModelRequestTransform {
