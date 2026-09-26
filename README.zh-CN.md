@@ -61,7 +61,7 @@ URI Agent 的目标是广泛兼容 pi.dev 模型目录，而不是只适配少�
 - Abliteration.ai 按凭据隔离的实时发现和静态后备模型；
 - StepFun Step Plan API 密钥登录、实时发现和静态后备推理模型。
 
-URI Agent 还支持 Anthropic、GitHub Copilot、Kimi Coding、xAI 和 OpenRouter 的服务商专属登录流程。
+URI Agent 还支持 GitHub Copilot、Kimi Coding、xAI 和 OpenRouter 的服务商专属登录流程。
 
 目录内容和账户权限会变化；目录中的模型仍需匹配的凭据、地区和订阅。当前服务商、实时发现、认证和兼容性细节见英文文档 [Models and configuration](docs/configuration.md#model-catalog)。
 

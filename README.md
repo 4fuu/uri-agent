@@ -96,8 +96,8 @@ integrations for:
 - StepFun Step Plan API-key login with live discovery and static fallback
   reasoning models.
 
-URI Agent also supports provider-specific login flows for Anthropic, GitHub
-Copilot, Kimi Coding, xAI, and OpenRouter.
+URI Agent also supports provider-specific login flows for GitHub Copilot, Kimi
+Coding, xAI, and OpenRouter.
 
 Catalog contents and account entitlements change; a listed model still requires
 the matching credentials, region, and subscription. See [Models and

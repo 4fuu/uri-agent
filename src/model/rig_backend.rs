@@ -311,6 +311,14 @@ impl RigBackend {
         if model.api == "antigravity" && auth_kind != AuthKind::Oauth {
             bail!("Antigravity requires Google OAuth; run :login and select Antigravity");
         }
+        if model.api == "anthropic-messages"
+            && model.provider == "anthropic"
+            && auth_kind == AuthKind::Oauth
+        {
+            bail!(
+                "Anthropic Claude Pro/Max subscription OAuth is no longer supported; run :login and save an Anthropic API key"
+            );
+        }
         let RigRequestOptions {
             extra_headers,
             strip_x_api_key,
@@ -334,14 +342,6 @@ impl RigBackend {
                 http::header::AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {api_key}"))
                     .context("invalid OAuth token for Authorization header")?,
-            );
-            headers.insert(
-                HeaderName::from_static("x-app"),
-                HeaderValue::from_static("cli"),
-            );
-            headers.insert(
-                http::header::USER_AGENT,
-                HeaderValue::from_static("claude-cli/2.1.251"),
             );
         }
         let limits = model.limits();
@@ -436,7 +436,7 @@ impl RigBackend {
                     .completion_model(&model.id),
             ),
             "anthropic-messages" => {
-                let mut builder = anthropic::Client::builder()
+                let builder = anthropic::Client::builder()
                     .api_key(api_key)
                     .base_url(&model.base_url)
                     .http_headers(headers)
@@ -451,11 +451,6 @@ impl RigBackend {
                         antigravity: None,
                         strip_x_api_key: anthropic_oauth || strip_x_api_key,
                     });
-                if anthropic_oauth {
-                    builder = builder
-                        .anthropic_beta("claude-code-20250219")
-                        .anthropic_beta("oauth-2025-04-20");
-                }
                 let mut completion = builder
                     .build()
                     .context("cannot initialize Anthropic provider")?

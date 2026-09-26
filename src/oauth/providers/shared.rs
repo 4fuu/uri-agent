@@ -1,23 +1,10 @@
 use super::super::OauthToken;
 use super::super::device::Poll;
 use super::super::util::form_body;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Duration;
-
-pub(super) async fn read_token_json(
-    response: reqwest::Response,
-    label: &str,
-) -> Result<OauthToken> {
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("{label} token request failed ({status}): {text}");
-    }
-    let value: Value = serde_json::from_str(&text).context(format!("{label} token is not JSON"))?;
-    token_from_value(&value)
-}
 
 pub(super) async fn read_token_form(
     response: reqwest::Response,

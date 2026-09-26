@@ -205,7 +205,6 @@ custom identity prefix.
 | `stepfun` | API key |
 | `cloudflare-ai-gateway` | API token, account ID, and gateway ID |
 | `antigravity` | Experimental Google browser OAuth |
-| `anthropic` | Claude Pro/Max browser OAuth |
 | `workbuddy` | WorkBuddy China browser login |
 | `openrouter` | Browser PKCE |
 | `openai-codex` | Browser or device-code login |

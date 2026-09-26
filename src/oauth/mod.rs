@@ -23,7 +23,6 @@ pub use util::parse_authorization_input;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OauthProvider {
     Antigravity,
-    Anthropic,
     WorkBuddy,
     OpenRouter,
     OpenAiCodex,
@@ -42,9 +41,8 @@ pub struct OauthMethod {
 }
 
 impl OauthProvider {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Antigravity,
-        Self::Anthropic,
         Self::WorkBuddy,
         Self::OpenRouter,
         Self::OpenAiCodex,
@@ -58,7 +56,6 @@ impl OauthProvider {
     pub fn from_id(id: &str) -> Option<Self> {
         Some(match id {
             "antigravity" => Self::Antigravity,
-            "anthropic" => Self::Anthropic,
             "workbuddy" => Self::WorkBuddy,
             "openrouter" => Self::OpenRouter,
             "openai-codex" => Self::OpenAiCodex,
@@ -74,7 +71,6 @@ impl OauthProvider {
     pub fn id(self) -> &'static str {
         match self {
             Self::Antigravity => "antigravity",
-            Self::Anthropic => "anthropic",
             Self::WorkBuddy => "workbuddy",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCodex => "openai-codex",
@@ -89,7 +85,6 @@ impl OauthProvider {
     pub fn name(self) -> &'static str {
         match self {
             Self::Antigravity => "Google Antigravity",
-            Self::Anthropic => "Anthropic (Claude Pro/Max)",
             Self::WorkBuddy => "WorkBuddy",
             Self::OpenRouter => "OpenRouter OAuth",
             Self::OpenAiCodex => "OpenAI Codex",
@@ -107,11 +102,6 @@ impl OauthProvider {
                 id: "oauth",
                 label: "Experimental Google OAuth",
                 description: "Private, unsupported Antigravity protocol",
-            }],
-            Self::Anthropic => &[OauthMethod {
-                id: "oauth",
-                label: "Claude Pro/Max",
-                description: "Browser OAuth, same flow as Pi Agent",
             }],
             Self::WorkBuddy => &[OauthMethod {
                 id: "workbuddy",
@@ -262,7 +252,6 @@ pub fn start_login(
     };
     match kind {
         OauthProvider::Antigravity => providers::start_antigravity(),
-        OauthProvider::Anthropic => providers::start_anthropic(),
         OauthProvider::WorkBuddy => providers::start_workbuddy(),
         OauthProvider::OpenRouter => providers::start_openrouter(),
         OauthProvider::OpenAiCodex if method == "device_code" => providers::start_codex_device(),
@@ -286,7 +275,6 @@ pub async fn refresh_token(provider: &str, token: &OauthToken) -> Result<OauthTo
     };
     let refreshed = match kind {
         OauthProvider::Antigravity => providers::refresh_antigravity(token).await,
-        OauthProvider::Anthropic => providers::refresh_anthropic(&token.refresh).await,
         OauthProvider::WorkBuddy => providers::refresh_workbuddy(token).await,
         OauthProvider::OpenRouter => Ok(token.clone()),
         OauthProvider::OpenAiCodex => providers::refresh_codex(&token.refresh).await,
@@ -377,9 +365,8 @@ mod tests {
 
     #[test]
     fn pi_oauth_providers_are_registered() {
-        assert_eq!(OauthProvider::ALL.len(), 10);
+        assert_eq!(OauthProvider::ALL.len(), 9);
         assert!(oauth_enabled("antigravity"));
-        assert!(oauth_enabled("anthropic"));
         assert!(oauth_enabled("workbuddy"));
         assert!(oauth_enabled("openrouter"));
         assert!(oauth_enabled("openai-codex"));
@@ -389,6 +376,7 @@ mod tests {
         assert!(oauth_enabled("xai"));
         assert!(oauth_enabled("radius"));
         assert!(!oauth_enabled("openai"));
+        assert!(!oauth_enabled("anthropic"));
         assert!(!oauth_enabled("codebuddy"));
         assert_eq!(OauthProvider::Antigravity.name(), "Google Antigravity");
         assert_eq!(OauthProvider::WorkBuddy.name(), "WorkBuddy");

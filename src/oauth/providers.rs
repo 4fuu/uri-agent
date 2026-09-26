@@ -1,4 +1,3 @@
-mod anthropic;
 mod antigravity;
 mod codex;
 mod github_copilot;
@@ -10,7 +9,6 @@ mod shared;
 mod workbuddy;
 mod xai;
 
-pub(super) use anthropic::{refresh_anthropic, start_anthropic};
 pub(super) use antigravity::{refresh_antigravity, start_antigravity};
 pub(crate) use codex::chatgpt_account_id;
 pub(super) use codex::{refresh_codex, start_codex_browser, start_codex_device};

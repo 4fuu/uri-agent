@@ -1620,8 +1620,7 @@ async fn resolve_model_credential(
     } else if !private_oauth {
         let mut environments = api_key_environments(provider);
         if provider == "anthropic" {
-            environments.insert(0, "ANTHROPIC_OAUTH_TOKEN".to_string());
-            environments.insert(1, "ANTHROPIC_AUTH_TOKEN".to_string());
+            environments.insert(0, "ANTHROPIC_AUTH_TOKEN".to_string());
         }
         for name in environments {
             if let Ok(value) = env::var(&name)
