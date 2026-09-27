@@ -16,6 +16,7 @@ pub(crate) enum ModelFailureKind {
     Authentication,
     Quota,
     Client,
+    MalformedToolInput,
     Other,
 }
 
@@ -207,6 +208,7 @@ fn classify_model_failure(
         {
             ModelFailureKind::ContextOverflow
         }
+        _ if looks_like_malformed_tool_input(&diagnostic) => ModelFailureKind::MalformedToolInput,
         _ if looks_like_timeout(&diagnostic) => ModelFailureKind::Timeout,
         _ if looks_like_network_failure(&diagnostic) => ModelFailureKind::Network,
         _ => match error {
@@ -282,6 +284,15 @@ fn looks_like_timeout(message: &str) -> bool {
             "operation timed out",
         ],
     )
+}
+
+/// The streaming assembler's own defect report: the provider finished the
+/// turn (`tool_calls` or `stop`) but a tool call's accumulated arguments
+/// never parsed as JSON. Hosted models produce such samples stochistically —
+/// an invalid escape or a self-truncated payload — so a fresh attempt is the
+/// recovery, not a session abort.
+fn looks_like_malformed_tool_input(message: &str) -> bool {
+    message.contains("arrived with malformed json input")
 }
 
 fn looks_like_network_failure(message: &str) -> bool {

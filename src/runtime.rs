@@ -6403,6 +6403,7 @@ mod tests {
             (ModelFailureKind::Timeout, 4),
             (ModelFailureKind::Conflict, 4),
             (ModelFailureKind::EmptyResponse, 4),
+            (ModelFailureKind::MalformedToolInput, 2),
         ] {
             assert_eq!(model_retry_policy(kind).unwrap().max_retries, expected);
         }
@@ -6479,6 +6480,55 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(retries, [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]);
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_are_retried_and_can_recover() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut responses = VecDeque::new();
+        // Malformed streamed tool arguments must retry with their small
+        // budget instead of aborting the turn as an unclassified failure.
+        responses.push_back(scripted_failure(
+            ModelFailureKind::MalformedToolInput,
+            None,
+            "tool call `protocol` arrived with malformed JSON input: invalid escape at line 1 column 176",
+        ));
+        responses.push_back(Ok(ModelResponse {
+            content: vec![AssistantContent::text("recovered")],
+            usage: None,
+            context_tokens: None,
+            finish_reason: Some(FinishReason::Stop),
+        }));
+        let backend = Arc::new(ScriptedBackend {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (runtime, session, output_directory) =
+            test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
+
+        runtime.run_turn("retry this".into()).await.unwrap();
+
+        assert_eq!(backend.requests.lock().await.len(), 2);
+        let retries = session
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ModelRetry {
+                    attempt,
+                    max_retries,
+                    reason,
+                    ..
+                } => Some((attempt, max_retries, reason)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].0, 1);
+        assert_eq!(retries[0].1, 2);
+        assert!(retries[0].2.contains("malformed tool arguments"));
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 

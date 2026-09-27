@@ -1354,6 +1354,39 @@ fn quota_and_stream_transport_errors_are_classified_separately() {
 }
 
 #[test]
+fn unparseable_streamed_tool_arguments_retry_instead_of_aborting_the_turn() {
+    // The streaming assembler reports these verbatim when a provider
+    // finishes the turn but a tool call's accumulated arguments never
+    // parsed. Both observed shapes — an invalid escape and a self-truncated
+    // array — must reach the retry policy instead of aborting the turn.
+    for message in [
+        "ResponseError: tool call `protocol` arrived with malformed JSON input: invalid escape at line 1 column 176",
+        "ResponseError: tool call `protocol` arrived with malformed JSON input: expected , or ] at line 1 column 341",
+    ] {
+        let failure = ModelFailure::from_completion_error(
+            CompletionError::ResponseError(message.to_string()),
+            ModelFailurePhase::Stream,
+            "stepfun",
+        );
+        assert_eq!(
+            failure.kind(),
+            ModelFailureKind::MalformedToolInput,
+            "{message}"
+        );
+        assert!(model_retry_policy(failure.kind()).is_some(), "{message}");
+    }
+
+    // Unrelated response errors stay unclassified.
+    let other = ModelFailure::from_completion_error(
+        CompletionError::ResponseError("unsupported tool".to_string()),
+        ModelFailurePhase::Stream,
+        "stepfun",
+    );
+    assert_eq!(other.kind(), ModelFailureKind::Other);
+    assert!(model_retry_policy(other.kind()).is_none());
+}
+
+#[test]
 fn statusless_provider_envelopes_keep_transient_error_types() {
     for (body, expected) in [
         (

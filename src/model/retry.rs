@@ -49,6 +49,15 @@ pub(crate) fn model_retry_policy(kind: ModelFailureKind) -> Option<ModelRetryPol
             max_delay: Duration::from_secs(8),
             reason: "empty response",
         }),
+        // Stochastic model output, not an endpoint defect: a fresh sample
+        // usually parses. Keep the budget small so a deterministically
+        // malformed caller still surfaces the failure.
+        ModelFailureKind::MalformedToolInput => Some(ModelRetryPolicy {
+            max_retries: 2,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(8),
+            reason: "malformed tool arguments",
+        }),
         ModelFailureKind::ContextOverflow
         | ModelFailureKind::Authentication
         | ModelFailureKind::Quota
