@@ -195,10 +195,9 @@ impl Protocol for CollaborationPlugin {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let (target, query) = split_target(request.target);
-        match target {
+        match request.target {
             "help" => {
-                require_empty(query.unwrap_or_default(), "collaboration://help query")?;
+                request.reject_unknown_headers(&[])?;
                 require_empty(request.body, "collaboration reads")?;
                 let name = self.state.ensure_presence().await?;
                 Ok(help(self.state.inner.session.id(), name.as_deref()).into_bytes())
@@ -206,7 +205,7 @@ impl Protocol for CollaborationPlugin {
             "participants" => {
                 require_empty(request.body, "collaboration reads")?;
                 self.state.ensure_presence().await?;
-                let all_projects = parse_scope(query)?;
+                let all_projects = parse_scope(&request)?;
                 let participants = self
                     .state
                     .inner
@@ -227,7 +226,7 @@ impl Protocol for CollaborationPlugin {
                         "status expects a `*** Read: collaboration://status/<name-or-id>` request"
                     )
                 }
-                let all_projects = parse_scope(query)?;
+                let all_projects = parse_scope(&request)?;
                 let participant = self
                     .state
                     .inner
@@ -248,9 +247,8 @@ impl Protocol for CollaborationPlugin {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let (target, query) = split_target(request.target);
-        if target == "name" {
-            require_empty(query.unwrap_or_default(), "collaboration://name query")?;
+        if request.target == "name" {
+            request.reject_unknown_headers(&[])?;
             let name = self.state.set_name(request.body).await?;
             return Ok(format!(
                 "Collaboration name assigned: {name}\nSession ID: {}",
@@ -258,27 +256,28 @@ impl Protocol for CollaborationPlugin {
             )
             .into_bytes());
         }
-        let Some(target) = target.strip_prefix("send/") else {
+        let Some(target) = request.target.strip_prefix("send/") else {
             bail!(
-                "collaboration exec expects `*** Exec: collaboration://name` with the name in the request body, or `*** Exec: collaboration://send/<name-or-id>?delivery=queue|steer` with the message in the request body"
+                "collaboration exec expects `*** Exec: collaboration://name` with the name in the request body, or `*** Exec: collaboration://send/<name-or-id>` with optional `*** delivery: queue|steer` headers and the message in the request body"
             );
         };
         if target.is_empty() || target.contains('/') {
             bail!("collaboration send target must be one participant name or session ID")
         }
-        self.send(target, query, request.body).await
+        self.send(target, &request).await
     }
 }
 
 impl CollaborationPlugin {
-    async fn send(&self, target: &str, query: Option<&str>, body: &str) -> Result<Vec<u8>> {
+    async fn send(&self, target: &str, request: &ProtocolRequest<'_>) -> Result<Vec<u8>> {
+        let body = request.body;
         if body.trim().is_empty() {
             bail!("collaboration message cannot be empty")
         }
         if body.len() > MAX_MESSAGE_BYTES {
             bail!("collaboration message cannot exceed 32 KiB")
         }
-        let options = SendOptions::parse(query)?;
+        let options = SendOptions::parse(request)?;
         let source_name = self.state.ensure_presence().await?;
         let target = self
             .state
@@ -362,55 +361,43 @@ struct SendOptions {
 }
 
 impl SendOptions {
-    fn parse(query: Option<&str>) -> Result<Self> {
-        let mut options = Self {
-            delivery: Delivery::Queue,
-            reply_requested: false,
-            all_projects: false,
-            in_reply_to: None,
+    fn parse(request: &ProtocolRequest<'_>) -> Result<Self> {
+        request.reject_unknown_headers(&["delivery", "reply", "scope", "in_reply_to"])?;
+        let delivery = match request.header_value("delivery")? {
+            None | Some("queue") => Delivery::Queue,
+            Some("steer") => Delivery::Steer,
+            Some(_) => bail!("delivery must be queue or steer"),
         };
-        let mut seen = std::collections::HashSet::new();
-        for (name, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            if !seen.insert(name.to_string()) {
-                bail!("duplicate collaboration send option: {name}")
+        let reply_requested = match request.header_value("reply")? {
+            None | Some("none") => false,
+            Some("requested") => true,
+            Some(_) => bail!("reply must be none or requested"),
+        };
+        let all_projects = match request.header_value("scope")? {
+            None | Some("project") => false,
+            Some("all") => true,
+            Some(_) => bail!("scope must be project or all"),
+        };
+        let in_reply_to = match request.header_value("in_reply_to")? {
+            None => None,
+            Some(value) => {
+                if value.is_empty()
+                    || value.len() > 80
+                    || !value.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                    })
+                {
+                    bail!("in_reply_to must be a valid collaboration message ID")
+                }
+                Some(value.to_string())
             }
-            match name.as_ref() {
-                "delivery" => {
-                    options.delivery = match value.as_ref() {
-                        "queue" => Delivery::Queue,
-                        "steer" => Delivery::Steer,
-                        _ => bail!("delivery must be queue or steer"),
-                    }
-                }
-                "reply" => {
-                    options.reply_requested = match value.as_ref() {
-                        "none" => false,
-                        "requested" => true,
-                        _ => bail!("reply must be none or requested"),
-                    }
-                }
-                "scope" => {
-                    options.all_projects = match value.as_ref() {
-                        "project" => false,
-                        "all" => true,
-                        _ => bail!("scope must be project or all"),
-                    }
-                }
-                "in_reply_to" => {
-                    if value.is_empty()
-                        || value.len() > 80
-                        || !value.chars().all(|character| {
-                            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                        })
-                    {
-                        bail!("in_reply_to must be a valid collaboration message ID")
-                    }
-                    options.in_reply_to = Some(value.into_owned());
-                }
-                _ => bail!("unknown collaboration send option: {name}"),
-            }
-        }
-        Ok(options)
+        };
+        Ok(Self {
+            delivery,
+            reply_requested,
+            all_projects,
+            in_reply_to,
+        })
     }
 }
 
@@ -448,7 +435,8 @@ task summaries:
 *** End Request
 
 *** Begin Request
-*** Read: collaboration://participants?scope=all
+*** Read: collaboration://participants
+*** scope: all
 *** End Request
 ```
 
@@ -461,7 +449,8 @@ also report that a saved session is offline:
 *** End Request
 
 *** Begin Request
-*** Read: collaboration://status/<session-id>?scope=all
+*** Read: collaboration://status/<session-id>
+*** scope: all
 *** End Request
 ```
 
@@ -474,31 +463,35 @@ by its current human name or stable session ID, without an `@` prefix:
 
 ```text
 *** Begin Request
-*** Exec: collaboration://send/Crane?delivery=queue
+*** Exec: collaboration://send/Crane
+*** delivery: queue
+*** Body:
 Review the parser changes and report risks.
 *** End Request
 
 *** Begin Request
-*** Exec: collaboration://send/<session-id>?delivery=steer&reply=requested
+*** Exec: collaboration://send/<session-id>
+*** delivery: steer
+*** reply: requested
+*** Body:
 Check this failing test now.
 *** End Request
 ```
 
-Options:
+Headers:
 
-- `delivery=queue` (default) durably queues a later turn. If the target is idle,
-  it starts that turn.
-- `delivery=steer` injects at the target's next model boundary. If the target is
-  idle or finishes before accepting it, it becomes a queued turn.
-- `reply=none` (default) does not request a response.
-- `reply=requested` asks for a response. The host generates a message ID and an
-  exact ID-based reply URI and injects both into the target message. This is a
-  request, not a wait or a response guarantee.
-- `scope=project` (default) resolves only participants in the current working
-  directory. `scope=all` permits a participant from another project.
-- `in_reply_to=<message-id>` marks a reply. Generated reply URIs already include
-  this option. XML represents each `&` separator as `&amp;`; use the decoded `&`
-  in the tool URI and put only the reply text in the body.
+- `delivery: queue` (default) durably queues a later turn. If the target is
+  idle, it starts that turn.
+- `delivery: steer` injects at the target's next model boundary. If the target
+  is idle or finishes before accepting it, it becomes a queued turn.
+- `reply: none` (default) does not request a response.
+- `reply: requested` asks for a response. The host generates a message ID and
+  an exact ID-based reply request and injects both into the target message.
+  This is a request, not a wait or a response guarantee.
+- `scope: project` (default) resolves only participants in the current working
+  directory. `scope: all` permits a participant from another project.
+- `in_reply_to: <message-id>` marks a reply. Generated reply requests already
+  carry this header; put only the reply text in the body.
 
 The host wraps the body in an internal `<collaboration_message>` XML envelope.
 It always injects the sender's stable session ID, current name when set,
@@ -524,12 +517,6 @@ the durable reference.
     )
 }
 
-fn split_target(target: &str) -> (&str, Option<&str>) {
-    target
-        .split_once('?')
-        .map_or((target, None), |(target, query)| (target, Some(query)))
-}
-
 fn require_empty(value: &str, label: &str) -> Result<()> {
     if !value.is_empty() {
         bail!("{label} must be empty")
@@ -537,21 +524,13 @@ fn require_empty(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_scope(query: Option<&str>) -> Result<bool> {
-    let mut scope = false;
-    let mut seen = false;
-    for (name, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-        if name != "scope" || seen {
-            bail!("collaboration read accepts only one scope=project|all option")
-        }
-        seen = true;
-        scope = match value.as_ref() {
-            "project" => false,
-            "all" => true,
-            _ => bail!("scope must be project or all"),
-        };
+fn parse_scope(request: &ProtocolRequest<'_>) -> Result<bool> {
+    request.reject_unknown_headers(&["scope"])?;
+    match request.header_value("scope")? {
+        None | Some("project") => Ok(false),
+        Some("all") => Ok(true),
+        Some(_) => bail!("scope must be project or all"),
     }
-    Ok(scope)
 }
 
 fn format_participants(
@@ -694,18 +673,22 @@ fn collaboration_envelope(
         );
     }
     if reply_requested {
-        let scope = if reply_scope_all {
-            "&amp;scope=all"
-        } else {
-            ""
-        };
+        output.push_str("  <reply requested=\"true\">\n");
         let _ = writeln!(
             output,
-            "  <reply requested=\"true\">\n    <uri>collaboration://send/{}?delivery=queue&amp;in_reply_to={}{}</uri>\n  </reply>",
-            xml_escape(source_id),
-            xml_escape(message_id),
-            scope,
+            "    <uri>collaboration://send/{}</uri>",
+            xml_escape(source_id)
         );
+        output.push_str("    <header>delivery: queue</header>\n");
+        let _ = writeln!(
+            output,
+            "    <header>in_reply_to: {}</header>",
+            xml_escape(message_id)
+        );
+        if reply_scope_all {
+            output.push_str("    <header>scope: all</header>\n");
+        }
+        output.push_str("  </reply>\n");
     }
     let _ = writeln!(
         output,
@@ -729,7 +712,7 @@ mod tests {
     use super::*;
     use crate::catalog::ModelLimits;
     use crate::plugin::ModelToolRegistry;
-    use crate::protocol::ProtocolRegistry;
+    use crate::protocol::{ProtocolRegistry, RequestHeader};
     use crate::session::SessionContext;
     use crate::task::TaskManager;
     use std::path::Path;
@@ -738,9 +721,9 @@ mod tests {
     fn help_documents_send_semantics_inline() {
         let page = help("session-id", Some("Crane"));
         assert!(page.contains("## Sending messages"));
-        assert!(page.contains("delivery=queue"));
-        assert!(page.contains("reply=requested"));
-        assert!(page.contains("in_reply_to=<message-id>"));
+        assert!(page.contains("delivery: queue"));
+        assert!(page.contains("reply: requested"));
+        assert!(page.contains("in_reply_to: <message-id>"));
         assert!(page.contains("Messages are limited to 32"));
         assert!(!page.contains("help/send"));
     }
@@ -762,25 +745,46 @@ mod tests {
         assert!(envelope.contains("<message_id>cm_123</message_id>"));
         assert!(envelope.contains("<delivery>steer</delivery>"));
         assert!(envelope.contains("<in_reply_to>cm_parent</in_reply_to>"));
-        assert!(envelope.contains(
-            "collaboration://send/source-id?delivery=queue&amp;in_reply_to=cm_123&amp;scope=all"
-        ));
+        assert!(envelope.contains("<uri>collaboration://send/source-id</uri>"));
+        assert!(envelope.contains("<header>delivery: queue</header>"));
+        assert!(envelope.contains("<header>in_reply_to: cm_123</header>"));
+        assert!(envelope.contains("<header>scope: all</header>"));
         assert!(envelope.contains("review &lt;this&gt; &amp; reply"));
         assert!(!envelope.contains("review <this>"));
     }
 
+    fn send_request<'a>(headers: &'a [RequestHeader]) -> ProtocolRequest<'a> {
+        ProtocolRequest {
+            uri: "collaboration://send/Builder",
+            target: "send/Builder",
+            headers,
+            body: "hello",
+        }
+    }
+
     #[test]
     fn send_options_are_plain_and_typed() {
-        let options = SendOptions::parse(Some(
-            "delivery=steer&reply=requested&scope=all&in_reply_to=cm_123",
-        ))
+        let options = SendOptions::parse(&send_request(&[
+            RequestHeader::new("delivery", "steer"),
+            RequestHeader::new("reply", "requested"),
+            RequestHeader::new("scope", "all"),
+            RequestHeader::new("in_reply_to", "cm_123"),
+        ]))
         .unwrap();
         assert_eq!(options.delivery.as_str(), "steer");
         assert!(options.reply_requested);
         assert!(options.all_projects);
         assert_eq!(options.in_reply_to.as_deref(), Some("cm_123"));
-        assert!(SendOptions::parse(Some("delivery=now")).is_err());
-        assert!(SendOptions::parse(Some("scope=all&scope=project")).is_err());
+        assert!(
+            SendOptions::parse(&send_request(&[RequestHeader::new("delivery", "now")])).is_err()
+        );
+        assert!(
+            SendOptions::parse(&send_request(&[
+                RequestHeader::new("scope", "all"),
+                RequestHeader::new("scope", "project"),
+            ]))
+            .is_err()
+        );
     }
 
     async fn protocol_fixture(
@@ -839,6 +843,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "collaboration://name",
                     target: "name",
+                    headers: &[],
                     body: "Wu Sir",
                 },
                 context.clone(),
@@ -850,6 +855,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "collaboration://name",
                     target: "name",
+                    headers: &[],
                     body: "Builder",
                 },
                 context.clone(),
@@ -861,6 +867,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "collaboration://help",
                     target: "help",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -874,8 +881,12 @@ mod tests {
         let receipt = source
             .exec(
                 ProtocolRequest {
-                    uri: "collaboration://send/Builder?delivery=queue&reply=requested",
-                    target: "send/Builder?delivery=queue&reply=requested",
+                    uri: "collaboration://send/Builder",
+                    target: "send/Builder",
+                    headers: &[
+                        RequestHeader::new("delivery", "queue"),
+                        RequestHeader::new("reply", "requested"),
+                    ],
                     body: "Review <parser> & report.",
                 },
                 context,
@@ -898,9 +909,8 @@ mod tests {
         assert!(content.contains("<name>Wu Sir</name>"));
         assert!(content.contains("<session_id>source-session</session_id>"));
         assert!(content.contains("<reply requested=\\\"true\\\">"));
-        assert!(
-            content.contains("collaboration://send/source-session?delivery=queue&amp;in_reply_to=")
-        );
+        assert!(content.contains("<uri>collaboration://send/source-session</uri>"));
+        assert!(content.contains("<header>in_reply_to: cm_"));
         assert!(content.contains("Review &lt;parser&gt; &amp; report."));
 
         source.shutdown().await.unwrap();

@@ -1,6 +1,8 @@
 use crate::output::OutputStore;
 use crate::plugin::{Plugin, PluginCredentials, PluginHost, PluginPermission};
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest, RequestHeader,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use html_to_markdown_rs::{
@@ -67,54 +69,73 @@ Provider help pages such as `https://help/parallel`, `https://help/exa`, and
 `https://help/tinyfish` take no body.
 "#;
 
-const PARALLEL_COMMON_HELP: &str = r#"Common Parallel search options:
+const PARALLEL_COMMON_HELP: &str = r#"Common Parallel search headers:
 
 ```text
 *** Begin Request
-*** Read: https://search?limit=10&mode=basic
+*** Read: https://search
+*** limit: 10
+*** mode: basic
+*** Body:
 <search query>
 *** End Request
 
 *** Begin Request
-*** Read: https://search?after_date=2026-01-01&include_domain=example.com
+*** Read: https://search
+*** after_date: 2026-01-01
+*** include_domain: example.com
+*** Body:
 <search query>
 *** End Request
 ```
 
 `limit` is 1-20. `mode` is `turbo`, `fast`, `basic`, or `advanced` and defaults
 to `advanced`. `after_date`, repeated `include_domain`, and `location` narrow the
-search. Read `https://help/parallel` for all supported Parallel options.
+search. Read `https://help/parallel` for all supported Parallel headers.
 "#;
 
-const EXA_COMMON_HELP: &str = r#"Common Exa search options:
+const EXA_COMMON_HELP: &str = r#"Common Exa search headers:
 
 ```text
 *** Begin Request
-*** Read: https://search?limit=10&type=auto
+*** Read: https://search
+*** limit: 10
+*** type: auto
+*** Body:
 <search query>
 *** End Request
 
 *** Begin Request
-*** Read: https://search?category=news&start_published_date=2026-01-01
+*** Read: https://search
+*** category: news
+*** start_published_date: 2026-01-01
+*** Body:
 <search query>
 *** End Request
 ```
 
 `limit` is 1-20. `type` defaults to `auto`. `category`, publication dates,
 repeated `include_domain`, and `location` narrow the search. Read
-`https://help/exa` for all supported Exa options.
+`https://help/exa` for all supported Exa headers.
 "#;
 
-const TINYFISH_COMMON_HELP: &str = r#"Common TinyFish search options:
+const TINYFISH_COMMON_HELP: &str = r#"Common TinyFish search headers:
 
 ```text
 *** Begin Request
-*** Read: https://search?limit=10&domain_type=news
+*** Read: https://search
+*** limit: 10
+*** domain_type: news
+*** Body:
 <search query>
 *** End Request
 
 *** Begin Request
-*** Read: https://search?recency_minutes=60&location=us&language=en
+*** Read: https://search
+*** recency_minutes: 60
+*** location: us
+*** language: en
+*** Body:
 <search query>
 *** End Request
 ```
@@ -122,119 +143,130 @@ const TINYFISH_COMMON_HELP: &str = r#"Common TinyFish search options:
 `limit` is 1-20 and fetches additional pages when needed. `domain_type`
 defaults to `web`. `location`, `language`, `recency_minutes`,
 `after_date`/`before_date`, and repeated `include_domain` narrow the search.
-Read `https://help/tinyfish` for all supported TinyFish options.
+Read `https://help/tinyfish` for all supported TinyFish headers.
 "#;
 
 const PARALLEL_HELP: &str = r#"# https — Parallel
 
-Use `provider=parallel` to select Parallel explicitly. Without `provider`, these
-options apply when Parallel is the first logged-in provider.
+Use a `provider: parallel` header to select Parallel explicitly. Without
+`provider`, these headers apply when Parallel is the first logged-in provider.
 
 ```text
 *** Begin Request
-*** Read: https://search?provider=parallel&mode=advanced&limit=10
+*** Read: https://search
+*** provider: parallel
+*** mode: advanced
+*** limit: 10
+*** Body:
 <objective>
 *** End Request
 ```
 
-Search options:
+Search headers (values are written literally, without any encoding):
 
-- `limit=1..20` (default 10)
-- `mode=turbo|fast|basic|advanced` (default `advanced`)
-- `search_query=<keywords>` may repeat up to 5 times. Values should be 3-6
+- `limit: 1..20` (default 10)
+- `mode: turbo|fast|basic|advanced` (default `advanced`)
+- `search_query: <keywords>` may repeat up to 5 times. Values should be 3-6
   words and at most 200 characters. Without it, the body is used as the sole
   search query as well as the objective and is limited to 200 characters; with
   at least one `search_query`, the objective body may be up to 5,000 characters.
-- `location=<country>` uses a two-letter country code. Parallel ignores an
+- `location: <country>` uses a two-letter country code. Parallel ignores an
   unsupported code and returns a warning.
-- `include_domain=<domain>` and `exclude_domain=<domain>` may repeat, up to 200
-  entries combined. Domains must not contain schemes, paths, ports, or
+- `include_domain: <domain>` and `exclude_domain: <domain>` may repeat, up to
+  200 entries combined. Domains must not contain schemes, paths, ports, or
   wildcards; a leading-dot extension such as `.gov` is accepted.
-- `after_date=YYYY-MM-DD` includes content published on or after that date.
-- `max_chars_total=<positive integer>` limits all returned excerpts.
-- `max_chars_per_result=<positive integer>` limits excerpts for each result.
-- `max_age_seconds=<integer >= 600>` requests a live fetch for older indexed
+- `after_date: YYYY-MM-DD` includes content published on or after that date.
+- `max_chars_total: <positive integer>` limits all returned excerpts.
+- `max_chars_per_result: <positive integer>` limits excerpts for each result.
+- `max_age_seconds: <integer >= 600>` requests a live fetch for older indexed
   content; it increases latency.
-- `timeout_seconds=<positive number>` controls live-fetch timeout.
-- `disable_cache_fallback=true|false` rejects stale cache fallback when true.
-- `session_id=<value>` groups related Parallel search requests.
-- `client_model=<model id>` lets Parallel tune output for the consuming model.
+- `timeout_seconds: <positive number>` controls live-fetch timeout.
+- `disable_cache_fallback: true|false` rejects stale cache fallback when true.
+- `session_id: <value>` groups related Parallel search requests.
+- `client_model: <model id>` lets Parallel tune output for the consuming model.
 
-Unknown, duplicate, incompatible, or invalid options are rejected. Parallel
+Unknown, duplicate, incompatible, or invalid headers are rejected. Parallel
 search and page extraction require a Parallel login through `:login`.
 "#;
 
 const EXA_HELP: &str = r#"# https — Exa
 
-Use `provider=exa` to select Exa explicitly. Without `provider`, these options
-apply when Exa is the first logged-in provider.
+Use a `provider: exa` header to select Exa explicitly. Without `provider`,
+these headers apply when Exa is the first logged-in provider.
 
 ```text
 *** Begin Request
-*** Read: https://search?provider=exa&type=auto&limit=10
+*** Read: https://search
+*** provider: exa
+*** type: auto
+*** limit: 10
+*** Body:
 <search query>
 *** End Request
 ```
 
-Search options:
+Search headers (values are written literally, without any encoding):
 
-- `limit=1..20` (default 10)
-- `type=instant|fast|auto|deep-lite|deep|deep-reasoning` (default `auto`)
-- `category=company|people|publication|news|personal%20site|financial%20report`
-- `location=<country>` uses a two-letter country code.
-- `include_domain=<domain-or-path>` and `exclude_domain=<domain-or-path>` may
+- `limit: 1..20` (default 10)
+- `type: instant|fast|auto|deep-lite|deep|deep-reasoning` (default `auto`)
+- `category: company|people|publication|news|personal site|financial report`
+- `location: <country>` uses a two-letter country code.
+- `include_domain: <domain-or-path>` and `exclude_domain: <domain-or-path>` may
   repeat. Exa also accepts wildcard subdomains such as `*.example.com`.
 - `start_published_date` and `end_published_date` accept an ISO 8601 date or
   date-time.
-- `moderation=true|false` enables Exa content moderation.
-- `content=highlights|text|summary` (default `highlights`).
-- `max_characters=1..10000` limits `highlights` or `text` content.
-- `max_age_hours=-1..720`: `0` always live-crawls, `-1` is cache-only, and a
+- `moderation: true|false` enables Exa content moderation.
+- `content: highlights|text|summary` (default `highlights`).
+- `max_characters: 1..10000` limits `highlights` or `text` content.
+- `max_age_hours: -1..720`: `0` always live-crawls, `-1` is cache-only, and a
   positive value accepts cache up to that many hours old.
-- `livecrawl_timeout=1..90000` controls live-crawl timeout in milliseconds.
-- `additional_query=<query>` may repeat up to 10 times for deep search types.
-- `subpages=0..100` extracts linked subpages for each result; up to 100 repeated
-  `subpage_target=<term>` values (each at most 100 characters) guide their
-  selection.
-- `system_prompt=<instructions>` guides deep-search planning.
+- `livecrawl_timeout: 1..90000` controls live-crawl timeout in milliseconds.
+- `additional_query: <query>` may repeat up to 10 times for deep search types.
+- `subpages: 0..100` extracts linked subpages for each result; up to 100
+  repeated `subpage_target: <term>` values (each at most 100 characters) guide
+  their selection.
+- `system_prompt: <instructions>` guides deep-search planning.
 
 `company` and `people` cannot be combined with publication dates or
-`exclude_domain`. Unknown, duplicate, incompatible, or invalid options are
+`exclude_domain`. Unknown, duplicate, incompatible, or invalid headers are
 rejected. Exa search and page extraction require an Exa login through `:login`.
 "#;
 
 const TINYFISH_HELP: &str = r#"# https — TinyFish
 
-Use `provider=tinyfish` to select TinyFish explicitly. Without `provider`, these
-options apply when TinyFish is the first logged-in provider.
+Use a `provider: tinyfish` header to select TinyFish explicitly. Without
+`provider`, these headers apply when TinyFish is the first logged-in provider.
 
 ```text
 *** Begin Request
-*** Read: https://search?provider=tinyfish&limit=10
+*** Read: https://search
+*** provider: tinyfish
+*** limit: 10
+*** Body:
 <search query>
 *** End Request
 ```
 
-Search options:
+Search headers (values are written literally, without any encoding):
 
-- `limit=1..20` (default 10). TinyFish returns one page of about 10 results
+- `limit: 1..20` (default 10). TinyFish returns one page of about 10 results
   per request; additional pages are fetched automatically to reach `limit`.
-- `location=<country>` uses a two-letter country code.
-- `language=<language>` uses a two-letter language code.
-- `include_domain=<domain>` and `exclude_domain=<domain>` may repeat. Domains
+- `location: <country>` uses a two-letter country code.
+- `language: <language>` uses a two-letter language code.
+- `include_domain: <domain>` and `exclude_domain: <domain>` may repeat. Domains
   must not contain schemes, paths, ports, or wildcards.
-- `recency_minutes=1..5256000` limits results to a freshness window and cannot
+- `recency_minutes: 1..5256000` limits results to a freshness window and cannot
   be combined with `after_date` or `before_date`.
-- `after_date=YYYY-MM-DD` and `before_date=YYYY-MM-DD` bound results by
+- `after_date: YYYY-MM-DD` and `before_date: YYYY-MM-DD` bound results by
   calendar date; `after_date` must not be later than `before_date`.
-- `domain_type=web|news|research_paper` (default `web`). News results include
+- `domain_type: web|news|research_paper` (default `web`). News results include
   publisher and date; research papers include authors and publication year.
-- `pub_year_min=0..9999` and `pub_year_max=0..9999` bound research papers by
-  publication year and require `domain_type=research_paper`; date and recency
+- `pub_year_min: 0..9999` and `pub_year_max: 0..9999` bound research papers by
+  publication year and require `domain_type: research_paper`; date and recency
   filters are not supported for research papers.
-- `purpose=<intent>` states why the search runs, up to 2000 characters.
+- `purpose: <intent>` states why the search runs, up to 2000 characters.
 
-Unknown, duplicate, incompatible, or invalid options are rejected. TinyFish
+Unknown, duplicate, incompatible, or invalid headers are rejected. TinyFish
 search and page extraction require a TinyFish login through `:login`.
 "#;
 
@@ -479,8 +511,8 @@ JavaScript-rendered content and PDFs may be incomplete.\n",
         }
     }
 
-    async fn search(&self, target: &str, body: &str) -> Result<Vec<u8>> {
-        let input = SearchInput::parse(target, body)?;
+    async fn search(&self, headers: &[RequestHeader], body: &str) -> Result<Vec<u8>> {
+        let input = SearchInput::parse(headers, body)?;
         let mut providers = self.configured_providers().await?;
         if let Some(requested) = input.provider {
             let Some(index) = providers
@@ -610,17 +642,18 @@ impl Protocol for HttpsProtocol {
     ) -> Result<Vec<u8>> {
         match request.target {
             "help" => {
+                request.reject_unknown_headers(&[])?;
                 require_empty_body(request.body, request.uri)?;
                 self.help().await
             }
             target if target.starts_with("help/") => {
+                request.reject_unknown_headers(&[])?;
                 require_empty_body(request.body, request.uri)?;
                 self.provider_help(target)
             }
-            target if target == "search" || target.starts_with("search?") => {
-                self.search(target, request.body).await
-            }
+            "search" => self.search(request.headers, request.body).await,
             target => {
+                request.reject_unknown_headers(&[])?;
                 require_empty_body(request.body, request.uri)?;
                 self.read_page(target).await
             }
@@ -644,7 +677,7 @@ struct SearchInput {
 }
 
 impl SearchInput {
-    fn parse(target: &str, body: &str) -> Result<Self> {
+    fn parse(headers: &[RequestHeader], body: &str) -> Result<Self> {
         let query = body.trim();
         if query.is_empty() {
             bail!(
@@ -656,16 +689,14 @@ impl SearchInput {
             );
         }
         let query = query.to_string();
-        let url = Url::parse(&format!("https://{target}"))
-            .context("https://search contains invalid URI options")?;
         let mut provider = None;
         let mut options = Vec::new();
-        for (name, value) in url.query_pairs() {
-            if name == "provider" {
+        for header in headers {
+            if header.name == "provider" {
                 ensure_once(&provider, "provider")?;
-                provider = Some(WebProvider::parse(&value)?);
+                provider = Some(WebProvider::parse(&header.value)?);
             } else {
-                options.push((name.into_owned(), value.into_owned()));
+                options.push((header.name.clone(), header.value.clone()));
             }
         }
         Ok(Self {
@@ -727,7 +758,7 @@ enum SearchOptions {
 
 fn ensure_once<T>(value: &Option<T>, name: &str) -> Result<()> {
     if value.is_some() {
-        bail!("https://search option appears more than once: {name}");
+        bail!("https://search header appears more than once: {name}");
     }
     Ok(())
 }
@@ -1093,6 +1124,13 @@ mod tests {
         serde_json::from_str(body).unwrap()
     }
 
+    fn search_headers(pairs: &[(&str, &str)]) -> Vec<RequestHeader> {
+        pairs
+            .iter()
+            .map(|(name, value)| RequestHeader::new(name, value))
+            .collect()
+    }
+
     #[tokio::test]
     async fn provider_request_ids_move_to_diagnostics_instead_of_model_output() {
         let session_id = format!("https{}", uuid::Uuid::now_v7().simple());
@@ -1115,7 +1153,7 @@ mod tests {
         assert_eq!(event["event"], "https_search_response");
         assert_eq!(event["provider"], "parallel");
         assert_eq!(event["request_id"], "request-123");
-        let request = SearchInput::parse("search", "query")
+        let request = SearchInput::parse(&[], "query")
             .unwrap()
             .resolve(WebProvider::Parallel)
             .unwrap();
@@ -1336,8 +1374,19 @@ mod tests {
         let output = protocol
             .read(
                 ProtocolRequest {
-                    uri: "https://search?limit=3&mode=advanced&search_query=rust%20language&search_query=rust%20documentation&location=us&after_date=2026-01-01&include_domain=rust-lang.org&max_age_seconds=600&disable_cache_fallback=true",
-                    target: "search?limit=3&mode=advanced&search_query=rust%20language&search_query=rust%20documentation&location=us&after_date=2026-01-01&include_domain=rust-lang.org&max_age_seconds=600&disable_cache_fallback=true",
+                    uri: "https://search",
+                    target: "search",
+                    headers: &search_headers(&[
+                        ("limit", "3"),
+                        ("mode", "advanced"),
+                        ("search_query", "rust language"),
+                        ("search_query", "rust documentation"),
+                        ("location", "us"),
+                        ("after_date", "2026-01-01"),
+                        ("include_domain", "rust-lang.org"),
+                        ("max_age_seconds", "600"),
+                        ("disable_cache_fallback", "true"),
+                    ]),
                     body: search_body,
                 },
                 ProtocolContext {
@@ -1431,7 +1480,19 @@ mod tests {
         let output = String::from_utf8(
             protocol
                 .search(
-                    "search?provider=exa&type=fast&category=news&start_published_date=2026-01-01&include_domain=example.com/news&content=highlights&max_characters=1500&location=us&moderation=true&subpages=1&subpage_target=docs",
+                    &search_headers(&[
+                        ("provider", "exa"),
+                        ("type", "fast"),
+                        ("category", "news"),
+                        ("start_published_date", "2026-01-01"),
+                        ("include_domain", "example.com/news"),
+                        ("content", "highlights"),
+                        ("max_characters", "1500"),
+                        ("location", "us"),
+                        ("moderation", "true"),
+                        ("subpages", "1"),
+                        ("subpage_target", "docs"),
+                    ]),
                     body,
                 )
                 .await
@@ -1497,7 +1558,7 @@ mod tests {
             .with_search_urls(parallel_url, exa_url, unused_tinyfish);
         let body = "fallback";
 
-        let output = String::from_utf8(protocol.search("search", body).await.unwrap()).unwrap();
+        let output = String::from_utf8(protocol.search(&[], body).await.unwrap()).unwrap();
         assert!(output.starts_with(UNTRUSTED_WEB_CONTENT));
         assert!(!output.contains("Provider:"));
         assert!(output.contains("Found through Exa."));
@@ -1553,11 +1614,11 @@ mod tests {
         assert!(tinyfish_help.contains("research_paper"));
 
         let query = "rust";
-        let error = protocol.search("search", query).await.unwrap_err();
+        let error = protocol.search(&[], query).await.unwrap_err();
         assert!(error.to_string().contains("run :login"));
 
         let error = protocol
-            .search("search?provider=unknown", query)
+            .search(&search_headers(&[("provider", "unknown")]), query)
             .await
             .unwrap_err();
         assert!(
@@ -1566,7 +1627,7 @@ mod tests {
                 .contains("must be parallel, exa, or tinyfish")
         );
 
-        let error = protocol.search("search", "").await.unwrap_err();
+        let error = protocol.search(&[], "").await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1595,7 +1656,7 @@ mod tests {
         assert!(!help.contains("`mode` is `turbo`"));
 
         let error = protocol
-            .search("search?provider=parallel", query)
+            .search(&search_headers(&[("provider", "parallel")]), query)
             .await
             .unwrap_err();
         assert!(
@@ -1606,28 +1667,38 @@ mod tests {
         assert!(error.to_string().contains("run :login and choose parallel"));
 
         let error = protocol
-            .search("search?provider=exa&unknown=value", query)
+            .search(
+                &search_headers(&[("provider", "exa"), ("unknown", "value")]),
+                query,
+            )
             .await
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("option is not supported by Exa: unknown")
-        );
-
-        let error = protocol
-            .search("search?provider=exa&limit=5&limit=10", query)
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("option appears more than once: limit")
+                .contains("header is not supported by Exa: unknown")
         );
 
         let error = protocol
             .search(
-                "search?provider=exa&category=company&start_published_date=2026-01-01",
+                &search_headers(&[("provider", "exa"), ("limit", "5"), ("limit", "10")]),
+                query,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("header appears more than once: limit")
+        );
+
+        let error = protocol
+            .search(
+                &search_headers(&[
+                    ("provider", "exa"),
+                    ("category", "company"),
+                    ("start_published_date", "2026-01-01"),
+                ]),
                 query,
             )
             .await
@@ -1657,13 +1728,21 @@ mod tests {
         assert!(!help.contains("defaults to `web`"));
 
         let error = protocol
-            .search("search?provider=parallel&limit=21", query)
+            .search(
+                &search_headers(&[("provider", "parallel"), ("limit", "21")]),
+                query,
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("limit must be between 1 and 20"));
 
         let input = SearchInput::parse(
-            "search?provider=parallel&include_domain=example.com&exclude_domain=example.org&location=sg",
+            &search_headers(&[
+                ("provider", "parallel"),
+                ("include_domain", "example.com"),
+                ("exclude_domain", "example.org"),
+                ("location", "sg"),
+            ]),
             query,
         )
         .unwrap();
@@ -1677,7 +1756,10 @@ mod tests {
         assert_eq!(options.mode, "advanced");
 
         let error = protocol
-            .search("search?provider=exa&max_characters=10001", query)
+            .search(
+                &search_headers(&[("provider", "exa"), ("max_characters", "10001")]),
+                query,
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("must not exceed 10000 for Exa"));
@@ -1741,7 +1823,16 @@ mod tests {
         let output = String::from_utf8(
             protocol
                 .search(
-                    "search?provider=tinyfish&limit=5&location=cn&language=zh&domain_type=news&recency_minutes=60&include_domain=example.com&purpose=release%20tracking",
+                    &search_headers(&[
+                        ("provider", "tinyfish"),
+                        ("limit", "5"),
+                        ("location", "cn"),
+                        ("language", "zh"),
+                        ("domain_type", "news"),
+                        ("recency_minutes", "60"),
+                        ("include_domain", "example.com"),
+                        ("purpose", "release tracking"),
+                    ]),
                     "rust language",
                 )
                 .await
@@ -1804,7 +1895,10 @@ mod tests {
 
         let output = String::from_utf8(
             protocol
-                .search("search?provider=tinyfish&limit=15", "paged")
+                .search(
+                    &search_headers(&[("provider", "tinyfish"), ("limit", "15")]),
+                    "paged",
+                )
                 .await
                 .unwrap(),
         )
@@ -1946,8 +2040,7 @@ mod tests {
             .with_credentials(PluginCredentials::new(manager))
             .with_search_urls(parallel_url, exa_url, tinyfish_url);
 
-        let output =
-            String::from_utf8(protocol.search("search", "fallback").await.unwrap()).unwrap();
+        let output = String::from_utf8(protocol.search(&[], "fallback").await.unwrap()).unwrap();
         assert!(output.starts_with(UNTRUSTED_WEB_CONTENT));
         assert!(output.contains("Found through TinyFish."));
         assert!(
@@ -1994,7 +2087,11 @@ mod tests {
 
         let error = protocol
             .search(
-                "search?provider=tinyfish&recency_minutes=60&after_date=2026-01-01",
+                &search_headers(&[
+                    ("provider", "tinyfish"),
+                    ("recency_minutes", "60"),
+                    ("after_date", "2026-01-01"),
+                ]),
                 query,
             )
             .await
@@ -2007,7 +2104,11 @@ mod tests {
 
         let error = protocol
             .search(
-                "search?provider=tinyfish&domain_type=research_paper&recency_minutes=60",
+                &search_headers(&[
+                    ("provider", "tinyfish"),
+                    ("domain_type", "research_paper"),
+                    ("recency_minutes", "60"),
+                ]),
                 query,
             )
             .await
@@ -2019,7 +2120,10 @@ mod tests {
         );
 
         let error = protocol
-            .search("search?provider=tinyfish&pub_year_min=2020", query)
+            .search(
+                &search_headers(&[("provider", "tinyfish"), ("pub_year_min", "2020")]),
+                query,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2030,7 +2134,12 @@ mod tests {
 
         let error = protocol
             .search(
-                "search?provider=tinyfish&domain_type=research_paper&pub_year_min=2025&pub_year_max=2020",
+                &search_headers(&[
+                    ("provider", "tinyfish"),
+                    ("domain_type", "research_paper"),
+                    ("pub_year_min", "2025"),
+                    ("pub_year_max", "2020"),
+                ]),
                 query,
             )
             .await
@@ -2043,7 +2152,11 @@ mod tests {
 
         let error = protocol
             .search(
-                "search?provider=tinyfish&after_date=2026-06-01&before_date=2026-01-01",
+                &search_headers(&[
+                    ("provider", "tinyfish"),
+                    ("after_date", "2026-06-01"),
+                    ("before_date", "2026-01-01"),
+                ]),
                 query,
             )
             .await
@@ -2055,7 +2168,10 @@ mod tests {
         );
 
         let error = protocol
-            .search("search?provider=tinyfish&language=english", query)
+            .search(
+                &search_headers(&[("provider", "tinyfish"), ("language", "english")]),
+                query,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2065,17 +2181,30 @@ mod tests {
         );
 
         let error = protocol
-            .search("search?provider=tinyfish&unknown=value", query)
+            .search(
+                &search_headers(&[("provider", "tinyfish"), ("unknown", "value")]),
+                query,
+            )
             .await
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("option is not supported by TinyFish: unknown")
+                .contains("header is not supported by TinyFish: unknown")
         );
 
         let input = SearchInput::parse(
-            "search?provider=tinyfish&include_domain=example.com&exclude_domain=example.org&location=us&language=en&domain_type=research_paper&pub_year_min=2017&pub_year_max=2020&purpose=find%20papers",
+            &search_headers(&[
+                ("provider", "tinyfish"),
+                ("include_domain", "example.com"),
+                ("exclude_domain", "example.org"),
+                ("location", "us"),
+                ("language", "en"),
+                ("domain_type", "research_paper"),
+                ("pub_year_min", "2017"),
+                ("pub_year_max", "2020"),
+                ("purpose", "find papers"),
+            ]),
             query,
         )
         .unwrap();

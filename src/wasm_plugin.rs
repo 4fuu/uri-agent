@@ -35,9 +35,10 @@ use uri_agent_plugin_sdk::{
     HOST_PLUGIN_STATE, HOST_READ, HandlerRequest, MANIFEST_EXPORT, Operation, PluginEvent,
     PluginManifest, PluginSettingGetResponse, PluginSettingSetRequest,
     PluginStateEntry as SdkPluginStateEntry, PluginStateRequest,
-    PluginStateScope as SdkPluginStateScope, ResidentEvent as SdkResidentEvent,
-    ResidentResponse as SdkResidentResponse, SubmitKind as SdkSubmitKind,
-    SystemPromptSelection as SdkSystemPromptSelection, SystemPromptUpdate as SdkSystemPromptUpdate,
+    PluginStateScope as SdkPluginStateScope, RequestHeader as SdkRequestHeader,
+    ResidentEvent as SdkResidentEvent, ResidentResponse as SdkResidentResponse,
+    SubmitKind as SdkSubmitKind, SystemPromptSelection as SdkSystemPromptSelection,
+    SystemPromptUpdate as SdkSystemPromptUpdate,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
@@ -152,7 +153,7 @@ fn author_help() -> String {
         r##"# wasm_plugin authoring
 
 Author WASM plugins that register protocols and typed direct model tools.
-The SDK and host use ABI version 6. Older ABIs are intentionally unsupported.
+The SDK and host use ABI version 8. Older ABIs are intentionally unsupported.
 
 ## Rust SDK
 
@@ -225,7 +226,8 @@ Prefer this path when structured or escape-heavy arguments would otherwise
 require nested protocol-body serialization.
 The SDK exports `uri_agent_manifest` and `uri_agent_handle`; plugin authors do
 not need to write ABI glue. `uri_agent_plugin_sdk::{{read, exec}}`
-let a plugin call URI Agent's built-in protocols using string bodies. Calls into
+let a plugin call URI Agent's built-in protocols with request headers and
+string bodies. Calls into
 dynamic WASM protocols and `wasm_plugin` itself are intentionally rejected to
 prevent recursive runtime entry.
 
@@ -330,6 +332,8 @@ struct HostBridge {
 #[derive(Deserialize)]
 struct HostRequest {
     uri: String,
+    #[serde(default)]
+    headers: Vec<SdkRequestHeader>,
     body: String,
 }
 
@@ -469,14 +473,27 @@ impl HostBridge {
         if name == MANAGER_PROTOCOL {
             bail!("WASM plugins cannot call {MANAGER_PROTOCOL} through the host API");
         }
+        let headers = request
+            .headers
+            .iter()
+            .map(|header| crate::protocol::RequestHeader::new(&header.name, &header.value))
+            .collect::<Vec<_>>();
         let registry =
             self.registry.get().and_then(Weak::upgrade).ok_or_else(|| {
                 anyhow!("WASM plugin host is not attached to the protocol registry")
             })?;
         self.runtime.block_on(async {
             match operation {
-                Operation::Read => registry.read_static(&request.uri, &request.body).await,
-                Operation::Exec => registry.exec_static(&request.uri, &request.body).await,
+                Operation::Read => {
+                    registry
+                        .read_static(&request.uri, &headers, &request.body)
+                        .await
+                }
+                Operation::Exec => {
+                    registry
+                        .exec_static(&request.uri, &headers, &request.body)
+                        .await
+                }
             }
         })
     }
@@ -1675,6 +1692,14 @@ impl WasmProtocol {
             operation,
             uri: request.uri.to_string(),
             target: request.target.to_string(),
+            headers: request
+                .headers
+                .iter()
+                .map(|header| SdkRequestHeader {
+                    name: header.name.clone(),
+                    value: header.value.clone(),
+                })
+                .collect(),
             body: request.body.to_string(),
         })?;
         call_wasm_handler(&self.runtime, &self.plugin_path, input).await
@@ -2328,6 +2353,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "first://still-running",
                     target: "still-running",
+                    headers: &[],
                     body: "",
                 },
                 ProtocolContext {
@@ -2503,7 +2529,7 @@ mod tests {
         assert!(author.contains("request_agent_access"));
         assert!(author.contains("request_state_access"));
         assert!(author.contains("with_resident"));
-        assert!(author.contains("ABI version 6"));
+        assert!(author.contains("ABI version 8"));
         assert!(!author.contains("subagent"));
         assert!(!author.contains("atomic enable step"));
 

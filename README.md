@@ -19,16 +19,16 @@ executing, and editing:
 
 ```text
 help(protocols: string[])
-protocol(request: string)
+protocol(requests: string[])
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`help` loads protocol contracts on demand. The `protocol` tool routes one
-fixed-format request string through URI protocols; a protocol that needs
-structured input takes complete serialized JSON as the raw body text. Typed
-tools handle structured or escape-heavy arguments. Trusted WASM plugins can
-add protocols and typed tools at runtime.
+`help` loads protocol contracts on demand. The `protocol` tool routes one to
+eight fixed-format request strings through URI protocols; a protocol that
+needs structured input takes complete serialized JSON as the raw body text.
+Typed tools handle structured or escape-heavy arguments. Trusted WASM plugins
+can add protocols and typed tools at runtime.
 
 > [!WARNING]
 > URI Agent is not a sandbox. File and shell protocols, and enabled WASM
@@ -48,7 +48,7 @@ supported providers.
   and trusted WASM plugins without changing runtime dispatch.
 - **Built-in MCP bridge:** connect stdio and Streamable HTTP servers with
   `:mcp`. Each server becomes an on-demand `<name>-mcp://` protocol, with
-  query-first arguments and a complete-JSON fallback for complex schemas.
+  header-first arguments and a complete-JSON fallback for complex schemas.
 - **ACP editor integration:** use URI Agent from compatible editors through
   stable ACP v1 over stdio. Each session can select its model, and its
   conversation can later reopen in the normal TUI.

@@ -194,7 +194,7 @@ impl ExaSearchOptions {
                     system_prompt = Some(require_text(value, name)?.to_string());
                 }
                 _ => bail!(
-                    "https://search option is not supported by Exa: {name}; read https://help/exa"
+                    "https://search header is not supported by Exa: {name}; read https://help/exa"
                 ),
             }
         }
@@ -203,17 +203,17 @@ impl ExaSearchOptions {
             bail!("Exa search accepts at most 1200 include or exclude domains");
         }
         if additional_queries.len() > 10 {
-            bail!("Exa search accepts at most 10 additional_query options");
+            bail!("Exa search accepts at most 10 additional_query headers");
         }
         if subpage_targets.len() > 100 {
-            bail!("Exa search accepts at most 100 subpage_target options");
+            bail!("Exa search accepts at most 100 subpage_target headers");
         }
         let search_type = search_type.unwrap_or_else(|| "auto".to_string());
         if !additional_queries.is_empty() && !search_type.starts_with("deep") {
             bail!("Exa additional_query requires a deep search type");
         }
         if !subpage_targets.is_empty() && subpages.unwrap_or(0) == 0 {
-            bail!("Exa subpage_target requires a positive subpages option");
+            bail!("Exa subpage_target requires a positive subpages header");
         }
         if matches!(category.as_deref(), Some("company" | "people"))
             && (!exclude_domains.is_empty()

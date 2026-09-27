@@ -146,7 +146,7 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
         .iter()
         .filter(|(name, _)| {
             !matches!(name.as_str(), "uri" | "body")
-                && !(protocol_request_consumed && *name == "request")
+                && !(protocol_request_consumed && *name == "requests")
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
@@ -246,7 +246,8 @@ fn longest_backtick_run(value: &str) -> usize {
 }
 
 /// Parses the `protocol` tool's fixed request format for display only: the
-/// `*** Read:`/`*** Exec:` verb, the address, and the raw request body.
+/// `*** Read:`/`*** Exec:` verb, the address, and the raw request body. Only
+/// the first request of a batch is previewed.
 struct ProtocolRequest<'a> {
     operation: &'a str,
     uri: &'a str,
@@ -254,7 +255,7 @@ struct ProtocolRequest<'a> {
 }
 
 fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolRequest<'_>> {
-    let request = arguments.get("request")?.as_str()?;
+    let request = arguments.get("requests")?.as_array()?.first()?.as_str()?;
     let mut offset = 0;
     let begin = next_request_line(request, &mut offset)?;
     if begin.trim_end() != "*** Begin Request" {
@@ -267,14 +268,28 @@ fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolReque
         return None;
     }
     let mut body = request.get(offset..).unwrap_or("");
-    if let Some(rest) = strip_legacy_body_header(body) {
-        body = rest;
+    loop {
+        let (line, rest) = body.split_once('\n').unwrap_or((body, ""));
+        let trimmed = line.trim_end_matches(['\r', ' ', '\t']);
+        if trimmed == "*** Body:" || is_header_line(trimmed) {
+            body = rest;
+        } else {
+            break;
+        }
     }
     Some(ProtocolRequest {
         operation,
         uri,
         body: strip_end_request(body),
     })
+}
+
+fn is_header_line(line: &str) -> bool {
+    line.strip_prefix("*** ")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(name, _)| {
+            !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+        })
 }
 
 fn next_request_line<'a>(text: &'a str, offset: &mut usize) -> Option<&'a str> {
@@ -288,11 +303,6 @@ fn next_request_line<'a>(text: &'a str, offset: &mut usize) -> Option<&'a str> {
     };
     *offset += consumed;
     Some(line)
-}
-
-fn strip_legacy_body_header(body: &str) -> Option<&str> {
-    let (line, rest) = body.split_once('\n').unwrap_or((body, ""));
-    (line.trim_end_matches(['\r', ' ', '\t']) == "*** Body:").then_some(rest)
 }
 
 fn strip_end_request(body: &str) -> &str {
@@ -498,7 +508,7 @@ pub(super) fn tool_argument_details(
 ) {
     if let Some(fields) = arguments.as_object() {
         for (key, value) in fields {
-            if matches!(key.as_str(), "uri" | "body" | "request") {
+            if matches!(key.as_str(), "uri" | "body" | "requests") {
                 continue;
             }
             if key == "patch"

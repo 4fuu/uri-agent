@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first call to any protocol.";
 
-pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with its `<protocol>://` address; the `request` parameter defines the fixed request format.";
+pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with its `<protocol>://` address; the `requests` parameter defines the fixed request format.";
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
@@ -33,11 +33,11 @@ pub fn system_prompt(
     write_entries(&mut prompt, protocols);
     prompt.push_str(
         "\nChoose a direct tool or a protocol as appropriate for the operation.\n\n\
-         Direct tools are called by name. Protocols are not tools: call them through the `protocol` tool with their <protocol>:// address, using the request format its `request` parameter defines.\n\n\
+         Direct tools are called by name. Protocols are not tools: call them through the `protocol` tool with their <protocol>:// address, using the request format its `requests` parameter defines.\n\n\
          Protocol rules:\n\
          - Load help first. Before the first call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
          - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
-         - Protocol request format: `*** Begin Request`, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional body lines, then a final `*** End Request` line. The closing line is required even when the operation takes no body.\n\
+         - Protocol request format: `*** Begin Request`, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional `*** name: value` header lines, a `*** Body:` separator line when headers are present, optional body lines, then a final `*** End Request` line. The closing line is required even when the operation takes no body.\n\
          - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n",
     );
     prompt.push_str(
@@ -141,7 +141,7 @@ mod tests {
         assert!(prompt.contains(
             "Direct tools are called by name. Protocols are not tools: call them through the \
              `protocol` tool with their <protocol>:// address, using the request format its \
-             `request` parameter defines."
+             `requests` parameter defines."
         ));
         assert!(
             prompt.find("Direct tools are called by name.").unwrap()

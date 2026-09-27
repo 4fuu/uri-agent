@@ -1,7 +1,9 @@
 use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, PluginRegistry};
 use crate::process::{PWSH_STDIN_BOOTSTRAP, ProcessTree};
 use crate::prompts;
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest, RequestHeader,
+};
 use crate::task::{AutoTask, TaskControls, TaskInput, TaskManager};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -48,33 +50,41 @@ cargo test
 
 If a foreground command is still running after about 60 seconds, URI Agent
 automatically converts the same process into a background task without
-restarting it. Use `background=true` to return a task immediately:
+restarting it. Shell options travel as `*** name: value` request header lines
+between the operation line and the `*** Body:` separator. Use a
+`background: true` header to return a task immediately:
 
 ```text
 *** Begin Request
-*** Exec: bash://run?background=true
+*** Exec: bash://run
+*** background: true
+*** Body:
 cargo test
 *** End Request
 ```
 
-Foreground and background commands share one execution timeout. `timeout` is
-an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
-and `timeout=0` disables the timeout:
+Foreground and background commands share one execution timeout. A `timeout`
+header carries an integer number of seconds; omission defaults to 1800
+seconds (30 minutes), and `timeout: 0` disables the timeout:
 
 ```text
 *** Begin Request
-*** Exec: bash://run?timeout=120
+*** Exec: bash://run
+*** timeout: 120
+*** Body:
 cargo test
 *** End Request
 ```
 
 Commands that need runtime input (confirmation prompts, passwords, REPLs)
-must run with `interactive=true`. Interactive commands are always managed
-background tasks and keep their stdin open:
+must run with an `interactive: true` header. Interactive commands are always
+managed background tasks and keep their stdin open:
 
 ```text
 *** Begin Request
-*** Exec: bash://run?interactive=true
+*** Exec: bash://run
+*** interactive: true
+*** Body:
 mysql -u root -p
 *** End Request
 ```
@@ -86,8 +96,8 @@ the final `*** End Request` belongs to the request format and is not sent, so
 add one extra empty line before it to end input with a newline. Close
 stdin with an `*** Exec: tasks://<id>/eof` request and interrupt with an
 `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
-running while the command waits for input; use `timeout=0` for an open-ended
-interactive command.
+running while the command waits for input; use a `timeout: 0` header for an
+open-ended interactive command.
 
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
@@ -137,26 +147,32 @@ Get-ChildItem -Path . -Force
 
 If a foreground command is still running after about 60 seconds, URI Agent
 automatically converts the same process into a background task without
-restarting it. Use `background=true` to return a task immediately:
+restarting it. Shell options travel as `*** name: value` request header lines
+between the operation line and the `*** Body:` separator. Use a
+`background: true` header to return a task immediately:
 
 ```text
 *** Begin Request
-*** Exec: pwsh://run?background=true
+*** Exec: pwsh://run
+*** background: true
+*** Body:
 cargo test
 *** End Request
 ```
 
-Foreground and background commands share one execution timeout. `timeout` is
-an integer number of seconds; omission defaults to 1800 seconds (30 minutes),
-and `timeout=0` disables the timeout.
+Foreground and background commands share one execution timeout. A `timeout`
+header carries an integer number of seconds; omission defaults to 1800
+seconds (30 minutes), and `timeout: 0` disables the timeout.
 
 Commands that need runtime input (confirmation prompts, passwords, REPLs)
-must run with `interactive=true`. Interactive commands are always managed
-background tasks and keep their stdin open:
+must run with an `interactive: true` header. Interactive commands are always
+managed background tasks and keep their stdin open:
 
 ```text
 *** Begin Request
-*** Exec: pwsh://run?interactive=true
+*** Exec: pwsh://run
+*** interactive: true
+*** Body:
 $token = Read-Host 'Token'
 *** End Request
 ```
@@ -168,8 +184,8 @@ the final `*** End Request` belongs to the request format and is not sent, so
 add one extra empty line before it to end input with a newline. Close
 stdin with an `*** Exec: tasks://<id>/eof` request and interrupt with an
 `*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
-running while the command waits for input; use `timeout=0` for an open-ended
-interactive command.
+running while the command waits for input; use a `timeout: 0` header for an
+open-ended interactive command.
 
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
@@ -368,6 +384,9 @@ impl Protocol for ShellProtocol {
                 self.name
             );
         }
+        if !request.headers.is_empty() {
+            bail!("{0}://help accepts no request headers", self.name);
+        }
         if !request.body.is_empty() {
             bail!("{0}://help requires an empty body", self.name);
         }
@@ -397,7 +416,12 @@ impl ShellProtocol {
         context: ProtocolContext,
         auto_background_after: Duration,
     ) -> Result<Vec<u8>> {
-        let options = parse_target(request.target).with_context(|| {
+        let options = if request.target == "run" {
+            parse_options(request.headers)
+        } else {
+            Err(anyhow!("expected shell target run"))
+        }
+        .with_context(|| {
             format!(
                 r#"invalid {0} exec; use an `*** Exec: {0}://run` request"#,
                 self.name
@@ -473,58 +497,47 @@ impl ShellProtocol {
     }
 }
 
-fn parse_target(target: &str) -> Result<ShellOptions> {
-    let (route, query) = target
-        .split_once('?')
-        .map_or((target, None), |(route, query)| (route, Some(query)));
-    if route != "run" {
-        bail!("expected shell target run");
-    }
+fn parse_options(headers: &[RequestHeader]) -> Result<ShellOptions> {
     let mut background = false;
     let mut timeout = DEFAULT_TIMEOUT;
     let mut interactive = false;
     let mut saw_background = false;
     let mut saw_timeout = false;
     let mut saw_interactive = false;
-    if let Some(query) = query {
-        if query.is_empty() {
-            bail!("shell query cannot be empty");
-        }
-        for option in query.split('&') {
-            let (name, value) = option
-                .split_once('=')
-                .ok_or_else(|| anyhow!("shell options must use name=value"))?;
-            match name {
-                "background" if !saw_background => {
-                    background = match value {
-                        "true" => true,
-                        "false" => false,
-                        _ => bail!("shell background must be true or false"),
-                    };
-                    saw_background = true;
-                }
-                "timeout" if !saw_timeout => {
-                    timeout = Duration::from_secs(value.parse::<u64>().map_err(|_| {
+    for header in headers {
+        let name = header.name.as_str();
+        let value = header.value.trim();
+        match name {
+            "background" if !saw_background => {
+                background = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => bail!("shell background must be true or false"),
+                };
+                saw_background = true;
+            }
+            "timeout" if !saw_timeout => {
+                timeout =
+                    Duration::from_secs(value.parse::<u64>().map_err(|_| {
                         anyhow!("shell timeout must be an integer number of seconds")
                     })?);
-                    saw_timeout = true;
-                }
-                "interactive" if !saw_interactive => {
-                    interactive = match value {
-                        "true" => true,
-                        "false" => false,
-                        _ => bail!("shell interactive must be true or false"),
-                    };
-                    saw_interactive = true;
-                }
-                "background" | "timeout" | "interactive" => bail!("duplicate shell option: {name}"),
-                _ => bail!("unknown shell option: {name}"),
+                saw_timeout = true;
             }
+            "interactive" if !saw_interactive => {
+                interactive = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => bail!("shell interactive must be true or false"),
+                };
+                saw_interactive = true;
+            }
+            "background" | "timeout" | "interactive" => bail!("duplicate shell header: {name}"),
+            _ => bail!("unknown shell header: {name}"),
         }
     }
     if interactive && saw_background && !background {
         bail!(
-            "interactive input requires background execution; omit background or use background=true"
+            "interactive input requires background execution; omit the background header or use `background: true`"
         );
     }
     Ok(ShellOptions {
@@ -1035,9 +1048,9 @@ mod tests {
         assert!(PWSH_HELP.contains("`*** Read:` requests support no shell operations"));
         assert!(PWSH_HELP.contains("request body MUST\ncontain at least one non-whitespace"));
         assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
-        assert!(PWSH_HELP.contains("`background=true`"));
-        assert!(PWSH_HELP.contains("`timeout` is\nan integer number of seconds"));
-        assert!(PWSH_HELP.contains("`interactive=true`"));
+        assert!(PWSH_HELP.contains("`background: true`"));
+        assert!(PWSH_HELP.contains("`timeout`\nheader carries an integer number of seconds"));
+        assert!(PWSH_HELP.contains("`interactive: true`"));
         assert!(PWSH_HELP.contains("tasks://<id>/send"));
         assert!(PWSH_HELP.contains(
             "the newline before\nthe final `*** End Request` belongs to the request format and is not sent"
@@ -1053,9 +1066,9 @@ mod tests {
         assert!(BASH_HELP.contains("`*** Read:` requests support no shell operations"));
         assert!(BASH_HELP.contains("request body MUST\ncontain at least one non-whitespace"));
         assert!(BASH_HELP.contains("MUST NOT add another background layer"));
-        assert!(BASH_HELP.contains("`background=true`"));
-        assert!(BASH_HELP.contains("`timeout=0` disables the timeout"));
-        assert!(BASH_HELP.contains("`interactive=true`"));
+        assert!(BASH_HELP.contains("`background: true`"));
+        assert!(BASH_HELP.contains("`timeout: 0` disables the timeout"));
+        assert!(BASH_HELP.contains("`interactive: true`"));
         assert!(BASH_HELP.contains("tasks://<id>/send"));
         assert!(BASH_HELP.contains(
             "the newline before\nthe final `*** End Request` belongs to the request format and is not sent"
@@ -1069,13 +1082,14 @@ mod tests {
         assert!(BASH_HELP.contains("Child processes\nremain owned by this execution"));
         assert!(BASH_HELP.contains("unified `tasks://` protocol"));
         assert!(!BASH_HELP.contains("?wait="));
+        assert!(!BASH_HELP.contains("?background="));
         assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }
 
     #[test]
-    fn shell_plugin_parses_background_and_timeout_options() {
+    fn shell_plugin_parses_background_and_timeout_headers() {
         assert_eq!(
-            parse_target("run").unwrap(),
+            parse_options(&[]).unwrap(),
             ShellOptions {
                 background: false,
                 timeout: Some(DEFAULT_TIMEOUT),
@@ -1083,7 +1097,11 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_target("run?background=true&timeout=0").unwrap(),
+            parse_options(&[
+                RequestHeader::new("background", "true"),
+                RequestHeader::new("timeout", "0"),
+            ])
+            .unwrap(),
             ShellOptions {
                 background: true,
                 timeout: None,
@@ -1091,24 +1109,34 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_target("run?timeout=30&background=false").unwrap(),
+            parse_options(&[
+                RequestHeader::new("timeout", "30"),
+                RequestHeader::new("background", "false"),
+            ])
+            .unwrap(),
             ShellOptions {
                 background: false,
                 timeout: Some(Duration::from_secs(30)),
                 interactive: false,
             }
         );
-        assert!(parse_target("run?timeout=not-a-number").is_err());
-        assert!(parse_target("run?background=yes").is_err());
-        assert!(parse_target("run?timeout=1&timeout=2").is_err());
-        assert!(parse_target("run?other=30").is_err());
-        assert!(parse_target("?timeout=30").is_err());
+        assert!(parse_options(&[RequestHeader::new("timeout", "not-a-number")]).is_err());
+        assert!(parse_options(&[RequestHeader::new("background", "yes")]).is_err());
+        assert!(
+            parse_options(&[
+                RequestHeader::new("timeout", "1"),
+                RequestHeader::new("timeout", "2"),
+            ])
+            .is_err()
+        );
+        let error = parse_options(&[RequestHeader::new("other", "30")]).unwrap_err();
+        assert!(error.to_string().contains("unknown shell header: other"));
     }
 
     #[test]
-    fn shell_interactive_option_implies_background_execution() {
+    fn shell_interactive_header_implies_background_execution() {
         assert_eq!(
-            parse_target("run?interactive=true").unwrap(),
+            parse_options(&[RequestHeader::new("interactive", "true")]).unwrap(),
             ShellOptions {
                 background: true,
                 timeout: Some(DEFAULT_TIMEOUT),
@@ -1116,7 +1144,12 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_target("run?interactive=true&background=true&timeout=0").unwrap(),
+            parse_options(&[
+                RequestHeader::new("interactive", "true"),
+                RequestHeader::new("background", "true"),
+                RequestHeader::new("timeout", "0"),
+            ])
+            .unwrap(),
             ShellOptions {
                 background: true,
                 timeout: None,
@@ -1124,16 +1157,28 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_target("run?interactive=false").unwrap(),
+            parse_options(&[RequestHeader::new("interactive", "false")]).unwrap(),
             ShellOptions {
                 background: false,
                 timeout: Some(DEFAULT_TIMEOUT),
                 interactive: false,
             }
         );
-        assert!(parse_target("run?interactive=true&background=false").is_err());
-        assert!(parse_target("run?interactive=1").is_err());
-        assert!(parse_target("run?interactive=true&interactive=true").is_err());
+        assert!(
+            parse_options(&[
+                RequestHeader::new("interactive", "true"),
+                RequestHeader::new("background", "false"),
+            ])
+            .is_err()
+        );
+        assert!(parse_options(&[RequestHeader::new("interactive", "1")]).is_err());
+        assert!(
+            parse_options(&[
+                RequestHeader::new("interactive", "true"),
+                RequestHeader::new("interactive", "true"),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1158,6 +1203,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "bash://run",
                     target: "run",
+                    headers: &[],
                     body: "cargo test",
                 },
                 context.clone(),
@@ -1175,6 +1221,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "bash://help",
                     target: "help",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -1188,6 +1235,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "bash://run",
                     target: "run",
+                    headers: &[],
                     body: " \n\t",
                 },
                 context,
@@ -1372,8 +1420,9 @@ mod tests {
         shell
             .exec(
                 ProtocolRequest {
-                    uri: "pwsh://run?background=true",
-                    target: "run?background=true",
+                    uri: "pwsh://run",
+                    target: "run",
+                    headers: &[RequestHeader::new("background", "true")],
                     body: &script,
                 },
                 context.clone(),
@@ -1391,6 +1440,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001",
                     target: "001",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -1449,6 +1499,7 @@ mod tests {
                 ProtocolRequest {
                     uri: &run_uri,
                     target: "run",
+                    headers: &[],
                     body: short,
                 },
                 context.clone(),
@@ -1467,6 +1518,7 @@ mod tests {
                 ProtocolRequest {
                     uri: &run_uri,
                     target: "run",
+                    headers: &[],
                     body: delayed,
                 },
                 context.clone(),
@@ -1479,13 +1531,13 @@ mod tests {
         assert!(accepted.contains("Background task started: tasks://002"));
         assert!(accepted.contains("then use one bounded wait. Do not poll or rerun"));
 
-        let background_uri = format!("{protocol}://run?background=true");
         let started = Instant::now();
         let accepted = shell
             .exec(
                 ProtocolRequest {
-                    uri: &background_uri,
-                    target: "run?background=true",
+                    uri: &run_uri,
+                    target: "run",
+                    headers: &[RequestHeader::new("background", "true")],
                     body: explicit,
                 },
                 context.clone(),
@@ -1540,13 +1592,14 @@ mod tests {
         let context = ProtocolContext {
             tasks: TaskManager::new(),
         };
-        let interactive_uri = format!("{protocol}://run?interactive=true");
+        let interactive_uri = format!("{protocol}://run");
 
         let accepted = shell
             .exec(
                 ProtocolRequest {
                     uri: &interactive_uri,
-                    target: "run?interactive=true",
+                    target: "run",
+                    headers: &[RequestHeader::new("interactive", "true")],
                     body: line_script,
                 },
                 context.clone(),
@@ -1563,6 +1616,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/send",
                     target: "001/send",
+                    headers: &[],
                     body: "hello\n",
                 },
                 context.clone(),
@@ -1583,12 +1637,15 @@ mod tests {
         let output = String::from_utf8(record.content).unwrap();
         assert!(output.contains("got:hello"), "{output}");
 
-        let interactive_eof_uri = format!("{protocol}://run?interactive=true&timeout=60");
         shell
             .exec(
                 ProtocolRequest {
-                    uri: &interactive_eof_uri,
-                    target: "run?interactive=true&timeout=60",
+                    uri: &interactive_uri,
+                    target: "run",
+                    headers: &[
+                        RequestHeader::new("interactive", "true"),
+                        RequestHeader::new("timeout", "60"),
+                    ],
                     body: bulk_script,
                 },
                 context.clone(),
@@ -1600,6 +1657,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://002/send",
                     target: "002/send",
+                    headers: &[],
                     body: "abc\n",
                 },
                 context.clone(),
@@ -1611,6 +1669,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://002/eof",
                     target: "002/eof",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -1651,8 +1710,12 @@ mod tests {
         shell
             .exec(
                 ProtocolRequest {
-                    uri: "bash://run?interactive=true&timeout=1",
-                    target: "run?interactive=true&timeout=1",
+                    uri: "bash://run",
+                    target: "run",
+                    headers: &[
+                        RequestHeader::new("interactive", "true"),
+                        RequestHeader::new("timeout", "1"),
+                    ],
                     body: "printf waiting; IFS= read -r line",
                 },
                 context.clone(),
@@ -1691,8 +1754,12 @@ mod tests {
         shell
             .exec(
                 ProtocolRequest {
-                    uri: "bash://run?interactive=true&timeout=60",
-                    target: "run?interactive=true&timeout=60",
+                    uri: "bash://run",
+                    target: "run",
+                    headers: &[
+                        RequestHeader::new("interactive", "true"),
+                        RequestHeader::new("timeout", "60"),
+                    ],
                     body: script,
                 },
                 context.clone(),
@@ -1720,6 +1787,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/interrupt",
                     target: "001/interrupt",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -1947,6 +2015,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "bash://run",
                     target: "run",
+                    headers: &[],
                     body: &command,
                 },
                 context.clone(),

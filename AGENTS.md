@@ -9,19 +9,23 @@ interface. The linked built-ins provide:
 
 ```text
 help(protocols: string[])
-protocol(request: string)
+protocol(requests: string[])
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
 `help` loads one or more protocols' model-facing contract pages; every other
 protocol call requires that protocol's contract to be loaded first. The `read`
-and `exec` tools are merged into `protocol`, which takes one fixed-format
-request string: a `*** Begin Request` line, one `*** Read: <address>` or
-`*** Exec: <address>` line, optional raw body lines, and a `*** End Request`
+and `exec` tools are merged into `protocol`, which takes one to eight
+fixed-format request strings and executes them in order. Each request is a
+`*** Begin Request` line, one `*** Read: <address>` or `*** Exec: <address>`
+line, optional `*** name: value` header lines, a `*** Body:` separator line
+when any header is present, optional raw body lines, and a `*** End Request`
 line. The request ends at the last `*** End Request` line; the lines between
-the operation line and it are the body and are never escaped. A leading
-`*** Body:` line is still accepted and ignored.
+the header section (or the operation line) and it are the body and are never
+escaped. Header names are ASCII letters, digits, `-`, and `_`; each protocol's
+help page lists the headers it accepts, and comparable numeric headers accept
+a comparison prefix such as `>=10`.
 A protocol that needs structured input takes complete serialized JSON as that
 raw body text.
 Capabilities with simple string input are registered as protocols and publish

@@ -14,12 +14,12 @@ URI Agent 是一个可扩展的终端编程 Agent，让模型上下文集中在�
 
 ```text
 help(protocols: string[])
-protocol(request: string)
+protocol(requests: string[])
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`help` 按需加载协议契约。`protocol` 工具通过 URI 协议路由一条固定格式的请求字符串；需要结构化输入的协议以完整序列化 JSON 作为原始请求体。结构复杂或需要大量转义的参数由有类型工具处理。可信 WASM 插件可以在运行时添加协议和有类型工具。
+`help` 按需加载协议契约。`protocol` 工具通过 URI 协议路由一到八条固定格式的请求字符串；需要结构化输入的协议以完整序列化 JSON 作为原始请求体。结构复杂或需要大量转义的参数由有类型工具处理。可信 WASM 插件可以在运行时添加协议和有类型工具。
 
 > [!WARNING]
 > URI Agent 不提供沙箱。文件与 Shell 协议以及已启用的 WASM 插件都拥有 `uri-agent` 进程的用户权限。请只使用可信的项目、配置和插件。
@@ -30,7 +30,7 @@ URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变�
 
 - **渐进式上下文：**仅在需要时加载协议契约、Skill 资源、内置文档和超长输出。
 - **可扩展工具：**通过内置 Rust 插件和可信 WASM 插件添加协议或有类型工具，无需修改运行时分发逻辑。
-- **内置 MCP 桥接：**使用 `:mcp` 连接 stdio 和 Streamable HTTP 服务器。每个服务器都会成为按需加载的 `<name>-mcp://` 协议；简单参数优先使用查询字符串，复杂参数可使用完整 JSON。
+- **内置 MCP 桥接：**使用 `:mcp` 连接 stdio 和 Streamable HTTP 服务器。每个服务器都会成为按需加载的 `<name>-mcp://` 协议；简单参数优先使用请求头，复杂参数可使用完整 JSON。
 - **ACP 编辑器集成：**通过稳定的 ACP v1 stdio 接口，在兼容的编辑器中使用 URI Agent。每个会话都能选择模型，对话之后还可以在普通 TUI 中重新打开。
 - **广泛模型支持：**直接在模型选择器中使用 pi.dev 目录、模型服务商专属登录和账户模型实时发现。
 - **持久化工作：**让长命令作为受管任务继续运行，并在重启后恢复工作。仅追加的 SQLite 会话会保留草稿、固化的启动上下文、有标题的工作笔记，以及上下文滚动或摘要检查点。

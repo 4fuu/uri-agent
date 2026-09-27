@@ -128,8 +128,10 @@ URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
   special-case tool names.
 - Every tool is declared and installed by a plugin. Protocol names and tool
   names are unique.
-- `protocol` calls always receive a string body. The registry splits only the
-  first `://` and passes the opaque remainder and body unchanged.
+- `protocol` calls always receive parsed request headers and a string body.
+  The registry splits only the first `://` and passes the opaque remainder,
+  headers, and body unchanged; protocols that do not opt into headers have
+  them rejected.
 - Every protocol implements its mandatory help page. Exact protocol behavior
   belongs to that page, loaded through the `help` tool; implementation, tests,
   and help change together.

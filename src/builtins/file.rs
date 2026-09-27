@@ -6,7 +6,7 @@ use crate::plugin::{
 };
 use crate::protocol::{
     Protocol, ProtocolContext, ProtocolDescriptor, ProtocolImage, ProtocolImageMediaType,
-    ProtocolReadOutput, ProtocolRequest,
+    ProtocolReadOutput, ProtocolRequest, RequestHeader,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -36,29 +36,29 @@ Current working directory: `file://{}`
   from the current working directory. On Unix, `~` and paths beginning with
   `~/` resolve from the current user's home directory; `~user` is not expanded.
 - PNG, JPEG, GIF, and WebP files are detected from their contents and returned
-  as images for models that accept image input. Image reads do not accept query
-  parameters.
-- Add `?offset=<line>&limit=<count>` to read a bounded text range. `<line>` is the
-  one-based starting line or directory-entry position, and `<count>` is the
-  maximum number of lines or entries to return. The default is 200 and the
-  maximum is 2000.
-- Query parameters use `=` between the name and value, not `>` or `<`. Angle
-  brackets in examples are placeholders; for example, use
-  `file://src/builtins/shell.rs?offset=1&limit=100`.
-- Add `?tail=<count>` to efficiently read the last lines of a text file. The
-  maximum is 2000. `tail` cannot be combined with `offset`, `limit`, or `glob`.
-- Add `?line_numbers=true` to prefix file content with its original one-based
-  line numbers. Line numbers are disabled by default and cannot be combined
-  with `glob`.
-- Add `?glob=<pattern>` to a directory address to list matching files
-  recursively with standard ignore rules. Patterns are relative to that
-  directory; for example, `file://src?glob=**/*.rs`. A glob scans at most
-  50000 files; narrow the root for larger trees.
-- Query values use form encoding: percent escapes and `+` as space. The path
-  portion is never percent-decoded.
-- Unknown, duplicate, malformed, or invalid query parameters are rejected;
-  out-of-range numeric values are clamped to their bounds.
-- Paginated file, directory, and glob reads return an exact `Next:` address.
+  as images for models that accept image input. Image reads do not accept
+  request headers.
+- Options are passed as `*** name: value` request headers between the
+  `*** Read:` line and the `*** End Request` line; the numeric values behave
+  as documented below. Header values are raw text and are never
+  percent-decoded.
+- Add `*** offset: <line>` and `*** limit: <count>` headers to read a bounded
+  text range. `<line>` is the one-based starting line or directory-entry
+  position, and `<count>` is the maximum number of lines or entries to return.
+  The default is 200 and the maximum is 2000.
+- Add a `*** tail: <count>` header to efficiently read the last lines of a
+  text file. The maximum is 2000. `tail` cannot be combined with `offset`,
+  `limit`, or `glob`.
+- Add a `*** line_numbers: true` header to prefix file content with its
+  original one-based line numbers. Line numbers are disabled by default and
+  cannot be combined with `glob`.
+- Add a `*** glob: <pattern>` header to a directory read to list matching
+  files recursively with standard ignore rules. Patterns are relative to that
+  directory; for example, `file://src` with a `*** glob: **/*.rs` header. A
+  glob scans at most 50000 files; narrow the root for larger trees.
+- Unknown, duplicate, malformed, or invalid headers are rejected; out-of-range
+  numeric values are clamped to their bounds.
+- Paginated file, directory, and glob reads return an exact `Next:` request.
   Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
@@ -102,9 +102,8 @@ impl FileProtocol {
             return Ok(help(&self.cwd).into_bytes().into());
         }
 
-        let (target, query) = split_query(request.target);
-        let path = resolve_path(&self.cwd, target)?;
-        let range = Range::parse(query)?;
+        let path = resolve_path(&self.cwd, request.target)?;
+        let range = Range::parse(request.headers)?;
         let metadata = fs::metadata(&path)
             .await
             .with_context(|| format!("cannot read {}", display_path(&path)))?;
@@ -125,7 +124,7 @@ impl FileProtocol {
             }
             Ok(read_directory(&path, request.uri, range).await?.into())
         } else if metadata.is_file() {
-            read_file(&path, request.uri, query.is_some(), range).await
+            read_file(&path, request.uri, !request.headers.is_empty(), range).await
         } else {
             bail!("not a regular file or directory: {}", display_path(&path))
         }
@@ -332,13 +331,6 @@ pub(crate) fn resolve_path(cwd: &Path, target: &str) -> Result<PathBuf> {
     }
 }
 
-fn split_query(target: &str) -> (&str, Option<&str>) {
-    match target.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (target, None),
-    }
-}
-
 #[derive(Clone)]
 struct Range {
     offset: usize,
@@ -349,18 +341,20 @@ struct Range {
 }
 
 impl Range {
-    fn parse(query: Option<&str>) -> Result<Self> {
+    fn parse(headers: &[RequestHeader]) -> Result<Self> {
         let mut offset = 1_usize;
         let mut limit = DEFAULT_LIMIT;
         let mut tail = None;
         let mut line_numbers = false;
         let mut glob = None;
         let mut seen = std::collections::HashSet::new();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        for header in headers {
+            let key = header.name.as_str();
+            let value = header.value.as_str();
             if !seen.insert(key.to_string()) {
-                bail!("duplicate file query parameter: {key}");
+                bail!("duplicate file header: {key}");
             }
-            match key.as_ref() {
+            match key {
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -382,7 +376,7 @@ impl Range {
                     )
                 }
                 "line_numbers" => {
-                    line_numbers = match value.as_ref() {
+                    line_numbers = match value {
                         "true" => true,
                         "false" => false,
                         _ => bail!("invalid line_numbers: {value}; expected true or false"),
@@ -392,9 +386,9 @@ impl Range {
                     if value.is_empty() {
                         bail!("file glob pattern cannot be empty");
                     }
-                    glob = Some(value.into_owned());
+                    glob = Some(value.to_string());
                 }
-                _ => bail!("unknown file query parameter: {key}"),
+                _ => bail!("unknown file header: {key}"),
             }
         }
         if tail.is_some()
@@ -438,12 +432,12 @@ async fn read_glob(
         output.push('\n');
     }
     if end < entries.len() {
-        let base = uri.split_once('?').map_or(uri, |(base, _)| base);
-        let mut query = form_urlencoded::Serializer::new(String::new());
-        query.append_pair("glob", &pattern);
-        query.append_pair("offset", &(end + 1).to_string());
-        query.append_pair("limit", &range.limit.to_string());
-        let _ = writeln!(output, "\nNext: {}?{}", base, query.finish());
+        let _ = writeln!(
+            output,
+            "\nNext:\n*** Begin Request\n*** Read: {uri}\n*** glob: {pattern}\n*** offset: {}\n*** limit: {}\n*** End Request",
+            end + 1,
+            range.limit
+        );
     }
     Ok(output.into_bytes())
 }
@@ -485,7 +479,7 @@ fn glob_output_path(cwd: &Path, path: &Path) -> String {
 async fn read_file(
     path: &Path,
     uri: &str,
-    has_query: bool,
+    has_headers: bool,
     range: Range,
 ) -> Result<ProtocolReadOutput> {
     if let Some(tail) = range.tail {
@@ -495,8 +489,8 @@ async fn read_file(
         .await
         .with_context(|| format!("cannot read {}", display_path(path)))?;
     if let Some(media_type) = ProtocolImageMediaType::detect(&content) {
-        if has_query {
-            bail!("file query parameters are not supported for image reads");
+        if has_headers {
+            bail!("file headers are not supported for image reads");
         }
         let size = content.len();
         let output = format!(
@@ -528,19 +522,16 @@ async fn read_file(
     }
 
     if end < lines.len() {
-        let base = uri.split_once('?').map_or(uri, |(base, _)| base);
         let line_numbers = if range.line_numbers {
-            "&line_numbers=true"
+            "*** line_numbers: true\n"
         } else {
             ""
         };
         let _ = writeln!(
             output,
-            "\nNext: {}?offset={}&limit={}{}",
-            base,
+            "\nNext:\n*** Begin Request\n*** Read: {uri}\n*** offset: {}\n*** limit: {}\n{line_numbers}*** End Request",
             end + 1,
-            range.limit,
-            line_numbers
+            range.limit
         );
     }
     Ok(output.into_bytes().into())
@@ -601,7 +592,7 @@ fn read_tail(path: &Path, count: usize, count_all_lines: bool) -> Result<TailRea
     file.read_exact(&mut header[..header_length])
         .with_context(|| format!("cannot read {}", display_path(path)))?;
     if ProtocolImageMediaType::detect(&header[..header_length]).is_some() {
-        bail!("file query parameters are not supported for image reads");
+        bail!("file headers are not supported for image reads");
     }
 
     let mut position = length;
@@ -703,11 +694,9 @@ async fn read_directory(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>>
         output.push('\n');
     }
     if end < entries.len() {
-        let base = uri.split_once('?').map_or(uri, |(base, _)| base);
         let _ = writeln!(
             output,
-            "\nNext: {}?offset={}&limit={}",
-            base,
+            "\nNext:\n*** Begin Request\n*** Read: {uri}\n*** offset: {}\n*** limit: {}\n*** End Request",
             end + 1,
             range.limit
         );
@@ -724,26 +713,18 @@ mod tests {
         let help = help(Path::new(r"\\?\C:\Users\4fu\project"));
         assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
         assert!(help.contains("`file://<path>`"));
-        assert!(help.contains("`?offset=<line>&limit=<count>`"));
-        assert!(
-            help.contains("Query parameters use `=` between the name and value, not `>` or `<`.")
-        );
-        assert!(help.contains("file://src/builtins/shell.rs?offset=1&limit=100"));
-        assert!(help.contains("`?tail=<count>`"));
-        assert!(help.contains("`tail` cannot be combined with `offset`, `limit`, or `glob`"));
-        assert!(help.contains("`?line_numbers=true`"));
-        assert!(help.contains("Line numbers are disabled by default and cannot be combined"));
-        assert!(help.contains("with `glob`."));
+        assert!(help.contains("`*** offset: <line>` and `*** limit: <count>` headers"));
+        assert!(help.contains("Options are passed as `*** name: value` request headers"));
+        assert!(help.contains("Header values are raw text and are never"));
+        assert!(help.contains("`*** tail: <count>`"));
+        assert!(help.contains("`tail` cannot be combined with `offset`,"));
+        assert!(help.contains("`*** line_numbers: true`"));
+        assert!(help.contains("Line numbers are disabled by default and"));
+        assert!(help.contains("cannot be combined with `glob`."));
         assert!(help.contains("PNG, JPEG, GIF, and WebP"));
-        assert!(help.contains("Image reads do not accept query"));
-        assert!(help.contains("`?glob=<pattern>`"));
-        assert!(help.contains("form encoding: percent escapes and `+` as space"));
-        assert!(help.contains("The path\n  portion is never percent-decoded"));
-        assert!(
-            help.contains(
-                "Unknown, duplicate, malformed, or invalid query parameters are rejected;"
-            )
-        );
+        assert!(help.contains("Image reads do not accept\n  request headers"));
+        assert!(help.contains("`*** glob: <pattern>`"));
+        assert!(help.contains("Unknown, duplicate, malformed, or invalid headers are rejected;"));
         assert!(help.contains("paths beginning with\n  `~/` resolve"));
         assert!(help.contains("`~user` is not expanded"));
         assert!(help.contains("Every `file` read"));
@@ -800,6 +781,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "file://",
                     target: "",
+                    headers: &[],
                     body: "src/lib.rs",
                 },
                 ProtocolContext {
@@ -814,51 +796,117 @@ mod tests {
 
     #[test]
     fn ranges_are_one_based_and_bounded() {
-        let range = Range::parse(Some("offset=0&limit=99999")).unwrap();
+        let range = Range::parse(&[
+            RequestHeader::new("offset", "0"),
+            RequestHeader::new("limit", "99999"),
+        ])
+        .unwrap();
         assert_eq!(range.offset, 1);
         assert_eq!(range.limit, MAX_LIMIT);
         assert_eq!(range.tail, None);
         assert!(!range.line_numbers);
-        assert!(Range::parse(Some("offset=1&offset=2")).is_err());
-        assert!(Range::parse(Some("limit=1&limit=2")).is_err());
-        assert!(Range::parse(Some("tail=1&tail=2")).is_err());
-        assert!(Range::parse(Some("line_numbers=true&line_numbers=false")).is_err());
-        assert!(Range::parse(Some("glob=*.rs&glob=*.md")).is_err());
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("offset", "1"),
+                RequestHeader::new("offset", "2")
+            ])
+            .is_err()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("limit", "1"),
+                RequestHeader::new("limit", "2")
+            ])
+            .is_err()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("tail", "1"),
+                RequestHeader::new("tail", "2")
+            ])
+            .is_err()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("line_numbers", "true"),
+                RequestHeader::new("line_numbers", "false")
+            ])
+            .is_err()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("glob", "*.rs"),
+                RequestHeader::new("glob", "*.md")
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn tail_ranges_are_bounded_and_exclusive() {
-        assert_eq!(Range::parse(Some("tail=0")).unwrap().tail, Some(1));
         assert_eq!(
-            Range::parse(Some("tail=99999")).unwrap().tail,
+            Range::parse(&[RequestHeader::new("tail", "0")])
+                .unwrap()
+                .tail,
+            Some(1)
+        );
+        assert_eq!(
+            Range::parse(&[RequestHeader::new("tail", "99999")])
+                .unwrap()
+                .tail,
             Some(MAX_LIMIT)
         );
-        assert!(Range::parse(Some("tail=2&line_numbers=true")).is_ok());
-        assert!(Range::parse(Some("tail=2&offset=1")).is_err());
-        assert!(Range::parse(Some("limit=2&tail=2")).is_err());
-        assert!(Range::parse(Some("glob=*.log&tail=2")).is_err());
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("tail", "2"),
+                RequestHeader::new("line_numbers", "true")
+            ])
+            .is_ok()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("tail", "2"),
+                RequestHeader::new("offset", "1")
+            ])
+            .is_err()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("limit", "2"),
+                RequestHeader::new("tail", "2")
+            ])
+            .is_err()
+        );
+        assert!(
+            Range::parse(&[
+                RequestHeader::new("glob", "*.log"),
+                RequestHeader::new("tail", "2")
+            ])
+            .is_err()
+        );
     }
 
     #[test]
-    fn glob_query_values_are_percent_decoded() {
-        let range = Range::parse(Some("glob=reports%2F%3F%26%23%25*.md")).unwrap();
+    fn glob_header_values_are_used_verbatim() {
+        let range =
+            Range::parse(&[RequestHeader::new("glob", "reports + draft/?&#%*.md")]).unwrap();
 
-        assert_eq!(range.glob.as_deref(), Some("reports/?&#%*.md"));
+        assert_eq!(range.glob.as_deref(), Some("reports + draft/?&#%*.md"));
     }
 
     #[test]
     fn line_numbers_are_opt_in() {
         assert!(
-            Range::parse(Some("line_numbers=true"))
+            Range::parse(&[RequestHeader::new("line_numbers", "true")])
                 .unwrap()
                 .line_numbers
         );
         assert!(
-            !Range::parse(Some("line_numbers=false"))
+            !Range::parse(&[RequestHeader::new("line_numbers", "false")])
                 .unwrap()
                 .line_numbers
         );
-        assert!(Range::parse(Some("line_numbers=1")).is_err());
+        assert!(Range::parse(&[RequestHeader::new("line_numbers", "1")]).is_err());
     }
 
     #[test]
@@ -913,7 +961,7 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha\nbeta\n").await.unwrap();
 
-        let plain = read_file(&path, "file://file.txt", false, Range::parse(None).unwrap())
+        let plain = read_file(&path, "file://file.txt", false, Range::parse(&[]).unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -923,9 +971,9 @@ mod tests {
 
         let numbered = read_file(
             &path,
-            "file://file.txt?line_numbers=true",
+            "file://file.txt",
             true,
-            Range::parse(Some("line_numbers=true")).unwrap(),
+            Range::parse(&[RequestHeader::new("line_numbers", "true")]).unwrap(),
         )
         .await
         .unwrap();
@@ -943,7 +991,7 @@ mod tests {
             .await
             .unwrap();
 
-        let output = read_file(&path, "file://file.txt", false, Range::parse(None).unwrap())
+        let output = read_file(&path, "file://file.txt", false, Range::parse(&[]).unwrap())
             .await
             .unwrap();
 
@@ -962,9 +1010,9 @@ mod tests {
             fs::write(&path, content).await.unwrap();
             let output = read_file(
                 &path,
-                "file://file.txt?tail=2",
+                "file://file.txt",
                 true,
-                Range::parse(Some("tail=2")).unwrap(),
+                Range::parse(&[RequestHeader::new("tail", "2")]).unwrap(),
             )
             .await
             .unwrap();
@@ -992,9 +1040,9 @@ mod tests {
             fs::write(&path, content).await.unwrap();
             let output = read_file(
                 &path,
-                "file://file.txt?tail=1",
+                "file://file.txt",
                 true,
-                Range::parse(Some("tail=1")).unwrap(),
+                Range::parse(&[RequestHeader::new("tail", "1")]).unwrap(),
             )
             .await
             .unwrap();
@@ -1013,9 +1061,9 @@ mod tests {
 
         let output = read_file(
             &path,
-            "file://file.txt?tail=20",
+            "file://file.txt",
             true,
-            Range::parse(Some("tail=20")).unwrap(),
+            Range::parse(&[RequestHeader::new("tail", "20")]).unwrap(),
         )
         .await
         .unwrap();
@@ -1037,9 +1085,13 @@ mod tests {
 
         let output = read_file(
             &path,
-            "file://file.txt?tail=2&line_numbers=true",
+            "file://file.txt",
             true,
-            Range::parse(Some("tail=2&line_numbers=true")).unwrap(),
+            Range::parse(&[
+                RequestHeader::new("tail", "2"),
+                RequestHeader::new("line_numbers", "true"),
+            ])
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -1058,9 +1110,9 @@ mod tests {
 
         let output = read_file(
             &path,
-            "file://file.txt?tail=20",
+            "file://file.txt",
             true,
-            Range::parse(Some("tail=20")).unwrap(),
+            Range::parse(&[RequestHeader::new("tail", "20")]).unwrap(),
         )
         .await
         .unwrap();
@@ -1081,9 +1133,9 @@ mod tests {
 
         let output = read_file(
             &path,
-            "file://file.txt?tail=2",
+            "file://file.txt",
             true,
-            Range::parse(Some("tail=2")).unwrap(),
+            Range::parse(&[RequestHeader::new("tail", "2")]).unwrap(),
         )
         .await
         .unwrap();
@@ -1100,14 +1152,23 @@ mod tests {
 
         let output = read_file(
             &path,
-            "file://file.txt?offset=1&limit=1&line_numbers=true",
+            "file://file.txt",
             true,
-            Range::parse(Some("offset=1&limit=1&line_numbers=true")).unwrap(),
+            Range::parse(&[
+                RequestHeader::new("offset", "1"),
+                RequestHeader::new("limit", "1"),
+                RequestHeader::new("line_numbers", "true"),
+            ])
+            .unwrap(),
         )
         .await
         .unwrap();
         let output = String::from_utf8(output.into_parts().0).unwrap();
-        assert!(output.contains("Next: file://file.txt?offset=2&limit=1&line_numbers=true"));
+        assert!(
+            output.contains(
+                "Next:\n*** Begin Request\n*** Read: file://file.txt\n*** offset: 2\n*** limit: 1\n*** line_numbers: true\n*** End Request"
+            )
+        );
     }
 
     #[tokio::test]
@@ -1121,7 +1182,7 @@ mod tests {
             &path,
             "file://screenshot.bin",
             false,
-            Range::parse(None).unwrap(),
+            Range::parse(&[]).unwrap(),
         )
         .await
         .unwrap();
@@ -1133,9 +1194,9 @@ mod tests {
 
         let error = read_file(
             &path,
-            "file://screenshot.bin?limit=1",
+            "file://screenshot.bin",
             true,
-            Range::parse(Some("limit=1")).unwrap(),
+            Range::parse(&[RequestHeader::new("limit", "1")]).unwrap(),
         )
         .await
         .unwrap_err();
@@ -1143,9 +1204,9 @@ mod tests {
 
         let error = read_file(
             &path,
-            "file://screenshot.bin?tail=1",
+            "file://screenshot.bin",
             true,
-            Range::parse(Some("tail=1")).unwrap(),
+            Range::parse(&[RequestHeader::new("tail", "1")]).unwrap(),
         )
         .await
         .unwrap_err();
@@ -1195,13 +1256,18 @@ mod tests {
         fs::write(directory.path().join("nested/b.rs"), "b")
             .await
             .unwrap();
-        let range = Range::parse(Some("glob=**/*.rs&offset=1&limit=1")).unwrap();
+        let range = Range::parse(&[
+            RequestHeader::new("glob", "**/*.rs"),
+            RequestHeader::new("offset", "1"),
+            RequestHeader::new("limit", "1"),
+        ])
+        .unwrap();
 
         let output = read_glob(
             directory.path(),
             directory.path(),
             "**/*.rs",
-            "file://?glob=**/*.rs&offset=1&limit=1",
+            "file://",
             range,
         )
         .await
@@ -1209,12 +1275,16 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.starts_with("a.rs\n"));
-        assert!(output.contains("Next: file://?glob=**%2F*.rs&offset=2&limit=1"));
+        assert!(
+            output.contains(
+                "Next:\n*** Begin Request\n*** Read: file://\n*** glob: **/*.rs\n*** offset: 2\n*** limit: 1\n*** End Request"
+            )
+        );
         assert!(!output.contains("more matches"));
     }
 
     #[tokio::test]
-    async fn glob_pagination_encodes_delimiters_in_the_continuation_address() {
+    async fn glob_pagination_preserves_the_pattern_in_the_continuation_request() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a&b.rs"), "a")
             .await
@@ -1228,19 +1298,30 @@ mod tests {
             directory.path(),
             directory.path(),
             pattern,
-            "file://?glob=*%26b.rs&offset=1&limit=1",
-            Range::parse(Some("glob=*%26b.rs&offset=1&limit=1")).unwrap(),
+            "file://",
+            Range::parse(&[
+                RequestHeader::new("glob", pattern),
+                RequestHeader::new("offset", "1"),
+                RequestHeader::new("limit", "1"),
+            ])
+            .unwrap(),
         )
         .await
         .unwrap();
         let output = String::from_utf8(output).unwrap();
 
-        assert!(output.contains("Next: file://?glob=*%26b.rs&offset=2&limit=1"));
-        let next = output.trim().lines().last().unwrap();
-        let uri = next.strip_prefix("Next: ").unwrap();
-        let (_, query) = uri.split_once('?').unwrap();
+        assert!(
+            output.contains(
+                "Next:\n*** Begin Request\n*** Read: file://\n*** glob: *&b.rs\n*** offset: 2\n*** limit: 1\n*** End Request"
+            )
+        );
+        let headers = [
+            RequestHeader::new("glob", pattern),
+            RequestHeader::new("offset", "2"),
+            RequestHeader::new("limit", "1"),
+        ];
         assert_eq!(
-            Range::parse(Some(query)).unwrap().glob.as_deref(),
+            Range::parse(&headers).unwrap().glob.as_deref(),
             Some(pattern)
         );
     }
@@ -1253,12 +1334,12 @@ mod tests {
             directory.path(),
             directory.path(),
             "**/*.rs",
-            "file://?glob=**/*.rs",
-            Range::parse(Some("glob=**/*.rs")).unwrap(),
+            "file://",
+            Range::parse(&[RequestHeader::new("glob", "**/*.rs")]).unwrap(),
         )
         .await
         .unwrap();
-        let listing = read_directory(directory.path(), "file://", Range::parse(None).unwrap())
+        let listing = read_directory(directory.path(), "file://", Range::parse(&[]).unwrap())
             .await
             .unwrap();
 
@@ -1272,8 +1353,9 @@ mod tests {
 
         let error = FileProtocol::new(directory.path())
             .read_request(ProtocolRequest {
-                uri: "file://?tail=1",
-                target: "?tail=1",
+                uri: "file://",
+                target: "",
+                headers: &[RequestHeader::new("tail", "1")],
                 body: "",
             })
             .await
@@ -1298,14 +1380,21 @@ mod tests {
 
         let output = read_directory(
             directory.path(),
-            "file://?offset=1&limit=1",
-            Range::parse(Some("offset=1&limit=1")).unwrap(),
+            "file://",
+            Range::parse(&[
+                RequestHeader::new("offset", "1"),
+                RequestHeader::new("limit", "1"),
+            ])
+            .unwrap(),
         )
         .await
         .unwrap();
         let output = String::from_utf8(output).unwrap();
 
-        assert_eq!(output, "a.txt\n\nNext: file://?offset=2&limit=1\n");
+        assert_eq!(
+            output,
+            "a.txt\n\nNext:\n*** Begin Request\n*** Read: file://\n*** offset: 2\n*** limit: 1\n*** End Request\n"
+        );
         assert!(!output.contains("more entries"));
     }
 }

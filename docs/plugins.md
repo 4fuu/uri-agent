@@ -18,16 +18,17 @@ their captured runtime. While resident lifecycle is active, reload shuts down
 old resident instances and starts their replacements before future wakes. The
 directory follows `URI_AGENT_CONFIG_DIR`.
 
-## ABI version 7
+## ABI version 8
 
-Only ABI v7 is accepted. Earlier ABI and the former subagent API have no
+Only ABI v8 is accepted. Earlier ABI and the former subagent API have no
 compatibility path. Every module exports `uri_agent_manifest`; a module with a
 protocol, tool, resident callback, or compaction callback also handles tagged
 requests through `uri_agent_handle`.
 
 The manifest declares protocol and strict typed-tool descriptors, model-role
 names, permissions, and resident opt-in. Protocols must implement the built-in
-`help` target; bodies are always strings. Typed tool schemas must be
+`help` target; protocol requests carry the URI target, request headers
+(`Vec<RequestHeader>`), and a string body. Typed tool schemas must be
 top-level objects with `properties` and `additionalProperties: false`. Calls
 into one module are serialized and its memory survives until reload.
 
@@ -57,7 +58,7 @@ optional output cap. `SubmitKind` is `Prompt` or `Steer`.
 Steer targets the next model boundary while the Agent is active and is accepted
 as Prompt when the Agent is idle.
 
-Plugin Agents use ordinary `sessions-v4.db` conversations. They require a
+Plugin Agents use ordinary `sessions-v5.db` conversations. They require a
 persisted same-project depth-1 parent and are always depth 2; no depth-2 Agent
 may create another. Provider/model and thinking freeze after the first durably
 accepted submission. Prompt, tools, and protocols are fixed at creation except

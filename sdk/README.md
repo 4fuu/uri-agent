@@ -41,7 +41,8 @@ define_plugin!(manifest(), handle);
 
 Every protocol implements the built-in `help` target; the host serves that
 page through the `help` tool. Bodies are strings, including
-`""` when empty. `read(uri, body)` and `exec(uri, body)` call static built-ins.
+`""` when empty. `read(uri, headers, body)` and `exec(uri, headers, body)`
+call static built-ins with `&[RequestHeader]` options.
 Register structured operations with `with_model_tools([ModelToolDescriptor])`
 and handle `HandlerRequest::ModelTool`; schemas must be strict top-level JSON
 objects.

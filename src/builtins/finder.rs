@@ -37,7 +37,7 @@ ask questions, so state any assumptions you make. The question may open with \
 `Scope: <path>`; keep code searches and file reads under that path unless the question itself \
 names other locations.\n\
 Load help for each protocol before its first use, for example help([\"search\", \"file\"]).\n\
-Call protocols with the protocol tool; its `request` parameter defines the fixed request \
+Call protocols with the protocol tool; its `requests` parameter defines the fixed request \
 format.\n\
 Your final reply is returned verbatim to the calling agent as the complete result. Make it \
 self-contained: a short answer first, then each supporting claim as a `path:line` or source \
@@ -353,6 +353,9 @@ impl Protocol for FinderProtocol {
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
     ) -> Result<Vec<u8>> {
+        if !request.headers.is_empty() {
+            bail!("finder reads accept no request headers");
+        }
         match request.target {
             "help" => {
                 if !request.body.is_empty() {
@@ -373,6 +376,9 @@ impl Protocol for FinderProtocol {
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
             bail!("finder help is read-only");
+        }
+        if !request.headers.is_empty() {
+            bail!("finder searches accept no request headers");
         }
         let question = request.body.trim();
         if question.is_empty() {
@@ -513,7 +519,12 @@ mod tests {
     }
 
     fn request<'a>(uri: &'a str, target: &'a str, body: &'a str) -> ProtocolRequest<'a> {
-        ProtocolRequest { uri, target, body }
+        ProtocolRequest {
+            uri,
+            target,
+            headers: &[],
+            body,
+        }
     }
 
     async fn wait_terminal(tasks: &TaskManager, id: &str) -> crate::task::TaskRecord {
@@ -971,7 +982,7 @@ mod tests {
             .await
             .system_prompt;
         assert_eq!(prompt, SYSTEM_PROMPT);
-        assert!(prompt.contains("Call protocols with the protocol tool; its `request` parameter"));
+        assert!(prompt.contains("Call protocols with the protocol tool; its `requests` parameter"));
         assert!(
             prompt.contains("Load help for each protocol before its first use, for example help([\"search\", \"file\"])")
         );

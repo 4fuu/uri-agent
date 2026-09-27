@@ -2,7 +2,7 @@
 
 URI Agent keeps the initial model interface small and loads operational detail
 only when a capability is needed. This document explains that design and the
-stable behavior shared across protocols. For exact addresses, query fields,
+stable behavior shared across protocols. For exact addresses, headers,
 limits, and examples, load the protocol's page through the `help` tool;
 direct-tool schemas are authoritative for their arguments.
 
@@ -12,7 +12,7 @@ Linked built-ins register four tools:
 
 ```text
 help(protocols: string[])
-protocol(request: string)
+protocol(requests: string[])
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
@@ -25,18 +25,32 @@ loaded yet, and the exact `<name>://help` address is not readable through
 it. Loaded contracts stay loaded for the rest of the session and are
 restored on resume.
 
-`protocol` calls use one fixed request format: a `*** Begin Request` line, one
+`protocol` takes one to eight request strings per call and executes them in
+order. Requests in one call must be independent: no request can use another's
+result, and one failing request does not affect the others. With more than one
+request the results arrive in order as `*** Result <n> of <m>: ok` or
+`*** Result <n> of <m>: error` sections.
+
+Each request uses one fixed format: a `*** Begin Request` line, one
 `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line,
-optional raw body lines, and a `*** End Request` line. The request ends at the
-last `*** End Request` line; the lines between the operation line and it are
-the request body and are passed verbatim, so a body line exactly matching
-`*** End Request` can be sent. The newline before the final `*** End Request`
-line belongs to the request format, so one extra empty line before it ends the
-body with a newline. Omit the body when the operation takes no body. Complete
-serialized JSON is that body only when a protocol explicitly requires it.
-Structural lines must match exactly. A leading `*** Body:` line is
-still accepted and ignored so earlier requests keep working; new requests
-should not include it. Runtime-loaded WASM plugins may add typed direct tools.
+optional `*** name: value` header lines, a `*** Body:` separator line when any
+header is present, optional raw body lines, and a `*** End Request` line. The
+request ends at the last `*** End Request` line; the lines between the header
+section (or the operation line) and it are the request body and are passed
+verbatim, so a body line exactly matching `*** End Request` can be sent. The
+newline before the final `*** End Request` line belongs to the request format,
+so one extra empty line before it ends the body with a newline. Omit the body
+when the operation takes no body. Complete serialized JSON is that body only
+when a protocol explicitly requires it. Structural lines must match exactly.
+Without headers a leading `*** Body:` line is still accepted and skipped so
+earlier requests keep working.
+
+Header names are ASCII letters, digits, `-`, and `_`, matched
+case-insensitively. Each protocol's help page lists the headers it accepts,
+and every protocol rejects headers it does not document. Comparable
+numeric headers accept a comparison prefix — `>=10`, `>10`, `<=50`, `<50` —
+where the protocol documents it; one lower and one upper bound may combine
+into a range. Runtime-loaded WASM plugins may add typed direct tools.
 
 A protocol may declare shared-help prerequisites; `help` loads them
 automatically ahead of the requested protocol, and using the dependent protocol
@@ -46,9 +60,10 @@ Routing is deliberately generic:
 
 1. split the address only at the first `://`;
 2. use the prefix as the registered protocol name;
-3. pass the opaque remainder and string body to that protocol unchanged.
+3. pass the opaque remainder, the parsed headers, and the string body to that
+   protocol unchanged.
 
-The registry does not parse protocol-specific paths or query fields. Protocol
+The registry does not parse protocol-specific paths or headers. Protocol
 names are unique, and duplicate registration fails rather than replacing an
 existing capability.
 
@@ -84,9 +99,9 @@ the `help` tool loads the shared page automatically. Connections are lazy and
 belong to one Agent session.
 
 Tool and prompt catalogs remain behind protocol reads, and each operation uses
-the server's current JSON Schema. Simple values can be represented in the URI;
-complex arguments can use a complete JSON body. Read the active help before
-constructing either form rather than relying on copied static syntax.
+the server's current JSON Schema. Simple arguments are passed as request
+headers; complex arguments can use a complete JSON body. Read the active help
+before constructing either form rather than relying on copied static syntax.
 
 Every operation resolves current server and Agent Environment configuration.
 Changing either reconnects the server; removing or disabling a server already
@@ -115,7 +130,10 @@ ProtocolRequest
 *** End Request
 
 *** Begin Request
-*** Read: search://src?mode=hybrid&glob=**/*.rs
+*** Read: search://src
+*** mode: hybrid
+*** glob: **/*.rs
+*** Body:
 credential refresh flow
 *** End Request
 ```

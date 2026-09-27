@@ -30,7 +30,7 @@ Read the version-matched URI Agent documentation embedded in this binary.
 
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
-- Targets are exact, case-sensitive filenames and do not accept paths or query parameters.
+- Targets are exact, case-sensitive filenames and do not accept paths or request headers.
 - These reads take no body.
 
 Available documents:
@@ -80,6 +80,9 @@ impl Protocol for UriAgentDocsProtocol {
                 request.uri
             );
         }
+        if !request.headers.is_empty() {
+            bail!("{PROTOCOL_NAME} reads accept no request headers");
+        }
         if request.target == "help" {
             return Ok(help().into_bytes());
         }
@@ -104,6 +107,7 @@ mod tests {
                 ProtocolRequest {
                     uri: &format!("{PROTOCOL_NAME}://{target}"),
                     target,
+                    headers: &[],
                     body: "",
                 },
                 ProtocolContext {

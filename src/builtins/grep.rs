@@ -4,7 +4,10 @@ use crate::plugin::{
     BinaryDownload, DownloadArchive, Plugin, PluginDownloads, PluginHost, PluginPermission,
 };
 use crate::prompts;
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Comparison, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest, RequestHeader,
+    parse_comparison,
+};
 use crate::retrieval::{
     SearchFilter, SearchHit, SearchMode, code_corpus, index_checkpoint, index_status,
     rebuild_index, search_index, sync_index,
@@ -38,34 +41,40 @@ retrieval.
 
 Current working directory: `{scheme}://{}`
 
-Search reads other than `mode=status` MUST pass a nonempty search pattern in
-the request body; `mode=status` takes no body. Use
+Search reads other than `mode: status` MUST pass a nonempty search pattern in
+the request body; `mode: status` takes no body. Use
 `{scheme}://<root>` for a project-relative or absolute file/directory root. The
 root may be empty: `{scheme}://` searches the current working directory. On Unix, `~`
 and paths beginning with `~/` resolve from the current user's home directory;
 `~user` is not expanded.
 
-Optional query parameters:
+Optional request headers (`*** <name>: <value>` lines between the operation
+line and a `*** Body:` separator):
 
-- `mode=exact` (the default) uses ripgrep (`rg`). Patterns use `rg`
-  regular-expression syntax unless `literal=true` is set. Use this mode for
+- `mode: exact` (the default) uses ripgrep (`rg`). Patterns use `rg`
+  regular-expression syntax unless `literal: true` is set. Use this mode for
   known identifiers, paths, syntax, or literal wording. Exact results are
   `path:line:text` lines; an output ending with `[match limit reached: <limit>]`
   covers only the first `limit` matches.
-- `mode=hybrid` combines keyword and semantic ranking. Prefer it for conceptual
+- `mode: hybrid` combines keyword and semantic ranking. Prefer it for conceptual
   searches.
-- `mode=semantic` prioritizes meaning over shared wording. Use it when relevant
+- `mode: semantic` prioritizes meaning over shared wording. Use it when relevant
   results are likely to use different wording from the query.
-- `mode=status` reports whether the selected root's semantic cache is current;
-  it takes no body and accepts no parameters other than `glob`.
-- `glob=<pattern>` filters searched paths using `rg` glob syntax.
+- `mode: status` reports whether the selected root's semantic cache is current;
+  it takes no body and accepts no headers other than `glob`.
+- `glob: <pattern>` filters searched paths using `rg` glob syntax.
 - If `rg` rejects a regular expression, the protocol retries it as literal
   text.
-- `literal=true` always uses `rg` literal matching.
-- `ignore_case=true` enables case-insensitive matching.
-- `context=<lines>` includes surrounding lines; values are clamped to 0 through 20.
-- `limit=<count>` bounds the number of matches; the default is 200 and values are
+- `literal: true` always uses `rg` literal matching.
+- `ignore_case: true` enables case-insensitive matching.
+- `context: <lines>` includes surrounding lines; values are clamped to 0 through 20.
+- `limit: <count>` bounds the number of matches; the default is 200 and values are
   clamped to 1 through 2,000.
+
+The numeric `context` and `limit` headers accept a comparison prefix —
+`>=10`, `>10`, `<=50`, `<50` — which bounds the effective value while its
+default still applies within the bounds; one lower and one upper bound may
+combine into a range. `!=` is not supported.
 
 Semantic and hybrid reads accept only `mode`, `glob`, and `limit`; their
 default limit is 7 and values are clamped to 1 through 50. A ranked read creates
@@ -75,13 +84,15 @@ managed task without restarting and delivers its result automatically. If
 completion marks the output as truncated, follow its `tasks://` instruction
 once. Do not submit the same search again to retrieve task output.
 
-Do not call status or index before a ranked search. Use `mode=status` only to
+Do not call status or index before a ranked search. Use `mode: status` only to
 diagnose the cache. Use an `*** Exec:` request only to prewarm or force-rebuild
 that exact root/glob cache:
 
 ```text
 *** Begin Request
-*** Exec: {scheme}://<root>?mode=index&glob=<pattern>
+*** Exec: {scheme}://<root>
+*** mode: index
+*** glob: <pattern>
 *** End Request
 ```
 
@@ -93,7 +104,10 @@ Examples:
 
 ```text
 *** Begin Request
-*** Read: {scheme}://src?glob=**/*.rs&limit=100
+*** Read: {scheme}://src
+*** glob: **/*.rs
+*** limit: 100
+*** Body:
 ProtocolRequest
 *** End Request
 
@@ -103,22 +117,40 @@ fn push(
 *** End Request
 
 *** Begin Request
-*** Read: {scheme}://?literal=true&ignore_case=true
+*** Read: {scheme}://
+*** literal: true
+*** ignore_case: true
+*** Body:
 exact text
 *** End Request
 
 *** Begin Request
-*** Read: {scheme}://src?mode=hybrid&glob=**/*.rs&limit=10
+*** Read: {scheme}://src
+*** mode: hybrid
+*** glob: **/*.rs
+*** limit: 10
+*** Body:
 authentication flow
 *** End Request
 
 *** Begin Request
-*** Exec: {scheme}://src?mode=index&glob=**/*.rs
+*** Read: {scheme}://src
+*** mode: hybrid
+*** glob: **/*.rs
+*** limit: <=50
+*** Body:
+authentication flow
+*** End Request
+
+*** Begin Request
+*** Exec: {scheme}://src
+*** mode: index
+*** glob: **/*.rs
 *** End Request
 ```
 
-`*** Exec:` requests support only `mode=index` (optionally with `glob`) and
-take no request body; `status` and `index` accept no other parameters.
+`*** Exec:` requests support only `mode: index` (optionally with `glob`) and
+take no request body; `status` and `index` accept no other headers.
 "#,
         display_path(cwd)
     )
@@ -220,16 +252,16 @@ impl Protocol for GrepProtocol {
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
         if request.target == "help" {
+            if !request.headers.is_empty() {
+                bail!("{}://help accepts no request headers", SEARCH_SCHEME);
+            }
             if !request.body.is_empty() {
                 bail!("{}://help requires an empty body", SEARCH_SCHEME);
             }
             return Ok(help(&self.cwd, SEARCH_SCHEME).into_bytes());
         }
-        let (root, query) = request
-            .target
-            .split_once('?')
-            .map_or((request.target, None), |(root, query)| (root, Some(query)));
-        let options = GrepOptions::parse(query, SEARCH_SCHEME)?;
+        let root = request.target;
+        let options = GrepOptions::parse(request.headers, SEARCH_SCHEME)?;
         let resolved = resolve_path(&self.cwd, root)?;
         validate_root(&resolved, SEARCH_SCHEME).await?;
         match options.mode {
@@ -285,11 +317,8 @@ impl Protocol for GrepProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
     ) -> Result<Vec<u8>> {
-        let (root, query) = request
-            .target
-            .split_once('?')
-            .map_or((request.target, None), |(root, query)| (root, Some(query)));
-        let options = GrepOptions::parse_exec(query, SEARCH_SCHEME)?;
+        let root = request.target;
+        let options = GrepOptions::parse_exec(request.headers, SEARCH_SCHEME)?;
         if !request.body.is_empty() {
             bail!("{} semantic indexing requires an empty body", SEARCH_SCHEME);
         }
@@ -390,6 +419,11 @@ enum GrepMode {
     Status,
 }
 
+/// Headers accepted by every `search` operation. Comparable numeric headers
+/// (`context`, `limit`) accept a comparison prefix; the rest are
+/// equality-only.
+const HEADER_NAMES: [&str; 6] = ["mode", "glob", "literal", "ignore_case", "context", "limit"];
+
 #[derive(Debug, Eq, PartialEq)]
 struct GrepOptions {
     mode: GrepMode,
@@ -402,7 +436,7 @@ struct GrepOptions {
 }
 
 impl GrepOptions {
-    fn parse(query: Option<&str>, scheme: &str) -> Result<Self> {
+    fn parse(headers: &[RequestHeader], scheme: &str) -> Result<Self> {
         let mut options = Self {
             mode: GrepMode::Exact,
             glob: None,
@@ -412,78 +446,192 @@ impl GrepOptions {
             limit: DEFAULT_LIMIT,
             limit_set: false,
         };
-        let mut seen = std::collections::HashSet::new();
-        for pair in query
-            .unwrap_or_default()
-            .split('&')
-            .filter(|pair| !pair.is_empty())
-        {
-            let (name, value) = pair
-                .split_once('=')
-                .ok_or_else(|| anyhow!("invalid {scheme} query component: {pair}"))?;
-            if !seen.insert(name) {
-                bail!("duplicate {scheme} query parameter: {name}");
-            }
-            match name {
-                "mode" => {
-                    options.mode = match value {
-                        "exact" => GrepMode::Exact,
-                        "semantic" | "hybrid" => {
-                            GrepMode::Semantic(SearchMode::parse(value, scheme)?)
-                        }
-                        "status" => GrepMode::Status,
-                        "index" => {
-                            bail!("{scheme} mode=index is available only through exec")
-                        }
-                        _ => {
-                            bail!(
-                                "{scheme} mode must be exact, semantic, hybrid, or status for reads"
-                            )
-                        }
-                    }
-                }
-                "glob" if !value.is_empty() => options.glob = Some(value.to_string()),
-                "glob" => bail!("{scheme} glob cannot be empty"),
-                "literal" => options.literal = parse_bool(name, value, scheme)?,
-                "ignore_case" => options.ignore_case = parse_bool(name, value, scheme)?,
-                "context" => {
-                    options.context = value
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid {scheme} context: {value}"))?
-                        .min(MAX_CONTEXT);
-                }
-                "limit" => {
-                    options.limit = value
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid {scheme} limit: {value}"))?
-                        .clamp(1, MAX_LIMIT);
-                    options.limit_set = true;
-                }
-                _ => bail!("unknown {scheme} query parameter: {name}"),
-            }
-        }
+        options.apply_headers(headers, scheme)?;
         Ok(options)
     }
 
-    fn parse_exec(query: Option<&str>, scheme: &str) -> Result<Self> {
-        let Some(query) = query else {
-            bail!("{scheme} exec requires mode=index");
+    fn set_option(&mut self, name: &str, value: &str, scheme: &str) -> Result<()> {
+        match name {
+            "mode" => {
+                self.mode = match value {
+                    "exact" => GrepMode::Exact,
+                    "semantic" | "hybrid" => GrepMode::Semantic(SearchMode::parse(value, scheme)?),
+                    "status" => GrepMode::Status,
+                    "index" => {
+                        bail!("{scheme} mode=index is available only through exec")
+                    }
+                    _ => {
+                        bail!("{scheme} mode must be exact, semantic, hybrid, or status for reads")
+                    }
+                };
+            }
+            "glob" if !value.is_empty() => self.glob = Some(value.to_string()),
+            "glob" => bail!("{scheme} glob cannot be empty"),
+            "literal" => self.literal = parse_bool(name, value, scheme)?,
+            "ignore_case" => self.ignore_case = parse_bool(name, value, scheme)?,
+            "context" => {
+                self.context = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid {scheme} context: {value}"))?
+                    .min(MAX_CONTEXT);
+            }
+            "limit" => {
+                self.limit = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid {scheme} limit: {value}"))?
+                    .clamp(1, MAX_LIMIT);
+                self.limit_set = true;
+            }
+            _ => bail!("unknown {scheme} header: {name}"),
+        }
+        Ok(())
+    }
+
+    fn apply_headers(&mut self, headers: &[RequestHeader], scheme: &str) -> Result<()> {
+        if let Some(header) = headers
+            .iter()
+            .find(|header| !HEADER_NAMES.contains(&header.name.as_str()))
+        {
+            bail!(
+                "unknown {scheme} header: {}; supported headers: {}",
+                header.name,
+                HEADER_NAMES.join(", ")
+            );
+        }
+        for name in ["mode", "glob", "literal", "ignore_case"] {
+            let values: Vec<&str> = headers
+                .iter()
+                .filter(|header| header.name == name)
+                .map(|header| header.value.as_str())
+                .collect();
+            if values.len() > 1 {
+                bail!("duplicate {scheme} header: {name}");
+            }
+            if let Some(value) = values.first() {
+                self.set_option(name, value, scheme)?;
+            }
+        }
+        for name in ["context", "limit"] {
+            self.apply_comparison_headers(name, headers, scheme)?;
+        }
+        Ok(())
+    }
+
+    /// Applies the comparison-capable numeric headers `context` and `limit`.
+    /// An exact value sets the option as usual. Bounds clamp the option's
+    /// default: one lower bound (`>` or `>=`) and one upper bound (`<` or
+    /// `<=`) may combine into a range.
+    fn apply_comparison_headers(
+        &mut self,
+        name: &str,
+        headers: &[RequestHeader],
+        scheme: &str,
+    ) -> Result<()> {
+        let values: Vec<&str> = headers
+            .iter()
+            .filter(|header| header.name == name)
+            .map(|header| header.value.as_str())
+            .collect();
+        if values.is_empty() {
+            return Ok(());
+        }
+        let mut exact = None;
+        let mut lower = None::<usize>;
+        let mut upper = None::<usize>;
+        for value in values {
+            let (comparison, operand) = parse_comparison(value);
+            let number = operand
+                .parse::<usize>()
+                .with_context(|| format!("invalid {scheme} {name}: {operand}"))?;
+            match comparison {
+                Comparison::Eq => {
+                    if exact.replace(number).is_some() {
+                        bail!("duplicate {scheme} header: {name}");
+                    }
+                }
+                Comparison::Ne => {
+                    bail!(
+                        "{scheme} header {name} does not support `!=`; use an exact value or a bound"
+                    );
+                }
+                Comparison::Gt | Comparison::Ge => {
+                    let bound = if comparison == Comparison::Gt {
+                        number.saturating_add(1)
+                    } else {
+                        number
+                    };
+                    if lower.replace(bound).is_some() {
+                        bail!("duplicate lower bound for {scheme} header: {name}");
+                    }
+                }
+                Comparison::Lt | Comparison::Le => {
+                    if comparison == Comparison::Lt && number == 0 {
+                        bail!("{scheme} header {name} has an empty range below 0");
+                    }
+                    let bound = if comparison == Comparison::Lt {
+                        number - 1
+                    } else {
+                        number
+                    };
+                    if upper.replace(bound).is_some() {
+                        bail!("duplicate upper bound for {scheme} header: {name}");
+                    }
+                }
+            }
+        }
+        if exact.is_some() && (lower.is_some() || upper.is_some()) {
+            bail!("{scheme} header {name} combines an exact value with a bound");
+        }
+        let (default, minimum, maximum) = match name {
+            "context" => (0, 0, MAX_CONTEXT),
+            _ => (DEFAULT_LIMIT, 1, MAX_LIMIT),
         };
-        let rewritten = query
-            .split('&')
-            .map(|pair| {
-                if pair == "mode=index" {
-                    "mode=status"
+        let resolved = match exact {
+            Some(exact) => exact.clamp(minimum, maximum),
+            None => {
+                let lower = lower.unwrap_or(minimum);
+                let upper = upper.unwrap_or(maximum);
+                if lower > upper {
+                    bail!(
+                        "{scheme} header {name} has an empty range: lower bound {lower} exceeds upper bound {upper}"
+                    );
+                }
+                default.clamp(lower, upper).clamp(minimum, maximum)
+            }
+        };
+        match name {
+            "context" => self.context = resolved,
+            _ => {
+                self.limit = resolved;
+                self.limit_set = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_exec(headers: &[RequestHeader], scheme: &str) -> Result<Self> {
+        let mode_headers: Vec<&str> = headers
+            .iter()
+            .filter(|header| header.name == "mode")
+            .map(|header| header.value.as_str())
+            .collect();
+        if mode_headers.len() > 1 {
+            bail!("duplicate {scheme} header: mode");
+        }
+        if mode_headers.first().is_none_or(|value| *value != "index") {
+            bail!("{scheme} exec requires a `mode: index` header");
+        }
+        let rewritten_headers: Vec<RequestHeader> = headers
+            .iter()
+            .map(|header| {
+                if header.name == "mode" {
+                    RequestHeader::new("mode", "status")
                 } else {
-                    pair
+                    header.clone()
                 }
             })
-            .collect::<Vec<_>>()
-            .join("&");
-        if !query.split('&').any(|pair| pair == "mode=index") {
-            bail!("{scheme} exec requires mode=index");
-        }
-        let mut options = Self::parse(Some(&rewritten), scheme)?;
+            .collect();
+        let mut options = Self::parse(&rewritten_headers, scheme)?;
         options.mode = GrepMode::Status;
         Ok(options)
     }
@@ -833,9 +981,21 @@ mod tests {
 
     #[test]
     fn grep_options_are_typed_bounded_and_reject_duplicates() {
+        let headers = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| RequestHeader::new(name, value))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
             GrepOptions::parse(
-                Some("glob=**/*.rs&literal=true&ignore_case=true&context=2&limit=10"),
+                &headers(&[
+                    ("glob", "**/*.rs"),
+                    ("literal", "true"),
+                    ("ignore_case", "true"),
+                    ("context", "2"),
+                    ("limit", "10"),
+                ]),
                 SEARCH_SCHEME
             )
             .unwrap(),
@@ -850,41 +1010,157 @@ mod tests {
             }
         );
         assert_eq!(
-            GrepOptions::parse(Some("mode=semantic"), SEARCH_SCHEME)
+            GrepOptions::parse(&headers(&[("mode", "semantic")]), SEARCH_SCHEME)
                 .unwrap()
                 .semantic_limit(),
             7
         );
-        let hybrid = GrepOptions::parse(Some("mode=hybrid&limit=51"), SEARCH_SCHEME).unwrap();
+        let hybrid = GrepOptions::parse(
+            &headers(&[("mode", "hybrid"), ("limit", "51")]),
+            SEARCH_SCHEME,
+        )
+        .unwrap();
         hybrid.validate_semantic(SEARCH_SCHEME).unwrap();
         assert_eq!(hybrid.semantic_limit(), 50);
-        assert!(GrepOptions::parse_exec(Some("mode=index&glob=**/*.rs"), SEARCH_SCHEME).is_ok());
-        assert!(GrepOptions::parse_exec(Some("mode=semantic"), SEARCH_SCHEME).is_err());
         assert!(
-            GrepOptions::parse_exec(Some("mode=index&limit=1"), SEARCH_SCHEME)
-                .unwrap()
-                .validate_index_operation(SEARCH_SCHEME)
-                .is_err()
+            GrepOptions::parse_exec(
+                &headers(&[("mode", "index"), ("glob", "**/*.rs")]),
+                SEARCH_SCHEME
+            )
+            .is_ok()
+        );
+        assert!(GrepOptions::parse_exec(&headers(&[("mode", "semantic")]), SEARCH_SCHEME).is_err());
+        assert!(
+            GrepOptions::parse_exec(
+                &headers(&[("mode", "index"), ("limit", "1")]),
+                SEARCH_SCHEME
+            )
+            .unwrap()
+            .validate_index_operation(SEARCH_SCHEME)
+            .is_err()
         );
         assert_eq!(
-            GrepOptions::parse(Some("context=21"), SEARCH_SCHEME)
+            GrepOptions::parse(&headers(&[("context", "21")]), SEARCH_SCHEME)
                 .unwrap()
                 .context,
             20
         );
         assert_eq!(
-            GrepOptions::parse(Some("limit=0"), SEARCH_SCHEME)
+            GrepOptions::parse(&headers(&[("limit", "0")]), SEARCH_SCHEME)
                 .unwrap()
                 .limit,
             1
         );
         assert_eq!(
-            GrepOptions::parse(Some("limit=99999"), SEARCH_SCHEME)
+            GrepOptions::parse(&headers(&[("limit", "99999")]), SEARCH_SCHEME)
                 .unwrap()
                 .limit,
             2_000
         );
-        assert!(GrepOptions::parse(Some("literal=true&literal=false"), SEARCH_SCHEME).is_err());
+        assert!(
+            GrepOptions::parse(
+                &headers(&[("literal", "true"), ("literal", "false")]),
+                SEARCH_SCHEME
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn grep_options_accept_headers_with_comparison_bounds() {
+        use crate::retrieval::SearchMode;
+
+        // Header names are case-insensitive and normalized by the request
+        // parser.
+        let options = GrepOptions::parse(
+            &[
+                RequestHeader::new("Mode", "hybrid"),
+                RequestHeader::new("glob", "**/*.rs"),
+            ],
+            SEARCH_SCHEME,
+        )
+        .unwrap();
+        assert_eq!(options.mode, GrepMode::Semantic(SearchMode::Hybrid));
+        assert_eq!(options.glob.as_deref(), Some("**/*.rs"));
+
+        // Exact values set the option; bounds clamp the default.
+        let exact =
+            GrepOptions::parse(&[RequestHeader::new("limit", "10")], SEARCH_SCHEME).unwrap();
+        assert_eq!(exact.limit, 10);
+        assert!(exact.limit_set);
+        let lower =
+            GrepOptions::parse(&[RequestHeader::new("limit", ">=1000")], SEARCH_SCHEME).unwrap();
+        assert_eq!(lower.limit, 1000);
+        let upper =
+            GrepOptions::parse(&[RequestHeader::new("limit", "<=50")], SEARCH_SCHEME).unwrap();
+        assert_eq!(upper.limit, 50);
+        // The default (200) lands inside the range and clamps to the upper bound.
+        let range = GrepOptions::parse(
+            &[
+                RequestHeader::new("limit", ">=10"),
+                RequestHeader::new("limit", "<=50"),
+            ],
+            SEARCH_SCHEME,
+        )
+        .unwrap();
+        assert_eq!(range.limit, 50);
+        // `>1` raises the lower bound to 2; context defaults to 0.
+        let context =
+            GrepOptions::parse(&[RequestHeader::new("context", ">1")], SEARCH_SCHEME).unwrap();
+        assert_eq!(context.context, 2);
+        // A lower bound below the default leaves the default untouched.
+        let bounded_default =
+            GrepOptions::parse(&[RequestHeader::new("limit", ">=10")], SEARCH_SCHEME).unwrap();
+        assert_eq!(bounded_default.limit, 200);
+    }
+
+    #[test]
+    fn grep_options_reject_header_misuse() {
+        let unknown = GrepOptions::parse(&[RequestHeader::new("offset", "5")], SEARCH_SCHEME);
+        assert!(format!("{:#}", unknown.unwrap_err()).contains("unknown search header: offset"));
+        let duplicate = GrepOptions::parse(
+            &[
+                RequestHeader::new("limit", "10"),
+                RequestHeader::new("limit", "20"),
+            ],
+            SEARCH_SCHEME,
+        );
+        assert!(format!("{:#}", duplicate.unwrap_err()).contains("duplicate search header: limit"));
+        let inequality = GrepOptions::parse(&[RequestHeader::new("limit", "!=10")], SEARCH_SCHEME);
+        assert!(format!("{:#}", inequality.unwrap_err()).contains("does not support `!=`"));
+        let empty = GrepOptions::parse(
+            &[
+                RequestHeader::new("limit", ">=100"),
+                RequestHeader::new("limit", "<=50"),
+            ],
+            SEARCH_SCHEME,
+        );
+        assert!(format!("{:#}", empty.unwrap_err()).contains("empty range"));
+        let mixed = GrepOptions::parse(
+            &[
+                RequestHeader::new("limit", "10"),
+                RequestHeader::new("limit", ">=5"),
+            ],
+            SEARCH_SCHEME,
+        );
+        assert!(
+            format!("{:#}", mixed.unwrap_err()).contains("combines an exact value with a bound")
+        );
+        // Equality-only headers do not take comparison prefixes.
+        let compared = GrepOptions::parse(&[RequestHeader::new("mode", ">hybrid")], SEARCH_SCHEME);
+        assert!(compared.is_err());
+    }
+
+    #[test]
+    fn grep_exec_accepts_mode_index_as_a_header() {
+        let options =
+            GrepOptions::parse_exec(&[RequestHeader::new("mode", "index")], SEARCH_SCHEME).unwrap();
+        assert_eq!(options.mode, GrepMode::Status);
+        assert!(
+            GrepOptions::parse_exec(&[RequestHeader::new("mode", "status")], SEARCH_SCHEME)
+                .is_err()
+        );
+        assert!(GrepOptions::parse_exec(&[], SEARCH_SCHEME).is_err());
     }
 
     #[test]
@@ -915,6 +1191,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "search://help",
                     target: "help",
+                    headers: &[],
                     body: "",
                 },
                 ProtocolContext {
@@ -939,13 +1216,14 @@ mod tests {
         assert!(help.contains("clamped to 1 through 50"));
         assert!(help.contains("Do not call status or index before a ranked search"));
         assert!(help.contains("continues as one\nmanaged task without restarting"));
-        assert!(help.contains("`*** Exec:` requests support only `mode=index`"));
+        assert!(help.contains("`*** Exec:` requests support only `mode: index`"));
 
         let error = protocol
             .read(
                 ProtocolRequest {
                     uri: "search://",
                     target: "",
+                    headers: &[],
                     body: "",
                 },
                 ProtocolContext {
@@ -999,8 +1277,14 @@ mod tests {
         let output = protocol
             .read(
                 ProtocolRequest {
-                    uri: "search://?glob=**/*.rs&ignore_case=true&context=1&limit=1",
-                    target: "?glob=**/*.rs&ignore_case=true&context=1&limit=1",
+                    uri: "search://",
+                    target: "",
+                    headers: &[
+                        RequestHeader::new("glob", "**/*.rs"),
+                        RequestHeader::new("ignore_case", "true"),
+                        RequestHeader::new("context", "1"),
+                        RequestHeader::new("limit", "1"),
+                    ],
                     body: "needle",
                 },
                 ProtocolContext {
@@ -1025,7 +1309,7 @@ mod tests {
         tokio::fs::write(directory.path().join("values.txt"), "a.b\naxb\nfn push(\n")
             .await
             .unwrap();
-        let default_options = GrepOptions::parse(None, SEARCH_SCHEME).unwrap();
+        let default_options = GrepOptions::parse(&[], SEARCH_SCHEME).unwrap();
 
         assert_eq!(
             run_grep(
@@ -1055,7 +1339,7 @@ mod tests {
 
         let literal = GrepOptions {
             literal: true,
-            ..GrepOptions::parse(None, SEARCH_SCHEME).unwrap()
+            ..GrepOptions::parse(&[], SEARCH_SCHEME).unwrap()
         };
         let output = run_grep(
             &rg,

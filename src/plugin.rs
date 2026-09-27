@@ -931,7 +931,7 @@ fn unknown_model_tool(name: &str, protocols: &ProtocolRegistry) -> anyhow::Error
         anyhow::anyhow!(
             "unknown model tool: {name}; protocols are not tools: call it through the \
              `protocol` tool with its <protocol>:// address, using the request format its \
-             `request` parameter defines"
+             `requests` parameter defines"
         )
     } else {
         anyhow::anyhow!("unknown model tool: {name}")

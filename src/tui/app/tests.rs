@@ -502,7 +502,7 @@ fn reasoning_folds_when_streaming_advances_to_text_or_a_tool() {
         kind: EventKind::ToolCall {
             call_id: "call".into(),
             name: "protocol".into(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"]}),
         },
     });
     assert!(!tool_app.blocks[0].expanded);
@@ -532,7 +532,7 @@ fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
         EventKind::ToolCall {
             call_id: "call-1".into(),
             name: "protocol".into(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"]}),
         },
     );
     apply_event(
@@ -4733,7 +4733,7 @@ fn tool_call_and_result_share_one_block() {
         kind: EventKind::ToolCall {
             call_id: "call-1".to_string(),
             name: "protocol".to_string(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://src/main.rs\n*** End Request"]}),
         },
     });
     app.apply(SessionEvent {
@@ -4815,7 +4815,7 @@ fn full_tool_documents_render_status_input_and_output_as_markdown() {
             call_id: "shell-call".to_string(),
             name: "protocol".to_string(),
             arguments: serde_json::json!({
-                "request": "*** Begin Request\n*** Exec: bash://run\n*** Body:\nprintf done\n*** End Request"
+                "requests": ["*** Begin Request\n*** Exec: bash://run\n*** Body:\nprintf done\n*** End Request"]
             }),
         },
     );
@@ -4890,7 +4890,7 @@ fn protocol_tool_documents_do_not_repeat_the_request_as_input_json() {
             call_id: "read-call".to_string(),
             name: "protocol".to_string(),
             arguments: serde_json::json!({
-                "request": "*** Begin Request\n*** Read: file://docs\n*** Body:\n{\"path\": \"docs\"}\n*** End Request"
+                "requests": ["*** Begin Request\n*** Read: file://docs\n*** Body:\n{\"path\": \"docs\"}\n*** End Request"]
             }),
         },
     );
@@ -4917,7 +4917,7 @@ fn protocol_tool_documents_do_not_repeat_the_request_as_input_json() {
         EventKind::ToolCall {
             call_id: "malformed-call".to_string(),
             name: "protocol".to_string(),
-            arguments: serde_json::json!({"request": "not a protocol request"}),
+            arguments: serde_json::json!({"requests": ["not a protocol request"]}),
         },
     );
     apply_event(
@@ -4932,7 +4932,8 @@ fn protocol_tool_documents_do_not_repeat_the_request_as_input_json() {
         },
     );
     let malformed = block_document(&app.blocks[1]);
-    assert!(malformed.contains("\"request\": \"not a protocol request\""));
+    assert!(malformed.contains("\"requests\": ["));
+    assert!(malformed.contains("not a protocol request"));
 }
 
 #[test]
@@ -4994,7 +4995,7 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
         EventKind::ToolCall {
             call_id: "failed-call".to_string(),
             name: "protocol".to_string(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://missing\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://missing\n*** End Request"]}),
         },
     );
     assert!(block_document(&app.blocks[0]).contains("**• Running**"));
@@ -5022,7 +5023,7 @@ fn tool_documents_distinguish_running_failed_and_empty_results() {
         EventKind::ToolCall {
             call_id: "empty-call".to_string(),
             name: "protocol".to_string(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://empty\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://empty\n*** End Request"]}),
         },
     );
     apply_event(
@@ -5047,7 +5048,7 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
         tool_title(
             "protocol",
             &serde_json::json!({
-                "request": "*** Begin Request\n*** Exec: bash://run\n*** Body:\ncargo test\necho done\n*** End Request"
+                "requests": ["*** Begin Request\n*** Exec: bash://run\n*** Body:\ncargo test\necho done\n*** End Request"]
             })
         ),
         "$ cargo test"
@@ -5055,7 +5056,7 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     assert_eq!(
         tool_title(
             "protocol",
-            &serde_json::json!({"request": "*** Begin Request\n*** Exec: bash://run\n*** Body:\ntest command\n*** End Request"})
+            &serde_json::json!({"requests": ["*** Begin Request\n*** Exec: bash://run\n*** Body:\ntest command\n*** End Request"]})
         ),
         "$ test command"
     );
@@ -5063,7 +5064,7 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
         tool_title(
             "protocol",
             &serde_json::json!({
-                "request": "*** Begin Request\n*** Exec: pwsh://run\nGet-ChildItem\n*** End Request"
+                "requests": ["*** Begin Request\n*** Exec: pwsh://run\nGet-ChildItem\n*** End Request"]
             })
         ),
         "$ Get-ChildItem"
@@ -5099,10 +5100,10 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
         tool_title(
             "protocol",
             &serde_json::json!({
-                "request": format!(
+                "requests": [format!(
                     "*** Begin Request\n*** Read: {}\n*** End Request",
                     r"file://\\?\C:\Users\4fu\project\src\main.rs?offset=1"
-                )
+                )]
             })
         ),
         r"Read C:\Users\4fu\project\src\main.rs?offset=1"
@@ -5155,7 +5156,7 @@ fn activity_status_follows_stream_events() {
         kind: EventKind::ToolCall {
             call_id: "call".to_string(),
             name: "protocol".to_string(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://src/main.rs\n*** End Request"]}),
         },
     });
     assert!(matches!(&app.activity, Some(Activity::Tool(name)) if name == "file"));
@@ -5373,7 +5374,7 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
         kind: EventKind::ToolCall {
             call_id: "old".into(),
             name: "protocol".into(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://old.rs\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://old.rs\n*** End Request"]}),
         },
     });
     app.apply(SessionEvent {
@@ -5393,7 +5394,7 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
         kind: EventKind::ToolCall {
             call_id: "current".into(),
             name: "protocol".into(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://current.rs\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://current.rs\n*** End Request"]}),
         },
     });
     app.selected_block = 1;
@@ -5906,7 +5907,7 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
             call_id: format!("giant-{index}"),
             name: "protocol".into(),
             arguments: serde_json::json!({
-                "request": format!("*** Begin Request\n*** Read: file://giant-{index}\n*** End Request")
+                "requests": [format!("*** Begin Request\n*** Read: file://giant-{index}\n*** End Request")]
             }),
         });
         giant.push(EventKind::ToolResult {
@@ -5935,7 +5936,7 @@ async fn lazy_pages_keep_turns_whole_preserve_anchors_and_converge_to_eager_rend
         EventKind::ToolCall {
             call_id: "current-tool".into(),
             name: "protocol".into(),
-            arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://current\n*** End Request"}),
+            arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://current\n*** End Request"]}),
         },
     ];
     opened
@@ -6369,7 +6370,7 @@ async fn global_history_actions_load_the_complete_session_before_navigating() {
             EventKind::ToolCall {
                 call_id: "old-tool".into(),
                 name: "protocol".into(),
-                arguments: serde_json::json!({"request": "*** Begin Request\n*** Read: file://old\n*** End Request"}),
+                arguments: serde_json::json!({"requests": ["*** Begin Request\n*** Read: file://old\n*** End Request"]}),
             },
             EventKind::ToolResult {
                 call_id: "old-tool".into(),

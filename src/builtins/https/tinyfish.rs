@@ -104,7 +104,7 @@ impl TinyfishSearchOptions {
                     purpose = Some(value.to_string());
                 }
                 _ => bail!(
-                    "https://search option is not supported by TinyFish: {name}; read https://help/tinyfish"
+                    "https://search header is not supported by TinyFish: {name}; read https://help/tinyfish"
                 ),
             }
         }

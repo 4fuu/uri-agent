@@ -25,10 +25,10 @@ use tokio_rusqlite::{
 };
 use uuid::Uuid;
 
-const SESSION_DATABASE_FILE: &str = "sessions-v4.db";
+const SESSION_DATABASE_FILE: &str = "sessions-v5.db";
 const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WRITE_BEGIN_ATTEMPTS: usize = 3;
-const RESUME_INDEX_VERSION: u32 = 4;
+const RESUME_INDEX_VERSION: u32 = 5;
 const MAX_EVENT_PAGE: usize = 512;
 const COLLABORATION_PRESENCE_TTL: chrono::Duration = chrono::Duration::seconds(10);
 const RESUME_EVENT_KINDS: &[&str] = &[

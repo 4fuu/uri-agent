@@ -1,5 +1,7 @@
 use crate::plugin::{Plugin, PluginHost};
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest, RequestHeader,
+};
 use crate::task::{TaskInput, TaskManager, TaskRecord};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -33,18 +35,23 @@ terminal tasks include complete output:
 *** End Request
 ```
 
-Wait up to 300 seconds when the result is needed before continuing:
+Wait up to 300 seconds when the result is needed before continuing; add a
+`*** wait: <seconds>` header line after the operation line. A `*** Body:`
+separator is only needed when a body follows, and `tasks` operations take
+none:
 
 ```text
 *** Begin Request
-*** Read: tasks://<id>?wait=30
+*** Read: tasks://<id>
+*** wait: 30
 *** End Request
 ```
 
-`wait` accepts an integer number of seconds; values outside 1 through 300 are
-clamped to the nearest bound. If the task finishes during the wait, the read
-returns its complete terminal output. If the wait expires, it returns current
-status and bounded latest output while the task keeps running.
+The `wait` header accepts an integer number of seconds; values outside 1
+through 300 are clamped to the nearest bound. If the task finishes during the
+wait, the read returns its complete terminal output. If the wait expires, it
+returns current status and bounded latest output while the task keeps
+running.
 
 Cancel a pending or running task:
 
@@ -99,10 +106,12 @@ impl Protocol for TasksProtocol {
     ) -> Result<Vec<u8>> {
         match request.target {
             "help" => {
+                require_no_headers(request.headers, "read", request.uri)?;
                 require_no_body(request.body, "read", request.uri)?;
                 Ok(HELP.as_bytes().to_vec())
             }
             "summary" => {
+                require_no_headers(request.headers, "read", request.uri)?;
                 require_no_body(request.body, "read", request.uri)?;
                 Ok(render_summary(&context.tasks).await)
             }
@@ -124,7 +133,7 @@ impl Protocol for TasksProtocol {
             ),
             target => {
                 require_no_body(request.body, "read", request.uri)?;
-                let (id, wait) = parse_read_target(target)?;
+                let (id, wait) = parse_read_target(target, request.headers)?;
                 render_task(&context.tasks, id, wait).await
             }
         }
@@ -137,9 +146,7 @@ impl Protocol for TasksProtocol {
     ) -> Result<Vec<u8>> {
         let route = parse_exec_target(request.target).map_err(|error| {
             if matches!(request.target, "help" | "summary")
-                || (!request.target.is_empty()
-                    && !request.target.contains('/')
-                    && !request.target.contains('?'))
+                || (!request.target.is_empty() && !request.target.contains('/'))
             {
                 anyhow!(
                     "task inspection requires read; use a `*** Read: {}` request",
@@ -149,6 +156,7 @@ impl Protocol for TasksProtocol {
                 error
             }
         })?;
+        require_no_headers(request.headers, "exec", request.uri)?;
         match route {
             ExecRoute::Cancel { id } => {
                 require_no_body(request.body, "exec", request.uri)?;
@@ -225,22 +233,33 @@ fn invalid_exec() -> anyhow::Error {
 }
 
 fn parse_exec_target(target: &str) -> Result<ExecRoute<'_>> {
-    let (route, query) = target
-        .split_once('?')
-        .map_or((target, None), |(route, query)| (route, Some(query)));
-    let Some((id, kind)) = route.split_once('/') else {
+    let Some((id, kind)) = target.split_once('/') else {
         return Err(invalid_exec());
     };
     if id.is_empty() || id.contains('/') {
         return Err(invalid_exec());
     }
-    match (kind, query) {
-        ("cancel", None) => Ok(ExecRoute::Cancel { id }),
-        ("send", None) => Ok(ExecRoute::Send { id }),
-        ("eof", None) => Ok(ExecRoute::Eof { id }),
-        ("interrupt", None) => Ok(ExecRoute::Interrupt { id }),
+    match kind {
+        "cancel" => Ok(ExecRoute::Cancel { id }),
+        "send" => Ok(ExecRoute::Send { id }),
+        "eof" => Ok(ExecRoute::Eof { id }),
+        "interrupt" => Ok(ExecRoute::Interrupt { id }),
         _ => Err(invalid_exec()),
     }
+}
+
+fn require_no_headers(headers: &[RequestHeader], operation: &str, uri: &str) -> Result<()> {
+    if let Some(header) = headers.first() {
+        let verb = match operation {
+            "exec" => "Exec",
+            _ => "Read",
+        };
+        bail!(
+            "this tasks operation takes no headers; retry with a `*** {verb}: {uri}` request without the `{}` header",
+            header.name
+        );
+    }
+    Ok(())
 }
 
 fn require_no_body(body: &str, operation: &str, uri: &str) -> Result<()> {
@@ -254,28 +273,35 @@ fn require_no_body(body: &str, operation: &str, uri: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_read_target(target: &str) -> Result<(&str, Option<Duration>)> {
-    let (id, query) = target
-        .split_once('?')
-        .map_or((target, None), |(id, query)| (id, Some(query)));
-    if id.is_empty() || id.contains('/') {
+fn parse_read_target<'a>(
+    target: &'a str,
+    headers: &[RequestHeader],
+) -> Result<(&'a str, Option<Duration>)> {
+    if target.is_empty() || target.contains('/') {
         bail!(
-            "tasks read expects `*** Read: tasks://summary`, `*** Read: tasks://<id>`, or `*** Read: tasks://<id>?wait=<seconds>`"
+            "tasks read expects `*** Read: tasks://summary` or `*** Read: tasks://<id>` with an optional `*** wait: <seconds>` header"
         );
     }
-    let Some(query) = query else {
-        return Ok((id, None));
-    };
-    let seconds = query
-        .strip_prefix("wait=")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|seconds| seconds.clamp(1, MAX_WAIT_SECONDS))
-        .ok_or_else(|| {
-            anyhow!(
-                "tasks read queries support only wait=<seconds> with an integer number of seconds"
-            )
-        })?;
-    Ok((id, Some(Duration::from_secs(seconds))))
+    let mut wait = None;
+    for header in headers {
+        if header.name != "wait" {
+            bail!(
+                "unknown tasks read header `{}`; the only supported header is `wait`",
+                header.name
+            );
+        }
+        if wait.is_some() {
+            bail!("duplicate tasks read header `wait`");
+        }
+        let seconds = header
+            .value
+            .trim()
+            .parse::<u64>()
+            .map(|seconds| seconds.clamp(1, MAX_WAIT_SECONDS))
+            .map_err(|_| anyhow!("the tasks `wait` header takes an integer number of seconds"))?;
+        wait = Some(Duration::from_secs(seconds));
+    }
+    Ok((target, wait))
 }
 
 async fn render_task(tasks: &TaskManager, id: &str, wait: Option<Duration>) -> Result<Vec<u8>> {
@@ -389,7 +415,8 @@ mod tests {
     fn help_documents_unified_non_polling_contract() {
         assert!(HELP.contains("tasks://summary"));
         assert!(HELP.contains("tasks://<id>"));
-        assert!(HELP.contains("tasks://<id>?wait=30"));
+        assert!(HELP.contains("*** wait: 30"));
+        assert!(!HELP.contains("?wait="));
         assert!(HELP.contains("tasks://<id>/cancel"));
         assert!(HELP.contains("takes no body. Interactive input routes"));
         assert!(HELP.contains("documented by the shell protocols"));
@@ -431,29 +458,34 @@ mod tests {
 
     #[test]
     fn task_reads_parse_an_optional_bounded_wait() {
-        assert_eq!(parse_read_target("001").unwrap(), ("001", None));
+        assert_eq!(parse_read_target("001", &[]).unwrap(), ("001", None));
         assert_eq!(
-            parse_read_target("001?wait=30").unwrap(),
+            parse_read_target("001", &[RequestHeader::new("wait", "30")]).unwrap(),
             ("001", Some(Duration::from_secs(30)))
         );
         assert_eq!(
-            parse_read_target("001?wait=0").unwrap(),
+            parse_read_target("001", &[RequestHeader::new("wait", "0")]).unwrap(),
             ("001", Some(Duration::from_secs(1)))
         );
         assert_eq!(
-            parse_read_target("001?wait=301").unwrap(),
+            parse_read_target("001", &[RequestHeader::new("wait", "301")]).unwrap(),
             ("001", Some(Duration::from_secs(300)))
         );
-        for target in [
-            "",
-            "001/extra",
-            "001?",
-            "001?wait=soon",
-            "001?other=30",
-            "001?wait=1&wait=2",
-        ] {
-            assert!(parse_read_target(target).is_err(), "accepted {target}");
+        for target in ["", "001/extra"] {
+            assert!(parse_read_target(target, &[]).is_err(), "accepted {target}");
         }
+        assert!(parse_read_target("001", &[RequestHeader::new("wait", "soon")]).is_err());
+        assert!(parse_read_target("001", &[RequestHeader::new("other", "30")]).is_err());
+        assert!(
+            parse_read_target(
+                "001",
+                &[
+                    RequestHeader::new("wait", "1"),
+                    RequestHeader::new("wait", "2"),
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -512,8 +544,9 @@ mod tests {
         let output = TasksProtocol
             .read(
                 ProtocolRequest {
-                    uri: "tasks://001?wait=1",
-                    target: "001?wait=1",
+                    uri: "tasks://001",
+                    target: "001",
+                    headers: &[RequestHeader::new("wait", "1")],
                     body: "",
                 },
                 context,
@@ -547,8 +580,9 @@ mod tests {
         let output = TasksProtocol
             .read(
                 ProtocolRequest {
-                    uri: "tasks://001?wait=1",
-                    target: "001?wait=1",
+                    uri: "tasks://001",
+                    target: "001",
+                    headers: &[RequestHeader::new("wait", "1")],
                     body: "",
                 },
                 context,
@@ -609,6 +643,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/cancel",
                     target: &target,
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -622,6 +657,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/cancel",
                     target: &target,
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -639,6 +675,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://summary",
                     target: "summary",
+                    headers: &[],
                     body: "null",
                 },
                 context,
@@ -674,6 +711,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/send",
                     target: "001/send",
+                    headers: &[],
                     body,
                 },
                 context.clone(),
@@ -689,8 +727,9 @@ mod tests {
         let error = TasksProtocol
             .exec(
                 ProtocolRequest {
-                    uri: "tasks://001/send?encoding=base64",
-                    target: "001/send?encoding=base64",
+                    uri: "tasks://001/send",
+                    target: "001/send",
+                    headers: &[RequestHeader::new("encoding", "base64")],
                     body: "eWVzCg==",
                 },
                 context.clone(),
@@ -698,16 +737,14 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("`*** Exec: tasks://<id>/send` with the input"),
-            "{error}"
-        );
+        assert!(error.contains("takes no headers"), "{error}");
 
         let error = TasksProtocol
             .exec(
                 ProtocolRequest {
                     uri: "tasks://001/eof",
                     target: "001/eof",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -722,6 +759,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/interrupt",
                     target: "001/interrupt",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -739,6 +777,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "tasks://001/interrupt",
                     target: "001/interrupt",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -752,6 +791,49 @@ mod tests {
         );
 
         tasks.cancel(&id).await;
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_routes_reject_headers_they_do_not_take() {
+        let tasks = TaskManager::new();
+        let context = ProtocolContext {
+            tasks: tasks.clone(),
+        };
+
+        let error = TasksProtocol
+            .read(
+                ProtocolRequest {
+                    uri: "tasks://summary",
+                    target: "summary",
+                    headers: &[RequestHeader::new("wait", "1")],
+                    body: "",
+                },
+                context.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("takes no headers"), "{error}");
+
+        let error = TasksProtocol
+            .read(
+                ProtocolRequest {
+                    uri: "tasks://001",
+                    target: "001",
+                    headers: &[RequestHeader::new("other", "30")],
+                    body: "",
+                },
+                context,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the only supported header is `wait`"),
+            "{error}"
+        );
+
         tasks.shutdown().await;
     }
 }

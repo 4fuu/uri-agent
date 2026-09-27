@@ -82,7 +82,7 @@ impl RecordTypes {
         self.selected.contains(&record_type)
     }
 
-    pub(super) fn query_value(&self) -> String {
+    pub(super) fn header_value(&self) -> String {
         RecordType::ALL
             .into_iter()
             .filter(|record_type| self.contains(*record_type))
@@ -306,7 +306,7 @@ mod tests {
                     call_id: "private".to_string(),
                     name: "exec".to_string(),
                     arguments: serde_json::json!({
-                        "uri": "context://notes/add?title=Secret",
+                        "uri": "context://notes/add",
                         "body": "deleted body"
                     }),
                 },
@@ -329,7 +329,7 @@ mod tests {
                     call_id: "session-search".to_string(),
                     name: "read".to_string(),
                     arguments: serde_json::json!({
-                        "uri": "sessions://search?mode=semantic",
+                        "uri": "sessions://search",
                         "body": "private search"
                     }),
                 },
@@ -384,7 +384,7 @@ mod tests {
         assert!(types.contains(RecordType::User));
         assert!(types.contains(RecordType::ToolResult));
         assert!(!types.contains(RecordType::Assistant));
-        assert_eq!(types.query_value(), "user,tool_result");
+        assert_eq!(types.header_value(), "user,tool_result");
         assert_eq!(parse_record_id("r42").unwrap(), 42);
         assert_eq!(parse_record_id("42").unwrap(), 42);
         assert!(parse_record_id("note-42").is_err());

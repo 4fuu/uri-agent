@@ -3183,7 +3183,7 @@ mod tests {
                 ToolFunction::new(
                     "protocol".to_string(),
                     serde_json::json!({
-                        "request": "*** Begin Request\n*** Read: missing://help\n*** End Request"
+                        "requests": ["*** Begin Request\n*** Read: missing://help\n*** End Request"]
                     }),
                 ),
             ))],
@@ -3208,7 +3208,7 @@ mod tests {
             ToolFunction::new(
                 "protocol".to_string(),
                 serde_json::json!({
-                    "request": format!("*** Begin Request\n*** Read: {uri}\n*** End Request")
+                    "requests": [format!("*** Begin Request\n*** Read: {uri}\n*** End Request")]
                 }),
             ),
         )
@@ -3232,7 +3232,7 @@ mod tests {
             ToolFunction::new(
                 "protocol".to_string(),
                 serde_json::json!({
-                    "request": format!("*** Begin Request\n*** Exec: {uri}\n{body}\n*** End Request")
+                    "requests": [format!("*** Begin Request\n*** Exec: {uri}\n{body}\n*** End Request")]
                 }),
             ),
         )
@@ -4963,7 +4963,7 @@ mod tests {
             ToolFunction::new(
                 "protocol".to_string(),
                 serde_json::json!({
-                    "request": "*** Begin Request\n*** Read: file://screenshot.png\n*** End Request"
+                    "requests": ["*** Begin Request\n*** Read: file://screenshot.png\n*** End Request"]
                 }),
             ),
         );
@@ -5713,6 +5713,7 @@ mod tests {
         let rollover_request = || ProtocolRequest {
             uri: "context://rollover",
             target: "rollover",
+            headers: &[],
             body: "",
         };
         assert!(

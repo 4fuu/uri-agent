@@ -9,12 +9,12 @@ Agent sessions, durability, retries, and context checkpoints.
 Sessions are stored in SQLite at:
 
 ```text
-<platform-data-dir>/uri-agent/sessions-v4.db
+<platform-data-dir>/uri-agent/sessions-v5.db
 ```
 
 On macOS the database is under `~/.config/uri-agent`; if no platform data
 directory exists, URI Agent falls back to `<project>/.uri-agent`. Earlier
-database versions remain untouched and are not migrated into `sessions-v4.db`.
+database versions remain untouched and are not migrated into `sessions-v5.db`.
 
 The canonical startup directory is each session's project boundary:
 

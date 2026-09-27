@@ -376,6 +376,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://help",
                     target: "help",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -393,6 +394,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://check.sh",
                     target: "check.sh",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -406,6 +408,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://",
                     target: "",
+                    headers: &[],
                     body: "",
                 },
                 context.clone(),
@@ -423,6 +426,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://../outside",
                     target: "../outside",
+                    headers: &[],
                     body: "",
                 },
                 context,
@@ -444,6 +448,7 @@ mod tests {
                     ProtocolRequest {
                         uri: "code-review-skill://outside-link",
                         target: "outside-link",
+                        headers: &[],
                         body: "",
                     },
                     ProtocolContext {
@@ -485,6 +490,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "review-skill://help",
                     target: "help",
+                    headers: &[],
                     body: "",
                 },
                 ProtocolContext {
@@ -514,6 +520,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "review-skill://help",
                     target: "help",
+                    headers: &[],
                     body: "",
                 },
                 ProtocolContext {

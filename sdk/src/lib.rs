@@ -12,7 +12,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -485,6 +485,21 @@ pub enum Operation {
     Exec,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl RequestHeader {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandlerRequest {
@@ -493,6 +508,7 @@ pub enum HandlerRequest {
         operation: Operation,
         uri: String,
         target: String,
+        headers: Vec<RequestHeader>,
         body: String,
     },
     ModelTool {
@@ -510,6 +526,7 @@ pub type HandlerResult = Result<Vec<u8>, String>;
 #[derive(Serialize)]
 struct HostRequest<'a> {
     uri: &'a str,
+    headers: &'a [RequestHeader],
     body: &'a str,
 }
 
@@ -532,13 +549,13 @@ mod host {
 }
 
 #[cfg(target_family = "wasm")]
-pub fn read(uri: &str, body: &str) -> Result<String, Error> {
-    call_host(uri, body, host::uri_agent_read)
+pub fn read(uri: &str, headers: &[RequestHeader], body: &str) -> Result<String, Error> {
+    call_host(uri, headers, body, host::uri_agent_read)
 }
 
 #[cfg(target_family = "wasm")]
-pub fn exec(uri: &str, body: &str) -> Result<String, Error> {
-    call_host(uri, body, host::uri_agent_exec)
+pub fn exec(uri: &str, headers: &[RequestHeader], body: &str) -> Result<String, Error> {
+    call_host(uri, headers, body, host::uri_agent_exec)
 }
 
 #[cfg(target_family = "wasm")]
@@ -655,10 +672,11 @@ pub fn set_plugin_setting(key: &str, value: Value) -> Result<(), Error> {
 #[cfg(target_family = "wasm")]
 fn call_host(
     uri: &str,
+    headers: &[RequestHeader],
     body: &str,
     call: unsafe fn(String) -> Result<String, Error>,
 ) -> Result<String, Error> {
-    let input = serde_json::to_string(&HostRequest { uri, body })?;
+    let input = serde_json::to_string(&HostRequest { uri, headers, body })?;
     unsafe { call(input) }
 }
 
@@ -697,7 +715,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_wire_types_use_the_v6_shape() {
+    fn public_wire_types_use_the_v8_shape() {
         let manifest = PluginManifest::new([ProtocolDescriptor::new(
             "example",
             "Example protocol",

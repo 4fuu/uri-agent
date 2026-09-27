@@ -70,10 +70,109 @@ pub struct ProtocolDescriptor {
     pub can_exec: bool,
 }
 
+/// One `*** name: value` header line from a protocol request. Header names
+/// are normalized to lowercase ASCII when the request is parsed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl RequestHeader {
+    pub fn new(name: &str, value: &str) -> Self {
+        Self {
+            name: name.to_ascii_lowercase(),
+            value: value.to_string(),
+        }
+    }
+}
+
+/// The comparison operator prefixing a request header value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Comparison {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Comparison {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+}
+
+/// Splits a header value into a leading comparison operator and its operand.
+/// A bare value is equality; `>=`, `<=`, and `!=` are matched before their
+/// single-character prefixes. Fields that do not opt into comparisons treat
+/// their header values verbatim and never call this.
+pub fn parse_comparison(value: &str) -> (Comparison, &str) {
+    for (operator, comparison) in [
+        (">=", Comparison::Ge),
+        ("<=", Comparison::Le),
+        ("!=", Comparison::Ne),
+        (">", Comparison::Gt),
+        ("<", Comparison::Lt),
+        ("=", Comparison::Eq),
+    ] {
+        if let Some(operand) = value.strip_prefix(operator) {
+            return (comparison, operand.trim_start_matches([' ', '\t']));
+        }
+    }
+    (Comparison::Eq, value)
+}
+
 pub struct ProtocolRequest<'a> {
     pub uri: &'a str,
     pub target: &'a str,
+    pub headers: &'a [RequestHeader],
     pub body: &'a str,
+}
+
+impl ProtocolRequest<'_> {
+    /// The values of every header with this name, in request order.
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|header| header.name == name)
+            .map(|header| header.value.as_str())
+            .collect()
+    }
+
+    /// The value of a header that must appear at most once.
+    pub fn header_value(&self, name: &str) -> Result<Option<&str>> {
+        let values = self.header_values(name);
+        if values.len() > 1 {
+            bail!("duplicate header `{name}` in {}", self.uri);
+        }
+        Ok(values.first().copied())
+    }
+
+    /// Reject headers whose names are not in `allowed`.
+    pub fn reject_unknown_headers(&self, allowed: &[&str]) -> Result<()> {
+        if let Some(header) = self
+            .headers
+            .iter()
+            .find(|header| !allowed.contains(&header.name.as_str()))
+        {
+            bail!(
+                "unknown header `{}` in {}; supported headers: {}",
+                header.name,
+                self.uri,
+                allowed.join(", ")
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +272,7 @@ impl From<Vec<u8>> for ProtocolReadOutput {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct PresentedProtocolRead {
     pub output: String,
     pub images: Vec<ProtocolImage>,
@@ -401,27 +501,50 @@ impl ProtocolRegistry {
     }
 
     pub async fn read(&self, uri: &str, body: &str) -> Result<String> {
-        Ok(self.dispatch_read(uri, body, true, true).await?.output)
+        Ok(self.dispatch_read(uri, &[], body, true, true).await?.output)
     }
 
     pub(crate) async fn read_for_model(
         &self,
         uri: &str,
+        headers: &[RequestHeader],
         body: &str,
     ) -> Result<PresentedProtocolRead> {
-        self.dispatch_read(uri, body, true, true).await
+        self.dispatch_read(uri, headers, body, true, true).await
     }
 
     pub async fn exec(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_exec(uri, body, true, true).await
+        self.dispatch_exec(uri, &[], body, true, true).await
     }
 
-    pub(crate) async fn read_static(&self, uri: &str, body: &str) -> Result<String> {
-        Ok(self.dispatch_read(uri, body, false, false).await?.output)
+    pub(crate) async fn exec_for_model(
+        &self,
+        uri: &str,
+        headers: &[RequestHeader],
+        body: &str,
+    ) -> Result<String> {
+        self.dispatch_exec(uri, headers, body, true, true).await
     }
 
-    pub(crate) async fn exec_static(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_exec(uri, body, false, false).await
+    pub(crate) async fn read_static(
+        &self,
+        uri: &str,
+        headers: &[RequestHeader],
+        body: &str,
+    ) -> Result<String> {
+        Ok(self
+            .dispatch_read(uri, headers, body, false, false)
+            .await?
+            .output)
+    }
+
+    pub(crate) async fn exec_static(
+        &self,
+        uri: &str,
+        headers: &[RequestHeader],
+        body: &str,
+    ) -> Result<String> {
+        self.dispatch_exec(uri, headers, body, false, false).await
     }
 
     /// Load help pages for the requested protocols through the help tool.
@@ -472,6 +595,7 @@ impl ProtocolRegistry {
                     ProtocolRequest {
                         uri: &uri,
                         target: "help",
+                        headers: &[],
                         body: "",
                     },
                     self.context.clone(),
@@ -587,6 +711,7 @@ impl ProtocolRegistry {
     async fn dispatch_read(
         &self,
         uri: &str,
+        headers: &[RequestHeader],
         body: &str,
         include_dynamic: bool,
         require_help: bool,
@@ -615,7 +740,15 @@ impl ProtocolRegistry {
             }
         }
         let response = protocol
-            .read_output(ProtocolRequest { uri, target, body }, self.context.clone())
+            .read_output(
+                ProtocolRequest {
+                    uri,
+                    target,
+                    headers,
+                    body,
+                },
+                self.context.clone(),
+            )
             .await?;
         let (content, images) = response.into_parts();
         let output = self.output.present(content, name).await?;
@@ -625,6 +758,7 @@ impl ProtocolRegistry {
     async fn dispatch_exec(
         &self,
         uri: &str,
+        headers: &[RequestHeader],
         body: &str,
         include_dynamic: bool,
         require_help: bool,
@@ -656,7 +790,15 @@ impl ProtocolRegistry {
             );
         }
         let content = protocol
-            .exec(ProtocolRequest { uri, target, body }, self.context.clone())
+            .exec(
+                ProtocolRequest {
+                    uri,
+                    target,
+                    headers,
+                    body,
+                },
+                self.context.clone(),
+            )
             .await?;
         self.output.present(content, name).await
     }
@@ -906,6 +1048,82 @@ mod tests {
         ) -> Result<Vec<u8>> {
             Ok(self.name.as_bytes().to_vec())
         }
+    }
+
+    #[test]
+    fn header_names_normalize_and_comparisons_split_from_operands() {
+        let header = RequestHeader::new("Mode", "hybrid");
+        assert_eq!(header.name, "mode");
+        assert_eq!(header.value, "hybrid");
+
+        assert_eq!(parse_comparison(">=10"), (Comparison::Ge, "10"));
+        assert_eq!(parse_comparison("> 10"), (Comparison::Gt, "10"));
+        assert_eq!(parse_comparison("<=50"), (Comparison::Le, "50"));
+        assert_eq!(parse_comparison("<50"), (Comparison::Lt, "50"));
+        assert_eq!(parse_comparison("!=x"), (Comparison::Ne, "x"));
+        assert_eq!(parse_comparison("=10"), (Comparison::Eq, "10"));
+        assert_eq!(parse_comparison("10"), (Comparison::Eq, "10"));
+        // An operator inside the value is not a prefix.
+        assert_eq!(parse_comparison("a >= b"), (Comparison::Eq, "a >= b"));
+    }
+
+    struct HeaderEchoProtocol;
+
+    #[async_trait]
+    impl Protocol for HeaderEchoProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "headers".to_string(),
+                description: "header echo test protocol".to_string(),
+                can_read: true,
+                can_exec: false,
+            }
+        }
+
+        async fn read(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<Vec<u8>> {
+            Ok(request
+                .headers
+                .iter()
+                .map(|header| format!("{}={}", header.name, header.value))
+                .collect::<Vec<_>>()
+                .join("&")
+                .into_bytes())
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_passes_headers_to_every_protocol() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let capture = Arc::new(Mutex::new(None));
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(CaptureProtocol {
+                capture: capture.clone(),
+            })
+            .unwrap();
+        registry.register(HeaderEchoProtocol).unwrap();
+        registry
+            .load_help(&["capture".to_string(), "headers".to_string()])
+            .await
+            .unwrap();
+        let headers = [RequestHeader::new("limit", ">=10")];
+
+        let result = registry
+            .read_for_model("headers://value", &headers, "")
+            .await
+            .unwrap();
+        assert_eq!(result.output, "limit=>=10");
+
+        // Calls without headers are unaffected.
+        assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
+        assert_eq!(registry.read("headers://value", "").await.unwrap(), "");
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
     #[test]
@@ -1261,9 +1479,18 @@ mod tests {
                 .downcast_ref::<ProtocolHelpRequired>()
                 .is_some()
         );
-        registry.read_static("capture://value", "").await.unwrap();
-        registry.exec_static("capture://run", "").await.unwrap();
-        registry.read_static("capture://help", "").await.unwrap();
+        registry
+            .read_static("capture://value", &[], "")
+            .await
+            .unwrap();
+        registry
+            .exec_static("capture://run", &[], "")
+            .await
+            .unwrap();
+        registry
+            .read_static("capture://help", &[], "")
+            .await
+            .unwrap();
         assert!(
             registry
                 .read("capture://value", "")

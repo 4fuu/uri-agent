@@ -1558,7 +1558,11 @@ fn acp_image_content(image: &rig::message::Image) -> Option<ImageContent> {
 
 fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     if name == "protocol"
-        && let Some(request) = arguments.get("request").and_then(serde_json::Value::as_str)
+        && let Some(request) = arguments
+            .get("requests")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|requests| requests.first())
+            .and_then(serde_json::Value::as_str)
     {
         let operation = request.lines().nth(1).unwrap_or_default().trim_end();
         if !operation.is_empty() {
@@ -1575,11 +1579,16 @@ fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
 fn tool_kind(name: &str, arguments: &serde_json::Value) -> ToolKind {
     match name {
         "protocol" => {
-            let request = arguments
-                .get("request")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if request.contains("*** Exec:") {
+            let has_exec = arguments
+                .get("requests")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|requests| {
+                    requests
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|request| request.contains("*** Exec:"))
+                });
+            if has_exec {
                 ToolKind::Execute
             } else {
                 ToolKind::Read
