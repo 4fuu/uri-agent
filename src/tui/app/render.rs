@@ -55,7 +55,12 @@ fn tool_document(block: &DisplayBlock, tool: &ToolDisplay, level: usize) -> Stri
 }
 
 fn tool_target(tool: &ToolDisplay) -> Option<Cow<'_, str>> {
-    if let Some(parsed) = parse_protocol_request(&tool.arguments) {
+    let requests = parse_protocol_requests(&tool.arguments);
+    if requests.len() > 1 {
+        // A batch lists each request under its own heading instead.
+        return None;
+    }
+    if let Some(parsed) = requests.first() {
         return Some(display_tool_uri(parsed.uri));
     }
     if let Some(uri) = tool
@@ -110,33 +115,42 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
         }
         return;
     }
-    let protocol_request_consumed = parse_protocol_request(&tool.arguments).is_some();
-    if let Some(body) = tool_body_text(&tool.arguments)
-        && !body.is_empty()
+    let protocol_requests = parse_protocol_requests(&tool.arguments);
+    let protocol_request_consumed = !protocol_requests.is_empty();
+    if protocol_requests.len() > 1 {
+        let request_heading = "#".repeat(level + 1);
+        document.push_str(&format!("\n{heading} Requests\n"));
+        for (index, request) in protocol_requests.iter().enumerate() {
+            let action = if request.operation == "Exec" {
+                "Exec"
+            } else {
+                "Read"
+            };
+            document.push_str(&format!(
+                "\n{request_heading} Request {} · {} {}\n",
+                index + 1,
+                action,
+                inline_code(&display_tool_uri(request.uri))
+            ));
+            append_request_body(document, request, level + 2);
+        }
+    } else if let Some(request) = protocol_requests.first() {
+        append_request_body(document, request, level);
+    } else if let Some(body) = tool
+        .arguments
+        .get("body")
+        .and_then(serde_json::Value::as_str)
     {
-        let protocol = tool_protocol(&tool.arguments);
-        let (label, language) = if parse_protocol_request(&tool.arguments)
-            .is_some_and(|parsed| parsed.operation == "Exec")
-        {
-            match protocol.as_deref() {
-                Some("bash") => ("Command", "bash"),
-                Some("pwsh") => ("Command", "powershell"),
-                _ => ("Input", "text"),
-            }
-        } else {
-            ("Input", "text")
-        };
-        let parsed = (label != "Command")
-            .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
-            .flatten();
-        let rendered = parsed.as_ref().and_then(|value| {
-            serde_json::to_string_pretty(&redact_sensitive_arguments(value)).ok()
-        });
-        document.push_str(&format!("\n{heading} {label}\n\n"));
-        document.push_str(&fenced_block(
-            rendered.as_deref().unwrap_or(body),
-            if rendered.is_some() { "json" } else { language },
-        ));
+        // Tools without a protocol request keep rendering a plain body field.
+        append_request_body(
+            document,
+            &ProtocolRequest {
+                operation: "",
+                uri: "",
+                body,
+            },
+            level,
+        );
     }
 
     let Some(arguments) = tool.arguments.as_object() else {
@@ -157,6 +171,37 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
     let input = serde_json::to_string_pretty(&remaining).unwrap_or_else(|_| remaining.to_string());
     document.push_str(&format!("\n{heading} Input\n\n"));
     document.push_str(&fenced_block(&input, "json"));
+}
+
+/// Appends one protocol request's body as a Command or Input section;
+/// requests without a body render nothing.
+fn append_request_body(document: &mut String, request: &ProtocolRequest<'_>, level: usize) {
+    let body = request.body;
+    if body.is_empty() {
+        return;
+    }
+    let heading = "#".repeat(level);
+    let protocol = request.uri.split("://").next().unwrap_or_default();
+    let (label, language) = if request.operation == "Exec" {
+        match protocol {
+            "bash" => ("Command", "bash"),
+            "pwsh" => ("Command", "powershell"),
+            _ => ("Input", "text"),
+        }
+    } else {
+        ("Input", "text")
+    };
+    let parsed = (label != "Command")
+        .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
+        .flatten();
+    let rendered = parsed
+        .as_ref()
+        .and_then(|value| serde_json::to_string_pretty(&redact_sensitive_arguments(value)).ok());
+    document.push_str(&format!("\n{heading} {label}\n\n"));
+    document.push_str(&fenced_block(
+        rendered.as_deref().unwrap_or(body),
+        if rendered.is_some() { "json" } else { language },
+    ));
 }
 
 pub(super) fn redact_sensitive_arguments(value: &serde_json::Value) -> serde_json::Value {
@@ -246,16 +291,25 @@ fn longest_backtick_run(value: &str) -> usize {
 }
 
 /// Parses the `protocol` tool's fixed request format for display only: the
-/// `*** Read:`/`*** Exec:` verb, the address, and the raw request body. Only
-/// the first request of a batch is previewed.
+/// `*** Read:`/`*** Exec:` verb, the address, and the raw request body. Every
+/// request of a batch is kept so previews can show the whole call.
 struct ProtocolRequest<'a> {
     operation: &'a str,
     uri: &'a str,
     body: &'a str,
 }
 
-fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolRequest<'_>> {
-    let request = arguments.get("requests")?.as_array()?.first()?.as_str()?;
+fn parse_protocol_requests(arguments: &serde_json::Value) -> Vec<ProtocolRequest<'_>> {
+    arguments
+        .get("requests")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|request| request.as_str().and_then(parse_protocol_request_text))
+        .collect()
+}
+
+fn parse_protocol_request_text(request: &str) -> Option<ProtocolRequest<'_>> {
     let mut offset = 0;
     let begin = next_request_line(request, &mut offset)?;
     if begin.trim_end() != "*** Begin Request" {
@@ -282,6 +336,10 @@ fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolReque
         uri,
         body: strip_end_request(body),
     })
+}
+
+fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolRequest<'_>> {
+    parse_protocol_requests(arguments).into_iter().next()
 }
 
 fn is_header_line(line: &str) -> bool {
@@ -322,15 +380,12 @@ pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
     (separator > 0).then(|| uri[..separator].to_string())
 }
 
-fn tool_body_text(arguments: &serde_json::Value) -> Option<&str> {
-    if let Some(parsed) = parse_protocol_request(arguments) {
-        return Some(parsed.body);
-    }
-    arguments.get("body")?.as_str()
-}
-
 fn tool_body(arguments: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
-    if let Some(parsed) = parse_protocol_request(arguments) {
+    let requests = parse_protocol_requests(arguments);
+    if requests.len() > 1 {
+        return None;
+    }
+    if let Some(parsed) = requests.first() {
         if parsed.body.is_empty() {
             return None;
         }
@@ -401,20 +456,23 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
         }
         return format!("Loaded help: {}", single_line_preview(&names, 64));
     }
-    let (action, uri, body) = match name {
-        "protocol" => {
-            let Some(parsed) = parse_protocol_request(arguments) else {
-                return name.to_string();
-            };
-            let action = if parsed.operation == "Exec" {
-                "Ran"
-            } else {
-                "Read"
-            };
-            (action, parsed.uri, parsed.body)
-        }
-        _ => return name.to_string(),
+    let requests = parse_protocol_requests(arguments);
+    let Some(parsed) = requests.first() else {
+        return name.to_string();
     };
+    let action = if parsed.operation == "Exec" {
+        "Ran"
+    } else {
+        "Read"
+    };
+    let title = protocol_request_title(action, parsed.uri, parsed.body);
+    if requests.len() > 1 {
+        return format!("{title} +{}", requests.len() - 1);
+    }
+    title
+}
+
+fn protocol_request_title(action: &str, uri: &str, body: &str) -> String {
     let uri = display_tool_uri(uri);
     let uri = uri.as_ref();
     let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
@@ -456,8 +514,11 @@ pub(super) fn tool_detail_lines(
 ) -> (Vec<(String, Color)>, usize) {
     let mut logical = Vec::new();
     if let Some(tool) = &block.tool {
-        if let Some(parsed) = parse_protocol_request(&tool.arguments) {
-            logical.push((format!("↳ {}", parsed.uri), MUTED));
+        let requests = parse_protocol_requests(&tool.arguments);
+        if !requests.is_empty() {
+            for parsed in &requests {
+                logical.push((format!("↳ {}", parsed.uri), MUTED));
+            }
         } else if let Some(uri) = tool
             .arguments
             .get("uri")

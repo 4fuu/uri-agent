@@ -4937,6 +4937,77 @@ fn protocol_tool_documents_do_not_repeat_the_request_as_input_json() {
 }
 
 #[test]
+fn protocol_batch_tool_calls_show_every_request() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "batch-call".to_string(),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({
+                "requests": [
+                    "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request",
+                    "*** Begin Request\n*** Exec: bash://run\n*** Body:\ncargo test\n*** End Request",
+                    "*** Begin Request\n*** Read: search://src\n*** mode: hybrid\n*** Body:\ncredential flow\n*** End Request"
+                ]
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "batch-call".to_string(),
+            name: "protocol".to_string(),
+            output: "*** Result 1 of 3: ok\nread\n\n*** Result 2 of 3: ok\ndone\n\n*** Result 3 of 3: error\nboom"
+                .to_string(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+
+    // The summary row keeps the first request and reports the rest of the batch.
+    assert_eq!(app.blocks[0].title, "Read src/main.rs +2");
+
+    // Expanding the row lists every request address in call order.
+    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20);
+    let details = details
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(details.contains("↳ file://src/main.rs"));
+    assert!(details.contains("↳ bash://run"));
+    assert!(details.contains("↳ search://src"));
+
+    // The opened document numbers each request and keeps its body, so the
+    // numbered result sections stay traceable to their requests.
+    let document = block_document(&app.blocks[0]);
+    assert!(document.contains("## Requests"));
+    assert!(document.contains("### Request 1 · Read `file://src/main.rs`"));
+    assert!(document.contains("### Request 2 · Exec `bash://run`"));
+    assert!(document.contains("### Request 3 · Read `search://src`"));
+    assert!(document.contains("```bash\ncargo test\n```"));
+    assert!(document.contains("credential flow"));
+    assert_eq!(document.matches("#### Command").count(), 1);
+    assert_eq!(document.matches("#### Input").count(), 1);
+    assert!(document.contains("*** Result 2 of 3: ok"));
+    // A batch has no single target, and the raw requests array is not repeated.
+    assert!(!document.contains("**Target:**"));
+    assert!(!document.contains("\"requests\""));
+
+    // The rendered transcript shows the batch summary, and the expanded row
+    // lists every request address on screen.
+    app.blocks[0].expanded = true;
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("✓ Read src/main.rs +2"));
+    assert!(rendered.contains("↳ file://src/main.rs"));
+    assert!(rendered.contains("↳ bash://run"));
+    assert!(rendered.contains("↳ search://src"));
+}
+
+#[test]
 fn tool_details_redact_sensitive_dynamic_arguments() {
     let mut app = test_app();
     apply_event(
@@ -5052,6 +5123,18 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
             })
         ),
         "$ cargo test"
+    );
+    assert_eq!(
+        tool_title(
+            "protocol",
+            &serde_json::json!({
+                "requests": [
+                    "*** Begin Request\n*** Exec: bash://run\n*** Body:\ncargo test\n*** End Request",
+                    "*** Begin Request\n*** Read: file://src/tui.rs\n*** End Request"
+                ]
+            })
+        ),
+        "$ cargo test +1"
     );
     assert_eq!(
         tool_title(
