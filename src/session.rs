@@ -455,6 +455,32 @@ pub enum SessionUpdate {
     Transient(EventKind),
 }
 
+/// One host context hint. Discriminant order is the emission order; a sent hint
+/// also counts every earlier hint as sent so a jump does not replay them.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextHint {
+    Note15 = 0,
+    Note30 = 1,
+    Note50 = 2,
+    Rollover60 = 3,
+    Rollover70 = 4,
+    Rollover80 = 5,
+    Final = 6,
+}
+
+impl ContextHint {
+    pub const ALL: u8 = (1 << 7) - 1;
+
+    pub fn bit(self) -> u8 {
+        1_u8 << (self as u8)
+    }
+
+    pub fn mask_through(self) -> u8 {
+        (1_u8 << (self as u8 + 1)).wrapping_sub(1)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -556,6 +582,10 @@ pub enum EventKind {
     },
     ContextReminder {
         window_id: u64,
+        /// Absent on reminders written before percentage hints. Those mark
+        /// every hint for the window as already sent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<ContextHint>,
     },
     ContextNote {
         id: String,
@@ -646,6 +676,10 @@ struct ResumeState {
     latest_rollover_window_id: Option<u64>,
     #[serde(default)]
     reminded_context_window_id: Option<u64>,
+    #[serde(default)]
+    context_hint_window_id: Option<u64>,
+    #[serde(default)]
+    context_hints_sent: u8,
     spec: Option<AgentSpec>,
     has_user: bool,
     successful_help_reads: HashSet<String>,
@@ -2393,8 +2427,17 @@ impl Session {
             .unwrap_or(1)
     }
 
-    pub(crate) async fn context_window_was_reminded(&self, window_id: u64) -> bool {
-        self.state.lock().await.derived.reminded_context_window_id == Some(window_id)
+    pub(crate) async fn context_hints_sent(&self, window_id: u64) -> u8 {
+        let derived = &self.state.lock().await.derived;
+        if derived.context_hint_window_id == Some(window_id) {
+            derived.context_hints_sent
+        } else if derived.context_hint_window_id.is_none()
+            && derived.reminded_context_window_id == Some(window_id)
+        {
+            ContextHint::ALL
+        } else {
+            0
+        }
     }
 
     pub async fn events_after(&self, sequence: u64, limit: usize) -> Result<Vec<SessionEvent>> {
@@ -3706,13 +3749,22 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.latest_compaction_sequence = Some(event.sequence);
             state.latest_rollover_window_id = Some(*window_id);
             state.reminded_context_window_id = None;
+            state.context_hint_window_id = None;
+            state.context_hints_sent = 0;
             state.successful_help_reads.clear();
             state.pending_help_reads.clear();
             state.token_calibration.pending_visible_units = 0;
             state.token_calibration.pending_reasoning_visible = false;
             state.token_calibration.pending_usage = None;
         }
-        EventKind::ContextReminder { window_id } => {
+        EventKind::ContextReminder { window_id, hint } => {
+            if state.context_hint_window_id != Some(*window_id) {
+                state.context_hints_sent = 0;
+                state.context_hint_window_id = Some(*window_id);
+            }
+            state.context_hints_sent |= hint
+                .map(ContextHint::mask_through)
+                .unwrap_or(ContextHint::ALL);
             state.reminded_context_window_id = Some(*window_id);
         }
         EventKind::ModelRetry { .. } | EventKind::Error { .. } => {
@@ -4600,6 +4652,74 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(event, EventKind::Task { output: None, .. }));
+    }
+
+    #[test]
+    fn legacy_context_reminder_marks_every_hint_sent() {
+        let event = serde_json::from_value::<EventKind>(serde_json::json!({
+            "kind": "context_reminder",
+            "window_id": 3
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            EventKind::ContextReminder {
+                window_id: 3,
+                hint: None
+            }
+        ));
+        let mut state = ResumeState::default();
+        apply_resume_event(
+            &mut state,
+            &SessionEvent {
+                sequence: 1,
+                at: Utc::now(),
+                kind: event,
+            },
+        );
+        assert_eq!(state.context_hint_window_id, Some(3));
+        assert_eq!(state.context_hints_sent, ContextHint::ALL);
+        assert_eq!(state.reminded_context_window_id, Some(3));
+    }
+
+    #[test]
+    fn context_hint_mask_covers_skipped_lower_tiers_until_rollover() {
+        let mut state = ResumeState::default();
+        apply_resume_event(
+            &mut state,
+            &SessionEvent {
+                sequence: 1,
+                at: Utc::now(),
+                kind: EventKind::ContextReminder {
+                    window_id: 1,
+                    hint: Some(ContextHint::Rollover60),
+                },
+            },
+        );
+        assert_eq!(
+            state.context_hints_sent,
+            ContextHint::Rollover60.mask_through()
+        );
+        assert_ne!(state.context_hints_sent & ContextHint::Note50.bit(), 0);
+        assert_eq!(state.context_hints_sent & ContextHint::Rollover70.bit(), 0);
+
+        apply_resume_event(
+            &mut state,
+            &SessionEvent {
+                sequence: 2,
+                at: Utc::now(),
+                kind: EventKind::ContextRollover {
+                    window_id: 2,
+                    tokens_before: 1,
+                    replacement_history: Vec::new(),
+                    manual: false,
+                },
+            },
+        );
+        assert_eq!(state.context_hint_window_id, None);
+        assert_eq!(state.context_hints_sent, 0);
+        assert_eq!(state.reminded_context_window_id, None);
+        assert_eq!(state.latest_rollover_window_id, Some(2));
     }
 
     #[tokio::test]

@@ -183,12 +183,18 @@ usage is authoritative when available; later content is estimated until a new
 response arrives. Before each request, the requested output is capped to the
 estimated remaining room after a safety margin.
 
-`rollover` is the default checkpoint strategy. Near the configured threshold,
-the model receives one hidden reminder to review its notes. At the threshold,
-URI Agent starts a fresh model window without generating a summary. The previous
-transcript remains in SQLite but leaves provider replay; a hidden bootstrap
-directs the model to active notes and bounded prior history. Protocol-help state
-resets for the new window.
+`rollover` is the default checkpoint strategy. Hidden reminders at 15%, 30%,
+and 50% of the context window ask the model to maintain notes after the work
+already in hand pauses. Reminders at 60%, 70%, and 80% also ask it to organize
+that work into notes and to request rollover at the next suitable task
+boundary; each states how many reminders remain in that series. A jump sends
+only the highest crossed reminder and marks the skipped levels sent. Near the
+configured threshold, one further hidden reminder asks for a final note update.
+If that reserve reminder is already due, it is sent instead of a percentage
+reminder. At the threshold, URI Agent starts a fresh model window without
+generating a summary. The previous transcript remains in SQLite but leaves
+provider replay; a hidden bootstrap directs the model to active notes and
+bounded prior history. Protocol-help state resets for the new window.
 
 The `context` protocol provides durable titled notes, context status, window and
 user-statement listings, exact or ranked history search, and reads around stable

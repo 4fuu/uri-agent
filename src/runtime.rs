@@ -16,7 +16,7 @@ use crate::plugin::{ModelToolOutput, ModelToolRegistry};
 use crate::protocol::{
     ProtocolHelpRequired, ProtocolImage, ProtocolImageMediaType, ProtocolRegistry,
 };
-use crate::session::{EventKind, PendingInput, Session};
+use crate::session::{ContextHint, EventKind, PendingInput, Session};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -47,6 +47,96 @@ const TASK_NOTIFICATION_MAX_CONTENT_CHARS: usize = 16_000;
 const CONTEXT_REMINDER_RESERVE_MULTIPLIER: usize = 2;
 const TURN_INTERRUPTED_BY_USER: &str = "turn interrupted by user";
 const TURN_INTERRUPTED_BY_SHUTDOWN: &str = "turn interrupted by shutdown";
+
+fn due_context_hint(
+    context_tokens: usize,
+    context_window: usize,
+    settings: compaction::Settings,
+    sent: u8,
+) -> Option<ContextHint> {
+    if context_tokens == 0 || context_window == 0 {
+        return None;
+    }
+    let percent = context_tokens.saturating_mul(100) / context_window;
+    let reminder_reserve = settings
+        .reserve_for(context_window)
+        .saturating_mul(CONTEXT_REMINDER_RESERVE_MULTIPLIER)
+        .min(context_window);
+    let final_due = context_tokens >= context_window.saturating_sub(reminder_reserve);
+    [
+        (ContextHint::Final, final_due),
+        (ContextHint::Rollover80, percent >= 80),
+        (ContextHint::Rollover70, percent >= 70),
+        (ContextHint::Rollover60, percent >= 60),
+        (ContextHint::Note50, percent >= 50),
+        (ContextHint::Note30, percent >= 30),
+        (ContextHint::Note15, percent >= 15),
+    ]
+    .into_iter()
+    .find_map(|(hint, due)| (due && sent & hint.bit() == 0).then_some(hint))
+}
+
+fn context_hint_message(
+    hint: ContextHint,
+    window_id: u64,
+    percent: usize,
+    remaining: usize,
+) -> String {
+    match hint {
+        ContextHint::Note15 => format!(
+            "<uri-agent-context-note-hint>\n\
+             This is a host reminder, not a user request. Context window {window_id} is past the 15% note hint (about {percent}% full, approximately {remaining} tokens remaining).\n\
+             Do not act on this hint until the work already in hand is finished. It does not ask you to stop, load help, or write notes now.\n\
+             After that work pauses, if this window has no working note, write one short context://notes entry covering decisions, file paths, verified results, and unfinished work that should survive a later rollover. If a note already covers that, leave it unchanged. Call help([\"context\"]) only at that later pause, and only if its contract is not loaded.\n\
+             </uri-agent-context-note-hint>"
+        ),
+        ContextHint::Note30 => format!(
+            "<uri-agent-context-note-hint>\n\
+             This is a host reminder, not a user request. Context window {window_id} is past the 30% note hint (about {percent}% full, approximately {remaining} tokens remaining).\n\
+             Finish the work already in hand first. This hint is not a request to review notes now.\n\
+             When that work pauses, update context://notes only if a decision, path, verified result, or unfinished step has changed since the last revision. If nothing durable changed, do not revise the notes. Replace an existing note when the subject is the same; do not add another note for it.\n\
+             </uri-agent-context-note-hint>"
+        ),
+        ContextHint::Note50 => format!(
+            "<uri-agent-context-note-hint>\n\
+             This is a host reminder, not a user request. Context window {window_id} is past the 50% note hint (about {percent}% full, approximately {remaining} tokens remaining).\n\
+             Finish the work already in hand first. Do not start note maintenance in the middle of it.\n\
+             When that work pauses, make context://notes sufficient to resume after this transcript is gone: current goal, decisions, paths, verified results, and the exact unfinished work. Skip the update if the active notes are already current. Later hints may suggest cutting this window at a task boundary; the host is not cutting it at this level.\n\
+             </uri-agent-context-note-hint>"
+        ),
+        ContextHint::Rollover60 => format!(
+            "<uri-agent-context-rollover-hint>\n\
+             This is a host reminder, not a user request. Context window {window_id} is past the 60% rollover hint (about {percent}% full, approximately {remaining} tokens remaining).\n\
+             This series will remind you twice more, at about 70% and 80%. If a suitable boundary has not arrived, do not rollover for this hint.\n\
+             Finish the work already in hand. Do not organize or rollover while that work, an unread tool result, or a half-read investigation still depends on this transcript.\n\
+             Before that work ends, organize the work in hand and write notes: record decisions, paths, verified results, and unfinished work in context://notes. If the notes already cover that, add only what changed; do not rewrite them.\n\
+             In addition, when that work ends, look for a suitable boundary and request a rollover. A suitable boundary is a finished subtask, a recorded decision, or a pause where the next step no longer needs the live transcript. At that boundary, request context://rollover. The handoff is optional, short, and at most 4,096 estimated tokens; notes are the durable record. If no suitable boundary has arrived, keep going. The host will not cut the window at this level.\n\
+             </uri-agent-context-rollover-hint>"
+        ),
+        ContextHint::Rollover70 => format!(
+            "<uri-agent-context-rollover-hint>\n\
+             This is a host reminder, not a user request. Context window {window_id} is past the 70% rollover hint (about {percent}% full, approximately {remaining} tokens remaining).\n\
+             One reminder in this series remains, at about 80%.\n\
+             Finish the work already in hand. Do not organize or rollover in the middle of it.\n\
+             Before that work ends, organize the work in hand and write notes so context://notes would be enough to continue after a rollover. If nothing new changed, do not rewrite them.\n\
+             In addition, when that work completes, take the next suitable boundary instead of opening a large new subtask in this window. A suitable boundary is a finished subtask or a pause before unrelated work. Update the notes, then request context://rollover with a short handoff. Do not wait for a perfect stopping point, and do not roll while you still need an unread tool result from this transcript.\n\
+             </uri-agent-context-rollover-hint>"
+        ),
+        ContextHint::Rollover80 => format!(
+            "<uri-agent-context-rollover-hint>\n\
+             This is a host reminder, not a user request. Context window {window_id} is past the 80% rollover hint (about {percent}% full, approximately {remaining} tokens remaining).\n\
+             This is the last reminder in the 60%, 70%, and 80% series. There will be no further reminder at these percentages.\n\
+             Before the step already in hand ends, organize that work and write notes, including any tool result you still need to read. Do not abandon that step to organize or rollover.\n\
+             When it completes, and before further work, request a rollover. Update context://notes first, then request context://rollover with a short handoff. A slightly early boundary is better than holding this transcript until the hard limit. If you do not roll, the host will later cut near that limit with an empty handoff, and records in the current model context will have to be recovered through context://.\n\
+             </uri-agent-context-rollover-hint>"
+        ),
+        ContextHint::Final => format!(
+            "<uri-agent-context-reminder>\n\
+             This is a host reminder, not a user request. Context window {window_id} has approximately {remaining} tokens remaining. Call help([\"context\"]) if its contract is not loaded, then review context://notes and update durable working state. URI Agent will automatically roll over near the hard limit. After rollover, all records in the current model context are cleared and can only be recovered through context://.\n\
+             </uri-agent-context-reminder>"
+        ),
+    }
+}
 
 fn capability_names(selection: &CapabilitySelection) -> Option<&[String]> {
     match selection {
@@ -1789,31 +1879,27 @@ impl AgentRuntime {
         if context_tokens == 0 {
             return Ok(false);
         }
-        let reminder_reserve = settings
-            .reserve_for(context_window)
-            .saturating_mul(CONTEXT_REMINDER_RESERVE_MULTIPLIER)
-            .min(context_window);
-        if context_tokens < context_window.saturating_sub(reminder_reserve) {
-            return Ok(false);
-        }
         let window_id = self.session.context_window_id().await;
-        if self.session.context_window_was_reminded(window_id).await {
+        let sent = self.session.context_hints_sent(window_id).await;
+        let Some(hint) = due_context_hint(context_tokens, context_window, settings, sent) else {
             return Ok(false);
-        }
+        };
+        let percent = context_tokens.saturating_mul(100) / context_window.max(1);
         let remaining = context_window.saturating_sub(context_tokens);
         self.session
             .append_batch(vec![
-                EventKind::ContextReminder { window_id },
+                EventKind::ContextReminder {
+                    window_id,
+                    hint: Some(hint),
+                },
                 EventKind::ModelMessage {
-                    message: Message::user(format!(
-                        "<uri-agent-context-reminder>\n\
-                         This is a host reminder, not a user request. Context window {window_id} has approximately {remaining} tokens remaining. Call help([\"context\"]) if its contract is not loaded, then review context://notes and update durable working state. URI Agent will automatically roll over near the hard limit. After rollover, all records in the current model context are cleared and can only be recovered through context://.\n\
-                         </uri-agent-context-reminder>"
+                    message: Message::user(context_hint_message(
+                        hint, window_id, percent, remaining,
                     )),
                 },
             ])
             .await
-            .context("cannot persist low-context reminder")?;
+            .context("cannot persist context hint")?;
         self.refresh_context_estimate().await;
         Ok(true)
     }
@@ -5659,8 +5745,262 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(reopened.context_window_was_reminded(1).await);
+        assert_ne!(
+            reopened.context_hints_sent(1).await & ContextHint::Final.bit(),
+            0
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[test]
+    fn context_hint_selects_the_highest_unsent_due_tier() {
+        let wide = compaction::Settings {
+            reserve_tokens: 10_000,
+            ..compaction::Settings::default()
+        };
+        let window = 1_000_000;
+        assert_eq!(due_context_hint(100_000, window, wide, 0), None);
+        assert_eq!(
+            due_context_hint(160_000, window, wide, 0),
+            Some(ContextHint::Note15)
+        );
+        assert_eq!(
+            due_context_hint(160_000, window, wide, ContextHint::Note15.mask_through()),
+            None
+        );
+        assert_eq!(
+            due_context_hint(650_000, window, wide, 0),
+            Some(ContextHint::Rollover60)
+        );
+        assert_eq!(
+            due_context_hint(990_000, window, wide, 0),
+            Some(ContextHint::Final)
+        );
+        let narrow = compaction::Settings {
+            reserve_tokens: 20_000,
+            ..compaction::Settings::default()
+        };
+        assert_eq!(
+            due_context_hint(70_000, 100_000, narrow, 0),
+            Some(ContextHint::Final)
+        );
+    }
+
+    #[test]
+    fn context_hint_messages_keep_the_approved_boundaries() {
+        let note = context_hint_message(ContextHint::Note15, 4, 16, 840_000);
+        assert!(note.contains("uri-agent-context-note-hint"));
+        assert!(note.contains("window 4"));
+        assert!(note.contains("15% note hint"));
+        assert!(note.contains("about 16% full"));
+        assert!(note.contains("840000 tokens remaining"));
+        assert!(
+            note.contains("Do not act on this hint until the work already in hand is finished")
+        );
+        assert!(
+            context_hint_message(ContextHint::Note30, 1, 31, 1)
+                .contains("only if a decision, path, verified result")
+        );
+        assert!(
+            context_hint_message(ContextHint::Note50, 1, 51, 1)
+                .contains("the host is not cutting it at this level")
+        );
+        let rollover60 = context_hint_message(ContextHint::Rollover60, 1, 61, 1);
+        assert!(rollover60.contains("uri-agent-context-rollover-hint"));
+        assert!(rollover60.contains("twice more, at about 70% and 80%"));
+        assert!(rollover60.contains("organize the work in hand and write notes"));
+        assert!(rollover60.contains("request context://rollover"));
+        assert!(
+            context_hint_message(ContextHint::Rollover70, 1, 71, 1)
+                .contains("One reminder in this series remains, at about 80%")
+        );
+        assert!(
+            context_hint_message(ContextHint::Rollover80, 1, 81, 1)
+                .contains("This is the last reminder in the 60%, 70%, and 80% series")
+        );
+        assert!(
+            context_hint_message(ContextHint::Final, 1, 96, 12_000)
+                .contains("all records in the current model context are cleared")
+        );
+    }
+
+    #[tokio::test]
+    async fn percentage_context_hints_are_sent_once_and_skip_lower_tiers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let database = workspace.path().join("sessions.db");
+        let session = crate::session::Session::open_at(
+            database.clone(),
+            Some(&session_id),
+            workspace.path(),
+            "fake",
+            "fake-model",
+            SessionContext {
+                system_prompt: "system".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let output = Arc::new(
+            crate::output::OutputStore::new(&session_id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let context_state = ContextState::new(session.clone());
+        let mut protocols = ProtocolRegistry::new(output, TaskManager::new());
+        protocols
+            .register(ContextPlugin::new(context_state.clone()))
+            .unwrap();
+        let runtime = AgentRuntime::new_with_context(
+            None,
+            Arc::new(protocols),
+            protocol_model_tools(),
+            session.clone(),
+            "system".to_string(),
+            ModelLimits {
+                context_window: 1_000_000,
+                ..ModelLimits::default()
+            },
+            context_state,
+        );
+        runtime
+            .set_compaction_settings(compaction::Settings {
+                reserve_tokens: 10_000,
+                ..compaction::Settings::default()
+            })
+            .await;
+        let (_cancel_tx, mut cancel) = watch::channel(None);
+        session
+            .append(EventKind::User {
+                text: "active task".to_string(),
+            })
+            .await
+            .unwrap();
+        let append_usage = |total: u64| {
+            let session = session.clone();
+            async move {
+                session
+                    .append_batch(vec![
+                        EventKind::Usage {
+                            input: total,
+                            output: 0,
+                            reasoning: 0,
+                            cache_read: 0,
+                            cache_write: 0,
+                            cost: 0.0,
+                            total,
+                            context: true,
+                            provider: "fake".to_string(),
+                            model: "fake-model".to_string(),
+                        },
+                        EventKind::ModelMessage {
+                            message: Message::assistant("working"),
+                        },
+                    ])
+                    .await
+                    .unwrap();
+            }
+        };
+
+        append_usage(100_000).await;
+        assert!(
+            !runtime
+                .compact_with(None, false, false, &mut cancel)
+                .await
+                .unwrap()
+        );
+        assert_eq!(context_reminder_count(&session).await, 0);
+
+        append_usage(160_000).await;
+        assert!(
+            !runtime
+                .compact_with(None, false, false, &mut cancel)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !runtime
+                .compact_with(None, false, false, &mut cancel)
+                .await
+                .unwrap()
+        );
+        let hints = context_hint_bodies(&session).await;
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("15% note hint"));
+        assert_eq!(
+            session.context_hints_sent(1).await,
+            ContextHint::Note15.mask_through()
+        );
+
+        append_usage(650_000).await;
+        assert!(
+            !runtime
+                .compact_with(None, false, false, &mut cancel)
+                .await
+                .unwrap()
+        );
+        let hints = context_hint_bodies(&session).await;
+        assert_eq!(hints.len(), 2);
+        assert!(hints[1].contains("60% rollover hint"));
+        assert!(hints[1].contains("twice more, at about 70% and 80%"));
+        assert!(!hints[1].contains("30% note hint"));
+        assert!(!hints[1].contains("50% note hint"));
+        assert_eq!(
+            session.context_hints_sent(1).await,
+            ContextHint::Rollover60.mask_through()
+        );
+
+        drop(runtime);
+        drop(session);
+        let reopened = crate::session::Session::open_at(
+            database,
+            Some(&session_id),
+            workspace.path(),
+            "ignored",
+            "ignored",
+            SessionContext {
+                system_prompt: "ignored".to_string(),
+                skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.context_hints_sent(1).await,
+            ContextHint::Rollover60.mask_through(),
+        );
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    async fn context_reminder_count(session: &crate::session::Session) -> usize {
+        session
+            .snapshot()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::ContextReminder { .. }))
+            .count()
+    }
+
+    async fn context_hint_bodies(session: &crate::session::Session) -> Vec<String> {
+        session
+            .snapshot()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ModelMessage { message } => {
+                    let message = serde_json::to_string(&message).unwrap();
+                    (message.contains("uri-agent-context-note-hint")
+                        || message.contains("uri-agent-context-rollover-hint")
+                        || message.contains("uri-agent-context-reminder"))
+                    .then_some(message)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
