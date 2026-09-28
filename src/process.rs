@@ -299,6 +299,9 @@ mod tests {
             .await
             .expect("child timed out")
             .unwrap();
-        assert!(!status.success(), "expected the group to be killed, got {status:?}");
+        assert!(
+            !status.success(),
+            "expected the group to be killed, got {status:?}"
+        );
     }
 }
