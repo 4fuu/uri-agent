@@ -219,6 +219,7 @@ and output cap remain fixed. Agents without the `context` protocol also use
 `summary` because they cannot recover from rollover.
 
 Provider overflow may force one checkpoint and retry for the current turn.
-`:compact` requests the active strategy manually, while `:context-strategy`
-changes it for the current runtime. Automatic behavior and token budgets are
+`:compact` requests a summary checkpoint manually and is available only under
+the summary strategy; rollover starts new windows on its own. `:context-strategy`
+changes the strategy for the current runtime. Automatic behavior and token budgets are
 configured under [settings](configuration.md#settings-fields-and-precedence).

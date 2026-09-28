@@ -94,7 +94,11 @@ same gesture to close itself rather than interrupting the Agent.
 Press `:` to open the command panel. Type to fuzzy-filter registered names,
 aliases, and descriptions; choose a result with the keyboard or mouse. Commands
 that need values open a selector or form. Search text filters the panel—it is
-not a second command syntax.
+not a second command syntax. Commands are listed by expected use: session
+lifecycle (`:new`, `:resume`, `:quit`), model choices, in-conversation tools,
+configuration, then rare setup; extension commands follow alphabetically. While
+searching, match quality ranks first and this order breaks ties. `:compact` is
+offered only under the summary context strategy.
 
 Common entry points include:
 

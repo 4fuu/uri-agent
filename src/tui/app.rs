@@ -2571,11 +2571,24 @@ impl App {
     }
 
     fn matching_commands(&self) -> Vec<CommandMatch> {
-        matching_commands(&self.commands, &self.command_query)
+        self.available_commands(&self.command_query)
+    }
+
+    /// Palette matches without commands the current state cannot run:
+    /// `:compact` summarizes, so it is offered only under the summary
+    /// strategy.
+    fn available_commands(&self, query: &str) -> Vec<CommandMatch> {
+        let summarizes = self.info.context_strategy == Strategy::Summary;
+        matching_commands(&self.commands, query)
+            .into_iter()
+            .filter(|command| {
+                summarizes || command.spec.target != CommandTarget::Core(CoreCommand::Compact)
+            })
+            .collect()
     }
 
     fn command_completion_candidates(&self, query: &str) -> Vec<CommandSpec> {
-        let matches = matching_commands(&self.commands, query);
+        let matches = self.available_commands(query);
         let canonical = matches
             .iter()
             .filter(|command| command.spec.id.to_ascii_lowercase().starts_with(query))

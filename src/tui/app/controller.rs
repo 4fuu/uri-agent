@@ -1514,7 +1514,16 @@ async fn dispatch_ui_command_with_arguments(
         CoreCommand::Resume => open_resume(app, services).await,
         CoreCommand::Search => Action::History(HistoryAction::Search),
         CoreCommand::NewSession => Action::NewSession,
-        CoreCommand::Compact => Action::Compact,
+        CoreCommand::Compact => {
+            if app.info.context_strategy == crate::compaction::Strategy::Summary {
+                Action::Compact
+            } else {
+                app.set_flash(
+                    ":compact needs the summary context strategy; switch with :context-strategy summary",
+                );
+                Action::Continue
+            }
+        }
         CoreCommand::ContextStrategy => {
             let current = services.runtime.context_strategy().await;
             let requested = if arguments.is_empty() {
@@ -1575,10 +1584,7 @@ pub(super) fn start_compaction(app: &mut App, runtime: Arc<AgentRuntime>) {
     app.busy = true;
     app.busy_since = Some(Instant::now());
     app.activity = Some(Activity::Compacting);
-    app.set_flash(match app.info.context_strategy {
-        crate::compaction::Strategy::Rollover => "Starting a fresh context window…",
-        crate::compaction::Strategy::Summary => "Summarizing older model context…",
-    });
+    app.set_flash("Summarizing older model context…");
     tokio::spawn(async move {
         if let Err(error) = runtime.compact().await {
             let _ = runtime

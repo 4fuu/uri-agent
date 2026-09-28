@@ -276,8 +276,8 @@ fn core_commands() -> Vec<CommandSpec> {
         ),
         CommandSpec::new(
             "compact",
-            "Context checkpoint",
-            "start a fresh context window or summarize, using the active strategy",
+            "Summarize context",
+            "summarize older history into a checkpoint (summary strategy only)",
             std::iter::empty::<&str>(),
             CommandTarget::Core(Compact),
         ),

@@ -2492,11 +2492,51 @@ pub(super) fn common_command_prefix(names: &[String]) -> String {
     first[..end].to_string()
 }
 
+/// Palette order by expected use: session lifecycle, per-turn model
+/// choices, in-conversation tools, occasional configuration, then rare setup.
+/// `insert` is last because `Space` and the compact action bar cover it.
+/// Commands not listed here, such as extension commands, follow
+/// alphabetically. Search scores still rank first; this order breaks ties.
+pub(super) const COMMAND_ORDER: &[&str] = &[
+    "new",
+    "resume",
+    "quit",
+    "model",
+    "effort",
+    "search",
+    "compact",
+    "status",
+    "tasks",
+    "terminal",
+    "copy",
+    "layout",
+    "settings",
+    "help",
+    "context-strategy",
+    "login",
+    "model-roles",
+    "mcp",
+    "logout",
+    "protocols",
+    "refresh-catalog",
+    "set-env",
+    "set-terminal",
+    "insert",
+];
+
+fn command_rank(id: &str) -> usize {
+    COMMAND_ORDER
+        .iter()
+        .position(|ordered| *ordered == id)
+        .unwrap_or(COMMAND_ORDER.len())
+}
+
 pub(super) fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<CommandMatch> {
     let query = query.trim().trim_start_matches([':', '：']).to_lowercase();
     if query.is_empty() {
-        return commands
-            .list()
+        let mut specs = commands.list();
+        specs.sort_by_key(|spec| command_rank(&spec.id));
+        return specs
             .into_iter()
             .map(|spec| CommandMatch {
                 name: spec.id.clone(),
@@ -2530,6 +2570,7 @@ pub(super) fn matching_commands(commands: &CommandRegistry, query: &str) -> Vec<
         left.0
             .cmp(&right.0)
             .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| command_rank(&left.2).cmp(&command_rank(&right.2)))
             .then_with(|| left.2.cmp(&right.2))
     });
     matches

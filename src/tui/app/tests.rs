@@ -7086,3 +7086,51 @@ fn compact_transcript_fills_the_full_width() {
         assert!(copied.starts_with("0123456789"), "{layout:?}: {copied}");
     }
 }
+
+#[test]
+fn command_palette_orders_commands_by_expected_use() {
+    let mut app = test_app();
+    app.info.context_strategy = crate::compaction::Strategy::Summary;
+    let names = app
+        .matching_commands()
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    let core = CommandRegistry::with_core_commands()
+        .list()
+        .into_iter()
+        .map(|spec| spec.id)
+        .collect::<Vec<_>>();
+    // Every core command has an explicit place; `mcp` is plugin-registered.
+    assert!(core.iter().all(|id| COMMAND_ORDER.contains(&id.as_str())));
+    let expected = COMMAND_ORDER
+        .iter()
+        .filter(|id| core.iter().any(|core_id| core_id == *id))
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected);
+    assert_eq!(names[..5], ["new", "resume", "quit", "model", "effort"]);
+    assert_eq!(names.last().map(String::as_str), Some("insert"));
+}
+
+#[test]
+fn compact_command_is_offered_only_under_the_summary_strategy() {
+    let mut app = test_app();
+    app.info.context_strategy = crate::compaction::Strategy::Rollover;
+    let offered = |app: &App| {
+        app.matching_commands()
+            .iter()
+            .any(|command| command.spec.id == "compact")
+    };
+    assert!(!offered(&app));
+    assert!(
+        !app.command_completion_candidates("compa")
+            .iter()
+            .any(|command| command.id == "compact")
+    );
+
+    app.info.context_strategy = crate::compaction::Strategy::Summary;
+    assert!(offered(&app));
+    app.command_query = "compa".to_string();
+    assert_eq!(app.matching_commands()[0].spec.id, "compact");
+}
