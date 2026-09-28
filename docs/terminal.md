@@ -43,6 +43,11 @@ Input goes to the terminal program. Press `Esc` twice within 500 milliseconds
 to close the terminal float; a single `Esc` is forwarded. Hold `Shift` while
 dragging or double-clicking to select terminal text, then copy through OSC52.
 
+Rows, tabs, and buttons inside a panel take a click before text selection
+does; the rest of a panel still selects text. In the [compact
+layout](interface.md#compact-layout) a single tap activates a row, because
+phone clients commonly claim double taps, for example for paste.
+
 URI Agent surfaces support direct drag and Unicode word selection. Hold
 `Shift` on reasoning and tool rows so ordinary clicks remain available for
 folding and opening. Conversation selections remain anchored while scrolling;

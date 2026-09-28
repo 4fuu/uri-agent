@@ -48,6 +48,7 @@ pub enum CoreCommand {
     SetEnvironment,
     SetTerminal,
     Terminal,
+    Layout,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,6 +322,13 @@ fn core_commands() -> Vec<CommandSpec> {
             "open the default terminal in a float",
             ["term"],
             CommandTarget::Core(Terminal),
+        ),
+        CommandSpec::new(
+            "layout",
+            "Layout",
+            "toggle the compact phone layout, or set auto, wide, or compact",
+            std::iter::empty::<&str>(),
+            CommandTarget::Core(Layout),
         ),
     ]
 }

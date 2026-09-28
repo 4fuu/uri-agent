@@ -36,6 +36,52 @@ use uuid::Uuid;
 const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Conversation layout. `Auto` switches to `Compact` on terminals at most
+/// [`COMPACT_LAYOUT_MAX_WIDTH`] columns wide, which covers phone SSH clients.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    #[default]
+    Auto,
+    Wide,
+    Compact,
+}
+
+pub const COMPACT_LAYOUT_MAX_WIDTH: u16 = 64;
+
+impl LayoutMode {
+    pub fn compact_at(self, width: u16) -> bool {
+        match self {
+            Self::Auto => width <= COMPACT_LAYOUT_MAX_WIDTH,
+            Self::Wide => false,
+            Self::Compact => true,
+        }
+    }
+}
+
+impl std::fmt::Display for LayoutMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "auto",
+            Self::Wide => "wide",
+            Self::Compact => "compact",
+        })
+    }
+}
+
+impl std::str::FromStr for LayoutMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "wide" => Ok(Self::Wide),
+            "compact" => Ok(Self::Compact),
+            _ => bail!("layout must be auto, wide, or compact"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
     #[default]
@@ -227,6 +273,7 @@ pub struct ActiveSettings {
     pub thinking: ThinkingLevel,
     pub terminal: Option<String>,
     pub key_display: KeyDisplayStyle,
+    pub layout: LayoutMode,
     pub compaction: compaction::Settings,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
@@ -280,6 +327,8 @@ struct SettingsFile {
     terminal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key_display: Option<KeyDisplayStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout: Option<LayoutMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionFile>,
     #[serde(flatten)]
@@ -1528,6 +1577,13 @@ async fn calculate_active(
         key_display = value.parse().context("invalid URI_AGENT_KEY_DISPLAY")?;
     }
 
+    let (mut layout, _) = setting(LayoutMode::Auto, files.global.layout, files.project.layout);
+    if let Ok(value) = env::var("URI_AGENT_LAYOUT")
+        && !value.trim().is_empty()
+    {
+        layout = value.parse().context("invalid URI_AGENT_LAYOUT")?;
+    }
+
     let compaction = compaction_settings(&files.global, &files.project)?;
 
     let credential = resolve_model_credential(files, catalog, invocation, &provider, true).await;
@@ -1541,6 +1597,7 @@ async fn calculate_active(
         thinking,
         terminal,
         key_display,
+        layout,
         compaction,
         provider_source,
         model_source,
@@ -3012,6 +3069,7 @@ mod tests {
             thinking: ThinkingLevel::Off,
             terminal: None,
             key_display: KeyDisplayStyle::Auto,
+            layout: LayoutMode::Auto,
             compaction: compaction::Settings::default(),
             provider_source,
             model_source,

@@ -254,7 +254,7 @@ pub(super) async fn perform_history_action(
                 }) if previous_direction == direction => target,
                 _ => app.transcript_offset,
             };
-            if direction < 0 && start <= SCROLL_ROWS.unsigned_abs() {
+            if direction < 0 && start <= app.wheel_rows().unsigned_abs() {
                 load_older_visible_history(app, session).await?;
             }
             app.smooth_scroll_transcript(direction);
@@ -1557,6 +1557,17 @@ async fn dispatch_ui_command_with_arguments(
             Action::Continue
         }
         CoreCommand::Terminal => Action::OpenTerminal,
+        CoreCommand::Layout => {
+            if arguments.is_empty() {
+                app.toggle_layout();
+            } else {
+                match arguments.parse::<LayoutMode>() {
+                    Ok(mode) => app.set_layout(mode),
+                    Err(error) => app.set_flash(error.to_string()),
+                }
+            }
+            Action::Continue
+        }
     }
 }
 
@@ -1610,6 +1621,10 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent, services: &LoopServ
         Some("status") => {
             return dispatch_ui_command(app, CommandTarget::Core(CoreCommand::Status), services)
                 .await;
+        }
+        Some("layout") => {
+            app.toggle_layout();
+            return Action::Continue;
         }
         Some("copy") => {
             if app.overlay == Some(Overlay::Composer) && composer_has_selection(&app.input) {
@@ -2827,10 +2842,11 @@ pub(super) async fn handle_mouse(
     if let Some(action) = handle_model_settings_mouse(app, mouse) {
         return action;
     }
+    let float_target = claim_float_press(app, mouse);
     if begin_direct_transcript_selection(app, mouse) {
         return Action::Continue;
     }
-    if update_mouse_selection(app, mouse, app.overlay.is_none()) {
+    if !float_target && update_mouse_selection(app, mouse, app.overlay.is_none()) {
         return Action::Continue;
     }
     if activate_transcript_mouse(app, mouse) {
@@ -2864,10 +2880,18 @@ pub(super) async fn handle_mouse(
                 app.click_transcript_block(index, false);
                 return Action::Continue;
             }
-            let activate = is_double_click(&mut app.last_click, target);
+            // Phone clients claim double taps, so a compact-layout tap
+            // activates directly.
+            let activate = is_double_click(&mut app.last_click, target) || app.compact;
             match target {
                 AppHit::Transcript(_) => unreachable!(),
                 AppHit::TranscriptTail => unreachable!(),
+                AppHit::CloseOverlay => {
+                    return handle_key(app, KeyEvent::from(KeyCode::Esc), services).await;
+                }
+                AppHit::ActionBar(button) => {
+                    return press_action_button(app, button, services).await;
+                }
                 AppHit::Completion(index) => {
                     app.select_completion(index);
                     return Action::RefreshCompletions;
@@ -2936,6 +2960,39 @@ pub(super) async fn handle_mouse(
     Action::Continue
 }
 
+async fn press_action_button(
+    app: &mut App,
+    button: ActionButton,
+    services: &LoopServices,
+) -> Action {
+    match button {
+        ActionButton::Compose => {
+            dispatch_ui_command(app, CommandTarget::Core(CoreCommand::Compose), services).await
+        }
+        ActionButton::Command => {
+            app.reset_command_search();
+            app.overlay = Some(Overlay::Command);
+            Action::Continue
+        }
+        ActionButton::Latest => {
+            if let Some(index) = app.filtered_indices().last().copied() {
+                app.selected_block = index;
+            }
+            app.transcript_offset =
+                transcript_live_tail(app.transcript_rows, app.transcript_height);
+            app.transcript_follow_tail = true;
+            app.transcript_center_selected = false;
+            Action::Continue
+        }
+        ActionButton::Stop if app.busy => Action::InterruptTurn,
+        ActionButton::Stop => Action::Continue,
+        ActionButton::Status => {
+            open_status(app);
+            Action::Continue
+        }
+    }
+}
+
 pub(super) fn scrollbar_history_action(
     app: &App,
     mouse: MouseEvent,
@@ -2954,7 +3011,7 @@ pub(super) fn handle_model_settings_mouse(app: &mut App, mouse: MouseEvent) -> O
         return None;
     }
     let target = hit_target(&app.hit_regions, mouse)?;
-    let activate = is_double_click(&mut app.last_click, target);
+    let activate = is_double_click(&mut app.last_click, target) || app.compact;
     let action = match target {
         AppHit::Model(index) => {
             if let Some(selector) = app.model_selector.as_mut() {
@@ -3089,8 +3146,11 @@ pub(super) fn handle_mouse_scroll(app: &mut App, direction: isize) {
                 if let Some(hub) = app.model_hub.as_mut() {
                     hub.move_role(direction);
                 }
-            } else if let Some(selector) = app.model_selector.as_mut() {
-                selector.move_selection(direction * SCROLL_ROWS);
+            } else {
+                let distance = direction * app.wheel_rows();
+                if let Some(selector) = app.model_selector.as_mut() {
+                    selector.move_selection(distance);
+                }
             }
         }
         Some(Overlay::Settings) => {
@@ -3464,6 +3524,18 @@ pub(super) fn close_float_on_outside_click(app: &mut App, mouse: MouseEvent) -> 
     app.overlay_scroll = 0;
     app.selection = None;
     true
+}
+
+/// Rows, tabs, and buttons inside a float take a press before free text
+/// selection can claim it; the rest of a float still selects text.
+pub(super) fn claim_float_press(app: &mut App, mouse: MouseEvent) -> bool {
+    let claimed = app.overlay.is_some()
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && hit_target(&app.hit_regions, mouse).is_some();
+    if claimed {
+        app.selection = None;
+    }
+    claimed
 }
 
 pub(super) fn handle_completion_mouse(app: &mut App, mouse: MouseEvent) -> bool {
@@ -3919,6 +3991,12 @@ pub(super) fn handle_terminal_key(app: &mut App, key: KeyEvent) -> Result<bool> 
 
 pub(super) fn handle_terminal_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     if consume_copy_click_release(app, mouse) {
+        return Ok(());
+    }
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && hit_target(&app.hit_regions, mouse) == Some(AppHit::CloseOverlay)
+    {
+        close_pty(app, "Terminal closed");
         return Ok(());
     }
     if is_selection_copy_click(app, mouse) {

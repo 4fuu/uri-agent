@@ -282,6 +282,7 @@ async fn show_session(
                 diagnostics_path: output.diagnostics_path(),
                 terminal: active.terminal,
                 key_display: active.key_display,
+                layout: active.layout,
             },
             draft,
             model_roles,

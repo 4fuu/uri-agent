@@ -32,6 +32,30 @@ Scrolling upward loads older complete turns in bounded pages. `Home`, transcript
 search, and message or tool jumps load the older pages they need; following the
 live tail remains immediate.
 
+## Compact layout
+
+Terminals at most 64 columns wide, such as a phone connected over SSH, use a
+compact touch layout. `F5` or `:layout` toggles it for the running process;
+`:layout auto`, `:layout wide`, or `:layout compact` sets the mode directly,
+and the `layout` setting chooses the startup mode (see
+[settings](configuration.md#settings-fields-and-precedence)). A toggle that
+lands on what the configured mode would choose returns to following the width.
+
+In the compact layout:
+
+- a two-row action bar below the footer writes a message, opens commands,
+  jumps to the latest output, and shows status, or stops the running turn;
+- the footer shows the model, effort, task count, and context percentage only;
+- the transcript has no scrollbar or side padding and fills the full width,
+  leaving selection and swipe scrolling to the terminal client;
+- each mouse-wheel event scrolls 2 rows instead of 6, because a phone swipe
+  arrives as a burst of wheel events; keyboard scrolling is unchanged;
+- panels fill the screen with a top border only, drop key hints from their
+  titles, and carry a `✕` button that acts like the panel's `Esc`; message
+  input stays at the bottom;
+- list rows use two lines, name above details, and a single tap chooses a row
+  instead of a double click.
+
 ## Composer and delivery
 
 Press `Space` to open the composer. `Enter` sends when idle; use
@@ -75,7 +99,7 @@ not a second command syntax.
 Common entry points include:
 
 - `:login`, `:logout`, `:model`, `:effort`, and `:model-roles` for model access;
-- `:settings`, `:set-env`, and `:set-terminal` for configuration;
+- `:settings`, `:set-env`, `:set-terminal`, and `:layout` for configuration;
 - `:resume`, `:new`, `:search`, `:compact`, and `:context-strategy` for sessions;
 - `:protocols`, `:tasks`, `:mcp`, `:status`, and `:terminal` for tools and status;
 - `:help` and `:quit` for reference and exit.

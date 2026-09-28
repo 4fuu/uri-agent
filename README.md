@@ -63,7 +63,8 @@ supported providers.
   project files and saved conversations with bundled zvec and Model2Vec assets.
 - **One terminal workflow:** use Queue and Steer, web access, keyboard and mouse
   controls, image input, and `@` file or `@@` session references from one
-  conversation surface.
+  conversation surface. Narrow terminals, such as a phone over SSH, switch to a
+  compact touch layout.
 
 ## Model and provider coverage
 

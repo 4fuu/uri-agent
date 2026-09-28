@@ -82,6 +82,7 @@ fn test_app_with_splash(show_splash: bool) -> App {
             diagnostics_path: PathBuf::from("/tmp/uri-agent/diagnostics.jsonl"),
             terminal: None,
             key_display: KeyDisplayStyle::Text,
+            layout: LayoutMode::Wide,
         },
         Keymap::with_defaults().unwrap(),
         String::new(),
@@ -4057,6 +4058,7 @@ fn effort_command_uses_a_selector_with_the_current_level_selected() {
         thinking_source: ValueSource::Global,
         terminal: None,
         key_display: KeyDisplayStyle::Text,
+        layout: LayoutMode::Auto,
         terminal_source: ValueSource::Default,
         credential_environment: BTreeMap::new(),
     };
@@ -4295,6 +4297,7 @@ fn settings_panel_hides_the_api_key_and_cycles_thinking() {
         thinking_source: ValueSource::Global,
         terminal: None,
         key_display: KeyDisplayStyle::Text,
+        layout: LayoutMode::Auto,
         terminal_source: ValueSource::Global,
         credential_environment: BTreeMap::new(),
     };
@@ -6767,5 +6770,319 @@ fn assert_brand_complete(rendered: &str, width: u16, screen: &str) {
             rendered.contains(&row),
             "{screen} at {width} columns is missing wordmark row {row:?}"
         );
+    }
+}
+
+fn compact_test_app() -> App {
+    let mut app = test_app();
+    app.info.layout = LayoutMode::Auto;
+    app.info.provider = "anthropic".to_string();
+    app.info.model = "claude-opus-5-5-20260901".to_string();
+    app
+}
+
+fn resume_selector(count: usize) -> SelectorState {
+    let items = (0..count)
+        .map(|index| SelectorItem {
+            id: index.to_string(),
+            title: format!("Session title number {index}"),
+            description: format!("2026-09-2{index} · 34 messages · /home/user/project"),
+            search_text: None,
+        })
+        .collect();
+    SelectorState::new(SelectorKind::Resume, "RESUME SESSION", items)
+}
+
+fn left_press(area: Rect) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn auto_layout_follows_width_and_toggle_returns_to_auto() {
+    let mut app = compact_test_app();
+    render_to_string(&mut app, 49, 24);
+    assert!(app.compact);
+    render_to_string(&mut app, 100, 24);
+    assert!(!app.compact);
+
+    app.toggle_layout();
+    assert!(app.compact);
+    assert_eq!(app.layout_override, Some(true));
+    render_to_string(&mut app, 100, 24);
+    assert!(app.compact, "an override survives redraws");
+
+    app.toggle_layout();
+    assert_eq!(
+        app.layout_override, None,
+        "matching auto drops the override"
+    );
+    render_to_string(&mut app, 49, 24);
+    assert!(app.compact);
+
+    app.set_layout(LayoutMode::Wide);
+    render_to_string(&mut app, 49, 24);
+    assert!(!app.compact);
+    assert_eq!(
+        "compact".parse::<LayoutMode>().unwrap(),
+        LayoutMode::Compact
+    );
+    assert!("tiny".parse::<LayoutMode>().is_err());
+}
+
+#[test]
+fn compact_conversation_has_action_bar_short_footer_and_no_scrollbar() {
+    let mut app = compact_test_app();
+    let rendered = render_to_string(&mut app, 49, 24);
+    let lines = rendered.lines().collect::<Vec<_>>();
+    assert!(lines[23].contains("commands") && lines[23].contains("status"));
+    assert!(app.hit_regions.iter().any(|region| region.target
+        == AppHit::ActionBar(ActionButton::Compose)
+        && region.area.height == ACTION_BAR_HEIGHT));
+
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: (0..40)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    );
+    app.busy = true;
+    app.active_task_count = 2;
+    let rendered = render_to_string(&mut app, 49, 24);
+    let lines = rendered.lines().collect::<Vec<_>>();
+    assert!(lines[23].contains("stop"));
+    assert!(lines[21].contains("claude-opus-5-5 · off"));
+    assert!(lines[21].contains("0.0%"));
+    assert!(!lines[21].contains("/128k"));
+    assert!(app.transcript_scrollbar_area.is_none());
+    assert!(!rendered.contains('┃'));
+}
+
+#[test]
+fn compact_panels_fill_the_screen_with_two_line_rows_and_a_close_button() {
+    let mut app = compact_test_app();
+    app.selector = Some(resume_selector(4));
+    app.overlay = Some(Overlay::Selector);
+    let rendered = render_to_string(&mut app, 49, 24);
+    assert_eq!(app.overlay_bounds, Some(Rect::new(0, 0, 49, 24)));
+    let lines = rendered.lines().collect::<Vec<_>>();
+    assert!(lines[0].contains("RESUME SESSION") && lines[0].contains('✕'));
+    let title_row = lines
+        .iter()
+        .position(|line| line.contains("Session title number 1"))
+        .unwrap();
+    assert!(lines[title_row + 1].contains("2026-09-21 · 34 messages"));
+
+    assert_eq!(app.hit_regions[0].target, AppHit::CloseOverlay);
+    assert_eq!(app.hit_regions[0].area.height, 2);
+    let row = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == AppHit::Selector(1))
+        .unwrap()
+        .area;
+    assert_eq!((row.y as usize, row.height), (title_row, 2));
+    assert_eq!(app.overlay_viewport_rows, (24 - 3) / 2);
+
+    app.overlay = Some(Overlay::Command);
+    let rendered = render_to_string(&mut app, 49, 24);
+    let first = rendered.lines().next().unwrap();
+    assert!(first.contains("COMMAND") && !first.contains("complete"));
+}
+
+#[test]
+fn float_rows_claim_presses_before_text_selection() {
+    for layout in [LayoutMode::Wide, LayoutMode::Compact] {
+        let mut app = compact_test_app();
+        app.info.layout = layout;
+        app.selector = Some(resume_selector(4));
+        app.overlay = Some(Overlay::Selector);
+        render_to_string(&mut app, 100, 24);
+        let row = app
+            .hit_regions
+            .iter()
+            .find(|region| region.target == AppHit::Selector(2))
+            .unwrap()
+            .area;
+        assert!(claim_float_press(&mut app, left_press(row)));
+        assert!(app.selection.is_none());
+
+        let blank = Rect::new(row.x, app.overlay_bounds.unwrap().bottom() - 2, 1, 1);
+        assert!(!claim_float_press(&mut app, left_press(blank)));
+    }
+    let mut app = compact_test_app();
+    render_to_string(&mut app, 49, 24);
+    let transcript_press = left_press(Rect::new(3, 3, 1, 1));
+    assert!(!claim_float_press(&mut app, transcript_press));
+}
+
+#[test]
+fn compact_settings_activate_on_a_single_tap() {
+    let active = ActiveSettings {
+        provider: "openai".to_string(),
+        model: "gpt-5.2".to_string(),
+        api_key: None,
+        auth_kind: AuthKind::ApiKey,
+        output_limit: 32 * 1024,
+        thinking: ThinkingLevel::Off,
+        compaction: crate::compaction::Settings::default(),
+        provider_source: ValueSource::Global,
+        model_source: ValueSource::Global,
+        api_key_source: ValueSource::Global,
+        output_limit_source: ValueSource::Global,
+        thinking_source: ValueSource::Global,
+        terminal: None,
+        key_display: KeyDisplayStyle::Text,
+        layout: LayoutMode::Auto,
+        terminal_source: ValueSource::Global,
+        credential_environment: BTreeMap::new(),
+    };
+    let mut app = compact_test_app();
+    app.overlay = Some(Overlay::Settings);
+    app.settings = Some(SettingsState {
+        active,
+        model: None,
+        environment_count: 0,
+        tab: SettingsTab::Model,
+        selected: 0,
+        editing: None,
+        api_key: String::new(),
+        api_key_changed: false,
+        thinking: ThinkingLevel::Off,
+        output_limit: "32768".to_string(),
+    });
+    let rendered = render_to_string(&mut app, 49, 24);
+    assert!(rendered.contains("Model · GLOBAL"));
+    assert!(rendered.contains("openai / gpt-5.2"));
+    let row = app
+        .hit_regions
+        .iter()
+        .find(|region| region.target == AppHit::Setting(0))
+        .unwrap()
+        .area;
+    assert_eq!(row.height, 2);
+    assert!(matches!(
+        handle_model_settings_mouse(&mut app, left_press(row)),
+        Some(Action::OpenSettingsModels)
+    ));
+}
+
+#[test]
+fn composer_hints_drop_trailing_entries_instead_of_clipping() {
+    let mut app = test_app();
+    app.busy = true;
+    app.overlay = Some(Overlay::Composer);
+    let rendered = render_to_string(&mut app, 49, 24);
+    let hint_row = rendered.lines().last().unwrap();
+    assert!(hint_row.contains("Enter choose delivery"));
+    assert!(!hint_row.contains("keep draft"));
+}
+
+#[test]
+fn welcome_splits_the_model_line_to_keep_the_effort() {
+    let mut app = compact_test_app();
+    let rendered = render_to_string(&mut app, 49, 24);
+    assert!(rendered.contains("anthropic / claude-opus-5-5-20260901"));
+    assert!(rendered.contains("effort off"));
+}
+
+#[test]
+fn compact_wheel_scroll_moves_fewer_rows() {
+    for (layout, rows) in [
+        (LayoutMode::Wide, SCROLL_ROWS),
+        (LayoutMode::Compact, COMPACT_SCROLL_ROWS),
+    ] {
+        let mut app = compact_test_app();
+        app.info.layout = layout;
+        apply_event(
+            &mut app,
+            0,
+            EventKind::User {
+                text: (0..80)
+                    .map(|index| format!("line {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+        );
+        render_to_string(&mut app, 49, 24);
+        let start = app.transcript_offset;
+        app.smooth_scroll_transcript(-1);
+        assert!(matches!(
+            app.mouse_scroll_animation,
+            Some(MouseScrollAnimation::Transcript { target, .. })
+                if start - target == rows as usize
+        ));
+
+        app.mouse_scroll_animation = None;
+        app.overlay = Some(Overlay::Help);
+        render_to_string(&mut app, 49, 24);
+        app.smooth_scroll_overlay(1);
+        assert!(matches!(
+            app.mouse_scroll_animation,
+            Some(MouseScrollAnimation::Overlay { target, .. }) if target as isize == rows
+        ));
+    }
+}
+
+#[test]
+fn wordmark_gives_an_odd_spare_column_to_the_left() {
+    for width in [49u16, 50] {
+        let mut app = compact_test_app();
+        let rendered = render_to_string(&mut app, width, 30);
+        // The top bitmap row is filled at both ends.
+        let row = rendered
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("wordmark top row");
+        let left = row.len() - row.trim_start().len();
+        let right = row
+            .chars()
+            .rev()
+            .take_while(|character| *character == ' ')
+            .count();
+        assert!(
+            left >= right && left - right <= 1,
+            "{width}: {left}/{right}"
+        );
+    }
+}
+
+#[test]
+fn compact_transcript_fills_the_full_width() {
+    for (layout, first_text_column, last_text_column) in
+        [(LayoutMode::Wide, 1, 47), (LayoutMode::Compact, 0, 48)]
+    {
+        let mut app = compact_test_app();
+        app.info.layout = layout;
+        apply_event(
+            &mut app,
+            0,
+            EventKind::AssistantText {
+                text: "0123456789".repeat(8),
+            },
+        );
+        apply_event(&mut app, 1, EventKind::TurnFinished);
+        let rendered = render_to_string(&mut app, 49, 16);
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("0123456789"))
+            .unwrap();
+        let text_end = row.trim_end_matches([' ', '┃', '│']).chars().count();
+        assert_eq!(text_end, last_text_column + 1, "{layout:?}");
+        assert_eq!(
+            row.len() - row.trim_start().len(),
+            first_text_column,
+            "{layout:?}"
+        );
+        let copied = complete_surface_text(app.selectable.as_ref().unwrap());
+        assert!(copied.starts_with("0123456789"), "{layout:?}: {copied}");
     }
 }

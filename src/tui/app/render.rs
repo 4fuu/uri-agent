@@ -676,6 +676,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         app.marquee = None;
     }
     let area = frame.area();
+    app.resolve_layout(area.width);
     frame.render_widget(Block::new().style(Style::default().bg(BG)), area);
     if app.showing_splash() {
         app.selectable = None;
@@ -690,7 +691,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let notice_height = notice_lines.len().min(u16::MAX as usize) as u16;
     let live_activity = footer_activity(app);
     let footer_height = 1 + u16::from(live_activity.is_some());
-    let constraints = match (idle, has_notices) {
+    let mut constraints = match (idle, has_notices) {
         (true, false) => vec![Constraint::Min(3)],
         (true, true) => vec![Constraint::Min(3), Constraint::Length(notice_height)],
         (false, false) => vec![Constraint::Min(3), Constraint::Length(footer_height)],
@@ -700,10 +701,17 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(footer_height),
         ],
     };
+    if app.compact {
+        constraints.push(Constraint::Length(ACTION_BAR_HEIGHT));
+    }
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+    let action_bar_area = app.compact.then(|| areas[areas.len() - 1]);
+    if let Some(action_bar_area) = action_bar_area {
+        render_action_bar(frame, app, action_bar_area);
+    }
     let footer_area = if idle {
         None
     } else if has_notices {
@@ -737,6 +745,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     if !flash_lines.is_empty() {
         let bottom = notice_area
             .or(footer_area)
+            .or(action_bar_area)
             .map_or(area.bottom(), |bottom_area| bottom_area.y);
         let height = flash_lines
             .len()
@@ -749,7 +758,9 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             flash_area,
         );
     }
-    app.transcript_scrollbar_area = if app.overlay.is_none() && !idle {
+    // The compact layout has no scrollbar: on a phone its column sits under
+    // the client's own text selection and swipes already scroll.
+    app.transcript_scrollbar_area = if app.overlay.is_none() && !idle && !app.compact {
         transcript_scrollbar_area(app, content)
     } else {
         None
@@ -759,10 +770,20 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         let area = overlay_area(frame.area(), app, overlay);
         app.overlay_bounds = Some(area);
         render_overlay(frame, app, overlay);
-        Some(area.inner(Margin {
-            horizontal: 2,
-            vertical: 2,
-        }))
+        Some(if app.compact {
+            // Top border and one padding row; one padding column per side.
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y.saturating_add(2),
+                area.width.saturating_sub(2),
+                area.height.saturating_sub(2),
+            )
+        } else {
+            area.inner(Margin {
+                horizontal: 2,
+                vertical: 2,
+            })
+        })
     } else {
         Some(Rect {
             width: content
@@ -777,7 +798,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
             .is_none()
             .then_some(transcript_row_separators)
             .flatten();
-        let left_padding = usize::from(row_separators.is_some());
+        let left_padding = usize::from(row_separators.is_some() && !app.compact);
         capture_surface(frame, app, selectable_area, row_separators, left_padding);
         render_selection(frame, app);
     } else {
@@ -787,9 +808,71 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_transcript_scrollbar(frame, app);
     }
     if app.overlay.is_none()
+        && !app.compact
         && let Some(footer_area) = footer_area.filter(|area| area.height == 1)
     {
         render_floating_tail_button(frame, app, footer_area);
+    }
+}
+
+pub(super) const ACTION_BAR_HEIGHT: u16 = 2;
+
+/// Compact-layout touch bar: two-row buttons, icon over label, sharing the
+/// width evenly so each stays comfortably wide on a phone.
+pub(super) fn render_action_bar(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let last = if app.busy {
+        (ActionButton::Stop, "■", "stop")
+    } else {
+        (ActionButton::Status, "≡", "status")
+    };
+    let buttons = [
+        (ActionButton::Compose, "✎", "write"),
+        (ActionButton::Command, ":", "commands"),
+        (ActionButton::Latest, "↓", "latest"),
+        last,
+    ];
+    frame.render_widget(Block::new().style(Style::default().bg(SURFACE)), area);
+    let count = buttons.len() as u16;
+    let gaps = count.saturating_sub(1);
+    let width = area.width.saturating_sub(gaps) / count;
+    if width == 0 {
+        return;
+    }
+    let mut x = area.x;
+    for (index, (button, icon, label)) in buttons.into_iter().enumerate() {
+        // The last button absorbs the division remainder.
+        let button_width = if index + 1 == buttons.len() {
+            area.right().saturating_sub(x)
+        } else {
+            width
+        };
+        let button_area = Rect::new(x, area.y, button_width, area.height);
+        let color = if button == ActionButton::Stop {
+            ERROR
+        } else {
+            ACCENT
+        };
+        let label = single_line_preview(label, button_width as usize);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    icon,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(label, Style::default().fg(TEXT)),
+            ])
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(ROW_ACTIVE)),
+            button_area,
+        );
+        app.hit_regions.push(HitRegion {
+            area: button_area,
+            target: AppHit::ActionBar(button),
+        });
+        x = x.saturating_add(button_width).saturating_add(1);
     }
 }
 
@@ -817,7 +900,18 @@ pub(super) fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, spl
         animation::wordmark(app.animation_phase, width)
     }
     .into_iter()
-    .map(|line| Line::styled(line, Style::default().fg(ACCENT)))
+    .map(|line| {
+        // Centering floors, leaving an odd spare column on the right, and the
+        // mark already reads left-heavy: its left edge is the full-height U
+        // while the I reaches its right edge only on the top and bottom rows.
+        // Give the spare column to the left instead.
+        let line = if (width.saturating_sub(line.width())) % 2 == 1 {
+            format!(" {line}")
+        } else {
+            line
+        };
+        Line::styled(line, Style::default().fg(ACCENT))
+    })
     .collect::<Vec<_>>();
     if splash {
         lines.extend([
@@ -836,18 +930,32 @@ pub(super) fn render_brand(frame: &mut Frame<'_>, app: &mut App, area: Rect, spl
 
 pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let model = if app.info.model_ready {
-        Line::styled(
-            single_line_preview(
-                &format!(
-                    "{} / {} · effort {}",
-                    app.info.provider, app.info.model, app.info.thinking
-                ),
-                width.saturating_sub(1),
-            ),
-            Style::default().fg(TEXT),
-        )
+        let full = format!(
+            "{} / {} · effort {}",
+            app.info.provider, app.info.model, app.info.thinking
+        );
+        // Split before truncating so a narrow window keeps the effort.
+        let rows = if full.width() < width {
+            vec![full]
+        } else {
+            vec![
+                format!("{} / {}", app.info.provider, app.info.model),
+                format!("effort {}", app.info.thinking),
+            ]
+        };
+        rows.into_iter()
+            .map(|row| {
+                Line::styled(
+                    single_line_preview(&row, width.saturating_sub(1)),
+                    Style::default().fg(TEXT),
+                )
+            })
+            .collect()
     } else {
-        Line::styled("No model configured. Run :login", Style::default().fg(WARM))
+        vec![Line::styled(
+            "No model configured. Run :login",
+            Style::default().fg(WARM),
+        )]
     };
     let hints = action_hints(
         &app.keymap,
@@ -857,14 +965,12 @@ pub(super) fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ("main", "help", "help"),
         ],
     );
-    let mut lines = vec![
-        Line::styled(
-            single_line_preview(&footer_cwd(&app.info.cwd), width.saturating_sub(1)),
-            Style::default().fg(MUTED),
-        ),
-        model,
-        Line::default(),
-    ];
+    let mut lines = vec![Line::styled(
+        single_line_preview(&footer_cwd(&app.info.cwd), width.saturating_sub(1)),
+        Style::default().fg(MUTED),
+    )];
+    lines.extend(model);
+    lines.push(Line::default());
     if let Some(hints) = fitted_hints(&hints, width.saturating_sub(1)) {
         lines.push(Line::styled(hints, Style::default().fg(MUTED)));
     }
@@ -916,13 +1022,18 @@ pub(super) fn render_footer(
     } else {
         animation::progress(progress_phase, 8, percent / 100.0)
     };
-    let context = single_line_preview(
-        &format!(
-            "{progress} {usage}/{}",
-            format_tokens(app.info.context_window as u64),
-        ),
-        available,
-    );
+    // Compact footers keep only the percentage so the model name survives.
+    let context = if app.compact {
+        single_line_preview(&usage, available)
+    } else {
+        single_line_preview(
+            &format!(
+                "{progress} {usage}/{}",
+                format_tokens(app.info.context_window as u64),
+            ),
+            available,
+        )
+    };
     let context_width = context.width();
     let task_count = app.active_task_count;
     let task = if task_count == 0 {
@@ -959,7 +1070,14 @@ pub(super) fn render_footer(
             .saturating_add(task_context_gap)
             .saturating_add(2),
     );
-    let model = single_line_preview(&compact_model(app), model_limit);
+    let model = single_line_preview(
+        &if app.compact {
+            short_model(app)
+        } else {
+            compact_model(app)
+        },
+        model_limit,
+    );
     let model_width = model.width();
     let gap = available.saturating_sub(
         model_width
@@ -1161,6 +1279,20 @@ pub(super) fn compact_model(app: &App) -> String {
     format!("{model} · effort {}{token_rate}", app.info.thinking)
 }
 
+/// Narrow footer label: the model without provider or a trailing
+/// `-YYYYMMDD` snapshot date, then the effort.
+pub(super) fn short_model(app: &App) -> String {
+    if !app.info.model_ready || app.info.model.is_empty() {
+        return "no-model".to_string();
+    }
+    let model = app.info.model.as_str();
+    let model = model
+        .rsplit_once('-')
+        .filter(|(_, date)| date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(model, |(name, _)| name);
+    format!("{model} · {}", app.info.thinking)
+}
+
 pub(super) fn context_percent(app: &App) -> f64 {
     if app.info.context_window > 0 {
         app.info.context_tokens as f64 / app.info.context_window as f64 * 100.0
@@ -1263,7 +1395,10 @@ pub(super) fn render_transcript(
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
         return vec![TextRowSeparator::Newline; area.height as usize];
     }
-    let message_width = area.width.saturating_sub(2).max(1) as usize;
+    // The right padding column doubles as the scrollbar track. The compact
+    // layout has no scrollbar and spends both padding columns on text.
+    let padding = u16::from(!app.compact);
+    let message_width = area.width.saturating_sub(padding * 2).max(1) as usize;
     let process_width = message_width.saturating_sub(2).max(1);
     app.transcript_body_width = process_width;
     let active_block = app.active_transcript_block();
@@ -1304,13 +1439,13 @@ pub(super) fn render_transcript(
         );
     visible_row_separators.resize(app.transcript_height, TextRowSeparator::Newline);
     frame.render_widget(
-        List::new(visible).block(Block::new().padding(Padding::horizontal(1))),
+        List::new(visible).block(Block::new().padding(Padding::horizontal(padding))),
         area,
     );
     // Ratatui resets the hidden cells behind wide glyphs even though the terminal paints their
     // background. Restore the complete user row so later frame diffs can clear exposed tail cells.
     let content_area = area.inner(Margin {
-        horizontal: 1,
+        horizontal: padding,
         vertical: 0,
     });
     for (row, user_surface) in user_surface_for_row.into_iter().enumerate() {
@@ -2429,6 +2564,16 @@ pub(super) fn fuzzy_score(haystack: &str, query: &str) -> Option<usize> {
 pub(super) const FLOAT_MIN_WIDTH: u16 = 60;
 
 pub(super) fn overlay_area(frame: Rect, app: &App, overlay: Overlay) -> Rect {
+    // Compact panels fill the screen; only input floats stay at the bottom
+    // above the phone keyboard.
+    if app.compact
+        && !matches!(
+            overlay,
+            Overlay::Composer | Overlay::Delivery | Overlay::Text | Overlay::Oauth
+        )
+    {
+        return frame;
+    }
     match overlay {
         Overlay::Command => centered(frame, 72, 62),
         Overlay::Status => bottom_float(frame, 16),
@@ -2481,7 +2626,9 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
     let area = overlay_area(frame.area(), app, overlay);
     frame.render_widget(Clear, area);
     let edge_to_edge = area.width == frame.area().width;
-    let (borders, padding) = if edge_to_edge {
+    let (borders, padding) = if app.compact {
+        (Borders::TOP, Padding::new(1, 1, 1, 0))
+    } else if edge_to_edge {
         (Borders::TOP | Borders::BOTTOM, Padding::vertical(1))
     } else {
         (Borders::ALL, Padding::uniform(1))
@@ -2519,6 +2666,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 section += 1;
             }
             let composer_area = sections[section];
+            app.composer_hint_width = composer_area.width.saturating_sub(4) as usize;
             app.sync_composer_chrome();
             if edge_to_edge && let Some(block) = app.input.block().cloned() {
                 app.input
@@ -2570,7 +2718,12 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
             }
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(fit_panel_title(" PROTOCOLS · help([name]) ", area.width)))
+                    .block(block.title(overlay_title(
+                        app.compact,
+                        "PROTOCOLS",
+                        "help([name])".to_string(),
+                        area.width,
+                    )))
                     .wrap(Wrap { trim: false })
                     .scroll((app.overlay_scroll, 0)),
                 area,
@@ -2587,7 +2740,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 .as_ref()
                 .map(|(title, body)| (title.as_str(), body.as_str()))
                 .unwrap_or(("DOCUMENT", "Nothing to show."));
-            let title = panel_title(name, hints);
+            let title = overlay_title(app.compact, name, hints, area.width);
             let inner_width = block.inner(area).width as usize;
             let lines = markdown::render(body, inner_width)
                 .into_iter()
@@ -2595,7 +2748,7 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 .collect::<Vec<_>>();
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(fit_panel_title(&title, area.width)))
+                    .block(block.title(title))
                     .scroll((app.overlay_scroll, 0)),
                 area,
             );
@@ -2615,14 +2768,14 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                 "{}█",
                 single_line_tail(&value, inner_width.saturating_sub(1))
             );
-            let title = format!(" {} ", prompt.title);
+            let title = overlay_title(app.compact, &prompt.title, String::new(), area.width);
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(prompt.message.clone(), Style::default().fg(MUTED)),
                     Line::default(),
                     Line::styled(value, Style::default().fg(TEXT)),
                 ])
-                .block(block.title(fit_panel_title(&title, area.width)))
+                .block(block.title(title))
                 .wrap(Wrap { trim: false }),
                 area,
             );
@@ -2659,14 +2812,66 @@ pub(super) fn render_overlay(frame: &mut Frame<'_>, app: &mut App, overlay: Over
                     Style::default().fg(TEXT),
                 ));
             }
-            let title = format!(" OAUTH · {} ", oauth.provider);
+            let title = overlay_title(
+                app.compact,
+                &format!("OAUTH · {}", oauth.provider),
+                String::new(),
+                area.width,
+            );
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(block.title(fit_panel_title(&title, area.width)))
+                    .block(block.title(title))
                     .wrap(Wrap { trim: false }),
                 area,
             );
         }
+    }
+    if app.compact && overlay != Overlay::Composer {
+        render_close_button(frame, app, area, overlay != Overlay::Terminal);
+    }
+}
+
+const CLOSE_BUTTON_WIDTH: u16 = 5;
+
+/// Compact panels have no side borders to click outside of, so the header
+/// carries a close target spanning the title row and, where the panel has
+/// one, the padding row below it. It acts like the panel's `Esc`.
+fn render_close_button(frame: &mut Frame<'_>, app: &mut App, area: Rect, two_rows: bool) {
+    let width = CLOSE_BUTTON_WIDTH.min(area.width);
+    let height = (1 + u16::from(two_rows)).min(area.height);
+    let button = Rect::new(area.right().saturating_sub(width), area.y, width, height);
+    if button.is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, button);
+    frame.render_widget(
+        Paragraph::new("✕").alignment(Alignment::Center).style(
+            Style::default()
+                .fg(ACCENT)
+                .bg(ROW_ACTIVE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        button,
+    );
+    app.hit_regions.insert(
+        0,
+        HitRegion {
+            area: button,
+            target: AppHit::CloseOverlay,
+        },
+    );
+}
+
+/// Panel title for the current layout. Compact headers drop key hints, which
+/// a touch user cannot press, and leave room for the close button.
+pub(super) fn overlay_title(compact: bool, name: &str, hints: String, width: u16) -> String {
+    if compact {
+        fit_panel_title(
+            &panel_title(name, String::new()),
+            width.saturating_sub(CLOSE_BUTTON_WIDTH),
+        )
+    } else {
+        fit_panel_title(&panel_title(name, hints), width)
     }
 }
 
@@ -2682,7 +2887,7 @@ pub(super) fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .modifier_hint("shift")
         .unwrap_or_else(|| "Shift".to_string());
     hints.push(format!("{shift}-drag select"));
-    let title = panel_title("TERMINAL", hints.join(" · "));
+    let title = overlay_title(app.compact, "TERMINAL", hints.join(" · "), area.width);
     let resize_error = {
         let Some(pty) = app.pty.as_mut() else {
             return;
@@ -2705,7 +2910,7 @@ pub(super) fn render_pty(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     })
                     .border_style(Style::default().fg(ACCENT))
                     .style(Style::default().bg(SURFACE))
-                    .title(fit_panel_title(&title, area.width)),
+                    .title(title),
             ),
             area,
         );
@@ -2735,19 +2940,23 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
     let subscription = app.info.provider == "kimi-coding";
     let model_time = model_time_status(app);
     let average_rate = average_rate_status(app);
-    let mut lines = vec![
-        status_row("PROJECT", project, Style::default().fg(ACCENT)),
-        status_row(
+    let compact = app.compact;
+    let mut lines: Vec<Line<'static>> = [
+        status_lines(compact, "PROJECT", project, Style::default().fg(ACCENT)),
+        status_lines(
+            compact,
             "SESSION",
             app.info.session_id.clone(),
             Style::default().fg(TEXT),
         ),
-        status_row(
+        status_lines(
+            compact,
             "LOG",
             display_path(&app.info.diagnostics_path),
             Style::default().fg(MUTED),
         ),
-        status_row(
+        status_lines(
+            compact,
             "MODEL",
             if app.info.model_ready {
                 format!(
@@ -2759,15 +2968,17 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             },
             Style::default().fg(if app.info.model_ready { TEXT } else { WARM }),
         ),
-        status_row("STATE", state, Style::default().fg(ACCENT)),
-        status_row(
+        status_lines(compact, "STATE", state, Style::default().fg(ACCENT)),
+        status_lines(
+            compact,
             "CONTEXT",
             context_status(app, percent),
             Style::default()
                 .fg(context_color(percent))
                 .add_modifier(Modifier::BOLD),
         ),
-        status_row(
+        status_lines(
+            compact,
             "TOKENS",
             format!(
                 "input {} · output {} · total {}",
@@ -2777,7 +2988,8 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             ),
             Style::default().fg(TEXT),
         ),
-        status_row(
+        status_lines(
+            compact,
             "CACHE",
             format!(
                 "read {} · write {} · last hit {cache_hit}",
@@ -2786,7 +2998,8 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             ),
             Style::default().fg(TEXT),
         ),
-        status_row(
+        status_lines(
+            compact,
             "COST",
             format!(
                 "${:.4}{}",
@@ -2795,14 +3008,18 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             ),
             Style::default().fg(if subscription { ACCENT } else { TEXT }),
         ),
-        status_row("MODEL TIME", model_time, Style::default().fg(TEXT)),
-        status_row("AVG RATE", average_rate, Style::default().fg(TEXT)),
-        status_row(
+        status_lines(compact, "MODEL TIME", model_time, Style::default().fg(TEXT)),
+        status_lines(compact, "AVG RATE", average_rate, Style::default().fg(TEXT)),
+        status_lines(
+            compact,
             "PROTOCOLS",
             format!("{} registered", active_protocols(app).len()),
             Style::default().fg(TEXT),
         ),
-    ];
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let plugin_items = plugin_status_items(app, true);
     if !plugin_items.is_empty() {
         lines.push(Line::default());
@@ -2810,8 +3027,9 @@ pub(super) fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
             "EXTENSIONS",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
-        lines.extend(plugin_items.into_iter().map(|item| {
-            status_row(
+        lines.extend(plugin_items.into_iter().flat_map(|item| {
+            status_lines(
+                compact,
                 single_line_preview(&item.label, 18),
                 single_line_preview(&item.value, 256),
                 status_tone_style(item.tone),
@@ -2860,6 +3078,29 @@ pub(super) fn average_rate_status(app: &App) -> String {
     }
 }
 
+/// Status rows align values in an 11-column label gutter. Compact panels
+/// are too narrow for wrapped values to align, so the label gets its own line.
+pub(super) fn status_lines(
+    compact: bool,
+    label: impl Into<String>,
+    value: impl Into<String>,
+    value_style: Style,
+) -> Vec<Line<'static>> {
+    if !compact {
+        return vec![status_row(label, value, value_style)];
+    }
+    vec![
+        Line::styled(
+            label.into(),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(value.into(), value_style),
+        ]),
+    ]
+}
+
 pub(super) fn status_row(
     label: impl Into<String>,
     value: impl Into<String>,
@@ -2876,16 +3117,20 @@ pub(super) fn status_row(
 
 pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    let title = panel_title(
+    let title = overlay_title(
+        app.compact,
         "COMMAND",
         action_hints(&app.keymap, &[("command", "complete", "complete")]),
+        area.width,
     );
-    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    frame.render_widget(block.title(title), area);
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    app.overlay_viewport_rows = sections[1].height as usize;
+    app.overlay_viewport_rows = (sections[1].height / row_height) as usize;
     let query_width = sections[0].width.saturating_sub(3) as usize;
     frame.render_widget(
         Paragraph::new(format!(
@@ -2905,6 +3150,27 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
     let description_width = row_width.saturating_sub(2 + name_width);
     let items = commands.iter().enumerate().map(|(index, item)| {
         let selected = index == app.command_selected;
+        let name_style = Style::default()
+            .fg(if selected { ACCENT } else { TEXT })
+            .add_modifier(if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        if compact {
+            let width = row_width.saturating_sub(2);
+            return compact_list_item(
+                selected,
+                vec![Span::styled(
+                    list_cell(&format!(":{}", item.name), width, selected, marquee_elapsed),
+                    name_style,
+                )],
+                vec![Span::styled(
+                    list_cell(&item.spec.description, width, selected, marquee_elapsed),
+                    Style::default().fg(MUTED),
+                )],
+            );
+        }
         ListItem::new(Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
@@ -2917,13 +3183,7 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
                     selected,
                     marquee_elapsed,
                 ),
-                Style::default()
-                    .fg(if selected { ACCENT } else { TEXT })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
+                name_style,
             ),
             Span::styled(
                 list_cell(
@@ -2939,18 +3199,14 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
     });
     let mut state = ListState::default().with_selected(Some(app.command_selected));
     frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    for index in state.offset()..commands.len() {
-        let y = sections[1]
-            .y
-            .saturating_add((index - state.offset()) as u16);
-        if y >= sections[1].bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[1].x, y, sections[1].width, 1),
-            target: AppHit::Palette(index),
-        });
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        sections[1],
+        state.offset(),
+        commands.len(),
+        row_height,
+        |index| Some(AppHit::Palette(index)),
+    );
 }
 
 const PENDING_PREVIEW_LIMIT: usize = 4;
@@ -3161,8 +3417,10 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         hints.push(actions);
     }
     frame.render_widget(
-        block.title(fit_panel_title(
-            &panel_title("SEND WHILE RUNNING", hints.join(" · ")),
+        block.title(overlay_title(
+            app.compact,
+            "SEND WHILE RUNNING",
+            hints.join(" · "),
             area.width,
         )),
         area,
@@ -3180,11 +3438,23 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         ("Queue", "Run after the current turn finishes"),
         ("Steer", "Add before the next model request"),
     ];
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
     let items = choices
         .iter()
         .enumerate()
         .map(|(index, (title, description))| {
             let selected = delivery.selected == index;
+            if compact {
+                return compact_list_item(
+                    selected,
+                    vec![Span::styled(
+                        *title,
+                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    )],
+                    vec![Span::styled(*description, Style::default().fg(MUTED))],
+                );
+            }
             ListItem::new(Line::from(vec![
                 Span::styled(
                     if selected { "› " } else { "  " },
@@ -3200,15 +3470,14 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         });
     let mut state = ListState::default().with_selected(Some(delivery.selected));
     frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    for index in 0..choices.len() {
-        let y = sections[1].y.saturating_add(index as u16);
-        if y < sections[1].bottom() {
-            app.hit_regions.push(HitRegion {
-                area: Rect::new(sections[1].x, y, sections[1].width, 1),
-                target: AppHit::Delivery(index),
-            });
-        }
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        sections[1],
+        state.offset(),
+        choices.len(),
+        row_height,
+        |index| Some(AppHit::Delivery(index)),
+    );
 }
 
 pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
@@ -3227,17 +3496,21 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         return;
     };
     frame.render_widget(
-        block.title(fit_panel_title(
-            &format!(" {} ", selector.title),
+        block.title(overlay_title(
+            app.compact,
+            &selector.title,
+            String::new(),
             area.width,
         )),
         area,
     );
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
-    app.overlay_viewport_rows = sections[1].height as usize;
+    app.overlay_viewport_rows = (sections[1].height / row_height) as usize;
     let query_width = sections[0].width.saturating_sub(3) as usize;
     frame.render_widget(
         Paragraph::new(format!(
@@ -3257,6 +3530,20 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         .filter_map(|(position, index)| {
             let item = selector.items.get(*index)?;
             let selected = position == selector.selected;
+            if compact {
+                let width = row_width.saturating_sub(2);
+                return Some(compact_list_item(
+                    selected,
+                    vec![Span::styled(
+                        list_cell(&item.title, width, selected, marquee_elapsed),
+                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    )],
+                    vec![Span::styled(
+                        list_cell(&item.description, width, selected, marquee_elapsed),
+                        Style::default().fg(MUTED),
+                    )],
+                ));
+            }
             Some(
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -3285,28 +3572,27 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
             )
         });
     let mut state = ListState::default().with_selected(Some(selector.selected));
+    let visible = selector.visible.len();
     frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    for position in state.offset()..selector.visible.len() {
-        let y = sections[1]
-            .y
-            .saturating_add((position - state.offset()) as u16);
-        if y >= sections[1].bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[1].x, y, sections[1].width, 1),
-            target: AppHit::Selector(position),
-        });
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        sections[1],
+        state.offset(),
+        visible,
+        row_height,
+        |position| Some(AppHit::Selector(position)),
+    );
 }
 
 pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     let inner = block.inner(area);
-    let title = panel_title(
+    let title = overlay_title(
+        app.compact,
         "MODEL HUB",
         action_hints(&app.keymap, &[("models", "refresh", "refresh")]),
+        area.width,
     );
-    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    frame.render_widget(block.title(title), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3388,15 +3674,18 @@ fn render_model_hub_tabs(
 }
 
 fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: Option<&str>) {
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
+    // Compact search drops the framed heading box to keep rows for results.
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Length(if compact { 1 } else { 3 }),
+            Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(area);
-    app.overlay_viewport_rows = sections[1].height as usize;
+    app.overlay_viewport_rows = (sections[1].height / row_height) as usize;
     let selected_key = app.model_selector.as_ref().and_then(|selector| {
         selector
             .selected()
@@ -3430,21 +3719,25 @@ fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: 
         |role| format!(" ASSIGN {role} · STEP 1 OF 2 · {summary} "),
     );
     let query_width = sections[0].width.saturating_sub(6) as usize;
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("⌕  ", Style::default().fg(ACCENT)),
-            Span::styled(
-                single_line_tail(selector.query(), query_width),
-                Style::default().fg(TEXT),
-            ),
-            Span::styled("█", Style::default().fg(ACCENT)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MUTED))
-                .title(fit_panel_title(&heading, sections[0].width)),
+    let query = Paragraph::new(Line::from(vec![
+        Span::styled("⌕  ", Style::default().fg(ACCENT)),
+        Span::styled(
+            single_line_tail(selector.query(), query_width),
+            Style::default().fg(TEXT),
         ),
+        Span::styled("█", Style::default().fg(ACCENT)),
+    ]));
+    frame.render_widget(
+        if compact {
+            query
+        } else {
+            query.block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MUTED))
+                    .title(fit_panel_title(&heading, sections[0].width)),
+            )
+        },
         sections[0],
     );
     let row_width = sections[1].width as usize;
@@ -3464,19 +3757,42 @@ fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: 
             .min(available.saturating_sub(minimum_name_width));
         let name_width = desired_name_width.min(available.saturating_sub(reserved_details));
         let details_width = available.saturating_sub(name_width);
+        let current = if selector.is_current(model) {
+            "● "
+        } else {
+            "  "
+        };
+        if compact {
+            let width = row_width.saturating_sub(4);
+            return compact_list_item(
+                selected,
+                vec![
+                    Span::styled(current, Style::default().fg(MUTED)),
+                    Span::styled(
+                        list_cell(model_label(model), width, selected, marquee_elapsed),
+                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    ),
+                ],
+                vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        list_cell(
+                            &format!("{} · {details}", model.provider_label()),
+                            width,
+                            selected,
+                            marquee_elapsed,
+                        ),
+                        Style::default().fg(MUTED),
+                    ),
+                ],
+            );
+        }
         ListItem::new(Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
                 Style::default().fg(ACCENT),
             ),
-            Span::styled(
-                if selector.is_current(model) {
-                    "● "
-                } else {
-                    "  "
-                },
-                Style::default().fg(MUTED),
-            ),
+            Span::styled(current, Style::default().fg(MUTED)),
             Span::styled(
                 list_cell(
                     model.provider_label(),
@@ -3498,19 +3814,16 @@ fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: 
         .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
     });
     let mut state = ListState::default().with_selected(Some(selector.selected_position()));
+    let visible = selector.visible_len();
     frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    for position in state.offset()..selector.visible_len() {
-        let y = sections[1]
-            .y
-            .saturating_add((position - state.offset()) as u16);
-        if y >= sections[1].bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[1].x, y, sections[1].width, 1),
-            target: AppHit::Model(position),
-        });
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        sections[1],
+        state.offset(),
+        visible,
+        row_height,
+        |position| Some(AppHit::Model(position)),
+    );
     let footer = if let Some(model) = selector.selected() {
         format!("{}/{} · {}", model.provider, model.id, model.api)
     } else {
@@ -3552,7 +3865,9 @@ fn render_model_roles(frame: &mut Frame<'_>, app: &mut App, area: Rect, interact
         );
         return;
     }
-    app.overlay_viewport_rows = area.height as usize;
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
+    app.overlay_viewport_rows = (area.height / row_height) as usize;
     let row_width = area.width as usize;
     let name_width = 18.min(row_width.saturating_sub(2));
     let source_width = 18.min(row_width.saturating_sub(2 + name_width));
@@ -3574,6 +3889,30 @@ fn render_model_roles(frame: &mut Frame<'_>, app: &mut App, area: Rect, interact
         } else {
             ("— no model assigned".to_string(), "—".to_string())
         };
+        if compact {
+            let width = row_width.saturating_sub(2);
+            return compact_list_item(
+                selected,
+                vec![Span::styled(
+                    list_cell(
+                        &format!("{} · {}", role.name, role_source_label(role)),
+                        width,
+                        selected,
+                        marquee_elapsed,
+                    ),
+                    Style::default().fg(if selected { ACCENT } else { TEXT }),
+                )],
+                vec![Span::styled(
+                    list_cell(
+                        &format!("{assignment} · {effort}"),
+                        width,
+                        selected,
+                        marquee_elapsed,
+                    ),
+                    Style::default().fg(if role.error.is_some() { ERROR } else { MUTED }),
+                )],
+            );
+        }
         ListItem::new(Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
@@ -3606,16 +3945,15 @@ fn render_model_roles(frame: &mut Frame<'_>, app: &mut App, area: Rect, interact
     let mut state = ListState::default().with_selected(Some(hub.selected_role));
     frame.render_stateful_widget(List::new(items), area, &mut state);
     if interactive {
-        for index in state.offset()..hub.roles.len() {
-            let y = area.y.saturating_add((index - state.offset()) as u16);
-            if y >= area.bottom() {
-                break;
-            }
-            app.hit_regions.push(HitRegion {
-                area: Rect::new(area.x, y, area.width, 1),
-                target: AppHit::ModelRole(index),
-            });
-        }
+        let roles = hub.roles.len();
+        push_list_hits(
+            &mut app.hit_regions,
+            area,
+            state.offset(),
+            roles,
+            row_height,
+            |index| Some(AppHit::ModelRole(index)),
+        );
     }
 }
 
@@ -3798,11 +4136,13 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         return;
     };
     let tab = settings.tab;
-    let title = panel_title(
+    let title = overlay_title(
+        app.compact,
         "SETTINGS",
         action_hints(&app.keymap, &[("settings", "save", "save")]),
+        area.width,
     );
-    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    frame.render_widget(block.title(title), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3949,7 +4289,9 @@ fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marque
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(2), Constraint::Length(4)])
         .split(area);
-    app.overlay_viewport_rows = sections[0].height as usize;
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
+    app.overlay_viewport_rows = (sections[0].height / row_height) as usize;
     let row_width = sections[0].width as usize;
     let label_width = 18.min(row_width.saturating_sub(2));
     let source_width = 22.min(row_width.saturating_sub(2 + label_width));
@@ -3959,6 +4301,25 @@ fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marque
         .enumerate()
         .map(|(index, (_, label, value, source))| {
             let selected = settings.selected == index;
+            if compact {
+                let width = row_width.saturating_sub(2);
+                return compact_list_item(
+                    selected,
+                    vec![Span::styled(
+                        list_cell(
+                            &format!("{label} · {source}"),
+                            width,
+                            selected,
+                            marquee_elapsed,
+                        ),
+                        Style::default().fg(if selected { ACCENT } else { MUTED }),
+                    )],
+                    vec![Span::styled(
+                        list_cell(value, width, selected, marquee_elapsed),
+                        Style::default().fg(TEXT),
+                    )],
+                );
+            }
             ListItem::new(Line::from(vec![
                 Span::styled(
                     if selected { "› " } else { "  " },
@@ -3981,16 +4342,14 @@ fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marque
         });
     let mut state = ListState::default().with_selected(Some(settings.selected));
     frame.render_stateful_widget(List::new(items), sections[0], &mut state);
-    for index in 0..row_count {
-        let y = sections[0].y.saturating_add(index as u16);
-        if y >= sections[0].bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[0].x, y, sections[0].width, 1),
-            target: AppHit::Setting(index),
-        });
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        sections[0],
+        state.offset(),
+        row_count,
+        row_height,
+        |index| Some(AppHit::Setting(index)),
+    );
     let detail = match settings.selected_item() {
         SettingsItem::Model => {
             "Conversation model · opens Model Hub · selection remains pending until Settings is saved"
@@ -4030,11 +4389,13 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
         return;
     }
     let inner = block.inner(area);
-    let title = panel_title(
+    let title = overlay_title(
+        app.compact,
         "TASKS",
         action_hints(&app.keymap, &[("tasks", "cancel", "cancel")]),
+        area.width,
     );
-    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    frame.render_widget(block.title(title), area);
     let selected_key = app
         .task_records
         .get(app.selected_task)
@@ -4042,9 +4403,26 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
     let marquee_elapsed = selected_key
         .map(|key| app.marquee_elapsed(key))
         .unwrap_or_default();
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
     let label_width = (inner.width as usize).saturating_sub(12);
     let items = app.task_records.iter().enumerate().map(|(index, task)| {
         let selected = index == app.selected_task;
+        if compact {
+            let width = (inner.width as usize).saturating_sub(2);
+            let color = if selected { ACCENT } else { TEXT };
+            return compact_list_item(
+                selected,
+                vec![Span::styled(
+                    list_cell(&task.label, width, selected, marquee_elapsed),
+                    Style::default().fg(color),
+                )],
+                vec![Span::styled(
+                    task.status.as_str().to_string(),
+                    Style::default().fg(MUTED),
+                )],
+            );
+        }
         ListItem::new(Line::from(vec![
             Span::raw(if selected { "› " } else { "  " }),
             Span::raw(format!("{:<10}", task.status.as_str())),
@@ -4063,16 +4441,14 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
     });
     let mut state = ListState::default().with_selected(Some(app.selected_task));
     frame.render_stateful_widget(List::new(items), inner, &mut state);
-    for index in state.offset()..app.task_records.len() {
-        let y = inner.y.saturating_add((index - state.offset()) as u16);
-        if y >= inner.bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(inner.x, y, inner.width, 1),
-            target: AppHit::Task(index),
-        });
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        inner,
+        state.offset(),
+        app.task_records.len(),
+        row_height,
+        |index| Some(AppHit::Task(index)),
+    );
 }
 
 pub(super) fn panel_tone_style(tone: TuiPanelTone) -> Style {
@@ -4107,9 +4483,9 @@ pub(super) fn render_plugin_panel(
         .map(|hint| format!("{} {}", hint.key, hint.label))
         .collect::<Vec<_>>()
         .join(" · ");
-    let title = panel_title(&view.title, String::new());
+    let title = overlay_title(app.compact, &view.title, String::new(), area.width);
     let inner = block.inner(area);
-    frame.render_widget(block.title(fit_panel_title(&title, area.width)), area);
+    frame.render_widget(block.title(title), area);
     let message_height = u16::from(view.message.is_some());
     let hints_height = u16::from(!hints.is_empty());
     let sections = Layout::default()
@@ -4120,7 +4496,9 @@ pub(super) fn render_plugin_panel(
             Constraint::Length(hints_height),
         ])
         .split(inner);
-    app.overlay_viewport_rows = sections[0].height as usize;
+    let compact = app.compact;
+    let row_height = list_row_height(compact);
+    app.overlay_viewport_rows = (sections[0].height / row_height) as usize;
     let row_width = sections[0].width as usize;
     let label_width = 20.min(row_width.saturating_sub(2));
     let value_width = row_width.saturating_sub(label_width + 2);
@@ -4131,6 +4509,39 @@ pub(super) fn render_plugin_panel(
             let mut characters = value.chars().collect::<Vec<_>>();
             characters.insert(cursor.min(characters.len()), '█');
             value = characters.into_iter().collect();
+        }
+        if compact {
+            let width = row_width.saturating_sub(2);
+            let mut secondary = vec![Span::styled(
+                single_line_preview(&value, width),
+                panel_tone_style(row.tone),
+            )];
+            let description_width = width.saturating_sub(value.width());
+            if !row.description.is_empty() && description_width > 3 {
+                let separator = if value.is_empty() { "" } else { " · " };
+                secondary.push(Span::styled(
+                    format!(
+                        "{separator}{}",
+                        single_line_preview(
+                            &row.description,
+                            description_width.saturating_sub(separator.width())
+                        )
+                    ),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            return compact_list_item(
+                selected,
+                vec![Span::styled(
+                    single_line_preview(&row.label, width),
+                    panel_tone_style(row.tone).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                )],
+                secondary,
+            );
         }
         let value_limit = if row.description.is_empty() {
             value_width
@@ -4176,21 +4587,18 @@ pub(super) fn render_plugin_panel(
     let selected = view.selected.filter(|index| *index < view.rows.len());
     let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(List::new(items), sections[0], &mut state);
-    for index in state.offset()..view.rows.len() {
-        let y = sections[0]
-            .y
-            .saturating_add((index - state.offset()) as u16);
-        if y >= sections[0].bottom() {
-            break;
-        }
-        if !view.rows[index].selectable {
-            continue;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[0].x, y, sections[0].width, 1),
-            target: AppHit::PluginRow(index),
-        });
-    }
+    push_list_hits(
+        &mut app.hit_regions,
+        sections[0],
+        state.offset(),
+        view.rows.len(),
+        row_height,
+        |index| {
+            view.rows[index]
+                .selectable
+                .then_some(AppHit::PluginRow(index))
+        },
+    );
     if let Some((message, tone)) = view.message {
         frame.render_widget(
             Paragraph::new(single_line_preview(&message, sections[1].width as usize))
@@ -4224,7 +4632,12 @@ pub(super) fn render_plugin_panel(
     }
 }
 
-pub(super) fn style_input(input: &mut TextArea<'static>, busy: bool, keymap: &Keymap) {
+pub(super) fn style_input(
+    input: &mut TextArea<'static>,
+    busy: bool,
+    keymap: &Keymap,
+    hint_width: usize,
+) {
     let border = ACCENT;
     let hints = if busy {
         action_hints(
@@ -4245,7 +4658,11 @@ pub(super) fn style_input(input: &mut TextArea<'static>, busy: bool, keymap: &Ke
             ],
         )
     };
-    let footer = format!(" {hints} ");
+    // Drop trailing hints rather than letting the right-aligned border title
+    // clip the leading ones.
+    let footer = fitted_hints(&hints, hint_width)
+        .map(|hints| format!(" {hints} "))
+        .unwrap_or_default();
     input.set_block(
         Block::default()
             .borders(Borders::ALL)
@@ -5272,6 +5689,53 @@ pub(super) fn marquee_preview(text: &str, limit: usize, elapsed_frames: usize) -
             .saturating_sub((phase - MARQUEE_HOLD_FRAMES * 2 - travel_frames) / MARQUEE_STEP_FRAMES)
     };
     marquee_window(&graphemes, start, limit)
+}
+
+/// Compact list rows put secondary columns on an indented second line rather
+/// than truncating every column into one.
+pub(super) fn list_row_height(compact: bool) -> u16 {
+    if compact { 2 } else { 1 }
+}
+
+pub(super) fn compact_list_item(
+    selected: bool,
+    primary: Vec<Span<'static>>,
+    secondary: Vec<Span<'static>>,
+) -> ListItem<'static> {
+    let mut first = vec![Span::styled(
+        if selected { "› " } else { "  " },
+        Style::default().fg(ACCENT),
+    )];
+    first.extend(primary);
+    let mut second = vec![Span::raw("  ")];
+    second.extend(secondary);
+    ListItem::new(vec![Line::from(first), Line::from(second)])
+        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+}
+
+/// Register one click target per visible list row, `row_height` cells tall.
+pub(super) fn push_list_hits(
+    hit_regions: &mut Vec<HitRegion<AppHit>>,
+    area: Rect,
+    offset: usize,
+    count: usize,
+    row_height: u16,
+    mut target: impl FnMut(usize) -> Option<AppHit>,
+) {
+    for index in offset..count {
+        let y = area
+            .y
+            .saturating_add(((index - offset) as u16).saturating_mul(row_height));
+        if y >= area.bottom() {
+            break;
+        }
+        if let Some(target) = target(index) {
+            hit_regions.push(HitRegion {
+                area: Rect::new(area.x, y, area.width, row_height.min(area.bottom() - y)),
+                target,
+            });
+        }
+    }
 }
 
 pub(super) fn list_cell(text: &str, width: usize, selected: bool, elapsed_frames: usize) -> String {

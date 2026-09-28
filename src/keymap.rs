@@ -14,6 +14,7 @@ map("global", "f1", "help");
 map("global", "f2", "settings");
 map("global", "f3", "model");
 map("global", "f4", "status");
+map("global", "f5", "layout");
 map("global", "ctrl+,", "settings");
 map("global", "ctrl+p", "protocols");
 map("global", "ctrl+t", "tasks");

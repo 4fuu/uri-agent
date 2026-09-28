@@ -341,6 +341,7 @@ Global and project settings use camel-case JSON fields:
 | `pluginSettings` | Plugin-owned values grouped by namespace | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
 | `keyDisplay` | `auto`, `macos`, or `text` hints | `auto` |
+| `layout` | `auto`, `wide`, or `compact` [conversation layout](interface.md#compact-layout) | `auto` |
 | `compaction.enabled` | Enable automatic checkpoints | `true` |
 | `compaction.strategy` | `rollover` or `summary` | `rollover` |
 | `compaction.reserveTokens` | Context reserved before checkpointing | `16384` |
@@ -357,8 +358,8 @@ built-in default
 ```
 
 Process overrides include `URI_AGENT_PROVIDER`, `URI_AGENT_MODEL`,
-`URI_AGENT_OUTPUT_LIMIT`, `URI_AGENT_THINKING`, `URI_AGENT_TERMINAL`, and
-`URI_AGENT_KEY_DISPLAY`. TUI changes write project settings when that file
+`URI_AGENT_OUTPUT_LIMIT`, `URI_AGENT_THINKING`, `URI_AGENT_TERMINAL`,
+`URI_AGENT_KEY_DISPLAY`, and `URI_AGENT_LAYOUT`. TUI changes write project settings when that file
 already exists; otherwise they write global settings. Process overrides remain
 in force and are not replaced by those writes.
 

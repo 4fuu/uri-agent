@@ -12,8 +12,8 @@ use crate::catalog::{CatalogModel, CatalogRefreshReport, ModelCatalog, ThinkingL
 use crate::clipboard;
 use crate::compaction::{ContextAccuracy, Strategy};
 use crate::config::{
-    ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, ModelRoleInfo, ValueSource,
-    display_path, validate_environment_name,
+    ActiveSettings, AgentEnvironment, AuthKind, ConfigManager, LayoutMode, ModelRoleInfo,
+    ValueSource, display_path, validate_environment_name,
 };
 use crate::keymap::{KeyDisplayStyle, KeyStroke, Keymap};
 use crate::model::{
@@ -94,6 +94,9 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const LEGACY_ANIMATION_FRAME_DURATION: Duration = Duration::from_millis(90);
 const PRESENTATION_FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const SCROLL_ROWS: isize = 6;
+/// Wheel step in the compact layout. A phone swipe arrives as a burst of
+/// wheel events, so the desktop step overshoots.
+const COMPACT_SCROLL_ROWS: isize = 2;
 const SMOOTH_SCROLL_CATCH_UP_FRAMES: usize = 8;
 const EXPANDED_PREVIEW_LINES: usize = 24;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
@@ -120,6 +123,7 @@ pub struct TuiInfo {
     pub diagnostics_path: PathBuf,
     pub terminal: Option<String>,
     pub key_display: KeyDisplayStyle,
+    pub layout: LayoutMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,6 +316,18 @@ enum AppHit {
     SettingsTab(usize),
     Selector(usize),
     TaskStatus,
+    Status,
+    CloseOverlay,
+    ActionBar(ActionButton),
+}
+
+/// Touch targets in the compact layout's bottom action bar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionButton {
+    Compose,
+    Command,
+    Latest,
+    Stop,
     Status,
 }
 
@@ -828,6 +844,12 @@ struct App {
     delivery: Option<DeliveryState>,
     overlay_scroll: u16,
     overlay_viewport_rows: usize,
+    /// Effective layout for the latest frame: the configured mode resolved
+    /// against the frame width, unless `layout_override` pins it.
+    compact: bool,
+    layout_override: Option<bool>,
+    frame_width: u16,
+    composer_hint_width: usize,
     jump: JumpKind,
     busy: bool,
     activity: Option<Activity>,
@@ -915,7 +937,7 @@ impl App {
         if !draft.is_empty() {
             input.insert_str(strip_image_references(&draft));
         }
-        style_input(&mut input, false, &keymap);
+        style_input(&mut input, false, &keymap, usize::MAX);
         Self {
             input,
             blocks: Vec::new(),
@@ -929,6 +951,10 @@ impl App {
             delivery: None,
             overlay_scroll: 0,
             overlay_viewport_rows: 0,
+            compact: false,
+            layout_override: None,
+            frame_width: 0,
+            composer_hint_width: usize::MAX,
             jump: JumpKind::All,
             busy: false,
             activity: None,
@@ -1043,6 +1069,40 @@ impl App {
             .into_iter()
             .chain(interrupt.filter(|deadline| *deadline > now))
             .min()
+    }
+
+    fn resolve_layout(&mut self, width: u16) {
+        self.frame_width = width;
+        self.compact = self
+            .layout_override
+            .unwrap_or_else(|| self.info.layout.compact_at(width));
+    }
+
+    /// Flip the effective layout for this process. Returning to what the
+    /// configured mode would choose drops the override, so `auto` resumes
+    /// following the terminal width.
+    fn toggle_layout(&mut self) {
+        let target = !self.compact;
+        let configured = self.info.layout.compact_at(self.frame_width);
+        self.layout_override = (target != configured).then_some(target);
+        self.compact = target;
+        self.announce_layout();
+    }
+
+    fn set_layout(&mut self, mode: LayoutMode) {
+        self.info.layout = mode;
+        self.layout_override = None;
+        self.resolve_layout(self.frame_width);
+        self.announce_layout();
+    }
+
+    fn announce_layout(&mut self) {
+        let effective = if self.compact { "compact" } else { "wide" };
+        if self.layout_override.is_some() || self.info.layout != LayoutMode::Auto {
+            self.set_flash(format!("Layout: {effective}"));
+        } else {
+            self.set_flash(format!("Layout: auto ({effective})"));
+        }
     }
 
     fn marquee_elapsed(&mut self, key: String) -> usize {
@@ -1838,7 +1898,12 @@ impl App {
     }
 
     fn sync_composer_chrome(&mut self) {
-        style_input(&mut self.input, self.busy, &self.keymap);
+        style_input(
+            &mut self.input,
+            self.busy,
+            &self.keymap,
+            self.composer_hint_width,
+        );
         self.input.clear_custom_highlight();
         let highlights = self
             .input
@@ -2378,6 +2443,14 @@ impl App {
         }
     }
 
+    fn wheel_rows(&self) -> isize {
+        if self.compact {
+            COMPACT_SCROLL_ROWS
+        } else {
+            SCROLL_ROWS
+        }
+    }
+
     fn smooth_scroll_transcript(&mut self, direction: isize) {
         let start = match self.mouse_scroll_animation {
             Some(MouseScrollAnimation::Transcript {
@@ -2386,7 +2459,7 @@ impl App {
             }) if previous_direction == direction => target,
             _ => self.transcript_offset,
         };
-        let target = self.transcript_scroll_destination(start, direction * SCROLL_ROWS);
+        let target = self.transcript_scroll_destination(start, direction * self.wheel_rows());
         self.mouse_scroll_animation = (target != self.transcript_offset)
             .then_some(MouseScrollAnimation::Transcript { target, direction });
         if self.mouse_scroll_animation.is_some() {
@@ -2403,7 +2476,7 @@ impl App {
             }) if previous_direction == direction => target,
             _ => self.overlay_scroll,
         };
-        let distance = direction * SCROLL_ROWS;
+        let distance = direction * self.wheel_rows();
         let target = if distance < 0 {
             start.saturating_sub(distance.unsigned_abs().min(u16::MAX as usize) as u16)
         } else {
