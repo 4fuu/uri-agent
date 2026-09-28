@@ -632,6 +632,12 @@ impl AgentRuntime {
             .expect("context usage lock poisoned")
     }
 
+    /// Context window of the active model. `set_backend` keeps it current
+    /// across model switches.
+    pub async fn context_window(&self) -> usize {
+        self.limits.read().await.context_window
+    }
+
     async fn build_model_request(&self) -> Result<ModelRequest> {
         let system = self.system_prompt().await?;
         let model = self.session.model_settings().await;

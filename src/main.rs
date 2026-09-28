@@ -123,12 +123,12 @@ async fn run_session(
     let (terminal_title, title_receiver) = tokio::sync::watch::channel(String::new());
     if let Some(reporter) = herdr {
         reporter
-            .start(agent.services().runtime.clone(), title_receiver)
+            .start(agent.services().runtime.clone(), title_receiver.clone())
             .await;
     }
     if let Some(reporter) = moshi {
         reporter
-            .start(agent.services().runtime.session().clone())
+            .start(agent.services().runtime.clone(), title_receiver)
             .await;
     }
     let startup_runtime = agent.services().runtime.clone();
@@ -180,10 +180,12 @@ async fn run_retained_session_inner(
     let runtime = agent.services().runtime.clone();
     let (terminal_title, title_receiver) = tokio::sync::watch::channel(String::new());
     if let Some(reporter) = herdr {
-        reporter.start(runtime.clone(), title_receiver).await;
+        reporter
+            .start(runtime.clone(), title_receiver.clone())
+            .await;
     }
     if let Some(reporter) = moshi {
-        reporter.start(runtime.session().clone()).await;
+        reporter.start(runtime.clone(), title_receiver).await;
     }
     let session = runtime.session();
     let settings = session.model_settings().await;

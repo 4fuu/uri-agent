@@ -4,7 +4,17 @@
 //! daemon collects coding-agent lifecycle events over a local Unix socket
 //! carrying newline-delimited JSON. When a daemon socket resolves, the
 //! reporter forwards the visible session's lifecycle so Moshi can keep its
-//! inbox row and push notifications current. Session observation, the
+//! inbox row and push notifications current. The row title follows the
+//! interface-generated session title once one exists — the daemon drops
+//! category-less frames, so the refresh rides a published session_started
+//! frame carrying a borrowed chat.message event name. A settled turn
+//! reports Task Done and quotes the final reply, a failed turn the error.
+//! Mid-turn
+//! progress and tool frames are projected but dropped before sending:
+//! moshi-hook never publishes category-less frames and suppresses tool
+//! progress, so they would be pure socket noise (the send gate carries a
+//! TODO). Session updates carry the remaining context percentage. Session
+//! observation, the
 //! moshi-hook envelope, and the socket transport stay separate: a daemon
 //! quirk belongs in the envelope builder, not in the turn watcher. Reporting
 //! is on by default and disabled with `URI_AGENT_MOSHI=0`. Only Unix
@@ -16,25 +26,28 @@
 //! conversation.
 
 use crate::agent::AgentSpec;
+use crate::runtime::AgentRuntime;
 use crate::session::{EventKind, Session, SessionUpdate};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Wire identity on the Moshi event API. That API rejects `uri-agent` and
-/// only accepts a fixed agent list. OpenCode is the unused allowlisted
-/// identity: the daemon only rewrites a few of its own titles, and `Stop`
-/// is special-cased only for `source: "codex"`.
-const SOURCE: &str = "opencode";
-/// Tool activity fires many times per turn; one frame per window keeps the
-/// inbox row fresh without flooding the daemon, which applies its own
-/// five-second push throttle as well.
-const TOOL_THROTTLE: Duration = Duration::from_secs(5);
+/// only accepts a fixed agent list. Pi is the short allowlisted identity:
+/// the daemon handles it as a first-class source family with session-title
+/// tracking, and the two-letter name keeps the Live Activity headline
+/// short. `codex` is not used, because the daemon drops a `Stop` event
+/// from that source.
+const SOURCE: &str = "pi";
+/// Tool and streaming activity fire many times per turn; each channel
+/// throttles to one frame per window, keeping the inbox row fresh without
+/// flooding the daemon, which applies its own five-second push throttle.
+const PROGRESS_THROTTLE: Duration = Duration::from_secs(5);
 /// One socket exchange must never stall the conversation.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// The daemon answers fire-and-forget frames with an `ack`; drain it so the
@@ -45,8 +58,8 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 /// Moshi renders at most 80 characters of an event title and 200 of its body;
 /// stay inside both bounds so nothing is cut off on the server.
 const TITLE_MAX: usize = 80;
-/// Moshi's notification body bound. The prompt goes here so a title rewrite
-/// still leaves the inbox row with something to show.
+/// Moshi's notification body bound. Prompts, rolling output tails, and the
+/// final reply excerpt go here.
 const MESSAGE_MAX: usize = 200;
 /// Lifecycle names from the documented moshi-hook envelope. They are not a
 /// source identity: `Stop` is only special-cased for `source: "codex"`.
@@ -56,6 +69,11 @@ const EVENT_STOP: &str = "Stop";
 const EVENT_SESSION_END: &str = "SessionEnd";
 const EVENT_PRE_TOOL: &str = "PreToolUse";
 const EVENT_POST_TOOL: &str = "PostToolUse";
+/// Borrowed message-event name for the published title refresh. A
+/// non-empty eventName keeps the title URI Agent sends, and the daemon
+/// publishes it under the session_started category without treating the
+/// frame as a fresh session start.
+const EVENT_CHAT_MESSAGE: &str = "chat.message";
 
 /// The multiplexer pane the process runs in, when it advertises one. Moshi
 /// uses the pane to attribute the session to the right terminal.
@@ -65,6 +83,11 @@ enum Endpoint {
     None,
     Tmux {
         pane: String,
+        /// Session and window names resolve lazily from tmux itself; the
+        /// socket path comes from `TMUX`.
+        session: Option<String>,
+        window: Option<String>,
+        socket: Option<String>,
     },
     Zellij {
         session: Option<String>,
@@ -100,7 +123,15 @@ impl Endpoint {
             };
         }
         if let Some(pane) = present(lookup("TMUX_PANE")) {
-            return Self::Tmux { pane };
+            let socket = lookup("TMUX")
+                .and_then(|value| value.split(',').next().map(str::to_string))
+                .filter(|value| !value.is_empty());
+            return Self::Tmux {
+                pane,
+                session: None,
+                window: None,
+                socket,
+            };
         }
         Self::None
     }
@@ -112,9 +143,17 @@ impl Endpoint {
     fn fields(&self) -> TerminalFields {
         match self {
             Self::None => TerminalFields::default(),
-            Self::Tmux { pane } => TerminalFields {
+            Self::Tmux {
+                pane,
+                session,
+                window,
+                socket,
+            } => TerminalFields {
                 kind: Some("tmux"),
                 tmux_pane: Some(pane.clone()),
+                tmux_session: session.clone(),
+                tmux_window: window.clone(),
+                tmux_socket: socket.clone(),
                 ..TerminalFields::default()
             },
             Self::Zellij { session, pane } => TerminalFields {
@@ -146,6 +185,9 @@ impl Endpoint {
 struct TerminalFields {
     kind: Option<&'static str>,
     tmux_pane: Option<String>,
+    tmux_session: Option<String>,
+    tmux_window: Option<String>,
+    tmux_socket: Option<String>,
     zellij_session: Option<String>,
     zellij_pane: Option<String>,
     herdr_pane: Option<String>,
@@ -188,14 +230,29 @@ enum MoshiAction {
     /// Attach the terminal pane to the session; never published as a push.
     Bind,
     /// Category-less attach. The daemon treats it as state, not an inbox push.
-    State,
+    State {
+        title: Option<String>,
+    },
+    /// The interface generated a session title after the row opened. A
+    /// category-less refresh would be dropped by the daemon, so the new
+    /// title rides a published session_started frame instead.
+    TitleUpdated {
+        title: String,
+        /// Keeps the published body non-empty; falls back to the title.
+        prompt: Option<String>,
+    },
     SessionStarted {
         prompt: Option<String>,
     },
     /// A later prompt. Refreshes the open row without announcing a new session.
     PromptSubmitted {
         prompt: String,
-        title: Option<String>,
+    },
+    /// Live turn status: the subtitle is the status label and the body the
+    /// rolling output tail. Category-less, so the daemon never pushes it.
+    Progress {
+        status: Status,
+        detail: Option<String>,
     },
     TaskComplete {
         failed: bool,
@@ -205,10 +262,12 @@ enum MoshiAction {
     },
     ToolRunning {
         tool: String,
+        /// The call's arguments, when non-empty, so the body can show what
+        /// is running.
+        detail: Option<String>,
     },
     ToolFinished {
         tool: String,
-        failed: bool,
     },
     SessionClosed,
 }
@@ -217,26 +276,62 @@ enum MoshiAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Notice {
     Prompt,
+    /// Streaming output or a retry moved the live status.
+    Progress(Status),
     Finished,
-    ToolStarted(String),
-    ToolFinished { tool: String, failed: bool },
+    ToolStarted(String, Option<String>),
+    ToolFinished(String),
 }
 
-/// Per-turn reporting state. The prompt is the notification body; the latest
-/// assistant text is the title. An error flips the completion to failed and
-/// becomes the body, so the phone shows why the turn stopped.
+/// What the turn is doing right now, mirroring the interface's activity
+/// line. The watcher tracks only the kind; the labels ride the envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Status {
+    Reasoning,
+    Writing,
+    Retrying {
+        attempt: usize,
+        max_retries: usize,
+        reason: String,
+    },
+}
+
+impl Status {
+    fn label(&self) -> String {
+        match self {
+            Self::Reasoning => "Reasoning".to_string(),
+            Self::Writing => "Writing".to_string(),
+            Self::Retrying {
+                attempt,
+                max_retries,
+                ..
+            } => format!("Retrying {attempt}/{max_retries}"),
+        }
+    }
+}
+
+/// Per-turn reporting state. The prompt opens and refreshes the row; while
+/// the turn runs the body follows the rolling activity tail; a settled turn
+/// quotes the final reply block and an error becomes the body, so the phone
+/// shows how the turn ended.
 #[derive(Default)]
 struct TurnState {
     prompt: Option<String>,
+    /// Rolling tail of the streaming text or reasoning, capped at the body
+    /// bound. A tool call clears it, so the call's detail owns the body
+    /// until output resumes.
+    activity: String,
+    /// Opening of the latest completed assistant text block, at the body
+    /// bound. A settled turn quotes it as the final reply.
     snippet: Option<String>,
-    /// Kept across completion so a later prompt can refresh the row without
-    /// resetting its title to "Session started".
-    last_title: Option<String>,
     error: Option<String>,
     failed: bool,
 }
 
-fn observe(kind: &EventKind, turn: &mut TurnState) -> Option<Notice> {
+/// Streaming deltas arrive as fragments, so the transient/persisted split
+/// drives the preview: a delta extends the rolling tail, while a persisted
+/// block restarts it.
+fn observe(kind: &EventKind, persisted: bool, turn: &mut TurnState) -> Option<Notice> {
     match kind {
         EventKind::User { text } => {
             let prompt = truncate(text, MESSAGE_MAX);
@@ -244,19 +339,42 @@ fn observe(kind: &EventKind, turn: &mut TurnState) -> Option<Notice> {
                 return None;
             }
             turn.prompt = Some(prompt);
+            turn.activity.clear();
             turn.snippet = None;
             turn.error = None;
             turn.failed = false;
             Some(Notice::Prompt)
         }
         EventKind::AssistantText { text } => {
-            let snippet = truncate(text, TITLE_MAX);
-            if !snippet.is_empty() {
-                turn.last_title = Some(snippet.clone());
-                turn.snippet = Some(snippet);
+            if persisted {
+                turn.activity = tail(text, MESSAGE_MAX);
+                let excerpt = truncate(text, MESSAGE_MAX);
+                if !excerpt.is_empty() {
+                    turn.snippet = Some(excerpt);
+                }
+            } else {
+                push_tail(&mut turn.activity, text, MESSAGE_MAX);
             }
-            None
+            Some(Notice::Progress(Status::Writing))
         }
+        EventKind::AssistantReasoning { text } => {
+            if persisted {
+                turn.activity = tail(text, MESSAGE_MAX);
+            } else {
+                push_tail(&mut turn.activity, text, MESSAGE_MAX);
+            }
+            Some(Notice::Progress(Status::Reasoning))
+        }
+        EventKind::ModelRetry {
+            attempt,
+            max_retries,
+            reason,
+            ..
+        } => Some(Notice::Progress(Status::Retrying {
+            attempt: *attempt,
+            max_retries: *max_retries,
+            reason: truncate(reason, MESSAGE_MAX),
+        })),
         EventKind::Error { text } => {
             turn.failed = true;
             let error = truncate(text, MESSAGE_MAX);
@@ -266,11 +384,22 @@ fn observe(kind: &EventKind, turn: &mut TurnState) -> Option<Notice> {
             None
         }
         EventKind::TurnFinished => Some(Notice::Finished),
-        EventKind::ToolCall { name, .. } => Some(Notice::ToolStarted(name.clone())),
-        EventKind::ToolResult { name, failed, .. } => Some(Notice::ToolFinished {
-            tool: name.clone(),
-            failed: *failed,
-        }),
+        EventKind::ToolCall {
+            name, arguments, ..
+        } => {
+            turn.activity.clear();
+            // An argument-less call leaves the body to the previous frame.
+            let detail = match arguments {
+                serde_json::Value::Null => None,
+                serde_json::Value::Object(map) if map.is_empty() => None,
+                other => {
+                    let detail = truncate(&other.to_string(), MESSAGE_MAX);
+                    (!detail.is_empty()).then_some(detail)
+                }
+            };
+            Some(Notice::ToolStarted(name.clone(), detail))
+        }
+        EventKind::ToolResult { name, .. } => Some(Notice::ToolFinished(name.clone())),
         _ => None,
     }
 }
@@ -284,9 +413,10 @@ fn project(notice: Notice, turn: &TurnState, announced: &mut bool) -> Vec<MoshiA
         && matches!(
             notice,
             Notice::Prompt
+                | Notice::Progress(_)
                 | Notice::Finished
-                | Notice::ToolStarted(_)
-                | Notice::ToolFinished { .. }
+                | Notice::ToolStarted(..)
+                | Notice::ToolFinished(_)
         );
     if first {
         *announced = true;
@@ -297,11 +427,15 @@ fn project(notice: Notice, turn: &TurnState, announced: &mut bool) -> Vec<MoshiA
     match notice {
         Notice::Prompt => {
             if !first && let Some(prompt) = turn.prompt.clone() {
-                actions.push(MoshiAction::PromptSubmitted {
-                    prompt,
-                    title: turn.last_title.clone(),
-                });
+                actions.push(MoshiAction::PromptSubmitted { prompt });
             }
+        }
+        Notice::Progress(status) => {
+            let detail = match &status {
+                Status::Retrying { reason, .. } => (!reason.is_empty()).then(|| reason.clone()),
+                _ => (!turn.activity.is_empty()).then(|| turn.activity.clone()),
+            };
+            actions.push(MoshiAction::Progress { status, detail });
         }
         Notice::Finished => actions.push(MoshiAction::TaskComplete {
             failed: turn.failed,
@@ -309,10 +443,10 @@ fn project(notice: Notice, turn: &TurnState, announced: &mut bool) -> Vec<MoshiA
             prompt: turn.prompt.clone(),
             error: turn.error.clone(),
         }),
-        Notice::ToolStarted(tool) => actions.push(MoshiAction::ToolRunning { tool }),
-        Notice::ToolFinished { tool, failed } => {
-            actions.push(MoshiAction::ToolFinished { tool, failed })
+        Notice::ToolStarted(tool, detail) => {
+            actions.push(MoshiAction::ToolRunning { tool, detail })
         }
+        Notice::ToolFinished(tool) => actions.push(MoshiAction::ToolFinished { tool }),
     }
     actions
 }
@@ -335,6 +469,8 @@ struct MoshiFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    subtitle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
     #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
@@ -346,10 +482,18 @@ struct MoshiFrame {
     project_name: Option<String>,
     #[serde(rename = "agentPid", skip_serializing_if = "Option::is_none")]
     agent_pid: Option<u32>,
+    #[serde(rename = "contextRemaining", skip_serializing_if = "Option::is_none")]
+    context_remaining: Option<u32>,
     #[serde(rename = "terminalKind", skip_serializing_if = "Option::is_none")]
     terminal_kind: Option<&'static str>,
     #[serde(rename = "tmuxPane", skip_serializing_if = "Option::is_none")]
     tmux_pane: Option<String>,
+    #[serde(rename = "tmuxSession", skip_serializing_if = "Option::is_none")]
+    tmux_session: Option<String>,
+    #[serde(rename = "tmuxWindow", skip_serializing_if = "Option::is_none")]
+    tmux_window: Option<String>,
+    #[serde(rename = "tmuxSocket", skip_serializing_if = "Option::is_none")]
+    tmux_socket: Option<String>,
     #[serde(rename = "zellijSession", skip_serializing_if = "Option::is_none")]
     zellij_session: Option<String>,
     #[serde(rename = "zellijPane", skip_serializing_if = "Option::is_none")]
@@ -366,34 +510,53 @@ struct MoshiFrame {
 
 /// Wire fields that depend on the lifecycle fact. Terminal and session
 /// fields are filled around this, so the adapter can change without the
-/// watcher learning moshi-hook names.
+/// watcher learning moshi-hook names. The generated session title owns the
+/// headline once it exists; the subtitle carries the live status label.
 struct WireParts {
     kind: &'static str,
     event_name: Option<&'static str>,
     category: Option<&'static str>,
     title: Option<String>,
+    subtitle: Option<String>,
     message: Option<String>,
     tool_name: Option<String>,
     agent_pid: Option<u32>,
 }
 
-fn wire_parts(action: &MoshiAction) -> WireParts {
+fn wire_parts(action: &MoshiAction, session_title: Option<&str>) -> WireParts {
+    let session_title = session_title.filter(|title| !title.is_empty());
     match action {
         MoshiAction::Bind => WireParts {
             kind: "session.bind",
             event_name: None,
             category: None,
             title: None,
+            subtitle: None,
             message: None,
             tool_name: None,
             agent_pid: Some(std::process::id()),
         },
-        MoshiAction::State => WireParts {
+        MoshiAction::State { title } => WireParts {
             kind: "session.update",
             event_name: Some(EVENT_SESSION_START),
             category: None,
-            title: None,
+            title: title.clone(),
+            subtitle: None,
             message: None,
+            tool_name: None,
+            agent_pid: None,
+        },
+        MoshiAction::TitleUpdated { title, prompt } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_CHAT_MESSAGE),
+            category: Some("session_started"),
+            title: Some(title.clone()),
+            // No subtitle: the refresh says nothing about the turn, so the
+            // status from the previous frame stands.
+            subtitle: None,
+            // The frame is published, so the body stays non-empty: the
+            // prompt, or the title itself before any prompt.
+            message: Some(prompt.clone().unwrap_or_else(|| title.clone())),
             tool_name: None,
             agent_pid: None,
         },
@@ -401,22 +564,29 @@ fn wire_parts(action: &MoshiAction) -> WireParts {
             kind: "session.update",
             event_name: Some(EVENT_SESSION_START),
             category: Some("session_started"),
-            title: Some("Session started".to_string()),
+            title: Some(session_title.unwrap_or("Session started").to_string()),
+            subtitle: Some("Thinking".to_string()),
             message: prompt.clone(),
             tool_name: None,
             agent_pid: None,
         },
-        MoshiAction::PromptSubmitted { prompt, title } => WireParts {
+        MoshiAction::PromptSubmitted { prompt } => WireParts {
             kind: "session.update",
             event_name: Some(EVENT_USER_PROMPT),
             category: Some("session_started"),
-            title: Some(
-                title
-                    .clone()
-                    .filter(|title| !title.is_empty())
-                    .unwrap_or_else(|| "Working".to_string()),
-            ),
+            title: Some(session_title.unwrap_or("Working").to_string()),
+            subtitle: Some("Thinking".to_string()),
             message: Some(prompt.clone()),
+            tool_name: None,
+            agent_pid: None,
+        },
+        MoshiAction::Progress { status, detail } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_SESSION_START),
+            category: None,
+            title: None,
+            subtitle: Some(status.label()),
+            message: detail.clone(),
             tool_name: None,
             agent_pid: None,
         },
@@ -425,49 +595,67 @@ fn wire_parts(action: &MoshiAction) -> WireParts {
             snippet,
             prompt,
             error,
-        } => WireParts {
-            kind: "session.update",
-            event_name: Some(EVENT_STOP),
-            category: Some("task_complete"),
-            title: Some(if *failed {
+        } => {
+            let status = if *failed { "Turn failed" } else { "Task Done" };
+            let fallback = if *failed {
                 "Turn failed".to_string()
             } else {
                 snippet
-                    .clone()
+                    .as_deref()
+                    .map(|snippet| truncate(snippet, TITLE_MAX))
+                    .filter(|snippet| !snippet.is_empty())
                     .unwrap_or_else(|| "Turn complete".to_string())
-            }),
-            // eventName keeps the title above. The body is the prompt, or the
-            // error when the turn failed. A missing prompt still leaves the
-            // assistant snippet, in case a daemon replaces the title.
-            message: if *failed {
+            };
+            let title = session_title.map(str::to_string).unwrap_or(fallback);
+            // The subtitle is the bare status. The body leads with the same
+            // status — a push may render only title and body — then quotes
+            // the final reply, or the error when the turn failed; a missing
+            // reply still leaves the prompt, in case a daemon replaces the
+            // title.
+            let body = if *failed {
                 error
                     .clone()
                     .or_else(|| prompt.clone())
                     .or_else(|| snippet.clone())
             } else {
-                prompt.clone().or_else(|| snippet.clone())
-            },
-            tool_name: None,
-            agent_pid: None,
-        },
-        MoshiAction::ToolRunning { tool } => WireParts {
+                snippet.clone().or_else(|| prompt.clone())
+            };
+            WireParts {
+                kind: "session.update",
+                event_name: Some(EVENT_STOP),
+                category: Some("task_complete"),
+                subtitle: (title != status).then(|| status.to_string()),
+                title: Some(title),
+                message: Some(match body {
+                    Some(body) if !body.is_empty() => {
+                        truncate(&format!("{status}\n{body}"), MESSAGE_MAX)
+                    }
+                    _ => status.to_string(),
+                }),
+                tool_name: None,
+                agent_pid: None,
+            }
+        }
+        // Tool frames carry no title: the daemon does not push tool progress,
+        // and a title here would clobber the session title on the inbox row.
+        // The status rides the subtitle instead.
+        MoshiAction::ToolRunning { tool, detail } => WireParts {
             kind: "session.update",
             event_name: Some(EVENT_PRE_TOOL),
             category: Some("tool_running"),
-            title: Some(format!("Running {tool}")),
-            message: None,
+            title: None,
+            subtitle: Some(format!("Running {tool}")),
+            message: detail.clone(),
             tool_name: Some(tool.clone()),
             agent_pid: None,
         },
-        MoshiAction::ToolFinished { tool, failed } => WireParts {
+        MoshiAction::ToolFinished { tool } => WireParts {
             kind: "session.update",
             event_name: Some(EVENT_POST_TOOL),
             category: Some("tool_finished"),
-            title: Some(if *failed {
-                format!("{tool} failed")
-            } else {
-                format!("{tool} finished")
-            }),
+            title: None,
+            subtitle: Some("Thinking".to_string()),
+            // No message: the body keeps the finished call's detail.
             message: None,
             tool_name: Some(tool.clone()),
             agent_pid: None,
@@ -477,7 +665,8 @@ fn wire_parts(action: &MoshiAction) -> WireParts {
             event_name: Some(EVENT_SESSION_END),
             // An empty category is a silent state carrier and is not published.
             category: Some("session_ended"),
-            title: Some("Session ended".to_string()),
+            title: Some(session_title.unwrap_or("Session ended").to_string()),
+            subtitle: None,
             message: None,
             tool_name: None,
             agent_pid: None,
@@ -485,13 +674,22 @@ fn wire_parts(action: &MoshiAction) -> WireParts {
     }
 }
 
+/// Facts known only while the worker runs: the generated session title and
+/// the remaining context percentage. One-shot frame builders leave them out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FrameFacts {
+    session_title: Option<String>,
+    context_remaining: Option<u32>,
+}
+
 fn frame_for(
     action: &MoshiAction,
     context: &FrameContext,
     endpoint: &Endpoint,
+    facts: &FrameFacts,
     now: DateTime<Utc>,
 ) -> MoshiFrame {
-    let parts = wire_parts(action);
+    let parts = wire_parts(action, facts.session_title.as_deref());
     let terminal = endpoint.fields();
     MoshiFrame {
         kind: parts.kind,
@@ -501,14 +699,23 @@ fn frame_for(
         event_name: parts.event_name,
         category: parts.category,
         title: parts.title,
+        subtitle: parts.subtitle,
         message: parts.message,
         tool_name: parts.tool_name,
         model_name: (!context.model.is_empty()).then(|| context.model.clone()),
         cwd: Some(context.cwd.clone()),
         project_name: Some(context.project.clone()),
         agent_pid: parts.agent_pid,
+        // Context fill rides session updates only, mirroring moshi-hook's own
+        // hooks; bind and close frames stay without it.
+        context_remaining: facts
+            .context_remaining
+            .filter(|_| parts.kind == "session.update"),
         terminal_kind: terminal.kind,
         tmux_pane: terminal.tmux_pane,
+        tmux_session: terminal.tmux_session,
+        tmux_window: terminal.tmux_window,
+        tmux_socket: terminal.tmux_socket,
         zellij_session: terminal.zellij_session,
         zellij_pane: terminal.zellij_pane,
         herdr_pane: terminal.herdr_pane,
@@ -524,6 +731,110 @@ fn truncate(text: &str, max: usize) -> String {
         return trimmed.to_string();
     }
     trimmed.chars().take(max).collect()
+}
+
+/// The last `max` characters of `text`: a live body shows the fragment
+/// being written, not the opening of a long stream.
+fn tail(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    text.chars().skip(count - max).collect()
+}
+
+/// Append a streaming fragment, keeping only the tail so the buffer stays
+/// bounded no matter how long the turn runs.
+fn push_tail(buffer: &mut String, text: &str, max: usize) {
+    buffer.push_str(text);
+    let count = buffer.chars().count();
+    if count > max {
+        *buffer = buffer.chars().skip(count - max).collect();
+    }
+}
+
+/// Remaining context as a percentage, mirroring moshi-hook's own hooks: the
+/// used share floors, a full window still reports 1, and unknown input
+/// reports nothing.
+fn remaining_percent(used: usize, window: usize) -> Option<u32> {
+    if used == 0 || window == 0 {
+        return None;
+    }
+    let used_pct = (used.saturating_mul(100) / window).min(100) as u32;
+    Some((100 - used_pct).max(1))
+}
+
+/// The watched session's remaining context percentage, when both sides of
+/// the ratio are known.
+async fn context_remaining(runtime: &AgentRuntime) -> Option<u32> {
+    remaining_percent(
+        runtime.context_usage().tokens,
+        runtime.context_window().await,
+    )
+}
+
+/// Ask tmux for the session and window names of a pane, mirroring
+/// moshi-hook's own hooks. A missing tmux binary or a stale pane resolves
+/// to nothing and the frames simply omit the names.
+#[cfg(unix)]
+async fn tmux_names(pane: &str) -> Option<(String, String)> {
+    let output = tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::process::Command::new("tmux")
+            .args(["display-message", "-p", "-t", pane, "#S\t#I"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().split('\t');
+    let session = parts.next()?.trim();
+    if session.is_empty() {
+        return None;
+    }
+    let window = parts.next().unwrap_or("").trim().to_string();
+    Some((session.to_string(), window))
+}
+
+#[cfg(not(unix))]
+async fn tmux_names(_pane: &str) -> Option<(String, String)> {
+    None
+}
+
+/// Fill in the tmux session and window names once they resolve. Retried on
+/// each attach until the pane answers; skipped while no daemon listens.
+async fn resolve_tmux_names(inner: &MoshiInner) {
+    if !inner.socket_path.exists() {
+        return;
+    }
+    let pane = {
+        let endpoint = inner.endpoint.read().expect("endpoint lock poisoned");
+        match &*endpoint {
+            Endpoint::Tmux {
+                pane,
+                session: None,
+                ..
+            } => pane.clone(),
+            _ => return,
+        }
+    };
+    let Some((session, window)) = tmux_names(&pane).await else {
+        return;
+    };
+    let mut endpoint = inner.endpoint.write().expect("endpoint lock poisoned");
+    if let Endpoint::Tmux {
+        session: session_slot,
+        window: window_slot,
+        ..
+    } = &mut *endpoint
+    {
+        *session_slot = Some(session);
+        *window_slot = (!window.is_empty()).then_some(window);
+    }
 }
 
 #[cfg(unix)]
@@ -588,12 +899,14 @@ async fn send_line(_path: &Path, _line: &[u8]) -> std::io::Result<()> {
 #[derive(Clone)]
 struct WatchedSession {
     session: Session,
+    runtime: Arc<AgentRuntime>,
+    title: watch::Receiver<String>,
     context: FrameContext,
 }
 
 struct MoshiInner {
     socket_path: PathBuf,
-    endpoint: Endpoint,
+    endpoint: RwLock<Endpoint>,
     target: watch::Sender<Option<WatchedSession>>,
     cancellation: CancellationToken,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -632,7 +945,7 @@ impl MoshiReporter {
         Self {
             inner: Arc::new(MoshiInner {
                 socket_path,
-                endpoint,
+                endpoint: RwLock::new(endpoint),
                 target: watch::channel(None).0,
                 cancellation: CancellationToken::new(),
                 worker: Mutex::new(None),
@@ -641,12 +954,16 @@ impl MoshiReporter {
     }
 
     /// Report the session now shown in the terminal. Repeated calls move
-    /// reporting to the newly visible session without restarting the worker.
-    pub async fn start(&self, session: Session) {
+    /// reporting to the newly visible session and its terminal-title receiver
+    /// without restarting the worker.
+    pub async fn start(&self, runtime: Arc<AgentRuntime>, title: watch::Receiver<String>) {
+        let session = runtime.session().clone();
         let spec = session.spec().await;
         let watched = WatchedSession {
             context: FrameContext::new(session.id(), &spec),
             session,
+            runtime,
+            title,
         };
         // `send_replace` stores the target even before the worker subscribes;
         // `send` would drop it when no receiver exists yet.
@@ -669,27 +986,27 @@ impl MoshiReporter {
     }
 }
 
+/// The worker's per-session observation state, swapped wholesale on attach.
+#[derive(Default)]
+struct WatchState {
+    watched: Option<WatchedSession>,
+    events: Option<broadcast::Receiver<SessionUpdate>>,
+    titles: Option<watch::Receiver<String>>,
+    session_title: Option<String>,
+    turn: TurnState,
+    announced: bool,
+}
+
 async fn run(inner: Arc<MoshiInner>) {
     let mut targets = inner.target.subscribe();
-    let mut watched: Option<WatchedSession> = None;
-    let mut events: Option<broadcast::Receiver<SessionUpdate>> = None;
-    let mut turn = TurnState::default();
-    let mut announced = false;
+    let mut state = WatchState::default();
     let mut reported: Vec<FrameContext> = Vec::new();
     let mut last_tool_send: Option<Instant> = None;
+    let mut last_progress_send: Option<Instant> = None;
     let mut backoff_until: Option<Instant> = None;
 
     let initial = targets.borrow_and_update().clone();
-    attach(
-        &inner,
-        &mut watched,
-        &mut events,
-        &mut turn,
-        &mut announced,
-        initial,
-        &mut backoff_until,
-    )
-    .await;
+    attach(&inner, &mut state, initial, &mut backoff_until).await;
     loop {
         tokio::select! {
             () = inner.cancellation.cancelled() => break,
@@ -698,78 +1015,147 @@ async fn run(inner: Arc<MoshiInner>) {
                     break;
                 }
                 let target = targets.borrow_and_update().clone();
-                attach(
-                    &inner,
-                    &mut watched,
-                    &mut events,
-                    &mut turn,
-                    &mut announced,
-                    target,
-                    &mut backoff_until,
-                )
-                .await;
+                attach(&inner, &mut state, target, &mut backoff_until).await;
             }
-            update = next_update(&mut events) => {
-                let kind = match update {
-                    Ok(SessionUpdate::Persisted(event)) => event.kind,
-                    Ok(SessionUpdate::Transient(kind)) => kind,
+            title = next_title(&mut state.titles) => {
+                let Ok(title) = title else {
+                    // The interface dropped the sender; stop watching titles
+                    // until the next attach provides a receiver.
+                    state.titles = None;
+                    continue;
+                };
+                if title.is_empty() || state.session_title.as_deref() == Some(title.as_str()) {
+                    continue;
+                }
+                state.session_title = Some(title.clone());
+                let Some(current) = state.watched.as_ref() else {
+                    continue;
+                };
+                // Before the row exists the first announce carries the
+                // title; afterwards the refresh must be published — the
+                // daemon drops category-less frames — so it rides a
+                // session_started frame.
+                if !state.announced {
+                    continue;
+                }
+                let facts = FrameFacts {
+                    session_title: Some(title.clone()),
+                    context_remaining: context_remaining(&current.runtime).await,
+                };
+                let endpoint = inner.endpoint.read().expect("endpoint lock poisoned").clone();
+                let frame = frame_for(
+                    &MoshiAction::TitleUpdated {
+                        title,
+                        prompt: state.turn.prompt.clone(),
+                    },
+                    &current.context,
+                    &endpoint,
+                    &facts,
+                    Utc::now(),
+                );
+                deliver(&inner, frame, &mut backoff_until).await;
+            }
+            update = next_update(&mut state.events) => {
+                let (kind, persisted) = match update {
+                    Ok(SessionUpdate::Persisted(event)) => (event.kind, true),
+                    Ok(SessionUpdate::Transient(kind)) => (kind, false),
                     // Notifications are lossy: skipped events only delay the
                     // next inbox-row refresh.
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => {
-                        events = None;
+                        state.events = None;
                         continue;
                     }
                 };
-                let Some(current) = watched.as_mut() else {
+                let Some(current) = state.watched.as_mut() else {
                     continue;
                 };
                 if let EventKind::AgentSpecUpdated { spec, .. } = &kind {
                     current.context = FrameContext::new(&current.context.session_id.clone(), spec);
                 }
-                let Some(notice) = observe(&kind, &mut turn) else {
+                let Some(notice) = observe(&kind, persisted, &mut state.turn) else {
                     continue;
                 };
                 let finished = matches!(notice, Notice::Finished);
-                let actions = project(notice, &turn, &mut announced);
+                let actions = project(notice, &state.turn, &mut state.announced);
                 if finished {
-                    turn.snippet = None;
-                    turn.error = None;
-                    turn.failed = false;
+                    state.turn.snippet = None;
+                    state.turn.error = None;
+                    state.turn.failed = false;
                 }
                 for action in actions {
+                    // TODO: moshi-hook never publishes category-less
+                    // progress frames and explicitly suppresses tool
+                    // progress ("daemon: suppressed tool progress event"),
+                    // so sending these is pure socket noise. Drop them at
+                    // the gate until the daemon grows a silent row-update
+                    // channel; the projection above stays intact, so
+                    // re-enabling means deleting this gate.
+                    if matches!(
+                        action,
+                        MoshiAction::Progress { .. }
+                            | MoshiAction::ToolRunning { .. }
+                            | MoshiAction::ToolFinished { .. }
+                    ) {
+                        continue;
+                    }
                     if matches!(action, MoshiAction::SessionStarted { .. }) {
                         remember_reported(&mut reported, &current.context);
                     }
-                    let tool_event = matches!(
-                        action,
-                        MoshiAction::ToolRunning { .. } | MoshiAction::ToolFinished { .. }
-                    );
-                    if tool_event && last_tool_send.is_some_and(|at| at.elapsed() < TOOL_THROTTLE)
-                    {
-                        continue;
+                    // Tool and streaming frames throttle in separate windows,
+                    // so a tool call right after a text burst still lands.
+                    let window = match &action {
+                        MoshiAction::ToolRunning { .. } | MoshiAction::ToolFinished { .. } => {
+                            Some(&mut last_tool_send)
+                        }
+                        MoshiAction::Progress { .. } => Some(&mut last_progress_send),
+                        _ => None,
+                    };
+                    if let Some(window) = window {
+                        if window.is_some_and(|at| at.elapsed() < PROGRESS_THROTTLE) {
+                            continue;
+                        }
+                        *window = Some(Instant::now());
                     }
-                    if tool_event {
-                        last_tool_send = Some(Instant::now());
-                    }
-                    let frame = frame_for(&action, &current.context, &inner.endpoint, Utc::now());
+                    let facts = FrameFacts {
+                        session_title: state.session_title.clone(),
+                        context_remaining: context_remaining(&current.runtime).await,
+                    };
+                    let endpoint =
+                        inner.endpoint.read().expect("endpoint lock poisoned").clone();
+                    let frame =
+                        frame_for(&action, &current.context, &endpoint, &facts, Utc::now());
                     deliver(&inner, frame, &mut backoff_until).await;
                 }
             }
         }
     }
-    let visible_id = watched
+    let visible_id = state
+        .watched
         .as_ref()
         .map(|current| current.context.session_id.clone());
-    drop(watched);
+    drop(state.watched);
     // Close every announced row, not only the visible one. A session switch
     // leaves the previous conversation alive, so it is not closed until the
     // process exits. A backoff must not swallow these frames.
     for context in close_order(reported, visible_id.as_deref()) {
+        let facts = FrameFacts {
+            session_title: state
+                .session_title
+                .clone()
+                .filter(|_| visible_id.as_deref() == Some(context.session_id.as_str())),
+            context_remaining: None,
+        };
+        let endpoint = inner
+            .endpoint
+            .read()
+            .expect("endpoint lock poisoned")
+            .clone();
         let frame = frame_for(
             &MoshiAction::SessionClosed,
             &context,
-            &inner.endpoint,
+            &endpoint,
+            &facts,
             Utc::now(),
         );
         let mut no_backoff = None;
@@ -807,33 +1193,49 @@ fn close_order(mut reported: Vec<FrameContext>, visible_id: Option<&str>) -> Vec
 /// was already in the log.
 async fn attach(
     inner: &MoshiInner,
-    watched: &mut Option<WatchedSession>,
-    events: &mut Option<broadcast::Receiver<SessionUpdate>>,
-    turn: &mut TurnState,
-    announced: &mut bool,
+    state: &mut WatchState,
     target: Option<WatchedSession>,
     backoff_until: &mut Option<Instant>,
 ) {
-    *watched = target;
-    *events = watched.as_ref().map(|watched| watched.session.subscribe());
-    *turn = TurnState::default();
-    *announced = false;
-    let Some(current) = watched.as_ref() else {
+    resolve_tmux_names(inner).await;
+    state.titles = target.as_ref().map(|watched| watched.title.clone());
+    state.session_title = state.titles.as_mut().and_then(|receiver| {
+        let title = receiver.borrow_and_update().clone();
+        (!title.is_empty()).then_some(title)
+    });
+    state.events = target.as_ref().map(|watched| watched.session.subscribe());
+    state.turn = TurnState::default();
+    state.announced = false;
+    state.watched = target;
+    let Some(current) = state.watched.as_ref() else {
         return;
     };
-    if inner.endpoint.has_pane() {
+    let endpoint = inner
+        .endpoint
+        .read()
+        .expect("endpoint lock poisoned")
+        .clone();
+    if endpoint.has_pane() {
         let frame = frame_for(
             &MoshiAction::Bind,
             &current.context,
-            &inner.endpoint,
+            &endpoint,
+            &FrameFacts::default(),
             Utc::now(),
         );
         deliver(inner, frame, backoff_until).await;
     }
+    let facts = FrameFacts {
+        session_title: state.session_title.clone(),
+        context_remaining: context_remaining(&current.runtime).await,
+    };
     let frame = frame_for(
-        &MoshiAction::State,
+        &MoshiAction::State {
+            title: state.session_title.clone(),
+        },
         &current.context,
-        &inner.endpoint,
+        &endpoint,
+        &facts,
         Utc::now(),
     );
     deliver(inner, frame, backoff_until).await;
@@ -846,6 +1248,20 @@ async fn next_update(
 ) -> Result<SessionUpdate, broadcast::error::RecvError> {
     match events.as_mut() {
         Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Receive the next generated session title, pending forever while no
+/// session is watched so the select arm stays inert.
+async fn next_title(
+    titles: &mut Option<watch::Receiver<String>>,
+) -> Result<String, watch::error::RecvError> {
+    match titles.as_mut() {
+        Some(receiver) => {
+            receiver.changed().await?;
+            Ok(receiver.borrow_and_update().clone())
+        }
         None => std::future::pending().await,
     }
 }
@@ -875,9 +1291,17 @@ async fn deliver(inner: &MoshiInner, frame: MoshiFrame, backoff_until: &mut Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::catalog::ModelLimits;
     use crate::catalog::ThinkingLevel;
     #[cfg(unix)]
+    use crate::plugin::ModelToolRegistry;
+    #[cfg(unix)]
+    use crate::protocol::ProtocolRegistry;
+    #[cfg(unix)]
     use crate::session::SessionContext;
+    #[cfg(unix)]
+    use crate::task::TaskManager;
 
     fn value_at(values: &[(&str, &str)], key: &str) -> Option<String> {
         values
@@ -955,7 +1379,25 @@ mod tests {
         assert_eq!(
             Endpoint::from_lookup(&|key| value_at(&tmux, key)),
             Endpoint::Tmux {
-                pane: "%7".to_string()
+                pane: "%7".to_string(),
+                session: None,
+                window: None,
+                socket: None,
+            }
+        );
+
+        // The socket path is TMUX's first comma-separated field.
+        let tmux_socket = [
+            ("TMUX_PANE", "%7"),
+            ("TMUX", "/tmp/tmux-1000/default,4035,0"),
+        ];
+        assert_eq!(
+            Endpoint::from_lookup(&|key| value_at(&tmux_socket, key)),
+            Endpoint::Tmux {
+                pane: "%7".to_string(),
+                session: None,
+                window: None,
+                socket: Some("/tmp/tmux-1000/default".to_string()),
             }
         );
 
@@ -996,7 +1438,10 @@ mod tests {
         assert_eq!(
             Endpoint::from_lookup(&|key| value_at(&incomplete, key)),
             Endpoint::Tmux {
-                pane: "%7".to_string()
+                pane: "%7".to_string(),
+                session: None,
+                window: None,
+                socket: None,
             }
         );
     }
@@ -1010,6 +1455,7 @@ mod tests {
                 &EventKind::User {
                     text: "hi".to_string()
                 },
+                true,
                 &mut turn
             )
             .is_some()
@@ -1026,33 +1472,85 @@ mod tests {
             &EventKind::User {
                 text: "again".to_string(),
             },
+            true,
             &mut turn,
         );
         assert_eq!(
             project(Notice::Prompt, &turn, &mut announced),
             vec![MoshiAction::PromptSubmitted {
-                prompt: "again".to_string(),
-                title: None,
+                prompt: "again".to_string()
             }]
         );
-        assert!(
+        // Streaming deltas move only the rolling tail; the completed block
+        // owns the excerpt a settled turn quotes.
+        assert_eq!(
+            observe(
+                &EventKind::AssistantText {
+                    text: "working ".to_string()
+                },
+                false,
+                &mut turn
+            ),
+            Some(Notice::Progress(Status::Writing))
+        );
+        assert_eq!(turn.activity, "working ");
+        assert_eq!(turn.snippet, None);
+        assert_eq!(
             observe(
                 &EventKind::AssistantText {
                     text: "working on it".to_string()
                 },
+                true,
                 &mut turn
-            )
-            .is_none()
+            ),
+            Some(Notice::Progress(Status::Writing))
         );
-        assert_eq!(turn.last_title.as_deref(), Some("working on it"));
+        assert_eq!(turn.snippet.as_deref(), Some("working on it"));
+        assert_eq!(
+            project(Notice::Progress(Status::Writing), &turn, &mut announced),
+            vec![MoshiAction::Progress {
+                status: Status::Writing,
+                detail: Some("working on it".to_string())
+            }]
+        );
+        // Reasoning reports its own status; a retry carries its numbers.
+        assert_eq!(
+            observe(
+                &EventKind::AssistantReasoning {
+                    text: "hmm".to_string()
+                },
+                false,
+                &mut turn
+            ),
+            Some(Notice::Progress(Status::Reasoning))
+        );
+        assert_eq!(
+            observe(
+                &EventKind::ModelRetry {
+                    attempt: 2,
+                    max_retries: 5,
+                    delay_ms: 1000,
+                    reason: "rate limited".to_string()
+                },
+                false,
+                &mut turn
+            ),
+            Some(Notice::Progress(Status::Retrying {
+                attempt: 2,
+                max_retries: 5,
+                reason: "rate limited".to_string()
+            }))
+        );
+        // A tool call clears the tail so its arguments own the body.
         assert_eq!(
             project(
                 observe(
                     &EventKind::ToolCall {
                         call_id: "c1".to_string(),
                         name: "bash".to_string(),
-                        arguments: serde_json::json!({})
+                        arguments: serde_json::json!({ "command": "ls" })
                     },
+                    true,
                     &mut turn
                 )
                 .unwrap(),
@@ -1060,8 +1558,23 @@ mod tests {
                 &mut announced
             ),
             vec![MoshiAction::ToolRunning {
-                tool: "bash".to_string()
+                tool: "bash".to_string(),
+                detail: Some("{\"command\":\"ls\"}".to_string())
             }]
+        );
+        assert!(turn.activity.is_empty());
+        // An argument-less call leaves the body to the previous frame.
+        assert_eq!(
+            observe(
+                &EventKind::ToolCall {
+                    call_id: "c2".to_string(),
+                    name: "tasks".to_string(),
+                    arguments: serde_json::json!({})
+                },
+                true,
+                &mut turn
+            ),
+            Some(Notice::ToolStarted("tasks".to_string(), None))
         );
         assert_eq!(
             project(
@@ -1073,6 +1586,7 @@ mod tests {
                         failed: false,
                         protocol_help_required: false
                     },
+                    true,
                     &mut turn
                 )
                 .unwrap(),
@@ -1080,13 +1594,12 @@ mod tests {
                 &mut announced
             ),
             vec![MoshiAction::ToolFinished {
-                tool: "bash".to_string(),
-                failed: false
+                tool: "bash".to_string()
             }]
         );
         assert_eq!(
             project(
-                observe(&EventKind::TurnFinished, &mut turn).unwrap(),
+                observe(&EventKind::TurnFinished, true, &mut turn).unwrap(),
                 &turn,
                 &mut announced
             ),
@@ -1105,7 +1618,7 @@ mod tests {
         turn.failed = false;
         assert_eq!(
             project(
-                observe(&EventKind::TurnFinished, &mut turn).unwrap(),
+                observe(&EventKind::TurnFinished, true, &mut turn).unwrap(),
                 &turn,
                 &mut announced
             ),
@@ -1126,13 +1639,14 @@ mod tests {
                 &EventKind::Error {
                     text: "boom".to_string()
                 },
+                true,
                 &mut turn
             )
             .is_none()
         );
         assert_eq!(
             project(
-                observe(&EventKind::TurnFinished, &mut turn).unwrap(),
+                observe(&EventKind::TurnFinished, true, &mut turn).unwrap(),
                 &turn,
                 &mut announced
             ),
@@ -1150,8 +1664,12 @@ mod tests {
         let context = context_fixture();
         let endpoint = Endpoint::Tmux {
             pane: "%7".to_string(),
+            session: Some("main".to_string()),
+            window: Some("3".to_string()),
+            socket: Some("/tmp/tmux-1000/default".to_string()),
         };
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let facts = FrameFacts::default();
 
         let started = serde_json::to_value(frame_for(
             &MoshiAction::SessionStarted {
@@ -1159,12 +1677,12 @@ mod tests {
             },
             &context,
             &endpoint,
+            &facts,
             now,
         ))
         .unwrap();
         assert_eq!(started["type"], "session.update");
-        assert_eq!(started["source"], "opencode");
-        assert_eq!(started["source"], "opencode");
+        assert_eq!(started["source"], "pi");
         assert_eq!(started["sessionId"], "sess-1");
         assert_eq!(started["eventName"], "SessionStart");
         assert_eq!(started["category"], "session_started");
@@ -1175,8 +1693,19 @@ mod tests {
         assert_eq!(started["modelName"], "test-model");
         assert_eq!(started["terminalKind"], "tmux");
         assert_eq!(started["tmuxPane"], "%7");
+        assert_eq!(started["tmuxSession"], "main");
+        assert_eq!(started["tmuxWindow"], "3");
+        assert_eq!(started["tmuxSocket"], "/tmp/tmux-1000/default");
+        assert_eq!(started["subtitle"], "Thinking");
+        assert!(started.get("contextRemaining").is_none());
         assert_eq!(started["requestedAt"], "2023-11-14T22:13:20Z");
 
+        // Worker facts: the generated title owns the headline, and updates
+        // carry the remaining context percentage.
+        let facts = FrameFacts {
+            session_title: Some("Fix parser recovery".to_string()),
+            context_remaining: Some(87),
+        };
         let completed = serde_json::to_value(frame_for(
             &MoshiAction::TaskComplete {
                 failed: true,
@@ -1186,13 +1715,35 @@ mod tests {
             },
             &context,
             &endpoint,
+            &facts,
             now,
         ))
         .unwrap();
         assert_eq!(completed["eventName"], "Stop");
         assert_eq!(completed["category"], "task_complete");
-        assert_eq!(completed["title"], "Turn failed");
-        assert_eq!(completed["message"], "boom");
+        assert_eq!(completed["title"], "Fix parser recovery");
+        assert_eq!(completed["subtitle"], "Turn failed");
+        assert_eq!(completed["message"], "Turn failed\nboom");
+        assert_eq!(completed["contextRemaining"], 87);
+
+        // A settled turn reports the bare status and quotes the final reply,
+        // not the prompt.
+        let completed_success = serde_json::to_value(frame_for(
+            &MoshiAction::TaskComplete {
+                failed: false,
+                snippet: Some("the fix is in".to_string()),
+                prompt: Some("do the thing".to_string()),
+                error: None,
+            },
+            &context,
+            &endpoint,
+            &facts,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(completed_success["title"], "Fix parser recovery");
+        assert_eq!(completed_success["subtitle"], "Task Done");
+        assert_eq!(completed_success["message"], "Task Done\nthe fix is in");
 
         let completed_without_prompt = serde_json::to_value(frame_for(
             &MoshiAction::TaskComplete {
@@ -1203,58 +1754,202 @@ mod tests {
             },
             &context,
             &endpoint,
+            &FrameFacts::default(),
             now,
         ))
         .unwrap();
         assert_eq!(completed_without_prompt["title"], "all done");
-        assert_eq!(completed_without_prompt["message"], "all done");
+        assert_eq!(completed_without_prompt["message"], "Task Done\nall done");
+        assert_eq!(completed_without_prompt["subtitle"], "Task Done");
 
         let refreshed = serde_json::to_value(frame_for(
             &MoshiAction::PromptSubmitted {
                 prompt: "do the next thing".to_string(),
-                title: Some("all done".to_string()),
             },
             &context,
             &endpoint,
+            &facts,
             now,
         ))
         .unwrap();
         assert_eq!(refreshed["eventName"], "UserPromptSubmit");
         assert_eq!(refreshed["category"], "session_started");
-        assert_eq!(refreshed["title"], "all done");
+        assert_eq!(refreshed["title"], "Fix parser recovery");
+        assert_eq!(refreshed["subtitle"], "Thinking");
         assert_eq!(refreshed["message"], "do the next thing");
+
+        // Live progress is a silent state frame: the status rides the
+        // subtitle and the rolling output tail the body.
+        let progress = serde_json::to_value(frame_for(
+            &MoshiAction::Progress {
+                status: Status::Writing,
+                detail: Some("streaming along".to_string()),
+            },
+            &context,
+            &endpoint,
+            &facts,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(progress["type"], "session.update");
+        assert!(progress.get("category").is_none());
+        assert!(progress.get("title").is_none());
+        assert_eq!(progress["subtitle"], "Writing");
+        assert_eq!(progress["message"], "streaming along");
+        assert_eq!(progress["contextRemaining"], 87);
+
+        let retrying = serde_json::to_value(frame_for(
+            &MoshiAction::Progress {
+                status: Status::Retrying {
+                    attempt: 2,
+                    max_retries: 5,
+                    reason: "rate limited".to_string(),
+                },
+                detail: Some("rate limited".to_string()),
+            },
+            &context,
+            &endpoint,
+            &FrameFacts::default(),
+            now,
+        ))
+        .unwrap();
+        assert_eq!(retrying["subtitle"], "Retrying 2/5");
+        assert_eq!(retrying["message"], "rate limited");
 
         let tool = serde_json::to_value(frame_for(
             &MoshiAction::ToolRunning {
                 tool: "bash".to_string(),
+                detail: Some("{\"command\":\"cargo test\"}".to_string()),
             },
             &context,
             &endpoint,
+            &FrameFacts::default(),
             now,
         ))
         .unwrap();
         assert_eq!(tool["eventName"], "PreToolUse");
         assert_eq!(tool["category"], "tool_running");
-        assert_eq!(tool["title"], "Running bash");
+        // Tool frames carry no title, so they never clobber the row title;
+        // the status rides the subtitle and the arguments the body.
+        assert!(tool.get("title").is_none());
+        assert_eq!(tool["subtitle"], "Running bash");
+        assert_eq!(tool["message"], "{\"command\":\"cargo test\"}");
         assert_eq!(tool["toolName"], "bash");
+
+        let tool_finished = serde_json::to_value(frame_for(
+            &MoshiAction::ToolFinished {
+                tool: "bash".to_string(),
+            },
+            &context,
+            &endpoint,
+            &FrameFacts::default(),
+            now,
+        ))
+        .unwrap();
+        // A finished call returns the subtitle to thinking and leaves the
+        // body on the call's detail.
+        assert_eq!(tool_finished["subtitle"], "Thinking");
+        assert!(tool_finished.get("message").is_none());
 
         let closed = serde_json::to_value(frame_for(
             &MoshiAction::SessionClosed,
             &context,
             &Endpoint::None,
+            &facts,
             now,
         ))
         .unwrap();
         assert_eq!(closed["type"], "session.closed");
         assert_eq!(closed["eventName"], "SessionEnd");
         assert_eq!(closed["category"], "session_ended");
-        assert_eq!(closed["title"], "Session ended");
+        assert_eq!(closed["title"], "Fix parser recovery");
+        // Bind and close frames stay without the context fill.
+        assert!(closed.get("contextRemaining").is_none());
         assert!(closed.get("terminalKind").is_none());
 
-        let bind =
-            serde_json::to_value(frame_for(&MoshiAction::Bind, &context, &endpoint, now)).unwrap();
+        let closed_without_title = serde_json::to_value(frame_for(
+            &MoshiAction::SessionClosed,
+            &context,
+            &Endpoint::None,
+            &FrameFacts::default(),
+            now,
+        ))
+        .unwrap();
+        assert_eq!(closed_without_title["title"], "Session ended");
+
+        let bind = serde_json::to_value(frame_for(
+            &MoshiAction::Bind,
+            &context,
+            &endpoint,
+            &FrameFacts::default(),
+            now,
+        ))
+        .unwrap();
         assert_eq!(bind["type"], "session.bind");
         assert!(bind["agentPid"].is_u64());
+
+        // A category-less state frame refreshes the row title silently.
+        let state = serde_json::to_value(frame_for(
+            &MoshiAction::State {
+                title: Some("Fix parser recovery".to_string()),
+            },
+            &context,
+            &endpoint,
+            &facts,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(state["type"], "session.update");
+        assert!(state.get("category").is_none());
+        assert_eq!(state["title"], "Fix parser recovery");
+        assert_eq!(state["contextRemaining"], 87);
+
+        // The generated title refreshes the row through a published frame:
+        // a borrowed chat.message event name under the session_started
+        // category, with the prompt keeping the body non-empty.
+        let title_update = serde_json::to_value(frame_for(
+            &MoshiAction::TitleUpdated {
+                title: "Fix parser recovery".to_string(),
+                prompt: Some("do the thing".to_string()),
+            },
+            &context,
+            &endpoint,
+            &facts,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(title_update["type"], "session.update");
+        assert_eq!(title_update["eventName"], "chat.message");
+        assert_eq!(title_update["category"], "session_started");
+        assert_eq!(title_update["title"], "Fix parser recovery");
+        assert_eq!(title_update["message"], "do the thing");
+        // No subtitle: the refresh says nothing about the turn.
+        assert!(title_update.get("subtitle").is_none());
+        assert_eq!(title_update["contextRemaining"], 87);
+
+        // Before any prompt the title itself keeps the body non-empty.
+        let title_without_prompt = serde_json::to_value(frame_for(
+            &MoshiAction::TitleUpdated {
+                title: "Fix parser recovery".to_string(),
+                prompt: None,
+            },
+            &context,
+            &endpoint,
+            &facts,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(title_without_prompt["message"], "Fix parser recovery");
+    }
+
+    #[test]
+    fn remaining_context_mirrors_the_daemon_hooks() {
+        assert_eq!(remaining_percent(0, 1000), None);
+        assert_eq!(remaining_percent(100, 0), None);
+        assert_eq!(remaining_percent(500, 1000), Some(50));
+        assert_eq!(remaining_percent(1, 1000), Some(100));
+        assert_eq!(remaining_percent(1000, 1000), Some(1));
+        assert_eq!(remaining_percent(1500, 1000), Some(1));
     }
 
     #[test]
@@ -1262,6 +1957,18 @@ mod tests {
         let long = "中".repeat(TITLE_MAX + 10);
         assert_eq!(truncate(&long, TITLE_MAX).chars().count(), TITLE_MAX);
         assert_eq!(truncate("  padded  ", TITLE_MAX), "padded");
+    }
+
+    #[test]
+    fn tail_keeps_the_latest_characters() {
+        assert_eq!(tail("short", 10), "short");
+        assert_eq!(tail("abcdefgh", 3), "fgh");
+        let mut buffer = String::from("ab");
+        push_tail(&mut buffer, "cdef", 4);
+        assert_eq!(buffer, "cdef");
+        // Multi-byte characters stay whole.
+        push_tail(&mut buffer, "中", 4);
+        assert_eq!(buffer, "def中");
     }
 
     #[test]
@@ -1315,6 +2022,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn runtime_fixture(database: &Path, cwd: &Path, id: &str) -> Arc<AgentRuntime> {
+        let session = session_fixture(database, cwd, id).await;
+        let output = Arc::new(
+            crate::output::OutputStore::new(id, 32 * 1024)
+                .await
+                .unwrap(),
+        );
+        Arc::new(AgentRuntime::new(
+            None,
+            Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
+            Arc::new(ModelToolRegistry::new()),
+            session,
+            "system".to_string(),
+            ModelLimits::default(),
+        ))
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn reporter_streams_lifecycle_frames_to_the_daemon_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1351,15 +2076,20 @@ mod tests {
 
         let cwd = temp.path().join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let session = session_fixture(&temp.path().join("sessions.db"), &cwd, "sess-1").await;
+        let runtime = runtime_fixture(&temp.path().join("sessions.db"), &cwd, "sess-1").await;
+        let session = runtime.session().clone();
 
         let reporter = MoshiReporter::from_parts(
             socket.clone(),
             Endpoint::Tmux {
                 pane: "%7".to_string(),
+                session: None,
+                window: None,
+                socket: None,
             },
         );
-        reporter.start(session.clone()).await;
+        let (_title_sender, title_receiver) = watch::channel(String::new());
+        reporter.start(runtime.clone(), title_receiver).await;
 
         // The attach frames prove the worker subscribed to the session, so
         // later appends cannot race the subscription. Attach itself is not a push.
@@ -1380,6 +2110,7 @@ mod tests {
             .unwrap();
         let frames = wait_for_frames(&received, 3).await;
         assert_eq!(frames[2]["category"], "session_started");
+        assert_eq!(frames[2]["subtitle"], "Thinking");
         assert_eq!(frames[2]["message"], "ship it");
 
         session
@@ -1408,20 +2139,140 @@ mod tests {
             .unwrap();
         session.append(EventKind::TurnFinished).await.unwrap();
 
-        let frames = wait_for_frames(&received, 5).await;
-        assert_eq!(frames[3]["category"], "tool_running");
-        assert_eq!(frames[3]["toolName"], "bash");
-        // The tool result landed inside the throttle window and was dropped.
-        assert_eq!(frames[4]["category"], "task_complete");
-        assert_eq!(frames[4]["eventName"], "Stop");
-        assert_eq!(frames[4]["title"], "all done");
-        assert_eq!(frames[4]["message"], "ship it");
+        // Progress and tool frames are projected but dropped at the send
+        // gate — the daemon never publishes them — so the completion is
+        // the frame right after the prompt announce.
+        let frames = wait_for_frames(&received, 4).await;
+        assert_eq!(frames[3]["category"], "task_complete");
+        assert_eq!(frames[3]["eventName"], "Stop");
+        assert_eq!(frames[3]["title"], "all done");
+        // The completion reports the bare status and quotes the final
+        // reply, not the prompt.
+        assert_eq!(frames[3]["subtitle"], "Task Done");
+        assert_eq!(frames[3]["message"], "Task Done\nall done");
 
         reporter.shutdown().await;
-        let frames = wait_for_frames(&received, 6).await;
-        assert_eq!(frames[5]["type"], "session.closed");
-        assert_eq!(frames[5]["category"], "session_ended");
-        assert_eq!(frames[5]["sessionId"], "sess-1");
+        let frames = wait_for_frames(&received, 5).await;
+        assert_eq!(frames[4]["type"], "session.closed");
+        assert_eq!(frames[4]["category"], "session_ended");
+        assert_eq!(frames[4]["sessionId"], "sess-1");
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_title_and_context_remaining_ride_later_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("moshi-hook.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let received = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let server_received = received.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut line = Vec::new();
+                let mut byte = [0_u8; 1];
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                            line.push(byte[0]);
+                        }
+                    }
+                }
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) {
+                    server_received.lock().await.push(value);
+                }
+                let _ = stream.write_all(b"{\"type\":\"ack\"}\n").await;
+            }
+        });
+
+        let cwd = temp.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let runtime = runtime_fixture(&temp.path().join("sessions.db"), &cwd, "sess-1").await;
+        runtime
+            .set_backend(
+                None,
+                Some(ModelLimits {
+                    context_window: 1_000,
+                    ..ModelLimits::default()
+                }),
+            )
+            .await;
+        runtime.refresh_context_estimate().await;
+        let expected_remaining = remaining_percent(runtime.context_usage().tokens, 1_000).unwrap();
+        let session = runtime.session().clone();
+
+        let reporter = MoshiReporter::from_parts(socket.clone(), Endpoint::None);
+        let (title_sender, title_receiver) = watch::channel(String::new());
+        reporter.start(runtime.clone(), title_receiver).await;
+
+        // The attach state frame already carries the context fill.
+        let frames = wait_for_frames(&received, 1).await;
+        assert_eq!(frames[0]["type"], "session.update");
+        assert!(frames[0].get("category").is_none());
+        assert!(frames[0].get("title").is_none());
+        assert_eq!(frames[0]["contextRemaining"], expected_remaining);
+
+        session
+            .append(EventKind::User {
+                text: "ship it".to_string(),
+            })
+            .await
+            .unwrap();
+        let frames = wait_for_frames(&received, 2).await;
+        assert_eq!(frames[1]["category"], "session_started");
+        // No generated title yet: the fallback title announces the session.
+        assert_eq!(frames[1]["title"], "Session started");
+        assert_eq!(frames[1]["subtitle"], "Thinking");
+        assert_eq!(frames[1]["contextRemaining"], expected_remaining);
+
+        // The generated title arrives asynchronously and refreshes the row.
+        // A category-less refresh would be dropped by the daemon, so the
+        // title rides a published session_started frame instead, with the
+        // prompt keeping the body non-empty.
+        title_sender
+            .send("Fix parser recovery".to_string())
+            .unwrap();
+        let frames = wait_for_frames(&received, 3).await;
+        assert_eq!(frames[2]["type"], "session.update");
+        assert_eq!(frames[2]["eventName"], "chat.message");
+        assert_eq!(frames[2]["category"], "session_started");
+        assert_eq!(frames[2]["title"], "Fix parser recovery");
+        assert_eq!(frames[2]["message"], "ship it");
+        assert_eq!(frames[2]["contextRemaining"], expected_remaining);
+
+        session
+            .append(EventKind::AssistantText {
+                text: "all done".to_string(),
+            })
+            .await
+            .unwrap();
+        session.append(EventKind::TurnFinished).await.unwrap();
+        let frames = wait_for_frames(&received, 4).await;
+        // The streaming progress frame is dropped at the send gate, so the
+        // completion is the next published frame.
+        assert_eq!(frames[3]["category"], "task_complete");
+        assert_eq!(frames[3]["title"], "Fix parser recovery");
+        assert_eq!(frames[3]["contextRemaining"], expected_remaining);
+        // The completion reports the bare status and quotes the final
+        // reply, not the prompt.
+        assert_eq!(frames[3]["subtitle"], "Task Done");
+        assert_eq!(frames[3]["message"], "Task Done\nall done");
+
+        reporter.shutdown().await;
+        let frames = wait_for_frames(&received, 5).await;
+        assert_eq!(frames[4]["type"], "session.closed");
+        assert_eq!(frames[4]["title"], "Fix parser recovery");
+        // Close frames stay without the context fill.
+        assert!(frames[4].get("contextRemaining").is_none());
         server.abort();
     }
 
@@ -1432,13 +2283,15 @@ mod tests {
         let cwd = temp.path().join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
         let database = temp.path().join("sessions.db");
-        let first = session_fixture(&database, &cwd, "first-session").await;
-        let second = session_fixture(&database, &cwd, "second-session").await;
+        let first = runtime_fixture(&database, &cwd, "first-session").await;
+        let second = runtime_fixture(&database, &cwd, "second-session").await;
 
         // A socket path with no listener keeps every delivery a silent no-op.
         let reporter = MoshiReporter::from_parts(temp.path().join("missing.sock"), Endpoint::None);
-        reporter.start(first).await;
-        reporter.start(second.clone()).await;
+        let (_first_title, first_receiver) = watch::channel(String::new());
+        let (_second_title, second_receiver) = watch::channel(String::new());
+        reporter.start(first, first_receiver).await;
+        reporter.start(second.clone(), second_receiver).await;
         assert!(reporter.inner.worker.lock().await.is_some());
 
         tokio::time::timeout(Duration::from_secs(2), reporter.shutdown())
