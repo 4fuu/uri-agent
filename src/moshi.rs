@@ -3,9 +3,10 @@
 //! [Moshi](https://getmoshi.app/) is a mobile terminal app whose `moshi-hook`
 //! daemon collects coding-agent lifecycle events over a local Unix socket
 //! carrying newline-delimited JSON. When a daemon socket resolves, the
-//! reporter forwards the visible session's
-//! lifecycle — session start, turn completion, and throttled tool activity —
-//! so Moshi can keep its inbox row and push notifications current. Reporting
+//! reporter forwards the visible session's lifecycle so Moshi can keep its
+//! inbox row and push notifications current. Session observation, the
+//! moshi-hook envelope, and the socket transport stay separate: a daemon
+//! quirk belongs in the envelope builder, not in the turn watcher. Reporting
 //! is on by default and disabled with `URI_AGENT_MOSHI=0`. Only Unix
 //! processes resolve a socket — WSL qualifies as Linux, while native Windows
 //! never probes or reports. Session switches
@@ -25,8 +26,11 @@ use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Agent identity Moshi shows on inbox rows and notifications.
-const SOURCE: &str = "uri-agent";
+/// Wire identity on the Moshi event API. That API rejects `uri-agent` and
+/// only accepts a fixed agent list. OpenCode is the unused allowlisted
+/// identity: the daemon only rewrites a few of its own titles, and `Stop`
+/// is special-cased only for `source: "codex"`.
+const SOURCE: &str = "opencode";
 /// Tool activity fires many times per turn; one frame per window keeps the
 /// inbox row fresh without flooding the daemon, which applies its own
 /// five-second push throttle as well.
@@ -41,6 +45,17 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 /// Moshi renders at most 80 characters of an event title and 200 of its body;
 /// stay inside both bounds so nothing is cut off on the server.
 const TITLE_MAX: usize = 80;
+/// Moshi's notification body bound. The prompt goes here so a title rewrite
+/// still leaves the inbox row with something to show.
+const MESSAGE_MAX: usize = 200;
+/// Lifecycle names from the documented moshi-hook envelope. They are not a
+/// source identity: `Stop` is only special-cased for `source: "codex"`.
+const EVENT_SESSION_START: &str = "SessionStart";
+const EVENT_USER_PROMPT: &str = "UserPromptSubmit";
+const EVENT_STOP: &str = "Stop";
+const EVENT_SESSION_END: &str = "SessionEnd";
+const EVENT_PRE_TOOL: &str = "PreToolUse";
+const EVENT_POST_TOOL: &str = "PostToolUse";
 
 /// The multiplexer pane the process runs in, when it advertises one. Moshi
 /// uses the pane to attribute the session to the right terminal.
@@ -57,6 +72,9 @@ enum Endpoint {
     },
     Herdr {
         pane: String,
+        session: Option<String>,
+        workspace_id: Option<String>,
+        tab_id: Option<String>,
     },
 }
 
@@ -68,7 +86,12 @@ impl Endpoint {
         if lookup("HERDR_ENV").as_deref() == Some("1")
             && let Some(pane) = present(lookup("HERDR_PANE_ID"))
         {
-            return Self::Herdr { pane };
+            return Self::Herdr {
+                pane,
+                session: present(lookup("HERDR_SESSION")),
+                workspace_id: present(lookup("HERDR_WORKSPACE_ID")),
+                tab_id: present(lookup("HERDR_TAB_ID")),
+            };
         }
         if present(lookup("ZELLIJ")).is_some() {
             return Self::Zellij {
@@ -86,25 +109,49 @@ impl Endpoint {
         !matches!(self, Self::None)
     }
 
-    #[allow(clippy::type_complexity)]
-    fn fields(
-        &self,
-    ) -> (
-        Option<&'static str>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
+    fn fields(&self) -> TerminalFields {
         match self {
-            Self::None => (None, None, None, None, None),
-            Self::Tmux { pane } => (Some("tmux"), Some(pane.clone()), None, None, None),
-            Self::Zellij { session, pane } => {
-                (Some("zellij"), None, session.clone(), pane.clone(), None)
-            }
-            Self::Herdr { pane } => (Some("herdr"), None, None, None, Some(pane.clone())),
+            Self::None => TerminalFields::default(),
+            Self::Tmux { pane } => TerminalFields {
+                kind: Some("tmux"),
+                tmux_pane: Some(pane.clone()),
+                ..TerminalFields::default()
+            },
+            Self::Zellij { session, pane } => TerminalFields {
+                kind: Some("zellij"),
+                zellij_session: session.clone(),
+                zellij_pane: pane.clone(),
+                ..TerminalFields::default()
+            },
+            Self::Herdr {
+                pane,
+                session,
+                workspace_id,
+                tab_id,
+            } => TerminalFields {
+                kind: Some("herdr"),
+                herdr_pane: Some(pane.clone()),
+                herdr_session: session.clone(),
+                herdr_workspace_id: workspace_id.clone(),
+                herdr_tab_id: tab_id.clone(),
+                ..TerminalFields::default()
+            },
         }
     }
+}
+
+/// Terminal identity copied onto every frame. Empty when the process is not
+/// inside a multiplexer pane.
+#[derive(Clone, Debug, Default)]
+struct TerminalFields {
+    kind: Option<&'static str>,
+    tmux_pane: Option<String>,
+    zellij_session: Option<String>,
+    zellij_pane: Option<String>,
+    herdr_pane: Option<String>,
+    herdr_session: Option<String>,
+    herdr_workspace_id: Option<String>,
+    herdr_tab_id: Option<String>,
 }
 
 /// Static per-session fields every frame carries.
@@ -134,15 +181,27 @@ impl FrameContext {
     }
 }
 
-/// What one session event should tell Moshi, before serialization.
+/// What the watcher asks the envelope builder to send. This is still URI
+/// Agent's view of a lifecycle fact; field names live only in `frame_for`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MoshiAction {
     /// Attach the terminal pane to the session; never published as a push.
     Bind,
-    SessionStarted,
+    /// Category-less attach. The daemon treats it as state, not an inbox push.
+    State,
+    SessionStarted {
+        prompt: Option<String>,
+    },
+    /// A later prompt. Refreshes the open row without announcing a new session.
+    PromptSubmitted {
+        prompt: String,
+        title: Option<String>,
+    },
     TaskComplete {
         failed: bool,
         snippet: Option<String>,
+        prompt: Option<String>,
+        error: Option<String>,
     },
     ToolRunning {
         tool: String,
@@ -154,35 +213,108 @@ enum MoshiAction {
     SessionClosed,
 }
 
-/// Per-turn reporting state: the latest assistant text becomes the completion
-/// title, and any error flips the completion to failed.
+/// Facts observed from the session, before any moshi-hook category is chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Notice {
+    Prompt,
+    Finished,
+    ToolStarted(String),
+    ToolFinished { tool: String, failed: bool },
+}
+
+/// Per-turn reporting state. The prompt is the notification body; the latest
+/// assistant text is the title. An error flips the completion to failed and
+/// becomes the body, so the phone shows why the turn stopped.
 #[derive(Default)]
 struct TurnState {
+    prompt: Option<String>,
     snippet: Option<String>,
+    /// Kept across completion so a later prompt can refresh the row without
+    /// resetting its title to "Session started".
+    last_title: Option<String>,
+    error: Option<String>,
     failed: bool,
 }
 
-fn map_event(kind: &EventKind, turn: &mut TurnState) -> Option<MoshiAction> {
+fn observe(kind: &EventKind, turn: &mut TurnState) -> Option<Notice> {
     match kind {
+        EventKind::User { text } => {
+            let prompt = truncate(text, MESSAGE_MAX);
+            if prompt.is_empty() {
+                return None;
+            }
+            turn.prompt = Some(prompt);
+            turn.snippet = None;
+            turn.error = None;
+            turn.failed = false;
+            Some(Notice::Prompt)
+        }
         EventKind::AssistantText { text } => {
-            turn.snippet = Some(truncate(text, TITLE_MAX));
+            let snippet = truncate(text, TITLE_MAX);
+            if !snippet.is_empty() {
+                turn.last_title = Some(snippet.clone());
+                turn.snippet = Some(snippet);
+            }
             None
         }
-        EventKind::Error { .. } => {
+        EventKind::Error { text } => {
             turn.failed = true;
+            let error = truncate(text, MESSAGE_MAX);
+            if !error.is_empty() {
+                turn.error = Some(error);
+            }
             None
         }
-        EventKind::TurnFinished => Some(MoshiAction::TaskComplete {
-            failed: std::mem::take(&mut turn.failed),
-            snippet: turn.snippet.take(),
-        }),
-        EventKind::ToolCall { name, .. } => Some(MoshiAction::ToolRunning { tool: name.clone() }),
-        EventKind::ToolResult { name, failed, .. } => Some(MoshiAction::ToolFinished {
+        EventKind::TurnFinished => Some(Notice::Finished),
+        EventKind::ToolCall { name, .. } => Some(Notice::ToolStarted(name.clone())),
+        EventKind::ToolResult { name, failed, .. } => Some(Notice::ToolFinished {
             tool: name.clone(),
             failed: *failed,
         }),
         _ => None,
     }
+}
+
+/// Turn a session notice into zero or more reports. The first real activity
+/// announces the session. Later prompts refresh the open row; they do not
+/// announce again.
+fn project(notice: Notice, turn: &TurnState, announced: &mut bool) -> Vec<MoshiAction> {
+    let mut actions = Vec::new();
+    let first = !*announced
+        && matches!(
+            notice,
+            Notice::Prompt
+                | Notice::Finished
+                | Notice::ToolStarted(_)
+                | Notice::ToolFinished { .. }
+        );
+    if first {
+        *announced = true;
+        actions.push(MoshiAction::SessionStarted {
+            prompt: turn.prompt.clone(),
+        });
+    }
+    match notice {
+        Notice::Prompt => {
+            if !first && let Some(prompt) = turn.prompt.clone() {
+                actions.push(MoshiAction::PromptSubmitted {
+                    prompt,
+                    title: turn.last_title.clone(),
+                });
+            }
+        }
+        Notice::Finished => actions.push(MoshiAction::TaskComplete {
+            failed: turn.failed,
+            snippet: turn.snippet.clone(),
+            prompt: turn.prompt.clone(),
+            error: turn.error.clone(),
+        }),
+        Notice::ToolStarted(tool) => actions.push(MoshiAction::ToolRunning { tool }),
+        Notice::ToolFinished { tool, failed } => {
+            actions.push(MoshiAction::ToolFinished { tool, failed })
+        }
+    }
+    actions
 }
 
 /// One newline-delimited JSON frame on the daemon socket. Optional fields
@@ -196,6 +328,8 @@ struct MoshiFrame {
     session_id: String,
     #[serde(rename = "requestedAt")]
     requested_at: String,
+    #[serde(rename = "eventName", skip_serializing_if = "Option::is_none")]
+    event_name: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,18 +356,134 @@ struct MoshiFrame {
     zellij_pane: Option<String>,
     #[serde(rename = "herdrPane", skip_serializing_if = "Option::is_none")]
     herdr_pane: Option<String>,
+    #[serde(rename = "herdrSession", skip_serializing_if = "Option::is_none")]
+    herdr_session: Option<String>,
+    #[serde(rename = "herdrWorkspaceId", skip_serializing_if = "Option::is_none")]
+    herdr_workspace_id: Option<String>,
+    #[serde(rename = "herdrTabId", skip_serializing_if = "Option::is_none")]
+    herdr_tab_id: Option<String>,
 }
 
-/// The action-specific fields of a frame: message type, inbox category,
-/// title, body, tool name, and the binding process ID.
-type FrameParts = (
-    &'static str,
-    Option<&'static str>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<u32>,
-);
+/// Wire fields that depend on the lifecycle fact. Terminal and session
+/// fields are filled around this, so the adapter can change without the
+/// watcher learning moshi-hook names.
+struct WireParts {
+    kind: &'static str,
+    event_name: Option<&'static str>,
+    category: Option<&'static str>,
+    title: Option<String>,
+    message: Option<String>,
+    tool_name: Option<String>,
+    agent_pid: Option<u32>,
+}
+
+fn wire_parts(action: &MoshiAction) -> WireParts {
+    match action {
+        MoshiAction::Bind => WireParts {
+            kind: "session.bind",
+            event_name: None,
+            category: None,
+            title: None,
+            message: None,
+            tool_name: None,
+            agent_pid: Some(std::process::id()),
+        },
+        MoshiAction::State => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_SESSION_START),
+            category: None,
+            title: None,
+            message: None,
+            tool_name: None,
+            agent_pid: None,
+        },
+        MoshiAction::SessionStarted { prompt } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_SESSION_START),
+            category: Some("session_started"),
+            title: Some("Session started".to_string()),
+            message: prompt.clone(),
+            tool_name: None,
+            agent_pid: None,
+        },
+        MoshiAction::PromptSubmitted { prompt, title } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_USER_PROMPT),
+            category: Some("session_started"),
+            title: Some(
+                title
+                    .clone()
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| "Working".to_string()),
+            ),
+            message: Some(prompt.clone()),
+            tool_name: None,
+            agent_pid: None,
+        },
+        MoshiAction::TaskComplete {
+            failed,
+            snippet,
+            prompt,
+            error,
+        } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_STOP),
+            category: Some("task_complete"),
+            title: Some(if *failed {
+                "Turn failed".to_string()
+            } else {
+                snippet
+                    .clone()
+                    .unwrap_or_else(|| "Turn complete".to_string())
+            }),
+            // eventName keeps the title above. The body is the prompt, or the
+            // error when the turn failed. A missing prompt still leaves the
+            // assistant snippet, in case a daemon replaces the title.
+            message: if *failed {
+                error
+                    .clone()
+                    .or_else(|| prompt.clone())
+                    .or_else(|| snippet.clone())
+            } else {
+                prompt.clone().or_else(|| snippet.clone())
+            },
+            tool_name: None,
+            agent_pid: None,
+        },
+        MoshiAction::ToolRunning { tool } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_PRE_TOOL),
+            category: Some("tool_running"),
+            title: Some(format!("Running {tool}")),
+            message: None,
+            tool_name: Some(tool.clone()),
+            agent_pid: None,
+        },
+        MoshiAction::ToolFinished { tool, failed } => WireParts {
+            kind: "session.update",
+            event_name: Some(EVENT_POST_TOOL),
+            category: Some("tool_finished"),
+            title: Some(if *failed {
+                format!("{tool} failed")
+            } else {
+                format!("{tool} finished")
+            }),
+            message: None,
+            tool_name: Some(tool.clone()),
+            agent_pid: None,
+        },
+        MoshiAction::SessionClosed => WireParts {
+            kind: "session.closed",
+            event_name: Some(EVENT_SESSION_END),
+            // An empty category is a silent state carrier and is not published.
+            category: Some("session_ended"),
+            title: Some("Session ended".to_string()),
+            message: None,
+            tool_name: None,
+            agent_pid: None,
+        },
+    }
+}
 
 fn frame_for(
     action: &MoshiAction,
@@ -241,90 +491,30 @@ fn frame_for(
     endpoint: &Endpoint,
     now: DateTime<Utc>,
 ) -> MoshiFrame {
-    let (kind, category, title, message, tool_name, agent_pid): FrameParts = match action {
-        MoshiAction::Bind => (
-            "session.bind",
-            None,
-            None,
-            None,
-            None,
-            Some(std::process::id()),
-        ),
-        MoshiAction::SessionStarted => (
-            "session.update",
-            Some("session_started"),
-            Some("Session started".to_string()),
-            None,
-            None,
-            None,
-        ),
-        MoshiAction::TaskComplete {
-            failed: true,
-            snippet,
-        } => (
-            "session.update",
-            Some("task_complete"),
-            Some("Turn failed".to_string()),
-            snippet.clone(),
-            None,
-            None,
-        ),
-        MoshiAction::TaskComplete {
-            failed: false,
-            snippet,
-        } => (
-            "session.update",
-            Some("task_complete"),
-            Some(
-                snippet
-                    .clone()
-                    .unwrap_or_else(|| "Turn complete".to_string()),
-            ),
-            None,
-            None,
-            None,
-        ),
-        MoshiAction::ToolRunning { tool } => (
-            "session.update",
-            Some("tool_running"),
-            Some(format!("Running {tool}")),
-            None,
-            Some(tool.clone()),
-            None,
-        ),
-        MoshiAction::ToolFinished { tool, failed } => (
-            "session.update",
-            Some("tool_finished"),
-            Some(if *failed {
-                format!("{tool} failed")
-            } else {
-                format!("{tool} finished")
-            }),
-            None,
-            Some(tool.clone()),
-            None,
-        ),
-        MoshiAction::SessionClosed => ("session.closed", None, None, None, None, None),
-    };
-    let (terminal_kind, tmux_pane, zellij_session, zellij_pane, herdr_pane) = endpoint.fields();
+    let parts = wire_parts(action);
+    let terminal = endpoint.fields();
     MoshiFrame {
-        kind,
+        kind: parts.kind,
         source: SOURCE,
         session_id: context.session_id.clone(),
         requested_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
-        category,
-        title,
-        message,
-        tool_name,
+        event_name: parts.event_name,
+        category: parts.category,
+        title: parts.title,
+        message: parts.message,
+        tool_name: parts.tool_name,
         model_name: (!context.model.is_empty()).then(|| context.model.clone()),
         cwd: Some(context.cwd.clone()),
         project_name: Some(context.project.clone()),
-        agent_pid,
-        terminal_kind,
-        tmux_pane,
-        zellij_session,
-        zellij_pane,
-        herdr_pane,
+        agent_pid: parts.agent_pid,
+        terminal_kind: terminal.kind,
+        tmux_pane: terminal.tmux_pane,
+        zellij_session: terminal.zellij_session,
+        zellij_pane: terminal.zellij_pane,
+        herdr_pane: terminal.herdr_pane,
+        herdr_session: terminal.herdr_session,
+        herdr_workspace_id: terminal.herdr_workspace_id,
+        herdr_tab_id: terminal.herdr_tab_id,
     }
 }
 
@@ -376,7 +566,10 @@ async fn send_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::UnixStream::connect(path).await?;
     stream.write_all(line).await?;
-    stream.shutdown().await?;
+    // The line is delivered. Half-close so the daemon can finish its one
+    // exchange, but a peer that already closed — or an ack that never arrives —
+    // must not look like a failed send and swallow the next frames.
+    let _ = stream.shutdown().await;
     let mut buffer = [0_u8; 256];
     let _ = tokio::time::timeout(ACK_TIMEOUT, stream.read(&mut buffer)).await;
     Ok(())
@@ -481,6 +674,8 @@ async fn run(inner: Arc<MoshiInner>) {
     let mut watched: Option<WatchedSession> = None;
     let mut events: Option<broadcast::Receiver<SessionUpdate>> = None;
     let mut turn = TurnState::default();
+    let mut announced = false;
+    let mut reported: Vec<FrameContext> = Vec::new();
     let mut last_tool_send: Option<Instant> = None;
     let mut backoff_until: Option<Instant> = None;
 
@@ -490,6 +685,7 @@ async fn run(inner: Arc<MoshiInner>) {
         &mut watched,
         &mut events,
         &mut turn,
+        &mut announced,
         initial,
         &mut backoff_until,
     )
@@ -502,8 +698,16 @@ async fn run(inner: Arc<MoshiInner>) {
                     break;
                 }
                 let target = targets.borrow_and_update().clone();
-                attach(&inner, &mut watched, &mut events, &mut turn, target, &mut backoff_until)
-                    .await;
+                attach(
+                    &inner,
+                    &mut watched,
+                    &mut events,
+                    &mut turn,
+                    &mut announced,
+                    target,
+                    &mut backoff_until,
+                )
+                .await;
             }
             update = next_update(&mut events) => {
                 let kind = match update {
@@ -523,50 +727,97 @@ async fn run(inner: Arc<MoshiInner>) {
                 if let EventKind::AgentSpecUpdated { spec, .. } = &kind {
                     current.context = FrameContext::new(&current.context.session_id.clone(), spec);
                 }
-                let Some(action) = map_event(&kind, &mut turn) else {
+                let Some(notice) = observe(&kind, &mut turn) else {
                     continue;
                 };
-                let tool_event = matches!(
-                    action,
-                    MoshiAction::ToolRunning { .. } | MoshiAction::ToolFinished { .. }
-                );
-                if tool_event && last_tool_send.is_some_and(|at| at.elapsed() < TOOL_THROTTLE) {
-                    continue;
+                let finished = matches!(notice, Notice::Finished);
+                let actions = project(notice, &turn, &mut announced);
+                if finished {
+                    turn.snippet = None;
+                    turn.error = None;
+                    turn.failed = false;
                 }
-                if tool_event {
-                    last_tool_send = Some(Instant::now());
+                for action in actions {
+                    if matches!(action, MoshiAction::SessionStarted { .. }) {
+                        remember_reported(&mut reported, &current.context);
+                    }
+                    let tool_event = matches!(
+                        action,
+                        MoshiAction::ToolRunning { .. } | MoshiAction::ToolFinished { .. }
+                    );
+                    if tool_event && last_tool_send.is_some_and(|at| at.elapsed() < TOOL_THROTTLE)
+                    {
+                        continue;
+                    }
+                    if tool_event {
+                        last_tool_send = Some(Instant::now());
+                    }
+                    let frame = frame_for(&action, &current.context, &inner.endpoint, Utc::now());
+                    deliver(&inner, frame, &mut backoff_until).await;
                 }
-                let frame = frame_for(&action, &current.context, &inner.endpoint, Utc::now());
-                deliver(&inner, frame, &mut backoff_until).await;
             }
         }
     }
-    if let Some(current) = watched.take() {
+    let visible_id = watched
+        .as_ref()
+        .map(|current| current.context.session_id.clone());
+    drop(watched);
+    // Close every announced row, not only the visible one. A session switch
+    // leaves the previous conversation alive, so it is not closed until the
+    // process exits. A backoff must not swallow these frames.
+    for context in close_order(reported, visible_id.as_deref()) {
         let frame = frame_for(
             &MoshiAction::SessionClosed,
-            &current.context,
+            &context,
             &inner.endpoint,
             Utc::now(),
         );
-        // A backoff from an earlier failure must not swallow the close frame.
         let mut no_backoff = None;
         deliver(&inner, frame, &mut no_backoff).await;
     }
 }
 
-/// Swap the watched session and announce it: bind the terminal pane first so
-/// the daemon attributes it to this session, then open the inbox row.
+/// Remember a session whose inbox row was opened. Repeating an id refreshes
+/// the frame fields used when that row is closed.
+fn remember_reported(reported: &mut Vec<FrameContext>, context: &FrameContext) {
+    if let Some(existing) = reported
+        .iter_mut()
+        .find(|row| row.session_id == context.session_id)
+    {
+        *existing = context.clone();
+        return;
+    }
+    reported.push(context.clone());
+}
+
+/// Announced rows to close, with the visible session last.
+fn close_order(mut reported: Vec<FrameContext>, visible_id: Option<&str>) -> Vec<FrameContext> {
+    if let Some(visible_id) = visible_id
+        && let Some(index) = reported.iter().position(|row| row.session_id == visible_id)
+    {
+        let visible = reported.remove(index);
+        reported.push(visible);
+    }
+    reported
+}
+
+/// Swap the watched session. Bind the pane, then send a category-less
+/// update so the daemon can remember the terminal without pushing. The inbox
+/// row opens on the first prompt, or on the first completion if that prompt
+/// was already in the log.
 async fn attach(
     inner: &MoshiInner,
     watched: &mut Option<WatchedSession>,
     events: &mut Option<broadcast::Receiver<SessionUpdate>>,
     turn: &mut TurnState,
+    announced: &mut bool,
     target: Option<WatchedSession>,
     backoff_until: &mut Option<Instant>,
 ) {
     *watched = target;
     *events = watched.as_ref().map(|watched| watched.session.subscribe());
     *turn = TurnState::default();
+    *announced = false;
     let Some(current) = watched.as_ref() else {
         return;
     };
@@ -580,7 +831,7 @@ async fn attach(
         deliver(inner, frame, backoff_until).await;
     }
     let frame = frame_for(
-        &MoshiAction::SessionStarted,
+        &MoshiAction::State,
         &current.context,
         &inner.endpoint,
         Utc::now(),
@@ -725,12 +976,18 @@ mod tests {
         let herdr = [
             ("HERDR_ENV", "1"),
             ("HERDR_PANE_ID", "w1:p2"),
+            ("HERDR_SESSION", "work"),
+            ("HERDR_WORKSPACE_ID", "w1"),
+            ("HERDR_TAB_ID", "w1:2"),
             ("TMUX_PANE", "%7"),
         ];
         assert_eq!(
             Endpoint::from_lookup(&|key| value_at(&herdr, key)),
             Endpoint::Herdr {
-                pane: "w1:p2".to_string()
+                pane: "w1:p2".to_string(),
+                session: Some("work".to_string()),
+                workspace_id: Some("w1".to_string()),
+                tab_id: Some("w1:2".to_string()),
             }
         );
 
@@ -747,17 +1004,39 @@ mod tests {
     #[test]
     fn turn_events_map_to_inbox_categories() {
         let mut turn = TurnState::default();
+        let mut announced = false;
         assert!(
-            map_event(
+            observe(
                 &EventKind::User {
                     text: "hi".to_string()
                 },
                 &mut turn
             )
-            .is_none()
+            .is_some()
+        );
+        assert_eq!(
+            project(Notice::Prompt, &turn, &mut announced),
+            vec![MoshiAction::SessionStarted {
+                prompt: Some("hi".to_string())
+            }]
+        );
+        // A later prompt refreshes the body but does not announce again.
+        assert!(announced);
+        observe(
+            &EventKind::User {
+                text: "again".to_string(),
+            },
+            &mut turn,
+        );
+        assert_eq!(
+            project(Notice::Prompt, &turn, &mut announced),
+            vec![MoshiAction::PromptSubmitted {
+                prompt: "again".to_string(),
+                title: None,
+            }]
         );
         assert!(
-            map_event(
+            observe(
                 &EventKind::AssistantText {
                     text: "working on it".to_string()
                 },
@@ -765,53 +1044,85 @@ mod tests {
             )
             .is_none()
         );
+        assert_eq!(turn.last_title.as_deref(), Some("working on it"));
         assert_eq!(
-            map_event(
-                &EventKind::ToolCall {
-                    call_id: "c1".to_string(),
-                    name: "bash".to_string(),
-                    arguments: serde_json::json!({})
-                },
-                &mut turn
+            project(
+                observe(
+                    &EventKind::ToolCall {
+                        call_id: "c1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({})
+                    },
+                    &mut turn
+                )
+                .unwrap(),
+                &turn,
+                &mut announced
             ),
-            Some(MoshiAction::ToolRunning {
+            vec![MoshiAction::ToolRunning {
                 tool: "bash".to_string()
-            })
+            }]
         );
         assert_eq!(
-            map_event(
-                &EventKind::ToolResult {
-                    call_id: "c1".to_string(),
-                    name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    failed: false,
-                    protocol_help_required: false
-                },
-                &mut turn
+            project(
+                observe(
+                    &EventKind::ToolResult {
+                        call_id: "c1".to_string(),
+                        name: "bash".to_string(),
+                        output: "ok".to_string(),
+                        failed: false,
+                        protocol_help_required: false
+                    },
+                    &mut turn
+                )
+                .unwrap(),
+                &turn,
+                &mut announced
             ),
-            Some(MoshiAction::ToolFinished {
+            vec![MoshiAction::ToolFinished {
                 tool: "bash".to_string(),
                 failed: false
-            })
+            }]
         );
         assert_eq!(
-            map_event(&EventKind::TurnFinished, &mut turn),
-            Some(MoshiAction::TaskComplete {
+            project(
+                observe(&EventKind::TurnFinished, &mut turn).unwrap(),
+                &turn,
+                &mut announced
+            ),
+            vec![MoshiAction::TaskComplete {
                 failed: false,
-                snippet: Some("working on it".to_string())
-            })
+                snippet: Some("working on it".to_string()),
+                prompt: Some("again".to_string()),
+                error: None,
+            }]
         );
 
         // The next turn starts clean, and an error flips its completion.
+        // A completion with no prior announce still opens the inbox row.
+        let mut announced = false;
+        turn.snippet = None;
+        turn.failed = false;
         assert_eq!(
-            map_event(&EventKind::TurnFinished, &mut turn),
-            Some(MoshiAction::TaskComplete {
-                failed: false,
-                snippet: None
-            })
+            project(
+                observe(&EventKind::TurnFinished, &mut turn).unwrap(),
+                &turn,
+                &mut announced
+            ),
+            vec![
+                MoshiAction::SessionStarted {
+                    prompt: Some("again".to_string())
+                },
+                MoshiAction::TaskComplete {
+                    failed: false,
+                    snippet: None,
+                    prompt: Some("again".to_string()),
+                    error: None,
+                }
+            ]
         );
         assert!(
-            map_event(
+            observe(
                 &EventKind::Error {
                     text: "boom".to_string()
                 },
@@ -820,11 +1131,17 @@ mod tests {
             .is_none()
         );
         assert_eq!(
-            map_event(&EventKind::TurnFinished, &mut turn),
-            Some(MoshiAction::TaskComplete {
+            project(
+                observe(&EventKind::TurnFinished, &mut turn).unwrap(),
+                &turn,
+                &mut announced
+            ),
+            vec![MoshiAction::TaskComplete {
                 failed: true,
-                snippet: None
-            })
+                snippet: None,
+                prompt: Some("again".to_string()),
+                error: Some("boom".to_string()),
+            }]
         );
     }
 
@@ -837,17 +1154,22 @@ mod tests {
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
 
         let started = serde_json::to_value(frame_for(
-            &MoshiAction::SessionStarted,
+            &MoshiAction::SessionStarted {
+                prompt: Some("hi".to_string()),
+            },
             &context,
             &endpoint,
             now,
         ))
         .unwrap();
         assert_eq!(started["type"], "session.update");
-        assert_eq!(started["source"], "uri-agent");
+        assert_eq!(started["source"], "opencode");
+        assert_eq!(started["source"], "opencode");
         assert_eq!(started["sessionId"], "sess-1");
+        assert_eq!(started["eventName"], "SessionStart");
         assert_eq!(started["category"], "session_started");
         assert_eq!(started["title"], "Session started");
+        assert_eq!(started["message"], "hi");
         assert_eq!(started["cwd"], "/tmp/project");
         assert_eq!(started["projectName"], "project");
         assert_eq!(started["modelName"], "test-model");
@@ -859,15 +1181,48 @@ mod tests {
             &MoshiAction::TaskComplete {
                 failed: true,
                 snippet: Some("partial answer".to_string()),
+                prompt: Some("do the thing".to_string()),
+                error: Some("boom".to_string()),
             },
             &context,
             &endpoint,
             now,
         ))
         .unwrap();
+        assert_eq!(completed["eventName"], "Stop");
         assert_eq!(completed["category"], "task_complete");
         assert_eq!(completed["title"], "Turn failed");
-        assert_eq!(completed["message"], "partial answer");
+        assert_eq!(completed["message"], "boom");
+
+        let completed_without_prompt = serde_json::to_value(frame_for(
+            &MoshiAction::TaskComplete {
+                failed: false,
+                snippet: Some("all done".to_string()),
+                prompt: None,
+                error: None,
+            },
+            &context,
+            &endpoint,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(completed_without_prompt["title"], "all done");
+        assert_eq!(completed_without_prompt["message"], "all done");
+
+        let refreshed = serde_json::to_value(frame_for(
+            &MoshiAction::PromptSubmitted {
+                prompt: "do the next thing".to_string(),
+                title: Some("all done".to_string()),
+            },
+            &context,
+            &endpoint,
+            now,
+        ))
+        .unwrap();
+        assert_eq!(refreshed["eventName"], "UserPromptSubmit");
+        assert_eq!(refreshed["category"], "session_started");
+        assert_eq!(refreshed["title"], "all done");
+        assert_eq!(refreshed["message"], "do the next thing");
 
         let tool = serde_json::to_value(frame_for(
             &MoshiAction::ToolRunning {
@@ -878,6 +1233,7 @@ mod tests {
             now,
         ))
         .unwrap();
+        assert_eq!(tool["eventName"], "PreToolUse");
         assert_eq!(tool["category"], "tool_running");
         assert_eq!(tool["title"], "Running bash");
         assert_eq!(tool["toolName"], "bash");
@@ -890,7 +1246,9 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(closed["type"], "session.closed");
-        assert!(closed.get("category").is_none());
+        assert_eq!(closed["eventName"], "SessionEnd");
+        assert_eq!(closed["category"], "session_ended");
+        assert_eq!(closed["title"], "Session ended");
         assert!(closed.get("terminalKind").is_none());
 
         let bind =
@@ -904,6 +1262,18 @@ mod tests {
         let long = "中".repeat(TITLE_MAX + 10);
         assert_eq!(truncate(&long, TITLE_MAX).chars().count(), TITLE_MAX);
         assert_eq!(truncate("  padded  ", TITLE_MAX), "padded");
+    }
+
+    #[test]
+    fn close_order_ends_the_visible_session_last() {
+        let mut first = context_fixture();
+        first.session_id = "first".to_string();
+        let mut second = context_fixture();
+        second.session_id = "second".to_string();
+        let order = close_order(vec![first, second], Some("first"));
+        assert_eq!(order[0].session_id, "second");
+        assert_eq!(order[1].session_id, "first");
+        assert!(close_order(Vec::new(), Some("missing")).is_empty());
     }
 
     #[cfg(unix)]
@@ -992,13 +1362,25 @@ mod tests {
         reporter.start(session.clone()).await;
 
         // The attach frames prove the worker subscribed to the session, so
-        // later appends cannot race the subscription.
+        // later appends cannot race the subscription. Attach itself is not a push.
         let frames = wait_for_frames(&received, 2).await;
         assert_eq!(frames[0]["type"], "session.bind");
         assert_eq!(frames[0]["tmuxPane"], "%7");
-        assert_eq!(frames[1]["category"], "session_started");
+        assert_eq!(frames[1]["type"], "session.update");
+        assert_eq!(frames[1]["eventName"], "SessionStart");
+        assert!(frames[1].get("category").is_none());
         assert_eq!(frames[1]["sessionId"], "sess-1");
         assert_eq!(frames[1]["modelName"], "test-model");
+
+        session
+            .append(EventKind::User {
+                text: "ship it".to_string(),
+            })
+            .await
+            .unwrap();
+        let frames = wait_for_frames(&received, 3).await;
+        assert_eq!(frames[2]["category"], "session_started");
+        assert_eq!(frames[2]["message"], "ship it");
 
         session
             .append(EventKind::AssistantText {
@@ -1026,17 +1408,20 @@ mod tests {
             .unwrap();
         session.append(EventKind::TurnFinished).await.unwrap();
 
-        let frames = wait_for_frames(&received, 4).await;
-        assert_eq!(frames[2]["category"], "tool_running");
-        assert_eq!(frames[2]["toolName"], "bash");
+        let frames = wait_for_frames(&received, 5).await;
+        assert_eq!(frames[3]["category"], "tool_running");
+        assert_eq!(frames[3]["toolName"], "bash");
         // The tool result landed inside the throttle window and was dropped.
-        assert_eq!(frames[3]["category"], "task_complete");
-        assert_eq!(frames[3]["title"], "all done");
+        assert_eq!(frames[4]["category"], "task_complete");
+        assert_eq!(frames[4]["eventName"], "Stop");
+        assert_eq!(frames[4]["title"], "all done");
+        assert_eq!(frames[4]["message"], "ship it");
 
         reporter.shutdown().await;
-        let frames = wait_for_frames(&received, 5).await;
-        assert_eq!(frames[4]["type"], "session.closed");
-        assert_eq!(frames[4]["sessionId"], "sess-1");
+        let frames = wait_for_frames(&received, 6).await;
+        assert_eq!(frames[5]["type"], "session.closed");
+        assert_eq!(frames[5]["category"], "session_ended");
+        assert_eq!(frames[5]["sessionId"], "sess-1");
         server.abort();
     }
 
