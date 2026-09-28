@@ -9,6 +9,7 @@ pub mod config;
 pub mod herdr;
 pub mod keymap;
 pub mod model;
+pub mod moshi;
 pub mod oauth;
 pub mod output;
 pub mod plugin;

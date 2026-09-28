@@ -110,6 +110,16 @@ A second display source publishes the terminal title the interface applies (the 
 
 Reporting is best effort and never blocks the conversation: a missing or older Herdr only means missing reports. Process exit releases the reporting source so Herdr stops tracking the pane. The integration stays inactive outside Herdr panes, and ACP mode, background resident mode, and depth-2 child Agents never report.
 
+## Moshi reporting
+
+[Moshi](https://getmoshi.app/) is a mobile terminal app whose `moshi-hook` daemon collects coding-agent lifecycle events over a local Unix socket for its inbox, push notifications, and Live Activities. URI Agent speaks that socket protocol directly and reports by default; set `URI_AGENT_MOSHI=0` to disable reporting.
+
+The reporter resolves the daemon socket from `MOSHI_SOCKET_PATH`, then the platform default: `$XDG_RUNTIME_DIR/moshi-hook.sock` on Linux and `<state>/moshi-hook.sock` on macOS, where `<state>` is `MOSHI_STATE_DIR` or `~/Library/Application Support/Moshi`. Reporting is Unix-only: Linux, macOS, and WSL resolve a socket (run `moshi-hook` and URI Agent inside the same WSL distribution), while native Windows never probes or reports. Without a listening daemon the reporter stays inactive, and a daemon that starts later is picked up automatically.
+
+The visible TUI session reports `session_started` when reporting attaches, `task_complete` when a turn settles (failed turns included), and `tool_running`/`tool_finished` throttled to one frame per five seconds. Frames carry the stable session ID, project directory, model, and — inside tmux, Zellij, or Herdr — the terminal pane, which lets Moshi attribute the session to the right terminal. Titles and bodies stay within Moshi's 80/200-character notification bounds. Session switches move reporting and rebind the pane to the newly visible session; process exit sends `session.closed`.
+
+Reporting is best effort and never blocks the conversation: socket failures back off for thirty seconds and drop frames rather than retrying. Like Herdr reporting, ACP mode, background resident mode, and depth-2 child Agents never report.
+
 ## Frozen startup context
 
 Before accepting the first prompt, a session freezes its complete generated

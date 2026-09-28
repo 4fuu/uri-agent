@@ -137,6 +137,7 @@ uri-agent --acpv1
 | 使用项目指令或 Skills | [Startup context and Skills](docs/context.md) |
 | 恢复会话，或了解协作、笔记、上下文滚动与持久化 | [Sessions and context](docs/sessions.md) |
 | 在 Herdr 终端复用器中上报面板状态 | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
+| 通过 moshi-hook 向 Moshi 应用上报会话生命周期 | [Moshi reporting](docs/sessions.md#moshi-reporting) |
 | 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
 [`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和请求体格式以 `help` 工具加载的协议帮助页为准；当前生效的界面说明以 `F1` 和 `:help` 为准。

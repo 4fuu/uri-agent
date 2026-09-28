@@ -5,6 +5,7 @@ use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
 use uri_agent::herdr::HerdrReporter;
 use uri_agent::model::configured_backend;
+use uri_agent::moshi::MoshiReporter;
 use uri_agent::session::{EventKind, SessionChoice};
 use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
 
@@ -27,6 +28,7 @@ async fn main() -> Result<()> {
     }
     let mut terminal = TuiTerminal::new()?;
     let herdr = HerdrReporter::from_env();
+    let moshi = MoshiReporter::from_env();
     let mut detached = Vec::<AgentHandle>::new();
     loop {
         let retained = match &config.session {
@@ -38,9 +40,25 @@ async fn main() -> Result<()> {
         };
         let result = match retained {
             Some(agent) => {
-                run_retained_session(&config, agent, &mut terminal, herdr.as_ref()).await
+                run_retained_session(
+                    &config,
+                    agent,
+                    &mut terminal,
+                    herdr.as_ref(),
+                    moshi.as_ref(),
+                )
+                .await
             }
-            None => run_session(&config, &host, &mut terminal, herdr.as_ref()).await,
+            None => {
+                run_session(
+                    &config,
+                    &host,
+                    &mut terminal,
+                    herdr.as_ref(),
+                    moshi.as_ref(),
+                )
+                .await
+            }
         };
         let (outcome, agent) = match result {
             Ok(result) => result,
@@ -49,6 +67,9 @@ async fn main() -> Result<()> {
                     agent.close().await;
                 }
                 if let Some(reporter) = &herdr {
+                    reporter.shutdown().await;
+                }
+                if let Some(reporter) = &moshi {
                     reporter.shutdown().await;
                 }
                 return Err(error);
@@ -61,6 +82,9 @@ async fn main() -> Result<()> {
                     agent.close().await;
                 }
                 if let Some(reporter) = &herdr {
+                    reporter.shutdown().await;
+                }
+                if let Some(reporter) = &moshi {
                     reporter.shutdown().await;
                 }
                 return Ok(());
@@ -77,6 +101,7 @@ async fn run_session(
     host: &AgentHost,
     terminal: &mut TuiTerminal,
     herdr: Option<&HerdrReporter>,
+    moshi: Option<&MoshiReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
     let initial = config.manager.current().await;
     let requested = match &config.session {
@@ -99,6 +124,11 @@ async fn run_session(
     if let Some(reporter) = herdr {
         reporter
             .start(agent.services().runtime.clone(), title_receiver)
+            .await;
+    }
+    if let Some(reporter) = moshi {
+        reporter
+            .start(agent.services().runtime.session().clone())
             .await;
     }
     let startup_runtime = agent.services().runtime.clone();
@@ -131,8 +161,9 @@ async fn run_retained_session(
     agent: AgentHandle,
     terminal: &mut TuiTerminal,
     herdr: Option<&HerdrReporter>,
+    moshi: Option<&MoshiReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
-    let result = run_retained_session_inner(config, agent.clone(), terminal, herdr).await;
+    let result = run_retained_session_inner(config, agent.clone(), terminal, herdr, moshi).await;
     if result.is_err() {
         agent.close().await;
     }
@@ -144,11 +175,15 @@ async fn run_retained_session_inner(
     agent: AgentHandle,
     terminal: &mut TuiTerminal,
     herdr: Option<&HerdrReporter>,
+    moshi: Option<&MoshiReporter>,
 ) -> Result<(TuiOutcome, AgentHandle)> {
     let runtime = agent.services().runtime.clone();
     let (terminal_title, title_receiver) = tokio::sync::watch::channel(String::new());
     if let Some(reporter) = herdr {
         reporter.start(runtime.clone(), title_receiver).await;
+    }
+    if let Some(reporter) = moshi {
+        reporter.start(runtime.session().clone()).await;
     }
     let session = runtime.session();
     let settings = session.model_settings().await;

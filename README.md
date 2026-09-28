@@ -194,6 +194,7 @@ lifecycle operations, and ownership constraints.
 | Use project instructions or Skills | [Startup context and Skills](docs/context.md) |
 | Resume sessions or understand collaboration, notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
 | Report pane state to the Herdr terminal multiplexer | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
+| Notify the Moshi app of session lifecycle over moshi-hook | [Moshi reporting](docs/sessions.md#moshi-reporting) |
 | Build or audit an extension | [WASM plugins](docs/plugins.md) |
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At
