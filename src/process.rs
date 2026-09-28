@@ -66,9 +66,13 @@ impl ProcessTree {
             if process_group == 0 {
                 return;
             }
-            // SAFETY: a negative PID targets only the process group created for
-            // this child immediately before it was spawned.
+            // SAFETY: the stored ID is the child's PID. setsid() makes that PID
+            // the process-group ID before exec. A negative PID targets that
+            // group; the positive PID covers the window before setsid() runs
+            // and cannot match another live group (a new PID is not an
+            // existing leader).
             let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+            let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
         }
 
         #[cfg(windows)]
@@ -87,9 +91,10 @@ impl ProcessTree {
             if process_group == 0 {
                 return;
             }
-            // SAFETY: a negative PID targets only the process group created for
-            // this child immediately before it was spawned.
+            // SAFETY: see terminate(). The positive PID covers the pre-setsid
+            // window; afterwards it signals the group leader as well.
             let _ = unsafe { libc::kill(-process_group, libc::SIGINT) };
+            let _ = unsafe { libc::kill(process_group, libc::SIGINT) };
         }
 
         #[cfg(not(unix))]
@@ -115,18 +120,26 @@ impl Drop for ProcessTree {
 fn configure_command(command: &mut Command, interruptible: bool) {
     use std::os::unix::process::CommandExt;
 
-    command.as_std_mut().process_group(0);
+    // setsid() creates the process group (pgid == pid) and drops the
+    // controlling terminal. Command::process_group() cannot be combined with
+    // it: that setpgid runs before pre_exec and makes the child a group
+    // leader, so setsid() then fails with EPERM. Without a controlling
+    // terminal, descendants cannot open /dev/tty and paint over the TUI the
+    // way a shared console would on Windows (see CREATE_NO_WINDOW below).
     let max_descriptor = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     let max_descriptor = if max_descriptor > 3 {
         max_descriptor.min(i32::MAX.into()) as i32
     } else {
         1024
     };
-    // SAFETY: process_group, the optional SIGINT reset, and descriptor setup
-    // run in the post-fork child. The closure calls only async-signal-safe
-    // syscalls and does not allocate.
+    // SAFETY: setsid, the optional SIGINT reset, and descriptor setup run in
+    // the post-fork child. The closure calls only async-signal-safe syscalls
+    // and does not allocate.
     unsafe {
         command.as_std_mut().pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
             if interruptible {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
             }
@@ -233,5 +246,59 @@ mod windows_job {
     pub(super) fn terminate(job: &OwnedHandle) {
         let handle: HANDLE = job.as_raw_handle().cast();
         let _ = unsafe { TerminateJobObject(handle, 1) };
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::ProcessTree;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    #[tokio::test]
+    async fn spawned_process_cannot_write_the_controlling_terminal() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("if (echo leak >/dev/tty) 2>/dev/null; then echo OPEN; else echo CLOSED; fi")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, tree) = ProcessTree::spawn(&mut command).unwrap();
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("child timed out")
+            .unwrap();
+        drop(tree);
+        assert!(status.success(), "{status:?}");
+        assert_eq!(stdout.trim(), "CLOSED");
+    }
+
+    #[tokio::test]
+    async fn terminate_kills_the_spawned_group() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (mut child, tree) = ProcessTree::spawn(&mut command).unwrap();
+        tree.terminate();
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("child timed out")
+            .unwrap();
+        assert!(!status.success(), "expected the group to be killed, got {status:?}");
     }
 }
