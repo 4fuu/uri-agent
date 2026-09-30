@@ -1,7 +1,7 @@
 use super::antigravity::AntigravityTransport;
 use super::codex_websocket::CodexWebSocketTransport;
 use super::failure::{ModelFailure, ModelFailurePhase};
-use super::request_transform::ModelRequestTransform;
+use super::request_transform::{ModelRequestTransform, ToolSchemas};
 use super::{ModelBackend, ModelDelta, ModelRequest, ModelResponse, clamp_thinking_level};
 use crate::catalog::{CatalogModel, ModelLimits, ThinkingLevel};
 use crate::config::{ActiveSettings, AuthKind, ConfigManager, resolve_config_value};
@@ -152,6 +152,7 @@ pub(crate) struct RigBackend {
     pub(super) provider: String,
     pub(super) limits: ModelLimits,
     pub(super) accepts_images: bool,
+    pub(super) tool_schemas: ToolSchemas,
 }
 
 #[derive(Default)]
@@ -362,6 +363,7 @@ impl RigBackend {
                 )
             })
             .transpose()?;
+        let tool_schemas = ToolSchemas::default();
         let request_client = AuthClient {
             inner: if model.provider == "muse-code" {
                 reqwest::Client::builder()
@@ -375,6 +377,7 @@ impl RigBackend {
                 model: model.clone(),
                 thinking,
                 session_id: session_id.map(str::to_string),
+                tool_schemas: tool_schemas.clone(),
             }),
             codex_websocket: (model.api == "openai-codex-responses")
                 .then(|| CodexWebSocketTransport::new(session_id.zip(codex_account_id.as_deref()))),
@@ -446,6 +449,7 @@ impl RigBackend {
                             model: model.clone(),
                             thinking,
                             session_id: session_id.map(str::to_string),
+                            tool_schemas: tool_schemas.clone(),
                         }),
                         codex_websocket: None,
                         antigravity: None,
@@ -477,6 +481,7 @@ impl RigBackend {
             provider: model.provider.clone(),
             limits,
             accepts_images: model.accepts_input("image"),
+            tool_schemas,
         })
     }
 }
@@ -560,6 +565,11 @@ impl ModelBackend for RigBackend {
             RigClient::OpenAiCompletions(_) | RigClient::OpenRouter(_)
         ) {
             request.history = openai_chat_compatible_history(request.history);
+        }
+        // The Google path rewrites each function declaration to carry the
+        // tool's original schema; publish it before the request is serialized.
+        if matches!(self.client, RigClient::Gemini(_)) {
+            self.tool_schemas.publish(&request.tools);
         }
         let mut response = match &self.client {
             RigClient::OpenAiResponses(model) => {

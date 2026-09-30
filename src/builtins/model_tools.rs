@@ -1,19 +1,19 @@
 use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
 use crate::prompts;
-use crate::protocol::{ProtocolRegistry, RequestHeader};
+use crate::protocol::{ProtocolRegistry, split_address};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
 
-const BEGIN_LINE: &str = "*** Begin Request";
-const END_LINE: &str = "*** End Request";
-const BODY_LINE: &str = "*** Body:";
-const MAX_REQUESTS: usize = 8;
-const RESERVED_HEADER_NAMES: [&str; 5] = ["read", "exec", "begin", "end", "body"];
-const CORRECT_FORM: &str = "*** Begin Request\n*** Read: <protocol>://<target>\n<optional body lines; omit this line when there is no body>\n*** End Request";
+pub(crate) const MAX_STEPS: usize = 8;
+pub(crate) const MAX_OPERATIONS: usize = 64;
+pub(crate) const MAX_FOR_ELEMENTS: usize = 32;
 
-#[derive(Clone, Copy, Debug)]
+const STEP_SHAPE_EXAMPLE: &str = r#"{"read": "file://src/main.rs"}"#;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ProtocolOperation {
     Read,
     Exec,
@@ -24,7 +24,20 @@ struct ProtocolTool;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProtocolArguments {
-    requests: Vec<String>,
+    steps: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepArgument {
+    read: Option<String>,
+    exec: Option<String>,
+    input: Option<Map<String, Value>>,
+    id: Option<String>,
+    r#if: Option<String>,
+    r#for: Option<String>,
+    max: Option<i64>,
+    show: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -35,174 +48,553 @@ struct HelpArguments {
 
 struct HelpTool;
 
+/// One step after whole-call validation.
 #[derive(Debug)]
-struct ParsedRequest {
+struct ValidatedStep {
     operation: ProtocolOperation,
-    uri: String,
-    headers: Vec<RequestHeader>,
-    body: String,
+    address: String,
+    input: Option<Map<String, Value>>,
+    /// Top-level input fields this step's protocol executes verbatim; their
+    /// values are never substituted.
+    literal_fields: Vec<String>,
+    id: Option<String>,
+    condition: Option<Expr>,
+    loop_spec: Option<LoopSpec>,
+    max: usize,
+    show: Show,
+    /// Root names referenced by this step's `input`, address, and `for`
+    /// source. A reference to a failed or skipped step skips this step.
+    data_refs: Vec<String>,
+    /// True when any later step references this step's `id`; the operation
+    /// then runs pinned in the foreground instead of auto-backgrounding.
+    referenced_later: bool,
 }
 
-/// Parses the fixed protocol request format:
-///
-/// ```text
-/// *** Begin Request
-/// *** Read: <protocol>://<target>
-/// *** name: value
-/// *** Body:
-/// <raw body lines>
-/// *** End Request
-/// ```
-///
-/// After the operation line, a run of `*** name: value` header lines carries
-/// per-protocol options. When any header is present, a `*** Body:` line must
-/// separate the headers from the body; without headers the separator is
-/// optional and simply skipped. The request ends at the last
-/// `*** End Request` line, so the body may itself contain that line. Every
-/// line after the separator (or the operation line) up to the final
-/// `*** End Request` line is the raw body, passed verbatim and never
-/// escaped. The newline that terminates the last body line belongs to the
-/// format, not the body, so a body of exactly one empty line is empty and
-/// one extra empty line ends the body with a newline.
-fn parse_request(request: &str) -> Result<ParsedRequest> {
-    let mut lines = request.split_inclusive('\n');
-    let first = lines.next().unwrap_or_default();
-    if trim_structural(first) != BEGIN_LINE {
-        bail!(
-            "invalid protocol request: the first line must be `{BEGIN_LINE}`; correct form:\n{CORRECT_FORM}"
-        );
-    }
-    let (operation, uri) = parse_operation_line(lines.next().unwrap_or_default())?;
-    let rest: Vec<&str> = lines.collect();
-    let Some(end) = rest
-        .iter()
-        .rposition(|line| trim_structural(line) == END_LINE)
-    else {
-        bail!(
-            "invalid protocol request: missing `{END_LINE}`; append the final marker after the operation line and all body lines; correct form:\n{CORRECT_FORM}"
-        );
-    };
-    if rest[end + 1..]
-        .iter()
-        .any(|line| !trim_structural(line).is_empty())
-    {
-        bail!("invalid protocol request: unexpected text after `{END_LINE}`");
-    }
-    let content = &rest[..end];
-    let mut headers = Vec::new();
-    let mut index = 0;
-    while let Some(line) = content.get(index) {
-        let trimmed = trim_structural(line);
-        if trimmed == BODY_LINE {
-            break;
+#[derive(Debug)]
+struct LoopSpec {
+    variable: String,
+    source: Operand,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Show {
+    All,
+    Errors,
+    None,
+}
+
+impl Show {
+    fn shows_output(self, failed: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::Errors => failed,
+            Self::None => false,
         }
-        let Some(header) = parse_header_line(trimmed)? else {
-            break;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Operand {
+    Reference {
+        root: String,
+        segments: Vec<Segment>,
+    },
+    Literal(Value),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Segment {
+    Field(String),
+    Index(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Comparator {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Debug)]
+struct Expr {
+    negated: bool,
+    left: Operand,
+    comparison: Option<(Comparator, Operand)>,
+}
+
+impl Expr {
+    /// Every reference root the expression can read.
+    fn roots(&self) -> Vec<&str> {
+        let right = self.comparison.as_ref().and_then(|(_, right)| right.root());
+        self.left.root().into_iter().chain(right).collect()
+    }
+}
+
+impl Operand {
+    fn root(&self) -> Option<&str> {
+        match self {
+            Self::Reference { root, .. } => Some(root),
+            Self::Literal(_) => None,
+        }
+    }
+
+    fn eval(&self, values: &HashMap<String, Value>) -> Result<Value> {
+        match self {
+            Self::Literal(value) => Ok(value.clone()),
+            Self::Reference { root, segments } => Ok(resolve_reference(root, segments, values)),
+        }
+    }
+}
+
+fn resolve_reference(root: &str, segments: &[Segment], values: &HashMap<String, Value>) -> Value {
+    let mut value = values.get(root).cloned().unwrap_or(Value::Null);
+    for segment in segments {
+        value = match (segment, &value) {
+            (Segment::Field(name), Value::Object(map)) => {
+                map.get(name).cloned().unwrap_or(Value::Null)
+            }
+            (Segment::Index(index), Value::Array(items)) => {
+                items.get(*index).cloned().unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
         };
-        headers.push(header);
-        index += 1;
     }
-    let body_lines: &[&str] = if headers.is_empty() {
-        // Without headers a leading `*** Body:` line separates an empty
-        // header section and is skipped.
-        if index == 0
-            && content
-                .first()
-                .is_some_and(|line| trim_structural(line) == BODY_LINE)
-        {
-            &content[1..]
+    value
+}
+
+/// Parses the fixed expression grammar `["not"] operand [comparator operand]`.
+fn parse_expression(text: &str) -> Result<Expr> {
+    let mut cursor = Cursor::new(text);
+    let negated = cursor.take_word("not");
+    let left = cursor.parse_operand()?;
+    cursor.skip_whitespace();
+    let comparison = cursor.take_comparator()?;
+    let expr = match comparison {
+        Some(comparator) => {
+            let right = cursor.parse_operand()?;
+            cursor.skip_whitespace();
+            if !cursor.is_empty() {
+                bail!(
+                    "invalid expression {:?}: unexpected text after the comparison; the \
+                     grammar is `[not] operand [comparator operand]`",
+                    text
+                );
+            }
+            Expr {
+                negated,
+                left,
+                comparison: Some((comparator, right)),
+            }
+        }
+        None => {
+            cursor.skip_whitespace();
+            if !cursor.is_empty() {
+                bail!(
+                    "invalid expression {:?}: unexpected text after the operand; the grammar \
+                     is `[not] operand [comparator operand]`",
+                    text
+                );
+            }
+            Expr {
+                negated,
+                left,
+                comparison: None,
+            }
+        }
+    };
+    Ok(expr)
+}
+
+/// Parses one operand: a reference or a JSON literal.
+fn parse_operand_str(text: &str) -> Result<Operand> {
+    let mut cursor = Cursor::new(text);
+    let operand = cursor.parse_operand()?;
+    cursor.skip_whitespace();
+    if !cursor.is_empty() {
+        bail!(
+            "invalid operand {:?}: a reference is `<id>` with `.field` and `[index]` segments; a \
+             literal is a number, a double-quoted string, true, false, or null",
+            text
+        );
+    }
+    Ok(operand)
+}
+
+struct Cursor<'a> {
+    text: &'a str,
+    bytes: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text: text.trim(),
+            bytes: 0,
+        }
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.text[self.bytes.min(self.text.len())..]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rest().trim().is_empty()
+    }
+
+    fn skip_whitespace(&mut self) {
+        let rest = self.rest();
+        let skipped = rest.len() - rest.trim_start().len();
+        self.bytes += skipped;
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.rest().chars().next()
+    }
+
+    /// Consumes the keyword `not` when it starts the expression.
+    fn take_word(&mut self, word: &str) -> bool {
+        self.skip_whitespace();
+        let rest = self.rest();
+        let Some(after) = rest.strip_prefix(word) else {
+            return false;
+        };
+        if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        self.bytes += word.len();
+        true
+    }
+
+    fn take_comparator(&mut self) -> Result<Option<Comparator>> {
+        self.skip_whitespace();
+        let rest = self.rest();
+        for (symbol, comparator) in [
+            ("==", Comparator::Eq),
+            ("!=", Comparator::Ne),
+            ("<=", Comparator::Le),
+            (">=", Comparator::Ge),
+            ("<", Comparator::Lt),
+            (">", Comparator::Gt),
+        ] {
+            if rest.starts_with(symbol) {
+                self.bytes += symbol.len();
+                return Ok(Some(comparator));
+            }
+        }
+        if rest.starts_with('=') {
+            bail!(
+                "invalid comparator: use `==` for equality; the comparators are ==, !=, <, <=, >, \
+                 and >="
+            );
+        }
+        Ok(None)
+    }
+
+    fn parse_operand(&mut self) -> Result<Operand> {
+        self.skip_whitespace();
+        let rest = self.rest();
+        let Some(first) = rest.chars().next() else {
+            bail!(
+                "invalid expression {:?}: an operand is missing; a reference is `<id>` with \
+                 `.field` and `[index]` segments, or a literal number, double-quoted string, \
+                 true, false, or null",
+                self.text
+            );
+        };
+        if first == '"' {
+            return Ok(Operand::Literal(Value::String(
+                self.parse_string_literal()?,
+            )));
+        }
+        if first.is_ascii_digit() || first == '-' {
+            return Ok(Operand::Literal(self.parse_number_literal()?));
+        }
+        if rest.starts_with("true") {
+            self.bytes += 4;
+            return Ok(Operand::Literal(Value::Bool(true)));
+        }
+        if rest.starts_with("false") {
+            self.bytes += 5;
+            return Ok(Operand::Literal(Value::Bool(false)));
+        }
+        if rest.starts_with("null") {
+            self.bytes += 4;
+            return Ok(Operand::Literal(Value::Null));
+        }
+        if first.is_ascii_lowercase() {
+            return self.parse_reference();
+        }
+        bail!(
+            "invalid operand {:?}: references start with a lowercase step `id` or `for` \
+             variable; literals are numbers, double-quoted strings, true, false, and null",
+            self.text
+        );
+    }
+
+    fn parse_string_literal(&mut self) -> Result<String> {
+        let rest = self.rest();
+        let mut literal = String::new();
+        let mut characters = rest.char_indices();
+        let (_, opening) = characters.next().expect("the caller checked the quote");
+        debug_assert_eq!(opening, '"');
+        for (offset, character) in characters {
+            match character {
+                '"' => {
+                    self.bytes += offset + 1;
+                    return Ok(literal);
+                }
+                '\\' => {
+                    let escape = rest[offset + 1..].chars().next().ok_or_else(|| {
+                        anyhow!(
+                            "invalid string literal in {:?}: trailing backslash",
+                            self.text
+                        )
+                    })?;
+                    literal.push(match escape {
+                        '"' => '"',
+                        '\\' => '\\',
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        other => bail!(
+                            "invalid escape `\\{other}` in string literal; supported escapes are \
+                             \\\", \\\\, \\n, \\t, and \\r"
+                        ),
+                    });
+                }
+                other => literal.push(other),
+            }
+        }
+        bail!(
+            "invalid string literal in {:?}: the closing quote is missing",
+            self.text
+        );
+    }
+
+    fn parse_number_literal(&mut self) -> Result<Value> {
+        let rest = self.rest();
+        let end = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+            .map(|(offset, c)| offset + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        let text = &rest[..end];
+        let value =
+            serde_json::from_str(text).map_err(|_| anyhow!("invalid number literal {text:?}"))?;
+        self.bytes += end;
+        Ok(value)
+    }
+
+    fn parse_reference(&mut self) -> Result<Operand> {
+        let rest = self.rest();
+        let root_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let root = &rest[..root_end];
+        if root.is_empty() {
+            bail!("invalid reference in {:?}", self.text);
+        }
+        self.bytes += root_end;
+        let mut segments = Vec::new();
+        loop {
+            match self.peek() {
+                Some('.') => {
+                    self.bytes += 1;
+                    let rest = self.rest();
+                    let end = rest
+                        .find(|c: char| c == '.' || c == '[' || c.is_ascii_whitespace())
+                        .unwrap_or(rest.len());
+                    if end == 0 {
+                        bail!(
+                            "invalid reference in {:?}: a `.` must be followed by a field name",
+                            self.text
+                        );
+                    }
+                    segments.push(Segment::Field(rest[..end].to_string()));
+                    self.bytes += end;
+                }
+                Some('[') => {
+                    self.bytes += 1;
+                    let rest = self.rest();
+                    let Some(end) = rest.find(']') else {
+                        bail!(
+                            "invalid reference in {:?}: a `[` index must end with `]`",
+                            self.text
+                        );
+                    };
+                    let index = rest[..end]
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("invalid index {:?} in reference", &rest[..end]))?;
+                    segments.push(Segment::Index(index));
+                    self.bytes += end + 1;
+                }
+                _ => break,
+            }
+        }
+        Ok(Operand::Reference {
+            root: root.to_string(),
+            segments,
+        })
+    }
+}
+
+fn eval_expression(expr: &Expr, values: &HashMap<String, Value>) -> Result<bool> {
+    let result = match &expr.comparison {
+        None => truthy(&expr.left.eval(values)?)?,
+        Some((comparator, right)) => {
+            compare_operands(*comparator, &expr.left.eval(values)?, &right.eval(values)?)?
+        }
+    };
+    Ok(result != expr.negated)
+}
+
+fn truthy(value: &Value) -> Result<bool> {
+    match value {
+        Value::Bool(flag) => Ok(*flag),
+        Value::Null => Ok(false),
+        other => bail!(
+            "a condition without a comparator must be true, false, or null; {} is not comparable \
+             to nothing",
+            json_type_name(other)
+        ),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        _ => left == right,
+    }
+}
+
+fn compare_operands(comparator: Comparator, left: &Value, right: &Value) -> Result<bool> {
+    match comparator {
+        Comparator::Eq => Ok(values_equal(left, right)),
+        Comparator::Ne => Ok(!values_equal(left, right)),
+        Comparator::Lt | Comparator::Le | Comparator::Gt | Comparator::Ge => {
+            let ordering = match (left, right) {
+                (Value::Number(left), Value::Number(right)) => left
+                    .as_f64()
+                    .partial_cmp(&right.as_f64())
+                    .ok_or_else(|| anyhow!("numbers are not comparable"))?,
+                (Value::String(left), Value::String(right)) => left.cmp(right),
+                _ => bail!(
+                    "ordering comparisons accept two numbers or two strings; got {} and {}",
+                    json_type_name(left),
+                    json_type_name(right)
+                ),
+            };
+            use std::cmp::Ordering::*;
+            Ok(match comparator {
+                Comparator::Lt => ordering == Less,
+                Comparator::Le => ordering != Greater,
+                Comparator::Gt => ordering == Greater,
+                Comparator::Ge => ordering != Less,
+                other => unreachable!("comparator {other:?} is handled above"),
+            })
+        }
+    }
+}
+
+/// A string that is exactly `{{ operand }}` with optional surrounding spaces
+/// inside the braces.
+fn whole_placeholder(text: &str) -> Option<&str> {
+    let trimmed = text.strip_prefix("{{")?.strip_suffix("}}")?;
+    let inner = trimmed.trim();
+    Some(inner)
+}
+
+/// Every `{{ operand }}` span inside an address string.
+fn address_placeholders(text: &str) -> Result<Vec<(usize, usize, String)>> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while let Some(start) = text[offset..].find("{{") {
+        let start = offset + start;
+        let Some(found) = text[start + 2..].find("}}") else {
+            bail!("invalid placeholder in address {text:?}: the closing `}}` is missing");
+        };
+        let close = start + 2 + found;
+        let end = close + 2;
+        spans.push((start, end, text[start + 2..close].trim().to_string()));
+        offset = end;
+    }
+    Ok(spans)
+}
+
+fn substitute_input(
+    input: &Map<String, Value>,
+    values: &HashMap<String, Value>,
+    literal_fields: &[String],
+) -> Result<Map<String, Value>> {
+    let mut substituted = Map::new();
+    for (key, value) in input {
+        if literal_fields.iter().any(|field| field == key) {
+            substituted.insert(key.clone(), value.clone());
         } else {
-            content
-        }
-    } else if content
-        .get(index)
-        .is_some_and(|line| trim_structural(line) == BODY_LINE)
-    {
-        &content[index + 1..]
-    } else if index == content.len() {
-        // Headers running directly into the end line: no body.
-        &[]
-    } else {
-        bail!(
-            "invalid protocol request: the header section must end with a `{BODY_LINE}` line before the body"
-        );
-    };
-    let mut body = String::new();
-    for line in body_lines {
-        body.push_str(line);
-    }
-    // The newline that terminates the last body line belongs to the format,
-    // not to the body. A body of exactly one empty line is therefore empty;
-    // one extra empty line ends the body with a newline.
-    if let Some(stripped) = body.strip_suffix('\n') {
-        body.truncate(stripped.len());
-        if body.ends_with('\r') {
-            body.pop();
+            substituted.insert(key.clone(), substitute_value(value, values)?);
         }
     }
-    Ok(ParsedRequest {
-        operation,
-        uri,
-        headers,
-        body,
-    })
+    Ok(substituted)
 }
 
-/// Parses one `*** name: value` header line. Returns `Ok(None)` when the
-/// line is not header-shaped: no `*** ` prefix, no colon, or whitespace
-/// before the colon.
-fn parse_header_line(line: &str) -> Result<Option<RequestHeader>> {
-    let Some(rest) = line.strip_prefix("*** ") else {
-        return Ok(None);
-    };
-    let Some((name, value)) = rest.split_once(':') else {
-        return Ok(None);
-    };
-    if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return Ok(None);
-    }
-    let mut characters = name.chars();
-    if !characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
-        || !characters.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        bail!(
-            "invalid protocol request: invalid header name `{name}`; header names are ASCII \
-             letters, digits, `-`, and `_`, and start with a letter"
-        );
-    }
-    let normalized = name.to_ascii_lowercase();
-    if RESERVED_HEADER_NAMES.contains(&normalized.as_str()) {
-        bail!(
-            "invalid protocol request: `*** {name}:` is a structural line, not a header; add a \
-             `{BODY_LINE}` line before the body to keep it as body text"
-        );
-    }
-    Ok(Some(RequestHeader::new(
-        &normalized,
-        value.trim_matches([' ', '\t']),
-    )))
-}
-
-fn parse_operation_line(line: &str) -> Result<(ProtocolOperation, String)> {
-    let trimmed = trim_structural(line);
-    for (prefix, operation) in [
-        ("*** Read: ", ProtocolOperation::Read),
-        ("*** Exec: ", ProtocolOperation::Exec),
-    ] {
-        if let Some(uri) = trimmed.strip_prefix(prefix) {
-            return Ok((operation, uri.to_string()));
+fn substitute_value(value: &Value, values: &HashMap<String, Value>) -> Result<Value> {
+    match value {
+        Value::String(text) => {
+            if let Some(inner) = whole_placeholder(text) {
+                return parse_operand_str(inner)?.eval(values);
+            }
+            Ok(value.clone())
         }
+        Value::Array(items) => Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| substitute_value(item, values))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        // Nested objects are not literal fields themselves, so substitution
+        // continues through them without exemptions.
+        Value::Object(map) => Ok(Value::Object(substitute_input(map, values, &[])?)),
+        _ => Ok(value.clone()),
     }
-    bail!(
-        "invalid protocol request: the second line must be `*** Read: <protocol>://<target>` or \
-         `*** Exec: <protocol>://<target>`; correct form:\n{CORRECT_FORM}"
-    )
 }
 
-fn trim_structural(line: &str) -> &str {
-    line.trim_end_matches(['\n', '\r', ' ', '\t'])
+fn substitute_address(address: &str, values: &HashMap<String, Value>) -> Result<String> {
+    if address_placeholders(address)?.is_empty() {
+        return Ok(address.to_string());
+    }
+    let mut result = String::new();
+    let mut offset = 0;
+    for (start, end, inner) in address_placeholders(address)? {
+        result.push_str(&address[offset..start]);
+        let value = parse_operand_str(&inner)?.eval(values)?;
+        match &value {
+            Value::String(text) => result.push_str(text),
+            Value::Number(number) => result.push_str(&number.to_string()),
+            Value::Bool(flag) => result.push_str(if *flag { "true" } else { "false" }),
+            other => bail!(
+                "address placeholders must reference a string, number, or boolean; got {}",
+                json_type_name(other)
+            ),
+        }
+        offset = end;
+    }
+    result.push_str(&address[offset..]);
+    Ok(result)
 }
 
 #[async_trait]
@@ -214,16 +606,60 @@ impl ModelTool for ProtocolTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "requests": {
+                    "steps": {
                         "type": "array",
-                        "items": { "type": "string" },
+                        "items": { "$ref": "#/$defs/step" },
                         "minItems": 1,
-                        "maxItems": 8,
-                        "description": "One to eight fixed-format requests, executed in order; requests in one call must be independent, because no request can use another's result. Each request is a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional `*** name: value` header lines, a `*** Body:` line (required when headers are present, skipped otherwise), raw body lines, and a final `*** End Request` line. The request ends at the last `*** End Request` line; the lines between the header section (or the operation line) and it are the request body, passed verbatim and never escaped, so a body line exactly matching `*** End Request` can be sent. The newline before the final `*** End Request` line belongs to the request format, not the body: add one extra empty line before it to end the body with a newline. Omit the body when the operation takes no body. Header names are ASCII letters, digits, `-`, and `_`; a protocol's help page lists the headers it accepts, and comparable numeric headers accept a comparison prefix such as `>=10`. When a protocol's help page requires JSON, that JSON is the request body. Structural lines must match exactly. Invoke every registered protocol only through this tool with its `<protocol>://` address; a protocol loaded through `help` never becomes a callable tool under its own name. With more than one request the results arrive in order as `*** Result <n> of <m>: ok` or `*** Result <n> of <m>: error` sections; one failing request does not affect the others. Examples:\n\n*** Begin Request\n*** Read: file://src/main.rs\n*** End Request\n\n*** Begin Request\n*** Exec: pwsh://run\ncargo test\n*** End Request\n\n*** Begin Request\n*** Read: search://src\n*** mode: hybrid\n*** limit: >=10\n*** Body:\ncredential refresh flow\n*** End Request"
+                        "maxItems": MAX_STEPS,
+                        "description": "One to eight steps, executed in order. Each step is an object with `read` or `exec` (exactly one): the `<protocol>://<target>` address to read or execute. `input` is the protocol's input object exactly as its help page documents; omit it when the operation takes none. `id` names the step for later references (`[a-z][a-z0-9_]*`, unique within the call). `if` is a condition; the step runs only when it is true. `for` is `<name> in <reference>` and runs the step once per element of the referenced list; it requires `max`, the maximum number of elements (1..=32). `show` controls whether the step's output enters the result: `all` (default), `errors`, or `none`. Conditions are `[not] operand [comparator operand]`: operands are references or literals, comparators are ==, !=, <, <=, >, and >= (two numbers or two strings), and `not` negates. References start with a step `id` or a `for` variable and continue with `.field` and `[index]` segments; they may point only to earlier steps. Each step exposes `<id>.ok` (true when the operation succeeded), `<id>.text` (the complete text output), and `<id>.json` (structured output, or null); a `for` step's value is the list of its per-element values. In `input`, a string value that is exactly `{{ reference }}` is replaced by the referenced value with its JSON type preserved; any other string stays literal, including strings that contain `{{`. Fields the protocol executes verbatim (such as shell `script`) are never substituted; pass data through dedicated fields like the shell `env` object. In `read` and `exec` addresses, `{{ reference }}` placeholders are replaced as text and must reference a string, number, or boolean. The whole call is validated before anything runs: a rejected call runs nothing. A call expands to at most 64 operations; further steps are reported as skipped. Results arrive in step order as `*** Result <n> of <m>: ok`, `: error`, or `: skipped` sections (loop elements use `<n>.<k>`), followed by the step's output unless `show` hides it; one failing step does not affect the others. Examples:\n\n{\"steps\": [{\"read\": \"file://src/main.rs\"}]}\n\n{\"steps\": [{\"id\": \"tests\", \"exec\": \"bash://run\", \"input\": {\"script\": \"cargo test\"}, \"show\": \"errors\"}, {\"if\": \"not tests.ok\", \"read\": \"file://target/test.log\"}]}\n\n{\"steps\": [{\"id\": \"issues\", \"exec\": \"github-mcp://tools/list_issues\", \"input\": {\"repo\": \"acme/api\"}, \"show\": \"none\"}, {\"for\": \"issue in issues.json.items\", \"max\": 20, \"if\": \"issue.comments > 0\", \"exec\": \"github-mcp://tools/get_issue\", \"input\": {\"repo\": \"acme/api\", \"number\": \"{{ issue.number }}\"}}]}"
                     }
                 },
-                "required": ["requests"],
-                "additionalProperties": false
+                "required": ["steps"],
+                "additionalProperties": false,
+                "$defs": {
+                    "step": {
+                        "type": "object",
+                        "properties": {
+                            "read": {
+                                "type": "string",
+                                "description": "Address to read: `<protocol>://<target>`"
+                            },
+                            "exec": {
+                                "type": "string",
+                                "description": "Address to execute: `<protocol>://<target>`"
+                            },
+                            "input": {
+                                "type": "object",
+                                "description": "Protocol input; the protocol's help page defines the fields"
+                            },
+                            "id": {
+                                "type": "string",
+                                "pattern": "^[a-z][a-z0-9_]*$",
+                                "description": "Name for later references, unique within the call"
+                            },
+                            "if": {
+                                "type": "string",
+                                "description": "Condition; the step runs only when it is true"
+                            },
+                            "for": {
+                                "type": "string",
+                                "description": "`<name> in <reference>`; runs the step once per list element; requires `max`"
+                            },
+                            "max": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_FOR_ELEMENTS,
+                                "description": "Upper bound for `for`; the call fails when the list is longer"
+                            },
+                            "show": {
+                                "type": "string",
+                                "enum": ["all", "errors", "none"],
+                                "description": "Whether the step's output enters the result"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                }
             }),
         }
     }
@@ -235,57 +671,605 @@ impl ModelTool for ProtocolTool {
     ) -> Result<ModelToolOutput> {
         let arguments: ProtocolArguments = serde_json::from_value(arguments.clone())
             .map_err(|error| anyhow!("invalid protocol arguments: {error}"))?;
-        if arguments.requests.is_empty() {
-            bail!("invalid protocol arguments: at least one request is required");
-        }
-        if arguments.requests.len() > MAX_REQUESTS {
-            bail!(
-                "invalid protocol arguments: at most {MAX_REQUESTS} requests per call, got {}",
-                arguments.requests.len()
-            );
-        }
-        if arguments.requests.len() == 1 {
-            return Self::execute_one(&arguments.requests[0], protocols).await;
-        }
-        let total = arguments.requests.len();
-        let mut sections = String::new();
-        let mut images = Vec::new();
-        for (index, request) in arguments.requests.iter().enumerate() {
-            if !sections.is_empty() {
-                sections.push_str("\n\n");
-            }
-            match Self::execute_one(request, protocols).await {
-                Ok(output) => {
-                    let (text, mut read_images) = output.into_parts();
-                    sections.push_str(&format!("*** Result {} of {total}: ok\n{text}", index + 1));
-                    images.append(&mut read_images);
-                }
-                Err(error) => {
-                    sections.push_str(&format!(
-                        "*** Result {} of {total}: error\n{error:#}",
-                        index + 1
-                    ));
-                }
-            }
-        }
-        Ok(ModelToolOutput::new(sections, images))
+        let steps = validate_steps(&arguments.steps, protocols).await?;
+        execute_steps(&steps, protocols).await
     }
 }
 
-impl ProtocolTool {
-    async fn execute_one(request: &str, protocols: &ProtocolRegistry) -> Result<ModelToolOutput> {
-        let parsed = parse_request(request)?;
-        match parsed.operation {
-            ProtocolOperation::Read => {
-                let result = protocols
-                    .read_for_model(&parsed.uri, &parsed.headers, &parsed.body)
-                    .await?;
-                Ok(ModelToolOutput::new(result.output, result.images))
+fn step_field_error(number: usize, field: &str, message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("invalid protocol arguments: step {number} field `{field}`: {message}")
+}
+
+/// Like `step_field_error`, but preserves the cause's error chain so typed
+/// errors such as `ProtocolHelpRequired` stay detectable by the runtime.
+fn step_field_error_from(number: usize, field: &str, error: anyhow::Error) -> anyhow::Error {
+    error.context(format!(
+        "invalid protocol arguments: step {number} field `{field}`"
+    ))
+}
+
+fn check_reference_root(
+    root: &str,
+    number: usize,
+    field: &str,
+    earlier_ids: &HashSet<String>,
+    loop_variable: Option<&str>,
+) -> Result<()> {
+    if earlier_ids.contains(root) {
+        return Ok(());
+    }
+    if loop_variable == Some(root) {
+        return Ok(());
+    }
+    let hint = match loop_variable {
+        Some(variable) => format!(" or the `for` variable `{variable}`"),
+        None => String::new(),
+    };
+    Err(step_field_error(
+        number,
+        field,
+        format!(
+            "reference `{root}` does not name an earlier step{hint}; references may point only \
+             to steps declared before this one; example: {STEP_SHAPE_EXAMPLE}"
+        ),
+    ))
+}
+
+fn valid_id(id: &str) -> bool {
+    let mut characters = id.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
+        && characters.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<Vec<ValidatedStep>> {
+    if raw.is_empty() {
+        bail!("invalid protocol arguments: at least one step is required");
+    }
+    if raw.len() > MAX_STEPS {
+        bail!(
+            "invalid protocol arguments: at most {MAX_STEPS} steps per call, got {}",
+            raw.len()
+        );
+    }
+    let mut steps = Vec::with_capacity(raw.len());
+    let mut ids = HashSet::new();
+    let mut all_reference_roots = Vec::new();
+    for (index, raw_step) in raw.iter().enumerate() {
+        let number = index + 1;
+        let step: StepArgument = serde_json::from_value(raw_step.clone())
+            .map_err(|error| anyhow!("invalid protocol arguments: step {number}: {error}"))?;
+        let (operation, address, field) = match (&step.read, &step.exec) {
+            (Some(_), Some(_)) => bail!(
+                "invalid protocol arguments: step {number}: specify exactly one of `read` and \
+                 `exec`; example: {STEP_SHAPE_EXAMPLE}"
+            ),
+            (None, None) => bail!(
+                "invalid protocol arguments: step {number}: specify one of `read` or `exec`; \
+                 example: {STEP_SHAPE_EXAMPLE}"
+            ),
+            (Some(address), None) => (ProtocolOperation::Read, address, "read"),
+            (None, Some(address)) => (ProtocolOperation::Exec, address, "exec"),
+        };
+        if address.trim().is_empty() {
+            return Err(step_field_error(
+                number,
+                field,
+                "the address cannot be empty",
+            ));
+        }
+        let (protocol_name, _) = split_address(address).map_err(|error| {
+            step_field_error(
+                number,
+                field,
+                format!("{error}; example: {STEP_SHAPE_EXAMPLE}"),
+            )
+        })?;
+        if !protocol_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || protocol_name.is_empty()
+        {
+            return Err(step_field_error(
+                number,
+                field,
+                format!(
+                    "the protocol name {protocol_name:?} is invalid; addresses are \
+                     `<protocol>://<target>`"
+                ),
+            ));
+        }
+        let exec = operation == ProtocolOperation::Exec;
+        protocols
+            .validate_step_operation(protocol_name, exec)
+            .await
+            .map_err(|error| step_field_error_from(number, field, error))?;
+        let literal_fields = protocols.literal_input_fields(protocol_name).await;
+
+        let id = match &step.id {
+            Some(id) => {
+                if !valid_id(id) {
+                    return Err(step_field_error(
+                        number,
+                        "id",
+                        format!(
+                            "{id:?} must match `[a-z][a-z0-9_]*` and be unique within the call"
+                        ),
+                    ));
+                }
+                if !ids.insert(id.clone()) {
+                    return Err(step_field_error(
+                        number,
+                        "id",
+                        format!("{id:?} is already used by an earlier step"),
+                    ));
+                }
+                Some(id.clone())
             }
-            ProtocolOperation::Exec => protocols
-                .exec_for_model(&parsed.uri, &parsed.headers, &parsed.body)
+            None => None,
+        };
+
+        let show = match step.show.as_deref() {
+            None | Some("all") => Show::All,
+            Some("errors") => Show::Errors,
+            Some("none") => Show::None,
+            Some(other) => {
+                return Err(step_field_error(
+                    number,
+                    "show",
+                    format!("{other:?} is not one of \"all\", \"errors\", or \"none\""),
+                ));
+            }
+        };
+
+        let loop_spec = match (&step.r#for, step.max) {
+            (Some(text), Some(max)) => {
+                if !(1..=MAX_FOR_ELEMENTS as i64).contains(&max) {
+                    return Err(step_field_error(
+                        number,
+                        "max",
+                        format!("{max} is outside 1..={MAX_FOR_ELEMENTS}"),
+                    ));
+                }
+                let (variable, source_text) = text.split_once(" in ").ok_or_else(|| {
+                    step_field_error(
+                        number,
+                        "for",
+                        format!("{text:?} must be `<name> in <reference>`"),
+                    )
+                })?;
+                if !valid_id(variable.trim()) {
+                    return Err(step_field_error(
+                        number,
+                        "for",
+                        format!(
+                            "the variable name {:?} must match `[a-z][a-z0-9_]*`",
+                            variable.trim()
+                        ),
+                    ));
+                }
+                let source = parse_operand_str(source_text.trim())
+                    .map_err(|error| step_field_error(number, "for", format!("{error:#}")))?;
+                let Operand::Reference { root, .. } = &source else {
+                    return Err(step_field_error(
+                        number,
+                        "for",
+                        "the source must be a reference to an earlier step, for example \
+                         `issue in issues.json.items`",
+                    ));
+                };
+                check_reference_root(root, number, "for", &ids, None)?;
+                Some(LoopSpec {
+                    variable: variable.trim().to_string(),
+                    source,
+                })
+            }
+            (Some(_), None) => {
+                return Err(step_field_error(
+                    number,
+                    "for",
+                    "`for` requires `max`, the maximum number of elements",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(step_field_error(number, "max", "`max` requires `for`"));
+            }
+            (None, None) => None,
+        };
+        let max = step.max.unwrap_or(0).max(0) as usize;
+
+        let condition = match &step.r#if {
+            Some(text) => {
+                let expression = parse_expression(text)
+                    .map_err(|error| step_field_error(number, "if", format!("{error:#}")))?;
+                for root in expression.roots() {
+                    let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
+                    check_reference_root(root, number, "if", &ids, loop_variable)?;
+                }
+                Some(expression)
+            }
+            None => None,
+        };
+
+        let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
+        let mut data_refs = Vec::new();
+        if let Some(input) = &step.input {
+            for value in input.values() {
+                collect_input_roots(value, &mut data_refs)
+                    .map_err(|error| step_field_error(number, "input", format!("{error:#}")))?;
+            }
+            for root in &data_refs {
+                check_reference_root(root, number, "input", &ids, loop_variable)?;
+            }
+        }
+        for (_, _, inner) in address_placeholders(address)
+            .map_err(|error| step_field_error(number, field, format!("{error:#}")))?
+        {
+            let operand = parse_operand_str(&inner)
+                .map_err(|error| step_field_error(number, field, format!("{error:#}")))?;
+            if let Some(root) = operand.root() {
+                check_reference_root(root, number, field, &ids, loop_variable)?;
+                data_refs.push(root.to_string());
+            }
+        }
+        if let Some(spec) = &loop_spec
+            && let Operand::Reference { root, .. } = &spec.source
+        {
+            data_refs.push(root.clone());
+        }
+        if let Some(condition) = &condition {
+            for root in condition.roots() {
+                all_reference_roots.push(root.to_string());
+            }
+        }
+        all_reference_roots.extend(data_refs.iter().cloned());
+        steps.push(ValidatedStep {
+            operation,
+            address: address.clone(),
+            input: step.input,
+            literal_fields,
+            id,
+            condition,
+            loop_spec,
+            max,
+            show,
+            data_refs,
+            referenced_later: false,
+        });
+    }
+    for step in &mut steps {
+        if let Some(id) = &step.id
+            && all_reference_roots.contains(id)
+        {
+            step.referenced_later = true;
+        }
+    }
+    Ok(steps)
+}
+
+fn collect_input_roots(value: &Value, roots: &mut Vec<String>) -> Result<()> {
+    match value {
+        Value::String(text) => {
+            if let Some(inner) = whole_placeholder(text)
+                && let Some(root) = parse_operand_str(inner)?.root()
+            {
+                roots.push(root.to_string());
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_input_roots(item, roots)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_input_roots(value, roots)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Per-step state used for skip propagation and `if` conditions.
+#[derive(Clone, Debug, PartialEq)]
+enum StepState {
+    Ran { ok: bool },
+    Failed,
+    Skipped,
+}
+
+impl StepState {
+    fn unusable(&self) -> bool {
+        matches!(self, Self::Failed | Self::Skipped)
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Skipped => "was skipped",
+            Self::Ran { .. } => "is usable",
+        }
+    }
+}
+
+fn skipped_value() -> Value {
+    serde_json::json!({ "ok": false, "text": "", "json": null })
+}
+
+fn operation_value(ok: bool, text: String, json: Option<Value>) -> Value {
+    serde_json::json!({
+        "ok": ok,
+        "text": text,
+        "json": json.unwrap_or(Value::Null),
+    })
+}
+
+async fn execute_steps(
+    steps: &[ValidatedStep],
+    protocols: &ProtocolRegistry,
+) -> Result<ModelToolOutput> {
+    let total = steps.len();
+    let mut sections: Vec<String> = Vec::new();
+    let mut images = Vec::new();
+    let mut values: HashMap<String, Value> = HashMap::new();
+    let mut states: HashMap<String, StepState> = HashMap::new();
+    let mut operations_started = 0usize;
+
+    for (index, step) in steps.iter().enumerate() {
+        let number = index + 1;
+        if let Some(root) = step
+            .data_refs
+            .iter()
+            .find(|root| states.get(*root).is_some_and(|state| state.unusable()))
+        {
+            let reason = states
+                .get(root)
+                .map(|state| state.reason())
+                .unwrap_or("failed");
+            sections.push(format!(
+                "*** Result {number} of {total}: skipped\nthis step references step `{root}`, \
+                 which {reason}"
+            ));
+            if let Some(id) = &step.id {
+                values.insert(id.clone(), skipped_value());
+                states.insert(id.clone(), StepState::Skipped);
+            }
+            continue;
+        }
+        if let Some(spec) = &step.loop_spec {
+            let source = match &spec.source {
+                Operand::Reference { root, segments } => resolve_reference(root, segments, &values),
+                Operand::Literal(_) => Value::Null,
+            };
+            let Value::Array(list) = source else {
+                sections.push(format!(
+                    "*** Result {number} of {total}: error\n`for` source did not resolve to a list"
+                ));
+                if let Some(id) = &step.id {
+                    values.insert(id.clone(), skipped_value());
+                    states.insert(id.clone(), StepState::Failed);
+                }
+                continue;
+            };
+            if list.len() > step.max {
+                sections.push(format!(
+                    "*** Result {number} of {total}: error\n`for` list has {} elements, more than `max` = {}",
+                    list.len(),
+                    step.max
+                ));
+                if let Some(id) = &step.id {
+                    values.insert(id.clone(), skipped_value());
+                    states.insert(id.clone(), StepState::Failed);
+                }
+                continue;
+            }
+            let mut element_values = Vec::new();
+            let mut any_failed = false;
+            if list.is_empty() {
+                sections.push(format!(
+                    "*** Result {number} of {total}: ok\n(the `for` list is empty)"
+                ));
+            }
+            for (element_index, element) in list.iter().enumerate() {
+                let label = format!("{number}.{}", element_index + 1);
+                values.insert(spec.variable.clone(), element.clone());
+                match run_element(
+                    step,
+                    &values,
+                    protocols,
+                    &mut operations_started,
+                    total,
+                    &label,
+                    &mut sections,
+                    &mut images,
+                )
                 .await
-                .map(Into::into),
+                {
+                    ElementOutcome::Ran { ok, text, json } => {
+                        any_failed |= !ok;
+                        element_values.push(operation_value(ok, text, json));
+                    }
+                    ElementOutcome::Skipped => element_values.push(skipped_value()),
+                }
+            }
+            values.remove(&spec.variable);
+            if let Some(id) = &step.id {
+                states.insert(
+                    id.clone(),
+                    if any_failed {
+                        StepState::Failed
+                    } else {
+                        StepState::Ran { ok: true }
+                    },
+                );
+                values.insert(id.clone(), Value::Array(element_values));
+            }
+        } else {
+            match run_element(
+                step,
+                &values,
+                protocols,
+                &mut operations_started,
+                total,
+                &number.to_string(),
+                &mut sections,
+                &mut images,
+            )
+            .await
+            {
+                ElementOutcome::Ran { ok, text, json } => {
+                    if let Some(id) = &step.id {
+                        // A failed operation leaves `.ok` and `.text`
+                        // readable for `if` conditions, but later steps that
+                        // reference it as data are skipped.
+                        states.insert(
+                            id.clone(),
+                            if ok {
+                                StepState::Ran { ok: true }
+                            } else {
+                                StepState::Failed
+                            },
+                        );
+                        values.insert(id.clone(), operation_value(ok, text, json));
+                    }
+                }
+                ElementOutcome::Skipped => {
+                    if let Some(id) = &step.id {
+                        states.insert(id.clone(), StepState::Skipped);
+                        values.insert(id.clone(), skipped_value());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ModelToolOutput::new(sections.join("\n\n"), images))
+}
+
+enum ElementOutcome {
+    Ran {
+        ok: bool,
+        text: String,
+        json: Option<Value>,
+    },
+    Skipped,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_element(
+    step: &ValidatedStep,
+    values: &HashMap<String, Value>,
+    protocols: &ProtocolRegistry,
+    operations_started: &mut usize,
+    total: usize,
+    label: &str,
+    sections: &mut Vec<String>,
+    images: &mut Vec<crate::protocol::ProtocolImage>,
+) -> ElementOutcome {
+    if let Some(condition) = &step.condition {
+        let decision = match eval_expression(condition, values) {
+            Ok(decision) => decision,
+            Err(error) => {
+                sections.push(format!("*** Result {label} of {total}: error\n{error:#}"));
+                return ElementOutcome::Ran {
+                    ok: false,
+                    text: format!("{error:#}"),
+                    json: None,
+                };
+            }
+        };
+        if !decision {
+            sections.push(format!(
+                "*** Result {label} of {total}: skipped\nthe `if` condition is false"
+            ));
+            return ElementOutcome::Skipped;
+        }
+    }
+    if *operations_started >= MAX_OPERATIONS {
+        sections.push(format!(
+            "*** Result {label} of {total}: skipped\nthis call reached the limit of \
+             {MAX_OPERATIONS} protocol operations"
+        ));
+        return ElementOutcome::Skipped;
+    }
+    *operations_started += 1;
+    let address = match substitute_address(&step.address, values) {
+        Ok(address) => address,
+        Err(error) => {
+            sections.push(format!("*** Result {label} of {total}: error\n{error:#}"));
+            return ElementOutcome::Ran {
+                ok: false,
+                text: format!("{error:#}"),
+                json: None,
+            };
+        }
+    };
+    let empty = Map::new();
+    let input = match step
+        .input
+        .as_ref()
+        .map(|input| substitute_input(input, values, &step.literal_fields))
+    {
+        Some(result) => match result {
+            Ok(input) => input,
+            Err(error) => {
+                sections.push(format!("*** Result {label} of {total}: error\n{error:#}"));
+                return ElementOutcome::Ran {
+                    ok: false,
+                    text: format!("{error:#}"),
+                    json: None,
+                };
+            }
+        },
+        None => empty,
+    };
+    let result = match step.operation {
+        ProtocolOperation::Read => {
+            protocols
+                .read_for_model(&address, &input, step.referenced_later)
+                .await
+        }
+        ProtocolOperation::Exec => {
+            protocols
+                .exec_for_model(&address, &input, step.referenced_later)
+                .await
+        }
+    };
+    match result {
+        Ok(output) => {
+            if step.show.shows_output(false) && !output.images.is_empty() {
+                images.extend(output.images);
+            }
+            if step.show.shows_output(false) {
+                sections.push(format!(
+                    "*** Result {label} of {total}: ok\n{}",
+                    output.output
+                ));
+            } else {
+                sections.push(format!("*** Result {label} of {total}: ok"));
+            }
+            ElementOutcome::Ran {
+                ok: true,
+                text: output.text,
+                json: output.json,
+            }
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            if step.show.shows_output(true) {
+                sections.push(format!("*** Result {label} of {total}: error\n{message}"));
+            } else {
+                sections.push(format!("*** Result {label} of {total}: error"));
+            }
+            ElementOutcome::Ran {
+                ok: false,
+                text: message,
+                json: None,
+            }
         }
     }
 }
@@ -345,18 +1329,44 @@ impl Plugin for ProtocolToolsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentHandle, AgentHost, AgentSpec};
+    use crate::catalog::ModelCatalog;
+    use crate::config::{AgentEnvironment, ConfigManager};
     use crate::output::OutputStore;
-    use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
-    use crate::task::TaskManager;
+    use crate::protocol::{
+        Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
+    };
+    use crate::task::{AutoTask, TaskManager};
+    use anyhow::anyhow;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    struct CaptureProtocol;
+    /// Recorded protocol calls: `(target, input)` pairs.
+    type RecordedInputs = Arc<Mutex<Vec<(String, Map<String, Value>)>>>;
+
+    const FAKE_HELP: &str = r#"# fake
+
+A recording protocol for step tests.
+
+```json
+{"read": "fake://data"}
+```
+"#;
+
+    /// Records every operation and answers by target: `data` returns a fixed
+    /// JSON document, `echo` returns its input as JSON, `fail` fails, and
+    /// anything else records the call and echoes the input.
+    struct FakeProtocol {
+        calls: RecordedInputs,
+    }
 
     #[async_trait]
-    impl Protocol for CaptureProtocol {
+    impl Protocol for FakeProtocol {
         fn descriptor(&self) -> ProtocolDescriptor {
             ProtocolDescriptor {
-                name: "capture".to_string(),
-                description: "Capture test protocol".to_string(),
+                name: "fake".to_string(),
+                description: "recording protocol for tests".to_string(),
                 can_read: true,
                 can_exec: true,
             }
@@ -366,413 +1376,906 @@ mod tests {
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(format!("read:{}", request.body).into_bytes())
+        ) -> Result<ProtocolOutput> {
+            self.answer(request)
         }
 
         async fn exec(
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(format!("exec:{}", request.body).into_bytes())
+        ) -> Result<ProtocolOutput> {
+            self.answer(request)
         }
     }
 
-    async fn protocols() -> (ProtocolRegistry, std::path::PathBuf) {
-        let session_id = format!("model-tools-{}", uuid::Uuid::now_v7().simple());
-        let output = std::sync::Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
-        let directory = output.directory().to_path_buf();
-        let mut protocols = ProtocolRegistry::new(output, TaskManager::new());
-        protocols.register(CaptureProtocol).unwrap();
-        (protocols, directory)
-    }
-
-    #[test]
-    fn protocol_tool_leaves_the_request_format_to_the_requests_parameter() {
-        let descriptor = ProtocolTool.descriptor();
-        assert_eq!(descriptor.name, "protocol");
-        assert_eq!(descriptor.parameters["required"], json!(["requests"]));
-        let requests = &descriptor.parameters["properties"]["requests"];
-        assert_eq!(requests["type"], "array");
-        assert_eq!(requests["minItems"], json!(1));
-        assert_eq!(requests["maxItems"], json!(8));
-        // The tool description states the purpose only; the requests
-        // parameter is the single definition of the format.
-        assert!(
-            descriptor
-                .description
-                .contains("Call a registered protocol")
-        );
-        assert!(
-            descriptor
-                .description
-                .contains("`requests` parameter defines the fixed request format")
-        );
-        assert!(
-            !descriptor.description.contains("*** Begin Request"),
-            "the tool description should not repeat the request format"
-        );
-        let request_description = requests["description"]
-            .as_str()
-            .expect("the requests parameter keeps its description");
-        for fragment in [
-            "a `*** Begin Request` line, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line",
-            "optional `*** name: value` header lines",
-            "a `*** Body:` line (required when headers are present, skipped otherwise)",
-            "The request ends at the last `*** End Request` line",
-            "passed verbatim and never escaped",
-            "a body line exactly matching `*** End Request` can be sent",
-            "The newline before the final `*** End Request` line belongs to the request format, not the body",
-            "add one extra empty line before it to end the body with a newline",
-            "Omit the body when the operation takes no body",
-            "that JSON is the request body",
-            "Structural lines must match exactly",
-            "never becomes a callable tool under its own name",
-            "*** Begin Request\n*** Read: file://src/main.rs\n*** End Request",
-            "*** Begin Request\n*** Exec: pwsh://run\ncargo test\n*** End Request",
-            "*** Begin Request\n*** Read: search://src\n*** mode: hybrid\n*** limit: >=10\n*** Body:\ncredential refresh flow\n*** End Request",
-            "One to eight fixed-format requests, executed in order",
-            "*** Result <n> of <m>: ok",
-            "*** Result <n> of <m>: error",
-            "one failing request does not affect the others",
-        ] {
-            assert!(
-                request_description.contains(fragment),
-                "requests description is missing: {fragment}"
-            );
+    impl FakeProtocol {
+        fn answer(&self, request: ProtocolRequest<'_>) -> Result<ProtocolOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.target.to_string(), request.input.clone()));
+            match request.target {
+                "help" => Ok(ProtocolOutput::text(FAKE_HELP.as_bytes().to_vec())),
+                "data" => Ok(ProtocolOutput::text("DATA".as_bytes().to_vec())
+                    .with_json(json!({"items": ["a", "b", "c"], "count": 3, "path": "src/a.rs"}))),
+                "fail" => Err(anyhow!("boom")),
+                _ => {
+                    let text = serde_json::to_string(&request.input).unwrap();
+                    Ok(ProtocolOutput::text(text.as_bytes().to_vec())
+                        .with_json(Value::Object(request.input.clone())))
+                }
+            }
         }
-        assert!(!request_description.contains("byte for byte"));
-        assert!(!request_description.contains("Only the lines"));
     }
 
-    #[test]
-    fn parse_request_reads_without_a_body_section() {
-        let parsed =
-            parse_request("*** Begin Request\n*** Read: file://src/main.rs\n*** End Request")
-                .unwrap();
-        assert!(matches!(parsed.operation, ProtocolOperation::Read));
-        assert_eq!(parsed.uri, "file://src/main.rs");
-        assert!(parsed.headers.is_empty());
-        assert!(parsed.body.is_empty());
+    /// Auto-backgrounds under any nonzero grace like the shell: unreferenced
+    /// operations promote to a background task, referenced ones stay in the
+    /// foreground.
+    struct SlowpokeProtocol {
+        pinned: Arc<Mutex<Vec<bool>>>,
     }
 
-    #[test]
-    fn parse_request_parses_header_lines() {
-        let parsed = parse_request(
-            "*** Begin Request\n*** Read: search://src\n*** mode: hybrid\n*** Limit:  >=10 \n*** Body:\ncredential flow\n*** End Request",
+    #[async_trait]
+    impl Protocol for SlowpokeProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "slowpoke".to_string(),
+                description: "auto-backgrounding protocol for tests".to_string(),
+                can_read: true,
+                can_exec: true,
+            }
+        }
+
+        async fn read(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<ProtocolOutput> {
+            if request.target == "help" {
+                request.reject_input()?;
+                return Ok(ProtocolOutput::text("slowpoke help".as_bytes().to_vec()));
+            }
+            bail!("slowpoke supports only exec")
+        }
+
+        async fn exec(
+            &self,
+            request: ProtocolRequest<'_>,
+            context: ProtocolContext,
+        ) -> Result<ProtocolOutput> {
+            if request.target == "help" {
+                request.reject_input()?;
+                return Ok(ProtocolOutput::text("slowpoke help".as_bytes().to_vec()));
+            }
+            self.pinned.lock().unwrap().push(context.pinned_foreground);
+            let record = context
+                .tasks
+                .allocate("slowpoke", "slowpoke job".to_string())
+                .await;
+            match context
+                .tasks
+                .run_with_auto_background(
+                    record,
+                    context.foreground_grace(Duration::ZERO),
+                    |_| async { Ok(b"done".to_vec()) },
+                )
+                .await?
+            {
+                AutoTask::Background(_) => {
+                    Ok(ProtocolOutput::text(b"background-promoted".to_vec()))
+                }
+                AutoTask::Terminal(record) => Ok(ProtocolOutput::text(
+                    format!("foreground-{}", String::from_utf8_lossy(&record.content)).into_bytes(),
+                )),
+            }
+        }
+    }
+
+    /// A protocol whose `script` field is executed text and must never be
+    /// substituted.
+    struct ScriptProtocol {
+        calls: Arc<Mutex<Vec<Map<String, Value>>>>,
+    }
+
+    #[async_trait]
+    impl Protocol for ScriptProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: "scripted".to_string(),
+                description: "script protocol for tests".to_string(),
+                can_read: true,
+                can_exec: true,
+            }
+        }
+
+        fn literal_input_fields(&self) -> &[&str] {
+            &["script"]
+        }
+
+        async fn read(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<ProtocolOutput> {
+            if request.target == "help" {
+                request.reject_input()?;
+                return Ok(ProtocolOutput::text("scripted help".as_bytes().to_vec()));
+            }
+            bail!("scripted supports only exec")
+        }
+
+        async fn exec(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<ProtocolOutput> {
+            if request.target == "help" {
+                bail!("scripted help is read-only");
+            }
+            self.calls.lock().unwrap().push(request.input.clone());
+            Ok(ProtocolOutput::text("script-ok".as_bytes().to_vec()))
+        }
+    }
+
+    struct Harness {
+        registry: ProtocolRegistry,
+        calls: RecordedInputs,
+        script_calls: Arc<Mutex<Vec<Map<String, Value>>>>,
+        pinned: Arc<Mutex<Vec<bool>>>,
+        output_directory: PathBuf,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.output_directory);
+        }
+    }
+
+    async fn new_harness() -> Harness {
+        let session_id = format!("steps-test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script_calls = Arc::new(Mutex::new(Vec::new()));
+        let pinned = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register(FakeProtocol {
+                calls: calls.clone(),
+            })
+            .unwrap();
+        registry
+            .register(SlowpokeProtocol {
+                pinned: pinned.clone(),
+            })
+            .unwrap();
+        registry
+            .register(ScriptProtocol {
+                calls: script_calls.clone(),
+            })
+            .unwrap();
+        registry
+            .load_help(&[
+                "fake".to_string(),
+                "slowpoke".to_string(),
+                "scripted".to_string(),
+            ])
+            .await
+            .unwrap();
+        calls.lock().unwrap().clear();
+        Harness {
+            registry,
+            calls,
+            script_calls,
+            pinned,
+            output_directory,
+        }
+    }
+
+    async fn run(harness: &Harness, steps: Value) -> Result<ModelToolOutput> {
+        ProtocolTool
+            .execute(&json!({ "steps": steps }), &harness.registry)
+            .await
+    }
+
+    fn recorded(harness: &Harness) -> Vec<(String, Map<String, Value>)> {
+        harness.calls.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn single_step_reports_result_one_of_one() {
+        let harness = new_harness().await;
+        let output = run(&harness, json!([{"read": "fake://data"}]))
+            .await
+            .unwrap();
+        assert_eq!(output.output(), "*** Result 1 of 1: ok\nDATA");
+        assert_eq!(recorded(&harness).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_the_whole_call_before_running_anything() {
+        let harness = new_harness().await;
+        let error = run(
+            &harness,
+            json!([
+                {"read": "fake://data"},
+                {"read": "fake://data", "unknown": true}
+            ]),
         )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("step 2"));
+        assert!(
+            recorded(&harness).is_empty(),
+            "a rejected call must run nothing"
+        );
+
+        for (steps, fragment) in [
+            (json!([]), "at least one step is required"),
+            (
+                Value::Array(vec![json!({"read": "fake://data"}); 9]),
+                "at most 8 steps per call",
+            ),
+            (
+                json!([{"read": "fake://data", "exec": "fake://echo"}]),
+                "exactly one of `read` and `exec`",
+            ),
+            (json!([{"read": "   "}]), "the address cannot be empty"),
+            (
+                json!([{"read": "fake://data", "id": "Bad-ID"}]),
+                "must match `[a-z][a-z0-9_]*`",
+            ),
+            (
+                json!([
+                    {"id": "a", "read": "fake://data"},
+                    {"id": "a", "read": "fake://data"}
+                ]),
+                "already used by an earlier step",
+            ),
+            (
+                json!([{"read": "fake://data", "show": "sometimes"}]),
+                "is not one of",
+            ),
+            (json!([{"read": "missing://data"}]), "unknown protocol"),
+            (
+                json!([{"read": "fake://data", "if": "later.ok"}]),
+                "does not name an earlier step",
+            ),
+            (
+                json!([{"read": "fake://data", "if": "(("}]),
+                "invalid operand",
+            ),
+            (
+                json!([{"for": "x in a.items", "read": "fake://data"}]),
+                "`for` requires `max`",
+            ),
+            (
+                json!([{"read": "fake://data", "max": 3}]),
+                "`max` requires `for`",
+            ),
+            (
+                json!([{"for": "x in 3", "max": 3, "read": "fake://data"}]),
+                "the source must be a reference",
+            ),
+        ] {
+            let error = format!("{:#}", run(&harness, steps).await.unwrap_err());
+            assert!(error.contains(fragment), "expected {fragment:?} in {error}");
+            assert!(recorded(&harness).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn for_runs_once_per_element_in_order_and_exposes_the_element_list() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {
+                    "id": "letters",
+                    "for": "item in d.json.items",
+                    "max": 8,
+                    "read": "fake://{{ item }}",
+                    "input": {"element": "{{ item }}"}
+                },
+                {"read": "fake://echo", "input": {"list": "{{ letters }}"}}
+            ]),
+        )
+        .await
         .unwrap();
-        assert_eq!(parsed.uri, "search://src");
+        let text = output.output();
+        assert!(text.contains("*** Result 2.1 of 3: ok"));
+        assert!(text.contains("*** Result 2.3 of 3: ok"));
+        let calls = recorded(&harness);
+        let targets: Vec<&str> = calls.iter().map(|(target, _)| target.as_str()).collect();
         assert_eq!(
-            parsed.headers,
-            vec![
-                RequestHeader::new("mode", "hybrid"),
-                RequestHeader::new("limit", ">=10"),
+            targets,
+            ["data", "a", "b", "c", "echo"],
+            "elements run sequentially in order"
+        );
+        // The last call receives the list of per-element values.
+        let last_input = calls.last().unwrap().1.clone();
+        let list = last_input.get("list").unwrap();
+        let texts: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.get("text").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "{\"element\":\"a\"}",
+                "{\"element\":\"b\"}",
+                "{\"element\":\"c\"}"
             ]
         );
-        assert_eq!(parsed.body, "credential flow");
     }
 
-    #[test]
-    fn parse_request_accepts_headers_without_a_body() {
-        let parsed = parse_request(
-            "*** Begin Request\n*** Read: file://src/main.rs\n*** limit: <=50\n*** End Request",
+    #[tokio::test]
+    async fn for_sources_must_be_lists_within_max_before_any_element_runs() {
+        let harness = new_harness().await;
+        let not_a_list = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"for": "x in d.json.count", "max": 4, "read": "fake://echo"}
+            ]),
         )
+        .await
         .unwrap();
-        assert_eq!(parsed.headers, vec![RequestHeader::new("limit", "<=50")]);
-        assert!(parsed.body.is_empty());
-        let parsed = parse_request(
-            "*** Begin Request\n*** Read: file://src/main.rs\n*** limit: <=50\n*** Body:\n*** End Request",
-        )
-        .unwrap();
-        assert_eq!(parsed.headers, vec![RequestHeader::new("limit", "<=50")]);
-        assert!(parsed.body.is_empty());
-    }
-
-    #[test]
-    fn parse_request_requires_a_body_separator_after_headers() {
-        let error = parse_request(
-            "*** Begin Request\n*** Read: search://src\n*** mode: hybrid\ncredential flow\n*** End Request",
-        )
-        .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("must end with a `*** Body:` line"),
-            "{error:#}"
+            not_a_list
+                .output()
+                .contains("`for` source did not resolve to a list")
+        );
+
+        let harness = new_harness().await;
+        let oversized = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"for": "x in d.json.items", "max": 2, "read": "fake://{{ x }}"}
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            oversized
+                .output()
+                .contains("`for` list has 3 elements, more than `max` = 2"),
+            "{}",
+            oversized.output()
+        );
+        assert_eq!(
+            recorded(&harness).len(),
+            1,
+            "an oversized list fails before any element runs"
+        );
+
+        let harness = new_harness().await;
+        let empty = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://echo", "show": "none", "input": {"items": []}},
+                {"for": "x in d.json.items", "max": 4, "read": "fake://echo", "input": {"list": "{{ x }}"}},
+                {"read": "fake://echo", "input": {"after": "{{ d.json.items }}"}}
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            empty
+                .output()
+                .contains("*** Result 2 of 3: ok\n(the `for` list is empty)")
+        );
+        let calls = recorded(&harness);
+        assert_eq!(calls.len(), 2, "the loop body never runs for an empty list");
+        let last = calls.last().unwrap().1.clone();
+        assert_eq!(
+            last.get("after").unwrap(),
+            &json!([]),
+            "the loop step's own value is the empty element list"
         );
     }
 
-    #[test]
-    fn parse_request_rejects_structural_lines_as_headers() {
-        let error = parse_request(
-            "*** Begin Request\n*** Read: search://src\n*** Read: file://a\n*** End Request",
+    #[tokio::test]
+    async fn loop_variables_are_invisible_outside_their_step() {
+        let harness = new_harness().await;
+        let error = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"for": "item in d.json.items", "max": 4, "read": "fake://data"},
+                {"read": "fake://echo", "input": {"late": "{{ item }}"}}
+            ]),
         )
+        .await
         .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("is a structural line, not a header"),
-            "{error:#}"
+            error.to_string().contains("does not name an earlier step"),
+            "the loop variable must not leak: {error}"
         );
     }
 
-    #[test]
-    fn parse_request_rejects_invalid_header_names() {
-        let error = parse_request(
-            "*** Begin Request\n*** Read: search://src\n*** 1mode: hybrid\n*** End Request",
+    #[tokio::test]
+    async fn failed_and_skipped_steps_are_reported_without_stopping_the_call() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"read": "fake://fail"},
+                {"read": "fake://data"},
+                {"id": "unused", "if": "false", "read": "fake://data"},
+                {"if": "true", "read": "fake://data"}
+            ]),
         )
-        .unwrap_err();
+        .await
+        .unwrap();
+        let text = output.output();
+        assert!(text.contains("*** Result 1 of 4: error\nboom"));
+        assert!(text.contains("*** Result 2 of 4: ok\nDATA"));
+        assert!(text.contains("*** Result 3 of 4: skipped\nthe `if` condition is false"));
+        assert!(text.contains("*** Result 4 of 4: ok\nDATA"));
+    }
+
+    #[tokio::test]
+    async fn referencing_a_failed_or_skipped_step_skips_with_that_reason() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "broken", "read": "fake://fail", "show": "none"},
+                {"read": "fake://echo", "input": {"value": "{{ broken.text }}"}},
+                {"id": "off", "if": "false", "read": "fake://data"},
+                {"read": "fake://echo", "input": {"value": "{{ off.json }}"}},
+                {"if": "broken.ok == false", "read": "fake://data"}
+            ]),
+        )
+        .await
+        .unwrap();
+        let text = output.output();
         assert!(
-            error.to_string().contains("invalid header name `1mode`"),
-            "{error:#}"
+            text.contains(
+                "*** Result 2 of 5: skipped\nthis step references step `broken`, which failed"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "*** Result 4 of 5: skipped\nthis step references step `off`, which was skipped"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("*** Result 5 of 5: ok\nDATA"),
+            "an `if` may read `.ok` of a failed step: {text}"
+        );
+        assert_eq!(recorded(&harness).len(), 2, "only steps 1 and 5 run");
+    }
+
+    #[tokio::test]
+    async fn whole_value_placeholders_keep_the_json_type() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"read": "fake://echo", "input": {
+                    "count": "{{ d.json.count }}",
+                    "path": "{{ d.json.path }}",
+                    "items": "{{ d.json.items }}"
+                }}
+            ]),
+        )
+        .await
+        .unwrap();
+        let calls = recorded(&harness);
+        let input = calls.last().unwrap().1.clone();
+        assert_eq!(input.get("count"), Some(&json!(3)), "numbers stay numbers");
+        assert_eq!(input.get("path"), Some(&json!("src/a.rs")));
+        assert_eq!(input.get("items"), Some(&json!(["a", "b", "c"])));
+        let text = output.output();
+        assert!(text.contains("*** Result 2 of 2: ok"));
+    }
+
+    #[tokio::test]
+    async fn partial_placeholder_strings_stay_literal() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"read": "fake://echo", "input": {
+                    "secret": "${{ d.json.path }}",
+                    "embedded": "value {{ d.json.count }} here",
+                    "escaped": "{{ \"{{x}}\" }}"
+                }}
+            ]),
+        )
+        .await
+        .unwrap();
+        let calls = recorded(&harness);
+        let input = calls.last().unwrap().1.clone();
+        assert_eq!(input.get("secret"), Some(&json!("${{ d.json.path }}")));
+        assert_eq!(
+            input.get("embedded"),
+            Some(&json!("value {{ d.json.count }} here"))
+        );
+        assert_eq!(input.get("escaped"), Some(&json!("{{x}}")));
+        assert!(output.output().contains("*** Result 2 of 2: ok"));
+    }
+
+    #[tokio::test]
+    async fn address_placeholders_accept_scalars_and_reject_containers() {
+        let harness = new_harness().await;
+        run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"read": "fake://{{ d.json.path }}"}
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded(&harness).last().unwrap().0, "src/a.rs");
+
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"read": "fake://run-{{ d.json.items }}"}
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output
+                .output()
+                .contains("address placeholders must reference a string, number, or boolean"),
+            "{}",
+            output.output()
         );
     }
 
-    #[test]
-    fn parse_request_keeps_header_shaped_body_lines_after_the_separator() {
-        let parsed = parse_request(
-            "*** Begin Request\n*** Exec: pwsh://run\n*** Body:\n*** Note: not a header\necho done\n*** End Request",
+    #[tokio::test]
+    async fn literal_input_fields_are_never_substituted() {
+        let harness = new_harness().await;
+        run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {
+                    "exec": "scripted://run",
+                    "input": {
+                        "script": "{{ d.json.path }}",
+                        "env": {"TARGET": "{{ d.json.path }}", "COUNT": "{{ d.json.count }}"}
+                    }
+                }
+            ]),
         )
+        .await
         .unwrap();
-        assert!(parsed.headers.is_empty());
-        assert_eq!(parsed.body, "*** Note: not a header\necho done");
+        let calls = harness.script_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let input = &calls[0];
+        assert_eq!(
+            input.get("script"),
+            Some(&json!("{{ d.json.path }}")),
+            "executed text keeps its placeholders"
+        );
+        assert_eq!(
+            input.get("env").unwrap().get("TARGET"),
+            Some(&json!("src/a.rs"))
+        );
+        assert_eq!(input.get("env").unwrap().get("COUNT"), Some(&json!(3)));
     }
 
-    #[test]
-    fn parse_request_keeps_multiline_bodies_verbatim() {
-        let request =
-            "*** Begin Request\n*** Exec: pwsh://run\nline one\n\nline \"three\"\n*** End Request";
-        let parsed = parse_request(request).unwrap();
-        assert!(matches!(parsed.operation, ProtocolOperation::Exec));
-        assert_eq!(parsed.uri, "pwsh://run");
-        assert_eq!(parsed.body, "line one\n\nline \"three\"");
-    }
-
-    #[test]
-    fn parse_request_skips_the_body_separator_without_headers() {
-        let parsed = parse_request(
-            "*** Begin Request\r\n*** Exec: pwsh://run\r\n*** Body:\r\nline one\r\n*** End Request\r\n",
+    #[tokio::test]
+    async fn operations_stop_at_sixty_four_and_report_skipped_elements() {
+        let harness = new_harness().await;
+        let items = Value::Array(vec![json!("x"); 32]);
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://echo", "show": "none", "input": {"items": items}},
+                {"for": "item in d.json.items", "max": 32, "read": "fake://echo", "input": {"item": "{{ item }}"}},
+                {"for": "item in d.json.items", "max": 32, "read": "fake://echo", "input": {"item": "{{ item }}"}}
+            ]),
         )
+        .await
         .unwrap();
-        assert_eq!(parsed.uri, "pwsh://run");
-        assert!(parsed.headers.is_empty());
-        assert_eq!(parsed.body, "line one");
+        let text = output.output();
+        assert!(
+            text.contains("*** Result 3.31 of 3: ok"),
+            "the sixty-fourth operation still runs: {text}"
+        );
+        assert!(
+            text.contains(
+                "*** Result 3.32 of 3: skipped\nthis call reached the limit of 64 protocol operations"
+            ),
+            "{text}"
+        );
+        assert_eq!(recorded(&harness).len(), 64);
     }
 
-    #[test]
-    fn parse_request_accepts_crlf_lines_and_spaces_in_the_uri() {
-        let parsed = parse_request(
-            "*** Begin Request\r\n*** Read: file://my docs/a.md\r\n*** End Request\r\n",
+    #[tokio::test]
+    async fn operations_referenced_later_stay_in_the_foreground() {
+        let harness = new_harness().await;
+        let referenced = run(
+            &harness,
+            json!([
+                {"id": "slow", "exec": "slowpoke://job"},
+                {"read": "fake://echo", "input": {"ok": "{{ slow.ok }}"}}
+            ]),
         )
+        .await
         .unwrap();
-        assert_eq!(parsed.uri, "file://my docs/a.md");
-        assert!(parsed.body.is_empty());
+        assert!(
+            referenced.output().contains("foreground-done"),
+            "{}",
+            referenced.output()
+        );
+        assert_eq!(*harness.pinned.lock().unwrap(), [true]);
+
+        let harness = new_harness().await;
+        let unreferenced = run(
+            &harness,
+            json!([{"exec": "slowpoke://job"}, {"read": "fake://data"}]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            unreferenced.output().contains("background-promoted"),
+            "{}",
+            unreferenced.output()
+        );
+        assert_eq!(*harness.pinned.lock().unwrap(), [false]);
     }
 
-    #[test]
-    fn parse_request_treats_exactly_one_empty_body_line_as_no_body() {
-        for request in [
-            "*** Begin Request\n*** Read: search://src\n\n*** End Request",
-            "*** Begin Request\n*** Read: search://src\n*** Body:\n\n*** End Request",
-        ] {
-            let parsed = parse_request(request).unwrap();
-            assert!(parsed.body.is_empty(), "{request:?}");
+    #[tokio::test]
+    async fn show_controls_what_enters_the_result() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"read": "fake://data", "show": "none"},
+                {"read": "fake://fail", "show": "none"},
+                {"read": "fake://fail", "show": "errors"},
+                {"read": "fake://data", "show": "errors"}
+            ]),
+        )
+        .await
+        .unwrap();
+        let text = output.output();
+        assert_eq!(
+            text,
+            "*** Result 1 of 4: ok\n\n\
+             *** Result 2 of 4: error\n\n\
+             *** Result 3 of 4: error\nboom\n\n\
+             *** Result 4 of 4: ok"
+        );
+    }
+
+    /// The real root-session registry, so help-example validation runs
+    /// against the built-in protocols this environment actually registers.
+    /// The handle must stay alive: the collaboration protocol holds only a
+    /// weak reference to the runtime it renders its help from.
+    async fn builtin_registry() -> (tempfile::TempDir, AgentHandle, Arc<ProtocolRegistry>) {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_directory = workspace.path().join("config");
+        tokio::fs::create_dir_all(&config_directory).await.unwrap();
+        tokio::fs::write(
+            config_directory.join("models.json"),
+            br#"{"providers":{"test-provider":{"baseUrl":"https://test.invalid/v1","api":"openai-responses","models":[{"id":"test-model","name":"Test","maxTokens":9000}]}}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(config_directory.join("settings.json"), b"{}")
+            .await
+            .unwrap();
+        let manager = ConfigManager::load_for_test(&config_directory, workspace.path())
+            .await
+            .unwrap();
+        let environment = Arc::new(AgentEnvironment::load(&config_directory).await.unwrap());
+        let catalog = Arc::new(ModelCatalog::load(&config_directory, true).await.unwrap());
+        let host = AgentHost::new(
+            manager.clone(),
+            environment,
+            catalog,
+            workspace.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let initial = manager.current().await;
+        let spec = AgentSpec::root(
+            &initial.provider,
+            &initial.model,
+            initial.thinking,
+            workspace.path(),
+        );
+        let handle = host.open_root(None, spec).await.unwrap();
+        handle.services().runtime.prepare_context().await.unwrap();
+        let protocols = handle.services().protocols.clone();
+        (workspace, handle, protocols)
+    }
+
+    /// Extract every ```json fenced block, parsed.
+    fn json_fences(text: &str) -> Vec<Value> {
+        let mut examples = Vec::new();
+        let mut rest = text;
+        while let Some(position) = rest.find("```json") {
+            let after = &rest[position + "```json".len()..];
+            let end = after
+                .find("```")
+                .expect("help text has an unterminated json fence");
+            let block = after[..end].trim();
+            let value = serde_json::from_str(block)
+                .unwrap_or_else(|error| panic!("invalid json fence {block:?}: {error}"));
+            examples.push(value);
+            rest = &after[end + "```".len()..];
+        }
+        examples
+    }
+
+    /// Normalize one extracted example to its step array: help pages show a
+    /// single step object, `docs/protocols.md` shows complete calls.
+    fn example_steps(example: &Value) -> Vec<Value> {
+        match example {
+            Value::Object(object) if object.contains_key("steps") => object["steps"]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| panic!("`steps` must be an array: {example}")),
+            _ => vec![example.clone()],
         }
     }
 
-    #[test]
-    fn parse_request_keeps_a_deliberate_trailing_newline() {
-        // One extra empty line before the end line means the body itself
-        // ends with a newline, which interactive `send` routes rely on.
-        let parsed =
-            parse_request("*** Begin Request\n*** Exec: tasks://001/send\nyes\n\n*** End Request")
-                .unwrap();
-        assert_eq!(parsed.body, "yes\n");
-        let parsed =
-            parse_request("*** Begin Request\n*** Exec: tasks://001/send\n\n\n*** End Request")
-                .unwrap();
-        assert_eq!(parsed.body, "\n");
+    fn step_protocol_names(steps: &[Value]) -> Vec<String> {
+        steps
+            .iter()
+            .map(|step| {
+                let address = step
+                    .as_object()
+                    .and_then(|object| object.get("read").or_else(|| object.get("exec")))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("json fence is not a step example: {step}"));
+                address.split("://").next().unwrap().to_string()
+            })
+            .collect()
     }
 
-    #[test]
-    fn parse_request_ends_at_the_last_end_line() {
-        // The request ends at the last `*** End Request` line, so body
-        // content may itself contain that line verbatim.
-        let parsed = parse_request(
-            "*** Begin Request\n*** Exec: tasks://001/send\n*** End Request\n*** End Request",
-        )
-        .unwrap();
-        assert_eq!(parsed.body, "*** End Request");
-        let parsed = parse_request(
-            "*** Begin Request\n*** Exec: tasks://001/send\nfirst\n*** End Request\nlast\n*** End Request\n\n",
-        )
-        .unwrap();
-        assert_eq!(parsed.body, "first\n*** End Request\nlast");
-    }
-
-    #[test]
-    fn parse_request_rejects_malformed_requests() {
-        for request in [
-            "",
-            "read file://src/main.rs",
-            "*** Begin Request\n*** Read file://src/main.rs\n*** End Request",
-            "*** Begin Request\n*** Read:\n*** End Request",
-            "*** Begin Request\n*** Read: file://a\n",
-            "*** Begin Request\n*** Read: file://a\n*** End Request\ntrailing",
-        ] {
-            let error = parse_request(request).unwrap_err();
-            assert!(
-                error.to_string().contains("invalid protocol request"),
-                "{request:?} produced {error:#}"
-            );
+    /// Every ```json step example on every registered help page and in
+    /// `docs/protocols.md` must pass whole-call validation against the real
+    /// registry. Examples naming a protocol this environment does not
+    /// register, such as a configured MCP server, are skipped instead of
+    /// failing.
+    #[tokio::test]
+    async fn help_page_and_docs_examples_validate_as_steps() {
+        async fn check(
+            steps: &[Value],
+            registered: &HashSet<&str>,
+            protocols: &ProtocolRegistry,
+        ) -> bool {
+            let targets = step_protocol_names(steps);
+            if targets
+                .iter()
+                .any(|name| !registered.contains(name.as_str()))
+            {
+                return false;
+            }
+            validate_steps(steps, protocols)
+                .await
+                .unwrap_or_else(|error| panic!("example {steps:?} failed validation: {error:#}"));
+            true
         }
 
-        let error = parse_request("*** Begin Request\n*** Read: file://a\n").unwrap_err();
-        assert!(error.to_string().contains(CORRECT_FORM));
+        let (_workspace, _handle, protocols) = builtin_registry().await;
+        let names: Vec<String> = protocols
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "file"),
+            "the built-in registry is missing core protocols: {names:?}"
+        );
 
-        let error =
-            parse_request("*** Begin Request\n*** Exec: file://a\nbody line\n").unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("all body lines"));
-        assert!(message.contains("<optional body lines"));
+        // Load every contract first: validation requires the target
+        // protocol's help to be loaded, and one page's examples may target
+        // other protocols than the page they appear on. `load_help` takes at
+        // most eight names per call.
+        let mut pages = Vec::new();
+        for chunk in names.chunks(8) {
+            pages.push(protocols.load_help(chunk).await.unwrap());
+        }
+
+        let registered: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let mut validated = 0;
+        for page in &pages {
+            for example in json_fences(page) {
+                let steps = example_steps(&example);
+                if check(&steps, &registered, &protocols).await {
+                    validated += 1;
+                }
+            }
+        }
+        assert!(validated > 0, "no help-page examples were validated");
+
+        let docs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/protocols.md"),
+        )
+        .unwrap();
+        let mut docs_validated = 0;
+        for example in json_fences(&docs) {
+            let steps = example_steps(&example);
+            if check(&steps, &registered, &protocols).await {
+                docs_validated += 1;
+            }
+        }
+        assert!(
+            docs_validated > 0,
+            "no docs/protocols.md examples were validated"
+        );
     }
 
+    /// The `protocol` tool schema is pinned to the step shape providers see:
+    /// one required `steps` array of 1..=8 objects, fixed step field types,
+    /// unknown step properties rejected, and no union constructs anywhere.
     #[test]
-    fn help_tool_describes_a_nonempty_protocol_list() {
-        let descriptor = HelpTool.descriptor();
-        assert_eq!(descriptor.name, "help");
-        assert_eq!(descriptor.parameters["required"], json!(["protocols"]));
+    fn protocol_tool_schema_pins_the_step_shape() {
+        let schema = ProtocolTool.descriptor().parameters;
+        let root = schema.as_object().expect("tool schema is an object");
+        assert_eq!(root.get("type").and_then(Value::as_str), Some("object"));
+        assert_eq!(root.get("required"), Some(&json!(["steps"])));
+        assert_eq!(root.get("additionalProperties"), Some(&json!(false)));
+        let steps = &root["properties"]["steps"];
+        assert_eq!(steps["type"], json!("array"));
+        assert_eq!(steps["minItems"], json!(1));
+        assert_eq!(steps["maxItems"], json!(MAX_STEPS));
+        assert_eq!(steps["items"], json!({"$ref": "#/$defs/step"}));
+
+        let step = &root["$defs"]["step"];
+        assert_eq!(step["type"], json!("object"));
+        assert_eq!(step["additionalProperties"], json!(false));
+        let properties = step["properties"].as_object().expect("step properties");
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
         assert_eq!(
-            descriptor.parameters["properties"]["protocols"]["minItems"],
-            json!(1)
+            names,
+            ["exec", "for", "id", "if", "input", "max", "read", "show"]
         );
-    }
+        for (field, kind) in [
+            ("read", "string"),
+            ("exec", "string"),
+            ("input", "object"),
+            ("id", "string"),
+            ("if", "string"),
+            ("for", "string"),
+            ("max", "integer"),
+            ("show", "string"),
+        ] {
+            assert_eq!(properties[field]["type"], json!(kind), "step field {field}");
+        }
+        assert_eq!(properties["show"]["enum"], json!(["all", "errors", "none"]));
 
-    #[tokio::test]
-    async fn help_tool_loads_protocols_and_unlocks_model_calls() {
-        let (protocols, output) = protocols().await;
-        let loaded = HelpTool
-            .execute(&json!({"protocols": ["capture"]}), &protocols)
-            .await
-            .unwrap();
-        assert!(loaded.output().contains("Loaded protocols stay loaded"));
-
-        let read = ProtocolTool
-            .execute(
-                &json!({"requests": ["*** Begin Request\n*** Read: capture://value\n*** End Request"]}),
-                &protocols,
-            )
-            .await
-            .unwrap();
-        let exec = ProtocolTool
-            .execute(
-                &json!({"requests": ["*** Begin Request\n*** Exec: capture://value\n{\"answer\":42}\n*** End Request"]}),
-                &protocols,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(read.output(), "read:");
-        assert_eq!(exec.output(), "exec:{\"answer\":42}");
-        let newline = ProtocolTool
-            .execute(
-                &json!({"requests": ["*** Begin Request\n*** Exec: capture://value\nyes\n\n*** End Request"]}),
-                &protocols,
-            )
-            .await
-            .unwrap();
-        assert_eq!(newline.output(), "exec:yes\n");
-        let embedded_end = ProtocolTool
-            .execute(
-                &json!({"requests": ["*** Begin Request\n*** Exec: capture://value\n*** End Request\nbody\n*** End Request"]}),
-                &protocols,
-            )
-            .await
-            .unwrap();
-        assert_eq!(embedded_end.output(), "exec:*** End Request\nbody");
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn protocol_tool_batches_requests_with_sectioned_results() {
-        let (protocols, output) = protocols().await;
-        HelpTool
-            .execute(&json!({"protocols": ["capture"]}), &protocols)
-            .await
-            .unwrap();
-        let result = ProtocolTool
-            .execute(
-                &json!({"requests": [
-                    "*** Begin Request\n*** Read: capture://one\n*** End Request",
-                    "*** Begin Request\n*** Exec: capture://two\nbody two\n*** End Request",
-                    "not a request",
-                ]}),
-                &protocols,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result.output(),
-            "*** Result 1 of 3: ok\nread:\n\n*** Result 2 of 3: ok\nexec:body two\n\n*** Result 3 of 3: error\ninvalid protocol request: the first line must be `*** Begin Request`; correct form:\n*** Begin Request\n*** Read: <protocol>://<target>\n<optional body lines; omit this line when there is no body>\n*** End Request"
-        );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn protocol_tool_rejects_empty_and_oversized_batches() {
-        let (protocols, output) = protocols().await;
-        let error = ProtocolTool
-            .execute(&json!({"requests": []}), &protocols)
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("at least one request"));
-
-        let oversized =
-            vec!["*** Begin Request\n*** Read: capture://value\n*** End Request".to_string(); 9];
-        let error = ProtocolTool
-            .execute(&json!({"requests": oversized}), &protocols)
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("at most 8 requests per call, got 9"));
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn help_tool_rejects_malformed_and_unknown_requests() {
-        let (protocols, output) = protocols().await;
-        let oversized: Vec<String> = ('a'..='j').map(|c| c.to_string()).collect();
-        let error = HelpTool
-            .execute(&json!({"protocols": oversized}), &protocols)
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("unknown protocol: a"));
-
-        let error = HelpTool
-            .execute(&json!({"protocols": "capture"}), &protocols)
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("invalid help arguments"));
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn protocol_tool_rejects_malformed_requests() {
-        let (protocols, output) = protocols().await;
-        let error = ProtocolTool
-            .execute(&json!({"requests": ["read capture://value"]}), &protocols)
-            .await
-            .unwrap_err();
-
-        assert!(format!("{error:#}").contains("invalid protocol request"));
-
-        let error = ProtocolTool
-            .execute(&json!({"requests": 42}), &protocols)
-            .await
-            .unwrap_err();
-
-        assert!(format!("{error:#}").contains("invalid protocol arguments"));
-        let _ = tokio::fs::remove_dir_all(output).await;
+        fn assert_fixed(value: &Value, path: &str) {
+            let Some(object) = value.as_object() else {
+                return;
+            };
+            if let Some(kind) = object.get("type") {
+                assert!(
+                    kind.is_string(),
+                    "schema {path}: `type` must be one fixed type"
+                );
+            }
+            assert!(!object.contains_key("anyOf"), "schema {path}: no anyOf");
+            assert!(!object.contains_key("oneOf"), "schema {path}: no oneOf");
+            for (key, child) in object {
+                assert_fixed(child, &format!("{path}.{key}"));
+            }
+        }
+        assert_fixed(&schema, "schema");
     }
 }

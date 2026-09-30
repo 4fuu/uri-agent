@@ -2,15 +2,52 @@ use super::clamp_thinking_level;
 use crate::catalog::{CatalogModel, ThinkingLevel};
 use crate::model::antigravity::resolve_route;
 use http::{HeaderMap, HeaderName, HeaderValue};
+use rig::completion::ToolDefinition;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const CODEX_CLIENT_VERSION: &str = "0.155.1";
+
+/// Original tool parameter schemas for the current request, shared between
+/// the backend that owns the request and the request transform that rewrites
+/// the serialized body. rig-core 0.42 converts tool parameters into its
+/// legacy `Schema` type before sending, which drops `additionalProperties`
+/// and other JSON Schema keywords; the backend publishes each tool's
+/// original schema here so the Google path can send it as
+/// `parametersJsonSchema` instead of the lossy conversion.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ToolSchemas(Arc<Mutex<HashMap<String, Value>>>);
+
+impl ToolSchemas {
+    pub(super) fn publish(&self, tools: &[ToolDefinition]) {
+        let mut schemas = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        schemas.clear();
+        schemas.extend(
+            tools
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.parameters.clone())),
+        );
+    }
+
+    fn original(&self, name: &str) -> Option<Value> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .cloned()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct ModelRequestTransform {
     pub(super) model: CatalogModel,
     pub(super) thinking: ThinkingLevel,
     pub(super) session_id: Option<String>,
+    pub(super) tool_schemas: ToolSchemas,
 }
 
 impl ModelRequestTransform {
@@ -954,6 +991,7 @@ impl ModelRequestTransform {
     /// otherwise); thinking can be disabled with a zero budget only when the
     /// model actually supports `off`.
     fn google(&self, body: &mut Map<String, Value>) {
+        self.restore_original_tool_schemas(body);
         if !self.model.reasoning() {
             return;
         }
@@ -988,6 +1026,36 @@ impl ModelRequestTransform {
                     "includeThoughts": true
                 }),
             );
+        }
+    }
+
+    /// Replaces each function declaration's lossy converted `parameters` with
+    /// the tool's original schema as `parametersJsonSchema`. The legacy
+    /// `Schema` conversion in rig-core 0.42 drops `additionalProperties`, so
+    /// the protocol tool's free-form `input` object would otherwise degrade
+    /// into a propertyless object. Declarations without a published original
+    /// schema are left untouched. Antigravity keeps its own keyword cleanup;
+    /// it moves `parametersJsonSchema` back into `parameters` before sending.
+    fn restore_original_tool_schemas(&self, body: &mut Map<String, Value>) {
+        let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for tool in tools {
+            for key in ["functionDeclarations", "function_declarations"] {
+                let Some(declarations) = tool.get_mut(key).and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                for declaration in declarations.iter_mut().filter_map(Value::as_object_mut) {
+                    let Some(name) = declaration.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(original) = self.tool_schemas.original(name) else {
+                        continue;
+                    };
+                    declaration.remove("parameters");
+                    declaration.insert("parametersJsonSchema".to_string(), original);
+                }
+            }
         }
     }
 

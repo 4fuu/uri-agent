@@ -2,17 +2,18 @@ use crate::output::OutputStore;
 use crate::prompts::PromptEntry;
 use crate::session::{EventKind, SessionEvent};
 use crate::task::TaskManager;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use rig::message::{ImageMediaType, ToolResultContent};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug)]
@@ -60,7 +61,36 @@ impl std::error::Error for ProtocolHelpRequired {}
 #[derive(Clone)]
 pub struct ProtocolContext {
     pub tasks: TaskManager,
+    /// Set for operations the `protocol` tool pinned to the foreground
+    /// because a later step references their result. Protocols that
+    /// auto-promote long foreground work to background tasks must keep such
+    /// operations in the foreground under their own deadline instead.
+    pub pinned_foreground: bool,
 }
+
+impl ProtocolContext {
+    pub fn new(tasks: TaskManager) -> Self {
+        Self {
+            tasks,
+            pinned_foreground: false,
+        }
+    }
+
+    /// The foreground grace before an auto-background promotion. Pinned
+    /// operations never promote, so they wait under a practically unbounded
+    /// grace instead of the protocol's usual one.
+    pub fn foreground_grace(&self, default: Duration) -> Duration {
+        if self.pinned_foreground {
+            PINNED_FOREGROUND_GRACE
+        } else {
+            default
+        }
+    }
+}
+
+/// A century of foreground patience for operations a later step references;
+/// `Duration::MAX` is avoided because waits saturate `Instant` arithmetic.
+const PINNED_FOREGROUND_GRACE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolDescriptor {
@@ -70,105 +100,27 @@ pub struct ProtocolDescriptor {
     pub can_exec: bool,
 }
 
-/// One `*** name: value` header line from a protocol request. Header names
-/// are normalized to lowercase ASCII when the request is parsed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequestHeader {
-    pub name: String,
-    pub value: String,
-}
-
-impl RequestHeader {
-    pub fn new(name: &str, value: &str) -> Self {
-        Self {
-            name: name.to_ascii_lowercase(),
-            value: value.to_string(),
-        }
-    }
-}
-
-/// The comparison operator prefixing a request header value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Comparison {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-impl Comparison {
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Self::Eq => "=",
-            Self::Ne => "!=",
-            Self::Lt => "<",
-            Self::Le => "<=",
-            Self::Gt => ">",
-            Self::Ge => ">=",
-        }
-    }
-}
-
-/// Splits a header value into a leading comparison operator and its operand.
-/// A bare value is equality; `>=`, `<=`, and `!=` are matched before their
-/// single-character prefixes. Fields that do not opt into comparisons treat
-/// their header values verbatim and never call this.
-pub fn parse_comparison(value: &str) -> (Comparison, &str) {
-    for (operator, comparison) in [
-        (">=", Comparison::Ge),
-        ("<=", Comparison::Le),
-        ("!=", Comparison::Ne),
-        (">", Comparison::Gt),
-        ("<", Comparison::Lt),
-        ("=", Comparison::Eq),
-    ] {
-        if let Some(operand) = value.strip_prefix(operator) {
-            return (comparison, operand.trim_start_matches([' ', '\t']));
-        }
-    }
-    (Comparison::Eq, value)
-}
-
 pub struct ProtocolRequest<'a> {
     pub uri: &'a str,
     pub target: &'a str,
-    pub headers: &'a [RequestHeader],
-    pub body: &'a str,
+    pub input: &'a Map<String, Value>,
 }
 
 impl ProtocolRequest<'_> {
-    /// The values of every header with this name, in request order.
-    pub fn header_values(&self, name: &str) -> Vec<&str> {
-        self.headers
-            .iter()
-            .filter(|header| header.name == name)
-            .map(|header| header.value.as_str())
-            .collect()
+    /// Deserialize `input` into a typed struct. The struct must derive
+    /// `#[serde(deny_unknown_fields)]` so unknown fields are rejected with
+    /// the accepted field list, matching the protocol's help page.
+    pub fn input_struct<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_value(Value::Object(self.input.clone()))
+            .with_context(|| format!("invalid input for {}", self.uri))
     }
 
-    /// The value of a header that must appear at most once.
-    pub fn header_value(&self, name: &str) -> Result<Option<&str>> {
-        let values = self.header_values(name);
-        if values.len() > 1 {
-            bail!("duplicate header `{name}` in {}", self.uri);
-        }
-        Ok(values.first().copied())
-    }
-
-    /// Reject headers whose names are not in `allowed`.
-    pub fn reject_unknown_headers(&self, allowed: &[&str]) -> Result<()> {
-        if let Some(header) = self
-            .headers
-            .iter()
-            .find(|header| !allowed.contains(&header.name.as_str()))
-        {
+    /// Reject any `input` field on a route that takes none.
+    pub fn reject_input(&self) -> Result<()> {
+        if let Some(key) = self.input.keys().next() {
             bail!(
-                "unknown header `{}` in {}; supported headers: {}",
-                header.name,
-                self.uri,
-                allowed.join(", ")
+                "unknown input field `{key}` in {}; this route takes no input fields",
+                self.uri
             );
         }
         Ok(())
@@ -242,39 +194,79 @@ impl ProtocolImage {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProtocolReadOutput {
-    content: Vec<u8>,
+/// One completed protocol operation. `text` is the complete text output and
+/// carries the truncation and spill logic when presented; `json` is the
+/// structured output exposed to step references as `<id>.json`; `images`
+/// are typed image results for models that accept them.
+#[derive(Clone, Debug)]
+pub struct ProtocolOutput {
+    text: Vec<u8>,
+    json: Option<Value>,
     images: Vec<ProtocolImage>,
 }
 
-impl ProtocolReadOutput {
-    pub fn new(content: Vec<u8>, images: Vec<ProtocolImage>) -> Self {
-        Self { content, images }
+impl ProtocolOutput {
+    pub fn new(text: Vec<u8>, json: Option<Value>, images: Vec<ProtocolImage>) -> Self {
+        Self { text, json, images }
     }
 
-    pub fn content(&self) -> &[u8] {
-        &self.content
+    pub fn text(text: impl Into<Vec<u8>>) -> Self {
+        Self::new(text.into(), None, Vec::new())
+    }
+
+    pub fn with_json(mut self, json: Value) -> Self {
+        self.json = Some(json);
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<ProtocolImage>) -> Self {
+        self.images = images;
+        self
+    }
+
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    pub fn json(&self) -> Option<&Value> {
+        self.json.as_ref()
     }
 
     pub fn images(&self) -> &[ProtocolImage] {
         &self.images
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<ProtocolImage>) {
-        (self.content, self.images)
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<Value>, Vec<ProtocolImage>) {
+        (self.text, self.json, self.images)
     }
 }
 
-impl From<Vec<u8>> for ProtocolReadOutput {
-    fn from(content: Vec<u8>) -> Self {
-        Self::new(content, Vec::new())
+impl From<Vec<u8>> for ProtocolOutput {
+    fn from(text: Vec<u8>) -> Self {
+        Self::text(text)
     }
 }
 
+impl From<String> for ProtocolOutput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&str> for ProtocolOutput {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
+/// A protocol operation after presentation: `output` is the bounded view the
+/// model sees, `text` keeps the complete text for step references, and
+/// `json` is the structured output.
 #[derive(Debug)]
-pub(crate) struct PresentedProtocolRead {
+pub(crate) struct PresentedProtocolOutput {
     pub output: String,
+    pub text: String,
+    pub json: Option<Value>,
     pub images: Vec<ProtocolImage>,
 }
 
@@ -296,11 +288,20 @@ pub trait Protocol: Send + Sync {
         &[]
     }
 
+    /// Top-level `input` fields whose string values this protocol executes
+    /// verbatim, such as a shell `script`. The `protocol` tool never
+    /// substitutes `{{ reference }}` placeholders in them; data reaches the
+    /// executed text through dedicated input fields instead (for the shell,
+    /// `env`). Nested values inside these fields are not substituted either.
+    fn literal_input_fields(&self) -> &[&str] {
+        &[]
+    }
+
     async fn read(
         &self,
         _request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         bail!("this protocol does not support read")
     }
 
@@ -308,15 +309,15 @@ pub trait Protocol: Send + Sync {
         &self,
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
-    ) -> Result<ProtocolReadOutput> {
-        self.read(request, context).await.map(Into::into)
+    ) -> Result<ProtocolOutput> {
+        self.read(request, context).await
     }
 
     async fn exec(
         &self,
         _request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         bail!("this protocol does not support exec")
     }
 }
@@ -346,7 +347,7 @@ impl ProtocolRegistry {
             protocols: BTreeMap::new(),
             dynamic: Vec::new(),
             output,
-            context: ProtocolContext { tasks },
+            context: ProtocolContext::new(tasks),
             help_read: AsyncMutex::new(HashSet::new()),
             allowed: RwLock::new(None),
         }
@@ -500,40 +501,44 @@ impl ProtocolRegistry {
         self.output.present(content, hint).await
     }
 
-    pub async fn read(&self, uri: &str, body: &str) -> Result<String> {
-        Ok(self.dispatch_read(uri, &[], body, true, true).await?.output)
+    pub async fn read(&self, uri: &str, input: &Map<String, Value>) -> Result<String> {
+        Ok(self
+            .dispatch_read(uri, input, true, true, false)
+            .await?
+            .output)
     }
 
     pub(crate) async fn read_for_model(
         &self,
         uri: &str,
-        headers: &[RequestHeader],
-        body: &str,
-    ) -> Result<PresentedProtocolRead> {
-        self.dispatch_read(uri, headers, body, true, true).await
+        input: &Map<String, Value>,
+        pinned_foreground: bool,
+    ) -> Result<PresentedProtocolOutput> {
+        self.dispatch_read(uri, input, true, true, pinned_foreground)
+            .await
     }
 
-    pub async fn exec(&self, uri: &str, body: &str) -> Result<String> {
-        self.dispatch_exec(uri, &[], body, true, true).await
+    pub async fn exec(&self, uri: &str, input: &Map<String, Value>) -> Result<String> {
+        self.dispatch_exec(uri, input, true, true, false).await
     }
 
     pub(crate) async fn exec_for_model(
         &self,
         uri: &str,
-        headers: &[RequestHeader],
-        body: &str,
-    ) -> Result<String> {
-        self.dispatch_exec(uri, headers, body, true, true).await
+        input: &Map<String, Value>,
+        pinned_foreground: bool,
+    ) -> Result<PresentedProtocolOutput> {
+        self.dispatch_exec_output(uri, input, true, true, pinned_foreground)
+            .await
     }
 
     pub(crate) async fn read_static(
         &self,
         uri: &str,
-        headers: &[RequestHeader],
-        body: &str,
+        input: &Map<String, Value>,
     ) -> Result<String> {
         Ok(self
-            .dispatch_read(uri, headers, body, false, false)
+            .dispatch_read(uri, input, false, false, false)
             .await?
             .output)
     }
@@ -541,10 +546,63 @@ impl ProtocolRegistry {
     pub(crate) async fn exec_static(
         &self,
         uri: &str,
-        headers: &[RequestHeader],
-        body: &str,
+        input: &Map<String, Value>,
     ) -> Result<String> {
-        self.dispatch_exec(uri, headers, body, false, false).await
+        self.dispatch_exec(uri, input, false, false, false).await
+    }
+
+    /// Input fields the named protocol executes verbatim; the `protocol`
+    /// tool leaves `{{ reference }}` placeholders in them untouched. Unknown
+    /// protocols report no literal fields.
+    pub(crate) async fn literal_input_fields(&self, name: &str) -> Vec<String> {
+        self.find_protocol(name, true)
+            .await
+            .map_or_else(Vec::new, |protocol| {
+                protocol
+                    .literal_input_fields()
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect()
+            })
+    }
+
+    /// Validate one planned step operation without running it: the protocol
+    /// exists and is selected, it supports the requested operation, and its
+    /// help page (and every shared prerequisite) is loaded.
+    pub(crate) async fn validate_step_operation(&self, name: &str, exec: bool) -> Result<()> {
+        let descriptor = self
+            .all_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.name == name)
+            .ok_or_else(|| self.unknown_protocol_error(name, true))?;
+        if exec {
+            if !descriptor.can_exec {
+                bail!(
+                    "protocol {name} does not support exec; call help([{name:?}]) and use its documented read operations"
+                );
+            }
+        } else if !descriptor.can_read {
+            bail!(
+                "protocol does not support read: {name}; call help([{name:?}]) and use its documented exec operations"
+            );
+        }
+        self.reject_help_address(name, "value")?;
+        let protocol = self.find_protocol(name, true).await;
+        let help_read = self.help_read.lock().await;
+        let dependencies = protocol.as_ref().map_or(&[][..], |protocol| {
+            let dependencies: &[String] = protocol.help_dependencies();
+            dependencies
+        });
+        if let Some(dependency) = dependencies
+            .iter()
+            .find(|dependency| !help_read.contains(*dependency))
+        {
+            return Err(ProtocolHelpRequired::dependency(dependency, name).into());
+        }
+        if !help_read.contains(name) {
+            return Err(ProtocolHelpRequired::new(name).into());
+        }
+        Ok(())
     }
 
     /// Load help pages for the requested protocols through the help tool.
@@ -590,20 +648,23 @@ impl ProtocolRegistry {
         let mut sections = Vec::with_capacity(ordered.len());
         for (name, protocol) in ordered.iter().zip(resolved) {
             let uri = format!("{name}://help");
+            let input = Map::new();
             let response = protocol
                 .read_output(
                     ProtocolRequest {
                         uri: &uri,
                         target: "help",
-                        headers: &[],
-                        body: "",
+                        input: &input,
                     },
                     self.context.clone(),
                 )
                 .await?;
-            let (content, images) = response.into_parts();
+            let (content, json, images) = response.into_parts();
             if !images.is_empty() {
                 bail!("protocol {name} help must be text-only");
+            }
+            if json.is_some() {
+                bail!("protocol {name} help must be plain text");
             }
             sections.push(self.output.present(content, name).await?);
         }
@@ -711,11 +772,11 @@ impl ProtocolRegistry {
     async fn dispatch_read(
         &self,
         uri: &str,
-        headers: &[RequestHeader],
-        body: &str,
+        input: &Map<String, Value>,
         include_dynamic: bool,
         require_help: bool,
-    ) -> Result<PresentedProtocolRead> {
+        pinned_foreground: bool,
+    ) -> Result<PresentedProtocolOutput> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
@@ -739,30 +800,44 @@ impl ProtocolRegistry {
                 return Err(ProtocolHelpRequired::new(name).into());
             }
         }
+        let mut context = self.context.clone();
+        context.pinned_foreground = pinned_foreground;
         let response = protocol
-            .read_output(
-                ProtocolRequest {
-                    uri,
-                    target,
-                    headers,
-                    body,
-                },
-                self.context.clone(),
-            )
+            .read_output(ProtocolRequest { uri, target, input }, context)
             .await?;
-        let (content, images) = response.into_parts();
+        let (content, json, images) = response.into_parts();
+        let text = String::from_utf8_lossy(&content).into_owned();
         let output = self.output.present(content, name).await?;
-        Ok(PresentedProtocolRead { output, images })
+        Ok(PresentedProtocolOutput {
+            output,
+            text,
+            json,
+            images,
+        })
     }
 
     async fn dispatch_exec(
         &self,
         uri: &str,
-        headers: &[RequestHeader],
-        body: &str,
+        input: &Map<String, Value>,
         include_dynamic: bool,
         require_help: bool,
+        pinned_foreground: bool,
     ) -> Result<String> {
+        Ok(self
+            .dispatch_exec_output(uri, input, include_dynamic, require_help, pinned_foreground)
+            .await?
+            .output)
+    }
+
+    async fn dispatch_exec_output(
+        &self,
+        uri: &str,
+        input: &Map<String, Value>,
+        include_dynamic: bool,
+        require_help: bool,
+        pinned_foreground: bool,
+    ) -> Result<PresentedProtocolOutput> {
         let (name, target) = split_address(uri)?;
         let protocol = self
             .find_protocol(name, include_dynamic)
@@ -789,18 +864,20 @@ impl ProtocolRegistry {
                 name
             );
         }
+        let mut context = self.context.clone();
+        context.pinned_foreground = pinned_foreground;
         let content = protocol
-            .exec(
-                ProtocolRequest {
-                    uri,
-                    target,
-                    headers,
-                    body,
-                },
-                self.context.clone(),
-            )
+            .exec(ProtocolRequest { uri, target, input }, context)
             .await?;
-        self.output.present(content, name).await
+        let (content, json, images) = content.into_parts();
+        let text = String::from_utf8_lossy(&content).into_owned();
+        let output = self.output.present(content, name).await?;
+        Ok(PresentedProtocolOutput {
+            output,
+            text,
+            json,
+            images,
+        })
     }
 
     async fn find_protocol(&self, name: &str, include_dynamic: bool) -> Option<Arc<dyn Protocol>> {
@@ -921,7 +998,7 @@ mod tests {
     struct CapturedRequest {
         uri: String,
         target: String,
-        body: String,
+        input: Value,
     }
 
     struct CaptureProtocol {
@@ -950,8 +1027,8 @@ mod tests {
             &self,
             _request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(self.0.as_bytes().to_vec())
+        ) -> Result<ProtocolOutput> {
+            Ok(ProtocolOutput::text(self.0.as_bytes().to_vec()))
         }
     }
 
@@ -1003,26 +1080,18 @@ mod tests {
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            *self.capture.lock().unwrap() = Some(CapturedRequest {
-                uri: request.uri.to_string(),
-                target: request.target.to_string(),
-                body: request.body.to_string(),
-            });
-            Ok(b"ok".to_vec())
+        ) -> Result<ProtocolOutput> {
+            *self.capture.lock().unwrap() = Some(request.captured());
+            Ok(ProtocolOutput::text("ok"))
         }
 
         async fn exec(
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            *self.capture.lock().unwrap() = Some(CapturedRequest {
-                uri: request.uri.to_string(),
-                target: request.target.to_string(),
-                body: request.body.to_string(),
-            });
-            Ok(b"ok".to_vec())
+        ) -> Result<ProtocolOutput> {
+            *self.capture.lock().unwrap() = Some(request.captured());
+            Ok(ProtocolOutput::text("ok"))
         }
     }
 
@@ -1045,58 +1114,27 @@ mod tests {
             &self,
             _request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(self.name.as_bytes().to_vec())
+        ) -> Result<ProtocolOutput> {
+            Ok(ProtocolOutput::text(self.name.as_bytes().to_vec()))
         }
     }
 
-    #[test]
-    fn header_names_normalize_and_comparisons_split_from_operands() {
-        let header = RequestHeader::new("Mode", "hybrid");
-        assert_eq!(header.name, "mode");
-        assert_eq!(header.value, "hybrid");
-
-        assert_eq!(parse_comparison(">=10"), (Comparison::Ge, "10"));
-        assert_eq!(parse_comparison("> 10"), (Comparison::Gt, "10"));
-        assert_eq!(parse_comparison("<=50"), (Comparison::Le, "50"));
-        assert_eq!(parse_comparison("<50"), (Comparison::Lt, "50"));
-        assert_eq!(parse_comparison("!=x"), (Comparison::Ne, "x"));
-        assert_eq!(parse_comparison("=10"), (Comparison::Eq, "10"));
-        assert_eq!(parse_comparison("10"), (Comparison::Eq, "10"));
-        // An operator inside the value is not a prefix.
-        assert_eq!(parse_comparison("a >= b"), (Comparison::Eq, "a >= b"));
-    }
-
-    struct HeaderEchoProtocol;
-
-    #[async_trait]
-    impl Protocol for HeaderEchoProtocol {
-        fn descriptor(&self) -> ProtocolDescriptor {
-            ProtocolDescriptor {
-                name: "headers".to_string(),
-                description: "header echo test protocol".to_string(),
-                can_read: true,
-                can_exec: false,
+    impl ProtocolRequest<'_> {
+        fn captured(&self) -> CapturedRequest {
+            CapturedRequest {
+                uri: self.uri.to_string(),
+                target: self.target.to_string(),
+                input: Value::Object(self.input.clone()),
             }
         }
+    }
 
-        async fn read(
-            &self,
-            request: ProtocolRequest<'_>,
-            _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(request
-                .headers
-                .iter()
-                .map(|header| format!("{}={}", header.name, header.value))
-                .collect::<Vec<_>>()
-                .join("&")
-                .into_bytes())
-        }
+    fn empty_input() -> Map<String, Value> {
+        Map::new()
     }
 
     #[tokio::test]
-    async fn registry_passes_headers_to_every_protocol() {
+    async fn registry_passes_input_to_every_protocol() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -1107,22 +1145,35 @@ mod tests {
                 capture: capture.clone(),
             })
             .unwrap();
-        registry.register(HeaderEchoProtocol).unwrap();
+        registry.load_help(&["capture".to_string()]).await.unwrap();
+        let input: Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "limit": 10,
+            "nested": {"deep": [1, null, true]},
+        }))
+        .unwrap();
+
         registry
-            .load_help(&["capture".to_string(), "headers".to_string()])
+            .read_for_model("capture://value", &input, false)
             .await
             .unwrap();
-        let headers = [RequestHeader::new("limit", ">=10")];
 
-        let result = registry
-            .read_for_model("headers://value", &headers, "")
-            .await
-            .unwrap();
-        assert_eq!(result.output, "limit=>=10");
+        assert_eq!(
+            capture.lock().unwrap().as_ref().unwrap(),
+            &CapturedRequest {
+                uri: "capture://value".to_string(),
+                target: "value".to_string(),
+                input: Value::Object(input.clone()),
+            }
+        );
 
-        // Calls without headers are unaffected.
-        assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
-        assert_eq!(registry.read("headers://value", "").await.unwrap(), "");
+        // Calls without input are unaffected.
+        assert_eq!(
+            registry
+                .read("capture://value", &empty_input())
+                .await
+                .unwrap(),
+            "ok"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -1191,7 +1242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_passes_opaque_uri_and_string_body_unchanged() {
+    async fn registry_passes_opaque_uri_and_input_unchanged() {
         let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
         let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
         let output_directory = output.directory().to_path_buf();
@@ -1202,11 +1253,15 @@ mod tests {
                 capture: capture.clone(),
             })
             .unwrap();
-        let body = r#"["markdown is fine",{"nested":[1,null,true]}]"#;
+        let input: Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "markdown is fine": "a://b?not=a url",
+            "nested": [1, null, true],
+        }))
+        .unwrap();
         registry.load_help(&["capture".to_string()]).await.unwrap();
 
         let result = registry
-            .read("capture://a://b?not=a url", body)
+            .read("capture://a://b?not=a url", &input)
             .await
             .unwrap();
 
@@ -1216,7 +1271,7 @@ mod tests {
             &CapturedRequest {
                 uri: "capture://a://b?not=a url".to_string(),
                 target: "a://b?not=a url".to_string(),
-                body: body.to_string(),
+                input: Value::Object(input.clone()),
             }
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -1234,10 +1289,14 @@ mod tests {
                 capture: capture.clone(),
             })
             .unwrap();
-        let body = "unchanged";
+        let input: Map<String, Value> =
+            serde_json::from_value(serde_json::json!({"wait": 30})).unwrap();
         registry.load_help(&["capture".to_string()]).await.unwrap();
 
-        let result = registry.exec("capture://run?wait=30", body).await.unwrap();
+        let result = registry
+            .exec("capture://run?wait=30", &input)
+            .await
+            .unwrap();
 
         assert_eq!(result, "ok");
         assert_eq!(
@@ -1245,7 +1304,7 @@ mod tests {
             &CapturedRequest {
                 uri: "capture://run?wait=30".to_string(),
                 target: "run?wait=30".to_string(),
-                body: body.to_string(),
+                input: Value::Object(input.clone()),
             }
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -1320,8 +1379,14 @@ mod tests {
             .unwrap();
 
         for error in [
-            registry.read("capture://value", "").await.unwrap_err(),
-            registry.exec("capture://run", "").await.unwrap_err(),
+            registry
+                .read("capture://value", &empty_input())
+                .await
+                .unwrap_err(),
+            registry
+                .exec("capture://run", &empty_input())
+                .await
+                .unwrap_err(),
         ] {
             assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
             assert_eq!(
@@ -1333,8 +1398,20 @@ mod tests {
 
         let help = registry.load_help(&["capture".to_string()]).await.unwrap();
         assert!(help.contains("Loaded protocols stay loaded"));
-        assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
-        assert_eq!(registry.exec("capture://run", "").await.unwrap(), "ok");
+        assert_eq!(
+            registry
+                .read("capture://value", &empty_input())
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            registry
+                .exec("capture://run", &empty_input())
+                .await
+                .unwrap(),
+            "ok"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -1351,8 +1428,14 @@ mod tests {
             .unwrap();
 
         for error in [
-            registry.read("capture://help", "").await.unwrap_err(),
-            registry.exec("capture://help", "").await.unwrap_err(),
+            registry
+                .read("capture://help", &empty_input())
+                .await
+                .unwrap_err(),
+            registry
+                .exec("capture://help", &empty_input())
+                .await
+                .unwrap_err(),
         ] {
             assert_eq!(
                 error.to_string(),
@@ -1394,16 +1477,19 @@ mod tests {
         assert!(help.contains(r#"the remaining names were skipped: ["p9"]"#));
 
         assert_eq!(
-            registry.read("p1://value", "").await.unwrap(),
+            registry.read("p1://value", &empty_input()).await.unwrap(),
             "p1",
             "the first requested protocol is loaded and unlocked"
         );
         assert_eq!(
-            registry.read("p8://value", "").await.unwrap(),
+            registry.read("p8://value", &empty_input()).await.unwrap(),
             "p8",
             "the eighth requested protocol is loaded and unlocked"
         );
-        let error = registry.read("p9://value", "").await.unwrap_err();
+        let error = registry
+            .read("p9://value", &empty_input())
+            .await
+            .unwrap_err();
         assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
         assert_eq!(
             error.to_string(),
@@ -1439,7 +1525,10 @@ mod tests {
             .select(Some(&["shared".to_string(), "dependent".to_string()]))
             .unwrap();
 
-        let error = registry.read("dependent://value", "").await.unwrap_err();
+        let error = registry
+            .read("dependent://value", &empty_input())
+            .await
+            .unwrap_err();
         assert!(error.downcast_ref::<ProtocolHelpRequired>().is_some());
         assert_eq!(
             error.to_string(),
@@ -1453,7 +1542,10 @@ mod tests {
         assert!(help.contains("shared"));
         assert!(help.contains("dependent"));
         assert_eq!(
-            registry.read("dependent://value", "").await.unwrap(),
+            registry
+                .read("dependent://value", &empty_input())
+                .await
+                .unwrap(),
             "dependent"
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -1473,27 +1565,27 @@ mod tests {
 
         assert!(
             registry
-                .read("capture://value", "")
+                .read("capture://value", &empty_input())
                 .await
                 .unwrap_err()
                 .downcast_ref::<ProtocolHelpRequired>()
                 .is_some()
         );
         registry
-            .read_static("capture://value", &[], "")
+            .read_static("capture://value", &empty_input())
             .await
             .unwrap();
         registry
-            .exec_static("capture://run", &[], "")
+            .exec_static("capture://run", &empty_input())
             .await
             .unwrap();
         registry
-            .read_static("capture://help", &[], "")
+            .read_static("capture://help", &empty_input())
             .await
             .unwrap();
         assert!(
             registry
-                .read("capture://value", "")
+                .read("capture://value", &empty_input())
                 .await
                 .unwrap_err()
                 .downcast_ref::<ProtocolHelpRequired>()
@@ -1540,7 +1632,13 @@ mod tests {
 
         registry.restore_help_reads(&events).await;
 
-        assert_eq!(registry.read("capture://value", "").await.unwrap(), "ok");
+        assert_eq!(
+            registry
+                .read("capture://value", &empty_input())
+                .await
+                .unwrap(),
+            "ok"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 
@@ -1574,5 +1672,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first", "second"]
         );
+    }
+
+    #[tokio::test]
+    async fn validate_step_operation_rejects_unknown_unsupported_and_unloaded_protocols() {
+        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
+        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
+        let output_directory = output.directory().to_path_buf();
+        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
+        registry
+            .register(NamedProtocol("reader".to_string()))
+            .unwrap();
+        registry
+            .register(CaptureProtocol {
+                capture: Arc::new(Mutex::new(None)),
+            })
+            .unwrap();
+
+        assert!(
+            registry
+                .validate_step_operation("missing", false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown protocol: missing")
+        );
+        assert!(
+            registry
+                .validate_step_operation("reader", true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("does not support exec")
+        );
+        assert!(
+            registry
+                .validate_step_operation("capture", false)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ProtocolHelpRequired>()
+                .is_some()
+        );
+        registry.load_help(&["capture".to_string()]).await.unwrap();
+        registry
+            .validate_step_operation("capture", false)
+            .await
+            .unwrap();
+        registry
+            .validate_step_operation("capture", true)
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 }

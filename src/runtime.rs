@@ -2348,8 +2348,12 @@ impl AgentRuntime {
                 let (output, images) = output.into_parts();
                 (output, images, false, false)
             }
-            Err(error) if error.downcast_ref::<ProtocolHelpRequired>().is_some() => {
-                (error.to_string(), Vec::new(), true, true)
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<ProtocolHelpRequired>().is_some()) =>
+            {
+                (format!("{error:#}"), Vec::new(), true, true)
             }
             Err(error) => {
                 let error = format!("Error: {error:#}");
@@ -2674,7 +2678,7 @@ fn task_notification_message(records: &[TaskRecord]) -> String {
         }
         if output_truncated {
             message.push_str(&format!(
-                "\n[Output truncated. If tasks help has not been loaded, call help([\"tasks\"]) first. Then read the complete output once with:\n*** Begin Request\n*** Read: {uri}\n*** End Request]"
+                "\n[Output truncated. If tasks help has not been loaded, call help([\"tasks\"]) first. Then read the complete output once with a step: {{\"read\": \"{uri}\"}}]"
             ));
         }
         message.push('\n');
@@ -2728,7 +2732,9 @@ mod tests {
     use super::*;
     use crate::builtins::context::ContextPlugin;
     use crate::model::ModelDelta;
-    use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+    use crate::protocol::{
+        Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
+    };
     use crate::session::{CollaborationStatus, SessionContext};
     use async_trait::async_trait;
     use rig::message::{ToolCallId, ToolFunction};
@@ -2880,9 +2886,9 @@ mod tests {
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
+        ) -> Result<ProtocolOutput> {
             if request.target == "help" {
-                return Ok(b"blocking help".to_vec());
+                return Ok(b"blocking help".to_vec().into());
             }
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.started.notify_one();
@@ -2905,11 +2911,11 @@ mod tests {
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
+        ) -> Result<ProtocolOutput> {
             Ok(if request.target == "help" {
-                b"image help".to_vec()
+                b"image help".to_vec().into()
             } else {
-                b"test image".to_vec()
+                b"test image".to_vec().into()
             })
         }
 
@@ -2917,12 +2923,13 @@ mod tests {
             &self,
             request: ProtocolRequest<'_>,
             context: ProtocolContext,
-        ) -> Result<crate::protocol::ProtocolReadOutput> {
+        ) -> Result<ProtocolOutput> {
             if request.target == "help" {
-                return self.read(request, context).await.map(Into::into);
+                return self.read(request, context).await;
             }
-            Ok(crate::protocol::ProtocolReadOutput::new(
+            Ok(ProtocolOutput::new(
                 b"test image".to_vec(),
+                None,
                 vec![ProtocolImage::new(
                     b"\x89PNG\r\n\x1a\nimage-data".to_vec(),
                     ProtocolImageMediaType::Png,
@@ -3274,9 +3281,7 @@ mod tests {
                 ToolCallId::new(id).unwrap(),
                 ToolFunction::new(
                     "protocol".to_string(),
-                    serde_json::json!({
-                        "requests": ["*** Begin Request\n*** Read: missing://help\n*** End Request"]
-                    }),
+                    serde_json::json!({"steps": [{"read": "missing://help"}]}),
                 ),
             ))],
             usage: None,
@@ -3299,9 +3304,7 @@ mod tests {
             ToolCallId::new(id).unwrap(),
             ToolFunction::new(
                 "protocol".to_string(),
-                serde_json::json!({
-                    "requests": [format!("*** Begin Request\n*** Read: {uri}\n*** End Request")]
-                }),
+                serde_json::json!({"steps": [{"read": uri}]}),
             ),
         )
     }
@@ -3318,14 +3321,12 @@ mod tests {
         )
     }
 
-    fn exec_call(id: &str, uri: &str, body: &str) -> ToolCall {
+    fn exec_call(id: &str, uri: &str, input: serde_json::Value) -> ToolCall {
         ToolCall::new(
             ToolCallId::new(id).unwrap(),
             ToolFunction::new(
                 "protocol".to_string(),
-                serde_json::json!({
-                    "requests": [format!("*** Begin Request\n*** Exec: {uri}\n{body}\n*** End Request")]
-                }),
+                serde_json::json!({"steps": [{"exec": uri, "input": input}]}),
             ),
         )
     }
@@ -3394,7 +3395,7 @@ mod tests {
         let message = task_notification_message(&[tasks.get(&id).await.unwrap()]);
 
         assert!(message.contains(r#"call help(["tasks"]) first"#));
-        assert!(message.contains("*** Read: tasks://001\n*** End Request"));
+        assert!(message.contains(r#"{"read": "tasks://001"}"#));
         tasks.shutdown().await;
     }
 
@@ -5054,9 +5055,7 @@ mod tests {
             ToolCallId::new("read-image").unwrap(),
             ToolFunction::new(
                 "protocol".to_string(),
-                serde_json::json!({
-                    "requests": ["*** Begin Request\n*** Read: file://screenshot.png\n*** End Request"]
-                }),
+                serde_json::json!({"steps": [{"read": "file://screenshot.png"}]}),
             ),
         );
         let backend = Arc::new(FakeBackend {
@@ -5358,8 +5357,8 @@ mod tests {
 
         runtime.run_turn("skip help".into()).await.unwrap();
 
-        let expected =
-            "Load this protocol first: call help([\"blocking\"]) before using blocking://.";
+        let expected = "invalid protocol arguments: step 1 field `read`: \
+             Load this protocol first: call help([\"blocking\"]) before using blocking://.";
         let events = session.snapshot().await.unwrap();
         assert!(events.iter().any(|event| matches!(
             &event.kind,
@@ -5462,7 +5461,12 @@ mod tests {
             .restore_help_read_names(HashSet::from(["context".to_string()]))
             .await;
         let protocols = Arc::new(protocols);
-        assert!(protocols.read("context://notes", "").await.is_ok());
+        assert!(
+            protocols
+                .read("context://notes", &serde_json::Map::new())
+                .await
+                .is_ok()
+        );
         let runtime = AgentRuntime::new_with_context(
             None,
             protocols.clone(),
@@ -5480,7 +5484,12 @@ mod tests {
             runtime.context_strategy().await,
             compaction::Strategy::Rollover
         );
-        assert!(protocols.read("context://notes", "").await.is_err());
+        assert!(
+            protocols
+                .read("context://notes", &serde_json::Map::new())
+                .await
+                .is_err()
+        );
         assert!(session.successful_protocol_help_reads().await.is_empty());
         assert_eq!(session.context_window_id().await, 2);
         let history = session.model_history().await;
@@ -5570,7 +5579,9 @@ mod tests {
                         AssistantContent::ToolCall(exec_call(
                             "rollover",
                             "context://rollover",
-                            "continue from the recovered task state",
+                            serde_json::json!({
+                                "handoff": "continue from the recovered task state"
+                            }),
                         )),
                         AssistantContent::ToolCall(read_call("notes", "context://notes")),
                     ],
@@ -6056,20 +6067,16 @@ mod tests {
             runtime.context_strategy().await,
             compaction::Strategy::Summary
         );
+        let rollover_uri = "context://rollover".to_string();
+        let rollover_input = serde_json::Map::new();
         let rollover_request = || ProtocolRequest {
-            uri: "context://rollover",
+            uri: &rollover_uri,
             target: "rollover",
-            headers: &[],
-            body: "",
+            input: &rollover_input,
         };
         assert!(
             context_plugin
-                .exec(
-                    rollover_request(),
-                    ProtocolContext {
-                        tasks: TaskManager::new(),
-                    },
-                )
+                .exec(rollover_request(), ProtocolContext::new(TaskManager::new()),)
                 .await
                 .is_err()
         );
@@ -6088,12 +6095,7 @@ mod tests {
         );
         assert!(
             context_plugin
-                .exec(
-                    rollover_request(),
-                    ProtocolContext {
-                        tasks: TaskManager::new(),
-                    },
-                )
+                .exec(rollover_request(), ProtocolContext::new(TaskManager::new()),)
                 .await
                 .is_err()
         );

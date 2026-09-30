@@ -1,5 +1,7 @@
 use crate::plugin::{Plugin, PluginHost};
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
+};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::fmt::Write as _;
@@ -30,8 +32,8 @@ Read the version-matched URI Agent documentation embedded in this binary.
 
 - Read `uri-agent-docs://README.md` for the documentation index.
 - Read `uri-agent-docs://<filename>` to load a document linked by the index.
-- Targets are exact, case-sensitive filenames and do not accept paths or request headers.
-- These reads take no body.
+- Targets are exact, case-sensitive filenames and do not accept paths.
+- These reads take no input fields.
 
 Available documents:
 "#,
@@ -70,24 +72,13 @@ impl Protocol for UriAgentDocsProtocol {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if !request.body.is_empty() {
-            if request.target == "help" {
-                bail!("uri-agent-docs://help requires an empty body");
-            }
-            bail!(
-                "uri-agent-docs reads take no body; retry with a `*** Read: {}` request",
-                request.uri
-            );
-        }
-        if !request.headers.is_empty() {
-            bail!("{PROTOCOL_NAME} reads accept no request headers");
-        }
+    ) -> Result<ProtocolOutput> {
+        request.reject_input()?;
         if request.target == "help" {
-            return Ok(help().into_bytes());
+            return Ok(help().into());
         }
         if let Some((_, content)) = DOCUMENTS.iter().find(|(name, _)| *name == request.target) {
-            return Ok(content.as_bytes().to_vec());
+            return Ok(content.as_bytes().to_vec().into());
         }
         bail!(
             r#"unknown {PROTOCOL_NAME} read target: {}; call help(["{PROTOCOL_NAME}"]) for the exact filename list"#,
@@ -100,19 +91,18 @@ impl Protocol for UriAgentDocsProtocol {
 mod tests {
     use super::*;
     use crate::task::TaskManager;
+    use serde_json::{Map, Value, json};
 
-    async fn read(target: &str) -> Result<Vec<u8>> {
+    async fn read(target: &str) -> Result<ProtocolOutput> {
+        let input = Map::new();
         UriAgentDocsProtocol
             .read(
                 ProtocolRequest {
                     uri: &format!("{PROTOCOL_NAME}://{target}"),
                     target,
-                    headers: &[],
-                    body: "",
+                    input: &input,
                 },
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
     }
@@ -120,11 +110,11 @@ mod tests {
     #[tokio::test]
     async fn reads_embedded_documentation_and_reports_the_complete_index() {
         assert_eq!(
-            read("README.md").await.unwrap(),
+            read("README.md").await.unwrap().text_bytes(),
             include_bytes!("../../docs/README.md")
         );
 
-        let help = String::from_utf8(read("help").await.unwrap()).unwrap();
+        let help = String::from_utf8(read("help").await.unwrap().text_bytes().to_vec()).unwrap();
         for (name, _) in DOCUMENTS {
             assert!(help.contains(&format!("`{name}`")));
         }
@@ -132,7 +122,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_document_linked_by_the_index_is_readable() {
-        let index = String::from_utf8(read("README.md").await.unwrap()).unwrap();
+        let index =
+            String::from_utf8(read("README.md").await.unwrap().text_bytes().to_vec()).unwrap();
         let mut linked = Vec::new();
         let mut rest = index.as_str();
         while let Some(position) = rest.find("](") {
@@ -158,5 +149,22 @@ mod tests {
                 .to_string()
                 .contains("unknown uri-agent-docs read target")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_any_input_field() {
+        let input: Map<String, Value> = serde_json::from_value(json!({"offset": 1})).unwrap();
+        let error = UriAgentDocsProtocol
+            .read(
+                ProtocolRequest {
+                    uri: "uri-agent-docs://README.md",
+                    target: "README.md",
+                    input: &input,
+                },
+                ProtocolContext::new(TaskManager::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("takes no input fields"));
     }
 }

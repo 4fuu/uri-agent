@@ -23,7 +23,7 @@ use zvec_rust::{
     SearchQuery,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const ZVEC_VERSION: &str = "0.7.0";
 const MODEL_SHA256: &str = "75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c";
 const TOKENIZER_SHA256: &str = "107bbdcbad4bff1d299b7a4c3a2fb17c52890688b7dd0e4c9deab79d3c4f3d45";
@@ -1498,7 +1498,7 @@ mod tests {
     async fn cancellation_before_rebuild_never_activates_an_index() {
         let directory = tempfile::tempdir().unwrap();
         let spec = IndexSpec::at(
-            directory.path().join("retrieval/v2/test/index"),
+            directory.path().join("retrieval/v3/test/index"),
             "test",
             "source",
             "extractor-v1",
@@ -1529,7 +1529,7 @@ mod tests {
     #[test]
     fn cache_directories_and_metadata_are_owner_only() {
         let directory = tempfile::tempdir().unwrap();
-        let namespace = directory.path().join("retrieval/v2/context");
+        let namespace = directory.path().join("retrieval/v3/context");
         let index = namespace.join("index");
         let temporary = namespace.join(".index.build.tmp");
         let spec = IndexSpec::at(index.clone(), "test", "source", "extractor-v1");
@@ -1544,7 +1544,7 @@ mod tests {
 
         for path in [
             directory.path().join("retrieval"),
-            directory.path().join("retrieval/v2"),
+            directory.path().join("retrieval/v3"),
             namespace,
             index.clone(),
             temporary,

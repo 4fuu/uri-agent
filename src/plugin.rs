@@ -938,8 +938,8 @@ fn unknown_model_tool(name: &str, protocols: &ProtocolRegistry) -> anyhow::Error
     if matches!(name, "read" | "exec") || is_protocol {
         anyhow::anyhow!(
             "unknown model tool: {name}; protocols are not tools: call it through the \
-             `protocol` tool with its <protocol>:// address, using the request format its \
-             `requests` parameter defines"
+             `protocol` tool with its <protocol>:// address in a step's `read` or `exec` \
+             field, with `input` fields defined by its help page"
         )
     } else {
         anyhow::anyhow!("unknown model tool: {name}")

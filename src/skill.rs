@@ -1,6 +1,7 @@
 use crate::config::{display_path, path_is_within};
 use crate::protocol::{
-    DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest,
+    DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput,
+    ProtocolRequest,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -12,7 +13,7 @@ use std::sync::{Arc, RwLock};
 
 fn help(skill_md: &str, skill_directory: &Path, protocol: &str) -> String {
     format!(
-        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read takes no body.\n",
+        "{skill_md}\n\nSkill files: file://{}/\nBundled resource route: {protocol}://<relative-path>\n`<relative-path>` is relative to this Skill directory.\nEvery `{protocol}` read takes no input fields.\n",
         display_path(skill_directory)
     )
 }
@@ -141,25 +142,8 @@ impl Protocol for SkillProtocol {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if !request.body.is_empty() {
-            if request.target == "help" {
-                bail!(
-                    "skill help takes no body; retry with a `*** Read: {}` request",
-                    request.uri
-                );
-            }
-            if request.target.is_empty() {
-                bail!(
-                    "skill reads take no body; put the relative resource path in the URI, for example `*** Read: {}://<relative-path>`",
-                    self.protocol
-                );
-            }
-            bail!(
-                "skill reads take no body; retry with a `*** Read: {}` request",
-                request.uri
-            );
-        }
+    ) -> Result<ProtocolOutput> {
+        request.reject_input()?;
         let root = self
             .snapshot
             .path
@@ -173,7 +157,7 @@ impl Protocol for SkillProtocol {
                     display_path(&self.snapshot.path)
                 )
             })?;
-            return Ok(help(&skill_md, root, &self.protocol).into_bytes());
+            return Ok(help(&skill_md, root, &self.protocol).into_bytes().into());
         }
         if request.target.is_empty() {
             bail!(
@@ -198,7 +182,9 @@ impl Protocol for SkillProtocol {
         if !metadata.is_file() {
             bail!("skill resource is not a file: {}", request.target);
         }
-        fs::read(&candidate).with_context(|| format!("cannot read {}", display_path(&candidate)))
+        Ok(fs::read(&candidate)
+            .with_context(|| format!("cannot read {}", display_path(&candidate)))?
+            .into())
     }
 }
 
@@ -313,6 +299,11 @@ fn skill_protocol_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Map;
+
+    fn empty_input() -> Map<String, serde_json::Value> {
+        Map::new()
+    }
 
     #[test]
     fn one_skill_gets_one_stable_protocol() {
@@ -368,48 +359,43 @@ mod tests {
         .unwrap();
         fs::write(directory.path().join("check.sh"), "echo ok").unwrap();
         let skill = SkillProtocol::load(&directory.path().join("SKILL.md")).unwrap();
-        let context = ProtocolContext {
-            tasks: crate::task::TaskManager::new(),
-        };
+        let context = ProtocolContext::new(crate::task::TaskManager::new());
         let help = skill
             .read(
                 ProtocolRequest {
                     uri: "code-review-skill://help",
                     target: "help",
-                    headers: &[],
-                    body: "",
+                    input: &empty_input(),
                 },
                 context.clone(),
             )
             .await
             .unwrap();
-        let help = String::from_utf8(help).unwrap();
+        let help = String::from_utf8(help.text_bytes().to_vec()).unwrap();
         assert!(help.contains("Skill files: file://"));
         assert!(help.contains("code-review-skill://<relative-path>"));
         assert!(help.contains("relative to this Skill directory"));
         assert!(help.contains("Every `code-review-skill` read"));
-        assert!(help.contains("Every `code-review-skill` read takes no body."));
+        assert!(help.contains("Every `code-review-skill` read takes no input fields."));
         let resource = skill
             .read(
                 ProtocolRequest {
                     uri: "code-review-skill://check.sh",
                     target: "check.sh",
-                    headers: &[],
-                    body: "",
+                    input: &empty_input(),
                 },
                 context.clone(),
             )
             .await
             .unwrap();
-        assert_eq!(resource, b"echo ok");
+        assert_eq!(resource.text_bytes(), b"echo ok");
 
         let error = skill
             .read(
                 ProtocolRequest {
                     uri: "code-review-skill://",
                     target: "",
-                    headers: &[],
-                    body: "",
+                    input: &empty_input(),
                 },
                 context.clone(),
             )
@@ -426,8 +412,7 @@ mod tests {
                 ProtocolRequest {
                     uri: "code-review-skill://../outside",
                     target: "../outside",
-                    headers: &[],
-                    body: "",
+                    input: &empty_input(),
                 },
                 context,
             )
@@ -448,12 +433,9 @@ mod tests {
                     ProtocolRequest {
                         uri: "code-review-skill://outside-link",
                         target: "outside-link",
-                        headers: &[],
-                        body: "",
+                        input: &empty_input(),
                     },
-                    ProtocolContext {
-                        tasks: crate::task::TaskManager::new(),
-                    },
+                    ProtocolContext::new(crate::task::TaskManager::new()),
                 )
                 .await
                 .unwrap_err();
@@ -490,16 +472,17 @@ mod tests {
                 ProtocolRequest {
                     uri: "review-skill://help",
                     target: "help",
-                    headers: &[],
-                    body: "",
+                    input: &empty_input(),
                 },
-                ProtocolContext {
-                    tasks: crate::task::TaskManager::new(),
-                },
+                ProtocolContext::new(crate::task::TaskManager::new()),
             )
             .await
             .unwrap();
-        assert!(String::from_utf8(help).unwrap().contains("changed body"));
+        assert!(
+            String::from_utf8(help.text_bytes().to_vec())
+                .unwrap()
+                .contains("changed body")
+        );
 
         fs::remove_file(path).unwrap();
         let replacement_directory = directory.path().join("replacement");
@@ -520,12 +503,9 @@ mod tests {
                 ProtocolRequest {
                     uri: "review-skill://help",
                     target: "help",
-                    headers: &[],
-                    body: "",
+                    input: &empty_input(),
                 },
-                ProtocolContext {
-                    tasks: crate::task::TaskManager::new(),
-                },
+                ProtocolContext::new(crate::task::TaskManager::new()),
             )
             .await
             .unwrap_err();

@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub const HELP_TOOL_DESCRIPTION: &str = "Load the usage contract of one or more protocols. Call this once before the first call to any protocol.";
 
-pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call a registered protocol with its `<protocol>://` address; the `requests` parameter defines the fixed request format.";
+pub const PROTOCOL_TOOL_DESCRIPTION: &str = "Call registered protocols through ordered steps. The `steps` parameter takes one to eight JSON step objects, each carrying a `read` or `exec` address plus an optional `input` object; each protocol's help page defines its addresses and input fields.";
 
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
@@ -33,11 +33,13 @@ pub fn system_prompt(
     write_entries(&mut prompt, protocols);
     prompt.push_str(
         "\nChoose a direct tool or a protocol as appropriate for the operation.\n\n\
-         Direct tools are called by name. Protocols are not tools: call them through the `protocol` tool with their <protocol>:// address, using the request format its `requests` parameter defines.\n\n\
+         Direct tools are called by name. Protocols are not tools: call them through the `protocol` tool by passing their <protocol>:// address in a step object.\n\n\
          Protocol rules:\n\
-         - Load help first. Before the first call to any protocol, you MUST call help with that protocol's name; batch several protocols in one call.\n\
-         - Follow the loaded help pages exactly. Only they define a protocol's valid addresses, parameters, and body formats; never guess them.\n\
-         - Protocol request format: `*** Begin Request`, one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line, optional `*** name: value` header lines, a `*** Body:` separator line when headers are present, optional body lines, then a final `*** End Request` line. The closing line is required even when the operation takes no body.\n\
+         - Load help first. Before the first call to any protocol, you MUST call help with that protocol's name, for example help([\"file\"]); batch several protocols in one call.\n\
+         - Follow the loaded help pages exactly. Only they define a protocol's valid addresses and input fields; never guess them.\n\
+         - Protocol call format: the `steps` parameter is an array of one to eight JSON objects, one object per operation. Each step carries exactly one of `read` or `exec`, the `<protocol>://<target>` address, plus an optional `input` object with that protocol's arguments exactly as its help page defines them; omit `input` when the operation takes none.\n\
+         - Step control fields: `id` names a step for later references, `if` runs the step only when its condition is true, `for` with `max` runs it once per element of a referenced list, and `show` (`all`, `errors`, or `none`) controls whether its output enters the result. The whole call is validated before anything runs.\n\
+         - Write each step as one single-line JSON object. Examples: {\"steps\": [{\"read\": \"file://src/main.rs\"}]} and {\"steps\": [{\"id\": \"tests\", \"exec\": \"bash://run\", \"input\": {\"script\": \"cargo test\"}, \"show\": \"errors\"}, {\"if\": \"not tests.ok\", \"read\": \"file://target/test.log\"}]}\n\
          - Protocol addresses use the custom form <protocol>://<opaque-target>. Angle-bracketed values are placeholders: replace them with actual values.\n",
     );
     prompt.push_str(
@@ -86,20 +88,20 @@ fn tool_order(name: &str) -> usize {
 
 pub fn task_accepted(id: &str) -> String {
     format!(
-        "Background task started: tasks://{id}\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, load the tasks protocol with help([\"tasks\"]) if needed, then use one bounded wait. Do not poll or rerun the operation."
+        "Background task started: tasks://{id}\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, load the tasks protocol with help([\"tasks\"]) if needed, then use one bounded wait. Do not poll or rerun the operation. A bounded wait is one read step with a wait input: {{\"read\": \"tasks://{id}\", \"input\": {{\"wait\": 30}}}}."
     )
 }
 
 pub fn interactive_task_accepted(id: &str) -> String {
     format!(
-        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with:\n\n*** Begin Request\n*** Exec: tasks://{id}/send\n<input>\n*** End Request\n\nThe input is written exactly, except that the newline before the final `*** End Request` belongs to the request format and is not sent; add one extra empty line before it to end input with a newline. Close stdin with an `*** Exec: tasks://{id}/eof` request and interrupt with an `*** Exec: tasks://{id}/interrupt` request. Read current output with a `*** Read: tasks://{id}` request and use one bounded wait when the result is needed. Do not poll or rerun the operation."
+        "Interactive task started: tasks://{id}\nCompletion will be delivered automatically. Load the tasks protocol with help([\"tasks\"]) if needed, then send input with a {{\"exec\": \"tasks://{id}/send\", \"input\": {{\"text\": \"<input>\"}}}} step; `text` is delivered to the process byte-for-byte. Close stdin with a {{\"exec\": \"tasks://{id}/eof\"}} step and interrupt with a {{\"exec\": \"tasks://{id}/interrupt\"}} step. Read current output with a {{\"read\": \"tasks://{id}\"}} step and use one bounded wait when the result is needed. Do not poll or rerun the operation."
     )
 }
 
 pub fn truncated_output(preview: &str, complete_file: &Path) -> String {
+    let uri = format!("file://{}", display_path(complete_file));
     format!(
-        "{preview}\n\n[output truncated]\nFull output: file://{}",
-        display_path(complete_file)
+        "{preview}\n\n[output truncated]\nFull output: {uri}\nRead the complete output once with: {{\"read\": \"{uri}\"}}"
     )
 }
 
@@ -130,18 +132,23 @@ mod tests {
                 < prompt.find("Available protocols:").unwrap()
         );
         assert!(prompt.contains("you MUST call help with that protocol's name"));
+        assert!(prompt.contains(r#"help(["file"])"#));
         assert!(prompt.contains("never guess them."));
-        assert!(prompt.contains("Protocol request format: `*** Begin Request`"));
         assert!(prompt.contains(
-            "one `*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line"
+            "the `steps` parameter is an array of one to eight JSON objects, one object per \
+             operation"
         ));
-        assert!(prompt.contains("then a final `*** End Request` line"));
-        assert!(prompt.contains("even when the operation takes no body"));
+        assert!(prompt.contains("exactly one of `read` or `exec`"));
+        assert!(prompt.contains("an optional `input` object"));
+        assert!(prompt.contains("Step control fields: `id`"));
+        assert!(prompt.contains("`for` with `max`"));
+        assert!(prompt.contains("`show` (`all`, `errors`, or `none`)"));
+        assert!(prompt.contains(r#"Examples: {"steps": [{"read": "file://src/main.rs"}]}"#));
+        assert!(prompt.contains(r#"{"if": "not tests.ok", "read": "file://target/test.log"}"#));
         assert!(prompt.contains("Choose a direct tool or a protocol as appropriate"));
         assert!(prompt.contains(
-            "Direct tools are called by name. Protocols are not tools: call them through the \
-             `protocol` tool with their <protocol>:// address, using the request format its \
-             `requests` parameter defines."
+            "Direct tools are called by name. Protocols are not tools: call them through \
+                 the `protocol` tool by passing their <protocol>:// address in a step object."
         ));
         assert!(
             prompt.find("Direct tools are called by name.").unwrap()
@@ -219,7 +226,7 @@ mod tests {
     fn task_acceptance_points_to_bounded_wait_without_inviting_polling() {
         assert_eq!(
             task_accepted("001"),
-            "Background task started: tasks://001\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, load the tasks protocol with help([\"tasks\"]) if needed, then use one bounded wait. Do not poll or rerun the operation."
+            "Background task started: tasks://001\nCompletion will be delivered automatically. Continue any independent work. If progress depends on this result, load the tasks protocol with help([\"tasks\"]) if needed, then use one bounded wait. Do not poll or rerun the operation. A bounded wait is one read step with a wait input: {\"read\": \"tasks://001\", \"input\": {\"wait\": 30}}."
         );
     }
 
@@ -228,16 +235,25 @@ mod tests {
         let message = interactive_task_accepted("002");
         assert!(message.starts_with("Interactive task started: tasks://002"));
         assert!(message.contains(r#"help(["tasks"])"#));
-        assert!(message.contains("*** Exec: tasks://002/send"));
-        assert!(message.contains("<input>"));
-        assert!(!message.contains("*** Body:"));
         assert!(message.contains(
-            "the newline before the final `*** End Request` belongs to the request format and is not sent"
+            r#"send input with a {"exec": "tasks://002/send", "input": {"text": "<input>"}} step"#
         ));
-        assert!(message.contains("add one extra empty line before it to end input with a newline"));
-        assert!(message.contains("*** Exec: tasks://002/eof"));
-        assert!(message.contains("*** Exec: tasks://002/interrupt"));
-        assert!(message.contains("*** Read: tasks://002"));
+        assert!(message.contains("<input>"));
+        assert!(message.contains(r#"{"exec": "tasks://002/eof"}"#));
+        assert!(message.contains(r#"{"exec": "tasks://002/interrupt"}"#));
+        assert!(message.contains(r#"{"read": "tasks://002"}"#));
         assert!(message.contains("Do not poll or rerun the operation"));
+    }
+
+    #[test]
+    fn truncated_output_links_the_file_and_a_single_read_step() {
+        let message = truncated_output("preview", Path::new("logs/full.txt"));
+        assert!(message.starts_with("preview\n\n[output truncated]\n"));
+        assert!(message.contains("Full output: file://logs/full.txt"));
+        assert!(
+            message.contains(
+                r#"Read the complete output once with: {"read": "file://logs/full.txt"}"#
+            )
+        );
     }
 }

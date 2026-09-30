@@ -2,7 +2,7 @@
 
 URI Agent keeps the initial model interface small and loads operational detail
 only when a capability is needed. This document explains that design and the
-stable behavior shared across protocols. For exact addresses, headers,
+stable behavior shared across protocols. For exact addresses, input fields,
 limits, and examples, load the protocol's page through the `help` tool;
 direct-tool schemas are authoritative for their arguments.
 
@@ -12,7 +12,7 @@ Linked built-ins register four tools:
 
 ```text
 help(protocols: string[])
-protocol(requests: string[])
+protocol(steps: object[])
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
@@ -25,32 +25,69 @@ loaded yet, and the exact `<name>://help` address is not readable through
 it. Loaded contracts stay loaded for the rest of the session and are
 restored on resume.
 
-`protocol` takes one to eight request strings per call and executes them in
-order. Requests in one call must be independent: no request can use another's
-result, and one failing request does not affect the others. With more than one
-request the results arrive in order as `*** Result <n> of <m>: ok` or
-`*** Result <n> of <m>: error` sections.
+`protocol` takes one to eight steps per call and executes them in order. Each
+step is one JSON object with exactly one of `read` or `exec` — the
+`<protocol>://<target>` address to read or execute — plus an optional `input`
+object and optional control fields. Steps in one call may chain through
+references; one failing step does not affect the others. Results arrive in
+step order as `*** Result <n> of <m>: ok`, `: error`, or `: skipped` sections
+(loop elements use `<n>.<k>`), each followed by the step's output unless
+`show` hides it.
 
-Each request uses one fixed format: a `*** Begin Request` line, one
-`*** Read: <protocol>://<target>` or `*** Exec: <protocol>://<target>` line,
-optional `*** name: value` header lines, a `*** Body:` separator line when any
-header is present, optional raw body lines, and a `*** End Request` line. The
-request ends at the last `*** End Request` line; the lines between the header
-section (or the operation line) and it are the request body and are passed
-verbatim, so a body line exactly matching `*** End Request` can be sent. The
-newline before the final `*** End Request` line belongs to the request format,
-so one extra empty line before it ends the body with a newline. Omit the body
-when the operation takes no body. Complete serialized JSON is that body only
-when a protocol explicitly requires it. Structural lines must match exactly.
-Without headers a leading `*** Body:` line is still accepted and skipped so
-earlier requests keep working.
+```json
+{"steps": [{"read": "file://src/main.rs"}]}
+```
 
-Header names are ASCII letters, digits, `-`, and `_`, matched
-case-insensitively. Each protocol's help page lists the headers it accepts,
-and every protocol rejects headers it does not document. Comparable
-numeric headers accept a comparison prefix — `>=10`, `>10`, `<=50`, `<50` —
-where the protocol documents it; one lower and one upper bound may combine
-into a range. Runtime-loaded WASM plugins may add typed direct tools.
+### Step fields
+
+- `read` or `exec` (exactly one, required): the address. The prefix before
+  `://` names the protocol; the opaque remainder is the target.
+- `input` (object): the protocol's input fields exactly as its help page
+  documents. Omit it when the operation takes none. Every protocol rejects
+  input fields it does not document.
+- `id` (`[a-z][a-z0-9_]*`, unique within the call): names the step so later
+  steps can reference it.
+- `if` (string): a condition; the step runs only when it is true.
+- `for` (string) and `max` (integer, 1..=32): `for` is `<name> in
+  <reference>` and runs the step once per element of the referenced list, in
+  order. `max` is required with `for` and bounds the list: a longer list
+  fails the step before any element runs. The step's own value is the list of
+  its per-element values; the loop variable is visible only inside the step.
+- `show` (`all`, `errors`, or `none`): whether the step's output enters the
+  result. `all` is the default; `errors` shows only failures; `none` shows
+  only the status line.
+
+### References and substitution
+
+Each step with an `id` exposes `<id>.ok` (true when the operation succeeded),
+`<id>.text` (the complete text output), and `<id>.json` (structured output,
+or null). References start with a step `id` or a `for` variable and continue
+with `.field` and `[index]` segments; they may point only to earlier steps.
+
+Conditions are `[not] operand [comparator operand]`. Operands are references
+or literals (numbers, double-quoted strings, `true`, `false`, `null`);
+comparators are `==`, `!=`, `<`, `<=`, `>`, and `>=` over two numbers or two
+strings; `not` negates.
+
+In `input`, a string value that is exactly `{{ reference }}` is replaced by
+the referenced value with its JSON type preserved. Any other string stays
+literal, including strings that contain `{{`; a literal string that is
+exactly a placeholder is written `{{ "{{name}}" }}`. Input text that a
+protocol executes verbatim — a shell `script`, for example — is never
+substituted; data reaches it through dedicated fields such as the shell `env`
+object. In `read` and `exec` addresses, `{{ reference }}` placeholders are
+replaced as text inside the string and must reference a string, number, or
+boolean.
+
+### Validation
+
+The whole call is validated before anything runs: field presence and types,
+protocol existence, loaded help, `read`/`exec` support, reference targets and
+ordering, `for`/`max` pairing, and expression syntax. A rejected call runs
+nothing. A step whose `input`, address, or `for` source references a failed or
+skipped step is skipped with that reason; an `if` may still read `.ok` of a
+failed step. A call expands to at most 64 operations; further steps are
+reported as skipped.
 
 A protocol may declare shared-help prerequisites; `help` loads them
 automatically ahead of the requested protocol, and using the dependent protocol
@@ -60,12 +97,12 @@ Routing is deliberately generic:
 
 1. split the address only at the first `://`;
 2. use the prefix as the registered protocol name;
-3. pass the opaque remainder, the parsed headers, and the string body to that
-   protocol unchanged.
+3. pass the opaque remainder and the `input` object to that protocol
+   unchanged.
 
-The registry does not parse protocol-specific paths or headers. Protocol
+The registry does not parse protocol-specific paths or input fields. Protocol
 names are unique, and duplicate registration fails rather than replacing an
-existing capability.
+existing capability. Runtime-loaded WASM plugins may add typed direct tools.
 
 ## Built-in capabilities
 
@@ -99,9 +136,10 @@ the `help` tool loads the shared page automatically. Connections are lazy and
 belong to one Agent session.
 
 Tool and prompt catalogs remain behind protocol reads, and each operation uses
-the server's current JSON Schema. Simple arguments are passed as request
-headers; complex arguments can use a complete JSON body. Read the active help
-before constructing either form rather than relying on copied static syntax.
+the server's current JSON Schema. The tool's arguments are the step's `input`
+object, passed to the server unchanged, including nested objects and strings
+with quotes or newlines. Read the active help before constructing a call
+rather than relying on copied static syntax.
 
 Every operation resolves current server and Agent Environment configuration.
 Changing either reconnects the server; removing or disabling a server already
@@ -123,19 +161,8 @@ explicit indexing is only for prewarming or repair. Use exact search for known
 identifiers, hybrid search for most conceptual queries, and semantic search
 when relevant text is likely to use different wording.
 
-```text
-*** Begin Request
-*** Read: search://src
-ProtocolRequest
-*** End Request
-
-*** Begin Request
-*** Read: search://src
-*** mode: hybrid
-*** glob: **/*.rs
-*** Body:
-credential refresh flow
-*** End Request
+```json
+{"steps": [{"read": "search://src", "input": {"query": "credential refresh flow", "mode": "hybrid", "glob": "**/*.rs"}}]}
 ```
 
 `context` exposes bounded recovery information for the active conversation,
@@ -151,14 +178,15 @@ All model-facing saved-session addresses use `context://sessions/...`.
 
 ### Delegated search
 
-`finder` runs one delegated lookup per call. The request body is a complete
-natural-language question; `finder://<root>` restricts code search to one
-project-relative or absolute directory with the same root rules as `search://`,
-while web reads stay unscoped. Each call starts a depth-2 Agent with read-only
-search, file, web, and task capabilities, a finder system prompt, and the model
-configured for the `finder` role; the reply ceiling is that model's own catalog
-output limit. The calling model receives the finder's final reply directly or
-through a background task after the foreground grace period.
+`finder` runs one delegated lookup per call. The `question` input field is a
+complete natural-language question; `finder://<root>` restricts code search to
+one project-relative or absolute directory with the same root rules as
+`search://`, while web reads stay unscoped. Each call starts a depth-2 Agent
+with read-only search, file, web, and task capabilities, a finder system
+prompt, and the model configured for the `finder` role; the reply ceiling is
+that model's own catalog output limit. The calling model receives the finder's
+final reply directly or through a background task after the foreground grace
+period.
 
 The protocol is registered only for new depth-1 sessions whose `finder` role
 resolves ([Model roles](configuration.md#model-roles-and-plugin-settings)); it
@@ -175,7 +203,7 @@ session ID, working directory, bounded first-request summary, provider/model,
 `idle` or `working` status, queue depth, and last heartbeat. Names resolve only
 while active; stable IDs remain suitable for `context://sessions/...` reads.
 
-Messages use a plain-text request body and target one active name or
+Messages use the `message` input field and target one active name or
 session ID.
 `queue` durably schedules a later turn, while `steer` targets the next model
 boundary and becomes a queued turn if the target is idle. The host wraps the

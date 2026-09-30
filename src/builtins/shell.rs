@@ -2,12 +2,13 @@ use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, Plu
 use crate::process::{PWSH_STDIN_BOOTSTRAP, ProcessTree};
 use crate::prompts;
 use crate::protocol::{
-    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest, RequestHeader,
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
 };
 use crate::task::{AutoTask, TaskControls, TaskInput, TaskManager};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -37,67 +38,47 @@ const BASH_HELP: &str = r#"# bash
 Run Bash commands. Commands start in the foreground and normally return their
 final result in the same `protocol` tool call.
 
-`*** Read:` requests support no shell operations. To run a
-command, use an `*** Exec: bash://run` request whose request body MUST
-contain at least one non-whitespace character:
+Read steps support no shell operations. Run a command with one exec step:
 
-```text
-*** Begin Request
-*** Exec: bash://run
-cargo test
-*** End Request
-```
+{"exec": "bash://run", "input": {"script": "cargo test"}}
+
+`bash://run` accepts these `input` fields; unknown fields are rejected:
+
+- `script` (string, required): the Bash script to run. It must contain at
+  least one non-whitespace character.
+- `background` (boolean, default false): return a task handle immediately
+  instead of waiting for the command.
+- `interactive` (boolean, default false): keep stdin open for runtime input
+  such as confirmation prompts, passwords, and REPLs. Interactive commands are
+  always background tasks; omit `background` or set it to true.
+- `timeout` (integer seconds, default 1800): execution timeout shared by
+  foreground and background runs; 0 disables the timeout.
+- `env` (object of string values): extra environment variables for this
+  command, overriding the Agent-managed environment.
 
 If a foreground command is still running after about 60 seconds, URI Agent
 automatically converts the same process into a background task without
-restarting it. Shell options travel as `*** name: value` request header lines
-between the operation line and the `*** Body:` separator. Use a
-`background: true` header to return a task immediately:
+restarting it.
 
-```text
-*** Begin Request
-*** Exec: bash://run
-*** background: true
-*** Body:
-cargo test
-*** End Request
-```
+Examples:
 
-Foreground and background commands share one execution timeout. A `timeout`
-header carries an integer number of seconds; omission defaults to 1800
-seconds (30 minutes), and `timeout: 0` disables the timeout:
+{"exec": "bash://run", "input": {"script": "cargo test", "timeout": 120}}
 
-```text
-*** Begin Request
-*** Exec: bash://run
-*** timeout: 120
-*** Body:
-cargo test
-*** End Request
-```
+{"exec": "bash://run", "input": {"script": "cargo test", "background": true}}
 
-Commands that need runtime input (confirmation prompts, passwords, REPLs)
-must run with an `interactive: true` header. Interactive commands are always
-managed background tasks and keep their stdin open:
+{"exec": "bash://run", "input": {"script": "mysql -u root -p", "interactive": true, "timeout": 0}}
 
-```text
-*** Begin Request
-*** Exec: bash://run
-*** interactive: true
-*** Body:
-mysql -u root -p
-*** End Request
-```
+Data never reaches a script through string interpolation. Pass values through
+`env` and read them as variables:
+`{"exec": "bash://run", "input": {"script": "deploy \"$TARGET\"", "env": {"TARGET": "production"}}}`.
 
-Read current output with a `*** Read: tasks://<id>` request, then send input
-with an `*** Exec: tasks://<id>/send` request whose request body carries
-the input text; the input is written exactly, except that the newline before
-the final `*** End Request` belongs to the request format and is not sent, so
-add one extra empty line before it to end input with a newline. Close
-stdin with an `*** Exec: tasks://<id>/eof` request and interrupt with an
-`*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
-running while the command waits for input; use a `timeout: 0` header for an
-open-ended interactive command.
+Read current output with a `{"read": "tasks://<id>"}` step, send input with a
+`{"exec": "tasks://<id>/send", "input": {"text": "yes\n"}}` step; `text` is
+delivered to the process byte-for-byte. Close stdin with a
+`{"exec": "tasks://<id>/eof"}` step and interrupt with a
+`{"exec": "tasks://<id>/interrupt"}` step. The shared timeout keeps running
+while the command waits for input; use `timeout: 0` for an open-ended
+interactive command.
 
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
@@ -134,58 +115,47 @@ common parameters (`-OutVariable`, `-ErrorAction`, `-ErrorVariable`). Pass
 their own flags only, and capture output with variables, `$LASTEXITCODE`,
 or redirection.
 
-`*** Read:` requests support no shell operations. To run a
-command, use an `*** Exec: pwsh://run` request whose request body MUST
-contain at least one non-whitespace character:
+Read steps support no shell operations. Run a command with one exec step:
 
-```text
-*** Begin Request
-*** Exec: pwsh://run
-Get-ChildItem -Path . -Force
-*** End Request
-```
+{"exec": "pwsh://run", "input": {"script": "Get-ChildItem -Path . -Force"}}
+
+`pwsh://run` accepts these `input` fields; unknown fields are rejected:
+
+- `script` (string, required): the PowerShell script to run. It must contain
+  at least one non-whitespace character.
+- `background` (boolean, default false): return a task handle immediately
+  instead of waiting for the command.
+- `interactive` (boolean, default false): keep stdin open for runtime input
+  such as confirmation prompts, passwords, and REPLs. Interactive commands are
+  always background tasks; omit `background` or set it to true.
+- `timeout` (integer seconds, default 1800): execution timeout shared by
+  foreground and background runs; 0 disables the timeout.
+- `env` (object of string values): extra environment variables for this
+  command, overriding the Agent-managed environment.
 
 If a foreground command is still running after about 60 seconds, URI Agent
 automatically converts the same process into a background task without
-restarting it. Shell options travel as `*** name: value` request header lines
-between the operation line and the `*** Body:` separator. Use a
-`background: true` header to return a task immediately:
+restarting it.
 
-```text
-*** Begin Request
-*** Exec: pwsh://run
-*** background: true
-*** Body:
-cargo test
-*** End Request
-```
+Examples:
 
-Foreground and background commands share one execution timeout. A `timeout`
-header carries an integer number of seconds; omission defaults to 1800
-seconds (30 minutes), and `timeout: 0` disables the timeout.
+{"exec": "pwsh://run", "input": {"script": "cargo test", "timeout": 120}}
 
-Commands that need runtime input (confirmation prompts, passwords, REPLs)
-must run with an `interactive: true` header. Interactive commands are always
-managed background tasks and keep their stdin open:
+{"exec": "pwsh://run", "input": {"script": "cargo test", "background": true}}
 
-```text
-*** Begin Request
-*** Exec: pwsh://run
-*** interactive: true
-*** Body:
-$token = Read-Host 'Token'
-*** End Request
-```
+{"exec": "pwsh://run", "input": {"script": "$token = Read-Host 'Token'", "interactive": true, "timeout": 0}}
 
-Read current output with a `*** Read: tasks://<id>` request, then send input
-with an `*** Exec: tasks://<id>/send` request whose request body carries
-the input text; the input is written exactly, except that the newline before
-the final `*** End Request` belongs to the request format and is not sent, so
-add one extra empty line before it to end input with a newline. Close
-stdin with an `*** Exec: tasks://<id>/eof` request and interrupt with an
-`*** Exec: tasks://<id>/interrupt` request. The shared timeout keeps
-running while the command waits for input; use a `timeout: 0` header for an
-open-ended interactive command.
+Data never reaches a script through string interpolation. Pass values through
+`env` and read them as variables:
+`{"exec": "pwsh://run", "input": {"script": "Deploy -Target $env:TARGET", "env": {"TARGET": "production"}}}`.
+
+Read current output with a `{"read": "tasks://<id>"}` step, send input with a
+`{"exec": "tasks://<id>/send", "input": {"text": "yes\n"}}` step; `text` is
+delivered to the process byte-for-byte. Close stdin with a
+`{"exec": "tasks://<id>/eof"}` step and interrupt with a
+`{"exec": "tasks://<id>/interrupt"}` step. The shared timeout keeps running
+while the command waits for input; use `timeout: 0` for an open-ended
+interactive command.
 
 You MUST NOT add another background layer inside the command. Child processes
 remain owned by this execution and are terminated when the root shell exits or
@@ -206,11 +176,23 @@ successful command with no output returns `(no output)`. Failures retain the
 exit code or timeout and any output observed before termination.
 "#;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ShellOptions {
     background: bool,
     timeout: Option<Duration>,
     interactive: bool,
+    env: BTreeMap<String, String>,
+    script: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecInput {
+    script: String,
+    background: Option<bool>,
+    interactive: Option<bool>,
+    timeout: Option<u64>,
+    env: Option<BTreeMap<String, String>>,
 }
 
 struct ExecutionControl<'a> {
@@ -373,37 +355,36 @@ impl Protocol for ShellProtocol {
         }
     }
 
+    fn literal_input_fields(&self) -> &[&str] {
+        &["script"]
+    }
+
     async fn read(
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         if request.target != "help" {
             bail!(
-                r#"{0} read supports no shell operations; run a command with an `*** Exec: {0}://run` request"#,
+                "{0} read supports no shell operations; use an {{\"exec\": \"{0}://run\", \
+                 \"input\": {{\"script\": \"<script>\"}}}} step",
                 self.name
             );
         }
-        if !request.headers.is_empty() {
-            bail!("{0}://help accepts no request headers", self.name);
-        }
-        if !request.body.is_empty() {
-            bail!("{0}://help requires an empty body", self.name);
-        }
+        request.reject_input()?;
         Ok(if self.name == "bash" {
             BASH_HELP
         } else {
             PWSH_HELP
         }
-        .as_bytes()
-        .to_vec())
+        .into())
     }
 
     async fn exec(
         &self,
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         self.exec_with_auto_background(request, context, AUTO_BACKGROUND_AFTER)
             .await
     }
@@ -415,19 +396,19 @@ impl ShellProtocol {
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
         auto_background_after: Duration,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         let options = if request.target == "run" {
-            parse_options(request.headers)
+            parse_options(self.name, &request)
         } else {
             Err(anyhow!("expected shell target run"))
         }
         .with_context(|| {
             format!(
-                r#"invalid {0} exec; use an `*** Exec: {0}://run` request"#,
+                r#"invalid {0} exec; use an {{"exec": "{0}://run", "input": {{"script": "<script>"}}}} step"#,
                 self.name
             )
         })?;
-        let command = command_from_body(request.body, self.name)?.to_string();
+        let command = options.script;
         let executable = self.executable.clone();
         let cwd = self.cwd.clone();
         let protocol = self.name.to_string();
@@ -461,8 +442,10 @@ impl ShellProtocol {
         }
         let progress_tasks = tasks.clone();
         let progress_id = id.clone();
+        let step_env = options.env;
         let work = move |cancellation| async move {
-            let environment = environment.snapshot().await;
+            let mut environment = environment.snapshot().await;
+            environment.extend(step_env);
             execute_with_cancellation(
                 &protocol,
                 &executable,
@@ -482,78 +465,45 @@ impl ShellProtocol {
         if options.background {
             tasks.spawn_with_cancellation(record, work).await;
             return Ok(if options.interactive {
-                prompts::interactive_task_accepted(&id).into_bytes()
+                prompts::interactive_task_accepted(&id).into()
             } else {
-                prompts::task_accepted(&id).into_bytes()
+                prompts::task_accepted(&id).into()
             });
         }
+        let auto_background_after = context.foreground_grace(auto_background_after);
         match tasks
             .run_with_auto_background(record, auto_background_after, work)
             .await?
         {
-            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into_bytes()),
-            AutoTask::Terminal(record) => record.terminal_result("shell command"),
+            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into()),
+            AutoTask::Terminal(record) => Ok(record.terminal_result("shell command")?.into()),
         }
     }
 }
 
-fn parse_options(headers: &[RequestHeader]) -> Result<ShellOptions> {
-    let mut background = false;
-    let mut timeout = DEFAULT_TIMEOUT;
-    let mut interactive = false;
-    let mut saw_background = false;
-    let mut saw_timeout = false;
-    let mut saw_interactive = false;
-    for header in headers {
-        let name = header.name.as_str();
-        let value = header.value.trim();
-        match name {
-            "background" if !saw_background => {
-                background = match value {
-                    "true" => true,
-                    "false" => false,
-                    _ => bail!("shell background must be true or false"),
-                };
-                saw_background = true;
-            }
-            "timeout" if !saw_timeout => {
-                timeout =
-                    Duration::from_secs(value.parse::<u64>().map_err(|_| {
-                        anyhow!("shell timeout must be an integer number of seconds")
-                    })?);
-                saw_timeout = true;
-            }
-            "interactive" if !saw_interactive => {
-                interactive = match value {
-                    "true" => true,
-                    "false" => false,
-                    _ => bail!("shell interactive must be true or false"),
-                };
-                saw_interactive = true;
-            }
-            "background" | "timeout" | "interactive" => bail!("duplicate shell header: {name}"),
-            _ => bail!("unknown shell header: {name}"),
-        }
-    }
-    if interactive && saw_background && !background {
+fn parse_options(protocol: &str, request: &ProtocolRequest<'_>) -> Result<ShellOptions> {
+    let input: ExecInput = request.input_struct()?;
+    let background = input.background.unwrap_or(false);
+    let interactive = input.interactive.unwrap_or(false);
+    if input.background == Some(false) && input.interactive == Some(true) {
         bail!(
-            "interactive input requires background execution; omit the background header or use `background: true`"
+            "interactive input requires background execution; omit the background field or use `background: true`"
         );
     }
+    if input.script.trim().is_empty() {
+        bail!(
+            "{protocol} script must contain a non-whitespace character; use an \
+             {{\"exec\": \"{protocol}://run\", \"input\": {{\"script\": \"<script>\"}}}} step"
+        );
+    }
+    let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT.as_secs());
     Ok(ShellOptions {
         background: background || interactive,
-        timeout: (!timeout.is_zero()).then_some(timeout),
+        timeout: (timeout != 0).then(|| Duration::from_secs(timeout)),
         interactive,
+        env: input.env.unwrap_or_default(),
+        script: input.script,
     })
-}
-
-fn command_from_body<'a>(body: &'a str, protocol: &str) -> Result<&'a str> {
-    if body.trim().is_empty() {
-        bail!(
-            r#"{protocol} command body must contain a non-whitespace character; use an `*** Exec: {protocol}://run` request"#
-        );
-    }
-    Ok(body)
 }
 
 fn command_label(command: &str) -> String {
@@ -1021,8 +971,21 @@ mod tests {
     use crate::config::AgentEnvironment;
     use crate::task::TaskStatus;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use serde_json::{Map, Value, json};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn input_map(value: Value) -> Map<String, Value> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn request<'a>(
+        uri: &'a str,
+        target: &'a str,
+        input: &'a Map<String, Value>,
+    ) -> ProtocolRequest<'a> {
+        ProtocolRequest { uri, target, input }
+    }
 
     #[test]
     fn process_output_uses_only_the_stream_labels_the_model_needs() {
@@ -1041,208 +1004,201 @@ mod tests {
 
     #[test]
     fn pwsh_help_uses_powershell_syntax_and_bounds_shell_work() {
+        for page in [BASH_HELP, PWSH_HELP] {
+            assert!(page.contains("Read steps support no shell operations"));
+            assert!(page.contains("least one non-whitespace character"));
+            assert!(page.contains("MUST NOT add another background layer"));
+            assert!(page.contains("\"background\": true"));
+            assert!(page.contains("`timeout` (integer seconds, default 1800)"));
+            assert!(page.contains("0 disables the timeout"));
+            assert!(page.contains("\"interactive\": true"));
+            assert!(page.contains("tasks://<id>/send"));
+            assert!(page.contains("delivered to the process byte-for-byte"));
+            assert!(page.contains("tasks://<id>/eof"));
+            assert!(page.contains("tasks://<id>/interrupt"));
+            assert!(page.contains("Child processes\nremain owned by this execution"));
+            assert!(page.contains("unified `tasks://` protocol"));
+            assert!(page.contains("Agent environment variables are injected"));
+            assert!(page.contains("`env` (object of string values)"));
+            assert!(
+                !page.contains("header"),
+                "help pages must not mention headers"
+            );
+            assert!(
+                !page.contains("*** "),
+                "help pages must not show request envelopes"
+            );
+        }
         assert!(PWSH_HELP.contains("PowerShell 7 syntax rather than Unix shell syntax"));
         assert!(PWSH_HELP.contains("`$env:NAME = 'value'`"));
         assert!(PWSH_HELP.contains("do not honor `.gitignore`"));
         assert!(PWSH_HELP.contains("do not accept PowerShell\ncommon parameters"));
-        assert!(PWSH_HELP.contains("`*** Read:` requests support no shell operations"));
-        assert!(PWSH_HELP.contains("request body MUST\ncontain at least one non-whitespace"));
-        assert!(PWSH_HELP.contains("MUST NOT add another background layer"));
-        assert!(PWSH_HELP.contains("`background: true`"));
-        assert!(PWSH_HELP.contains("`timeout`\nheader carries an integer number of seconds"));
-        assert!(PWSH_HELP.contains("`interactive: true`"));
-        assert!(PWSH_HELP.contains("tasks://<id>/send"));
-        assert!(PWSH_HELP.contains(
-            "the newline before\nthe final `*** End Request` belongs to the request format and is not sent"
-        ));
-        assert!(
-            PWSH_HELP
-                .contains("so\nadd one extra empty line before it to end input with a newline")
-        );
-        assert!(PWSH_HELP.contains("tasks://<id>/eof"));
-        assert!(PWSH_HELP.contains("Child processes\nremain owned by this execution"));
-        assert!(PWSH_HELP.contains("unified `tasks://` protocol"));
-        assert!(PWSH_HELP.contains("Agent environment variables are injected"));
-        assert!(BASH_HELP.contains("`*** Read:` requests support no shell operations"));
-        assert!(BASH_HELP.contains("request body MUST\ncontain at least one non-whitespace"));
-        assert!(BASH_HELP.contains("MUST NOT add another background layer"));
-        assert!(BASH_HELP.contains("`background: true`"));
-        assert!(BASH_HELP.contains("`timeout: 0` disables the timeout"));
-        assert!(BASH_HELP.contains("`interactive: true`"));
-        assert!(BASH_HELP.contains("tasks://<id>/send"));
-        assert!(BASH_HELP.contains(
-            "the newline before\nthe final `*** End Request` belongs to the request format and is not sent"
-        ));
-        assert!(
-            BASH_HELP
-                .contains("so\nadd one extra empty line before it to end input with a newline")
-        );
-        assert!(BASH_HELP.contains("tasks://<id>/eof"));
-        assert!(BASH_HELP.contains("tasks://<id>/interrupt"));
-        assert!(BASH_HELP.contains("Child processes\nremain owned by this execution"));
-        assert!(BASH_HELP.contains("unified `tasks://` protocol"));
-        assert!(!BASH_HELP.contains("?wait="));
-        assert!(!BASH_HELP.contains("?background="));
-        assert!(BASH_HELP.contains("Agent environment variables are injected"));
     }
 
     #[test]
-    fn shell_plugin_parses_background_and_timeout_headers() {
+    fn shell_input_parses_background_timeout_and_env_fields() {
+        let plain = input_map(json!({"script": "cargo test"}));
         assert_eq!(
-            parse_options(&[]).unwrap(),
+            parse_options("bash", &request("bash://run", "run", &plain)).unwrap(),
             ShellOptions {
                 background: false,
                 timeout: Some(DEFAULT_TIMEOUT),
                 interactive: false,
+                env: BTreeMap::new(),
+                script: "cargo test".to_string(),
             }
         );
+
+        let unbounded = input_map(json!({
+            "script": "cargo test",
+            "background": true,
+            "timeout": 0,
+        }));
         assert_eq!(
-            parse_options(&[
-                RequestHeader::new("background", "true"),
-                RequestHeader::new("timeout", "0"),
-            ])
-            .unwrap(),
+            parse_options("bash", &request("bash://run", "run", &unbounded)).unwrap(),
             ShellOptions {
                 background: true,
                 timeout: None,
                 interactive: false,
+                env: BTreeMap::new(),
+                script: "cargo test".to_string(),
             }
         );
+
+        let bounded = input_map(json!({
+            "script": "cargo test",
+            "timeout": 30,
+            "background": false,
+            "env": {"EXTRA": "value"},
+        }));
         assert_eq!(
-            parse_options(&[
-                RequestHeader::new("timeout", "30"),
-                RequestHeader::new("background", "false"),
-            ])
-            .unwrap(),
+            parse_options("bash", &request("bash://run", "run", &bounded)).unwrap(),
             ShellOptions {
                 background: false,
                 timeout: Some(Duration::from_secs(30)),
                 interactive: false,
+                env: BTreeMap::from([("EXTRA".to_string(), "value".to_string())]),
+                script: "cargo test".to_string(),
             }
         );
-        assert!(parse_options(&[RequestHeader::new("timeout", "not-a-number")]).is_err());
-        assert!(parse_options(&[RequestHeader::new("background", "yes")]).is_err());
+
+        let typed = input_map(json!({"script": "cargo test", "timeout": "30"}));
         assert!(
-            parse_options(&[
-                RequestHeader::new("timeout", "1"),
-                RequestHeader::new("timeout", "2"),
-            ])
-            .is_err()
+            parse_options("bash", &request("bash://run", "run", &typed))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid input for bash://run")
         );
-        let error = parse_options(&[RequestHeader::new("other", "30")]).unwrap_err();
-        assert!(error.to_string().contains("unknown shell header: other"));
+        let unknown = input_map(json!({"script": "cargo test", "other": 30}));
+        let error = parse_options("bash", &request("bash://run", "run", &unknown)).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field `other`"));
+        assert!(format!("{error:#}").contains("expected one of"));
+        let env_values = input_map(json!({"script": "x", "env": {"EXTRA": 1}}));
+        assert!(parse_options("bash", &request("bash://run", "run", &env_values)).is_err());
     }
 
     #[test]
-    fn shell_interactive_header_implies_background_execution() {
+    fn shell_interactive_input_implies_background_execution() {
+        let implied = input_map(json!({"script": "mysql -u root -p", "interactive": true}));
         assert_eq!(
-            parse_options(&[RequestHeader::new("interactive", "true")]).unwrap(),
+            parse_options("bash", &request("bash://run", "run", &implied)).unwrap(),
             ShellOptions {
                 background: true,
                 timeout: Some(DEFAULT_TIMEOUT),
                 interactive: true,
+                env: BTreeMap::new(),
+                script: "mysql -u root -p".to_string(),
             }
         );
+
+        let explicit = input_map(json!({
+            "script": "mysql -u root -p",
+            "interactive": true,
+            "background": true,
+            "timeout": 0,
+        }));
         assert_eq!(
-            parse_options(&[
-                RequestHeader::new("interactive", "true"),
-                RequestHeader::new("background", "true"),
-                RequestHeader::new("timeout", "0"),
-            ])
-            .unwrap(),
+            parse_options("bash", &request("bash://run", "run", &explicit)).unwrap(),
             ShellOptions {
                 background: true,
                 timeout: None,
                 interactive: true,
+                env: BTreeMap::new(),
+                script: "mysql -u root -p".to_string(),
             }
         );
+
+        let off = input_map(json!({"script": "x", "interactive": false}));
         assert_eq!(
-            parse_options(&[RequestHeader::new("interactive", "false")]).unwrap(),
+            parse_options("bash", &request("bash://run", "run", &off)).unwrap(),
             ShellOptions {
                 background: false,
                 timeout: Some(DEFAULT_TIMEOUT),
                 interactive: false,
+                env: BTreeMap::new(),
+                script: "x".to_string(),
             }
         );
+
+        let conflicting = input_map(json!({
+            "script": "x",
+            "interactive": true,
+            "background": false,
+        }));
         assert!(
-            parse_options(&[
-                RequestHeader::new("interactive", "true"),
-                RequestHeader::new("background", "false"),
-            ])
-            .is_err()
+            parse_options("bash", &request("bash://run", "run", &conflicting))
+                .unwrap_err()
+                .to_string()
+                .contains("interactive input requires background execution")
         );
-        assert!(parse_options(&[RequestHeader::new("interactive", "1")]).is_err());
-        assert!(
-            parse_options(&[
-                RequestHeader::new("interactive", "true"),
-                RequestHeader::new("interactive", "true"),
-            ])
-            .is_err()
-        );
+        let typed = input_map(json!({"script": "x", "interactive": "1"}));
+        assert!(parse_options("bash", &request("bash://run", "run", &typed)).is_err());
     }
 
     #[test]
-    fn shell_body_only_accepts_a_command_string() {
-        assert_eq!(
-            command_from_body("cargo test", "bash").unwrap(),
-            "cargo test"
-        );
-        assert!(command_from_body("", "bash").is_err());
-        assert!(command_from_body(" \n\t", "bash").is_err());
+    fn shell_script_requires_a_non_whitespace_character() {
+        for script in ["", " \n\t"] {
+            let input = input_map(json!({"script": script}));
+            let error = parse_options("bash", &request("bash://run", "run", &input))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("non-whitespace character"), "{error}");
+            assert!(error.contains("{\"exec\": \"bash://run\""), "{error}");
+        }
     }
 
     #[tokio::test]
-    async fn shell_route_errors_provide_copyable_read_and_exec_calls() {
+    async fn shell_route_errors_provide_copyable_exec_steps() {
         let shell = ShellProtocol::new("bash", PathBuf::from("bash"), Path::new("."));
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
 
+        let input = input_map(json!({"script": "cargo test"}));
         let read_error = shell
-            .read(
-                ProtocolRequest {
-                    uri: "bash://run",
-                    target: "run",
-                    headers: &[],
-                    body: "cargo test",
-                },
-                context.clone(),
-            )
+            .read(request("bash://run", "run", &input), context.clone())
             .await
             .unwrap_err();
-        assert!(
-            read_error
-                .to_string()
-                .contains("`*** Exec: bash://run` request")
-        );
+        assert!(read_error.to_string().contains("{\"exec\": \"bash://run\""));
 
+        let empty = input_map(json!({}));
         let exec_error = shell
-            .exec(
-                ProtocolRequest {
-                    uri: "bash://help",
-                    target: "help",
-                    headers: &[],
-                    body: "",
-                },
-                context.clone(),
-            )
+            .exec(request("bash://help", "help", &empty), context.clone())
             .await
             .unwrap_err();
-        assert!(format!("{exec_error:#}").contains("`*** Exec: bash://run` request"));
+        assert!(format!("{exec_error:#}").contains("{\"exec\": \"bash://run\""));
 
-        let body_error = shell
-            .exec(
-                ProtocolRequest {
-                    uri: "bash://run",
-                    target: "run",
-                    headers: &[],
-                    body: " \n\t",
-                },
-                context,
-            )
+        let help_input = input_map(json!({"script": "x"}));
+        let help_error = shell
+            .read(request("bash://help", "help", &help_input), context.clone())
             .await
             .unwrap_err();
-        assert!(body_error.to_string().contains("non-whitespace character"));
+        assert!(help_error.to_string().contains("takes no input fields"));
+
+        let blank = input_map(json!({"script": " \n\t"}));
+        let script_error = shell
+            .exec(request("bash://run", "run", &blank), context)
+            .await
+            .unwrap_err();
+        assert!(format!("{script_error:#}").contains("non-whitespace character"));
     }
 
     #[test]
@@ -1410,23 +1366,14 @@ mod tests {
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
         let line_count = 10_000;
         let script =
             format!("1..{line_count} | ForEach-Object {{ Write-Output \"line-$($_):中文-✓\" }}");
+        let run_input = input_map(json!({"script": script, "background": true}));
 
         shell
-            .exec(
-                ProtocolRequest {
-                    uri: "pwsh://run",
-                    target: "run",
-                    headers: &[RequestHeader::new("background", "true")],
-                    body: &script,
-                },
-                context.clone(),
-            )
+            .exec(request("pwsh://run", "run", &run_input), context.clone())
             .await
             .unwrap();
         let record = context
@@ -1435,19 +1382,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(record.status, TaskStatus::Completed);
+        let empty = input_map(json!({}));
         let detail = TasksProtocol
-            .read(
-                ProtocolRequest {
-                    uri: "tasks://001",
-                    target: "001",
-                    headers: &[],
-                    body: "",
-                },
-                context.clone(),
-            )
+            .read(request("tasks://001", "001", &empty), context.clone())
             .await
             .unwrap();
-        let detail = String::from_utf8(detail).unwrap();
+        let detail = String::from_utf8(detail.text_bytes().to_vec()).unwrap();
         let output = detail
             .lines()
             .filter(|line| line.starts_with("line-"))
@@ -1490,62 +1430,49 @@ mod tests {
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
-        let context = ProtocolContext {
-            tasks: crate::task::TaskManager::new(),
-        };
+        let context = ProtocolContext::new(crate::task::TaskManager::new());
         let run_uri = format!("{protocol}://run");
+        let short_input = input_map(json!({"script": short}));
         let completed = shell
             .exec_with_auto_background(
-                ProtocolRequest {
-                    uri: &run_uri,
-                    target: "run",
-                    headers: &[],
-                    body: short,
-                },
+                request(&run_uri, "run", &short_input),
                 context.clone(),
                 Duration::from_secs(10),
             )
             .await
             .unwrap();
-        let completed = String::from_utf8(completed).unwrap();
+        let completed = String::from_utf8(completed.text_bytes().to_vec()).unwrap();
         assert!(completed.contains("foreground-ok"));
         assert!(!completed.contains("Exit:"));
         assert!(context.tasks.list().await.is_empty());
 
         let started = Instant::now();
+        let delayed_input = input_map(json!({"script": delayed}));
         let accepted = shell
             .exec_with_auto_background(
-                ProtocolRequest {
-                    uri: &run_uri,
-                    target: "run",
-                    headers: &[],
-                    body: delayed,
-                },
+                request(&run_uri, "run", &delayed_input),
                 context.clone(),
                 Duration::from_millis(20),
             )
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_millis(150));
-        let accepted = String::from_utf8(accepted).unwrap();
+        let accepted = String::from_utf8(accepted.text_bytes().to_vec()).unwrap();
         assert!(accepted.contains("Background task started: tasks://002"));
         assert!(accepted.contains("then use one bounded wait. Do not poll or rerun"));
 
         let started = Instant::now();
+        let explicit_input = input_map(json!({"script": explicit, "background": true}));
         let accepted = shell
-            .exec(
-                ProtocolRequest {
-                    uri: &run_uri,
-                    target: "run",
-                    headers: &[RequestHeader::new("background", "true")],
-                    body: explicit,
-                },
-                context.clone(),
-            )
+            .exec(request(&run_uri, "run", &explicit_input), context.clone())
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_millis(150));
-        assert!(String::from_utf8(accepted).unwrap().contains("tasks://003"));
+        assert!(
+            String::from_utf8(accepted.text_bytes().to_vec())
+                .unwrap()
+                .contains("tasks://003")
+        );
 
         let automatic = context
             .tasks
@@ -1589,36 +1516,26 @@ mod tests {
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
         let interactive_uri = format!("{protocol}://run");
 
+        let line_input = input_map(json!({"script": line_script, "interactive": true}));
         let accepted = shell
             .exec(
-                ProtocolRequest {
-                    uri: &interactive_uri,
-                    target: "run",
-                    headers: &[RequestHeader::new("interactive", "true")],
-                    body: line_script,
-                },
+                request(&interactive_uri, "run", &line_input),
                 context.clone(),
             )
             .await
             .unwrap();
         assert!(
-            String::from_utf8(accepted.clone())
+            String::from_utf8(accepted.text_bytes().to_vec())
                 .unwrap()
                 .contains("Interactive task started: tasks://001")
         );
+        let send = input_map(json!({"text": "hello\n"}));
         TasksProtocol
             .exec(
-                ProtocolRequest {
-                    uri: "tasks://001/send",
-                    target: "001/send",
-                    headers: &[],
-                    body: "hello\n",
-                },
+                request("tasks://001/send", "001/send", &send),
                 context.clone(),
             )
             .await
@@ -1637,41 +1554,30 @@ mod tests {
         let output = String::from_utf8(record.content).unwrap();
         assert!(output.contains("got:hello"), "{output}");
 
+        let bulk_input = input_map(json!({
+            "script": bulk_script,
+            "interactive": true,
+            "timeout": 60,
+        }));
         shell
             .exec(
-                ProtocolRequest {
-                    uri: &interactive_uri,
-                    target: "run",
-                    headers: &[
-                        RequestHeader::new("interactive", "true"),
-                        RequestHeader::new("timeout", "60"),
-                    ],
-                    body: bulk_script,
-                },
+                request(&interactive_uri, "run", &bulk_input),
                 context.clone(),
             )
             .await
             .unwrap();
+        let send = input_map(json!({"text": "abc\n"}));
         TasksProtocol
             .exec(
-                ProtocolRequest {
-                    uri: "tasks://002/send",
-                    target: "002/send",
-                    headers: &[],
-                    body: "abc\n",
-                },
+                request("tasks://002/send", "002/send", &send),
                 context.clone(),
             )
             .await
             .unwrap();
+        let empty = input_map(json!({}));
         TasksProtocol
             .exec(
-                ProtocolRequest {
-                    uri: "tasks://002/eof",
-                    target: "002/eof",
-                    headers: &[],
-                    body: "",
-                },
+                request("tasks://002/eof", "002/eof", &empty),
                 context.clone(),
             )
             .await
@@ -1703,21 +1609,16 @@ mod tests {
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
+        let interactive_input = input_map(json!({
+            "script": "printf waiting; IFS= read -r line",
+            "interactive": true,
+            "timeout": 1,
+        }));
 
         shell
             .exec(
-                ProtocolRequest {
-                    uri: "bash://run",
-                    target: "run",
-                    headers: &[
-                        RequestHeader::new("interactive", "true"),
-                        RequestHeader::new("timeout", "1"),
-                    ],
-                    body: "printf waiting; IFS= read -r line",
-                },
+                request("bash://run", "run", &interactive_input),
                 context.clone(),
             )
             .await
@@ -1745,23 +1646,18 @@ mod tests {
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
         let script =
             "printf ready; trap 'printf trapped; exit 42' INT; while :; do sleep 0.1; done";
+        let interactive_input = input_map(json!({
+            "script": script,
+            "interactive": true,
+            "timeout": 60,
+        }));
 
         shell
             .exec(
-                ProtocolRequest {
-                    uri: "bash://run",
-                    target: "run",
-                    headers: &[
-                        RequestHeader::new("interactive", "true"),
-                        RequestHeader::new("timeout", "60"),
-                    ],
-                    body: script,
-                },
+                request("bash://run", "run", &interactive_input),
                 context.clone(),
             )
             .await
@@ -1782,14 +1678,10 @@ mod tests {
         }
         assert!(ready, "the interactive command never reported readiness");
 
+        let empty = input_map(json!({}));
         TasksProtocol
             .exec(
-                ProtocolRequest {
-                    uri: "tasks://001/interrupt",
-                    target: "001/interrupt",
-                    headers: &[],
-                    body: "",
-                },
+                request("tasks://001/interrupt", "001/interrupt", &empty),
                 context.clone(),
             )
             .await
@@ -1843,6 +1735,74 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output.trim_end(), "managed");
         assert!(!output.contains("inherited"));
+    }
+
+    #[tokio::test]
+    async fn step_env_values_reach_the_command_and_override_managed_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = format!("URI_AGENT_SHELL_ENV_TEST_{}", uuid::Uuid::now_v7().simple());
+        let (protocol, executable, script) = if cfg!(windows) {
+            let Some(executable) = find_executable("pwsh") else {
+                return;
+            };
+            ("pwsh", executable, format!("Write-Output $env:{name}"))
+        } else {
+            let Some(executable) = find_executable("bash") else {
+                return;
+            };
+            ("bash", executable, format!("printf '%s' \"${name}\""))
+        };
+        let mut shell = ShellProtocol::new(protocol, executable, directory.path());
+        let environment = Arc::new(AgentEnvironment::load(directory.path()).await.unwrap());
+        environment.set(&name, "managed".to_string()).await.unwrap();
+        shell.environment = Some(PluginEnvironment::new(environment));
+        let run_uri = format!("{protocol}://run");
+        let run_input = input_map(json!({
+            "script": script,
+            "env": {name: "from-step"},
+        }));
+
+        let output = shell
+            .exec(
+                request(&run_uri, "run", &run_input),
+                ProtocolContext::new(TaskManager::new()),
+            )
+            .await
+            .unwrap();
+        let output = String::from_utf8(output.text_bytes().to_vec()).unwrap();
+        assert_eq!(output.trim_end(), "from-step");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_foreground_commands_never_promote_to_background() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(executable) = find_executable("bash") else {
+            return;
+        };
+        let mut shell = ShellProtocol::new("bash", executable, directory.path());
+        shell.environment = Some(PluginEnvironment::new(Arc::new(
+            AgentEnvironment::load(directory.path()).await.unwrap(),
+        )));
+        let mut context = ProtocolContext::new(TaskManager::new());
+        context.pinned_foreground = true;
+        let run_input = input_map(json!({"script": "sleep 0.2; printf pinned-ok"}));
+
+        let output = shell
+            .exec_with_auto_background(
+                request("bash://run", "run", &run_input),
+                context.clone(),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            String::from_utf8(output.text_bytes().to_vec())
+                .unwrap()
+                .contains("pinned-ok")
+        );
+        assert!(context.tasks.list().await.is_empty());
     }
 
     #[cfg(unix)]
@@ -2006,18 +1966,12 @@ mod tests {
         shell.environment = Some(PluginEnvironment::new(Arc::new(
             AgentEnvironment::load(directory.path()).await.unwrap(),
         )));
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
+        let run_input = input_map(json!({"script": command}));
 
         {
             let execution = shell.exec_with_auto_background(
-                ProtocolRequest {
-                    uri: "bash://run",
-                    target: "run",
-                    headers: &[],
-                    body: &command,
-                },
+                request("bash://run", "run", &run_input),
                 context.clone(),
                 Duration::from_secs(60),
             );

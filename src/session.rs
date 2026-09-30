@@ -25,7 +25,7 @@ use tokio_rusqlite::{
 };
 use uuid::Uuid;
 
-const SESSION_DATABASE_FILE: &str = "sessions-v5.db";
+const SESSION_DATABASE_FILE: &str = "sessions-v6.db";
 const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WRITE_BEGIN_ATTEMPTS: usize = 3;
 const RESUME_INDEX_VERSION: u32 = 5;
@@ -291,9 +291,10 @@ impl SessionArchive {
                        AND events.kind IN ('user', 'assistant_text', 'tool_call', 'tool_result', 'error')
                        AND NOT (
                          events.kind = 'tool_call'
-                         AND (
-                           COALESCE(json_extract(events.payload_json, '$.arguments.uri'), '') LIKE 'context://%'
-                           OR COALESCE(json_extract(events.payload_json, '$.arguments.uri'), '') LIKE 'sessions://%'
+                         AND EXISTS (
+                           SELECT 1 FROM json_each(events.payload_json, '$.arguments.steps') AS step
+                           WHERE COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
+                              OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
                          )
                        )
                        AND NOT (
@@ -304,9 +305,10 @@ impl SessionArchive {
                              AND calls.kind = 'tool_call'
                              AND json_extract(calls.payload_json, '$.call_id') =
                                  json_extract(events.payload_json, '$.call_id')
-                             AND (
-                               COALESCE(json_extract(calls.payload_json, '$.arguments.uri'), '') LIKE 'context://%'
-                               OR COALESCE(json_extract(calls.payload_json, '$.arguments.uri'), '') LIKE 'sessions://%'
+                             AND EXISTS (
+                               SELECT 1 FROM json_each(calls.payload_json, '$.arguments.steps') AS step
+                               WHERE COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
+                                  OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
                              )
                          )
                        )
@@ -4299,25 +4301,35 @@ mod tests {
                 },
                 EventKind::ToolCall {
                     call_id: "public".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"uri": "file://README.md", "body": ""}),
+                    name: "protocol".into(),
+                    arguments: serde_json::json!({"steps": [{"read": "file://README.md"}]}),
                 },
                 EventKind::ToolResult {
                     call_id: "public".into(),
-                    name: "read".into(),
+                    name: "protocol".into(),
                     output: "public result".into(),
                     failed: false,
                     protocol_help_required: false,
                 },
                 EventKind::ToolCall {
                     call_id: "private-context".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"uri": "context://history/search", "body": "secret"}),
+                    name: "protocol".into(),
+                    arguments: serde_json::json!({
+                        "steps": [
+                            {"read": "context://history/search", "input": {"query": "secret"}}
+                        ]
+                    }),
                 },
                 EventKind::ToolCall {
-                    call_id: "private-sessions".into(),
-                    name: "read".into(),
-                    arguments: serde_json::json!({"uri": "sessions://search", "body": "secret"}),
+                    call_id: "mixed".into(),
+                    name: "protocol".into(),
+                    arguments: serde_json::json!({
+                        "steps": [
+                            {"exec": "context://notes/add",
+                             "input": {"title": "t", "content": "secret"}},
+                            {"read": "file://notes.md"}
+                        ]
+                    }),
                 },
             ])
             .await
@@ -4326,15 +4338,15 @@ mod tests {
             .append_batch(vec![
                 EventKind::ToolResult {
                     call_id: "private-context".into(),
-                    name: "read".into(),
+                    name: "protocol".into(),
                     output: "private context result".into(),
                     failed: false,
                     protocol_help_required: false,
                 },
                 EventKind::ToolResult {
-                    call_id: "private-sessions".into(),
-                    name: "read".into(),
-                    output: "private session result".into(),
+                    call_id: "mixed".into(),
+                    name: "protocol".into(),
+                    output: "mixed result".into(),
                     failed: false,
                     protocol_help_required: false,
                 },
@@ -4373,6 +4385,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_v5_session_database_is_never_opened_or_modified() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("sessions-v5.db");
+        // A valid SQLite database in the legacy location; opening it for any
+        // statement or checkpoint would change its bytes or add side files.
+        let connection = SqliteConnection::open(&legacy).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE marker (value TEXT);
+                 INSERT INTO marker VALUES ('v5');",
+            )
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&legacy).unwrap();
+
+        assert_eq!(SESSION_DATABASE_FILE, "sessions-v6.db");
+        let opened = session(&temp.path().join(SESSION_DATABASE_FILE), Some("v6-fresh")).await;
+        opened
+            .append(EventKind::User {
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        opened.append(EventKind::TurnFinished).await.unwrap();
+        drop(opened);
+
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
+        assert!(temp.path().join(SESSION_DATABASE_FILE).exists());
+        assert!(!temp.path().join("sessions-v5.db-wal").exists());
+        assert!(!temp.path().join("sessions-v5.db-shm").exists());
     }
 
     #[tokio::test]

@@ -1558,15 +1558,21 @@ fn acp_image_content(image: &rig::message::Image) -> Option<ImageContent> {
 
 fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     if name == "protocol"
-        && let Some(request) = arguments
-            .get("requests")
+        && let Some(step) = arguments
+            .get("steps")
             .and_then(serde_json::Value::as_array)
-            .and_then(|requests| requests.first())
-            .and_then(serde_json::Value::as_str)
+            .and_then(|steps| steps.first())
     {
-        let operation = request.lines().nth(1).unwrap_or_default().trim_end();
-        if !operation.is_empty() {
-            return format!("protocol {operation}");
+        let operation = if step.get("exec").is_some() {
+            "Exec"
+        } else {
+            "Read"
+        };
+        if let Some(address) = step
+            .get(operation.to_lowercase())
+            .and_then(serde_json::Value::as_str)
+        {
+            return format!("protocol {operation}: {address}");
         }
     }
     if arguments.is_null() || arguments.as_object().is_some_and(serde_json::Map::is_empty) {
@@ -1580,14 +1586,9 @@ fn tool_kind(name: &str, arguments: &serde_json::Value) -> ToolKind {
     match name {
         "protocol" => {
             let has_exec = arguments
-                .get("requests")
+                .get("steps")
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|requests| {
-                    requests
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .any(|request| request.contains("*** Exec:"))
-                });
+                .is_some_and(|steps| steps.iter().any(|step| step.get("exec").is_some()));
             if has_exec {
                 ToolKind::Execute
             } else {
@@ -1630,6 +1631,81 @@ mod tests {
     };
     use clap::Parser;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn protocol_tool_titles_come_from_the_first_step() {
+        assert_eq!(
+            tool_title(
+                "protocol",
+                &serde_json::json!({"steps": [{"read": "file://src/main.rs"}]})
+            ),
+            "protocol Read: file://src/main.rs"
+        );
+        assert_eq!(
+            tool_title(
+                "protocol",
+                &serde_json::json!({"steps": [
+                    {"read": "file://src/main.rs"},
+                    {"exec": "bash://run", "input": {"script": "cargo test"}}
+                ]})
+            ),
+            "protocol Read: file://src/main.rs"
+        );
+        assert_eq!(
+            tool_title(
+                "protocol",
+                &serde_json::json!({"steps": [
+                    {"exec": "bash://run", "input": {"script": "cargo test"}},
+                    {"read": "file://src/main.rs"}
+                ]})
+            ),
+            "protocol Exec: bash://run"
+        );
+        assert_eq!(tool_title("protocol", &serde_json::json!({})), "protocol");
+        assert_eq!(
+            tool_title("protocol", &serde_json::json!({"steps": []})),
+            r#"protocol {"steps":[]}"#
+        );
+        assert_eq!(
+            tool_title("help", &serde_json::json!({"protocols": ["file"]})),
+            r#"help {"protocols":["file"]}"#
+        );
+    }
+
+    #[test]
+    fn protocol_tool_kind_is_execute_when_any_step_execs() {
+        assert_eq!(
+            tool_kind(
+                "protocol",
+                &serde_json::json!({"steps": [{"read": "file://src/main.rs"}]})
+            ),
+            ToolKind::Read
+        );
+        assert_eq!(
+            tool_kind(
+                "protocol",
+                &serde_json::json!({"steps": [
+                    {"read": "file://src/main.rs"},
+                    {"exec": "bash://run", "input": {"script": "cargo test"}}
+                ]})
+            ),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            tool_kind(
+                "protocol",
+                &serde_json::json!({"steps": [
+                    {"exec": "tasks://001/send", "input": {"text": "yes\n"}}
+                ]})
+            ),
+            ToolKind::Execute
+        );
+        assert_eq!(
+            tool_kind("replace", &serde_json::Value::Null),
+            ToolKind::Edit
+        );
+        assert_eq!(tool_kind("help", &serde_json::json!({})), ToolKind::Other);
+    }
 
     async fn model_project(config_directory: &Path, project_directory: &Path) -> Arc<AcpProject> {
         let manager = ConfigManager::load_for_test(config_directory, project_directory)

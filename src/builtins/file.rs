@@ -6,11 +6,13 @@ use crate::plugin::{
 };
 use crate::protocol::{
     Protocol, ProtocolContext, ProtocolDescriptor, ProtocolImage, ProtocolImageMediaType,
-    ProtocolReadOutput, ProtocolRequest, RequestHeader,
+    ProtocolOutput, ProtocolRequest,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use ignore::{DirEntry, WalkBuilder, overrides::OverrideBuilder};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -36,33 +38,35 @@ Current working directory: `file://{}`
   from the current working directory. On Unix, `~` and paths beginning with
   `~/` resolve from the current user's home directory; `~user` is not expanded.
 - PNG, JPEG, GIF, and WebP files are detected from their contents and returned
-  as images for models that accept image input. Image reads do not accept
-  request headers.
-- Options are passed as `*** name: value` request headers between the
-  `*** Read:` line and the `*** End Request` line; the numeric values behave
-  as documented below. Header values are raw text and are never
-  percent-decoded.
-- Add `*** offset: <line>` and `*** limit: <count>` headers to read a bounded
-  text range. `<line>` is the one-based starting line or directory-entry
-  position, and `<count>` is the maximum number of lines or entries to return.
-  The default is 200 and the maximum is 2000.
-- Add a `*** tail: <count>` header to efficiently read the last lines of a
-  text file. The maximum is 2000. `tail` cannot be combined with `offset`,
-  `limit`, or `glob`.
-- Add a `*** line_numbers: true` header to prefix file content with its
-  original one-based line numbers. Line numbers are disabled by default and
-  cannot be combined with `glob`.
-- Add a `*** glob: <pattern>` header to a directory read to list matching
-  files recursively with standard ignore rules. Patterns are relative to that
-  directory; for example, `file://src` with a `*** glob: **/*.rs` header. A
-  glob scans at most 50000 files; narrow the root for larger trees.
-- Unknown, duplicate, malformed, or invalid headers are rejected; out-of-range
-  numeric values are clamped to their bounds.
-- Paginated file, directory, and glob reads return an exact `Next:` request.
+  as images for models that accept image input. Image reads take no input.
+- Pass `input` fields to bound or shape a read. Every field is optional;
+  unknown fields are rejected:
+  - `offset` (integer): one-based starting line or directory-entry position.
+  - `limit` (integer): maximum number of lines or entries to return; the
+    default is 200 and the maximum is 2000.
+  - `tail` (integer): efficiently read the last lines of a text file; the
+    maximum is 2000. `tail` cannot be combined with `offset`, `limit`, or
+    `glob`.
+  - `line_numbers` (boolean): prefix file content with its original one-based
+    line numbers. Line numbers are disabled by default and cannot be combined
+    with `glob`.
+  - `glob` (string): with a directory read, list matching files recursively
+    with standard ignore rules. Patterns are relative to that directory. A
+    glob scans at most 50000 files; narrow the root for larger trees.
+- Out-of-range numeric values are clamped to their bounds.
+- Paginated file, directory, and glob reads return an exact `Next:` step.
   Empty directories return `No entries.` and empty globs return `No matches.`.
 - Full outputs saved by the system are exposed as `file://` addresses.
 
-Every `file` read takes no body.
+Examples:
+
+{{"read": "file://src/main.rs"}}
+
+{{"read": "file://src/main.rs", "input": {{"offset": 401, "limit": 200, "line_numbers": true}}}}
+
+{{"read": "file://logs/app.log", "input": {{"tail": 50}}}}
+
+{{"read": "file://src", "input": {{"glob": "**/*.rs"}}}}
 "#,
         display_path(cwd)
     )
@@ -80,30 +84,16 @@ impl FileProtocol {
         }
     }
 
-    async fn read_request(&self, request: ProtocolRequest<'_>) -> Result<ProtocolReadOutput> {
-        if !request.body.is_empty() {
-            if request.target == "help" {
-                bail!("file://help requires an empty body");
-            }
-            if request.target.is_empty() {
-                bail!(
-                    "file reads take no body; put the path in the URI, for example:\n\
-                     *** Begin Request\n\
-                     *** Read: file://<path>\n\
-                     *** End Request"
-                );
-            }
-            bail!(
-                "file reads take no body; retry with a `*** Read: {}` request",
-                request.uri
-            );
-        }
+    async fn read_request(&self, request: ProtocolRequest<'_>) -> Result<ProtocolOutput> {
         if request.target == "help" {
-            return Ok(help(&self.cwd).into_bytes().into());
+            request.reject_input()?;
+            return Ok(help(&self.cwd).into());
         }
 
         let path = resolve_path(&self.cwd, request.target)?;
-        let range = Range::parse(request.headers)?;
+        let input = request.input_struct::<ReadInput>()?;
+        let range = Range::from_input(&input)?;
+        let has_input = !request.input.is_empty();
         let metadata = fs::metadata(&path)
             .await
             .with_context(|| format!("cannot read {}", display_path(&path)))?;
@@ -124,7 +114,7 @@ impl FileProtocol {
             }
             Ok(read_directory(&path, request.uri, range).await?.into())
         } else if metadata.is_file() {
-            read_file(&path, request.uri, !request.headers.is_empty(), range).await
+            read_file(&path, request.uri, has_input, range).await
         } else {
             bail!("not a regular file or directory: {}", display_path(&path))
         }
@@ -298,15 +288,7 @@ impl Protocol for FileProtocol {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        Ok(self.read_request(request).await?.into_parts().0)
-    }
-
-    async fn read_output(
-        &self,
-        request: ProtocolRequest<'_>,
-        _context: ProtocolContext,
-    ) -> Result<ProtocolReadOutput> {
+    ) -> Result<ProtocolOutput> {
         self.read_request(request).await
     }
 }
@@ -331,6 +313,16 @@ pub(crate) fn resolve_path(cwd: &Path, target: &str) -> Result<PathBuf> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadInput {
+    offset: Option<usize>,
+    limit: Option<usize>,
+    tail: Option<usize>,
+    line_numbers: Option<bool>,
+    glob: Option<String>,
+}
+
 #[derive(Clone)]
 struct Range {
     offset: usize,
@@ -341,71 +333,44 @@ struct Range {
 }
 
 impl Range {
-    fn parse(headers: &[RequestHeader]) -> Result<Self> {
-        let mut offset = 1_usize;
-        let mut limit = DEFAULT_LIMIT;
-        let mut tail = None;
-        let mut line_numbers = false;
-        let mut glob = None;
-        let mut seen = std::collections::HashSet::new();
-        for header in headers {
-            let key = header.name.as_str();
-            let value = header.value.as_str();
-            if !seen.insert(key.to_string()) {
-                bail!("duplicate file header: {key}");
-            }
-            match key {
-                "offset" => {
-                    offset = value
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid offset: {value}"))?
-                        .max(1)
-                }
-                "limit" => {
-                    limit = value
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid limit: {value}"))?
-                        .clamp(1, MAX_LIMIT)
-                }
-                "tail" => {
-                    tail = Some(
-                        value
-                            .parse::<usize>()
-                            .with_context(|| format!("invalid tail: {value}"))?
-                            .clamp(1, MAX_LIMIT),
-                    )
-                }
-                "line_numbers" => {
-                    line_numbers = match value {
-                        "true" => true,
-                        "false" => false,
-                        _ => bail!("invalid line_numbers: {value}; expected true or false"),
-                    }
-                }
-                "glob" => {
-                    if value.is_empty() {
-                        bail!("file glob pattern cannot be empty");
-                    }
-                    glob = Some(value.to_string());
-                }
-                _ => bail!("unknown file header: {key}"),
-            }
-        }
+    fn from_input(input: &ReadInput) -> Result<Self> {
+        let tail = input.tail.map(|tail| tail.clamp(1, MAX_LIMIT));
         if tail.is_some()
-            && ["offset", "limit", "glob"]
-                .iter()
-                .any(|key| seen.contains(*key))
+            && [
+                input.offset.is_some(),
+                input.limit.is_some(),
+                input.glob.is_some(),
+            ]
+            .into_iter()
+            .any(|set| set)
         {
             bail!("tail cannot be combined with offset, limit, or glob");
         }
+        if let Some(pattern) = &input.glob
+            && pattern.is_empty()
+        {
+            bail!("file glob pattern cannot be empty");
+        }
         Ok(Self {
-            offset,
-            limit,
+            offset: input.offset.unwrap_or(1).max(1),
+            limit: input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
             tail,
-            line_numbers,
-            glob,
+            line_numbers: input.line_numbers.unwrap_or(false),
+            glob: input.glob.clone(),
         })
     }
+}
+
+/// The exact continuation step appended after a truncated read.
+fn next_step(uri: &str, input: Value) -> String {
+    let mut step = Map::new();
+    step.insert("read".to_string(), Value::String(uri.to_string()));
+    if let Some(fields) = input.as_object()
+        && !fields.is_empty()
+    {
+        step.insert("input".to_string(), input);
+    }
+    format!("Next: {}", Value::Object(step))
 }
 
 async fn read_glob(
@@ -432,12 +397,11 @@ async fn read_glob(
         output.push('\n');
     }
     if end < entries.len() {
-        let _ = writeln!(
-            output,
-            "\nNext:\n*** Begin Request\n*** Read: {uri}\n*** glob: {pattern}\n*** offset: {}\n*** limit: {}\n*** End Request",
-            end + 1,
-            range.limit
+        let continuation = next_step(
+            uri,
+            json!({"glob": pattern, "offset": end + 1, "limit": range.limit}),
         );
+        let _ = writeln!(output, "\n{continuation}");
     }
     Ok(output.into_bytes())
 }
@@ -479,9 +443,9 @@ fn glob_output_path(cwd: &Path, path: &Path) -> String {
 async fn read_file(
     path: &Path,
     uri: &str,
-    has_headers: bool,
+    has_input: bool,
     range: Range,
-) -> Result<ProtocolReadOutput> {
+) -> Result<ProtocolOutput> {
     if let Some(tail) = range.tail {
         return read_file_tail(path, tail, range.line_numbers).await;
     }
@@ -489,8 +453,8 @@ async fn read_file(
         .await
         .with_context(|| format!("cannot read {}", display_path(path)))?;
     if let Some(media_type) = ProtocolImageMediaType::detect(&content) {
-        if has_headers {
-            bail!("file headers are not supported for image reads");
+        if has_input {
+            bail!("file input is not supported for image reads");
         }
         let size = content.len();
         let output = format!(
@@ -499,8 +463,9 @@ async fn read_file(
             media_type.mime_type(),
             size
         );
-        return Ok(ProtocolReadOutput::new(
+        return Ok(ProtocolOutput::new(
             output.into_bytes(),
+            None,
             vec![ProtocolImage::new(content, media_type)],
         ));
     }
@@ -522,17 +487,11 @@ async fn read_file(
     }
 
     if end < lines.len() {
-        let line_numbers = if range.line_numbers {
-            "*** line_numbers: true\n"
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            output,
-            "\nNext:\n*** Begin Request\n*** Read: {uri}\n*** offset: {}\n*** limit: {}\n{line_numbers}*** End Request",
-            end + 1,
-            range.limit
-        );
+        let mut input = json!({"offset": end + 1, "limit": range.limit});
+        if range.line_numbers {
+            input["line_numbers"] = Value::Bool(true);
+        }
+        let _ = writeln!(output, "\n{}", next_step(uri, input));
     }
     Ok(output.into_bytes().into())
 }
@@ -543,11 +502,7 @@ struct TailRead {
     starts_at_beginning: bool,
 }
 
-async fn read_file_tail(
-    path: &Path,
-    count: usize,
-    line_numbers: bool,
-) -> Result<ProtocolReadOutput> {
+async fn read_file_tail(path: &Path, count: usize, line_numbers: bool) -> Result<ProtocolOutput> {
     let path = path.to_path_buf();
     let tail = tokio::task::spawn_blocking(move || read_tail(&path, count, line_numbers))
         .await
@@ -592,7 +547,7 @@ fn read_tail(path: &Path, count: usize, count_all_lines: bool) -> Result<TailRea
     file.read_exact(&mut header[..header_length])
         .with_context(|| format!("cannot read {}", display_path(path)))?;
     if ProtocolImageMediaType::detect(&header[..header_length]).is_some() {
-        bail!("file headers are not supported for image reads");
+        bail!("file input is not supported for image reads");
     }
 
     let mut position = length;
@@ -694,12 +649,8 @@ async fn read_directory(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>>
         output.push('\n');
     }
     if end < entries.len() {
-        let _ = writeln!(
-            output,
-            "\nNext:\n*** Begin Request\n*** Read: {uri}\n*** offset: {}\n*** limit: {}\n*** End Request",
-            end + 1,
-            range.limit
-        );
+        let continuation = next_step(uri, json!({"offset": end + 1, "limit": range.limit}));
+        let _ = writeln!(output, "\n{continuation}");
     }
     Ok(output.into_bytes())
 }
@@ -708,27 +659,46 @@ async fn read_directory(path: &Path, uri: &str, range: Range) -> Result<Vec<u8>>
 mod tests {
     use super::*;
 
+    fn input_map(value: Value) -> Map<String, Value> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn request<'a>(
+        uri: &'a str,
+        target: &'a str,
+        input: &'a Map<String, Value>,
+    ) -> ProtocolRequest<'a> {
+        ProtocolRequest { uri, target, input }
+    }
+
+    fn parse_range(value: Value) -> Result<Range> {
+        Range::from_input(&serde_json::from_value(value)?)
+    }
+
     #[test]
-    fn help_reports_display_path_and_opt_in_line_numbers() {
+    fn help_documents_input_fields_and_examples() {
         let help = help(Path::new(r"\\?\C:\Users\4fu\project"));
         assert!(help.contains(r"Current working directory: `file://C:\Users\4fu\project`"));
         assert!(help.contains("`file://<path>`"));
-        assert!(help.contains("`*** offset: <line>` and `*** limit: <count>` headers"));
-        assert!(help.contains("Options are passed as `*** name: value` request headers"));
-        assert!(help.contains("Header values are raw text and are never"));
-        assert!(help.contains("`*** tail: <count>`"));
-        assert!(help.contains("`tail` cannot be combined with `offset`,"));
-        assert!(help.contains("`*** line_numbers: true`"));
-        assert!(help.contains("Line numbers are disabled by default and"));
-        assert!(help.contains("cannot be combined with `glob`."));
+        assert!(help.contains("`offset` (integer): one-based starting line"));
+        assert!(help.contains("the\n    default is 200 and the maximum is 2000"));
+        assert!(help.contains("`tail` (integer): efficiently read the last lines"));
+        assert!(help.contains("`tail` cannot be combined with `offset`, `limit`, or"));
+        assert!(help.contains("`line_numbers` (boolean): prefix file content"));
+        assert!(help.contains("cannot be combined\n    with `glob`"));
+        assert!(help.contains("`glob` (string): with a directory read"));
+        assert!(help.contains("at most 50000 files"));
+        assert!(help.contains("Out-of-range numeric values are clamped to their bounds"));
         assert!(help.contains("PNG, JPEG, GIF, and WebP"));
-        assert!(help.contains("Image reads do not accept\n  request headers"));
-        assert!(help.contains("`*** glob: <pattern>`"));
-        assert!(help.contains("Unknown, duplicate, malformed, or invalid headers are rejected;"));
+        assert!(help.contains("Image reads take no input."));
         assert!(help.contains("paths beginning with\n  `~/` resolve"));
         assert!(help.contains("`~user` is not expanded"));
-        assert!(help.contains("Every `file` read"));
-        assert!(help.contains("Every `file` read takes no body."));
+        assert!(help.contains(r#"{"read": "file://src/main.rs"}"#));
+        assert!(help.contains(r#"{"read": "file://src/main.rs", "input": {"offset": 401, "limit": 200, "line_numbers": true}}"#));
+        assert!(help.contains(r#"{"read": "file://logs/app.log", "input": {"tail": 50}}"#));
+        assert!(help.contains(r#"{"read": "file://src", "input": {"glob": "**/*.rs"}}"#));
+        assert!(!help.contains("header"));
+        assert!(!help.contains("body"));
     }
 
     #[test]
@@ -774,122 +744,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn misplaced_file_body_reports_where_the_path_belongs() {
+    async fn help_rejects_any_input_field() {
         let directory = tempfile::tempdir().unwrap();
+        let input = input_map(json!({"offset": 1}));
         let error = FileProtocol::new(directory.path())
             .read(
-                ProtocolRequest {
-                    uri: "file://",
-                    target: "",
-                    headers: &[],
-                    body: "src/lib.rs",
-                },
-                ProtocolContext {
-                    tasks: crate::task::TaskManager::new(),
-                },
+                request("file://help", "help", &input),
+                ProtocolContext::new(crate::task::TaskManager::new()),
             )
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("*** Read: file://<path>"));
+        assert!(error.to_string().contains("takes no input fields"));
+    }
+
+    #[tokio::test]
+    async fn unknown_input_fields_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = input_map(json!({"lines": 10}));
+        let error = FileProtocol::new(directory.path())
+            .read(
+                ProtocolRequest {
+                    uri: "file://src/main.rs",
+                    target: "src/main.rs",
+                    input: &input,
+                },
+                ProtocolContext::new(crate::task::TaskManager::new()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown field `lines`"));
+        assert!(format!("{error:#}").contains("expected one of"));
+    }
+
+    #[tokio::test]
+    async fn directories_reject_tail_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = input_map(json!({"tail": 1}));
+
+        let error = FileProtocol::new(directory.path())
+            .read(
+                request("file://", "", &input),
+                ProtocolContext::new(crate::task::TaskManager::new()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("tail is only supported for text file reads")
+        );
     }
 
     #[test]
     fn ranges_are_one_based_and_bounded() {
-        let range = Range::parse(&[
-            RequestHeader::new("offset", "0"),
-            RequestHeader::new("limit", "99999"),
-        ])
-        .unwrap();
+        let range = parse_range(json!({"offset": 0, "limit": 99999})).unwrap();
         assert_eq!(range.offset, 1);
         assert_eq!(range.limit, MAX_LIMIT);
         assert_eq!(range.tail, None);
         assert!(!range.line_numbers);
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("offset", "1"),
-                RequestHeader::new("offset", "2")
-            ])
-            .is_err()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("limit", "1"),
-                RequestHeader::new("limit", "2")
-            ])
-            .is_err()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("tail", "1"),
-                RequestHeader::new("tail", "2")
-            ])
-            .is_err()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("line_numbers", "true"),
-                RequestHeader::new("line_numbers", "false")
-            ])
-            .is_err()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("glob", "*.rs"),
-                RequestHeader::new("glob", "*.md")
-            ])
-            .is_err()
-        );
+        assert!(serde_json::from_value::<ReadInput>(json!({"offset": "2"})).is_err());
+        assert!(serde_json::from_value::<ReadInput>(json!({"limit": 1.5})).is_err());
+        assert!(serde_json::from_value::<ReadInput>(json!({"line_numbers": "true"})).is_err());
+        assert!(serde_json::from_value::<ReadInput>(json!({"line_numbers": 1})).is_err());
     }
 
     #[test]
-    fn tail_ranges_are_bounded_and_exclusive() {
+    fn tail_ranges_are_bounded() {
+        assert_eq!(parse_range(json!({"tail": 0})).unwrap().tail, Some(1));
         assert_eq!(
-            Range::parse(&[RequestHeader::new("tail", "0")])
-                .unwrap()
-                .tail,
-            Some(1)
-        );
-        assert_eq!(
-            Range::parse(&[RequestHeader::new("tail", "99999")])
-                .unwrap()
-                .tail,
+            parse_range(json!({"tail": 99999})).unwrap().tail,
             Some(MAX_LIMIT)
         );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("tail", "2"),
-                RequestHeader::new("line_numbers", "true")
-            ])
-            .is_ok()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("tail", "2"),
-                RequestHeader::new("offset", "1")
-            ])
-            .is_err()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("limit", "2"),
-                RequestHeader::new("tail", "2")
-            ])
-            .is_err()
-        );
-        assert!(
-            Range::parse(&[
-                RequestHeader::new("glob", "*.log"),
-                RequestHeader::new("tail", "2")
-            ])
-            .is_err()
-        );
+        assert!(parse_range(json!({"tail": 2, "line_numbers": true})).is_ok());
+        assert!(parse_range(json!({"tail": 2, "offset": 1})).is_err());
+        assert!(parse_range(json!({"limit": 2, "tail": 2})).is_err());
+        assert!(parse_range(json!({"glob": "*.log", "tail": 2})).is_err());
+        assert!(parse_range(json!({"glob": ""})).is_err());
     }
 
     #[test]
-    fn glob_header_values_are_used_verbatim() {
-        let range =
-            Range::parse(&[RequestHeader::new("glob", "reports + draft/?&#%*.md")]).unwrap();
+    fn glob_input_values_are_used_verbatim() {
+        let range = parse_range(json!({"glob": "reports + draft/?&#%*.md"})).unwrap();
 
         assert_eq!(range.glob.as_deref(), Some("reports + draft/?&#%*.md"));
     }
@@ -897,16 +835,16 @@ mod tests {
     #[test]
     fn line_numbers_are_opt_in() {
         assert!(
-            Range::parse(&[RequestHeader::new("line_numbers", "true")])
+            parse_range(json!({"line_numbers": true}))
                 .unwrap()
                 .line_numbers
         );
+        assert!(!parse_range(json!({})).unwrap().line_numbers);
         assert!(
-            !Range::parse(&[RequestHeader::new("line_numbers", "false")])
+            !parse_range(json!({"line_numbers": false}))
                 .unwrap()
                 .line_numbers
         );
-        assert!(Range::parse(&[RequestHeader::new("line_numbers", "1")]).is_err());
     }
 
     #[test]
@@ -961,11 +899,16 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha\nbeta\n").await.unwrap();
 
-        let plain = read_file(&path, "file://file.txt", false, Range::parse(&[]).unwrap())
-            .await
-            .unwrap();
+        let plain = read_file(
+            &path,
+            "file://file.txt",
+            false,
+            parse_range(json!({})).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            String::from_utf8(plain.into_parts().0).unwrap(),
+            String::from_utf8(plain.text_bytes().to_vec()).unwrap(),
             "alpha\nbeta\n"
         );
 
@@ -973,12 +916,12 @@ mod tests {
             &path,
             "file://file.txt",
             true,
-            Range::parse(&[RequestHeader::new("line_numbers", "true")]).unwrap(),
+            parse_range(json!({"line_numbers": true})).unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(
-            String::from_utf8(numbered.into_parts().0).unwrap(),
+            String::from_utf8(numbered.text_bytes().to_vec()).unwrap(),
             "1 │ alpha\n2 │ beta\n"
         );
     }
@@ -991,12 +934,17 @@ mod tests {
             .await
             .unwrap();
 
-        let output = read_file(&path, "file://file.txt", false, Range::parse(&[]).unwrap())
-            .await
-            .unwrap();
+        let output = read_file(
+            &path,
+            "file://file.txt",
+            false,
+            parse_range(json!({})).unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
-            String::from_utf8(output.into_parts().0).unwrap(),
+            String::from_utf8(output.text_bytes().to_vec()).unwrap(),
             "alpha\nbeta\ngamma\n"
         );
     }
@@ -1012,13 +960,13 @@ mod tests {
                 &path,
                 "file://file.txt",
                 true,
-                Range::parse(&[RequestHeader::new("tail", "2")]).unwrap(),
+                parse_range(json!({"tail": 2})).unwrap(),
             )
             .await
             .unwrap();
 
             assert_eq!(
-                String::from_utf8(output.into_parts().0).unwrap(),
+                String::from_utf8(output.text_bytes().to_vec()).unwrap(),
                 "one\ntwo\n"
             );
         }
@@ -1042,12 +990,15 @@ mod tests {
                 &path,
                 "file://file.txt",
                 true,
-                Range::parse(&[RequestHeader::new("tail", "1")]).unwrap(),
+                parse_range(json!({"tail": 1})).unwrap(),
             )
             .await
             .unwrap();
 
-            assert_eq!(String::from_utf8(output.into_parts().0).unwrap(), expected);
+            assert_eq!(
+                String::from_utf8(output.text_bytes().to_vec()).unwrap(),
+                expected
+            );
         }
     }
 
@@ -1063,13 +1014,13 @@ mod tests {
             &path,
             "file://file.txt",
             true,
-            Range::parse(&[RequestHeader::new("tail", "20")]).unwrap(),
+            parse_range(json!({"tail": 20})).unwrap(),
         )
         .await
         .unwrap();
 
         assert_eq!(
-            String::from_utf8(output.into_parts().0).unwrap(),
+            String::from_utf8(output.text_bytes().to_vec()).unwrap(),
             "zero\none\ntwo\n"
         );
     }
@@ -1087,17 +1038,13 @@ mod tests {
             &path,
             "file://file.txt",
             true,
-            Range::parse(&[
-                RequestHeader::new("tail", "2"),
-                RequestHeader::new("line_numbers", "true"),
-            ])
-            .unwrap(),
+            parse_range(json!({"tail": 2, "line_numbers": true})).unwrap(),
         )
         .await
         .unwrap();
 
         assert_eq!(
-            String::from_utf8(output.into_parts().0).unwrap(),
+            String::from_utf8(output.text_bytes().to_vec()).unwrap(),
             "11 │ line 11\n12 │ line 12\n"
         );
     }
@@ -1112,11 +1059,11 @@ mod tests {
             &path,
             "file://file.txt",
             true,
-            Range::parse(&[RequestHeader::new("tail", "20")]).unwrap(),
+            parse_range(json!({"tail": 20})).unwrap(),
         )
         .await
         .unwrap();
-        let output = String::from_utf8(output.into_parts().0).unwrap();
+        let output = String::from_utf8(output.text_bytes().to_vec()).unwrap();
 
         assert_eq!(output, "zero\none\ntwo\n");
         assert!(!output.contains("Next:"));
@@ -1135,13 +1082,16 @@ mod tests {
             &path,
             "file://file.txt",
             true,
-            Range::parse(&[RequestHeader::new("tail", "2")]).unwrap(),
+            parse_range(json!({"tail": 2})).unwrap(),
         )
         .await
         .unwrap();
         let expected = format!("middle\n{suffix}\n");
 
-        assert_eq!(String::from_utf8(output.into_parts().0).unwrap(), expected);
+        assert_eq!(
+            String::from_utf8(output.text_bytes().to_vec()).unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -1154,21 +1104,14 @@ mod tests {
             &path,
             "file://file.txt",
             true,
-            Range::parse(&[
-                RequestHeader::new("offset", "1"),
-                RequestHeader::new("limit", "1"),
-                RequestHeader::new("line_numbers", "true"),
-            ])
-            .unwrap(),
+            parse_range(json!({"offset": 1, "limit": 1, "line_numbers": true})).unwrap(),
         )
         .await
         .unwrap();
-        let output = String::from_utf8(output.into_parts().0).unwrap();
-        assert!(
-            output.contains(
-                "Next:\n*** Begin Request\n*** Read: file://file.txt\n*** offset: 2\n*** limit: 1\n*** line_numbers: true\n*** End Request"
-            )
-        );
+        let output = String::from_utf8(output.text_bytes().to_vec()).unwrap();
+        assert!(output.contains(
+            r#"Next: {"read":"file://file.txt","input":{"offset":2,"limit":1,"line_numbers":true}}"#
+        ));
     }
 
     #[tokio::test]
@@ -1182,12 +1125,12 @@ mod tests {
             &path,
             "file://screenshot.bin",
             false,
-            Range::parse(&[]).unwrap(),
+            parse_range(json!({})).unwrap(),
         )
         .await
         .unwrap();
 
-        assert!(String::from_utf8_lossy(output.content()).contains("image/png"));
+        assert!(String::from_utf8_lossy(output.text_bytes()).contains("image/png"));
         assert_eq!(output.images().len(), 1);
         assert_eq!(output.images()[0].bytes(), bytes);
         assert_eq!(output.images()[0].media_type(), ProtocolImageMediaType::Png);
@@ -1196,7 +1139,7 @@ mod tests {
             &path,
             "file://screenshot.bin",
             true,
-            Range::parse(&[RequestHeader::new("limit", "1")]).unwrap(),
+            parse_range(json!({"limit": 1})).unwrap(),
         )
         .await
         .unwrap_err();
@@ -1206,7 +1149,7 @@ mod tests {
             &path,
             "file://screenshot.bin",
             true,
-            Range::parse(&[RequestHeader::new("tail", "1")]).unwrap(),
+            parse_range(json!({"tail": 1})).unwrap(),
         )
         .await
         .unwrap_err();
@@ -1247,7 +1190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn glob_pagination_returns_a_complete_continuation_address() {
+    async fn glob_pagination_returns_a_complete_continuation_step() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir_all(directory.path().join("nested"))
             .await
@@ -1256,12 +1199,7 @@ mod tests {
         fs::write(directory.path().join("nested/b.rs"), "b")
             .await
             .unwrap();
-        let range = Range::parse(&[
-            RequestHeader::new("glob", "**/*.rs"),
-            RequestHeader::new("offset", "1"),
-            RequestHeader::new("limit", "1"),
-        ])
-        .unwrap();
+        let range = parse_range(json!({"glob": "**/*.rs", "offset": 1, "limit": 1})).unwrap();
 
         let output = read_glob(
             directory.path(),
@@ -1275,16 +1213,14 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.starts_with("a.rs\n"));
-        assert!(
-            output.contains(
-                "Next:\n*** Begin Request\n*** Read: file://\n*** glob: **/*.rs\n*** offset: 2\n*** limit: 1\n*** End Request"
-            )
-        );
+        assert!(output.contains(
+            r#"Next: {"read":"file://","input":{"glob":"**/*.rs","offset":2,"limit":1}}"#
+        ));
         assert!(!output.contains("more matches"));
     }
 
     #[tokio::test]
-    async fn glob_pagination_preserves_the_pattern_in_the_continuation_request() {
+    async fn glob_pagination_preserves_the_pattern_in_the_continuation_step() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a&b.rs"), "a")
             .await
@@ -1299,31 +1235,15 @@ mod tests {
             directory.path(),
             pattern,
             "file://",
-            Range::parse(&[
-                RequestHeader::new("glob", pattern),
-                RequestHeader::new("offset", "1"),
-                RequestHeader::new("limit", "1"),
-            ])
-            .unwrap(),
+            parse_range(json!({"glob": pattern, "offset": 1, "limit": 1})).unwrap(),
         )
         .await
         .unwrap();
         let output = String::from_utf8(output).unwrap();
 
-        assert!(
-            output.contains(
-                "Next:\n*** Begin Request\n*** Read: file://\n*** glob: *&b.rs\n*** offset: 2\n*** limit: 1\n*** End Request"
-            )
-        );
-        let headers = [
-            RequestHeader::new("glob", pattern),
-            RequestHeader::new("offset", "2"),
-            RequestHeader::new("limit", "1"),
-        ];
-        assert_eq!(
-            Range::parse(&headers).unwrap().glob.as_deref(),
-            Some(pattern)
-        );
+        assert!(output.contains(
+            r#"Next: {"read":"file://","input":{"glob":"*&b.rs","offset":2,"limit":1}}"#
+        ));
     }
 
     #[tokio::test]
@@ -1335,11 +1255,11 @@ mod tests {
             directory.path(),
             "**/*.rs",
             "file://",
-            Range::parse(&[RequestHeader::new("glob", "**/*.rs")]).unwrap(),
+            parse_range(json!({"glob": "**/*.rs"})).unwrap(),
         )
         .await
         .unwrap();
-        let listing = read_directory(directory.path(), "file://", Range::parse(&[]).unwrap())
+        let listing = read_directory(directory.path(), "file://", parse_range(json!({})).unwrap())
             .await
             .unwrap();
 
@@ -1348,28 +1268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directories_reject_tail_reads() {
-        let directory = tempfile::tempdir().unwrap();
-
-        let error = FileProtocol::new(directory.path())
-            .read_request(ProtocolRequest {
-                uri: "file://",
-                target: "",
-                headers: &[RequestHeader::new("tail", "1")],
-                body: "",
-            })
-            .await
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("tail is only supported for text file reads")
-        );
-    }
-
-    #[tokio::test]
-    async fn directory_pagination_returns_only_the_continuation_address() {
+    async fn directory_pagination_returns_only_the_continuation_step() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.txt"), "a")
             .await
@@ -1381,11 +1280,7 @@ mod tests {
         let output = read_directory(
             directory.path(),
             "file://",
-            Range::parse(&[
-                RequestHeader::new("offset", "1"),
-                RequestHeader::new("limit", "1"),
-            ])
-            .unwrap(),
+            parse_range(json!({"offset": 1, "limit": 1})).unwrap(),
         )
         .await
         .unwrap();
@@ -1393,8 +1288,20 @@ mod tests {
 
         assert_eq!(
             output,
-            "a.txt\n\nNext:\n*** Begin Request\n*** Read: file://\n*** offset: 2\n*** limit: 1\n*** End Request\n"
+            "a.txt\n\nNext: {\"read\":\"file://\",\"input\":{\"offset\":2,\"limit\":1}}\n"
         );
         assert!(!output.contains("more entries"));
+    }
+
+    #[test]
+    fn next_step_omits_an_empty_input_object() {
+        assert_eq!(
+            next_step("file://src/main.rs", json!({})),
+            r#"Next: {"read":"file://src/main.rs"}"#
+        );
+        assert_eq!(
+            next_step("file://src/main.rs", json!({"offset": 2})),
+            r#"Next: {"read":"file://src/main.rs","input":{"offset":2}}"#
+        );
     }
 }

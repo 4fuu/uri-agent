@@ -1,7 +1,7 @@
 # URI Agent plugin SDK
 
 This crate provides the Rust guest types, exports, and host calls for trusted
-URI Agent Extism plugins. It implements ABI v7 only; older ABI and the former
+URI Agent Extism plugins. It implements ABI v9 only; older ABI and the former
 subagent API are unsupported. Runtime installation and limits are documented
 in [WASM plugins](../docs/plugins.md).
 
@@ -21,7 +21,7 @@ uri-agent-plugin-sdk = "2026.928.1"
 Define a manifest and handler, then use `define_plugin!` to generate `uri_agent_manifest` and `uri_agent_handle`:
 
 ```rust
-use uri_agent_plugin_sdk::{define_plugin, HandlerRequest, HandlerResult,
+use uri_agent_plugin_sdk::{define_plugin, HandlerOutput, HandlerRequest, HandlerResult,
     Operation, PluginManifest, ProtocolDescriptor};
 
 fn manifest() -> PluginManifest {
@@ -32,7 +32,7 @@ fn manifest() -> PluginManifest {
 fn handle(request: HandlerRequest) -> HandlerResult {
     match request {
         HandlerRequest::Protocol { operation: Operation::Read, target, .. }
-            if target == "help" => Ok(b"# example\n".to_vec()),
+            if target == "help" => Ok("# example\n".into()),
         _ => Err("unsupported request".into()),
     }
 }
@@ -40,9 +40,10 @@ define_plugin!(manifest(), handle);
 ```
 
 Every protocol implements the built-in `help` target; the host serves that
-page through the `help` tool. Bodies are strings, including
-`""` when empty. `read(uri, headers, body)` and `exec(uri, headers, body)`
-call static built-ins with `&[RequestHeader]` options.
+page through the `help` tool. Protocol requests carry the URI target and one
+JSON `input` object; a handler returns `{ text, json? }`, where `json` is
+optional structured output. `read(uri, input)` and `exec(uri, input)` call
+static built-ins with a `serde_json::Value` object.
 Register structured operations with `with_model_tools([ModelToolDescriptor])`
 and handle `HandlerRequest::ModelTool`; schemas must be strict top-level JSON
 objects.
@@ -78,11 +79,11 @@ is accepted as Prompt when the Agent is idle. Accepted input is durable.
 Provider/model and thinking freeze after the first durably accepted submission.
 
 When the callback boolean is true, handle
-`HandlerRequest::Event { event: PluginEvent::Compacted { .. } }`. Return JSON
-bytes encoding `Option<AgentSpecPatch>`; patches may alter only system prompt,
-tools, and protocols after summary generation. Enabling the callback forces the
-Agent's context strategy to `summary`. URI Agent atomically commits the patch
-with the compaction checkpoint.
+`HandlerRequest::Event { event: PluginEvent::Compacted { .. } }`. Return a
+handler result whose `text` is JSON encoding `Option<AgentSpecPatch>`; patches
+may alter only system prompt, tools, and protocols after summary generation.
+Enabling the callback forces the Agent's context strategy to `summary`. URI
+Agent atomically commits the patch with the compaction checkpoint.
 
 ## State and resident lifecycle
 
@@ -94,9 +95,9 @@ Entries include a revision; compare-and-set accepts an expected revision (or
 1 MiB and live in separate SQLite state, not sessions or plugin settings.
 
 Opt in with `.with_resident()` and handle `PluginEvent::Resident` events:
-`ResidentEvent::Start`, `Wake`, and `Shutdown`. Return JSON bytes encoding
-`ResidentResponse`; `wake_after_ms` requests another wake. Non-resident plugins
-remain request-driven.
+`ResidentEvent::Start`, `Wake`, and `Shutdown`. Return a handler result whose
+`text` is JSON encoding `ResidentResponse`; `wake_after_ms` requests another
+wake. Non-resident plugins remain request-driven.
 
 The SDK also exposes `model_role`, which resolves the plugin's declared roles
 (`with_model_roles`) at call time, permission-free `plugin_setting` /

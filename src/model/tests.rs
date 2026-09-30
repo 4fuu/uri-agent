@@ -43,6 +43,7 @@ fn transformed(model: CatalogModel, thinking: ThinkingLevel, body: Value) -> Val
             model,
             thinking,
             session_id: None,
+            tool_schemas: ToolSchemas::default(),
         }
         .transform_bytes(bytes::Bytes::from(bytes)),
     )
@@ -329,6 +330,7 @@ fn configured_auth_client_applies_request_transforms() {
             model: catalog_model("openai-responses", json!({})),
             thinking: ThinkingLevel::Off,
             session_id: None,
+            tool_schemas: ToolSchemas::default(),
         }),
         ..Default::default()
     };
@@ -565,6 +567,7 @@ fn codex_request_transform_matches_current_routing_contract() {
         model,
         thinking: ThinkingLevel::High,
         session_id: Some(session_id),
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::new();
     headers.insert("session_id", HeaderValue::from_static("random-rig-id"));
@@ -1814,6 +1817,7 @@ fn completions_cache_control_and_session_affinity_match_pi() {
         model: model.clone(),
         thinking: ThinkingLevel::Off,
         session_id: Some("session-1".to_string()),
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::new();
     transform.transform_headers(&mut headers);
@@ -1856,6 +1860,7 @@ fn opencode_requests_use_stable_session_header_and_preserve_user_agent() {
             model,
             thinking: ThinkingLevel::Off,
             session_id: Some("session-1".to_string()),
+            tool_schemas: ToolSchemas::default(),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1875,6 +1880,7 @@ fn opencode_requests_use_stable_session_header_and_preserve_user_agent() {
         model: opencode,
         thinking: ThinkingLevel::Off,
         session_id: Some("session-1".to_string()),
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::new();
     transform.transform_headers(&mut headers);
@@ -1887,6 +1893,7 @@ fn opencode_requests_use_stable_session_header_and_preserve_user_agent() {
         model: catalog_model("openai-completions", json!({})),
         thinking: ThinkingLevel::Off,
         session_id: Some("session-1".to_string()),
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::new();
     transform.transform_headers(&mut headers);
@@ -1903,6 +1910,7 @@ fn anthropic_affinity_uses_only_its_documented_header() {
         model,
         thinking: ThinkingLevel::Off,
         session_id: Some("session-1".to_string()),
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::new();
     transform.transform_headers(&mut headers);
@@ -2026,6 +2034,7 @@ fn anthropic_mid_conversation_effort_adds_betas_unless_explicitly_configured() {
         model,
         thinking: ThinkingLevel::Off,
         session_id: None,
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::new();
     transform.transform_headers(&mut headers);
@@ -2073,6 +2082,7 @@ fn github_copilot_uses_official_cli_identity_and_dynamic_initiator() {
         model,
         thinking: ThinkingLevel::Off,
         session_id: None,
+        tool_schemas: ToolSchemas::default(),
     };
     let mut headers = HeaderMap::from_iter([
         (
@@ -2181,6 +2191,88 @@ fn gemini_uses_level_for_v3_and_budget_for_v25() {
     assert_eq!(
         automatic_body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
         -1
+    );
+}
+
+#[test]
+fn google_declarations_carry_the_original_tool_schema_as_parameters_json_schema() {
+    // The protocol tool's real shape: fixed step fields plus one free-form
+    // object and schema keywords the legacy rig `Schema` conversion drops.
+    let original = json!({
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/step"},
+                "minItems": 1,
+                "maxItems": 8,
+                "description": "One to eight steps, executed in order."
+            }
+        },
+        "required": ["steps"],
+        "additionalProperties": false,
+        "$defs": {
+            "step": {
+                "type": "object",
+                "properties": {
+                    "read": {"type": "string"},
+                    "exec": {"type": "string"},
+                    "input": {
+                        "type": "object",
+                        "description": "Protocol input; the protocol's help page defines the fields"
+                    },
+                    "id": {"type": "string"},
+                    "if": {"type": "string"},
+                    "show": {"type": "string", "enum": ["all", "errors", "none"]}
+                },
+                "additionalProperties": false
+            }
+        }
+    });
+    let tools = vec![ToolDefinition {
+        name: "protocol".to_string(),
+        description: "Call registered protocols through ordered steps.".to_string(),
+        parameters: original.clone(),
+    }];
+    let transform = ModelRequestTransform {
+        model: catalog_model("google-generative-ai", json!({})),
+        thinking: ThinkingLevel::Off,
+        session_id: None,
+        tool_schemas: ToolSchemas::default(),
+    };
+    transform.tool_schemas.publish(&tools);
+
+    // The wire body as rig-core 0.42 serializes it: the lossy legacy schema
+    // in `parameters`.
+    let body = transform.transform_bytes(bytes::Bytes::from(
+        serde_json::to_vec(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "read the file"}]}],
+            "tools": [{"functionDeclarations": [{
+                "name": "protocol",
+                "description": "Call registered protocols through ordered steps.",
+                "parameters": {"type": "object", "properties": {}}
+            }]}]
+        }))
+        .unwrap(),
+    ));
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    let declaration = &body["tools"][0]["functionDeclarations"][0];
+    assert_eq!(declaration["parametersJsonSchema"], original);
+    assert!(declaration.get("parameters").is_none());
+    let schema = &declaration["parametersJsonSchema"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["steps"]));
+    assert_eq!(
+        schema["$defs"]["step"]["properties"]["input"],
+        json!({
+            "type": "object",
+            "description": "Protocol input; the protocol's help page defines the fields"
+        })
+    );
+    assert_eq!(
+        schema["properties"]["steps"]["items"],
+        json!({"$ref": "#/$defs/step"})
     );
 }
 

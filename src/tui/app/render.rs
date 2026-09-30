@@ -55,20 +55,13 @@ fn tool_document(block: &DisplayBlock, tool: &ToolDisplay, level: usize) -> Stri
 }
 
 fn tool_target(tool: &ToolDisplay) -> Option<Cow<'_, str>> {
-    let requests = parse_protocol_requests(&tool.arguments);
-    if requests.len() > 1 {
-        // A batch lists each request under its own heading instead.
+    let steps = parse_protocol_steps(&tool.arguments);
+    if steps.len() > 1 {
+        // A multi-step call lists each step under its own heading instead.
         return None;
     }
-    if let Some(parsed) = requests.first() {
-        return Some(display_tool_uri(parsed.uri));
-    }
-    if let Some(uri) = tool
-        .arguments
-        .get("uri")
-        .and_then(serde_json::Value::as_str)
-    {
-        return Some(display_tool_uri(uri));
+    if let Some(parsed) = steps.first() {
+        return Some(display_tool_uri(parsed.address));
     }
     if tool.name == "replace" {
         let path = tool.arguments.get("path")?.as_str()?;
@@ -115,42 +108,42 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
         }
         return;
     }
-    let protocol_requests = parse_protocol_requests(&tool.arguments);
-    let protocol_request_consumed = !protocol_requests.is_empty();
-    if protocol_requests.len() > 1 {
-        let request_heading = "#".repeat(level + 1);
-        document.push_str(&format!("\n{heading} Requests\n"));
-        for (index, request) in protocol_requests.iter().enumerate() {
-            let action = if request.operation == "Exec" {
+    let protocol_steps = parse_protocol_steps(&tool.arguments);
+    let protocol_steps_consumed = !protocol_steps.is_empty();
+    if protocol_steps.len() > 1 {
+        let step_heading = "#".repeat(level + 1);
+        document.push_str(&format!("\n{heading} Steps\n"));
+        for (index, step) in protocol_steps.iter().enumerate() {
+            let action = if step.operation == "exec" {
                 "Exec"
             } else {
                 "Read"
             };
             document.push_str(&format!(
-                "\n{request_heading} Request {} · {} {}\n",
+                "\n{step_heading} Step {} · {} {}\n",
                 index + 1,
                 action,
-                inline_code(&display_tool_uri(request.uri))
+                inline_code(&display_tool_uri(step.address))
             ));
-            append_request_body(document, request, level + 2);
+            append_step_input(document, step, level + 2);
         }
-    } else if let Some(request) = protocol_requests.first() {
-        append_request_body(document, request, level);
+    } else if let Some(step) = protocol_steps.first() {
+        append_step_input(document, step, level);
     } else if let Some(body) = tool
         .arguments
         .get("body")
         .and_then(serde_json::Value::as_str)
     {
-        // Tools without a protocol request keep rendering a plain body field.
-        append_request_body(
-            document,
-            &ProtocolRequest {
-                operation: "",
-                uri: "",
-                body,
-            },
-            level,
-        );
+        // Tools without protocol steps keep rendering a plain body field.
+        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+        let rendered = parsed.as_ref().and_then(|value| {
+            serde_json::to_string_pretty(&redact_sensitive_arguments(value)).ok()
+        });
+        document.push_str(&format!("\n{heading} Input\n\n"));
+        document.push_str(&fenced_block(
+            rendered.as_deref().unwrap_or(body),
+            if rendered.is_some() { "json" } else { "text" },
+        ));
     }
 
     let Some(arguments) = tool.arguments.as_object() else {
@@ -159,8 +152,7 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
     let remaining = arguments
         .iter()
         .filter(|(name, _)| {
-            !matches!(name.as_str(), "uri" | "body")
-                && !(protocol_request_consumed && *name == "requests")
+            name.as_str() != "body" && !(protocol_steps_consumed && name.as_str() == "steps")
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
@@ -173,35 +165,48 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
     document.push_str(&fenced_block(&input, "json"));
 }
 
-/// Appends one protocol request's body as a Command or Input section;
-/// requests without a body render nothing.
-fn append_request_body(document: &mut String, request: &ProtocolRequest<'_>, level: usize) {
-    let body = request.body;
-    if body.is_empty() {
+/// Appends one protocol step's `input` as a Command or Input section;
+/// steps without input render nothing.
+fn append_step_input(document: &mut String, step: &ProtocolStep<'_>, level: usize) {
+    let Some(input) = step.input else {
+        return;
+    };
+    if input.as_object().is_some_and(serde_json::Map::is_empty) {
         return;
     }
     let heading = "#".repeat(level);
-    let protocol = request.uri.split("://").next().unwrap_or_default();
-    let (label, language) = if request.operation == "Exec" {
-        match protocol {
-            "bash" => ("Command", "bash"),
-            "pwsh" => ("Command", "powershell"),
-            _ => ("Input", "text"),
+    let protocol = step.address.split("://").next().unwrap_or_default();
+    if step.operation == "exec"
+        && matches!(protocol, "bash" | "pwsh")
+        && let Some(script) = input.get("script").and_then(serde_json::Value::as_str)
+    {
+        let language = if protocol == "pwsh" {
+            "powershell"
+        } else {
+            "bash"
+        };
+        document.push_str(&format!("\n{heading} Command\n\n"));
+        document.push_str(&fenced_block(script, language));
+        if let Some(fields) = input.as_object() {
+            let remaining = fields
+                .iter()
+                .filter(|(name, _)| name.as_str() != "script")
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>();
+            if !remaining.is_empty() {
+                let value = serde_json::Value::Object(remaining);
+                let rendered = serde_json::to_string_pretty(&redact_sensitive_arguments(&value))
+                    .unwrap_or_else(|_| value.to_string());
+                document.push_str(&format!("\n{heading} Input\n\n"));
+                document.push_str(&fenced_block(&rendered, "json"));
+            }
         }
-    } else {
-        ("Input", "text")
-    };
-    let parsed = (label != "Command")
-        .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
-        .flatten();
-    let rendered = parsed
-        .as_ref()
-        .and_then(|value| serde_json::to_string_pretty(&redact_sensitive_arguments(value)).ok());
-    document.push_str(&format!("\n{heading} {label}\n\n"));
-    document.push_str(&fenced_block(
-        rendered.as_deref().unwrap_or(body),
-        if rendered.is_some() { "json" } else { language },
-    ));
+        return;
+    }
+    let rendered = serde_json::to_string_pretty(&redact_sensitive_arguments(input))
+        .unwrap_or_else(|_| input.to_string());
+    document.push_str(&format!("\n{heading} Input\n\n"));
+    document.push_str(&fenced_block(&rendered, "json"));
 }
 
 pub(super) fn redact_sensitive_arguments(value: &serde_json::Value) -> serde_json::Value {
@@ -290,111 +295,56 @@ fn longest_backtick_run(value: &str) -> usize {
         .unwrap_or_default()
 }
 
-/// Parses the `protocol` tool's fixed request format for display only: the
-/// `*** Read:`/`*** Exec:` verb, the address, and the raw request body. Every
-/// request of a batch is kept so previews can show the whole call.
-struct ProtocolRequest<'a> {
+/// One parsed `protocol` step for display only: the `read`/`exec` verb, the
+/// address, and the step's `input` object. Every step of a call is kept so
+/// previews can show the whole call.
+struct ProtocolStep<'a> {
     operation: &'a str,
-    uri: &'a str,
-    body: &'a str,
+    address: &'a str,
+    input: Option<&'a serde_json::Value>,
 }
 
-fn parse_protocol_requests(arguments: &serde_json::Value) -> Vec<ProtocolRequest<'_>> {
+fn parse_protocol_steps(arguments: &serde_json::Value) -> Vec<ProtocolStep<'_>> {
     arguments
-        .get("requests")
+        .get("steps")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|request| request.as_str().and_then(parse_protocol_request_text))
+        .filter_map(|step| {
+            let object = step.as_object()?;
+            let (operation, address) = match (
+                object.get("read").and_then(serde_json::Value::as_str),
+                object.get("exec").and_then(serde_json::Value::as_str),
+            ) {
+                (Some(address), None) => ("read", address),
+                (None, Some(address)) => ("exec", address),
+                _ => return None,
+            };
+            Some(ProtocolStep {
+                operation,
+                address,
+                input: object.get("input"),
+            })
+        })
         .collect()
 }
 
-fn parse_protocol_request_text(request: &str) -> Option<ProtocolRequest<'_>> {
-    let mut offset = 0;
-    let begin = next_request_line(request, &mut offset)?;
-    if begin.trim_end() != "*** Begin Request" {
-        return None;
-    }
-    let operation_line = next_request_line(request, &mut offset)?.trim_end();
-    let (verb, uri) = operation_line.strip_prefix("*** ")?.split_once(' ')?;
-    let operation = verb.strip_suffix(':').unwrap_or(verb);
-    if !matches!(operation, "Read" | "Exec") || uri.is_empty() {
-        return None;
-    }
-    let mut body = request.get(offset..).unwrap_or("");
-    loop {
-        let (line, rest) = body.split_once('\n').unwrap_or((body, ""));
-        let trimmed = line.trim_end_matches(['\r', ' ', '\t']);
-        if trimmed == "*** Body:" || is_header_line(trimmed) {
-            body = rest;
-        } else {
-            break;
-        }
-    }
-    Some(ProtocolRequest {
-        operation,
-        uri,
-        body: strip_end_request(body),
-    })
-}
-
-fn parse_protocol_request(arguments: &serde_json::Value) -> Option<ProtocolRequest<'_>> {
-    parse_protocol_requests(arguments).into_iter().next()
-}
-
-fn is_header_line(line: &str) -> bool {
-    line.strip_prefix("*** ")
-        .and_then(|rest| rest.split_once(':'))
-        .is_some_and(|(name, _)| {
-            !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace())
-        })
-}
-
-fn next_request_line<'a>(text: &'a str, offset: &mut usize) -> Option<&'a str> {
-    let rest = text.get(*offset..)?;
-    if rest.is_empty() {
-        return None;
-    }
-    let (line, consumed) = match rest.split_once('\n') {
-        Some((line, _)) => (line, line.len() + 1),
-        None => (rest, rest.len()),
-    };
-    *offset += consumed;
-    Some(line)
-}
-
-fn strip_end_request(body: &str) -> &str {
-    let trimmed = body.trim_end_matches(['\n', '\r']);
-    trimmed
-        .strip_suffix("*** End Request")
-        .unwrap_or(trimmed)
-        .trim_end_matches(['\n', '\r'])
-}
-
 pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
-    let uri = match parse_protocol_request(arguments) {
-        Some(parsed) => parsed.uri.to_string(),
-        None => arguments.get("uri")?.as_str()?.to_string(),
-    };
-    let separator = uri.find("://").or_else(|| uri.find(':'))?;
-    (separator > 0).then(|| uri[..separator].to_string())
+    let address = parse_protocol_steps(arguments).first()?.address;
+    let separator = address.find("://").or_else(|| address.find(':'))?;
+    (separator > 0).then(|| address[..separator].to_string())
 }
 
 fn tool_body(arguments: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
-    let requests = parse_protocol_requests(arguments);
-    if requests.len() > 1 {
+    let steps = parse_protocol_steps(arguments);
+    if steps.len() > 1 {
         return None;
     }
-    if let Some(parsed) = requests.first() {
-        if parsed.body.is_empty() {
+    if let Some(input) = steps.first().and_then(|step| step.input) {
+        if input.as_object().is_some_and(serde_json::Map::is_empty) {
             return None;
         }
-        return serde_json::from_str(parsed.body)
-            .ok()
-            .map(Cow::Owned)
-            .or(Some(Cow::Owned(serde_json::Value::String(
-                parsed.body.to_string(),
-            ))));
+        return Some(Cow::Borrowed(input));
     }
     let body = arguments.get("body")?;
     let Some(value) = body.as_str() else {
@@ -456,30 +406,35 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
         }
         return format!("Loaded help: {}", single_line_preview(&names, 64));
     }
-    let requests = parse_protocol_requests(arguments);
-    let Some(parsed) = requests.first() else {
+    let steps = parse_protocol_steps(arguments);
+    let Some(parsed) = steps.first() else {
         return name.to_string();
     };
-    let action = if parsed.operation == "Exec" {
+    let action = if parsed.operation == "exec" {
         "Ran"
     } else {
         "Read"
     };
-    let title = protocol_request_title(action, parsed.uri, parsed.body);
-    if requests.len() > 1 {
-        return format!("{title} +{}", requests.len() - 1);
+    let script = parsed
+        .input
+        .and_then(|input| input.get("script"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let title = protocol_step_title(action, parsed.address, script);
+    if steps.len() > 1 {
+        return format!("{title} +{}", steps.len() - 1);
     }
     title
 }
 
-fn protocol_request_title(action: &str, uri: &str, body: &str) -> String {
-    let uri = display_tool_uri(uri);
-    let uri = uri.as_ref();
-    let (protocol, target) = uri.split_once("://").unwrap_or((uri, ""));
-    if action == "Ran" && matches!(protocol, "bash" | "pwsh") && !body.is_empty() {
+fn protocol_step_title(action: &str, address: &str, script: &str) -> String {
+    let address = display_tool_uri(address);
+    let address = address.as_ref();
+    let (protocol, target) = address.split_once("://").unwrap_or((address, ""));
+    if action == "Ran" && matches!(protocol, "bash" | "pwsh") && !script.is_empty() {
         return format!(
             "$ {}",
-            single_line_preview(body.lines().next().unwrap_or_default(), 76)
+            single_line_preview(script.lines().next().unwrap_or_default(), 76)
         );
     }
     if action == "Read" && protocol == "file" {
@@ -488,7 +443,7 @@ fn protocol_request_title(action: &str, uri: &str, body: &str) -> String {
     if target == "help" {
         return format!("Read {protocol} help");
     }
-    format!("{action} {}", single_line_preview(uri, 76))
+    format!("{action} {}", single_line_preview(address, 76))
 }
 
 pub(super) fn patch_targets(patch: &str) -> Vec<String> {
@@ -514,17 +469,11 @@ pub(super) fn tool_detail_lines(
 ) -> (Vec<(String, Color)>, usize) {
     let mut logical = Vec::new();
     if let Some(tool) = &block.tool {
-        let requests = parse_protocol_requests(&tool.arguments);
-        if !requests.is_empty() {
-            for parsed in &requests {
-                logical.push((format!("↳ {}", parsed.uri), MUTED));
+        let steps = parse_protocol_steps(&tool.arguments);
+        if !steps.is_empty() {
+            for step in &steps {
+                logical.push((format!("↳ {}", step.address), MUTED));
             }
-        } else if let Some(uri) = tool
-            .arguments
-            .get("uri")
-            .and_then(serde_json::Value::as_str)
-        {
-            logical.push((format!("↳ {uri}"), MUTED));
         } else {
             logical.push((format!("↳ {}", tool.name), MUTED));
         }
@@ -567,9 +516,10 @@ pub(super) fn tool_argument_details(
     arguments: &serde_json::Value,
     lines: &mut Vec<(String, Color)>,
 ) {
+    let steps_consumed = !parse_protocol_steps(arguments).is_empty();
     if let Some(fields) = arguments.as_object() {
         for (key, value) in fields {
-            if matches!(key.as_str(), "uri" | "body" | "requests") {
+            if key == "body" || (steps_consumed && key == "steps") {
                 continue;
             }
             if key == "patch"

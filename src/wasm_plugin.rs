@@ -12,13 +12,13 @@ use crate::plugin::{
 };
 use crate::plugin_state::{PluginState, PluginStateScope};
 use crate::protocol::{
-    DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRegistry,
-    ProtocolRequest, split_address, validate_descriptor,
+    DynamicProtocolSource, Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput,
+    ProtocolRegistry, ProtocolRequest, split_address, validate_descriptor,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use extism::{Manifest, PluginBuilder, UserData, ValType, Wasm};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,13 +32,12 @@ use uri_agent_plugin_sdk::{
     AgentSpecPatch as SdkAgentSpecPatch, AgentStatus as SdkAgentStatus, AgentSubmitResponse,
     CapabilitySelection as SdkCapabilitySelection, HANDLE_EXPORT, HOST_AGENT, HOST_CREDENTIALS,
     HOST_ENVIRONMENT, HOST_EXEC, HOST_MODEL_ROLE, HOST_PLUGIN_SETTING_GET, HOST_PLUGIN_SETTING_SET,
-    HOST_PLUGIN_STATE, HOST_READ, HandlerRequest, MANIFEST_EXPORT, Operation, PluginEvent,
-    PluginManifest, PluginSettingGetResponse, PluginSettingSetRequest,
-    PluginStateEntry as SdkPluginStateEntry, PluginStateRequest,
-    PluginStateScope as SdkPluginStateScope, RequestHeader as SdkRequestHeader,
-    ResidentEvent as SdkResidentEvent, ResidentResponse as SdkResidentResponse,
-    SubmitKind as SdkSubmitKind, SystemPromptSelection as SdkSystemPromptSelection,
-    SystemPromptUpdate as SdkSystemPromptUpdate,
+    HOST_PLUGIN_STATE, HOST_READ, HandlerOutput, HandlerRequest, HostRequest as SdkHostRequest,
+    MANIFEST_EXPORT, Operation, PluginEvent, PluginManifest, PluginSettingGetResponse,
+    PluginSettingSetRequest, PluginStateEntry as SdkPluginStateEntry, PluginStateRequest,
+    PluginStateScope as SdkPluginStateScope, ResidentEvent as SdkResidentEvent,
+    ResidentResponse as SdkResidentResponse, SubmitKind as SdkSubmitKind,
+    SystemPromptSelection as SdkSystemPromptSelection, SystemPromptUpdate as SdkSystemPromptUpdate,
 };
 
 const MANAGER_PROTOCOL: &str = "wasm_plugin";
@@ -90,10 +89,10 @@ Last reload diagnostics: {diagnostics}
 
 - Read `wasm_plugin://help/load` for loading, updating, removing, and reloading plugins.
 - Read `wasm_plugin://help/author` for the SDK, ABI, protocols, direct tools, and permissions.
-- Reload the plugin directory with an `*** Exec: wasm_plugin://reload` request.
+- Reload the plugin directory with an {{"exec": "wasm_plugin://reload"}} step.
   You MUST read `wasm_plugin://help/load` before changing plugin files or calling reload.
 
-Every `wasm_plugin` read and exec call takes no body.
+Every `wasm_plugin` read and exec call takes no input.
 "#,
         directory = display_path(directory),
     )
@@ -126,7 +125,7 @@ Plugin directory: `{directory}`
    then rename it to `<name>.wasm` in the same directory. The rename is the
    atomic enable step. Hidden files, nested files, and files that do not end in
    `.wasm` are ignored.
-5. Reload with an `*** Exec: wasm_plugin://reload` request. The call returns after reload builds a
+5. Reload with an {{"exec": "wasm_plugin://reload"}} step. The call returns after reload builds a
    complete replacement protocol and direct-tool set and swaps it into the running agent.
    Existing calls keep their old runtime until they finish. Invalid or
    conflicting modules are skipped and reported.
@@ -153,7 +152,7 @@ fn author_help() -> String {
         r##"# wasm_plugin authoring
 
 Author WASM plugins that register protocols and typed direct model tools.
-The SDK and host use ABI version 8. Older ABIs are intentionally unsupported.
+The SDK and host use ABI version 9. Older ABIs are intentionally unsupported.
 
 ## Rust SDK
 
@@ -172,8 +171,8 @@ Minimal plugin:
 
 ```rust
 use uri_agent_plugin_sdk::{{
-    HandlerRequest, HandlerResult, ModelToolDescriptor, Operation, PluginManifest,
-    ProtocolDescriptor, define_plugin,
+    HandlerOutput, HandlerRequest, HandlerResult, ModelToolDescriptor, Operation,
+    PluginManifest, ProtocolDescriptor, define_plugin,
 }};
 
 fn manifest() -> PluginManifest {{
@@ -202,13 +201,26 @@ fn handle(request: HandlerRequest) -> HandlerResult {{
             target,
             ..
         }} if target == "help" =>
-            Ok(b"# example\n\nDescribe every supported address here.\n".to_vec()),
+            Ok("# example\n\nDescribe every supported address and input here.\n".into()),
+        HandlerRequest::Protocol {{
+            operation: Operation::Exec,
+            target,
+            input,
+            ..
+        }} if target == "echo" => {{
+            let text = serde_json::to_string_pretty(&input)
+                .map_err(|error| error.to_string())?;
+            Ok(HandlerOutput {{
+                text,
+                json: Some(serde_json::Value::Object(input)),
+            }})
+        }}
         HandlerRequest::ModelTool {{ name, arguments }}
             if name == "example_greeting" => {{
                 let name = arguments["name"]
                     .as_str()
                     .ok_or_else(|| "name must be a string".to_string())?;
-                Ok(format!("Hello, {{name}}!\n").into_bytes())
+                Ok(format!("Hello, {{name}}!\n").into())
             }}
         _ => Err("unsupported plugin request".to_string()),
     }}
@@ -219,15 +231,15 @@ define_plugin!(manifest(), handle);
 
 Every declared protocol must set `can_read` to `true` and handle
 the built-in help request, documenting every
-supported address and body shape; the host serves that page through the help tool.
+supported address and input shape; the host serves that page through the help tool.
 Register a typed direct tool by passing `ModelToolDescriptor` values to
 `PluginManifest::with_model_tools` and matching `HandlerRequest::ModelTool`.
-Prefer this path when structured or escape-heavy arguments would otherwise
-require nested protocol-body serialization.
+Prefer this path when arguments need a strict schema with named, typed
+properties instead of free-form protocol input.
 The SDK exports `uri_agent_manifest` and `uri_agent_handle`; plugin authors do
 not need to write ABI glue. `uri_agent_plugin_sdk::{{read, exec}}`
-let a plugin call URI Agent's built-in protocols with request headers and
-string bodies. Calls into
+let a plugin call URI Agent's built-in protocols with one JSON `input` object.
+Calls into
 dynamic WASM protocols and `wasm_plugin` itself are intentionally rejected to
 prevent recursive runtime entry.
 
@@ -327,14 +339,6 @@ struct HostBridge {
     agent_handles: Arc<StdMutex<BTreeMap<u64, AgentHandle>>>,
     next_agent_handle: Arc<AtomicU64>,
     module: Arc<OnceLock<(Weak<StdMutex<extism::Plugin>>, PathBuf)>>,
-}
-
-#[derive(Deserialize)]
-struct HostRequest {
-    uri: String,
-    #[serde(default)]
-    headers: Vec<SdkRequestHeader>,
-    body: String,
 }
 
 #[derive(Serialize)]
@@ -467,33 +471,20 @@ impl HostBridge {
     }
 
     fn dispatch(&self, operation: Operation, input: &str) -> Result<String> {
-        let request: HostRequest =
+        let request: SdkHostRequest =
             serde_json::from_str(input).context("invalid URI Agent host request")?;
         let (name, _) = split_address(&request.uri)?;
         if name == MANAGER_PROTOCOL {
             bail!("WASM plugins cannot call {MANAGER_PROTOCOL} through the host API");
         }
-        let headers = request
-            .headers
-            .iter()
-            .map(|header| crate::protocol::RequestHeader::new(&header.name, &header.value))
-            .collect::<Vec<_>>();
         let registry =
             self.registry.get().and_then(Weak::upgrade).ok_or_else(|| {
                 anyhow!("WASM plugin host is not attached to the protocol registry")
             })?;
         self.runtime.block_on(async {
             match operation {
-                Operation::Read => {
-                    registry
-                        .read_static(&request.uri, &headers, &request.body)
-                        .await
-                }
-                Operation::Exec => {
-                    registry
-                        .exec_static(&request.uri, &headers, &request.body)
-                        .await
-                }
+                Operation::Read => registry.read_static(&request.uri, &request.input).await,
+                Operation::Exec => registry.exec_static(&request.uri, &request.input).await,
             }
         })
     }
@@ -814,6 +805,15 @@ struct WasmCompactionCallback {
     module: Arc<OnceLock<(Weak<StdMutex<extism::Plugin>>, PathBuf)>>,
 }
 
+/// Decode one handler result. Modules that return no bytes count as an empty
+/// text result; ABI v9 results are `{"text", "json"?}` objects.
+fn parse_handler_output(output: &[u8], display: &str, what: &str) -> Result<HandlerOutput> {
+    if output.is_empty() {
+        return Ok(HandlerOutput::default());
+    }
+    serde_json::from_slice(output).with_context(|| format!("invalid {what} from {display}"))
+}
+
 #[async_trait]
 impl CompactionCallback for WasmCompactionCallback {
     async fn compacted(&self, context: CompactionContext) -> Result<Option<AgentSpecPatch>> {
@@ -831,11 +831,17 @@ impl CompactionCallback for WasmCompactionCallback {
             },
         })?;
         let output = call_wasm_handler(&runtime, &path, input).await?;
-        if output.is_empty() {
-            return Ok(None);
-        }
-        let patch: Option<SdkAgentSpecPatch> =
-            serde_json::from_slice(&output).context("invalid WASM compaction callback response")?;
+        let result = parse_handler_output(
+            &output,
+            &display_path(&path),
+            "WASM compaction callback response",
+        )?;
+        let patch: Option<SdkAgentSpecPatch> = if result.text.is_empty() {
+            None
+        } else {
+            serde_json::from_str(&result.text)
+                .context("invalid WASM compaction callback response")?
+        };
         Ok(patch.map(|patch| AgentSpecPatch {
             system_prompt: patch.system_prompt.map(|prompt| match prompt {
                 SdkSystemPromptUpdate::Append(prompt) => SystemPromptUpdate::Append(prompt),
@@ -1335,20 +1341,15 @@ impl Protocol for WasmPluginManager {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if !request.body.is_empty() {
-            bail!(
-                "wasm_plugin help reads require an empty body; retry read({:?}, \"\")",
-                request.uri
-            );
-        }
+    ) -> Result<ProtocolOutput> {
+        request.reject_input()?;
         match request.target {
-            "help/load" => return Ok(load_help(&self.directory).into_bytes()),
-            "help/author" => return Ok(author_help().into_bytes()),
+            "help/load" => return Ok(load_help(&self.directory).into()),
+            "help/author" => return Ok(author_help().into()),
             "help" => {}
             _ => {
                 bail!(
-                    "unknown wasm_plugin read target; use `*** Read: wasm_plugin://help/load` or `*** Read: wasm_plugin://help/author`"
+                    "unknown wasm_plugin read target; use an {{\"read\": \"wasm_plugin://help/load\"}} or {{\"read\": \"wasm_plugin://help/author\"}} step"
                 )
             }
         }
@@ -1382,23 +1383,21 @@ impl Protocol for WasmPluginManager {
             diagnostic_count,
             report.diagnostics_file.as_deref(),
         )
-        .into_bytes())
+        .into())
     }
 
     async fn exec(
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         if request.target != "reload" {
-            bail!("unknown wasm_plugin operation; use an `*** Exec: wasm_plugin://reload` request");
-        }
-        if !request.body.is_empty() {
             bail!(
-                "wasm_plugin://reload takes no body; retry with an `*** Exec: wasm_plugin://reload` request"
+                "unknown wasm_plugin operation; use an {{\"exec\": \"wasm_plugin://reload\"}} step"
             );
         }
-        Ok(self.reload().await?.render().into_bytes())
+        request.reject_input()?;
+        Ok(self.reload().await?.render().into())
     }
 }
 
@@ -1640,10 +1639,15 @@ impl WasmResident {
             event: PluginEvent::Resident { event },
         })?;
         let output = call_wasm_handler(&self.runtime, &self.plugin_path, input).await?;
-        let response = if output.is_empty() {
+        let result = parse_handler_output(
+            &output,
+            &display_path(&self.plugin_path),
+            "resident response",
+        )?;
+        let response = if result.text.is_empty() {
             SdkResidentResponse::default()
         } else {
-            serde_json::from_slice(&output).with_context(|| {
+            serde_json::from_str(&result.text).with_context(|| {
                 format!(
                     "invalid resident response from {}",
                     display_path(&self.plugin_path)
@@ -1672,7 +1676,7 @@ impl Protocol for WasmProtocol {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         self.call(Operation::Read, request).await
     }
 
@@ -1680,29 +1684,32 @@ impl Protocol for WasmProtocol {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         self.call(Operation::Exec, request).await
     }
 }
 
 impl WasmProtocol {
-    async fn call(&self, operation: Operation, request: ProtocolRequest<'_>) -> Result<Vec<u8>> {
+    async fn call(
+        &self,
+        operation: Operation,
+        request: ProtocolRequest<'_>,
+    ) -> Result<ProtocolOutput> {
         let input = serde_json::to_vec(&HandlerRequest::Protocol {
             protocol: self.descriptor.name.clone(),
             operation,
             uri: request.uri.to_string(),
             target: request.target.to_string(),
-            headers: request
-                .headers
-                .iter()
-                .map(|header| SdkRequestHeader {
-                    name: header.name.clone(),
-                    value: header.value.clone(),
-                })
-                .collect(),
-            body: request.body.to_string(),
+            input: request.input.clone(),
         })?;
-        call_wasm_handler(&self.runtime, &self.plugin_path, input).await
+        let output = call_wasm_handler(&self.runtime, &self.plugin_path, input).await?;
+        let result =
+            parse_handler_output(&output, &display_path(&self.plugin_path), "handler result")?;
+        Ok(ProtocolOutput::new(
+            result.text.into_bytes(),
+            result.json,
+            Vec::new(),
+        ))
     }
 }
 
@@ -1728,8 +1735,10 @@ impl ModelTool for WasmModelTool {
             arguments: arguments.clone(),
         })?;
         let output = call_wasm_handler(&self.runtime, &self.plugin_path, input).await?;
+        let result =
+            parse_handler_output(&output, &display_path(&self.plugin_path), "handler result")?;
         protocols
-            .present(output, &self.descriptor.name)
+            .present(result.text.into_bytes(), &self.descriptor.name)
             .await
             .map(Into::into)
     }
@@ -1974,6 +1983,7 @@ mod tests {
     use crate::protocol::{Protocol, ProtocolContext, ProtocolRegistry, ProtocolRequest};
     use crate::session::{EventKind, SessionEvent};
     use crate::task::TaskManager;
+    use serde_json::Map;
 
     struct CaptureProtocol;
 
@@ -1992,17 +2002,31 @@ mod tests {
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(format!("host received {}", request.target).into_bytes())
+        ) -> Result<ProtocolOutput> {
+            Ok(format!(
+                "host received {} {}",
+                request.target,
+                input_json(request.input)
+            )
+            .into())
         }
 
         async fn exec(
             &self,
             request: ProtocolRequest<'_>,
             _context: ProtocolContext,
-        ) -> Result<Vec<u8>> {
-            Ok(format!("host executed {}", request.target).into_bytes())
+        ) -> Result<ProtocolOutput> {
+            Ok(format!(
+                "host executed {} {}",
+                request.target,
+                input_json(request.input)
+            )
+            .into())
         }
+    }
+
+    fn input_json(input: &Map<String, Value>) -> String {
+        serde_json::to_string(input).expect("input maps serialize as JSON")
     }
 
     fn output_function(name: &str, output: &[u8]) -> String {
@@ -2031,42 +2055,170 @@ mod tests {
         )
     }
 
-    fn module(manifest: &str, with_handler: bool) -> Vec<u8> {
-        let handler = with_handler.then_some(
-            r#"
-            (func (export "uri_agent_handle") (result i32)
-                (local $length i64)
-                (local $pointer i64)
-                (local $index i64)
-                call $input_length
-                local.tee $length
-                call $alloc
-                local.set $pointer
-                block $done
+    /// WAT fragment that stores one byte at `$out + $pos` and advances `$pos`.
+    fn pos_store(byte: u8) -> String {
+        format!(
+            r#"local.get $out
+                local.get $pos
+                i64.add
+                i32.const {byte}
+                call $store_u8
+                local.get $pos
+                i64.const 1
+                i64.add
+                local.set $pos"#
+        )
+    }
+
+    fn pos_stores(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| pos_store(*byte))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// WAT fragment that stores the current `$byte` at `$out + $pos` and
+    /// advances `$pos` by one.
+    fn pos_store_byte() -> String {
+        r#"local.get $out
+                local.get $pos
+                i64.add
+                local.get $byte
+                call $store_u8
+                local.get $pos
+                i64.const 1
+                i64.add
+                local.set $pos"#
+            .to_string()
+    }
+
+    /// WAT fragment that stores one hex digit of `$nib` at `$out + $pos` and
+    /// advances `$pos` by one.
+    fn pos_store_nib() -> String {
+        r#"local.get $out
+                local.get $pos
+                i64.add
+                local.get $nib
+                i32.const 10
+                i32.ge_u
+                if (result i32)
+                    local.get $nib
+                    i32.const 87
+                    i32.add
+                else
+                    local.get $nib
+                    i32.const 48
+                    i32.add
+                end
+                call $store_u8
+                local.get $pos
+                i64.const 1
+                i64.add
+                local.set $pos"#
+            .to_string()
+    }
+
+    /// The JSON-escaping copy loop shared by the echo and host-call wrappers.
+    /// Quotes and backslashes gain a leading backslash; control characters
+    /// become `\u00XX` so wrapped text is always a valid JSON string.
+    fn escaped_copy_loop(source: &str, length: &str) -> String {
+        format!(
+            r#"block $done
                     loop $copy
                         local.get $index
-                        local.get $length
+                        {length}
                         i64.ge_u
                         br_if $done
-                        local.get $pointer
-                        local.get $index
-                        i64.add
-                        local.get $index
-                        call $input_load_u8
-                        call $store_u8
+                        {source}
+                        local.set $byte
+                        local.get $byte
+                        i32.const 34
+                        i32.eq
+                        local.get $byte
+                        i32.const 92
+                        i32.eq
+                        i32.or
+                        if
+                            {backslash}
+                            {byte}
+                        else
+                            local.get $byte
+                            i32.const 32
+                            i32.ge_u
+                            if
+                                {byte}
+                            else
+                                {backslash}
+                                {u}
+                                {zero}
+                                {zero}
+                                local.get $byte
+                                i32.const 4
+                                i32.shr_u
+                                local.set $nib
+                                {nib}
+                                local.get $byte
+                                i32.const 15
+                                i32.and
+                                local.set $nib
+                                {nib}
+                            end
+                        end
                         local.get $index
                         i64.const 1
                         i64.add
                         local.set $index
                         br $copy
                     end
-                end
-                local.get $pointer
+                end"#,
+            length = length,
+            source = source,
+            backslash = pos_store(b'\\'),
+            byte = pos_store_byte(),
+            u = pos_store(b'u'),
+            zero = pos_store(b'0'),
+            nib = pos_store_nib(),
+        )
+    }
+
+    /// Handler bytes that echo the full request back inside an ABI v9
+    /// handler result: `{{"text":"<JSON-escaped request bytes>"}}`.
+    fn echo_handler() -> String {
+        format!(
+            r#"
+            (func (export "uri_agent_handle") (result i32)
+                (local $length i64)
+                (local $out i64)
+                (local $pos i64)
+                (local $index i64)
+                (local $byte i32)
+                (local $nib i32)
+                call $input_length
+                local.set $length
                 local.get $length
+                i64.const 6
+                i64.mul
+                i64.const 16
+                i64.add
+                call $alloc
+                local.set $out
+                {prefix}
+                {copy}
+                {suffix}
+                local.get $out
+                local.get $pos
                 call $output_set
                 i32.const 0)
             "#,
-        );
+            prefix = pos_stores(b"{\"text\":\""),
+            suffix = pos_stores(br#""}"#),
+            copy = escaped_copy_loop("local.get $index call $input_load_u8", "local.get $length"),
+        )
+    }
+
+    fn module(manifest: &str, with_handler: bool) -> Vec<u8> {
+        let handler = with_handler.then_some(echo_handler());
         wat::parse_str(format!(
             r#"
             (module
@@ -2126,6 +2278,9 @@ mod tests {
         )
     }
 
+    /// A module whose handler calls one host function with a fixed request and
+    /// returns the host result inside an ABI v9 handler result:
+    /// `{{"text":"<JSON-escaped host result>"}}`.
     fn host_call_module_with_input(manifest: &str, host_function: &str, input: &[u8]) -> Vec<u8> {
         let stores = input
             .iter()
@@ -2142,28 +2297,53 @@ mod tests {
             (module
                 (import "extism:host/env" "alloc" (func $alloc (param i64) (result i64)))
                 (import "extism:host/env" "length" (func $length (param i64) (result i64)))
+                (import "extism:host/env" "load_u8" (func $load_u8 (param i64) (result i32)))
                 (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
                 (import "extism:host/env" "store_u8" (func $store_u8 (param i64 i32)))
                 (import "extism:host/user" "{host_function}" (func $host_call (param i64) (result i64)))
-                {}
+                {manifest_output}
                 (func (export "uri_agent_handle") (result i32)
                     (local $input i64)
-                    (local $output i64)
+                    (local $host i64)
+                    (local $host_length i64)
+                    (local $out i64)
+                    (local $pos i64)
+                    (local $index i64)
+                    (local $byte i32)
+                    (local $nib i32)
                     i64.const {request_length}
                     call $alloc
                     local.set $input
                     {stores}
                     local.get $input
                     call $host_call
-                    local.tee $output
-                    local.get $output
+                    local.tee $host
                     call $length
+                    local.set $host_length
+                    local.get $host_length
+                    i64.const 6
+                    i64.mul
+                    i64.const 16
+                    i64.add
+                    call $alloc
+                    local.set $out
+                    {prefix}
+                    {copy}
+                    {suffix}
+                    local.get $out
+                    local.get $pos
                     call $output_set
                     i32.const 0)
             )
             "#,
-            output_function(MANIFEST_EXPORT, manifest.as_bytes()),
+            manifest_output = output_function(MANIFEST_EXPORT, manifest.as_bytes()),
             request_length = input.len(),
+            prefix = pos_stores(b"{\"text\":\""),
+            suffix = pos_stores(br#""}"#),
+            copy = escaped_copy_loop(
+                "local.get $host local.get $index i64.add call $load_u8",
+                "local.get $host_length",
+            ),
         ))
         .unwrap()
     }
@@ -2172,22 +2352,30 @@ mod tests {
         host_call_module_with_input(
             manifest,
             host_function,
-            br#"{"uri":"capture://from-plugin","body":"{\"answer\":42}"}"#,
+            br#"{"uri":"capture://from-plugin","input":{"answer":42}}"#,
         )
     }
 
+    fn handler_result_bytes(text: &str) -> Vec<u8> {
+        serde_json::to_vec(&HandlerOutput {
+            text: text.to_string(),
+            json: None,
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn only_the_current_abi_version_is_supported() {
+    fn abi_nine_manifests_load_and_version_eight_is_rejected() {
         let mut manifest = PluginManifest::new([]);
-        manifest.abi_version = MIN_SUPPORTED_ABI_VERSION;
+        manifest.abi_version = ABI_VERSION;
+        assert_eq!(manifest.abi_version, 9);
         validate_manifest(&manifest).unwrap();
 
-        manifest.abi_version = MIN_SUPPORTED_ABI_VERSION - 1;
+        manifest.abi_version = 8;
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
         assert!(
-            validate_manifest(&manifest)
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported ABI version")
+            error.contains("unsupported ABI version 8; expected 9 through 9"),
+            "unexpected version error: {error}"
         );
         manifest.abi_version = ABI_VERSION + 1;
         assert!(
@@ -2325,11 +2513,14 @@ mod tests {
         .unwrap();
 
         restore_help_read(&registry, "wasm_plugin").await;
-        let reloaded = registry.exec("wasm_plugin://reload", "").await.unwrap();
+        let reloaded = registry
+            .exec("wasm_plugin://reload", &Map::new())
+            .await
+            .unwrap();
         assert!(reloaded.contains(r#"Protocols: ["first"]"#));
         assert!(!reloaded.contains("Loaded plugins:"));
         restore_help_read(&registry, "first").await;
-        assert!(registry.read("first://value", "").await.is_ok());
+        assert!(registry.read("first://value", &Map::new()).await.is_ok());
         let help = registry.load_help(&["wasm_plugin".into()]).await.unwrap();
         assert!(help.contains(r#"Active dynamic protocols: ["first"]"#));
         let old_protocol = manager.protocol("first").unwrap();
@@ -2343,27 +2534,27 @@ mod tests {
         )
         .await
         .unwrap();
-        registry.exec("wasm_plugin://reload", "").await.unwrap();
+        registry
+            .exec("wasm_plugin://reload", &Map::new())
+            .await
+            .unwrap();
 
-        assert!(registry.read("first://value", "").await.is_err());
+        assert!(registry.read("first://value", &Map::new()).await.is_err());
         restore_help_read(&registry, "second").await;
-        assert!(registry.read("second://value", "").await.is_ok());
+        assert!(registry.read("second://value", &Map::new()).await.is_ok());
         let old_result = old_protocol
             .read(
                 ProtocolRequest {
                     uri: "first://still-running",
                     target: "still-running",
-                    headers: &[],
-                    body: "",
+                    input: &Map::new(),
                 },
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap();
         assert!(
-            String::from_utf8(old_result)
+            String::from_utf8(old_result.text_bytes().to_vec())
                 .unwrap()
                 .contains("first://still-running")
         );
@@ -2496,7 +2687,7 @@ mod tests {
 
         assert!(manager.reload_from(&missing).await.is_err());
         restore_help_read(&registry, "stable").await;
-        assert!(registry.read("stable://value", "").await.is_ok());
+        assert!(registry.read("stable://value", &Map::new()).await.is_ok());
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 
@@ -2511,17 +2702,21 @@ mod tests {
         assert!(help.contains("wasm_plugin://help/load"));
         assert!(help.contains("wasm_plugin://help/author"));
         assert!(help.contains("MUST read `wasm_plugin://help/load`"));
-        assert!(help.contains("read and exec call takes no body."));
+        assert!(help.contains("read and exec call takes no input."));
+        assert!(help.contains(r#"{"exec": "wasm_plugin://reload"}"#));
         assert!(!help.contains("cargo build"));
         assert!(!help.contains("ModelToolDescriptor"));
 
-        let load = registry.read("wasm_plugin://help/load", "").await.unwrap();
+        let load = registry
+            .read("wasm_plugin://help/load", &Map::new())
+            .await
+            .unwrap();
         assert!(load.contains("cargo build --release --target wasm32-wasip1"));
         assert!(load.contains("atomic enable step"));
         assert!(!load.contains("ModelToolDescriptor"));
 
         let author = registry
-            .read("wasm_plugin://help/author", "")
+            .read("wasm_plugin://help/author", &Map::new())
             .await
             .unwrap();
         assert!(author.contains("ModelToolDescriptor"));
@@ -2529,18 +2724,42 @@ mod tests {
         assert!(author.contains("request_agent_access"));
         assert!(author.contains("request_state_access"));
         assert!(author.contains("with_resident"));
-        assert!(author.contains("ABI version 8"));
+        assert!(author.contains("ABI version 9"));
+        assert!(author.contains("HandlerOutput"));
+        assert!(author.contains(r#"json: Some(serde_json::Value::Object(input))"#));
         assert!(!author.contains("subagent"));
         assert!(!author.contains("atomic enable step"));
+        assert!(
+            !author.to_lowercase().contains("header"),
+            "author help must not mention request headers"
+        );
+        assert!(
+            !author.to_lowercase().contains("body"),
+            "author help must not mention request bodies"
+        );
 
-        assert!(registry.read("wasm_plugin://list", "").await.is_err());
         assert!(
             registry
-                .read("wasm_plugin://help/load", "unexpected")
+                .read("wasm_plugin://list", &Map::new())
                 .await
                 .is_err()
         );
-        assert!(registry.exec("wasm_plugin://install", "").await.is_err());
+        let mut unexpected = Map::new();
+        unexpected.insert("query".to_string(), Value::from("x"));
+        let error = registry
+            .read("wasm_plugin://help/load", &unexpected)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("takes no input"),
+            "unexpected input rejection: {error:#}"
+        );
+        assert!(
+            registry
+                .exec("wasm_plugin://install", &Map::new())
+                .await
+                .is_err()
+        );
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 
@@ -2554,7 +2773,10 @@ mod tests {
             .unwrap();
 
         restore_help_read(&registry, "wasm_plugin").await;
-        let reloaded = registry.exec("wasm_plugin://reload", "").await.unwrap();
+        let reloaded = registry
+            .exec("wasm_plugin://reload", &Map::new())
+            .await
+            .unwrap();
         assert!(reloaded.contains("Skipped: 1"));
         assert!(!reloaded.contains("bad.wasm"));
 
@@ -2595,8 +2817,8 @@ mod tests {
         manager.reload().await.unwrap();
 
         restore_help_read(&registry, "host_call").await;
-        let result = registry.read("host_call://run", "").await.unwrap();
-        assert_eq!(result, "host received from-plugin");
+        let result = registry.read("host_call://run", &Map::new()).await.unwrap();
+        assert_eq!(result, r#"host received from-plugin {"answer":42}"#);
 
         tokio::fs::write(
             manager.directory().join("host.wasm"),
@@ -2605,8 +2827,190 @@ mod tests {
         .await
         .unwrap();
         manager.reload().await.unwrap();
-        let result = registry.exec("host_call://run", "").await.unwrap();
-        assert_eq!(result, "host executed from-plugin");
+        let result = registry.exec("host_call://run", &Map::new()).await.unwrap();
+        assert_eq!(result, r#"host executed from-plugin {"answer":42}"#);
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_calls_reach_static_protocols_with_the_input_map_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let (registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        tokio::fs::write(
+            manager.directory().join("host.wasm"),
+            host_call_module_with_input(
+                &valid_manifest("host_call"),
+                HOST_READ,
+                &serde_json::to_vec(&SdkHostRequest {
+                    uri: "capture://from-plugin".to_string(),
+                    input: serde_json::from_value(serde_json::json!({
+                        "answer": 42,
+                        "nested": {"list": [1, "two"]},
+                        "unicode": "héllo 🦀"
+                    }))
+                    .unwrap(),
+                })
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        restore_help_read(&registry, "host_call").await;
+        let result = registry.read("host_call://run", &Map::new()).await.unwrap();
+        assert_eq!(
+            result,
+            r#"host received from-plugin {"answer":42,"nested":{"list":[1,"two"]},"unicode":"héllo 🦀"}"#
+        );
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abi_version_eight_modules_are_rejected_with_the_version_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let legacy = r#"{"abi_version":8,"protocols":[{"name":"legacy","description":"Legacy protocol","can_read":true,"can_exec":true}],"model_tools":[],"permissions":{"environment":false,"credentials":false}}"#;
+        let current = r#"{"abi_version":9,"protocols":[{"name":"current","description":"Current protocol","can_read":true,"can_exec":true}],"model_tools":[],"permissions":{"environment":false,"credentials":false}}"#;
+        tokio::fs::write(
+            manager.directory().join("legacy.wasm"),
+            module(legacy, true),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("current.wasm"),
+            module(current, true),
+        )
+        .await
+        .unwrap();
+
+        let report = manager.reload().await.unwrap();
+        assert_eq!(report.protocols, ["current"]);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(
+            report.diagnostics[0].contains("unsupported ABI version 8; expected 9 through 9"),
+            "unexpected diagnostic: {}",
+            report.diagnostics[0]
+        );
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugin_protocol_input_round_trips_nested_values_byte_for_byte() {
+        let directory = tempfile::tempdir().unwrap();
+        let (registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        tokio::fs::write(
+            manager.directory().join("echo.wasm"),
+            module(&valid_manifest("echo"), true),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+        restore_help_read(&registry, "echo").await;
+
+        let mut input = Map::new();
+        input.insert(
+            "text".to_string(),
+            Value::from("multi\nline \"quoted\" and \\ backslash\ttab"),
+        );
+        input.insert(
+            "nested".to_string(),
+            serde_json::json!({
+                "list": [1, 2.5, false, null, {"deep": ["🦀", "日本語"]}],
+                "empty_object": {},
+                "empty_array": [],
+                "boolean": true
+            }),
+        );
+        let input_json = serde_json::to_string(&Value::Object(input.clone())).unwrap();
+
+        // The echo module returns the whole ABI v9 request as its result
+        // text, so the host-serialized input must appear byte-for-byte.
+        let result = registry.read("echo://run", &input).await.unwrap();
+        assert!(
+            result.contains(&input_json),
+            "presented output is missing the exact input JSON: {result}"
+        );
+        let result = registry.exec("echo://run", &input).await.unwrap();
+        assert!(
+            result.contains(&input_json),
+            "presented exec output is missing the exact input JSON: {result}"
+        );
+        let _ = tokio::fs::remove_dir_all(output.directory()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugin_handler_results_carry_text_and_structured_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_registry, _model_tools, manager, output) =
+            registry_with_manager(directory.path()).await;
+        let structured = HandlerOutput {
+            text: "plain text".to_string(),
+            json: Some(serde_json::json!({
+                "answer": 42,
+                "nested": ["a", {"b": true}, [1, 2, 3]]
+            })),
+        };
+        tokio::fs::write(
+            manager.directory().join("structured.wasm"),
+            response_module(
+                &valid_manifest("structured"),
+                &serde_json::to_vec(&structured).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manager.directory().join("text-only.wasm"),
+            response_module(
+                &valid_manifest("text_only"),
+                &handler_result_bytes("only text"),
+            ),
+        )
+        .await
+        .unwrap();
+        manager.reload().await.unwrap();
+
+        let structured_protocol = manager.protocol("structured").unwrap();
+        let response = structured_protocol
+            .read(
+                ProtocolRequest {
+                    uri: "structured://value",
+                    target: "value",
+                    input: &Map::new(),
+                },
+                ProtocolContext::new(TaskManager::new()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text_bytes(), b"plain text");
+        assert_eq!(
+            response.json(),
+            Some(&serde_json::json!({
+                "answer": 42,
+                "nested": ["a", {"b": true}, [1, 2, 3]]
+            }))
+        );
+        assert!(response.images().is_empty());
+
+        let text_only_protocol = manager.protocol("text_only").unwrap();
+        let response = text_only_protocol
+            .exec(
+                ProtocolRequest {
+                    uri: "text_only://value",
+                    target: "value",
+                    input: &Map::new(),
+                },
+                ProtocolContext::new(TaskManager::new()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text_bytes(), b"only text");
+        assert_eq!(response.json(), None);
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
 
@@ -2647,13 +3051,13 @@ mod tests {
         restore_help_read(&registry, "denied_environment").await;
         assert_eq!(
             registry
-                .read("allowed_environment://read", "")
+                .read("allowed_environment://read", &Map::new())
                 .await
                 .unwrap(),
             r#""managed-secret""#
         );
         let error = registry
-            .read("denied_environment://read", "")
+            .read("denied_environment://read", &Map::new())
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("did not request environment access"));
@@ -2687,7 +3091,10 @@ mod tests {
 
         restore_help_read(&registry, "model_role").await;
         assert_eq!(
-            registry.read("model_role://read", "").await.unwrap(),
+            registry
+                .read("model_role://read", &Map::new())
+                .await
+                .unwrap(),
             r#"{"provider":"example","model":"review-model","thinking":"low"}"#
         );
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
@@ -2759,7 +3166,10 @@ mod tests {
         .unwrap();
         manager.reload().await.unwrap();
         restore_help_read(&registry, "settings_owner").await;
-        registry.read("settings_owner://write", "").await.unwrap();
+        registry
+            .read("settings_owner://write", &Map::new())
+            .await
+            .unwrap();
 
         tokio::fs::write(
             &plugin_path,
@@ -2775,7 +3185,7 @@ mod tests {
         restore_help_read(&registry, "settings_owner").await;
         assert_eq!(
             registry
-                .read("settings_owner://read", "")
+                .read("settings_owner://read", &Map::new())
                 .await
                 .unwrap()
                 .trim(),
@@ -2796,7 +3206,7 @@ mod tests {
         restore_help_read(&registry, "settings_other").await;
         assert_eq!(
             registry
-                .read("settings_other://read", "")
+                .read("settings_other://read", &Map::new())
                 .await
                 .unwrap()
                 .trim(),
@@ -2824,7 +3234,10 @@ mod tests {
         manager.reload().await.unwrap();
 
         restore_help_read(&registry, "denied_agent").await;
-        let error = registry.read("denied_agent://run", "").await.unwrap_err();
+        let error = registry
+            .read("denied_agent://run", &Map::new())
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("did not request Agent access"));
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
@@ -2871,14 +3284,17 @@ mod tests {
         restore_help_read(&registry, "allowed_state").await;
         assert_eq!(
             registry
-                .read("allowed_state://run", "")
+                .read("allowed_state://run", &Map::new())
                 .await
                 .unwrap()
                 .trim(),
             "null"
         );
         restore_help_read(&registry, "denied_state").await;
-        let error = registry.read("denied_state://run", "").await.unwrap_err();
+        let error = registry
+            .read("denied_state://run", &Map::new())
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("did not request state access"));
         let _ = tokio::fs::remove_dir_all(output.directory()).await;
     }
@@ -2893,7 +3309,7 @@ mod tests {
             manager.directory().join("resident.wasm"),
             response_module(
                 &serde_json::to_string(&manifest).unwrap(),
-                br#"{"wakeAfterMs":250}"#,
+                &handler_result_bytes(r#"{"wakeAfterMs":250}"#),
             ),
         )
         .await
@@ -2924,9 +3340,12 @@ mod tests {
             registry_with_manager(directory.path()).await;
         let manifest = serde_json::to_string(&PluginManifest::new([]).with_resident()).unwrap();
         let path = manager.directory().join("resident.wasm");
-        tokio::fs::write(&path, response_module(&manifest, br#"{"wakeAfterMs":250}"#))
-            .await
-            .unwrap();
+        tokio::fs::write(
+            &path,
+            response_module(&manifest, &handler_result_bytes(r#"{"wakeAfterMs":250}"#)),
+        )
+        .await
+        .unwrap();
         manager.start_residents().await.unwrap();
         assert!(
             manager
@@ -2940,7 +3359,7 @@ mod tests {
 
         tokio::fs::write(
             &path,
-            response_module(&manifest, br#"{"wakeAfterMs":null}"#),
+            response_module(&manifest, &handler_result_bytes(r#"{"wakeAfterMs":null}"#)),
         )
         .await
         .unwrap();
@@ -2997,13 +3416,13 @@ mod tests {
         restore_help_read(&registry, "denied_credentials").await;
         assert_eq!(
             registry
-                .read("allowed_credentials://read", "")
+                .read("allowed_credentials://read", &Map::new())
                 .await
                 .unwrap(),
             r#""saved-search-key""#
         );
         let error = registry
-            .read("denied_credentials://read", "")
+            .read("denied_credentials://read", &Map::new())
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("did not request credential access"));

@@ -116,7 +116,7 @@ impl ParallelSearchOptions {
                     client_model = Some(require_text(value, name)?.to_string());
                 }
                 _ => bail!(
-                    "https://search header is not supported by Parallel: {name}; read https://help/parallel"
+                    "https://search input field is not supported by Parallel: {name}; read https://help/parallel"
                 ),
             }
         }
@@ -125,18 +125,18 @@ impl ParallelSearchOptions {
             bail!("Parallel search objective must not exceed 5000 characters");
         }
         if search_queries.len() > 5 {
-            bail!("https://search accepts at most 5 Parallel search_query headers");
+            bail!("https://search accepts at most 5 search_query values");
         }
         if search_queries.is_empty() {
             if query.chars().count() > 200 {
                 bail!(
-                    "Parallel search bodies over 200 characters require at least one search_query header"
+                    "Parallel search bodies over 200 characters require at least one search_query value"
                 );
             }
             search_queries.push(query.to_string());
         }
         if include_domains.len() + exclude_domains.len() > 200 {
-            bail!("Parallel search accepts at most 200 domain headers");
+            bail!("Parallel search accepts at most 200 domain values");
         }
 
         Ok((

@@ -1,5 +1,7 @@
 use crate::session::{EventKind, SessionEvent};
 use anyhow::{Result, anyhow, bail};
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -64,14 +66,14 @@ impl RecordTypes {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self> {
-        if value.is_empty() {
+    pub(super) fn parse_list(values: &[String]) -> Result<Self> {
+        if values.is_empty() {
             bail!("record types must not be empty");
         }
         let mut selected = HashSet::new();
-        for value in value.split(',') {
+        for value in values {
             if value.is_empty() {
-                bail!("record types must be a comma-separated list without empty entries");
+                bail!("record types must not contain empty entries");
             }
             selected.insert(RecordType::parse(value)?);
         }
@@ -82,13 +84,13 @@ impl RecordTypes {
         self.selected.contains(&record_type)
     }
 
-    pub(super) fn header_value(&self) -> String {
+    /// Selected type labels in the canonical display order.
+    pub(super) fn labels(&self) -> Vec<&'static str> {
         RecordType::ALL
             .into_iter()
             .filter(|record_type| self.contains(*record_type))
             .map(RecordType::label)
-            .collect::<Vec<_>>()
-            .join(",")
+            .collect()
     }
 }
 
@@ -160,6 +162,26 @@ pub(super) fn window_ranges(events: &[SessionEvent]) -> Vec<WindowRange> {
     ranges
 }
 
+/// A `protocol` call whose steps touch any `context://` address is private:
+/// it is excluded from recoverable history together with its result so
+/// deleted note content cannot be reconstructed and history searches do not
+/// recursively change their corpus. One call mixing a private step with
+/// public steps stays private.
+fn is_private_protocol_call(arguments: &Value) -> bool {
+    arguments
+        .get("steps")
+        .and_then(Value::as_array)
+        .is_some_and(|steps| steps.iter().any(is_private_protocol_step))
+}
+
+fn is_private_protocol_step(step: &Value) -> bool {
+    ["read", "exec"].iter().any(|field| {
+        step.get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|address| address.starts_with("context://"))
+    })
+}
+
 pub(super) fn conversation_records(
     events: &[SessionEvent],
     types: &RecordTypes,
@@ -169,15 +191,7 @@ pub(super) fn conversation_records(
         .filter_map(|event| match &event.kind {
             EventKind::ToolCall {
                 call_id, arguments, ..
-            } if arguments
-                .get("uri")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|uri| {
-                    uri.starts_with("context://") || uri.starts_with("sessions://")
-                }) =>
-            {
-                Some(call_id.clone())
-            }
+            } if is_private_protocol_call(arguments) => Some(call_id.clone()),
             _ => None,
         })
         .collect::<HashSet<_>>();
@@ -238,6 +252,16 @@ pub(super) fn conversation_records(
 
 pub(super) fn record_id(sequence: u64) -> String {
     format!("r{sequence}")
+}
+
+/// Step input cursor for paginated reads: a record ID (`"r42"`) string on
+/// history reads and an integer count on around reads. Untagged so either
+/// JSON shape parses; the route validation picks the accepted one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(super) enum Before {
+    Count(usize),
+    Record(String),
 }
 
 pub(super) fn parse_record_id(value: &str) -> Result<u64> {
@@ -306,8 +330,9 @@ mod tests {
                     call_id: "private".to_string(),
                     name: "exec".to_string(),
                     arguments: serde_json::json!({
-                        "uri": "context://notes/add",
-                        "body": "deleted body"
+                        "steps": [
+                            {"exec": "context://notes/add", "input": {"title": "t", "content": "deleted body"}}
+                        ]
                     }),
                 },
             },
@@ -326,11 +351,13 @@ mod tests {
                 sequence: 5,
                 at,
                 kind: EventKind::ToolCall {
-                    call_id: "session-search".to_string(),
-                    name: "read".to_string(),
+                    call_id: "mixed".to_string(),
+                    name: "exec".to_string(),
                     arguments: serde_json::json!({
-                        "uri": "sessions://search",
-                        "body": "private search"
+                        "steps": [
+                            {"read": "context://history/search", "input": {"query": "private search"}},
+                            {"read": "file://README.md"}
+                        ]
                     }),
                 },
             },
@@ -338,9 +365,9 @@ mod tests {
                 sequence: 6,
                 at,
                 kind: EventKind::ToolResult {
-                    call_id: "session-search".to_string(),
-                    name: "read".to_string(),
-                    output: "private session result".to_string(),
+                    call_id: "mixed".to_string(),
+                    name: "exec".to_string(),
+                    output: "mixed result".to_string(),
                     failed: false,
                     protocol_help_required: false,
                 },
@@ -371,20 +398,37 @@ mod tests {
                 .iter()
                 .any(|record| record.text.contains("private search"))
         );
+        // The mixed call carries one public step but stays fully private,
+        // including its result.
         assert!(
             !records
                 .iter()
-                .any(|record| record.text.contains("private session"))
+                .any(|record| record.text.contains("mixed result"))
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.text.contains("file://README.md"))
         );
     }
 
     #[test]
     fn record_type_filters_and_around_counts_are_stable() {
-        let types = RecordTypes::parse("user,tool_result").unwrap();
+        let types =
+            RecordTypes::parse_list(&["user".to_string(), "tool_result".to_string()]).unwrap();
         assert!(types.contains(RecordType::User));
         assert!(types.contains(RecordType::ToolResult));
         assert!(!types.contains(RecordType::Assistant));
-        assert_eq!(types.header_value(), "user,tool_result");
+        assert_eq!(types.labels(), ["user", "tool_result"]);
+        assert_eq!(
+            RecordTypes::parse_list(&["tool_result".to_string(), "user".to_string()])
+                .unwrap()
+                .labels(),
+            ["user", "tool_result"]
+        );
+        assert!(RecordTypes::parse_list(&[]).is_err());
+        assert!(RecordTypes::parse_list(&["".to_string()]).is_err());
+        assert!(RecordTypes::parse_list(&["secret".to_string()]).is_err());
         assert_eq!(parse_record_id("r42").unwrap(), 42);
         assert_eq!(parse_record_id("42").unwrap(), 42);
         assert!(parse_record_id("note-42").is_err());
@@ -406,5 +450,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 3, 4]
         );
+    }
+
+    #[test]
+    fn non_step_or_public_step_arguments_are_not_private() {
+        assert!(!is_private_protocol_call(&serde_json::json!({
+            "steps": [{"read": "file://README.md"}]
+        })));
+        assert!(!is_private_protocol_call(&serde_json::json!({
+            "steps": [{"read": "file://context://not-a-context-address"}]
+        })));
+        assert!(!is_private_protocol_call(
+            &serde_json::json!({"uri": "context://notes"})
+        ));
+        assert!(is_private_protocol_call(&serde_json::json!({
+            "steps": [{"exec": "context://rollover"}]
+        })));
     }
 }

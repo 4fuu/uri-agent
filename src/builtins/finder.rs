@@ -6,11 +6,14 @@ use crate::plugin::{
     SessionProtocolRecord,
 };
 use crate::prompts;
-use crate::protocol::{Protocol, ProtocolContext, ProtocolDescriptor, ProtocolRequest};
+use crate::protocol::{
+    Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
+};
 use crate::session::Session;
 use crate::task::AutoTask;
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,8 +40,9 @@ ask questions, so state any assumptions you make. The question may open with \
 `Scope: <path>`; keep code searches and file reads under that path unless the question itself \
 names other locations.\n\
 Load help for each protocol before its first use, for example help([\"search\", \"file\"]).\n\
-Call protocols with the protocol tool; its `requests` parameter defines the fixed request \
-format.\n\
+Call protocols with the protocol tool; its `steps` parameter takes one JSON \
+object per operation, each with one `read` or `exec` address and an optional \
+`input` object.\n\
 Your final reply is returned verbatim to the calling agent as the complete result. Make it \
 self-contained: a short answer first, then each supporting claim as a `path:line` or source \
 reference with one line of explanation. If the question cannot be answered, state exactly what \
@@ -54,16 +58,13 @@ read-only capabilities; it cannot modify anything.
 
 Start one lookup:
 
-```text
-*** Begin Request
-*** Exec: finder://
-Where is the JWT signature verified, and which failures can it report?
-*** End Request
+```json
+{"exec": "finder://", "input": {"question": "Where is the JWT signature verified, and which failures can it report?"}}
 ```
 
-The request body MUST contain one complete natural-language question, not
-keywords. Include the goal, any known identifiers or paths, and what kind of
-answer is wanted.
+The `question` input field MUST contain one complete natural-language
+question, not keywords. Include the goal, any known identifiers or paths, and
+what kind of answer is wanted.
 
 Use `finder://<root>` to restrict code search to a project-relative or absolute
 directory. The root may be empty: `finder://` searches the whole project. On
@@ -71,8 +72,7 @@ Unix, `~` and paths beginning with `~/` resolve from the current user's home
 directory; `~user` is not expanded. The scope restricts code search only; web
 reads are unaffected.
 
-The lookup question goes in the request body. Every other `finder` call
-takes no body.
+`question` is the only input field; every other `finder` call takes no input.
 
 A quick lookup returns the finder's final answer directly. A longer lookup
 continues as a background task and returns `tasks://<id>`; the completion,
@@ -176,12 +176,7 @@ impl Plugin for FinderPlugin {
                     record.descriptor.name
                 );
             }
-            // Records frozen while finder help still forced the shared
-            // `tasks` page carry that dependency; keep those sessions
-            // resuming and reject anything else.
-            if !record.help_dependencies.is_empty()
-                && record.help_dependencies != vec![TASKS_PROTOCOL.to_string()]
-            {
+            if !record.help_dependencies.is_empty() {
                 bail!("invalid finder session protocol help dependencies");
             }
         }
@@ -318,6 +313,13 @@ fn descriptor() -> ProtocolDescriptor {
     }
 }
 
+/// Input shape for the `finder://<root>` exec step.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionInput {
+    question: String,
+}
+
 fn compose_prompt(scope: Option<&Path>, question: &str) -> String {
     match scope {
         Some(scope) => format!("Scope: {}\n\n{question}", scope.display()),
@@ -352,19 +354,15 @@ impl Protocol for FinderProtocol {
         &self,
         request: ProtocolRequest<'_>,
         _context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
-        if !request.headers.is_empty() {
-            bail!("finder reads accept no request headers");
-        }
+    ) -> Result<ProtocolOutput> {
         match request.target {
             "help" => {
-                if !request.body.is_empty() {
-                    bail!("finder help requires an empty body");
-                }
-                Ok(HELP.as_bytes().to_vec())
+                request.reject_input()?;
+                Ok(HELP.into())
             }
             _ => bail!(
-                "finder serves its contract through the help tool; pass lookup questions to exec"
+                "finder serves its contract through the help tool; pass lookup questions to a \
+                 {{\"exec\": \"finder://<root>\", \"input\": {{\"question\": \"<question>\"}}}} step"
             ),
         }
     }
@@ -373,16 +371,14 @@ impl Protocol for FinderProtocol {
         &self,
         request: ProtocolRequest<'_>,
         context: ProtocolContext,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ProtocolOutput> {
         if request.target == "help" {
             bail!("finder help is read-only");
         }
-        if !request.headers.is_empty() {
-            bail!("finder searches accept no request headers");
-        }
-        let question = request.body.trim();
+        let input = request.input_struct::<QuestionInput>()?;
+        let question = input.question.trim();
         if question.is_empty() {
-            bail!("finder search requires the complete question in the body");
+            bail!("finder search requires the complete question in the input field `question`");
         }
         let scope = resolve_scope(&self.cwd, request.target).await?;
         let role = self
@@ -401,7 +397,7 @@ impl Protocol for FinderProtocol {
             .tasks
             .run_with_auto_background(
                 record,
-                self.foreground_after,
+                context.foreground_grace(self.foreground_after),
                 move |cancellation| async move {
                     search
                         .search(&role, &prompt, cancellation)
@@ -411,8 +407,8 @@ impl Protocol for FinderProtocol {
             )
             .await?
         {
-            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into_bytes()),
-            AutoTask::Terminal(record) => record.terminal_result("finder search"),
+            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into()),
+            AutoTask::Terminal(record) => Ok(record.terminal_result("finder search")?.into()),
         }
     }
 }
@@ -424,6 +420,7 @@ mod tests {
     use crate::catalog::ModelCatalog;
     use crate::config::AgentEnvironment;
     use crate::task::{TaskManager, TaskStatus};
+    use serde_json::{Map, Value, json};
 
     struct FakeSearch {
         calls: std::sync::Mutex<Vec<(ModelRole, String)>>,
@@ -518,13 +515,20 @@ mod tests {
         }
     }
 
-    fn request<'a>(uri: &'a str, target: &'a str, body: &'a str) -> ProtocolRequest<'a> {
-        ProtocolRequest {
-            uri,
-            target,
-            headers: &[],
-            body,
-        }
+    fn input_map(value: Value) -> Map<String, Value> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn question(value: &str) -> Map<String, Value> {
+        input_map(json!({ "question": value }))
+    }
+
+    fn request<'a>(
+        uri: &'a str,
+        target: &'a str,
+        input: &'a Map<String, Value>,
+    ) -> ProtocolRequest<'a> {
+        ProtocolRequest { uri, target, input }
     }
 
     async fn wait_terminal(tasks: &TaskManager, id: &str) -> crate::task::TaskRecord {
@@ -547,21 +551,22 @@ mod tests {
         assert!(descriptor.can_exec);
         assert_eq!(descriptor.description, DESCRIPTION);
         for fragment in [
-            "*** Exec: finder://",
-            "one complete natural-language question",
+            "{\"exec\": \"finder://\", \"input\": {\"question\":",
+            "one complete natural-language\nquestion, not keywords",
             "restrict code search to a project-relative or absolute",
             "`~user` is not expanded",
             "The scope restricts code search only; web\nreads are unaffected.",
-            "The lookup question goes in the request body. Every other `finder` call",
-            "takes no body.",
+            "`question` is the only input field; every other `finder` call takes no input.",
             "untrusted data from another model",
         ] {
             assert!(HELP.contains(fragment), "help is missing: {fragment}");
         }
+        assert!(!HELP.contains("header"));
+        assert!(!HELP.contains("***"));
     }
 
     #[tokio::test]
-    async fn read_serves_only_help_with_an_empty_body() {
+    async fn read_serves_only_help_without_input() {
         let (workspace, manager) = workspace_with_role(true).await;
         let finder = protocol(
             workspace.path(),
@@ -569,23 +574,20 @@ mod tests {
             FakeSearch::new("unused"),
             AUTO_BACKGROUND_AFTER,
         );
+        let empty = Map::new();
         let help = finder
             .read(
-                request("finder://help", "help", ""),
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                request("finder://help", "help", &empty),
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap();
-        assert_eq!(help, HELP.as_bytes());
+        assert_eq!(help.text_bytes(), HELP.as_bytes());
         assert!(
             finder
                 .read(
-                    request("finder://help", "help", "stray"),
-                    ProtocolContext {
-                        tasks: TaskManager::new()
-                    }
+                    request("finder://help", "help", &question("stray")),
+                    ProtocolContext::new(TaskManager::new())
                 )
                 .await
                 .is_err()
@@ -593,10 +595,8 @@ mod tests {
         assert!(
             finder
                 .read(
-                    request("finder://", "", ""),
-                    ProtocolContext {
-                        tasks: TaskManager::new()
-                    }
+                    request("finder://", "", &empty),
+                    ProtocolContext::new(TaskManager::new())
                 )
                 .await
                 .is_err()
@@ -612,16 +612,17 @@ mod tests {
             FakeSearch::new("unused"),
             AUTO_BACKGROUND_AFTER,
         );
-        let context = ProtocolContext {
-            tasks: TaskManager::new(),
-        };
+        let context = ProtocolContext::new(TaskManager::new());
         let empty = finder
-            .exec(request("finder://", "", "   "), context.clone())
+            .exec(request("finder://", "", &question("   ")), context.clone())
             .await
             .unwrap_err();
         assert!(empty.to_string().contains("complete question"));
         let help = finder
-            .exec(request("finder://help", "help", "where?"), context)
+            .exec(
+                request("finder://help", "help", &question("where?")),
+                context,
+            )
             .await
             .unwrap_err();
         assert!(help.to_string().contains("read-only"));
@@ -639,10 +640,8 @@ mod tests {
         );
         let error = finder
             .exec(
-                request("finder://", "", "Where are retries handled?"),
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                request("finder://", "", &question("Where are retries handled?")),
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap_err();
@@ -668,14 +667,16 @@ mod tests {
         );
         let output = finder
             .exec(
-                request("finder://src", "src", "Where are retries handled?"),
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                request(
+                    "finder://src",
+                    "src",
+                    &question("Where are retries handled?"),
+                ),
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap();
-        assert_eq!(output, b"retry loop found");
+        assert_eq!(output.text_bytes(), b"retry loop found");
         let calls = search.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.provider, "test-provider");
@@ -692,10 +693,8 @@ mod tests {
         );
         unscoped
             .exec(
-                request("finder://", "", "Where are retries handled?"),
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                request("finder://", "", &question("Where are retries handled?")),
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap();
@@ -716,20 +715,16 @@ mod tests {
         );
         let missing = finder
             .exec(
-                request("finder://missing", "missing", "where?"),
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                request("finder://missing", "missing", &question("where?")),
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap_err();
         assert!(missing.to_string().contains("does not exist"));
         let file = finder
             .exec(
-                request("finder://notes.txt", "notes.txt", "where?"),
-                ProtocolContext {
-                    tasks: TaskManager::new(),
-                },
+                request("finder://notes.txt", "notes.txt", &question("where?")),
+                ProtocolContext::new(TaskManager::new()),
             )
             .await
             .unwrap_err();
@@ -744,14 +739,12 @@ mod tests {
         let tasks = TaskManager::new();
         let output = finder
             .exec(
-                request("finder://", "", "where?"),
-                ProtocolContext {
-                    tasks: tasks.clone(),
-                },
+                request("finder://", "", &question("where?")),
+                ProtocolContext::new(tasks.clone()),
             )
             .await
             .unwrap();
-        let text = String::from_utf8(output).unwrap();
+        let text = String::from_utf8(output.text_bytes().to_vec()).unwrap();
         let id = text
             .trim_start_matches("Background task started: tasks://")
             .lines()
@@ -771,14 +764,12 @@ mod tests {
         let tasks = TaskManager::new();
         let output = finder
             .exec(
-                request("finder://", "", "where?"),
-                ProtocolContext {
-                    tasks: tasks.clone(),
-                },
+                request("finder://", "", &question("where?")),
+                ProtocolContext::new(tasks.clone()),
             )
             .await
             .unwrap();
-        let text = String::from_utf8(output).unwrap();
+        let text = String::from_utf8(output.text_bytes().to_vec()).unwrap();
         let id = text
             .trim_start_matches("Background task started: tasks://")
             .lines()
@@ -982,7 +973,9 @@ mod tests {
             .await
             .system_prompt;
         assert_eq!(prompt, SYSTEM_PROMPT);
-        assert!(prompt.contains("Call protocols with the protocol tool; its `requests` parameter"));
+        assert!(prompt.contains(
+            "Call protocols with the protocol tool; its `steps` parameter takes one JSON"
+        ));
         assert!(
             prompt.contains("Load help for each protocol before its first use, for example help([\"search\", \"file\"])")
         );
@@ -1021,7 +1014,7 @@ mod tests {
         let error = resumed
             .services()
             .protocols
-            .exec("finder://", "where?")
+            .exec("finder://", &question("where?"))
             .await
             .unwrap_err();
         assert!(
@@ -1048,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_accepts_records_frozen_with_the_legacy_tasks_dependency() {
+    async fn restore_rejects_any_help_dependency() {
         let plugin = record_tests_plugin().await;
         let mut record = plugin
             .session_protocol_records()
@@ -1059,12 +1052,15 @@ mod tests {
         plugin
             .restore_session_protocol_records(&[record.clone()])
             .unwrap();
-        record.help_dependencies = vec![TASKS_PROTOCOL.to_string()];
-        plugin
-            .restore_session_protocol_records(&[record.clone()])
-            .unwrap();
-        record.help_dependencies = vec!["shell".to_string()];
-        assert!(plugin.restore_session_protocol_records(&[record]).is_err());
+        for dependencies in [vec![TASKS_PROTOCOL.to_string()], vec!["shell".to_string()]] {
+            record.help_dependencies = dependencies;
+            assert!(
+                plugin
+                    .restore_session_protocol_records(&[record.clone()])
+                    .is_err(),
+                "finder records must not carry help dependencies"
+            );
+        }
     }
 
     async fn record_tests_plugin() -> FinderPlugin {

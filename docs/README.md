@@ -22,7 +22,7 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 These documents explain stable concepts and cross-cutting behavior. More specific references remain authoritative:
 
 - `uri-agent --help` defines the current command-line interface.
-- The active model-tool schemas define direct-tool arguments; a protocol's page loaded through the `help` tool defines its accepted addresses, string body, execution behavior, result routes, and limits.
+- The active model-tool schemas define direct-tool arguments; a protocol's page loaded through the `help` tool defines its accepted addresses, `input` fields, execution behavior, result routes, and limits.
 - `uri-agent-docs://README.md` exposes this documentation embedded in the running binary, independent of its startup working directory.
 - The `wasm_plugin` help page publishes active WASM plugin state and routes to separate loading and authoring help pages.
 - `F1` and `:help` show the active command and keymap reference after global and project overrides are applied.

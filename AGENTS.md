@@ -9,30 +9,27 @@ interface. The linked built-ins provide:
 
 ```text
 help(protocols: string[])
-protocol(requests: string[])
+protocol(steps: object[])
 replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
 `help` loads one or more protocols' model-facing contract pages; every other
 protocol call requires that protocol's contract to be loaded first. The `read`
-and `exec` tools are merged into `protocol`, which takes one to eight
-fixed-format request strings and executes them in order. Each request is a
-`*** Begin Request` line, one `*** Read: <address>` or `*** Exec: <address>`
-line, optional `*** name: value` header lines, a `*** Body:` separator line
-when any header is present, optional raw body lines, and a `*** End Request`
-line. The request ends at the last `*** End Request` line; the lines between
-the header section (or the operation line) and it are the body and are never
-escaped. Header names are ASCII letters, digits, `-`, and `_`; each protocol's
-help page lists the headers it accepts, and comparable numeric headers accept
-a comparison prefix such as `>=10`.
-A protocol that needs structured input takes complete serialized JSON as that
-raw body text.
-Capabilities with simple string input are registered as protocols and publish
-their operational instructions through the `help` tool. Prefer a typed direct
-tool for complex or escape-heavy arguments. All model tools are registered by
-linked or WASM plugins; do not special-case tool names in the runtime or place
-every capability in the initial system prompt.
+and `exec` tools are merged into `protocol`, which takes one to eight step
+objects and executes them in order. Each step is a JSON object with exactly
+one of `read` or `exec` — the `<protocol>://<target>` address — an optional
+`input` object holding the protocol's input fields, and optional control
+fields (`id`, `if`, `for` with `max`, `show`). Later steps may reference
+earlier `id`s through `{{ reference }}` substitution in `input` values and
+addresses; each protocol's help page lists the `input` fields it accepts, and
+input text a protocol executes verbatim (a shell `script`) is never
+substituted.
+Capabilities with a small input surface are registered as protocols and
+publish their operational instructions through the `help` tool. Prefer a typed
+direct tool for complex or escape-heavy arguments. All model tools are
+registered by linked or WASM plugins; do not special-case tool names in the
+runtime or place every capability in the initial system prompt.
 
 ## Read before changing
 

@@ -4,7 +4,7 @@
 //! host-call wrappers compile only for WebAssembly guests.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
@@ -12,7 +12,7 @@ pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
 
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
 pub const HANDLE_EXPORT: &str = "uri_agent_handle";
 pub const HOST_NAMESPACE: &str = "extism:host/user";
@@ -485,21 +485,6 @@ pub enum Operation {
     Exec,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct RequestHeader {
-    pub name: String,
-    pub value: String,
-}
-
-impl RequestHeader {
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandlerRequest {
@@ -508,8 +493,7 @@ pub enum HandlerRequest {
         operation: Operation,
         uri: String,
         target: String,
-        headers: Vec<RequestHeader>,
-        body: String,
+        input: Map<String, Value>,
     },
     ModelTool {
         name: String,
@@ -520,14 +504,39 @@ pub enum HandlerRequest {
     },
 }
 
-pub type HandlerResult = Result<Vec<u8>, String>;
+/// One completed protocol operation returned by a plugin handler. `text` is
+/// the complete text output; `json` is optional structured output exposed to
+/// step references as `<id>.json`. Omit `json` or set it to `null` when the
+/// operation has no structured output. Images remain host-only.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandlerOutput {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+}
 
-#[cfg(target_family = "wasm")]
-#[derive(Serialize)]
-struct HostRequest<'a> {
-    uri: &'a str,
-    headers: &'a [RequestHeader],
-    body: &'a str,
+impl From<String> for HandlerOutput {
+    fn from(text: String) -> Self {
+        Self { text, json: None }
+    }
+}
+
+impl From<&str> for HandlerOutput {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
+pub type HandlerResult = Result<HandlerOutput, String>;
+
+/// Wire shape for the host `read` and `exec` calls a plugin makes back into
+/// URI Agent's static built-in protocols.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequest {
+    pub uri: String,
+    pub input: Map<String, Value>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -549,13 +558,13 @@ mod host {
 }
 
 #[cfg(target_family = "wasm")]
-pub fn read(uri: &str, headers: &[RequestHeader], body: &str) -> Result<String, Error> {
-    call_host(uri, headers, body, host::uri_agent_read)
+pub fn read(uri: &str, input: Value) -> Result<String, Error> {
+    call_host(uri, input, host::uri_agent_read)
 }
 
 #[cfg(target_family = "wasm")]
-pub fn exec(uri: &str, headers: &[RequestHeader], body: &str) -> Result<String, Error> {
-    call_host(uri, headers, body, host::uri_agent_exec)
+pub fn exec(uri: &str, input: Value) -> Result<String, Error> {
+    call_host(uri, input, host::uri_agent_exec)
 }
 
 #[cfg(target_family = "wasm")]
@@ -672,11 +681,16 @@ pub fn set_plugin_setting(key: &str, value: Value) -> Result<(), Error> {
 #[cfg(target_family = "wasm")]
 fn call_host(
     uri: &str,
-    headers: &[RequestHeader],
-    body: &str,
+    input: Value,
     call: unsafe fn(String) -> Result<String, Error>,
 ) -> Result<String, Error> {
-    let input = serde_json::to_string(&HostRequest { uri, headers, body })?;
+    let Value::Object(input) = input else {
+        return Err(Error::msg("host call input must be a JSON object"));
+    };
+    let input = serde_json::to_string(&HostRequest {
+        uri: uri.to_string(),
+        input,
+    })?;
     unsafe { call(input) }
 }
 
@@ -698,7 +712,8 @@ macro_rules! define_plugin {
         pub fn uri_agent_handle(
             request: $crate::Json<$crate::HandlerRequest>,
         ) -> $crate::FnResult<Vec<u8>> {
-            Ok($handler(request.0).map_err($crate::Error::msg)?)
+            let output = $handler(request.0).map_err($crate::Error::msg)?;
+            Ok(serde_json::to_vec(&output)?)
         }
 
         #[cfg(not(target_family = "wasm"))]
@@ -715,7 +730,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_wire_types_use_the_v8_shape() {
+    fn public_wire_types_use_the_v9_shape() {
         let manifest = PluginManifest::new([ProtocolDescriptor::new(
             "example",
             "Example protocol",
@@ -725,8 +740,9 @@ mod tests {
         .request_agent_access()
         .request_state_access()
         .with_resident();
+        assert_eq!(ABI_VERSION, 9);
         let value = serde_json::to_value(manifest).unwrap();
-        assert_eq!(value["abi_version"], ABI_VERSION);
+        assert_eq!(value["abi_version"], 9);
         assert_eq!(value["protocols"][0]["name"], "example");
         assert_eq!(value["permissions"]["agents"], true);
         assert_eq!(value["permissions"]["state"], true);
@@ -780,5 +796,103 @@ mod tests {
         assert_eq!(value["event"]["type"], "compacted");
         assert_eq!(value["event"]["session_id"], "child");
         assert_eq!(value["event"]["spec"]["model"], "gpt-5");
+    }
+
+    #[test]
+    fn protocol_requests_carry_one_input_object_and_round_trip_exactly() {
+        let input: Map<String, Value> = serde_json::from_value(serde_json::json!({
+            "query": "multi\nline \"quoted\" text with \\ backslash and tab\t",
+            "unicode": "héllo 🦀 日本語",
+            "options": {
+                "limit": 10,
+                "ratio": -2.5,
+                "enabled": false,
+                "nothing": null,
+                "deep": {"list": [1, "two", [3, {"four": true}]], "empty": {}}
+            },
+            "tags": ["alpha", "beta"]
+        }))
+        .unwrap();
+        let request = HandlerRequest::Protocol {
+            protocol: "example".to_string(),
+            operation: Operation::Exec,
+            uri: "example://echo".to_string(),
+            target: "echo".to_string(),
+            input,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["kind"], "protocol");
+        assert_eq!(value["protocol"], "example");
+        assert_eq!(value["operation"], "exec");
+        assert_eq!(value["uri"], "example://echo");
+        assert_eq!(value["target"], "echo");
+        assert_eq!(
+            value["input"]["options"]["deep"]["list"][2][1]["four"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            value["input"]["query"],
+            "multi\nline \"quoted\" text with \\ backslash and tab\t"
+        );
+        assert_eq!(value["input"]["unicode"], "héllo 🦀 日本語");
+
+        // Host -> plugin -> host keeps every nested value byte-for-byte.
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let parsed: HandlerRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, request);
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), bytes);
+    }
+
+    #[test]
+    fn host_calls_and_handler_results_use_the_v9_shapes() {
+        let host_call = HostRequest {
+            uri: "file://src/main.rs".to_string(),
+            input: serde_json::from_value(serde_json::json!({"offset": 401, "glob": "**/*.rs"}))
+                .unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(&host_call).unwrap(),
+            serde_json::json!({
+                "uri": "file://src/main.rs",
+                "input": {"offset": 401, "glob": "**/*.rs"}
+            })
+        );
+        let parsed: HostRequest =
+            serde_json::from_value(serde_json::json!({"uri": "file://x", "input": {}})).unwrap();
+        assert_eq!(parsed.input.len(), 0);
+        assert!(serde_json::from_value::<HostRequest>(serde_json::json!({
+            "uri": "file://x",
+            "input": {},
+            "body": ""
+        }))
+        .is_err());
+
+        let structured = HandlerOutput {
+            text: "answer".to_string(),
+            json: Some(serde_json::json!({"answer": 42, "nested": [1, {"two": "2"}]})),
+        };
+        assert_eq!(
+            serde_json::to_value(&structured).unwrap(),
+            serde_json::json!({"text": "answer", "json": {"answer": 42, "nested": [1, {"two": "2"}]}})
+        );
+        // `json` is omitted when absent, and explicit `null` is accepted.
+        assert_eq!(
+            serde_json::to_value(HandlerOutput::from("only text")).unwrap(),
+            serde_json::json!({"text": "only text"})
+        );
+        assert_eq!(
+            serde_json::from_value::<HandlerOutput>(serde_json::json!({
+                "text": "only text",
+                "json": null
+            }))
+            .unwrap(),
+            HandlerOutput::from("only text")
+        );
+        let result = finish(Ok(HandlerOutput::from("done")));
+        assert_eq!(result, "done");
+    }
+
+    fn finish(result: HandlerResult) -> String {
+        result.map(|output| output.text).unwrap_or_default()
     }
 }
