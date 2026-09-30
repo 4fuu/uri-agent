@@ -254,6 +254,30 @@ older `{uri, body}` argument shape are deleted.
 - `src/builtins/finder.rs`: child system prompt; delete the legacy `tasks`
   help-dependency restore path.
 
+## Remove standalone `sessions` protocol remnants
+
+Saved-session access moved to `context://sessions/…` earlier, but the former
+standalone protocol still exists in code. Delete it in phase 1:
+
+- `src/builtins/sessions.rs`: `SessionsPlugin` still implements `Protocol`
+  with the descriptor name `sessions`, and carries a `base_uri` switch between
+  `sessions://` (`SESSIONS_BASE_URI`, used only by the test constructor
+  `with_archive`) and `context://sessions/`. Turn it into an internal handler
+  that only `ContextPlugin` calls, with the fixed `context://sessions/` base;
+  delete `SESSIONS_BASE_URI`, `with_archive`, the `base_uri` field and
+  parameters, and the `Protocol` implementation and descriptor.
+- The saved-session help text mentions `sessions://` calls as omitted from
+  results; it names only `context://`.
+- The private-call filters in `src/builtins/history.rs` and the
+  `searchable_records` SQL in `src/session.rs` stop matching `sessions://`
+  (they are rewritten for steps anyway).
+- Tests in `sessions.rs`, `history.rs`, and `session.rs` that build
+  `sessions://` requests or arguments move to `context://sessions/…`.
+  Guard assertions in `context.rs` that output does not contain `sessions://`
+  are deleted with the base-URI switch they protected.
+- Keep `SessionCompletionPlugin` and the `@@<session-id>` composer completion;
+  they are not part of the removed protocol.
+
 ## WASM ABI and SDK
 
 - `ABI_VERSION` becomes 9; version 8 is rejected like every older version.
@@ -312,8 +336,8 @@ Update together with the code:
 
 1. Core: step schema and executor without `for` and substitution, `input`
    in the `Protocol` trait, `ProtocolOutput`, all built-in protocols and help
-   pages, MCP, WASM ABI 9, persistence bump, embedded-format rewrites, Gemini
-   schema fix, documentation.
+   pages, MCP, WASM ABI 9, persistence bump, embedded-format rewrites,
+   `sessions` protocol remnant removal, Gemini schema fix, documentation.
 2. Data flow: `for`/`max`, `{{ }}` substitution, foreground pinning of
    referenced operations, shell `env`.
 
