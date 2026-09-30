@@ -341,13 +341,155 @@ Update together with the code:
 2. Data flow: `for`/`max`, `{{ }}` substitution, foreground pinning of
    referenced operations, shell `env`.
 
-Each phase ends with `cargo fmt --check`, `cargo clippy --all-targets
---all-features -- -D warnings`, `cargo test`, and `cargo check`.
+## Acceptance criteria
 
-## Open verification
+A phase is accepted only when every item in its list holds. Automated items
+are tests or commands in the repository; "search" items are `rg` runs over
+`src`, `sdk`, `examples`, `docs`, `AGENTS.md`, and both READMEs, excluding
+this plan file, and must return no matches.
 
-- Gemini with `parametersJsonSchema` accepts the free-form `input` object.
-- Antigravity accepts free-form `input`.
-- A manual comparison of format error rates between the envelope and steps on
-  the weakest supported model, using the same tasks: single read, multi-line
-  shell script, and MCP call.
+### Every phase
+
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
+  warnings`, `cargo test`, and `cargo check` pass, including the example
+  plugin workspace member.
+- No test needs live credentials or network access.
+- The documentation checks in the development guide pass, and `README.md` and
+  `README.zh-CN.md` stay equivalent.
+
+### Phase 1
+
+Model interface:
+
+- A test pins the `protocol` tool schema: one required `steps` array of 1..=8
+  objects; step properties `read`, `exec`, `input`, `id`, `if`, and `show`
+  with fixed types; unknown step properties rejected; no `anyOf`, `oneOf`, or
+  multi-type `type` anywhere in the schema.
+- Validation tests cover each rejected shape: `input` as a string, both or
+  neither of `read`/`exec`, an unknown step field, more than 8 steps, a
+  duplicate `id`, a reference to an unknown or later step, an invalid
+  expression, an unknown protocol, an unsupported operation, and a protocol
+  whose help is not loaded. For each, the call is rejected, the message names
+  the step and field, and a counting test protocol records zero invocations.
+- Execution tests cover: independent steps with ordered `ok`/`error`
+  sections; `if` true and false; a step skipped because it references a failed
+  step, reported as `skipped` with the reason; an `if` reading `.ok` of a
+  failed step; `show` values `all`, `errors`, and `none`; `.text` holding the
+  complete text when the displayed output is truncated.
+
+Removal (search items):
+
+- `\*\*\* (Begin Request|End Request|Body:|Read:|Exec:)` and `requests:`
+  as the tool parameter.
+- `RequestHeader`, `header_value`, `header_values`, `reject_unknown_headers`,
+  `parse_comparison`, `Comparison`.
+- `sessions://`, `SESSIONS_BASE_URI`, and an `impl Protocol for
+  SessionsPlugin`.
+- `map_arguments`, `coerce_values`, `coerce_scalar`, `schema_property`,
+  `render_legacy_help` in `src/builtins/mcp.rs`.
+- `arguments.uri` and `$.arguments.uri` fallbacks in `src/tui`,
+  `src/builtins/history.rs`, and `src/session.rs`.
+- The word "header" in any protocol help page or in `docs/protocols.md`,
+  except where it refers to HTTP headers of MCP or provider configuration.
+
+Protocols:
+
+- Each built-in protocol has a test that accepts one valid `input` per route
+  and rejects an unknown `input` field with an error listing the accepted
+  fields. `uri-agent-docs`, `<name>-skill`, and `wasm_plugin` reject any
+  `input` field.
+- A test extracts every JSON step example from every built-in help page and
+  from `docs/protocols.md`, and each one passes step validation against the
+  registered protocols.
+- `tasks://<id>/send` delivers `text` byte-for-byte, including a trailing
+  newline and an empty-string rejection.
+- `search` rejects `"limit": ">=10"` and accepts `"limit": 10` with the
+  existing clamps.
+- Shell `script`, search `query`, finder `question`, collaboration
+  `message`, and notes `content` keep their previous validation (non-empty,
+  length limits).
+
+MCP:
+
+- Tool calls pass `input` to the server unchanged, including nested objects
+  and strings containing quotes and newlines.
+- `.json` equals `structuredContent`; without it, equals the parsed single
+  JSON text block; otherwise `null`. `isError` yields `ok == false`.
+- `resources/read` requires `input.uri`; prompt reads pass `input` as prompt
+  arguments.
+- Restoring a session protocol record without `help_dependencies: ["mcp"]`
+  fails.
+
+Privacy:
+
+- History records and `searchable_records` exclude a `protocol` call when any
+  step address starts with `context://`, together with its result; tests use
+  the step argument shape, including a mixed call.
+
+WASM:
+
+- Manifests with ABI 9 load; ABI 8 is rejected with the explicit version
+  error.
+- The SDK wire-shape test pins the v9 `HandlerRequest::Protocol`,
+  `HostRequest`, and handler result shapes.
+- The example plugin round-trips `input` through its echo route, and a host
+  `read`/`exec` from a plugin reaches a static protocol with `input`.
+
+Persistence:
+
+- Sessions are stored in `sessions-v6.db`. A test with an existing
+  `sessions-v5.db` shows it is neither opened nor modified.
+- Retrieval sidecars are written under `retrieval/v3/`.
+
+Providers:
+
+- A request-transform test shows `google-generative-ai` function declarations
+  carrying `parametersJsonSchema` equal to the original tool schema, with the
+  free-form `input` object intact and no lossy `parameters` field.
+
+Interfaces:
+
+- TUI tests render titles and details for a single read, a shell exec, and a
+  multi-step call from step arguments.
+- ACP tests show `tool_title` from the first step and `tool_kind` `Execute`
+  when any step uses `exec`.
+
+Documentation:
+
+- `AGENTS.md`, both READMEs, `docs/protocols.md`, `docs/plugins.md`,
+  `docs/context.md`, `docs/sessions.md`, and `docs/README.md` describe the step
+  interface, `input`, ABI 9, and `sessions-v6.db`, and no longer mention the
+  envelope, headers, ABI 8, or `sessions-v5.db`.
+
+### Phase 2
+
+- The tool schema adds `for` (string) and `max` (integer) and nothing else.
+- `for` runs once per element in order; the step value is the list of element
+  values; a `for` source that is not a list fails the step; a list longer than
+  `max` fails the step before any element runs; `for` without `max` or `max`
+  outside 1..=32 fails validation.
+- Execution stops starting new operations once 64 operations have run in one
+  call; the remaining steps are reported as `skipped` with that reason.
+- Substitution tests: a whole-value placeholder keeps the JSON type (number
+  stays a number); `${{ secrets.TOKEN }}` and other partial `{{` strings stay
+  literal; `{{ "{{x}}" }}` yields the literal `{{x}}`; address substitution
+  accepts scalars and rejects objects and lists; shell `script` is never
+  substituted, while shell `env` values are.
+- A test with a shortened foreground grace shows that an operation referenced
+  by a later step is not promoted to a background task, while an unreferenced
+  one still is.
+- Help pages and `docs/protocols.md` document `for`, `max`, and substitution,
+  and their examples pass the help-example validation test.
+- This plan file is deleted.
+
+### Manual gates before release
+
+These need real accounts and are recorded in the release notes of the change:
+
+- Gemini through `parametersJsonSchema` accepts free-form `input` and the
+  model fills MCP tool arguments in it.
+- Antigravity accepts free-form `input`; if it does not, the release notes
+  state the limitation for that endpoint.
+- On the weakest supported model, the same task set (single read, multi-line
+  shell script, MCP call with nested arguments, conditional step) shows a
+  format error rate no higher with steps than with the envelope.
