@@ -293,8 +293,10 @@ impl SessionArchive {
                          events.kind = 'tool_call'
                          AND EXISTS (
                            SELECT 1 FROM json_each(events.payload_json, '$.arguments.steps') AS step
-                           WHERE COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
-                              OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
+                           WHERE CASE WHEN step.type = 'object' THEN
+                               COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
+                               OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
+                           ELSE 0 END
                          )
                        )
                        AND NOT (
@@ -307,8 +309,10 @@ impl SessionArchive {
                                  json_extract(events.payload_json, '$.call_id')
                              AND EXISTS (
                                SELECT 1 FROM json_each(calls.payload_json, '$.arguments.steps') AS step
-                               WHERE COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
-                                  OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
+                               WHERE CASE WHEN step.type = 'object' THEN
+                                   COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
+                                   OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
+                               ELSE 0 END
                              )
                          )
                        )
@@ -4353,6 +4357,18 @@ mod tests {
                 EventKind::AssistantText {
                     text: "public conclusion".into(),
                 },
+                // Arguments are stored before validation, so malformed step
+                // shapes must not break the query.
+                EventKind::ToolCall {
+                    call_id: "malformed-list".into(),
+                    name: "protocol".into(),
+                    arguments: serde_json::json!({"steps": ["*** Begin Request", 3]}),
+                },
+                EventKind::ToolCall {
+                    call_id: "malformed-string".into(),
+                    name: "protocol".into(),
+                    arguments: serde_json::json!({"steps": "context://notes"}),
+                },
             ])
             .await
             .unwrap();
@@ -4370,6 +4386,8 @@ mod tests {
                 first[1].sequence,
                 first[2].sequence,
                 second[2].sequence,
+                second[3].sequence,
+                second[4].sequence,
             ]
             .into_iter()
             .map(|sequence| SearchableSessionRecord {

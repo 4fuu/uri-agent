@@ -129,21 +129,6 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
         }
     } else if let Some(step) = protocol_steps.first() {
         append_step_input(document, step, level);
-    } else if let Some(body) = tool
-        .arguments
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-    {
-        // Tools without protocol steps keep rendering a plain body field.
-        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
-        let rendered = parsed.as_ref().and_then(|value| {
-            serde_json::to_string_pretty(&redact_sensitive_arguments(value)).ok()
-        });
-        document.push_str(&format!("\n{heading} Input\n\n"));
-        document.push_str(&fenced_block(
-            rendered.as_deref().unwrap_or(body),
-            if rendered.is_some() { "json" } else { "text" },
-        ));
     }
 
     let Some(arguments) = tool.arguments.as_object() else {
@@ -151,9 +136,7 @@ fn append_tool_input(document: &mut String, tool: &ToolDisplay, level: usize) {
     };
     let remaining = arguments
         .iter()
-        .filter(|(name, _)| {
-            name.as_str() != "body" && !(protocol_steps_consumed && name.as_str() == "steps")
-        })
+        .filter(|(name, _)| !(protocol_steps_consumed && name.as_str() == "steps"))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<serde_json::Map<_, _>>();
     if remaining.is_empty() {
@@ -335,28 +318,16 @@ pub(super) fn tool_protocol(arguments: &serde_json::Value) -> Option<String> {
     (separator > 0).then(|| address[..separator].to_string())
 }
 
-fn tool_body(arguments: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
+/// The `input` of a single-step protocol call, shown as detail lines.
+fn tool_body(arguments: &serde_json::Value) -> Option<&serde_json::Value> {
     let steps = parse_protocol_steps(arguments);
     if steps.len() > 1 {
         return None;
     }
-    if let Some(input) = steps.first().and_then(|step| step.input) {
-        if input.as_object().is_some_and(serde_json::Map::is_empty) {
-            return None;
-        }
-        return Some(Cow::Borrowed(input));
-    }
-    let body = arguments.get("body")?;
-    let Some(value) = body.as_str() else {
-        return Some(Cow::Borrowed(body));
-    };
-    if value.is_empty() {
-        return None;
-    }
-    serde_json::from_str(value)
-        .ok()
-        .map(Cow::Owned)
-        .or(Some(Cow::Borrowed(body)))
+    steps
+        .first()
+        .and_then(|step| step.input)
+        .filter(|input| !input.as_object().is_some_and(serde_json::Map::is_empty))
 }
 
 pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
@@ -519,7 +490,7 @@ pub(super) fn tool_argument_details(
     let steps_consumed = !parse_protocol_steps(arguments).is_empty();
     if let Some(fields) = arguments.as_object() {
         for (key, value) in fields {
-            if key == "body" || (steps_consumed && key == "steps") {
+            if steps_consumed && key == "steps" {
                 continue;
             }
             if key == "patch"
@@ -538,7 +509,7 @@ pub(super) fn tool_argument_details(
     let Some(body) = tool_body(arguments) else {
         return;
     };
-    match body.as_ref() {
+    match body {
         serde_json::Value::String(value) => {
             let files = patch_targets(value);
             if !files.is_empty() {

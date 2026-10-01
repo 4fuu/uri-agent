@@ -100,8 +100,11 @@ pub fn interactive_task_accepted(id: &str) -> String {
 
 pub fn truncated_output(preview: &str, complete_file: &Path) -> String {
     let uri = format!("file://{}", display_path(complete_file));
+    // Serialize the step so path separators such as Windows backslashes stay
+    // valid JSON.
+    let step = format!("{{\"read\": {}}}", serde_json::Value::from(uri.as_str()));
     format!(
-        "{preview}\n\n[output truncated]\nFull output: {uri}\nRead the complete output once with: {{\"read\": \"{uri}\"}}"
+        "{preview}\n\n[output truncated]\nFull output: {uri}\nRead the complete output once with: {step}"
     )
 }
 
@@ -254,6 +257,13 @@ mod tests {
             message.contains(
                 r#"Read the complete output once with: {"read": "file://logs/full.txt"}"#
             )
+        );
+        let windows = truncated_output("preview", Path::new(r"C:\out\full.txt"));
+        let step = windows.rsplit("once with: ").next().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(step).unwrap()["read"],
+            r"file://C:\out\full.txt",
+            "the step stays valid JSON for backslash paths"
         );
     }
 }

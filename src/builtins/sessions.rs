@@ -60,15 +60,15 @@ Conversation records use session-local IDs such as `r42`, matching `context://`.
 Input is one JSON object in the step's `input` field. Field values are literal text with no percent encoding or other escaping, so paths with spaces or `?` work as-is.
 
 - `context://sessions/recent` lists saved sessions. Input accepts `scope`
-  (`project` or `all`), `cwd` (only with `scope=all`), `limit` (clamped to
+  (`project` or `all`), `cwd` (only with `"scope": "all"`), `limit` (clamped to
   1..50), and `offset`.
 - `context://sessions/search` searches session IDs, working directories, and
   selected record types. `query` is required nonempty text of at most
   {MAX_QUERY_CHARS} characters. It accepts `types` in addition to the discovery
   fields and returns record IDs for conversation matches. Use the default
-  `mode="exact"` for known IDs, paths, or literal wording. Prefer
-  `mode="hybrid"`, which combines keyword and semantic ranking, for conceptual
-  searches. Use `mode="semantic"` when relevant records are likely to use
+  `"mode": "exact"` for known IDs, paths, or literal wording. Prefer
+  `"mode": "hybrid"`, which combines keyword and semantic ranking, for conceptual
+  searches. Use `"mode": "semantic"` when relevant records are likely to use
   different wording.
 - A ranked read creates or incrementally refreshes a cache for its selected
   `scope` and `cwd` as needed, then searches it; the default scope is the current
@@ -88,7 +88,7 @@ Input is one JSON object in the step's `input` field. Field values are literal t
   anchor. Optional `before` and `after` are record counts and default to 10
   each; their sum must not exceed 50. Optional `types` filters the result.
 
-`include_tools` remains supported for compatibility and cannot be combined with `types`. `include_tools=false` selects `user`, `assistant`, and `error`; `include_tools=true` selects every type.
+`include_tools` remains supported for compatibility and cannot be combined with `types`. `"include_tools": false` selects `user`, `assistant`, and `error`; `"include_tools": true` selects every type.
 
 Examples:
 
@@ -376,19 +376,20 @@ impl SessionsOptions {
         self.scope_value()?;
         self.cwd_value()?;
         if self.cwd.is_some() && self.scope_value()? != Scope::All {
-            bail!("sessions cwd requires scope=\"all\"")
+            bail!("sessions cwd requires `\"scope\": \"all\"`")
         }
         Ok(())
     }
 
     fn validate_read(&self) -> Result<()> {
-        if self.mode.is_some()
+        if self.query.is_some()
+            || self.mode.is_some()
             || self.scope.is_some()
             || self.cwd.is_some()
             || self.offset.is_some()
             || self.after.is_some()
         {
-            bail!("sessions discovery options are not accepted with a session ID target")
+            bail!("sessions query and discovery options are not accepted with a session ID target")
         }
         self.resolve_types()?;
         self.history_cursor()?;
@@ -396,7 +397,8 @@ impl SessionsOptions {
     }
 
     fn validate_around(&self) -> Result<()> {
-        if self.mode.is_some()
+        if self.query.is_some()
+            || self.mode.is_some()
             || self.scope.is_some()
             || self.cwd.is_some()
             || self.offset.is_some()
@@ -1660,6 +1662,14 @@ mod tests {
             .unwrap()
             .validate_read()
             .unwrap_err();
+        serde_json::from_value::<SessionsOptions>(json!({"query": "foo"}))
+            .unwrap()
+            .validate_read()
+            .unwrap_err();
+        serde_json::from_value::<SessionsOptions>(json!({"query": "foo"}))
+            .unwrap()
+            .validate_around()
+            .unwrap_err();
         serde_json::from_value::<SessionsOptions>(json!({"before": 30}))
             .unwrap()
             .validate_read()
@@ -1959,12 +1969,12 @@ mod tests {
         assert!(
             help.contains(r#"{"exec": "context://sessions/index", "input": {"scope": "all"}}"#)
         );
-        assert!(help.contains("mode=\"semantic\""));
-        assert!(help.contains("mode=\"hybrid\""));
+        assert!(help.contains("`\"mode\": \"semantic\"`"));
+        assert!(help.contains("`\"mode\": \"hybrid\"`"));
         assert!(help.contains("Do not read or execute `context://sessions/index`"));
         assert!(help.contains("continues as\n  one managed task without restarting"));
         assert!(help.contains("context://sessions/<session-id>/around/<record-id>"));
-        assert!(help.contains("include_tools=false"));
+        assert!(help.contains("`\"include_tools\": false`"));
         assert!(help.contains("percent encoding or other escaping"));
         assert!(!help.contains("query parameter"));
         assert!(!help.contains("{\\\"query\\\""));

@@ -569,12 +569,19 @@ impl ProtocolRegistry {
     /// Validate one planned step operation without running it: the protocol
     /// exists and is selected, it supports the requested operation, and its
     /// help page (and every shared prerequisite) is loaded.
-    pub(crate) async fn validate_step_operation(&self, name: &str, exec: bool) -> Result<()> {
-        let descriptor = self
-            .all_descriptors()
-            .into_iter()
-            .find(|descriptor| descriptor.name == name)
+    pub(crate) async fn validate_step_operation(
+        &self,
+        name: &str,
+        target: &str,
+        exec: bool,
+    ) -> Result<()> {
+        // Resolve through the active protocol selection so validation
+        // accepts exactly the protocols dispatch will find.
+        let protocol = self
+            .find_protocol(name, true)
+            .await
             .ok_or_else(|| self.unknown_protocol_error(name, true))?;
+        let descriptor = protocol.descriptor();
         if exec {
             if !descriptor.can_exec {
                 bail!(
@@ -586,13 +593,9 @@ impl ProtocolRegistry {
                 "protocol does not support read: {name}; call help([{name:?}]) and use its documented exec operations"
             );
         }
-        self.reject_help_address(name, "value")?;
-        let protocol = self.find_protocol(name, true).await;
+        self.reject_help_address(name, target)?;
         let help_read = self.help_read.lock().await;
-        let dependencies = protocol.as_ref().map_or(&[][..], |protocol| {
-            let dependencies: &[String] = protocol.help_dependencies();
-            dependencies
-        });
+        let dependencies: &[String] = protocol.help_dependencies();
         if let Some(dependency) = dependencies
             .iter()
             .find(|dependency| !help_read.contains(*dependency))
@@ -1691,7 +1694,7 @@ mod tests {
 
         assert!(
             registry
-                .validate_step_operation("missing", false)
+                .validate_step_operation("missing", "x", false)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1699,7 +1702,7 @@ mod tests {
         );
         assert!(
             registry
-                .validate_step_operation("reader", true)
+                .validate_step_operation("reader", "x", true)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1707,7 +1710,7 @@ mod tests {
         );
         assert!(
             registry
-                .validate_step_operation("capture", false)
+                .validate_step_operation("capture", "x", false)
                 .await
                 .unwrap_err()
                 .downcast_ref::<ProtocolHelpRequired>()
@@ -1715,13 +1718,31 @@ mod tests {
         );
         registry.load_help(&["capture".to_string()]).await.unwrap();
         registry
-            .validate_step_operation("capture", false)
+            .validate_step_operation("capture", "x", false)
             .await
             .unwrap();
         registry
-            .validate_step_operation("capture", true)
+            .validate_step_operation("capture", "x", true)
             .await
             .unwrap();
+        assert!(
+            registry
+                .validate_step_operation("capture", "help", false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("help pages are loaded with the help tool")
+        );
+        registry.select(Some(&["reader".to_string()])).unwrap();
+        assert!(
+            registry
+                .validate_step_operation("capture", "x", false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown protocol: capture"),
+            "validation honors the active protocol selection"
+        );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }
 }

@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -54,7 +55,9 @@ Read steps support no shell operations. Run a command with one exec step:
 - `timeout` (integer seconds, default 1800): execution timeout shared by
   foreground and background runs; 0 disables the timeout.
 - `env` (object of string values): extra environment variables for this
-  command, overriding the Agent-managed environment.
+  command, overriding the Agent-managed environment. Names must be nonempty
+  and contain no `=`; numbers and booleans, such as substituted references,
+  are converted to text.
 
 If a foreground command is still running after about 60 seconds, URI Agent
 automatically converts the same process into a background task without
@@ -131,7 +134,9 @@ Read steps support no shell operations. Run a command with one exec step:
 - `timeout` (integer seconds, default 1800): execution timeout shared by
   foreground and background runs; 0 disables the timeout.
 - `env` (object of string values): extra environment variables for this
-  command, overriding the Agent-managed environment.
+  command, overriding the Agent-managed environment. Names must be nonempty
+  and contain no `=`; numbers and booleans, such as substituted references,
+  are converted to text.
 
 If a foreground command is still running after about 60 seconds, URI Agent
 automatically converts the same process into a background task without
@@ -192,7 +197,7 @@ struct ExecInput {
     background: Option<bool>,
     interactive: Option<bool>,
     timeout: Option<u64>,
-    env: Option<BTreeMap<String, String>>,
+    env: Option<BTreeMap<String, Value>>,
 }
 
 struct ExecutionControl<'a> {
@@ -501,9 +506,32 @@ fn parse_options(protocol: &str, request: &ProtocolRequest<'_>) -> Result<ShellO
         background: background || interactive,
         timeout: (timeout != 0).then(|| Duration::from_secs(timeout)),
         interactive,
-        env: input.env.unwrap_or_default(),
+        env: step_environment(input.env.unwrap_or_default())?,
         script: input.script,
     })
+}
+
+/// Validates `env` names and converts values to text. Numbers and booleans
+/// are accepted because a whole-value `{{ reference }}` substitution keeps
+/// the referenced JSON type.
+fn step_environment(env: BTreeMap<String, Value>) -> Result<BTreeMap<String, String>> {
+    env.into_iter()
+        .map(|(name, value)| {
+            if name.is_empty() || name.contains(['=', '\0']) {
+                bail!("env names must be nonempty and contain neither `=` nor NUL; got {name:?}");
+            }
+            let value = match value {
+                Value::String(text) => text,
+                Value::Number(number) => number.to_string(),
+                Value::Bool(flag) => flag.to_string(),
+                _ => bail!("env value for {name:?} must be a string, number, or boolean"),
+            };
+            if value.contains('\0') {
+                bail!("env value for {name:?} must not contain NUL");
+            }
+            Ok((name, value))
+        })
+        .collect()
 }
 
 fn command_label(command: &str) -> String {
@@ -1093,8 +1121,29 @@ mod tests {
         let error = parse_options("bash", &request("bash://run", "run", &unknown)).unwrap_err();
         assert!(format!("{error:#}").contains("unknown field `other`"));
         assert!(format!("{error:#}").contains("expected one of"));
-        let env_values = input_map(json!({"script": "x", "env": {"EXTRA": 1}}));
-        assert!(parse_options("bash", &request("bash://run", "run", &env_values)).is_err());
+        let scalars = input_map(json!({"script": "x", "env": {"COUNT": 3, "FLAG": true}}));
+        assert_eq!(
+            parse_options("bash", &request("bash://run", "run", &scalars))
+                .unwrap()
+                .env,
+            BTreeMap::from([
+                ("COUNT".to_string(), "3".to_string()),
+                ("FLAG".to_string(), "true".to_string()),
+            ]),
+            "substituted numbers and booleans become text"
+        );
+        for env in [
+            json!({"EXTRA": {"nested": 1}}),
+            json!({"EXTRA": null}),
+            json!({"A=B": "x"}),
+            json!({"": "x"}),
+        ] {
+            let values = input_map(json!({"script": "x", "env": env}));
+            assert!(
+                parse_options("bash", &request("bash://run", "run", &values)).is_err(),
+                "{env} must be rejected"
+            );
+        }
     }
 
     #[test]

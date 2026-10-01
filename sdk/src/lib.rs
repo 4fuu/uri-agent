@@ -11,6 +11,8 @@ use serde_json::{Map, Value};
 pub use extism_pdk;
 #[cfg(target_family = "wasm")]
 pub use extism_pdk::{plugin_fn, Error, FnResult, Json};
+#[doc(hidden)]
+pub use serde_json;
 
 pub const ABI_VERSION: u32 = 9;
 pub const MANIFEST_EXPORT: &str = "uri_agent_manifest";
@@ -713,7 +715,7 @@ macro_rules! define_plugin {
             request: $crate::Json<$crate::HandlerRequest>,
         ) -> $crate::FnResult<Vec<u8>> {
             let output = $handler(request.0).map_err($crate::Error::msg)?;
-            Ok(serde_json::to_vec(&output)?)
+            Ok($crate::serde_json::to_vec(&output)?)
         }
 
         #[cfg(not(target_family = "wasm"))]

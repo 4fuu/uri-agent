@@ -65,7 +65,7 @@ fn help() -> &'static str {
 
 Manage persistent working notes, recover conversation records across context-window rollovers, and read saved sessions.
 
-Every step takes one JSON object in its `input` field. Search routes require a nonempty `query` string of at most 500 characters; all other routes reject any input field.
+Each route accepts only the `input` fields listed for it below and rejects any other field; omit `input` for routes that list none. Search routes require a nonempty `query` string of at most 500 characters.
 
 The target after `context://` is opaque: never append `?name=value` query suffixes. Field values are raw text and are not percent-decoded.
 
@@ -85,7 +85,7 @@ Consult another session whenever its history or notes could help. `@@<session-id
 - `context://sessions/<session-id>/notes/<note-id>/context` reads records around a selected revision anchor.
 - Reading `context://sessions/index` diagnoses the saved-session search cache. Use a `{"exec": "context://sessions/index"}` step only to prewarm or rebuild that private cache; it never modifies a session.
 
-Discovery defaults to the current project. The discovery and index routes accept a `scope` of `project` or `all`; `cwd` is available with `scope=all`. Results document their pagination options.
+Discovery defaults to the current project. The discovery and index routes accept a `scope` of `project` or `all`; `cwd` is available with `"scope": "all"`. Results document their pagination options.
 
 ## Current session
 

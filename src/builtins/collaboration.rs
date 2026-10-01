@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use rig::message::UserContent;
 use serde::Deserialize;
+use serde_json::Value;
 use std::fmt::Write as _;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -495,8 +496,9 @@ Input fields:
   model boundary. If the target is idle or finishes before accepting it, it
   becomes a queued turn.
 - `reply` (string): `none` (default) does not request a response.
-  `requested` asks for a response. The host generates a message ID and
-  an exact ID-based reply request and injects both into the target message.
+  `requested` asks for a response. The host generates a message ID and a
+  ready-to-use reply step carrying it, and injects both into the target
+  message; the recipient replaces only the step's `message` placeholder.
   This is a request, not a wait or a response guarantee.
 - `scope` (string): `project` (default) resolves only participants in the
   current working directory. `all` permits a participant from another
@@ -676,21 +678,23 @@ fn collaboration_envelope(
         );
     }
     if reply_requested {
+        let mut input = serde_json::Map::new();
+        input.insert("message".to_string(), Value::from("<your reply>"));
+        input.insert("delivery".to_string(), Value::from("queue"));
+        input.insert("in_reply_to".to_string(), Value::from(message_id));
+        if reply_scope_all {
+            input.insert("scope".to_string(), Value::from("all"));
+        }
+        let step = serde_json::json!({
+            "exec": format!("collaboration://send/{source_id}"),
+            "input": input,
+        });
         output.push_str("  <reply requested=\"true\">\n");
         let _ = writeln!(
             output,
-            "    <uri>collaboration://send/{}</uri>",
-            xml_escape(source_id)
+            "    <step>{}</step>",
+            xml_escape_text(&step.to_string())
         );
-        output.push_str("    <header>delivery: queue</header>\n");
-        let _ = writeln!(
-            output,
-            "    <header>in_reply_to: {}</header>",
-            xml_escape(message_id)
-        );
-        if reply_scope_all {
-            output.push_str("    <header>scope: all</header>\n");
-        }
         output.push_str("  </reply>\n");
     }
     let _ = writeln!(
@@ -700,6 +704,13 @@ fn collaboration_envelope(
     );
     output.push_str("</collaboration_message>");
     output
+}
+
+/// Escapes XML text content only, keeping quotes readable inside JSON.
+fn xml_escape_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn xml_escape(text: &str) -> String {
@@ -756,10 +767,28 @@ mod tests {
         assert!(envelope.contains("<message_id>cm_123</message_id>"));
         assert!(envelope.contains("<delivery>steer</delivery>"));
         assert!(envelope.contains("<in_reply_to>cm_parent</in_reply_to>"));
-        assert!(envelope.contains("<uri>collaboration://send/source-id</uri>"));
-        assert!(envelope.contains("<header>delivery: queue</header>"));
-        assert!(envelope.contains("<header>in_reply_to: cm_123</header>"));
-        assert!(envelope.contains("<header>scope: all</header>"));
+        let step = envelope
+            .split("<step>")
+            .nth(1)
+            .and_then(|rest| rest.split("</step>").next())
+            .unwrap()
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        let step: Value = serde_json::from_str(&step).unwrap();
+        assert_eq!(
+            step,
+            serde_json::json!({
+                "exec": "collaboration://send/source-id",
+                "input": {
+                    "message": "<your reply>",
+                    "delivery": "queue",
+                    "in_reply_to": "cm_123",
+                    "scope": "all"
+                }
+            })
+        );
+        assert!(!envelope.contains("header"));
         assert!(envelope.contains("review &lt;this&gt; &amp; reply"));
         assert!(!envelope.contains("review <this>"));
     }
@@ -917,8 +946,11 @@ mod tests {
         assert!(content.contains("<name>Wu Sir</name>"));
         assert!(content.contains("<session_id>source-session</session_id>"));
         assert!(content.contains("<reply requested=\\\"true\\\">"));
-        assert!(content.contains("<uri>collaboration://send/source-session</uri>"));
-        assert!(content.contains("<header>in_reply_to: cm_"));
+        assert!(
+            content
+                .contains(r#"<step>{\"exec\":\"collaboration://send/source-session\",\"input\":{"#)
+        );
+        assert!(content.contains(r#"\"in_reply_to\":\"cm_"#));
         assert!(content.contains("Review &lt;parser&gt; &amp; report."));
 
         source.shutdown().await.unwrap();

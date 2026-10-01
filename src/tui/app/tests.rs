@@ -5095,7 +5095,7 @@ fn tool_details_redact_sensitive_dynamic_arguments() {
             name: "custom".to_string(),
             arguments: serde_json::json!({
                 "api_key": "argument-secret",
-                "body": r#"{"authorization":"body-secret","query":"visible body"}"#,
+                "body": {"authorization": "body-secret", "query": "visible body"},
                 "environment_variables": {"DATABASE_URL": "env-secret"},
                 "message": "visible argument",
                 "settings": {"password": "nested-secret"}
@@ -5277,7 +5277,7 @@ fn tool_summaries_describe_shell_patch_and_unknown_arguments_without_json() {
     let mut lines = Vec::new();
     tool_argument_details(
         &serde_json::json!({
-            "body": "{\"path\":\"src/main.rs\",\"limit\":20}"
+            "steps": [{"read": "file://src", "input": {"path": "src/main.rs", "limit": 20}}]
         }),
         &mut lines,
     );

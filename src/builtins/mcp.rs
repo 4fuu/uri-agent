@@ -1673,6 +1673,14 @@ impl McpProtocol {
             }
             path if path.starts_with("prompts/") => {
                 let name = decode_path_name(&path["prompts/".len()..])?;
+                if let Some((argument, _)) =
+                    request.input.iter().find(|(_, value)| !value.is_string())
+                {
+                    bail!(
+                        "MCP prompt argument `{argument}` must be a string; prompt arguments are \
+                         string values"
+                    );
+                }
                 let arguments = request.input.clone();
                 let runtime = self.runtime.clone();
                 let identity = self.record.identity.clone();
@@ -2134,6 +2142,33 @@ async fn run_managed<F>(
 where
     F: Future<Output = Result<ProtocolOutput>> + Send + 'static,
 {
+    run_managed_after(
+        context,
+        AUTO_BACKGROUND_AFTER,
+        protocol,
+        label,
+        runtime,
+        identity,
+        future,
+    )
+    .await
+}
+
+/// Runs an MCP operation in the foreground for `auto_background_after`, or
+/// without promotion when a later step references it, then promotes it to a
+/// background task.
+async fn run_managed_after<F>(
+    context: ProtocolContext,
+    auto_background_after: Duration,
+    protocol: &str,
+    label: &str,
+    runtime: Arc<McpRuntime>,
+    identity: String,
+    future: F,
+) -> Result<ProtocolOutput>
+where
+    F: Future<Output = Result<ProtocolOutput>> + Send + 'static,
+{
     // Task records store bytes only, so a foreground-completed operation
     // hands its structured output back through this slot; a background
     // promotion has no `.json` because the model then reads the task as text.
@@ -2169,7 +2204,7 @@ where
         .await;
     let record = context
         .tasks
-        .wait(&id, AUTO_BACKGROUND_AFTER)
+        .wait(&id, context.foreground_grace(auto_background_after))
         .await
         .ok_or_else(|| anyhow!("MCP task disappeared: {id}"))?;
     if record.status.terminal() {
@@ -4531,6 +4566,16 @@ mod tests {
             harness.captured("prompts/get").get("arguments").unwrap(),
             &input
         );
+        let number = harness
+            .read("fake-mcp://prompts/release-notes", json!({"version": 1}))
+            .await
+            .unwrap_err();
+        assert!(
+            number
+                .to_string()
+                .contains("MCP prompt argument `version` must be a string"),
+            "{number:#}"
+        );
         harness.shutdown().await;
     }
 
@@ -5230,6 +5275,66 @@ mod tests {
             .unwrap();
         assert!(runtime.store.resolve("Broken Server").await.is_err());
 
+        runtime.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[tokio::test]
+    async fn operations_referenced_later_stay_in_the_foreground() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let global = directory.path().join("global");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::create_dir_all(&global).await.unwrap();
+        let environment = Arc::new(AgentEnvironment::load(&global).await.unwrap());
+        let output = Arc::new(
+            OutputStore::new(&format!("mcp-test-{}", uuid::Uuid::now_v7().simple()), 1024)
+                .await
+                .unwrap(),
+        );
+        let output_directory = output.directory().to_path_buf();
+        let runtime = Arc::new(McpRuntime::new(
+            McpConfigStore::new(&project, &global),
+            PluginEnvironment::new(environment),
+            output,
+        ));
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(ProtocolOutput::text(b"done".to_vec()).with_json(json!({"n": 1})))
+        };
+
+        let mut pinned = ProtocolContext::new(TaskManager::new());
+        pinned.pinned_foreground = true;
+        let output = run_managed_after(
+            pinned,
+            Duration::ZERO,
+            "fake-mcp",
+            "slow",
+            runtime.clone(),
+            "fake".to_string(),
+            slow(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.text_bytes(), b"done");
+        assert_eq!(output.json(), Some(&json!({"n": 1})));
+
+        let unpinned = run_managed_after(
+            ProtocolContext::new(TaskManager::new()),
+            Duration::ZERO,
+            "fake-mcp",
+            "slow",
+            runtime.clone(),
+            "fake".to_string(),
+            slow(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(unpinned.text_bytes()).contains("Background task started"),
+            "an unreferenced operation still promotes to the background"
+        );
+        assert_eq!(unpinned.json(), None);
         runtime.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

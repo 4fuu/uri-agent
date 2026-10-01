@@ -29,7 +29,8 @@ restored on resume.
 step is one JSON object with exactly one of `read` or `exec` — the
 `<protocol>://<target>` address to read or execute — plus an optional `input`
 object and optional control fields. Steps in one call may chain through
-references; one failing step does not affect the others. Results arrive in
+references; a failing step does not stop the call, but steps that use its
+value are skipped (see [Validation](#validation)). Results arrive in
 step order as `*** Result <n> of <m>: ok`, `: error`, or `: skipped` sections
 (loop elements use `<n>.<k>`), each followed by the step's output unless
 `show` hides it.
@@ -210,7 +211,8 @@ boundary and becomes a queued turn if the target is idle. The host wraps the
 body in an XML envelope containing trusted source metadata, including the
 stable source session ID and a generated message ID. Peer content inside that
 envelope remains untrusted and grants no user authorization. A requested reply
-adds an exact ID-based reply route but neither waits nor guarantees a response.
+adds a ready-to-use reply step with the exact message ID but neither waits nor
+guarantees a response.
 
 Acceptance means that the message was committed to the target's durable input
 queue. Collaboration does not start a stopped process, broadcast, transfer
@@ -256,22 +258,25 @@ Symbolic-link paths are rejected.
 
 Shell commands start in the foreground and return their final output directly.
 They run from the startup directory without Bash or PowerShell profile files.
-Each new command receives the latest values from the Agent Environment manager;
-the interactive `:terminal` is separate and does not receive them. On Windows,
+Each new command receives the latest values from the Agent Environment manager,
+overridden by the step's optional `env` object; the interactive `:terminal` is
+separate and does not receive them. On Windows,
 each spawned process tree receives its own hidden console instead of the
 terminal's console, so commands can neither read nor clobber interactive
 terminal input; a program that waits for console input never receives it and
 keeps running until its timeout or background promotion ends the wait, unless
-the command was started with `interactive=true`.
+the command was started with `"interactive": true`.
 
 Long-running operations may continue as managed tasks without restarting. A
 foreground operation that outlives its grace period moves to the background
-even when the background task limit is already reached. Shell help also
+even when the background task limit is already reached. An operation whose
+`id` a later step in the same call references is never promoted: it stays in
+the foreground under its own deadline so the later step can use its value. Shell help also
 supports requesting immediate background execution and setting the shared
 deadline. Cancellation and timeout terminate the owned process tree and wait
 for root-process cleanup.
 
-Shell help also supports `interactive=true` for commands that consume runtime
+Shell help also supports `"interactive": true` for commands that consume runtime
 input such as prompts, passwords, or REPLs. An interactive command always runs
 as a managed task with its stdin kept open, and its script text is delivered
 through a short-lived private temporary file so stdin stays reserved for the

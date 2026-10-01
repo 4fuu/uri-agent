@@ -671,7 +671,7 @@ impl TaskManager {
                     "task {id} input is already closed; wait for completion or use a {{\"exec\": \"tasks://{id}/cancel\"}} step"
                 ),
                 None => anyhow::bail!(
-                    "task {id} does not accept input; rerun the command with interactive=true"
+                    "task {id} does not accept input; rerun the command with `\"interactive\": true` in its input"
                 ),
             }
         }
@@ -1104,7 +1104,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains("does not accept input")
-                && error.contains("rerun the command with interactive=true"),
+                && error.contains("rerun the command with `\"interactive\": true` in its input"),
             "{error}"
         );
         assert!(!tasks.interrupt(&id).await);

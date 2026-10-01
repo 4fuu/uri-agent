@@ -200,7 +200,7 @@ lifecycle operations, and ownership constraints.
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At
 runtime, a protocol's page loaded through the `help` tool is the authoritative
-reference for its accepted URIs and body shape; `F1` and `:help` show the
+reference for its accepted URIs and `input` fields; `F1` and `:help` show the
 active interface reference.
 
 ## Development

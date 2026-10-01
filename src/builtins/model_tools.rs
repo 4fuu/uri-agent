@@ -254,7 +254,7 @@ impl<'a> Cursor<'a> {
         self.rest().chars().next()
     }
 
-    /// Consumes the keyword `not` when it starts the expression.
+    /// Consumes `word` when it is followed by a non-identifier character.
     fn take_word(&mut self, word: &str) -> bool {
         self.skip_whitespace();
         let rest = self.rest();
@@ -312,17 +312,14 @@ impl<'a> Cursor<'a> {
         if first.is_ascii_digit() || first == '-' {
             return Ok(Operand::Literal(self.parse_number_literal()?));
         }
-        if rest.starts_with("true") {
-            self.bytes += 4;
-            return Ok(Operand::Literal(Value::Bool(true)));
-        }
-        if rest.starts_with("false") {
-            self.bytes += 5;
-            return Ok(Operand::Literal(Value::Bool(false)));
-        }
-        if rest.starts_with("null") {
-            self.bytes += 4;
-            return Ok(Operand::Literal(Value::Null));
+        for (keyword, literal) in [
+            ("true", Value::Bool(true)),
+            ("false", Value::Bool(false)),
+            ("null", Value::Null),
+        ] {
+            if self.take_word(keyword) {
+                return Ok(Operand::Literal(literal));
+            }
         }
         if first.is_ascii_lowercase() {
             return self.parse_reference();
@@ -340,14 +337,14 @@ impl<'a> Cursor<'a> {
         let mut characters = rest.char_indices();
         let (_, opening) = characters.next().expect("the caller checked the quote");
         debug_assert_eq!(opening, '"');
-        for (offset, character) in characters {
+        while let Some((offset, character)) = characters.next() {
             match character {
                 '"' => {
                     self.bytes += offset + 1;
                     return Ok(literal);
                 }
                 '\\' => {
-                    let escape = rest[offset + 1..].chars().next().ok_or_else(|| {
+                    let (_, escape) = characters.next().ok_or_else(|| {
                         anyhow!(
                             "invalid string literal in {:?}: trailing backslash",
                             self.text
@@ -406,7 +403,7 @@ impl<'a> Cursor<'a> {
                     self.bytes += 1;
                     let rest = self.rest();
                     let end = rest
-                        .find(|c: char| c == '.' || c == '[' || c.is_ascii_whitespace())
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
                         .unwrap_or(rest.len());
                     if end == 0 {
                         bail!(
@@ -511,12 +508,12 @@ fn compare_operands(comparator: Comparator, left: &Value, right: &Value) -> Resu
     }
 }
 
-/// A string that is exactly `{{ operand }}` with optional surrounding spaces
-/// inside the braces.
-fn whole_placeholder(text: &str) -> Option<&str> {
-    let trimmed = text.strip_prefix("{{")?.strip_suffix("}}")?;
-    let inner = trimmed.trim();
-    Some(inner)
+/// The operand of a string that is exactly `{{ operand }}`, with optional
+/// surrounding spaces inside the braces. Any other string, including
+/// template text such as `{{a}} and {{b}}`, is literal.
+fn whole_placeholder(text: &str) -> Option<Operand> {
+    let inner = text.strip_prefix("{{")?.strip_suffix("}}")?;
+    parse_operand_str(inner).ok()
 }
 
 /// Every `{{ operand }}` span inside an address string.
@@ -555,8 +552,8 @@ fn substitute_input(
 fn substitute_value(value: &Value, values: &HashMap<String, Value>) -> Result<Value> {
     match value {
         Value::String(text) => {
-            if let Some(inner) = whole_placeholder(text) {
-                return parse_operand_str(inner)?.eval(values);
+            if let Some(operand) = whole_placeholder(text) {
+                return operand.eval(values);
             }
             Ok(value.clone())
         }
@@ -611,7 +608,7 @@ impl ModelTool for ProtocolTool {
                         "items": { "$ref": "#/$defs/step" },
                         "minItems": 1,
                         "maxItems": MAX_STEPS,
-                        "description": "One to eight steps, executed in order. Each step is an object with `read` or `exec` (exactly one): the `<protocol>://<target>` address to read or execute. `input` is the protocol's input object exactly as its help page documents; omit it when the operation takes none. `id` names the step for later references (`[a-z][a-z0-9_]*`, unique within the call). `if` is a condition; the step runs only when it is true. `for` is `<name> in <reference>` and runs the step once per element of the referenced list; it requires `max`, the maximum number of elements (1..=32). `show` controls whether the step's output enters the result: `all` (default), `errors`, or `none`. Conditions are `[not] operand [comparator operand]`: operands are references or literals, comparators are ==, !=, <, <=, >, and >= (two numbers or two strings), and `not` negates. References start with a step `id` or a `for` variable and continue with `.field` and `[index]` segments; they may point only to earlier steps. Each step exposes `<id>.ok` (true when the operation succeeded), `<id>.text` (the complete text output), and `<id>.json` (structured output, or null); a `for` step's value is the list of its per-element values. In `input`, a string value that is exactly `{{ reference }}` is replaced by the referenced value with its JSON type preserved; any other string stays literal, including strings that contain `{{`. Fields the protocol executes verbatim (such as shell `script`) are never substituted; pass data through dedicated fields like the shell `env` object. In `read` and `exec` addresses, `{{ reference }}` placeholders are replaced as text and must reference a string, number, or boolean. The whole call is validated before anything runs: a rejected call runs nothing. A call expands to at most 64 operations; further steps are reported as skipped. Results arrive in step order as `*** Result <n> of <m>: ok`, `: error`, or `: skipped` sections (loop elements use `<n>.<k>`), followed by the step's output unless `show` hides it; one failing step does not affect the others. Examples:\n\n{\"steps\": [{\"read\": \"file://src/main.rs\"}]}\n\n{\"steps\": [{\"id\": \"tests\", \"exec\": \"bash://run\", \"input\": {\"script\": \"cargo test\"}, \"show\": \"errors\"}, {\"if\": \"not tests.ok\", \"read\": \"file://target/test.log\"}]}\n\n{\"steps\": [{\"id\": \"issues\", \"exec\": \"github-mcp://tools/list_issues\", \"input\": {\"repo\": \"acme/api\"}, \"show\": \"none\"}, {\"for\": \"issue in issues.json.items\", \"max\": 20, \"if\": \"issue.comments > 0\", \"exec\": \"github-mcp://tools/get_issue\", \"input\": {\"repo\": \"acme/api\", \"number\": \"{{ issue.number }}\"}}]}"
+                        "description": "One to eight steps, executed in order. Each step is an object with `read` or `exec` (exactly one): the `<protocol>://<target>` address to read or execute. `input` is the protocol's input object exactly as its help page documents; omit it when the operation takes none. `id` names the step for later references (`[a-z][a-z0-9_]*`, unique within the call). `if` is a condition; the step runs only when it is true. `for` is `<name> in <reference>` and runs the step once per element of the referenced list; it requires `max`, the maximum number of elements (1..=32). `show` controls whether the step's output enters the result: `all` (default), `errors`, or `none`. Conditions are `[not] operand [comparator operand]`: operands are references or literals, comparators are ==, !=, <, <=, >, and >= (two numbers or two strings), and `not` negates. References start with a step `id` or a `for` variable and continue with `.field` and `[index]` segments; they may point only to earlier steps. Each step exposes `<id>.ok` (true when the operation succeeded), `<id>.text` (the complete text output), and `<id>.json` (structured output, or null); a `for` step's value is the list of its per-element values. In `input`, a string value that is exactly `{{ reference }}` is replaced by the referenced value with its JSON type preserved; any other string stays literal, including strings that contain `{{`. Fields the protocol executes verbatim (such as shell `script`) are never substituted; pass data through dedicated fields like the shell `env` object. In `read` and `exec` addresses, `{{ reference }}` placeholders are replaced as text and must reference a string, number, or boolean. The whole call is validated before anything runs: a rejected call runs nothing. A call expands to at most 64 operations; further steps are reported as skipped. Results arrive in step order as `*** Result <n> of <m>: ok`, `: error`, or `: skipped` sections (loop elements use `<n>.<k>`), followed by the step's output unless `show` hides it; a failing step does not stop the call, but steps that use its value in `input`, an address, or a `for` source are skipped. Examples:\n\n{\"steps\": [{\"read\": \"file://src/main.rs\"}]}\n\n{\"steps\": [{\"id\": \"tests\", \"exec\": \"bash://run\", \"input\": {\"script\": \"cargo test\"}, \"show\": \"errors\"}, {\"if\": \"not tests.ok\", \"read\": \"file://target/test.log\"}]}\n\n{\"steps\": [{\"id\": \"issues\", \"exec\": \"github-mcp://tools/list_issues\", \"input\": {\"repo\": \"acme/api\"}, \"show\": \"none\"}, {\"for\": \"issue in issues.json.items\", \"max\": 20, \"if\": \"issue.comments > 0\", \"exec\": \"github-mcp://tools/get_issue\", \"input\": {\"repo\": \"acme/api\", \"number\": \"{{ issue.number }}\"}}]}"
                     }
                 },
                 "required": ["steps"],
@@ -715,12 +712,70 @@ fn check_reference_root(
     ))
 }
 
+/// Expression keywords; an `id` or `for` variable with one of these names
+/// could never be referenced.
+const RESERVED_NAMES: [&str; 4] = ["not", "true", "false", "null"];
+
 fn valid_id(id: &str) -> bool {
     let mut characters = id.chars();
     characters
         .next()
         .is_some_and(|first| first.is_ascii_lowercase())
         && characters.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !RESERVED_NAMES.contains(&id)
+}
+
+/// A JSON type name for error messages and its membership check.
+type FieldType = (&'static str, fn(&Value) -> bool);
+
+/// Expected JSON type of every step field, named in validation errors.
+fn step_field_type(field: &str) -> Option<FieldType> {
+    Some(match field {
+        "read" | "exec" | "id" | "if" | "for" | "show" => ("a string", Value::is_string),
+        "input" => ("an object", Value::is_object),
+        "max" => ("an integer", |value| value.is_i64() || value.is_u64()),
+        _ => return None,
+    })
+}
+
+/// Rejects a step that is not an object, has an unknown field, or has a
+/// field of the wrong type, naming the step and field.
+fn check_step_shape(number: usize, raw_step: &Value) -> Result<()> {
+    let Value::Object(object) = raw_step else {
+        bail!(
+            "invalid protocol arguments: step {number} must be an object, got {}; example: \
+             {STEP_SHAPE_EXAMPLE}",
+            json_type_name(raw_step)
+        );
+    };
+    for (field, value) in object {
+        let Some((expected, matches)) = step_field_type(field) else {
+            return Err(step_field_error(
+                number,
+                field,
+                format!(
+                    "unknown step field; step fields are read, exec, input, id, if, for, max, \
+                     and show; example: {STEP_SHAPE_EXAMPLE}"
+                ),
+            ));
+        };
+        if !matches(value) {
+            let example = if field == "input" {
+                r#"{"read": "search://src", "input": {"query": "parse config"}}"#
+            } else {
+                STEP_SHAPE_EXAMPLE
+            };
+            return Err(step_field_error(
+                number,
+                field,
+                format!(
+                    "must be {expected}, got {}; example: {example}",
+                    json_type_name(value)
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<Vec<ValidatedStep>> {
@@ -738,6 +793,7 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
     let mut all_reference_roots = Vec::new();
     for (index, raw_step) in raw.iter().enumerate() {
         let number = index + 1;
+        check_step_shape(number, raw_step)?;
         let step: StepArgument = serde_json::from_value(raw_step.clone())
             .map_err(|error| anyhow!("invalid protocol arguments: step {number}: {error}"))?;
         let (operation, address, field) = match (&step.read, &step.exec) {
@@ -759,7 +815,7 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
                 "the address cannot be empty",
             ));
         }
-        let (protocol_name, _) = split_address(address).map_err(|error| {
+        let (protocol_name, target) = split_address(address).map_err(|error| {
             step_field_error(
                 number,
                 field,
@@ -782,7 +838,7 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
         }
         let exec = operation == ProtocolOperation::Exec;
         protocols
-            .validate_step_operation(protocol_name, exec)
+            .validate_step_operation(protocol_name, target, exec)
             .await
             .map_err(|error| step_field_error_from(number, field, error))?;
         let literal_fields = protocols.literal_input_fields(protocol_name).await;
@@ -794,11 +850,14 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
                         number,
                         "id",
                         format!(
-                            "{id:?} must match `[a-z][a-z0-9_]*` and be unique within the call"
+                            "{id:?} must match `[a-z][a-z0-9_]*`, must not be one of not, true, \
+                             false, or null, and must be unique within the call"
                         ),
                     ));
                 }
-                if !ids.insert(id.clone()) {
+                // The id joins `ids` only after this step's own references
+                // are checked, so a step cannot reference itself.
+                if ids.contains(id) {
                     return Err(step_field_error(
                         number,
                         "id",
@@ -839,13 +898,24 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
                         format!("{text:?} must be `<name> in <reference>`"),
                     )
                 })?;
-                if !valid_id(variable.trim()) {
+                let variable = variable.trim();
+                if !valid_id(variable) {
                     return Err(step_field_error(
                         number,
                         "for",
                         format!(
-                            "the variable name {:?} must match `[a-z][a-z0-9_]*`",
-                            variable.trim()
+                            "the variable name {variable:?} must match `[a-z][a-z0-9_]*` and must \
+                             not be one of not, true, false, or null"
+                        ),
+                    ));
+                }
+                if ids.contains(variable) || id.as_deref() == Some(variable) {
+                    return Err(step_field_error(
+                        number,
+                        "for",
+                        format!(
+                            "the variable name {variable:?} is already a step `id`; choose a \
+                             different name"
                         ),
                     ));
                 }
@@ -861,7 +931,7 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
                 };
                 check_reference_root(root, number, "for", &ids, None)?;
                 Some(LoopSpec {
-                    variable: variable.trim().to_string(),
+                    variable: variable.to_string(),
                     source,
                 })
             }
@@ -895,9 +965,10 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
         let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
         let mut data_refs = Vec::new();
         if let Some(input) = &step.input {
-            for value in input.values() {
-                collect_input_roots(value, &mut data_refs)
-                    .map_err(|error| step_field_error(number, "input", format!("{error:#}")))?;
+            for (key, value) in input {
+                if !literal_fields.contains(key) {
+                    collect_input_roots(value, &mut data_refs);
+                }
             }
             for root in &data_refs {
                 check_reference_root(root, number, "input", &ids, loop_variable)?;
@@ -924,6 +995,9 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
             }
         }
         all_reference_roots.extend(data_refs.iter().cloned());
+        if let Some(id) = &id {
+            ids.insert(id.clone());
+        }
         steps.push(ValidatedStep {
             operation,
             address: address.clone(),
@@ -948,29 +1022,26 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
     Ok(steps)
 }
 
-fn collect_input_roots(value: &Value, roots: &mut Vec<String>) -> Result<()> {
+fn collect_input_roots(value: &Value, roots: &mut Vec<String>) {
     match value {
         Value::String(text) => {
-            if let Some(inner) = whole_placeholder(text)
-                && let Some(root) = parse_operand_str(inner)?.root()
+            if let Some(operand) = whole_placeholder(text)
+                && let Some(root) = operand.root()
             {
                 roots.push(root.to_string());
             }
-            Ok(())
         }
         Value::Array(items) => {
             for item in items {
-                collect_input_roots(item, roots)?;
+                collect_input_roots(item, roots);
             }
-            Ok(())
         }
         Value::Object(map) => {
             for value in map.values() {
-                collect_input_roots(value, roots)?;
+                collect_input_roots(value, roots);
             }
-            Ok(())
         }
-        _ => Ok(()),
+        _ => {}
     }
 }
 
@@ -1069,6 +1140,7 @@ async fn execute_steps(
             }
             let mut element_values = Vec::new();
             let mut any_failed = false;
+            let mut limited = false;
             if list.is_empty() {
                 sections.push(format!(
                     "*** Result {number} of {total}: ok\n(the `for` list is empty)"
@@ -1094,14 +1166,22 @@ async fn execute_steps(
                         element_values.push(operation_value(ok, text, json));
                     }
                     ElementOutcome::Skipped => element_values.push(skipped_value()),
+                    ElementOutcome::Limited => {
+                        limited = true;
+                        element_values.push(skipped_value());
+                    }
                 }
             }
             values.remove(&spec.variable);
             if let Some(id) = &step.id {
+                // A list cut short by the operation limit is incomplete, so
+                // later steps that use it as data are skipped.
                 states.insert(
                     id.clone(),
                     if any_failed {
                         StepState::Failed
+                    } else if limited {
+                        StepState::Skipped
                     } else {
                         StepState::Ran { ok: true }
                     },
@@ -1137,7 +1217,7 @@ async fn execute_steps(
                         values.insert(id.clone(), operation_value(ok, text, json));
                     }
                 }
-                ElementOutcome::Skipped => {
+                ElementOutcome::Skipped | ElementOutcome::Limited => {
                     if let Some(id) = &step.id {
                         states.insert(id.clone(), StepState::Skipped);
                         values.insert(id.clone(), skipped_value());
@@ -1156,7 +1236,10 @@ enum ElementOutcome {
         text: String,
         json: Option<Value>,
     },
+    /// Skipped by its `if` condition.
     Skipped,
+    /// Skipped because the call reached `MAX_OPERATIONS`.
+    Limited,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1170,17 +1253,30 @@ async fn run_element(
     sections: &mut Vec<String>,
     images: &mut Vec<crate::protocol::ProtocolImage>,
 ) -> ElementOutcome {
+    if *operations_started >= MAX_OPERATIONS {
+        sections.push(format!(
+            "*** Result {label} of {total}: skipped\nthis call reached the limit of \
+             {MAX_OPERATIONS} protocol operations"
+        ));
+        return ElementOutcome::Limited;
+    }
+    let failed = |sections: &mut Vec<String>, error: anyhow::Error| {
+        let message = format!("{error:#}");
+        if step.show.shows_output(true) {
+            sections.push(format!("*** Result {label} of {total}: error\n{message}"));
+        } else {
+            sections.push(format!("*** Result {label} of {total}: error"));
+        }
+        ElementOutcome::Ran {
+            ok: false,
+            text: message,
+            json: None,
+        }
+    };
     if let Some(condition) = &step.condition {
         let decision = match eval_expression(condition, values) {
             Ok(decision) => decision,
-            Err(error) => {
-                sections.push(format!("*** Result {label} of {total}: error\n{error:#}"));
-                return ElementOutcome::Ran {
-                    ok: false,
-                    text: format!("{error:#}"),
-                    json: None,
-                };
-            }
+            Err(error) => return failed(sections, error),
         };
         if !decision {
             sections.push(format!(
@@ -1189,44 +1285,18 @@ async fn run_element(
             return ElementOutcome::Skipped;
         }
     }
-    if *operations_started >= MAX_OPERATIONS {
-        sections.push(format!(
-            "*** Result {label} of {total}: skipped\nthis call reached the limit of \
-             {MAX_OPERATIONS} protocol operations"
-        ));
-        return ElementOutcome::Skipped;
-    }
-    *operations_started += 1;
     let address = match substitute_address(&step.address, values) {
         Ok(address) => address,
-        Err(error) => {
-            sections.push(format!("*** Result {label} of {total}: error\n{error:#}"));
-            return ElementOutcome::Ran {
-                ok: false,
-                text: format!("{error:#}"),
-                json: None,
-            };
-        }
+        Err(error) => return failed(sections, error),
     };
-    let empty = Map::new();
-    let input = match step
-        .input
-        .as_ref()
-        .map(|input| substitute_input(input, values, &step.literal_fields))
-    {
-        Some(result) => match result {
+    let input = match &step.input {
+        Some(input) => match substitute_input(input, values, &step.literal_fields) {
             Ok(input) => input,
-            Err(error) => {
-                sections.push(format!("*** Result {label} of {total}: error\n{error:#}"));
-                return ElementOutcome::Ran {
-                    ok: false,
-                    text: format!("{error:#}"),
-                    json: None,
-                };
-            }
+            Err(error) => return failed(sections, error),
         },
-        None => empty,
+        None => Map::new(),
     };
+    *operations_started += 1;
     let result = match step.operation {
         ProtocolOperation::Read => {
             protocols
@@ -1258,19 +1328,7 @@ async fn run_element(
                 json: output.json,
             }
         }
-        Err(error) => {
-            let message = format!("{error:#}");
-            if step.show.shows_output(true) {
-                sections.push(format!("*** Result {label} of {total}: error\n{message}"));
-            } else {
-                sections.push(format!("*** Result {label} of {total}: error"));
-            }
-            ElementOutcome::Ran {
-                ok: false,
-                text: message,
-                json: None,
-            }
-        }
+        Err(error) => failed(sections, error),
     }
 }
 
@@ -1523,6 +1581,8 @@ A recording protocol for step tests.
         calls: RecordedInputs,
         script_calls: Arc<Mutex<Vec<Map<String, Value>>>>,
         pinned: Arc<Mutex<Vec<bool>>>,
+        /// Non-help reads of the `readonly` and `unloaded` protocols.
+        limited_calls: Arc<Mutex<usize>>,
         output_directory: PathBuf,
     }
 
@@ -1555,11 +1615,23 @@ A recording protocol for step tests.
                 calls: script_calls.clone(),
             })
             .unwrap();
+        let limited_calls = Arc::new(Mutex::new(0));
+        for (name, can_exec) in [("readonly", false), ("unloaded", true)] {
+            registry
+                .register(LimitedProtocol {
+                    name,
+                    can_exec,
+                    calls: limited_calls.clone(),
+                })
+                .unwrap();
+        }
+        // `unloaded` stays without loaded help for the help-gate tests.
         registry
             .load_help(&[
                 "fake".to_string(),
                 "slowpoke".to_string(),
                 "scripted".to_string(),
+                "readonly".to_string(),
             ])
             .await
             .unwrap();
@@ -1569,6 +1641,7 @@ A recording protocol for step tests.
             calls,
             script_calls,
             pinned,
+            limited_calls,
             output_directory,
         }
     }
@@ -2120,6 +2193,36 @@ A recording protocol for step tests.
         examples
     }
 
+    /// Extract every single-line step example outside ```json fences: a
+    /// whole line or a backtick code span that parses as a JSON object starting with a
+    /// step or `steps` field.
+    fn inline_steps(text: &str) -> Vec<Value> {
+        const STARTS: [&str; 4] = ["{\"read\"", "{\"exec\"", "{\"id\"", "{\"steps\""];
+        let mut candidates = Vec::new();
+        let mut in_json_fence = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                in_json_fence = !in_json_fence && trimmed == "```json";
+                continue;
+            }
+            // `json_fences` covers fenced JSON, including multi-line calls.
+            if in_json_fence {
+                continue;
+            }
+            candidates.push(trimmed);
+            candidates.extend(trimmed.split('`').skip(1).step_by(2));
+        }
+        candidates
+            .into_iter()
+            .filter(|candidate| STARTS.iter().any(|start| candidate.starts_with(start)))
+            .map(|candidate| {
+                serde_json::from_str(candidate)
+                    .unwrap_or_else(|error| panic!("invalid inline step {candidate:?}: {error}"))
+            })
+            .collect()
+    }
+
     /// Normalize one extracted example to its step array: help pages show a
     /// single step object, `docs/protocols.md` shows complete calls.
     fn example_steps(example: &Value) -> Vec<Value> {
@@ -2172,10 +2275,13 @@ A recording protocol for step tests.
         }
 
         let (_workspace, _handle, protocols) = builtin_registry().await;
+        // Skill protocols come from the developer's home directory, not this
+        // repository, so their pages are not built-in examples.
         let names: Vec<String> = protocols
             .descriptors()
             .into_iter()
             .map(|descriptor| descriptor.name)
+            .filter(|name| !name.ends_with("-skill"))
             .collect();
         assert!(
             names.iter().any(|name| name == "file"),
@@ -2194,7 +2300,7 @@ A recording protocol for step tests.
         let registered: HashSet<&str> = names.iter().map(String::as_str).collect();
         let mut validated = 0;
         for page in &pages {
-            for example in json_fences(page) {
+            for example in json_fences(page).into_iter().chain(inline_steps(page)) {
                 let steps = example_steps(&example);
                 if check(&steps, &registered, &protocols).await {
                     validated += 1;
@@ -2208,7 +2314,7 @@ A recording protocol for step tests.
         )
         .unwrap();
         let mut docs_validated = 0;
-        for example in json_fences(&docs) {
+        for example in json_fences(&docs).into_iter().chain(inline_steps(&docs)) {
             let steps = example_steps(&example);
             if check(&steps, &registered, &protocols).await {
                 docs_validated += 1;
@@ -2277,5 +2383,316 @@ A recording protocol for step tests.
             }
         }
         assert_fixed(&schema, "schema");
+    }
+
+    /// A protocol with configurable read/exec support, used for operation
+    /// and help-gate validation tests.
+    struct LimitedProtocol {
+        name: &'static str,
+        can_exec: bool,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Protocol for LimitedProtocol {
+        fn descriptor(&self) -> ProtocolDescriptor {
+            ProtocolDescriptor {
+                name: self.name.to_string(),
+                description: "limited protocol for tests".to_string(),
+                can_read: true,
+                can_exec: self.can_exec,
+            }
+        }
+
+        async fn read(
+            &self,
+            request: ProtocolRequest<'_>,
+            _context: ProtocolContext,
+        ) -> Result<ProtocolOutput> {
+            if request.target != "help" {
+                *self.calls.lock().unwrap() += 1;
+            }
+            Ok(ProtocolOutput::text(b"limited".to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn every_rejected_shape_names_the_step_and_field_and_runs_nothing() {
+        let harness = new_harness().await;
+        let limited_calls = harness.limited_calls.clone();
+
+        for (steps, fragments) in [
+            (
+                json!([{"read": "fake://data"}, {"read": "fake://data", "input": "query"}]),
+                vec!["step 2 field `input`", "must be an object, got a string"],
+            ),
+            (
+                json!([{"read": "fake://data", "max": "3"}]),
+                vec!["step 1 field `max`", "must be an integer"],
+            ),
+            (
+                json!([{"read": "fake://data", "exec": "fake://echo"}]),
+                vec!["step 1", "exactly one of `read` and `exec`"],
+            ),
+            (
+                json!([{"input": {}}]),
+                vec!["step 1", "one of `read` or `exec`"],
+            ),
+            (
+                json!([{"read": "fake://data", "unknown": true}]),
+                vec!["step 1 field `unknown`", "unknown step field"],
+            ),
+            (json!(["fake://data"]), vec!["step 1 must be an object"]),
+            (
+                json!([
+                    {"read": "fake://echo", "input": {"v": "{{ later.text }}"}},
+                    {"id": "later", "read": "fake://data"}
+                ]),
+                vec!["step 1 field `input`", "does not name an earlier step"],
+            ),
+            (
+                json!([{"id": "me", "if": "me.ok", "read": "fake://data"}]),
+                vec!["step 1 field `if`", "does not name an earlier step"],
+            ),
+            (
+                json!([{"id": "me", "read": "fake://echo", "input": {"v": "{{ me.text }}"}}]),
+                vec!["step 1 field `input`", "does not name an earlier step"],
+            ),
+            (
+                json!([
+                    {"id": "x", "read": "fake://data"},
+                    {"for": "x in x.json.items", "max": 4, "read": "fake://echo"}
+                ]),
+                vec!["step 2 field `for`", "already a step `id`"],
+            ),
+            (
+                json!([{"id": "null", "read": "fake://data"}]),
+                vec![
+                    "step 1 field `id`",
+                    "must not be one of not, true, false, or null",
+                ],
+            ),
+            (
+                json!([{"read": "fake://data", "if": "d.ok =! true"}]),
+                vec!["step 1 field `if`"],
+            ),
+            (
+                json!([
+                    {"id": "d", "read": "fake://data"},
+                    {"for": "x in d.json.items", "max": 0, "read": "fake://echo"}
+                ]),
+                vec!["step 2 field `max`", "outside 1..=32"],
+            ),
+            (
+                json!([
+                    {"id": "d", "read": "fake://data"},
+                    {"for": "x in d.json.items", "max": 33, "read": "fake://echo"}
+                ]),
+                vec!["step 2 field `max`", "outside 1..=32"],
+            ),
+            (
+                json!([{"read": "missing://data"}]),
+                vec!["step 1 field `read`", "unknown protocol"],
+            ),
+            (
+                json!([{"exec": "readonly://data"}]),
+                vec!["step 1 field `exec`", "does not support exec"],
+            ),
+            (
+                json!([{"read": "unloaded://data"}]),
+                vec!["step 1 field `read`", "help"],
+            ),
+            (
+                json!([{"read": "fake://data"}, {"read": "fake://help"}]),
+                vec![
+                    "step 2 field `read`",
+                    "help pages are loaded with the help tool",
+                ],
+            ),
+        ] {
+            let error = format!("{:#}", run(&harness, steps.clone()).await.unwrap_err());
+            for fragment in fragments {
+                assert!(
+                    error.contains(fragment),
+                    "expected {fragment:?} for {steps} in {error}"
+                );
+            }
+            assert!(recorded(&harness).is_empty(), "{steps} must run nothing");
+            assert_eq!(*limited_calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn expressions_parse_without_spaces_escapes_and_keyword_prefixes() {
+        let values = HashMap::from([
+            (
+                "d".to_string(),
+                json!({"ok": false, "json": {"count": 3, "name": "a\"b"}}),
+            ),
+            ("nullable".to_string(), json!({"ok": true})),
+        ]);
+        for (text, expected) in [
+            ("d.json.count>2", true),
+            ("d.json.count>=4", false),
+            ("d.ok==false", true),
+            ("not d.ok", true),
+            ("nullable.ok", true),
+            ("true_value_missing.ok == null", true),
+            (r#"d.json.name == "a\"b""#, true),
+            (r#""a\nb" == "a\nb""#, true),
+            (r#""a\\b" == "a\\b""#, true),
+        ] {
+            let expression =
+                parse_expression(text).unwrap_or_else(|error| panic!("{text}: {error:#}"));
+            assert_eq!(
+                eval_expression(&expression, &values).unwrap(),
+                expected,
+                "{text}"
+            );
+        }
+        let Expr {
+            left: Operand::Literal(literal),
+            ..
+        } = parse_expression(r#""a\nb\\c\"d""#).unwrap()
+        else {
+            panic!("expected a string literal");
+        };
+        assert_eq!(literal, json!("a\nb\\c\"d"));
+        assert!(parse_expression(r#""a\qb""#).is_err());
+    }
+
+    #[tokio::test]
+    async fn conditions_read_references_and_show_hides_condition_errors() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"if": "d.json.count>2", "read": "fake://echo", "input": {"n": 1}},
+                {"if": "d.json.count < 2", "read": "fake://echo", "input": {"n": 2}},
+                {"if": "d.json.items", "read": "fake://echo", "show": "none"},
+                {"if": "d.json.items", "read": "fake://echo"}
+            ]),
+        )
+        .await
+        .unwrap();
+        let text = output.output();
+        assert!(text.contains("*** Result 2 of 5: ok"), "{text}");
+        assert!(
+            text.contains("*** Result 3 of 5: skipped\nthe `if` condition is false"),
+            "{text}"
+        );
+        assert!(text.contains("*** Result 4 of 5: error\n\n"), "{text}");
+        assert!(
+            text.contains("*** Result 5 of 5: error\na condition without a comparator"),
+            "{text}"
+        );
+        assert_eq!(recorded(&harness).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn template_like_strings_and_literal_fields_stay_literal() {
+        let harness = new_harness().await;
+        run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://data", "show": "none"},
+                {"read": "fake://echo", "input": {
+                    "pair": "{{a}} and {{b}}",
+                    "handlebars": "{{#each items}}{{this}}{{/each}}",
+                    "go": "{{ define \"t\" }}x{{ end }}"
+                }},
+                {"exec": "scripted://run", "input": {"script": "{{ missing.text }}"}}
+            ]),
+        )
+        .await
+        .unwrap();
+        let input = recorded(&harness).last().unwrap().1.clone();
+        assert_eq!(input["pair"], json!("{{a}} and {{b}}"));
+        assert_eq!(
+            input["handlebars"],
+            json!("{{#each items}}{{this}}{{/each}}")
+        );
+        assert_eq!(input["go"], json!("{{ define \"t\" }}x{{ end }}"));
+        assert_eq!(
+            harness.script_calls.lock().unwrap()[0]["script"],
+            json!("{{ missing.text }}"),
+            "literal fields are neither validated nor substituted"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_references_hold_the_complete_output_when_the_preview_is_truncated() {
+        let harness = new_harness().await;
+        let long = "x".repeat(4096);
+        let output = run(
+            &harness,
+            json!([
+                {"id": "big", "read": "fake://echo", "input": {"long": long}},
+                {"read": "fake://echo", "input": {"copy": "{{ big.text }}"}, "show": "none"}
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.output().contains("[output truncated]"),
+            "{}",
+            output.output()
+        );
+        let copy = recorded(&harness).last().unwrap().1["copy"].clone();
+        assert_eq!(
+            copy,
+            json!(serde_json::to_string(&json!({"long": long})).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operation_limit_skips_remaining_steps_and_dependents() {
+        let harness = new_harness().await;
+        let items = Value::Array(vec![json!("x"); 32]);
+        let output = run(
+            &harness,
+            json!([
+                {"id": "d", "read": "fake://echo", "show": "none", "input": {"items": items}},
+                {"for": "item in d.json.items", "max": 32, "read": "fake://echo", "show": "none"},
+                {"id": "cut", "for": "item in d.json.items", "max": 32, "read": "fake://echo", "show": "none"},
+                {"if": "false", "read": "fake://data"},
+                {"read": "fake://echo", "input": {"list": "{{ cut }}"}}
+            ]),
+        )
+        .await
+        .unwrap();
+        let text = output.output();
+        assert!(
+            text.contains(
+                "*** Result 4 of 5: skipped\nthis call reached the limit of 64 protocol operations"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("*** Result 5 of 5: skipped\nthis step references step `cut`"),
+            "an incomplete loop list is not usable as data: {text}"
+        );
+        assert_eq!(recorded(&harness).len(), 64);
+    }
+
+    #[tokio::test]
+    async fn operations_referenced_by_a_condition_stay_in_the_foreground() {
+        let harness = new_harness().await;
+        let output = run(
+            &harness,
+            json!([
+                {"id": "slow", "exec": "slowpoke://job"},
+                {"if": "slow.ok", "read": "fake://data"}
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.output().contains("foreground-done"),
+            "{}",
+            output.output()
+        );
+        assert_eq!(*harness.pinned.lock().unwrap(), [true]);
     }
 }

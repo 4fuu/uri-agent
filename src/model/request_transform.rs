@@ -1034,8 +1034,9 @@ impl ModelRequestTransform {
     /// `Schema` conversion in rig-core 0.42 drops `additionalProperties`, so
     /// the protocol tool's free-form `input` object would otherwise degrade
     /// into a propertyless object. Declarations without a published original
-    /// schema are left untouched. Antigravity keeps its own keyword cleanup;
-    /// it moves `parametersJsonSchema` back into `parameters` before sending.
+    /// schema are left untouched. Only the `google-generative-ai` path calls
+    /// this; Antigravity still sends rig's converted `parameters` after its
+    /// own keyword cleanup, pending verification against the live endpoint.
     fn restore_original_tool_schemas(&self, body: &mut Map<String, Value>) {
         let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
             return;

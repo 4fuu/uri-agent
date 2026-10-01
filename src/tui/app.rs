@@ -2693,13 +2693,7 @@ fn block_search_text(block: &DisplayBlock) -> String {
     let Some(tool) = &block.tool else {
         return block.text.clone();
     };
-    let mut arguments = redact_sensitive_arguments(&tool.arguments);
-    if let Some(body) = arguments.get_mut("body")
-        && let Some(body_text) = body.as_str()
-        && let Ok(parsed) = serde_json::from_str(body_text)
-    {
-        *body = redact_sensitive_arguments(&parsed);
-    }
+    let arguments = redact_sensitive_arguments(&tool.arguments);
     let mut text = serde_json::to_string(&arguments).unwrap_or_else(|_| arguments.to_string());
     if let Some(output) = &tool.output {
         if !text.is_empty() {

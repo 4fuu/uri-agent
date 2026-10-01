@@ -263,8 +263,8 @@ impl Protocol for GrepProtocol {
         if input.mode != "index" {
             bail!(
                 "{SEARCH_SCHEME} exec requires {{\"mode\": \"index\"}}; correct form:\n\
-                 {{\"exec\": \"{}\", \"input\": {{\"mode\": \"index\"}}}}",
-                request.uri
+                 {{\"exec\": {}, \"input\": {{\"mode\": \"index\"}}}}",
+                Value::from(request.uri)
             );
         }
         if let Some(glob) = &input.glob
@@ -405,7 +405,7 @@ impl GrepOptions {
             Some("semantic") => GrepMode::Semantic(SearchMode::parse("semantic", scheme)?),
             Some("hybrid") => GrepMode::Semantic(SearchMode::parse("hybrid", scheme)?),
             Some("status") => GrepMode::Status,
-            Some("index") => bail!("{scheme} mode=index is available only through exec"),
+            Some("index") => bail!("{scheme} `\"mode\": \"index\"` is available only through exec"),
             Some(other) => bail!(
                 "{scheme} mode must be exact, semantic, hybrid, or status for reads, got {other:?}"
             ),
@@ -439,7 +439,8 @@ fn require_query(input: &ReadInput, uri: &str) -> Result<()> {
     if input.query.as_deref().is_none_or(|query| query.is_empty()) {
         bail!(
             "search requires a nonempty `query`; correct form:\n\
-             {{\"read\": \"{uri}\", \"input\": {{\"query\": \"<pattern>\"}}}}"
+             {{\"read\": {}, \"input\": {{\"query\": \"<pattern>\"}}}}",
+            Value::from(uri)
         );
     }
     Ok(())
@@ -454,7 +455,7 @@ fn validate_semantic_input(input: &ReadInput, scheme: &str) -> Result<()> {
 
 fn validate_status_input(input: &ReadInput, scheme: &str) -> Result<()> {
     if input.query.is_some() {
-        bail!("{scheme} mode=status takes no query");
+        bail!("{scheme} `\"mode\": \"status\"` takes no query");
     }
     if input.literal.is_some()
         || input.ignore_case.is_some()
@@ -847,7 +848,9 @@ mod tests {
         let error =
             GrepOptions::from_read_input(&read_input(json!({"mode": "index"})), SEARCH_SCHEME)
                 .unwrap_err();
-        assert!(format!("{error:#}").contains("mode=index is available only through exec"));
+        assert!(
+            format!("{error:#}").contains("`\"mode\": \"index\"` is available only through exec")
+        );
         let error =
             GrepOptions::from_read_input(&read_input(json!({"mode": "reverse"})), SEARCH_SCHEME)
                 .unwrap_err();
