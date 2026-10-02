@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rhai::{Engine, ImmutableString};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
@@ -456,25 +456,6 @@ impl Keymap {
             .cloned()
     }
 
-    pub fn key_for(&self, mode: &str, action: &str) -> Option<String> {
-        let bindings = self.bindings.lock().unwrap();
-        bindings
-            .iter()
-            .filter(|((binding_mode, _), binding_action)| {
-                binding_mode == mode && binding_action.as_str() == action
-            })
-            .min_by_key(|((_, key), _)| key_preference(key, self.display_style))
-            .or_else(|| {
-                bindings
-                    .iter()
-                    .filter(|((binding_mode, _), binding_action)| {
-                        binding_mode == "global" && binding_action.as_str() == action
-                    })
-                    .min_by_key(|((_, key), _)| key_preference(key, self.display_style))
-            })
-            .map(|((_, key), _)| key.canonical())
-    }
-
     pub fn key_hint(&self, mode: &str, action: &str) -> Option<String> {
         let bindings = self.bindings.lock().unwrap();
         bindings
@@ -519,14 +500,6 @@ impl Keymap {
             .into_iter()
             .map(|(key, action)| (key.display(self.display_style), action))
             .collect()
-    }
-
-    pub fn paths(project: Option<&Path>) -> Result<Vec<PathBuf>> {
-        let mut paths = vec![config_directory()?.join("keymap.rhai")];
-        if let Some(project) = project {
-            paths.push(project.join(".uri-agent/keymap.rhai"));
-        }
-        Ok(paths)
     }
 
     async fn evaluate_file(&self, path: &Path) -> Result<()> {
@@ -767,7 +740,6 @@ mod tests {
 
         assert_eq!(keymap.action("main", "down").as_deref(), Some("next"));
         assert_eq!(keymap.action("main", "up").as_deref(), Some("previous"));
-        assert_eq!(keymap.key_for("main", "previous").as_deref(), Some("up"));
         assert_eq!(
             keymap.action("main", "ctrl+down").as_deref(),
             Some("scroll_down")
