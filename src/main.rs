@@ -16,11 +16,32 @@ async fn main() -> Result<()> {
         print!("{}", uri_agent::builtins::docs_output(topic.as_deref())?);
         return Ok(());
     }
+    let models = match &cli.command {
+        Some(uri_agent::config::Subcommand::Models { all }) => Some(*all),
+        _ => None,
+    };
+    if models.is_some() && (cli.acpv1 || cli.execute.is_some()) {
+        anyhow::bail!("`models` cannot be combined with --acpv1 or --execute");
+    }
     if cli.acpv1 {
         return uri_agent::acp::v1::serve(cli).await;
     }
     let execute_prompt = uri_agent::execute::read_prompt(cli.execute.as_deref()).await?;
     let mut config = Config::load(cli).await?;
+    if let Some(all) = models {
+        if let Some(warning) = config.refresh_catalog_for_cli().await {
+            eprintln!("warning: {warning}");
+        }
+        let listing = config.model_listing(all).await;
+        if listing.is_empty() {
+            eprintln!(
+                "no runnable models: configure a provider credential (see `uri-agent --help`), \
+or pass --all to list every catalog model"
+            );
+        }
+        print!("{listing}");
+        return Ok(());
+    }
     let host = AgentHost::new(
         config.manager.clone(),
         config.environment.clone(),

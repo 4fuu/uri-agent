@@ -421,6 +421,27 @@ Notable modes are:
   and `--output-limit` apply as usual, and the flag cannot be combined with
   `--acpv1`.
 
+- `uri-agent models` lists the models this configuration can run, one per
+  line as `<provider>/<id>` with its display name; `*` marks the current
+  default. Only providers with a configured credential are listed unless
+  `--all` is given. Unless offline, a stale catalog is refreshed first, and a
+  failed refresh falls back to the cached catalog with a warning on stderr.
+  Global flags go before the subcommand: `uri-agent --offline models`.
+
+Without `--provider`, `--model` also accepts the `<provider>/<id>` form that
+`uri-agent models` prints. The value is split at its first `/` only when that
+provider lists the remaining ID and no provider lists the whole value as an
+ID, so IDs that contain `/` (such as OpenRouter's) keep working unchanged.
+
+```bash
+uri-agent models
+uri-agent -x "review the diff" --model anthropic/claude-sonnet-4-5
+```
+
+A new `-x` session must have a configured model. When the model is not in
+the cached catalog, `-x` refreshes the catalog once before failing with a
+pointer to `uri-agent models`; this check runs before any model request.
+
 The prompt for `-x` comes from the flag value, from stdin, or from both:
 
 ```bash

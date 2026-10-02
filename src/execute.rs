@@ -89,7 +89,31 @@ pub async fn run(host: &AgentHost, config: &Config, prompt: &str) -> Result<()> 
         SessionChoice::Latest => Some("latest"),
         SessionChoice::Existing(id) => Some(id.as_str()),
     };
-    let initial = config.manager.current().await;
+    let mut initial = config.manager.current().await;
+    if requested.is_none() {
+        if !initial.model_configured() {
+            bail!(
+                "no model is configured: pass --model <provider>/<id>; `uri-agent models` lists \
+runnable IDs"
+            );
+        }
+        // A model discovered after the cached catalog was written is found by
+        // one refresh; anything still missing cannot run.
+        if initial.catalog_model(&config.catalog).await.is_none() {
+            if let Some(warning) = config.refresh_catalog_for_cli().await {
+                eprintln!("warning: {warning}");
+            }
+            initial = config.manager.current().await;
+            if initial.catalog_model(&config.catalog).await.is_none() {
+                bail!(
+                    "model {}/{} is not in the model catalog; `uri-agent models` lists runnable \
+IDs",
+                    initial.provider,
+                    initial.model
+                );
+            }
+        }
+    }
     let spec = AgentSpec::root(
         &initial.provider,
         &initial.model,

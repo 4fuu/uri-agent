@@ -126,11 +126,12 @@ set; run `:model` in the interface to pick a runnable model."
     )]
     pub provider: Option<String>,
 
-    /// Model ID from the selected provider.
+    /// Model ID from the selected provider, or `<provider>/<id>` as `uri-agent models` prints it.
     #[arg(
         long,
         long_help = "Model ID from the selected provider. Overrides the defaultModel setting and \
-URI_AGENT_MODEL for this invocation."
+URI_AGENT_MODEL for this invocation. Without --provider, the `<provider>/<id>` form that \
+`uri-agent models` prints selects both at once; IDs that themselves contain `/` still work."
     )]
     pub model: Option<String>,
 
@@ -237,6 +238,19 @@ pub enum Subcommand {
         /// Document filename to print, for example configuration.md.
         topic: Option<String>,
     },
+    /// List runnable model IDs as `<provider>/<id>` for --model.
+    #[command(
+        long_about = "List the models this configuration can run, one per line as \
+`<provider>/<id>` followed by the display name; `*` marks the current default. Without --all, \
+only providers with a configured credential are listed. Unless offline, the model catalog is \
+refreshed first when it is stale, and a failed refresh falls back to the cached catalog with a \
+warning on stderr. Global flags such as --offline, --provider, and --cwd go before `models`."
+    )]
+    Models {
+        /// Also list models of providers without a configured credential.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// Opening paragraph of `uri-agent --help`; `-h` keeps the one-line `about`.
@@ -281,6 +295,14 @@ const EXAMPLES: &[(&str, &str)] = &[
     (
         "uri-agent --provider anthropic --model claude-sonnet-4-5",
         "Choose the provider and model for this run",
+    ),
+    (
+        "uri-agent models",
+        "List runnable model IDs as <provider>/<id>",
+    ),
+    (
+        "uri-agent -x \"review the diff\" --model anthropic/claude-sonnet-4-5",
+        "Execute one prompt with a model ID copied from `uri-agent models`",
     ),
     (
         "uri-agent --acpv1",
@@ -505,6 +527,32 @@ fn files_reference() -> String {
     output
 }
 
+/// Accept `--model <provider>/<id>`, the form `uri-agent models` prints, when
+/// `--provider` is absent. The value splits at its first `/` only when that
+/// provider lists the remaining ID and no provider lists the whole value as
+/// an ID, so model IDs that contain `/` keep working unchanged.
+async fn split_model_argument(
+    catalog: &ModelCatalog,
+    provider: Option<String>,
+    model: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(value) = model.as_deref().filter(|_| provider.is_none()) else {
+        return (provider, model);
+    };
+    let Some((prefix, id)) = value.split_once('/') else {
+        return (provider, model);
+    };
+    if catalog.model(prefix, id).await.is_none() {
+        return (provider, model);
+    }
+    for candidate in catalog.providers().await {
+        if catalog.model(&candidate, value).await.is_some() {
+            return (provider, model);
+        }
+    }
+    (Some(prefix.to_string()), Some(id.to_string()))
+}
+
 pub struct Config {
     pub manager: Arc<ConfigManager>,
     pub environment: Arc<AgentEnvironment>,
@@ -528,14 +576,15 @@ impl Config {
         let offline =
             cli.offline || environment_truthy(ENV_OFFLINE) || environment_truthy(ENV_PI_OFFLINE);
         let catalog = Arc::new(ModelCatalog::load(&directory, offline).await?);
+        let (provider, model) = split_model_argument(&catalog, cli.provider, cli.model).await;
         let manager = Arc::new(
             ConfigManager::load(
                 directory,
                 &cwd,
                 catalog.clone(),
                 InvocationOverrides {
-                    provider: cli.provider,
-                    model: cli.model,
+                    provider,
+                    model,
                     api_key: cli.api_key,
                     output_limit: cli.output_limit,
                     thinking: cli.thinking,
@@ -557,6 +606,79 @@ impl Config {
             session,
             cwd,
         })
+    }
+
+    /// Refresh a stale model catalog unless networking is disabled, returning
+    /// a warning instead of failing so callers can use the cached catalog.
+    pub async fn refresh_catalog_for_cli(&self) -> Option<String> {
+        if !self.catalog.networking_enabled() {
+            return None;
+        }
+        match self.manager.refresh_catalog(false).await {
+            Ok(report) if report.pi_failures + report.discovery_failures > 0 => Some(
+                "some model catalog sources could not be refreshed; cached entries are listed"
+                    .to_string(),
+            ),
+            Ok(_) => None,
+            Err(error) => Some(format!(
+                "model catalog refresh failed; using the cached catalog: {error:#}"
+            )),
+        }
+    }
+
+    /// `uri-agent models`: one `<provider>/<id>` per line with its display
+    /// name, `*` marking the current default. `all` also lists providers
+    /// without a configured credential.
+    pub async fn model_listing(&self, all: bool) -> String {
+        let active = self.manager.current().await;
+        let models = if all {
+            let mut models = Vec::new();
+            for provider in self.catalog.providers().await {
+                models.extend(self.catalog.models(&provider).await);
+            }
+            models.sort_by(|left, right| {
+                left.provider
+                    .cmp(&right.provider)
+                    .then_with(|| left.name.cmp(&right.name))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            models
+        } else {
+            self.manager
+                .selectable_models(&active.provider, &active.model)
+                .await
+        };
+        let rows = models
+            .iter()
+            .map(|model| {
+                let current = model.provider == active.provider && model.id == active.model;
+                let name = if model.name.trim().is_empty() || model.name == model.id {
+                    String::new()
+                } else {
+                    model.name.clone()
+                };
+                (
+                    format!(
+                        "{} {}/{}",
+                        if current { "*" } else { " " },
+                        model.provider,
+                        model.id
+                    ),
+                    name,
+                )
+            })
+            .collect::<Vec<_>>();
+        let width = rows.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+        let mut output = String::new();
+        for (id, name) in rows {
+            if name.is_empty() {
+                output.push_str(&id);
+            } else {
+                output.push_str(&format!("{id:width$}  {name}"));
+            }
+            output.push('\n');
+        }
+        output
     }
 }
 
@@ -1132,6 +1254,39 @@ impl ConfigManager {
             }
         }
         configured
+    }
+
+    /// Models a session can select: every catalog model of a provider with a
+    /// configured credential, plus the current model when it is in the
+    /// catalog without one, sorted by provider, name, and ID.
+    pub async fn selectable_models(
+        &self,
+        current_provider: &str,
+        current_model: &str,
+    ) -> Vec<CatalogModel> {
+        let mut models = Vec::new();
+        for provider in self
+            .model_providers_with_credentials(current_provider)
+            .await
+        {
+            models.extend(self.catalog.models(&provider).await);
+        }
+        if !current_provider.is_empty()
+            && !current_model.is_empty()
+            && !models
+                .iter()
+                .any(|model| model.provider == current_provider && model.id == current_model)
+            && let Some(current) = self.catalog.model(current_provider, current_model).await
+        {
+            models.push(current);
+        }
+        models.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        models
     }
 
     /// Resolve a provider API key outside the active model selection.
@@ -2743,6 +2898,94 @@ mod tests {
             }
             assert!(Cli::try_parse_from(arguments).is_err(), "{conflicting}");
         }
+    }
+
+    #[tokio::test]
+    async fn model_argument_accepts_the_listed_provider_slash_id_form() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("models.json"),
+            br#"{"providers":{"alpha":{"baseUrl":"https://alpha.invalid/v1","api":"openai-responses","models":[{"id":"one","name":"One"},{"id":"beta/two","name":"Routed"}]},"beta":{"baseUrl":"https://beta.invalid/v1","api":"openai-responses","models":[{"id":"two","name":"Two"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        let catalog = ModelCatalog::load(root.path(), true).await.unwrap();
+        let split = |provider: Option<&str>, model: Option<&str>| {
+            split_model_argument(
+                &catalog,
+                provider.map(str::to_string),
+                model.map(str::to_string),
+            )
+        };
+
+        assert_eq!(
+            split(None, Some("alpha/one")).await,
+            (Some("alpha".to_string()), Some("one".to_string()))
+        );
+        // `beta/two` is also alpha's literal model ID, so it stays whole.
+        assert_eq!(
+            split(None, Some("beta/two")).await,
+            (None, Some("beta/two".to_string()))
+        );
+        assert_eq!(
+            split(None, Some("alpha/missing")).await,
+            (None, Some("alpha/missing".to_string()))
+        );
+        assert_eq!(
+            split(Some("alpha"), Some("beta/two")).await,
+            (Some("alpha".to_string()), Some("beta/two".to_string()))
+        );
+        assert_eq!(
+            split(None, Some("one")).await,
+            (None, Some("one".to_string()))
+        );
+        assert_eq!(split(None, None).await, (None, None));
+    }
+
+    #[tokio::test]
+    async fn model_listing_prints_provider_slash_id_and_marks_the_current_model() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("config");
+        let project = root.path().join("project");
+        fs::create_dir_all(&directory).await.unwrap();
+        fs::write(
+            directory.join("models.json"),
+            br#"{"providers":{"alpha":{"baseUrl":"https://alpha.invalid/v1","api":"openai-responses","models":[{"id":"one","name":"One"},{"id":"two","name":"two"}]}}}"#,
+        )
+        .await
+        .unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            br#"{"defaultProvider":"alpha","defaultModel":"one"}"#,
+        )
+        .await
+        .unwrap();
+        let manager = ConfigManager::load_for_test(&directory, &project)
+            .await
+            .unwrap();
+        let config = Config {
+            catalog: manager.catalog.clone(),
+            manager,
+            environment: Arc::new(AgentEnvironment::load(&directory).await.unwrap()),
+            session: SessionChoice::New,
+            cwd: project,
+        };
+
+        // Without a credential only the current model is selectable.
+        assert_eq!(config.model_listing(false).await, "* alpha/one  One\n");
+        let all = config.model_listing(true).await;
+        let lines = all.lines().map(str::trim_end).collect::<Vec<_>>();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("* alpha/one ") && line.ends_with("  One"))
+        );
+        assert!(
+            lines.contains(&"  alpha/two"),
+            "an ID-only name is not repeated"
+        );
+        assert_eq!(all.matches('*').count(), 1);
+        assert_eq!(config.refresh_catalog_for_cli().await, None);
     }
 
     #[test]

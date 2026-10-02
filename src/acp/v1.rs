@@ -892,30 +892,10 @@ async fn pending_config_options(
 }
 
 async fn selectable_models(project: &AcpProject, spec: &AgentSpec) -> Vec<CatalogModel> {
-    let providers = project
+    project
         .manager
-        .model_providers_with_credentials(&spec.provider)
-        .await;
-    let mut models = Vec::new();
-    for provider in providers {
-        models.extend(project.catalog.models(&provider).await);
-    }
-    if !spec.provider.is_empty()
-        && !spec.model.is_empty()
-        && !models
-            .iter()
-            .any(|model| model.provider == spec.provider && model.id == spec.model)
-        && let Some(current) = project.catalog.model(&spec.provider, &spec.model).await
-    {
-        models.push(current);
-    }
-    models.sort_by(|left, right| {
-        left.provider
-            .cmp(&right.provider)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    models
+        .selectable_models(&spec.provider, &spec.model)
+        .await
 }
 
 async fn selectable_model(
