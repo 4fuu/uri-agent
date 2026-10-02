@@ -580,37 +580,36 @@ where
     }
 }
 
-#[derive(Clone)]
-pub struct TuiPanelSpec {
-    pub provider: Arc<dyn TuiPanelProvider>,
-}
-
 #[derive(Default)]
 pub struct TuiRegistry {
-    panels: BTreeMap<String, TuiPanelSpec>,
+    panels: BTreeMap<String, Arc<dyn TuiPanelProvider>>,
     status: BTreeMap<String, Arc<dyn TuiStatusProvider>>,
     completions: BTreeMap<String, Arc<dyn TuiCompletionProvider>>,
     submissions: BTreeMap<String, Arc<dyn TuiSubmissionProvider>>,
 }
 
 impl TuiRegistry {
+    fn register_unique<T>(
+        map: &mut BTreeMap<String, T>,
+        kind: &str,
+        id: &str,
+        value: T,
+    ) -> Result<()> {
+        validate_name(id)?;
+        if map.contains_key(id) {
+            bail!("{kind} is already registered: {id}");
+        }
+        map.insert(id.to_string(), value);
+        Ok(())
+    }
+
     pub fn register_panel(
         &mut self,
         id: impl Into<String>,
         provider: impl TuiPanelProvider + 'static,
     ) -> Result<()> {
         let id = id.into();
-        validate_name(&id)?;
-        if self.panels.contains_key(&id) {
-            bail!("TUI panel is already registered: {id}");
-        }
-        self.panels.insert(
-            id,
-            TuiPanelSpec {
-                provider: Arc::new(provider),
-            },
-        );
-        Ok(())
+        Self::register_unique(&mut self.panels, "TUI panel", &id, Arc::new(provider))
     }
 
     pub async fn open_panel(
@@ -618,10 +617,10 @@ impl TuiRegistry {
         id: &str,
         context: TuiPanelContext,
     ) -> Result<Box<dyn TuiPanelSession>> {
-        let Some(panel) = self.panels.get(id) else {
+        let Some(provider) = self.panels.get(id) else {
             bail!("unknown TUI panel: {id}");
         };
-        panel.provider.open(context).await
+        provider.open(context).await
     }
 
     pub fn register_status(
@@ -630,12 +629,12 @@ impl TuiRegistry {
         provider: impl TuiStatusProvider + 'static,
     ) -> Result<()> {
         let id = id.into();
-        validate_name(&id)?;
-        if self.status.contains_key(&id) {
-            bail!("TUI status provider is already registered: {id}");
-        }
-        self.status.insert(id, Arc::new(provider));
-        Ok(())
+        Self::register_unique(
+            &mut self.status,
+            "TUI status provider",
+            &id,
+            Arc::new(provider),
+        )
     }
 
     pub fn status_items(&self, context: &TuiStatusContext) -> Vec<TuiStatusItem> {
@@ -651,12 +650,12 @@ impl TuiRegistry {
         provider: impl TuiCompletionProvider + 'static,
     ) -> Result<()> {
         let id = id.into();
-        validate_name(&id)?;
-        if self.completions.contains_key(&id) {
-            bail!("TUI completion provider is already registered: {id}");
-        }
-        self.completions.insert(id, Arc::new(provider));
-        Ok(())
+        Self::register_unique(
+            &mut self.completions,
+            "TUI completion provider",
+            &id,
+            Arc::new(provider),
+        )
     }
 
     pub async fn completions(
@@ -679,12 +678,12 @@ impl TuiRegistry {
         provider: impl TuiSubmissionProvider + 'static,
     ) -> Result<()> {
         let id = id.into();
-        validate_name(&id)?;
-        if self.submissions.contains_key(&id) {
-            bail!("TUI submission provider is already registered: {id}");
-        }
-        self.submissions.insert(id, Arc::new(provider));
-        Ok(())
+        Self::register_unique(
+            &mut self.submissions,
+            "TUI submission provider",
+            &id,
+            Arc::new(provider),
+        )
     }
 
     pub async fn submission_effects(&self, context: &TuiSubmissionContext) -> Vec<TuiEffect> {
@@ -964,23 +963,6 @@ pub fn validate_model_tool_descriptor(descriptor: &ModelToolDescriptor) -> Resul
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum PluginPermission {
-    /// Read the user-managed Agent environment. This declaration is an audit
-    /// marker for trusted plugin code, not an interactive approval boundary.
-    Environment,
-    /// Resolve saved or provider-environment API keys. This declaration is an
-    /// audit marker for trusted plugin code, not an interactive approval boundary.
-    Credentials,
-    /// Download and cache a pinned external executable. This declaration is an
-    /// audit marker for trusted plugin code, not an interactive approval boundary.
-    Downloads,
-    /// Create, open, and submit work to persistent Agents.
-    /// This declaration is an audit marker for trusted plugin code, not an
-    /// interactive approval boundary.
-    Agents,
-}
-
 #[derive(Clone)]
 pub struct PluginEnvironment {
     environment: Arc<AgentEnvironment>,
@@ -1103,7 +1085,6 @@ pub struct PluginHost<'a> {
     credentials: Option<Arc<ConfigManager>>,
     agents: Option<PluginAgents>,
     downloads: PluginDownloads,
-    permissions: HashSet<PluginPermission>,
 }
 
 impl<'a> PluginHost<'a> {
@@ -1123,7 +1104,6 @@ impl<'a> PluginHost<'a> {
             credentials: None,
             agents: None,
             downloads: PluginDownloads::new(),
-            permissions: HashSet::new(),
         }
     }
 
@@ -1139,16 +1119,10 @@ impl<'a> PluginHost<'a> {
     }
 
     pub fn environment(&self) -> Result<PluginEnvironment> {
-        if !self.permissions.contains(&PluginPermission::Environment) {
-            bail!("plugin did not request Agent environment access");
-        }
         Ok(PluginEnvironment::new(self.environment.clone()))
     }
 
     pub fn credentials(&self) -> Result<PluginCredentials> {
-        if !self.permissions.contains(&PluginPermission::Credentials) {
-            bail!("plugin did not request credential access");
-        }
         let manager = self
             .credentials
             .clone()
@@ -1165,18 +1139,12 @@ impl<'a> PluginHost<'a> {
     }
 
     pub fn agents(&self) -> Result<PluginAgents> {
-        if !self.permissions.contains(&PluginPermission::Agents) {
-            bail!("plugin did not request Agent access");
-        }
         self.agents
             .clone()
             .ok_or_else(|| anyhow::anyhow!("plugin Agent access is not attached"))
     }
 
     pub fn downloads(&self) -> Result<PluginDownloads> {
-        if !self.permissions.contains(&PluginPermission::Downloads) {
-            bail!("plugin did not request binary download access");
-        }
         Ok(self.downloads.clone())
     }
 }
@@ -1235,12 +1203,6 @@ pub trait Plugin: Send + Sync {
     /// frozen. A plugin may contribute prompt content without adding a protocol.
     fn system_prompt_fragment(&self) -> Result<Option<String>> {
         Ok(None)
-    }
-
-    /// Permissions requested by this trusted plugin. Requests are explicit so
-    /// source review can find sensitive host access without an approval flow.
-    fn permissions(&self) -> Vec<PluginPermission> {
-        Vec::new()
     }
 
     /// Names of the model roles this plugin resolves. Declared roles stay
@@ -1462,15 +1424,7 @@ impl PluginRegistry {
         }
 
         for plugin in &self.plugins {
-            let permissions = plugin.permissions();
-            let unique = permissions.iter().copied().collect::<HashSet<_>>();
-            if unique.len() != permissions.len() {
-                bail!("plugin declares the same permission more than once");
-            }
-            host.permissions = unique;
-            let result = plugin.register(host).context("failed to register plugin");
-            host.permissions.clear();
-            result?;
+            plugin.register(host).context("failed to register plugin")?;
         }
 
         let installed = host
@@ -1765,12 +1719,10 @@ mod tests {
     struct PromptOnlyPlugin;
 
     struct EnvironmentPlugin {
-        requests_environment: bool,
         environment: Arc<std::sync::OnceLock<PluginEnvironment>>,
     }
 
     struct CredentialPlugin {
-        requests_credentials: bool,
         credentials: Arc<std::sync::OnceLock<PluginCredentials>>,
     }
 
@@ -1779,7 +1731,6 @@ mod tests {
     }
 
     struct AgentPlugin {
-        requests_agents: bool,
         agents: Arc<std::sync::OnceLock<PluginAgents>>,
     }
 
@@ -1791,7 +1742,6 @@ mod tests {
     struct NamedModelTool(&'static str);
 
     struct DownloadPlugin {
-        requests_downloads: bool,
         downloads: Arc<std::sync::OnceLock<PluginDownloads>>,
     }
 
@@ -1856,13 +1806,6 @@ mod tests {
     }
 
     impl Plugin for EnvironmentPlugin {
-        fn permissions(&self) -> Vec<PluginPermission> {
-            self.requests_environment
-                .then_some(PluginPermission::Environment)
-                .into_iter()
-                .collect()
-        }
-
         fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
             self.environment
                 .set(host.environment()?)
@@ -1871,13 +1814,6 @@ mod tests {
     }
 
     impl Plugin for CredentialPlugin {
-        fn permissions(&self) -> Vec<PluginPermission> {
-            self.requests_credentials
-                .then_some(PluginPermission::Credentials)
-                .into_iter()
-                .collect()
-        }
-
         fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
             self.credentials
                 .set(host.credentials()?)
@@ -1894,13 +1830,6 @@ mod tests {
     }
 
     impl Plugin for AgentPlugin {
-        fn permissions(&self) -> Vec<PluginPermission> {
-            self.requests_agents
-                .then_some(PluginPermission::Agents)
-                .into_iter()
-                .collect()
-        }
-
         fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
             self.agents
                 .set(host.agents()?)
@@ -1922,13 +1851,6 @@ mod tests {
     }
 
     impl Plugin for DownloadPlugin {
-        fn permissions(&self) -> Vec<PluginPermission> {
-            self.requests_downloads
-                .then_some(PluginPermission::Downloads)
-                .into_iter()
-                .collect()
-        }
-
         fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
             self.downloads
                 .set(host.downloads()?)
@@ -2229,14 +2151,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_must_request_binary_download_access() {
+    async fn plugins_receive_the_binary_download_handle_at_install() {
         let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let denied_capture = Arc::new(std::sync::OnceLock::new());
-        let mut denied = PluginRegistry::new();
-        denied.add(DownloadPlugin {
-            requests_downloads: false,
-            downloads: denied_capture,
+        let capture = Arc::new(std::sync::OnceLock::new());
+        let mut plugins = PluginRegistry::new();
+        plugins.add(DownloadPlugin {
+            downloads: capture.clone(),
         });
         let mut host = PluginHost::new(
             &mut protocols,
@@ -2246,24 +2167,13 @@ mod tests {
             environment,
         );
 
-        let error = denied.install(&mut host).unwrap_err();
-        assert!(format!("{error:#}").contains("did not request binary download access"));
-        assert!(host.downloads().is_err());
-
-        let allowed_capture = Arc::new(std::sync::OnceLock::new());
-        let mut allowed = PluginRegistry::new();
-        allowed.add(DownloadPlugin {
-            requests_downloads: true,
-            downloads: allowed_capture.clone(),
-        });
-        allowed.install(&mut host).unwrap();
-        assert!(allowed_capture.get().is_some());
-        assert!(host.downloads().is_err());
+        plugins.install(&mut host).unwrap();
+        assert!(capture.get().is_some());
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 
     #[tokio::test]
-    async fn plugins_must_request_environment_access_once_for_dynamic_reads() {
+    async fn plugins_read_the_agent_environment_dynamically() {
         let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
         environment
@@ -2271,11 +2181,10 @@ mod tests {
             .await
             .unwrap();
 
-        let denied_capture = Arc::new(std::sync::OnceLock::new());
-        let mut denied = PluginRegistry::new();
-        denied.add(EnvironmentPlugin {
-            requests_environment: false,
-            environment: denied_capture,
+        let capture = Arc::new(std::sync::OnceLock::new());
+        let mut plugins = PluginRegistry::new();
+        plugins.add(EnvironmentPlugin {
+            environment: capture.clone(),
         });
         let mut host = PluginHost::new(
             &mut protocols,
@@ -2284,18 +2193,8 @@ mod tests {
             &mut tui,
             environment.clone(),
         );
-        let error = denied.install(&mut host).unwrap_err();
-        assert!(format!("{error:#}").contains("did not request Agent environment access"));
-        assert!(host.environment().is_err());
-
-        let allowed_capture = Arc::new(std::sync::OnceLock::new());
-        let mut allowed = PluginRegistry::new();
-        allowed.add(EnvironmentPlugin {
-            requests_environment: true,
-            environment: allowed_capture.clone(),
-        });
-        allowed.install(&mut host).unwrap();
-        let reader = allowed_capture.get().unwrap();
+        plugins.install(&mut host).unwrap();
+        let reader = capture.get().unwrap();
         assert_eq!(
             reader.get("NPM_TOKEN").await.unwrap().as_deref(),
             Some("first")
@@ -2314,7 +2213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_must_request_credential_access_once_for_dynamic_reads() {
+    async fn plugins_read_credentials_dynamically_once_attached() {
         let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
         let manager = ConfigManager::load_for_test(&output, &output)
@@ -2325,11 +2224,10 @@ mod tests {
             .await
             .unwrap();
 
-        let denied_capture = Arc::new(std::sync::OnceLock::new());
-        let mut denied = PluginRegistry::new();
-        denied.add(CredentialPlugin {
-            requests_credentials: false,
-            credentials: denied_capture,
+        let capture = Arc::new(std::sync::OnceLock::new());
+        let mut plugins = PluginRegistry::new();
+        plugins.add(CredentialPlugin {
+            credentials: capture.clone(),
         });
         let mut host = PluginHost::new(
             &mut protocols,
@@ -2339,18 +2237,8 @@ mod tests {
             environment,
         )
         .with_credentials(manager.clone());
-        let error = denied.install(&mut host).unwrap_err();
-        assert!(format!("{error:#}").contains("did not request credential access"));
-        assert!(host.credentials().is_err());
-
-        let allowed_capture = Arc::new(std::sync::OnceLock::new());
-        let mut allowed = PluginRegistry::new();
-        allowed.add(CredentialPlugin {
-            requests_credentials: true,
-            credentials: allowed_capture.clone(),
-        });
-        allowed.install(&mut host).unwrap();
-        let reader = allowed_capture.get().unwrap();
+        plugins.install(&mut host).unwrap();
+        let reader = capture.get().unwrap();
         assert_eq!(
             reader.api_key("parallel").await.unwrap().as_deref(),
             Some("first")
@@ -2368,7 +2256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_resolve_model_roles_dynamically_without_a_permission() {
+    async fn plugins_resolve_model_roles_dynamically() {
         let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         tokio::fs::create_dir_all(&output).await.unwrap();
         tokio::fs::write(
@@ -2430,7 +2318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_must_request_agent_access() {
+    async fn plugins_receive_agent_access_once_attached() {
         let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
         let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
         let manager = ConfigManager::load_for_test(&output, &output)
@@ -2448,12 +2336,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let agents = PluginAgents::new(agent_host, None);
-        let denied_capture = Arc::new(std::sync::OnceLock::new());
-        let mut denied = PluginRegistry::new();
-        denied.add(AgentPlugin {
-            requests_agents: false,
-            agents: denied_capture,
+        let capture = Arc::new(std::sync::OnceLock::new());
+        let mut plugins = PluginRegistry::new();
+        plugins.add(AgentPlugin {
+            agents: capture.clone(),
         });
         let mut host = PluginHost::new(
             &mut protocols,
@@ -2463,21 +2349,29 @@ mod tests {
             environment,
         )
         .with_credentials(manager)
-        .with_agents(agents);
+        .with_agents(PluginAgents::new(agent_host, None));
 
-        let error = denied.install(&mut host).unwrap_err();
-        assert!(format!("{error:#}").contains("did not request Agent access"));
-        assert!(host.agents().is_err());
+        // Agent access stays unavailable until the host carries it.
+        let (
+            mut detached_protocols,
+            mut detached_tools,
+            mut detached_commands,
+            mut detached_tui,
+            detached_directory,
+        ) = empty_host().await;
+        let detached = PluginHost::new(
+            &mut detached_protocols,
+            &mut detached_tools,
+            &mut detached_commands,
+            &mut detached_tui,
+            Arc::new(AgentEnvironment::load(&detached_directory).await.unwrap()),
+        );
+        assert!(detached.agents().is_err());
+        let _ = tokio::fs::remove_dir_all(detached_directory).await;
 
-        let allowed_capture = Arc::new(std::sync::OnceLock::new());
-        let mut allowed = PluginRegistry::new();
-        allowed.add(AgentPlugin {
-            requests_agents: true,
-            agents: allowed_capture.clone(),
-        });
-        allowed.install(&mut host).unwrap();
-        assert!(allowed_capture.get().is_some());
-        assert!(host.agents().is_err());
+        plugins.install(&mut host).unwrap();
+        assert!(capture.get().is_some());
+        assert!(host.agents().is_ok());
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 }

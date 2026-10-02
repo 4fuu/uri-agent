@@ -1,5 +1,5 @@
 use crate::output::OutputStore;
-use crate::plugin::{Plugin, PluginCredentials, PluginHost, PluginPermission};
+use crate::plugin::{Plugin, PluginCredentials, PluginHost};
 use crate::protocol::{
     Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
 };
@@ -563,10 +563,6 @@ JavaScript-rendered content and PDFs may be incomplete.\n",
 impl Plugin for HttpsProtocol {
     fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
         vec![self.descriptor()]
-    }
-
-    fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Credentials]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {

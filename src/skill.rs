@@ -278,7 +278,11 @@ fn parse_frontmatter(content: &str) -> Result<Frontmatter> {
     serde_yaml::from_str(&content[..end]).context("cannot parse YAML frontmatter")
 }
 
-fn skill_protocol_name(name: &str) -> Result<String> {
+/// Derives a stable kebab-case protocol slug from a display name, appending
+/// `suffix` such as `-skill` or `-mcp` unless the normalized name already ends
+/// with it. Shared by Skill and MCP protocol naming so both normalize display
+/// names identically; `label` names the subject in the empty-name error.
+pub(crate) fn protocol_slug(name: &str, suffix: &str, label: &str) -> Result<String> {
     let mut protocol = String::new();
     let mut separated = false;
     for character in name.chars() {
@@ -294,12 +298,16 @@ fn skill_protocol_name(name: &str) -> Result<String> {
         protocol.pop();
     }
     if protocol.is_empty() {
-        bail!("skill name must contain an ASCII letter or number");
+        bail!("{label} name must contain an ASCII letter or number");
     }
-    if !protocol.ends_with("-skill") {
-        protocol.push_str("-skill");
+    if !protocol.ends_with(suffix) {
+        protocol.push_str(suffix);
     }
     Ok(protocol)
+}
+
+fn skill_protocol_name(name: &str) -> Result<String> {
+    protocol_slug(name, "-skill", "skill")
 }
 
 #[cfg(test)]

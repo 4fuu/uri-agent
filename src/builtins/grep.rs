@@ -1,8 +1,6 @@
 use super::file::resolve_path;
 use crate::config::display_path;
-use crate::plugin::{
-    BinaryDownload, DownloadArchive, Plugin, PluginDownloads, PluginHost, PluginPermission,
-};
+use crate::plugin::{BinaryDownload, DownloadArchive, Plugin, PluginDownloads, PluginHost};
 use crate::prompts;
 use crate::protocol::{
     Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
@@ -156,10 +154,6 @@ impl GrepProtocol {
 impl Plugin for GrepProtocol {
     fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
         vec![self.descriptor()]
-    }
-
-    fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Downloads]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {

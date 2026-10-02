@@ -1,4 +1,4 @@
-use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginPermission, PluginRegistry};
+use crate::plugin::{Plugin, PluginEnvironment, PluginHost, PluginRegistry};
 use crate::process::{PWSH_STDIN_BOOTSTRAP, ProcessTree};
 use crate::prompts;
 use crate::protocol::{
@@ -282,14 +282,6 @@ impl Plugin for PwshPlugin {
         self.warning.iter().cloned().collect()
     }
 
-    fn permissions(&self) -> Vec<PluginPermission> {
-        self.protocol
-            .as_ref()
-            .map(|_| PluginPermission::Environment)
-            .into_iter()
-            .collect()
-    }
-
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
         if let Some(protocol) = &self.protocol {
             let mut protocol = protocol.clone();
@@ -331,10 +323,6 @@ fn add_plugins_with(
 impl Plugin for ShellProtocol {
     fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
         vec![self.descriptor()]
-    }
-
-    fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Environment]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
