@@ -2002,35 +2002,16 @@ pub(super) async fn handle_overlay_key(
         },
         Overlay::Models => handle_models_key(app, key, key_name),
         Overlay::Settings => handle_settings_key(app, key, key_name),
-        Overlay::Document => match app.keymap.action("document", key_name).as_deref() {
-            Some("quit") => Action::Quit,
-            Some("close") => {
+        Overlay::Document => {
+            if app.keymap.action("document", key_name).as_deref() == Some("copy") {
+                copy_document(app);
+                return Action::Continue;
+            }
+            apply_scrolling_key(app, "document", key_name, |app| {
                 app.document = None;
                 app.overlay = None;
-                Action::Continue
-            }
-            Some("copy") => {
-                copy_document(app);
-                Action::Continue
-            }
-            Some("scroll_up") => {
-                app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
-                Action::Continue
-            }
-            Some("scroll_down") => {
-                app.overlay_scroll = app.overlay_scroll.saturating_add(1);
-                Action::Continue
-            }
-            Some("page_up") => {
-                app.page_overlay(-1);
-                Action::Continue
-            }
-            Some("page_down") => {
-                app.page_overlay(1);
-                Action::Continue
-            }
-            _ => Action::Continue,
-        },
+            })
+        }
         Overlay::Terminal => Action::Continue,
         Overlay::Plugin => {
             let action = app.keymap.action("plugin_panel", key_name);
@@ -2038,16 +2019,7 @@ pub(super) async fn handle_overlay_key(
                 Some("page_up") => Some(TuiPanelEvent::Page(app.overlay_page_distance(-1))),
                 Some("page_down") => Some(TuiPanelEvent::Page(app.overlay_page_distance(1))),
                 Some(action) => Some(TuiPanelEvent::Action(action.to_string())),
-                None if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
-                {
-                    match key.code {
-                        KeyCode::Char(character) => Some(TuiPanelEvent::Text(character)),
-                        _ => None,
-                    }
-                }
-                None => None,
+                None => unmodified_char(key).map(TuiPanelEvent::Text),
             };
             if let Some(event) = event {
                 handle_plugin_panel_event(app, event).await;
@@ -2055,30 +2027,7 @@ pub(super) async fn handle_overlay_key(
             Action::Continue
         }
         Overlay::Status | Overlay::Help | Overlay::Protocols => {
-            match app.keymap.action("list", key_name).as_deref() {
-                Some("quit") => Action::Quit,
-                Some("close") => {
-                    app.overlay = None;
-                    Action::Continue
-                }
-                Some("previous") => {
-                    app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
-                    Action::Continue
-                }
-                Some("next") => {
-                    app.overlay_scroll = app.overlay_scroll.saturating_add(1);
-                    Action::Continue
-                }
-                Some("page_up") => {
-                    app.page_overlay(-1);
-                    Action::Continue
-                }
-                Some("page_down") => {
-                    app.page_overlay(1);
-                    Action::Continue
-                }
-                _ => Action::Continue,
-            }
+            apply_scrolling_key(app, "list", key_name, |app| app.overlay = None)
         }
     }
 }
@@ -2098,6 +2047,143 @@ async fn handle_plugin_panel_event(app: &mut App, event: TuiPanelEvent) {
             app.overlay = None;
         }
         Err(error) => app.set_flash(format!("Plugin panel failed: {error:#}")),
+    }
+}
+
+/// A plain typed character. Text-entry overlays accept these directly;
+/// modified keys (ctrl-, alt-, cmd-) stay reserved for mapped actions.
+fn unmodified_char(key: KeyEvent) -> Option<char> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    if let KeyCode::Char(character) = key.code {
+        return Some(character);
+    }
+    None
+}
+
+/// Keys shared by the scrolling overlays — status, help, protocols, and the
+/// document viewer. They differ only in their keymap `mode` (lists call line
+/// scrolling `previous`/`next`, the document `scroll_up`/`scroll_down`) and
+/// what `close` clears.
+fn apply_scrolling_key(
+    app: &mut App,
+    mode: &str,
+    key_name: &str,
+    close: impl FnOnce(&mut App),
+) -> Action {
+    match app.keymap.action(mode, key_name).as_deref() {
+        Some("quit") => Action::Quit,
+        Some("close") => {
+            close(app);
+            Action::Continue
+        }
+        Some("previous" | "scroll_up") => {
+            app.overlay_scroll = app.overlay_scroll.saturating_sub(1);
+            Action::Continue
+        }
+        Some("next" | "scroll_down") => {
+            app.overlay_scroll = app.overlay_scroll.saturating_add(1);
+            Action::Continue
+        }
+        Some("page_up") => {
+            app.page_overlay(-1);
+            Action::Continue
+        }
+        Some("page_down") => {
+            app.page_overlay(1);
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+/// Leaves the effort picker's selected option to `next`, which receives the
+/// current selection and the option count. Does nothing when no effort
+/// picker is active.
+fn set_effort_selection(app: &mut App, next: impl FnOnce(usize, usize) -> usize) {
+    if let Some(ModelRoleFlow::PickingEffort {
+        options, selected, ..
+    }) = app
+        .model_hub
+        .as_mut()
+        .and_then(|hub| hub.role_flow.as_mut())
+    {
+        *selected = next(*selected, options.len());
+    }
+}
+
+/// Leaves the model browser: the hub's MODELS tab closes the whole hub,
+/// while the role-assignment flow returns to its roles tab.
+fn abandon_model_browser(app: &mut App, role_flow: bool) {
+    if role_flow {
+        if let Some(hub) = app.model_hub.as_mut() {
+            hub.role_flow = None;
+        }
+    } else {
+        close_model_hub(app);
+    }
+}
+
+/// Keys for the model browser, shared by the hub's MODELS tab and the
+/// role-assignment flow: navigation, query editing, and selection. Only
+/// leaving the browser differs between the two.
+fn handle_model_browser_key(
+    app: &mut App,
+    key: KeyEvent,
+    key_name: &str,
+    role_flow: bool,
+) -> Action {
+    let page_up = app.overlay_page_distance(-1);
+    let page_down = app.overlay_page_distance(1);
+    if app.model_selector.is_none()
+        || app.keymap.action("models", key_name).as_deref() == Some("close")
+    {
+        abandon_model_browser(app, role_flow);
+        return Action::Continue;
+    }
+    let selector = app.model_selector.as_mut().expect("checked above");
+    match app.keymap.action("models", key_name).as_deref() {
+        Some("quit") => Action::Quit,
+        Some("previous") => {
+            selector.move_selection(-1);
+            Action::Continue
+        }
+        Some("next") => {
+            selector.move_selection(1);
+            Action::Continue
+        }
+        Some("page_up") => {
+            selector.page_selection(page_up);
+            Action::Continue
+        }
+        Some("page_down") => {
+            selector.page_selection(page_down);
+            Action::Continue
+        }
+        Some("first") => {
+            selector.first();
+            Action::Continue
+        }
+        Some("last") => {
+            selector.last();
+            Action::Continue
+        }
+        Some("confirm") => Action::SelectModel,
+        Some("backspace") => {
+            selector.backspace();
+            Action::Continue
+        }
+        Some("refresh") => Action::RefreshCatalog,
+        _ => {
+            if let Some(character) = unmodified_char(key) {
+                selector.push(character);
+            }
+            Action::Continue
+        }
     }
 }
 
@@ -2186,11 +2272,7 @@ pub(super) fn apply_command_key(app: &mut App, key: KeyEvent, key_name: &str) ->
             CommandKey::Continue
         }
         _ => {
-            if let KeyCode::Char(character) = key.code
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-            {
+            if let Some(character) = unmodified_char(key) {
                 app.command_query.push(character);
                 app.command_selected = 0;
                 app.command_stem = None;
@@ -2313,56 +2395,7 @@ pub(super) fn handle_models_key(app: &mut App, key: KeyEvent, key_name: &str) ->
                 _ => Action::Continue,
             };
         }
-        let Some(selector) = app.model_selector.as_mut() else {
-            close_model_hub(app);
-            return Action::Continue;
-        };
-        return match app.keymap.action("models", key_name).as_deref() {
-            Some("close") => {
-                close_model_hub(app);
-                Action::Continue
-            }
-            Some("previous") => {
-                selector.move_selection(-1);
-                Action::Continue
-            }
-            Some("next") => {
-                selector.move_selection(1);
-                Action::Continue
-            }
-            Some("page_up") => {
-                selector.page_selection(page_up);
-                Action::Continue
-            }
-            Some("page_down") => {
-                selector.page_selection(page_down);
-                Action::Continue
-            }
-            Some("first") => {
-                selector.first();
-                Action::Continue
-            }
-            Some("last") => {
-                selector.last();
-                Action::Continue
-            }
-            Some("confirm") => Action::SelectModel,
-            Some("backspace") => {
-                selector.backspace();
-                Action::Continue
-            }
-            Some("refresh") => Action::RefreshCatalog,
-            _ => {
-                if let KeyCode::Char(character) = key.code
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-                {
-                    selector.push(character);
-                }
-                Action::Continue
-            }
-        };
+        return handle_model_browser_key(app, key, key_name, false);
     };
 
     match flow {
@@ -2393,63 +2426,31 @@ pub(super) fn handle_models_key(app: &mut App, key: KeyEvent, key_name: &str) ->
                 Action::Continue
             }
             Some("previous") => {
-                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    *selected = wrapped_index(*selected, -1, options.len());
-                }
+                set_effort_selection(app, |selected, count| wrapped_index(selected, -1, count));
                 Action::Continue
             }
             Some("next") => {
-                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    *selected = wrapped_index(*selected, 1, options.len());
-                }
+                set_effort_selection(app, |selected, count| wrapped_index(selected, 1, count));
                 Action::Continue
             }
             Some("page_up") => {
-                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    *selected = bounded_index(*selected, page_up, options.len());
-                }
+                set_effort_selection(app, |selected, count| {
+                    bounded_index(selected, page_up, count)
+                });
                 Action::Continue
             }
             Some("page_down") => {
-                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    *selected = bounded_index(*selected, page_down, options.len());
-                }
+                set_effort_selection(app, |selected, count| {
+                    bounded_index(selected, page_down, count)
+                });
                 Action::Continue
             }
             Some("first") => {
-                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    *selected = 0;
-                }
+                set_effort_selection(app, |_, _| 0);
                 Action::Continue
             }
             Some("last") => {
-                if let Some(ModelRoleFlow::PickingEffort { selected, .. }) = app
-                    .model_hub
-                    .as_mut()
-                    .and_then(|hub| hub.role_flow.as_mut())
-                {
-                    *selected = options.len().saturating_sub(1);
-                }
+                set_effort_selection(app, |_, count| count.saturating_sub(1));
                 Action::Continue
             }
             Some("confirm") => {
@@ -2465,63 +2466,7 @@ pub(super) fn handle_models_key(app: &mut App, key: KeyEvent, key_name: &str) ->
             }
             _ => Action::Continue,
         },
-        ModelRoleFlow::PickingModel { .. } => {
-            let Some(selector) = app.model_selector.as_mut() else {
-                if let Some(hub) = app.model_hub.as_mut() {
-                    hub.role_flow = None;
-                }
-                return Action::Continue;
-            };
-            match app.keymap.action("models", key_name).as_deref() {
-                Some("quit") => Action::Quit,
-                Some("close") => {
-                    if let Some(hub) = app.model_hub.as_mut() {
-                        hub.role_flow = None;
-                    }
-                    Action::Continue
-                }
-                Some("previous") => {
-                    selector.move_selection(-1);
-                    Action::Continue
-                }
-                Some("next") => {
-                    selector.move_selection(1);
-                    Action::Continue
-                }
-                Some("page_up") => {
-                    selector.page_selection(page_up);
-                    Action::Continue
-                }
-                Some("page_down") => {
-                    selector.page_selection(page_down);
-                    Action::Continue
-                }
-                Some("first") => {
-                    selector.first();
-                    Action::Continue
-                }
-                Some("last") => {
-                    selector.last();
-                    Action::Continue
-                }
-                Some("confirm") => Action::SelectModel,
-                Some("backspace") => {
-                    selector.backspace();
-                    Action::Continue
-                }
-                Some("refresh") => Action::RefreshCatalog,
-                _ => {
-                    if let KeyCode::Char(character) = key.code
-                        && !key.modifiers.intersects(
-                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                        )
-                    {
-                        selector.push(character);
-                    }
-                    Action::Continue
-                }
-            }
-        }
+        ModelRoleFlow::PickingModel { .. } => handle_model_browser_key(app, key, key_name, true),
     }
 }
 
@@ -2612,11 +2557,7 @@ pub(super) fn apply_selector_key(app: &mut App, key: KeyEvent, key_name: &str) -
             SelectorKey::Continue
         }
         _ => {
-            if let KeyCode::Char(character) = key.code
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-            {
+            if let Some(character) = unmodified_char(key) {
                 selector.query.push(character);
                 selector.rebuild();
             }
@@ -2788,11 +2729,7 @@ pub(super) fn handle_text_key(app: &mut App, key: KeyEvent, key_name: &str) -> A
             }
         }
         _ => {
-            if let KeyCode::Char(character) = key.code
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-            {
+            if let Some(character) = unmodified_char(key) {
                 prompt.value.push(character);
             }
             Action::Continue
@@ -2826,11 +2763,7 @@ pub(super) fn handle_oauth_key(app: &mut App, key: KeyEvent, key_name: &str) -> 
             Action::Continue
         }
         _ => {
-            if let KeyCode::Char(character) = key.code
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-            {
+            if let Some(character) = unmodified_char(key) {
                 oauth.paste.push(character);
             }
             Action::Continue
@@ -2853,12 +2786,9 @@ pub(super) fn handle_settings_key(app: &mut App, key: KeyEvent, key_name: &str) 
                 }
             }
             _ => {
-                if let KeyCode::Char(character) = key.code
+                if let Some(character) = unmodified_char(key)
                     && character.is_ascii_digit()
                     && settings.editing == Some(EditingSetting::OutputLimit)
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
                 {
                     settings.output_limit.push(character);
                 }
@@ -3815,60 +3745,71 @@ pub(super) fn open_api_key_prompt(app: &mut App, provider: String) {
     } else {
         format!("{instructions} {controls}.")
     };
-    app.text_prompt = Some(TextPrompt {
-        title: format!("API KEY · {provider}"),
+    open_text_prompt(
+        app,
+        format!("API KEY · {provider}"),
         message,
+        true,
+        TextPurpose::ApiKey { provider },
+    );
+}
+
+/// Opens the single-line text prompt overlay for `purpose`, starting empty.
+fn open_text_prompt(
+    app: &mut App,
+    title: impl Into<String>,
+    message: impl Into<String>,
+    secret: bool,
+    purpose: TextPurpose,
+) {
+    app.text_prompt = Some(TextPrompt {
+        title: title.into(),
+        message: message.into(),
         value: String::new(),
-        secret: true,
-        purpose: TextPurpose::ApiKey { provider },
+        secret,
+        purpose,
     });
     app.overlay = Some(Overlay::Text);
 }
 
 fn open_cloudflare_token_prompt(app: &mut App) {
-    app.text_prompt = Some(TextPrompt {
-        title: "CLOUDFLARE API TOKEN".to_string(),
-        message: "Paste a Cloudflare API token with AI Gateway access. Nothing is saved until the account and gateway steps are complete.".to_string(),
-        value: String::new(),
-        secret: true,
-        purpose: TextPurpose::CloudflareToken,
-    });
-    app.overlay = Some(Overlay::Text);
+    open_text_prompt(
+        app,
+        "CLOUDFLARE API TOKEN",
+        "Paste a Cloudflare API token with AI Gateway access. Nothing is saved until the account and gateway steps are complete.",
+        true,
+        TextPurpose::CloudflareToken,
+    );
 }
 
 fn open_cloudflare_account_prompt(app: &mut App, token: String) {
-    app.text_prompt = Some(TextPrompt {
-        title: "CLOUDFLARE ACCOUNT".to_string(),
-        message: "Enter the Cloudflare account ID that owns the AI Gateway.".to_string(),
-        value: String::new(),
-        secret: false,
-        purpose: TextPurpose::CloudflareAccountId { token },
-    });
-    app.overlay = Some(Overlay::Text);
+    open_text_prompt(
+        app,
+        "CLOUDFLARE ACCOUNT",
+        "Enter the Cloudflare account ID that owns the AI Gateway.",
+        false,
+        TextPurpose::CloudflareAccountId { token },
+    );
 }
 
 fn open_cloudflare_gateway_prompt(app: &mut App, token: String, account_id: String) {
-    app.text_prompt = Some(TextPrompt {
-        title: "CLOUDFLARE AI GATEWAY".to_string(),
-        message: format!(
-            "Enter the AI Gateway ID, or leave blank to use {CLOUDFLARE_DEFAULT_GATEWAY_ID}."
-        ),
-        value: String::new(),
-        secret: false,
-        purpose: TextPurpose::CloudflareGatewayId { token, account_id },
-    });
-    app.overlay = Some(Overlay::Text);
+    open_text_prompt(
+        app,
+        "CLOUDFLARE AI GATEWAY",
+        format!("Enter the AI Gateway ID, or leave blank to use {CLOUDFLARE_DEFAULT_GATEWAY_ID}."),
+        false,
+        TextPurpose::CloudflareGatewayId { token, account_id },
+    );
 }
 
 pub(super) fn open_copilot_domain_prompt(app: &mut App) {
-    app.text_prompt = Some(TextPrompt {
-        title: "GITHUB COPILOT".to_string(),
-        message: "GitHub Enterprise URL/domain (blank for github.com)".to_string(),
-        value: String::new(),
-        secret: false,
-        purpose: TextPurpose::CopilotDomain,
-    });
-    app.overlay = Some(Overlay::Text);
+    open_text_prompt(
+        app,
+        "GITHUB COPILOT",
+        "GitHub Enterprise URL/domain (blank for github.com)",
+        false,
+        TextPurpose::CopilotDomain,
+    );
 }
 
 pub(super) async fn open_environment(
@@ -3953,29 +3894,26 @@ pub(super) async fn delete_environment(
 }
 
 pub(super) fn open_environment_name_prompt(app: &mut App, return_to_settings: bool) {
-    app.text_prompt = Some(TextPrompt {
-        title: "ADD AGENT ENVIRONMENT".to_string(),
-        message: "Variable name, for example NPM_TOKEN".to_string(),
-        value: String::new(),
-        secret: false,
-        purpose: TextPurpose::EnvironmentName { return_to_settings },
-    });
-    app.overlay = Some(Overlay::Text);
+    open_text_prompt(
+        app,
+        "ADD AGENT ENVIRONMENT",
+        "Variable name, for example NPM_TOKEN",
+        false,
+        TextPurpose::EnvironmentName { return_to_settings },
+    );
 }
 
 pub(super) fn open_environment_value_prompt(app: &mut App, name: String, return_to_settings: bool) {
-    app.text_prompt = Some(TextPrompt {
-        title: format!("SET {name}"),
-        message: "Value is stored privately and injected into future Agent shell commands."
-            .to_string(),
-        value: String::new(),
-        secret: true,
-        purpose: TextPurpose::EnvironmentValue {
+    open_text_prompt(
+        app,
+        format!("SET {name}"),
+        "Value is stored privately and injected into future Agent shell commands.",
+        true,
+        TextPurpose::EnvironmentValue {
             name,
             return_to_settings,
         },
-    });
-    app.overlay = Some(Overlay::Text);
+    );
 }
 
 pub(super) fn open_set_terminal_prompt(app: &mut App) {
@@ -5036,9 +4974,7 @@ pub(super) async fn finish_background(
                 let _ = services.runtime.session().save_draft("").await;
             }
             Err(error) => {
-                app.busy = false;
-                app.busy_since = None;
-                app.activity = None;
+                app.end_run();
                 app.clear_transient_blocks();
                 // The failed start leaves no turn, so drop its empty card.
                 app.settle_live_process();
