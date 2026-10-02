@@ -1,13 +1,8 @@
-use super::super::device;
-use super::super::util::{http_client, open_url, trusted_http_url};
-use super::super::{LoginSetup, OauthDisplay, OauthLogin, OauthToken, channels, set_display};
-use super::shared::{
-    FormUrlEncoded, json_expires, json_interval, json_or_error, oauth_poll_from_token_response,
-    read_token_form, required_str,
-};
+use super::super::util::{http_client, trusted_http_url};
+use super::super::{OauthLogin, OauthToken};
+use super::shared::{FormUrlEncoded, LoginFlow, device_flow, read_token_form, spawn_login_flow};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -24,77 +19,47 @@ fn host() -> String {
 pub(in crate::oauth) fn start_kimi() -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)>
 {
     let host = host();
-    let LoginSetup {
-        login,
-        paste_rx: _,
-        cancel_rx,
-        done_tx,
-        done_rx,
-        display,
-    } = channels(
-        host.clone(),
+    let display_host = host.clone();
+    spawn_login_flow(
+        display_host,
         Some("starting…".to_string()),
         "Open Kimi Code and enter the device code.",
-    );
-    tokio::spawn(async move {
-        let result = kimi_login(host, cancel_rx, display).await;
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        move |flow| kimi_login(host, flow),
+    )
 }
 
-async fn kimi_login(
-    host: String,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
-    display: Arc<Mutex<OauthDisplay>>,
-) -> Result<OauthToken> {
+async fn kimi_login(host: String, flow: LoginFlow) -> Result<OauthToken> {
     let client = http_client()?;
-    let response = client
-        .post(format!("{host}/api/oauth/device_authorization"))
-        .header("Accept", "application/json")
-        .form_urlencoded(&[("client_id", KIMI_CLIENT_ID)])
-        .send()
-        .await
-        .context("Kimi Code device authorization failed")?;
-    let value = json_or_error(response, "Kimi Code device authorization").await?;
-    let device_code = required_str(&value, "device_code")?;
-    let user_code = required_str(&value, "user_code")?;
-    let verification = trusted_http_url(
-        value
-            .get("verification_uri_complete")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("verification_uri").and_then(Value::as_str))
-            .unwrap_or_default(),
-    )?;
-    set_display(
-        &display,
-        verification.clone(),
-        Some(user_code),
+    let token_client = client.clone();
+    let token_url = format!("{host}/api/oauth/token");
+    device_flow(
+        flow.cancel_rx,
+        flow.display,
         "Open Kimi Code and enter the device code.",
-    );
-    open_url(&verification);
-    device::poll(
-        json_interval(&value),
-        json_expires(&value).or(Some(Duration::from_secs(15 * 60))),
+        "Kimi Code",
+        client
+            .post(format!("{host}/api/oauth/device_authorization"))
+            .header("Accept", "application/json")
+            .form_urlencoded(&[("client_id", KIMI_CLIENT_ID)]),
+        |value| {
+            let verification = value
+                .get("verification_uri_complete")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("verification_uri").and_then(Value::as_str))
+                .unwrap_or_default();
+            trusted_http_url(verification)
+        },
         true,
-        cancel_rx,
-        || {
-            let client = client.clone();
-            let host = host.clone();
-            let device_code = device_code.clone();
-            async move {
-                let response = client
-                    .post(format!("{host}/api/oauth/token"))
-                    .header("Accept", "application/json")
-                    .form_urlencoded(&[
-                        ("client_id", KIMI_CLIENT_ID),
-                        ("device_code", device_code.as_str()),
-                        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ])
-                    .send()
-                    .await?;
-                oauth_poll_from_token_response(response, "Kimi Code").await
-            }
+        Some(Duration::from_secs(15 * 60)),
+        move |device_code| {
+            token_client
+                .post(token_url.clone())
+                .header("Accept", "application/json")
+                .form_urlencoded(&[
+                    ("client_id", KIMI_CLIENT_ID),
+                    ("device_code", device_code),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ])
         },
     )
     .await
@@ -133,38 +98,10 @@ fn kimi_refresh_retryable(status: reqwest::StatusCode) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shared::test_http::read_request;
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    async fn read_request(socket: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 4096];
-            let count = socket.read(&mut chunk).await.unwrap();
-            assert!(count > 0, "client closed before finishing its request");
-            request.extend_from_slice(&chunk[..count]);
-            let Some(header_end) = request
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .map(|index| index + 4)
-            else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or_default();
-            if request.len() >= header_end + content_length {
-                return String::from_utf8(request).unwrap();
-            }
-        }
-    }
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
 
     #[test]
     fn refresh_retries_only_transient_statuses() {

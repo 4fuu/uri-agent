@@ -1,8 +1,11 @@
 use super::super::callback;
 use super::super::device::{self, Poll};
 use super::super::util::{encode, generate_pkce, http_client, open_url};
-use super::super::{LoginSetup, OauthLogin, OauthToken, channels, set_display};
-use super::shared::{FormUrlEncoded, json_interval, random_hex, read_token_form, required_str};
+use super::super::{OauthLogin, OauthToken, set_display};
+use super::shared::{
+    FormUrlEncoded, LoginFlow, json_interval, random_hex, read_token_form, required_str,
+    spawn_login_flow,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -23,21 +26,12 @@ pub(in crate::oauth) fn start_codex_browser()
         encode(&pkce.challenge),
         encode(&state)
     );
-    let LoginSetup {
-        login,
-        mut paste_rx,
-        mut cancel_rx,
-        done_tx,
-        done_rx,
-        display: _,
-    } = channels(
-        url.clone(),
+    open_url(&url);
+    spawn_login_flow(
+        url,
         None,
         "Complete ChatGPT login in the browser, or paste the redirect URL / code.",
-    );
-    open_url(&url);
-    tokio::spawn(async move {
-        let result = async {
+        move |mut flow| async move {
             let callback = callback::bind(
                 "127.0.0.1",
                 1455,
@@ -49,109 +43,99 @@ pub(in crate::oauth) fn start_codex_browser()
             .await;
             let (code, _) = callback::race_callback_or_paste(
                 &callback,
-                &mut paste_rx,
-                &mut cancel_rx,
+                &mut flow.paste_rx,
+                &mut flow.cancel_rx,
                 Some(&state),
             )
             .await?;
             codex_exchange(&code, &pkce.verifier, "http://localhost:1455/auth/callback").await
-        }
-        .await;
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        },
+    )
 }
 
 pub(in crate::oauth) fn start_codex_device()
 -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
-    let LoginSetup {
-        login,
-        paste_rx: _,
-        cancel_rx,
-        done_tx,
-        done_rx,
-        display,
-    } = channels(
+    spawn_login_flow(
         "https://auth.openai.com/codex/device".to_string(),
         Some("starting…".to_string()),
         "Open the verification URL and enter the device code.",
+        codex_device_login,
+    )
+}
+
+async fn codex_device_login(flow: LoginFlow) -> Result<OauthToken> {
+    let LoginFlow {
+        paste_rx: _,
+        cancel_rx,
+        display,
+    } = flow;
+    let client = http_client()?;
+    let response = client
+        .post("https://auth.openai.com/api/accounts/deviceauth/usercode")
+        .json(&json!({ "client_id": CODEX_CLIENT_ID }))
+        .send()
+        .await
+        .context("OpenAI Codex device code request failed")?;
+    let status = response.status();
+    let value = response.json::<Value>().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!("OpenAI Codex device code request failed ({status}): {value}");
+    }
+    let device_auth_id = required_str(&value, "device_auth_id")?;
+    let user_code = required_str(&value, "user_code")?;
+    let interval = json_interval(&value);
+    set_display(
+        &display,
+        "https://auth.openai.com/codex/device",
+        Some(user_code.clone()),
+        "Open the verification URL and enter the device code.",
     );
-    tokio::spawn(async move {
-        let result = async {
-            let client = http_client()?;
-            let response = client
-                .post("https://auth.openai.com/api/accounts/deviceauth/usercode")
-                .json(&json!({ "client_id": CODEX_CLIENT_ID }))
-                .send()
-                .await
-                .context("OpenAI Codex device code request failed")?;
-            let status = response.status();
-            let value = response.json::<Value>().await.unwrap_or(Value::Null);
-            if !status.is_success() {
-                bail!("OpenAI Codex device code request failed ({status}): {value}");
+    open_url("https://auth.openai.com/codex/device");
+    let payload = device::poll(
+        interval,
+        Some(Duration::from_secs(15 * 60)),
+        false,
+        cancel_rx,
+        || {
+            let client = client.clone();
+            let device_auth_id = device_auth_id.clone();
+            let user_code = user_code.clone();
+            async move {
+                let response = client
+                    .post("https://auth.openai.com/api/accounts/deviceauth/token")
+                    .json(&json!({"device_auth_id": device_auth_id, "user_code": user_code}))
+                    .send()
+                    .await?;
+                if response.status().is_success() {
+                    let value = response.json::<Value>().await.unwrap_or(Value::Null);
+                    return Ok(Poll::Complete((
+                        required_str(&value, "authorization_code")?,
+                        required_str(&value, "code_verifier")?,
+                    )));
+                }
+                if matches!(response.status().as_u16(), 403 | 404) {
+                    return Ok(Poll::Pending);
+                }
+                let text = response.text().await.unwrap_or_default();
+                if text.contains("deviceauth_authorization_pending") {
+                    return Ok(Poll::Pending);
+                }
+                if text.contains("slow_down") {
+                    return Ok(Poll::SlowDown { interval: None });
+                }
+                Ok(Poll::Failed(format!(
+                    "OpenAI Codex device auth failed: {text}"
+                )))
             }
-            let device_auth_id = required_str(&value, "device_auth_id")?;
-            let user_code = required_str(&value, "user_code")?;
-            let interval = json_interval(&value);
-            set_display(
-                &display,
-                "https://auth.openai.com/codex/device",
-                Some(user_code.clone()),
-                "Open the verification URL and enter the device code.",
-            );
-            open_url("https://auth.openai.com/codex/device");
-            let payload = device::poll(
-                interval,
-                Some(Duration::from_secs(15 * 60)),
-                false,
-                cancel_rx,
-                || {
-                    let client = client.clone();
-                    let device_auth_id = device_auth_id.clone();
-                    let user_code = user_code.clone();
-                    async move {
-                        let response = client
-                            .post("https://auth.openai.com/api/accounts/deviceauth/token")
-                            .json(
-                                &json!({"device_auth_id": device_auth_id, "user_code": user_code}),
-                            )
-                            .send()
-                            .await?;
-                        if response.status().is_success() {
-                            let value = response.json::<Value>().await.unwrap_or(Value::Null);
-                            return Ok(Poll::Complete((
-                                required_str(&value, "authorization_code")?,
-                                required_str(&value, "code_verifier")?,
-                            )));
-                        }
-                        if matches!(response.status().as_u16(), 403 | 404) {
-                            return Ok(Poll::Pending);
-                        }
-                        let text = response.text().await.unwrap_or_default();
-                        if text.contains("deviceauth_authorization_pending") {
-                            return Ok(Poll::Pending);
-                        }
-                        if text.contains("slow_down") {
-                            return Ok(Poll::SlowDown { interval: None });
-                        }
-                        Ok(Poll::Failed(format!(
-                            "OpenAI Codex device auth failed: {text}"
-                        )))
-                    }
-                },
-            )
-            .await?;
-            codex_exchange(
-                &payload.0,
-                &payload.1,
-                "https://auth.openai.com/deviceauth/callback",
-            )
-            .await
-        }
-        .await;
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        },
+    )
+    .await?;
+    codex_exchange(
+        &payload.0,
+        &payload.1,
+        "https://auth.openai.com/deviceauth/callback",
+    )
+    .await
 }
 
 pub(in crate::oauth) async fn refresh_codex(refresh: &str) -> Result<OauthToken> {

@@ -1,6 +1,7 @@
 use super::super::callback;
 use super::super::util::{encode, generate_pkce, http_client, open_url};
-use super::super::{LoginSetup, OauthLogin, OauthToken, channels, set_display};
+use super::super::{OauthLogin, OauthToken, set_display};
+use super::shared::spawn_login_flow;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -8,32 +9,42 @@ use tokio::sync::oneshot;
 
 pub(in crate::oauth) fn start_openrouter()
 -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
-    let LoginSetup {
-        login: login_holder,
-        mut paste_rx,
-        mut cancel_rx,
-        done_tx,
-        done_rx,
-        display,
-    } = channels(
+    spawn_login_flow(
         String::new(),
         None,
         "Complete sign-in in the browser, or paste the redirect URL / code.",
-    );
-    tokio::spawn(async move {
-        let result = async {
+        |mut flow| async move {
             let pkce = generate_pkce()?;
             let path = format!("/oauth/callback/{}", uuid::Uuid::now_v7().simple());
-            let callback = callback::bind_ephemeral("127.0.0.1", &path, None, "Signed in to OpenRouter. You may now close this page.").await?;
-            let authorize = format!("https://openrouter.ai/auth?callback_url={}&code_challenge={}&code_challenge_method=S256", encode(&callback.redirect_uri), encode(&pkce.challenge));
-            set_display(&display, authorize.clone(), None, "Complete sign-in in the browser, or paste the redirect URL / code.");
+            let callback = callback::bind_ephemeral(
+                "127.0.0.1",
+                &path,
+                None,
+                "Signed in to OpenRouter. You may now close this page.",
+            )
+            .await?;
+            let authorize = format!(
+                "https://openrouter.ai/auth?callback_url={}&code_challenge={}&code_challenge_method=S256",
+                encode(&callback.redirect_uri),
+                encode(&pkce.challenge)
+            );
+            set_display(
+                &flow.display,
+                authorize.clone(),
+                None,
+                "Complete sign-in in the browser, or paste the redirect URL / code.",
+            );
             open_url(&authorize);
-            let (code, _) = callback::race_callback_or_paste(&callback, &mut paste_rx, &mut cancel_rx, None).await?;
+            let (code, _) = callback::race_callback_or_paste(
+                &callback,
+                &mut flow.paste_rx,
+                &mut flow.cancel_rx,
+                None,
+            )
+            .await?;
             openrouter_exchange(&code, &pkce.verifier).await
-        }.await;
-        let _ = done_tx.send(result);
-    });
-    Ok((login_holder, done_rx))
+        },
+    )
 }
 
 async fn openrouter_exchange(code: &str, verifier: &str) -> Result<OauthToken> {

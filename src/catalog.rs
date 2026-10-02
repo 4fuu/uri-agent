@@ -495,43 +495,19 @@ impl ModelCatalog {
         };
         let current = self.inner.read().await.store.clone();
         let now = Utc::now().timestamp_millis();
-        let client = self.client.clone();
-        let providers_url = self.providers_url.clone();
-        let refreshed = stream::iter(providers.into_iter().map(|provider| {
-            let client = client.clone();
-            let providers_url = providers_url.clone();
-            let cached = current.get(&provider).cloned().unwrap_or_default();
-            async move {
-                if !force
-                    && cached
-                        .checked_at
-                        .is_some_and(|checked| now - checked < REFRESH_INTERVAL_MS)
-                    && cached.last_modified.is_some()
-                {
-                    return (provider, cached.clone(), Ok(cached));
-                }
-                let fallback = cached.clone();
-                let result = fetch_provider(&client, &providers_url, &provider, cached, now).await;
-                (provider, fallback, result)
-            }
-        }))
-        .buffer_unordered(REQUEST_CONCURRENCY)
-        .collect::<Vec<_>>()
+        let (refreshed, pi_failures) = refresh_pi_providers(
+            &self.client,
+            &self.providers_url,
+            providers,
+            &current,
+            now,
+            force,
+        )
         .await;
+        report.pi_failures += pi_failures;
 
         let mut state = self.inner.write().await;
-        for (provider, mut fallback, result) in refreshed {
-            match result {
-                Ok(entry) => {
-                    state.store.insert(provider, entry);
-                }
-                Err(_) => {
-                    report.pi_failures += 1;
-                    fallback.checked_at = Some(now);
-                    state.store.insert(provider, fallback);
-                }
-            }
-        }
+        state.store.extend(refreshed);
         state.user = read_json(&self.user_path).await?;
         let (base_models, warnings) = merge_catalog(&state.store, &state.user, &BTreeMap::new());
         state.warnings.extend(warnings);
@@ -556,42 +532,27 @@ impl ModelCatalog {
             .await;
         }
 
-        let discovery_requests = credentials
-            .iter()
-            .filter_map(|(provider, credential)| {
-                if !discovery::supports_provider(provider)
-                    || !discovery::refresh_enabled(provider)
-                    || (provider != workbuddy::PROVIDER
-                        && provider != radius::PROVIDER
-                        && !base_models.contains_key(provider))
-                {
-                    return None;
-                }
-                let fingerprint = discovery::credential_fingerprint(provider, credential);
-                let cached = current
-                    .get(provider)
-                    .and_then(|entry| entry.discoveries.get(&fingerprint))
-                    .cloned();
-                if !force
-                    && cached.as_ref().is_some_and(|entry| {
-                        now - entry.checked_at < discovery::refresh_interval(provider)
-                    })
-                {
-                    return None;
-                }
-                Some((provider.clone(), credential.clone(), fingerprint, cached))
-            })
-            .collect::<Vec<_>>();
-        let discovery_results = stream::iter(discovery_requests)
-            .map(|(provider, credential, fingerprint, cached)| {
+        let requests = discovery_requests(credentials, &current, &base_models, force, now);
+        let discovery_results = stream::iter(requests)
+            .map(|request| {
                 let client = self.client.clone();
                 let catalog = base_models.clone();
                 let hints = protocol_hints.clone();
                 async move {
-                    let result =
-                        discovery::discover(&client, &provider, &credential, &catalog, &hints)
-                            .await;
-                    (provider, fingerprint, cached, result)
+                    let result = discovery::discover(
+                        &client,
+                        &request.provider,
+                        &request.credential,
+                        &catalog,
+                        &hints,
+                    )
+                    .await;
+                    DiscoveryOutcome {
+                        provider: request.provider,
+                        fingerprint: request.fingerprint,
+                        cached: request.cached,
+                        result,
+                    }
                 }
             })
             .buffer_unordered(REQUEST_CONCURRENCY)
@@ -599,52 +560,8 @@ impl ModelCatalog {
             .await;
 
         let mut state = self.inner.write().await;
-        for (provider, fingerprint, cached, result) in discovery_results {
-            let entry = state.store.entry(provider.clone()).or_default();
-            if provider != workbuddy::PROVIDER {
-                entry
-                    .discoveries
-                    .retain(|existing, _| existing == &fingerprint);
-            }
-            match result {
-                Ok(models) => {
-                    entry.discoveries.insert(
-                        fingerprint,
-                        DiscoveryStoreEntry {
-                            models,
-                            checked_at: now,
-                            succeeded: Some(true),
-                        },
-                    );
-                }
-                Err(_) => {
-                    report.discovery_failures += 1;
-                    entry.discoveries.insert(
-                        fingerprint,
-                        DiscoveryStoreEntry {
-                            models: cached
-                                .as_ref()
-                                .map_or_else(Vec::new, |entry| entry.models.clone()),
-                            checked_at: now,
-                            succeeded: Some(cached.as_ref().is_some_and(|entry| entry.succeeded())),
-                        },
-                    );
-                }
-            }
-            while provider == workbuddy::PROVIDER
-                && entry.discoveries.len() > workbuddy::MAX_CACHED_CONFIGS
-            {
-                let Some(oldest) = entry
-                    .discoveries
-                    .iter()
-                    .min_by_key(|(_, discovery)| discovery.checked_at)
-                    .map(|(fingerprint, _)| fingerprint.clone())
-                else {
-                    break;
-                };
-                entry.discoveries.remove(&oldest);
-            }
-        }
+        report.discovery_failures =
+            apply_discovery_results(&mut state.store, discovery_results, now);
         write_json(&self.store_path, &state.store).await?;
         state.protocol_hints = protocol_hints;
         let (models, warnings) = merge_catalog(&state.store, &state.user, &state.discovery_scopes);
@@ -724,6 +641,182 @@ impl ModelCatalog {
     pub async fn warnings(&self) -> Vec<String> {
         self.inner.read().await.warnings.clone()
     }
+}
+
+/// Refresh every pi provider catalog concurrently. Providers whose cached
+/// entry is still fresh are kept as-is; a failed fetch falls back to the
+/// cached entry with a fresh `checked_at`, so the next refresh can skip it.
+/// Returns the entries to store and the number of failed fetches.
+async fn refresh_pi_providers(
+    client: &reqwest::Client,
+    providers_url: &str,
+    providers: Vec<String>,
+    current: &BTreeMap<String, StoreEntry>,
+    now: i64,
+    force: bool,
+) -> (BTreeMap<String, StoreEntry>, usize) {
+    let refreshed = stream::iter(providers.into_iter().map(|provider| {
+        let cached = current.get(&provider).cloned().unwrap_or_default();
+        async move {
+            if !force
+                && cached
+                    .checked_at
+                    .is_some_and(|checked| now - checked < REFRESH_INTERVAL_MS)
+                && cached.last_modified.is_some()
+            {
+                return (provider, cached.clone(), Ok(cached));
+            }
+            let fallback = cached.clone();
+            let result = fetch_provider(client, providers_url, &provider, cached, now).await;
+            (provider, fallback, result)
+        }
+    }))
+    .buffer_unordered(REQUEST_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut store = BTreeMap::new();
+    let mut failures = 0;
+    for (provider, mut fallback, result) in refreshed {
+        match result {
+            Ok(entry) => {
+                store.insert(provider, entry);
+            }
+            Err(_) => {
+                failures += 1;
+                fallback.checked_at = Some(now);
+                store.insert(provider, fallback);
+            }
+        }
+    }
+    (store, failures)
+}
+
+/// One scheduled live-discovery request: the provider, its credential and
+/// fingerprint, and the cached discovery for that fingerprint if one exists.
+struct DiscoveryRequest {
+    provider: String,
+    credential: CatalogCredential,
+    fingerprint: String,
+    cached: Option<DiscoveryStoreEntry>,
+}
+
+/// Collect the live-discovery requests that are due: supported providers
+/// with a credential, either provider-owned (WorkBuddy, Radius) or present in
+/// the merged base catalog, whose cached result for this credential
+/// fingerprint is older than the provider's refresh interval.
+fn discovery_requests(
+    credentials: &BTreeMap<String, CatalogCredential>,
+    current: &BTreeMap<String, StoreEntry>,
+    base_models: &BTreeMap<String, Vec<CatalogModel>>,
+    force: bool,
+    now: i64,
+) -> Vec<DiscoveryRequest> {
+    credentials
+        .iter()
+        .filter_map(|(provider, credential)| {
+            if !discovery::supports_provider(provider)
+                || !discovery::refresh_enabled(provider)
+                || (provider != workbuddy::PROVIDER
+                    && provider != radius::PROVIDER
+                    && !base_models.contains_key(provider))
+            {
+                return None;
+            }
+            let fingerprint = discovery::credential_fingerprint(provider, credential);
+            let cached = current
+                .get(provider)
+                .and_then(|entry| entry.discoveries.get(&fingerprint))
+                .cloned();
+            if !force
+                && cached.as_ref().is_some_and(|entry| {
+                    now - entry.checked_at < discovery::refresh_interval(provider)
+                })
+            {
+                return None;
+            }
+            Some(DiscoveryRequest {
+                provider: provider.clone(),
+                credential: credential.clone(),
+                fingerprint,
+                cached,
+            })
+        })
+        .collect()
+}
+
+/// Store completed discovery results. A successful discovery replaces the
+/// provider's cached entries for older fingerprints; a failed one keeps the
+/// cached models so the catalog still lists them. WorkBuddy keeps up to
+/// [`workbuddy::MAX_CACHED_CONFIGS`] discovery configs, evicting the oldest.
+/// Returns the number of failed discoveries.
+fn apply_discovery_results(
+    store: &mut BTreeMap<String, StoreEntry>,
+    results: Vec<DiscoveryOutcome>,
+    now: i64,
+) -> usize {
+    let mut failures = 0;
+    for outcome in results {
+        let DiscoveryOutcome {
+            provider,
+            fingerprint,
+            cached,
+            result,
+        } = outcome;
+        let entry = store.entry(provider.clone()).or_default();
+        if provider != workbuddy::PROVIDER {
+            entry
+                .discoveries
+                .retain(|existing, _| existing == &fingerprint);
+        }
+        match result {
+            Ok(models) => {
+                entry.discoveries.insert(
+                    fingerprint,
+                    DiscoveryStoreEntry {
+                        models,
+                        checked_at: now,
+                        succeeded: Some(true),
+                    },
+                );
+            }
+            Err(_) => {
+                failures += 1;
+                entry.discoveries.insert(
+                    fingerprint,
+                    DiscoveryStoreEntry {
+                        models: cached
+                            .as_ref()
+                            .map_or_else(Vec::new, |entry| entry.models.clone()),
+                        checked_at: now,
+                        succeeded: Some(cached.as_ref().is_some_and(|entry| entry.succeeded())),
+                    },
+                );
+            }
+        }
+        while provider == workbuddy::PROVIDER
+            && entry.discoveries.len() > workbuddy::MAX_CACHED_CONFIGS
+        {
+            let Some(oldest) = entry
+                .discoveries
+                .iter()
+                .min_by_key(|(_, discovery)| discovery.checked_at)
+                .map(|(fingerprint, _)| fingerprint.clone())
+            else {
+                break;
+            };
+            entry.discoveries.remove(&oldest);
+        }
+    }
+    failures
+}
+
+/// One completed live-discovery request and its outcome.
+struct DiscoveryOutcome {
+    provider: String,
+    fingerprint: String,
+    cached: Option<DiscoveryStoreEntry>,
+    result: Result<Vec<CatalogModel>>,
 }
 
 async fn fetch_provider(

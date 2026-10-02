@@ -1,5 +1,6 @@
 use super::super::util::{open_url, trusted_http_url};
-use super::super::{LoginSetup, OauthDisplay, OauthLogin, OauthToken, channels, set_display};
+use super::super::{OauthDisplay, OauthLogin, OauthToken, set_display};
+use super::shared::spawn_login_flow;
 use anyhow::{Context, Result, anyhow, bail};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{StatusCode, Url};
@@ -186,31 +187,22 @@ fn insert_header(
 
 pub(crate) fn start_login() -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
     let endpoint = WORKBUDDY_ENDPOINT.to_string();
-    let LoginSetup {
-        login,
-        paste_rx: _,
-        cancel_rx,
-        done_tx,
-        done_rx,
-        display,
-    } = channels(
+    spawn_login_flow(
         endpoint.clone(),
         None,
         "Generating the WorkBuddy login URL…",
-    );
-    tokio::spawn(async move {
-        let result = match tokio::time::timeout(
-            LOGIN_TIMEOUT,
-            workbuddy_login(endpoint, cancel_rx, display),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("WorkBuddy login timed out after 5 minutes")),
-        };
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        |flow| async move {
+            match tokio::time::timeout(
+                LOGIN_TIMEOUT,
+                workbuddy_login(endpoint, flow.cancel_rx, flow.display),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("WorkBuddy login timed out after 5 minutes")),
+            }
+        },
+    )
 }
 
 async fn workbuddy_login(

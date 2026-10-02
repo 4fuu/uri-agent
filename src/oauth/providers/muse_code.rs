@@ -1,7 +1,9 @@
+#[cfg(test)]
+use super::super::channels;
 use super::super::device::{self, Poll};
 use super::super::util::open_url;
-use super::super::{LoginSetup, OauthDisplay, OauthLogin, OauthToken, channels, set_display};
-use super::shared::{FormUrlEncoded, json_expires, json_interval, required_str};
+use super::super::{OauthDisplay, OauthLogin, OauthToken, set_display};
+use super::shared::{FormUrlEncoded, json_expires, json_interval, required_str, spawn_login_flow};
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -9,7 +11,7 @@ use serde_json::{Map, Number, Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::oneshot;
 
 const CLIENT_ID: &str = "1031625952748946";
 const DEVICE_URL: &str = "https://auth.meta.com/oidc/device/authorization/";
@@ -19,38 +21,29 @@ const API_VERSION: &str = "1.0.0";
 
 pub(in crate::oauth) fn start_muse_code()
 -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
-    let LoginSetup {
-        login,
-        paste_rx: _,
-        cancel_rx,
-        done_tx,
-        done_rx,
-        display,
-    } = channels(
+    spawn_login_flow(
         "https://auth.meta.com".to_string(),
         Some("starting…".to_string()),
         "Open the Meta verification URL and enter the device code.",
-    );
-    tokio::spawn(async move {
-        let mut outer_cancel = cancel_rx.clone();
-        let result = if *outer_cancel.borrow() {
-            Err(anyhow!("OAuth login was cancelled"))
-        } else {
-            tokio::select! {
-                result = login_flow(DEVICE_URL, TOKEN_URL, KEY_URL, cancel_rx, display, true) => result,
-                _ = outer_cancel.changed() => Err(anyhow!("OAuth login was cancelled")),
+        |flow| async move {
+            let mut outer_cancel = flow.cancel_rx.clone();
+            if *outer_cancel.borrow() {
+                Err(anyhow!("OAuth login was cancelled"))
+            } else {
+                tokio::select! {
+                    result = login_flow(DEVICE_URL, TOKEN_URL, KEY_URL, flow.cancel_rx, flow.display, true) => result,
+                    _ = outer_cancel.changed() => Err(anyhow!("OAuth login was cancelled")),
+                }
             }
-        };
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        },
+    )
 }
 
 async fn login_flow(
     device_url: &str,
     token_url: &str,
     key_url: &str,
-    cancel_rx: watch::Receiver<bool>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
     display: Arc<Mutex<OauthDisplay>>,
     open_browser: bool,
 ) -> Result<OauthToken> {

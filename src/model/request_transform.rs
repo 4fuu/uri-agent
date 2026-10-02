@@ -9,6 +9,73 @@ use std::sync::{Arc, Mutex};
 
 const CODEX_CLIENT_VERSION: &str = "0.159.0";
 
+/// Catalog provider IDs whose OpenAI-completions compatibility is loose
+/// enough that optional OpenAI fields must not be sent by default, and the
+/// base-URL fragments that identify the same providers behind custom
+/// endpoints. `uses_max_tokens` keeps the narrower lists of providers that
+/// still take `max_tokens` rather than `max_completion_tokens`.
+const NONSTANDARD_COMPLETIONS_PROVIDERS: &[&str] = &[
+    "nvidia",
+    "cerebras",
+    "xai",
+    "together",
+    "deepseek",
+    "zai",
+    "zai-coding-cn",
+    "moonshotai",
+    "moonshotai-cn",
+    "opencode",
+    "cloudflare-workers-ai",
+    "ant-ling",
+];
+const NONSTANDARD_COMPLETIONS_URL_NEEDLES: &[&str] = &[
+    "integrate.api.nvidia.com",
+    "cerebras.ai",
+    "api.x.ai",
+    "api.together.",
+    "chutes.ai",
+    "deepseek.com",
+    "api.z.ai",
+    "open.bigmodel.cn",
+    "api.moonshot.",
+    "opencode.ai",
+    "api.cloudflare.com",
+    "gateway.ai.cloudflare.com",
+    "api.ant-ling.com",
+];
+const MAX_TOKENS_PROVIDERS: &[&str] = &[
+    "deepseek",
+    "moonshotai",
+    "moonshotai-cn",
+    "together",
+    "nvidia",
+    "ant-ling",
+    "zai",
+    "zai-coding-cn",
+];
+const MAX_TOKENS_URL_NEEDLES: &[&str] = &[
+    "chutes.ai",
+    "deepseek.com",
+    "api.moonshot.",
+    "gateway.ai.cloudflare.com",
+    "api.together.",
+    "integrate.api.nvidia.com",
+    "api.ant-ling.com",
+    "api.z.ai",
+    "open.bigmodel.cn",
+];
+
+/// Match a provider by catalog ID, or by a base-URL fragment when the model
+/// comes from a custom endpoint of the same provider.
+fn provider_or_url_matches(
+    provider: &str,
+    base_url: &str,
+    providers: &[&str],
+    url_needles: &[&str],
+) -> bool {
+    providers.contains(&provider) || url_needles.iter().any(|needle| base_url.contains(needle))
+}
+
 /// Original tool parameter schemas for the current request, shared between
 /// the backend that owns the request and the request transform that rewrites
 /// the serialized body. rig-core 0.42 converts tool parameters into its
@@ -426,78 +493,26 @@ impl ModelRequestTransform {
         }
     }
 
-    fn completions_compat(&self, key: &str, default: bool) -> bool {
-        self.model
-            .compat(key)
-            .and_then(Value::as_bool)
-            .unwrap_or(default)
-    }
-
+    /// Whether this model runs on one of the providers listed above.
     fn nonstandard_completions_provider(&self) -> bool {
-        let provider = self.model.provider.as_str();
-        let url = self.model.base_url.to_ascii_lowercase();
-        matches!(
-            provider,
-            "nvidia"
-                | "cerebras"
-                | "xai"
-                | "together"
-                | "deepseek"
-                | "zai"
-                | "zai-coding-cn"
-                | "moonshotai"
-                | "moonshotai-cn"
-                | "opencode"
-                | "cloudflare-workers-ai"
-                | "ant-ling"
-        ) || [
-            "integrate.api.nvidia.com",
-            "cerebras.ai",
-            "api.x.ai",
-            "api.together.",
-            "chutes.ai",
-            "deepseek.com",
-            "api.z.ai",
-            "open.bigmodel.cn",
-            "api.moonshot.",
-            "opencode.ai",
-            "api.cloudflare.com",
-            "gateway.ai.cloudflare.com",
-            "api.ant-ling.com",
-        ]
-        .iter()
-        .any(|needle| url.contains(needle))
+        provider_or_url_matches(
+            self.model.provider.as_str(),
+            &self.model.base_url.to_ascii_lowercase(),
+            NONSTANDARD_COMPLETIONS_PROVIDERS,
+            NONSTANDARD_COMPLETIONS_URL_NEEDLES,
+        )
     }
 
     fn uses_max_tokens(&self) -> bool {
         if let Some(field) = self.model.compat("maxTokensField").and_then(Value::as_str) {
             return field == "max_tokens";
         }
-        let provider = self.model.provider.as_str();
-        let url = self.model.base_url.to_ascii_lowercase();
-        matches!(
-            provider,
-            "deepseek"
-                | "moonshotai"
-                | "moonshotai-cn"
-                | "together"
-                | "nvidia"
-                | "ant-ling"
-                | "zai"
-                | "zai-coding-cn"
-        ) || [
-            "chutes.ai",
-            "deepseek.com",
-            "api.moonshot.",
-            "gateway.ai.cloudflare.com",
-            "api.together.",
-            "integrate.api.nvidia.com",
-            "api.ant-ling.com",
-            "api.z.ai",
-            "open.bigmodel.cn",
-        ]
-        .iter()
-        .any(|needle| url.contains(needle))
+        provider_or_url_matches(
+            self.model.provider.as_str(),
+            &self.model.base_url.to_ascii_lowercase(),
+            MAX_TOKENS_PROVIDERS,
+            MAX_TOKENS_URL_NEEDLES,
+        )
     }
 
     fn thinking_format(&self) -> &str {
@@ -530,10 +545,10 @@ impl ModelRequestTransform {
         } else if let Some(max_tokens) = body.remove("max_tokens") {
             body.insert("max_completion_tokens".to_string(), max_tokens);
         }
-        if !self.completions_compat("supportsUsageInStreaming", true) {
+        if !self.compat_bool("supportsUsageInStreaming", true) {
             body.remove("stream_options");
         }
-        if self.completions_compat("supportsStore", !self.nonstandard_completions_provider()) {
+        if self.compat_bool("supportsStore", !self.nonstandard_completions_provider()) {
             body.insert("store".to_string(), Value::Bool(false));
         } else {
             body.remove("store");
@@ -563,7 +578,7 @@ impl ModelRequestTransform {
     }
 
     fn apply_reasoning_replay_compat(&self, body: &mut Map<String, Value>) {
-        let required = self.completions_compat(
+        let required = self.compat_bool(
             "requiresReasoningContentOnAssistantMessages",
             self.model.provider == "deepseek"
                 || self
@@ -575,16 +590,7 @@ impl ModelRequestTransform {
         if !required || !self.model.reasoning() {
             return;
         }
-        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-            return;
-        };
-        for message in messages.iter_mut().filter_map(Value::as_object_mut) {
-            if message.get("role").and_then(Value::as_str) == Some("assistant") {
-                message
-                    .entry("reasoning_content")
-                    .or_insert_with(|| Value::String(String::new()));
-            }
-        }
+        ensure_assistant_message_field(body, "reasoning_content");
     }
 
     fn apply_deepseek_v41_flash_compat(&self, body: &mut Map<String, Value>) {
@@ -594,16 +600,7 @@ impl ModelRequestTransform {
         if self.compat_bool("disallowToolChoice", false) {
             body.remove("tool_choice");
         }
-        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-            return;
-        };
-        for message in messages.iter_mut().filter_map(Value::as_object_mut) {
-            if message.get("role").and_then(Value::as_str) == Some("assistant") {
-                message
-                    .entry("content")
-                    .or_insert_with(|| Value::String(String::new()));
-            }
-        }
+        ensure_assistant_message_field(body, "content");
     }
 
     fn apply_developer_role(&self, body: &mut Map<String, Value>) {
@@ -612,7 +609,7 @@ impl ModelRequestTransform {
         }
         let openrouter_model = self.model.provider == "openrouter"
             && (self.model.id.starts_with("anthropic/") || self.model.id.starts_with("openai/"));
-        let supported = self.completions_compat(
+        let supported = self.compat_bool(
             "supportsDeveloperRole",
             openrouter_model
                 || (!self.nonstandard_completions_provider()
@@ -673,7 +670,7 @@ impl ModelRequestTransform {
 
     fn supports_reasoning_effort(&self) -> bool {
         let provider = self.model.provider.as_str();
-        self.completions_compat(
+        self.compat_bool(
             "supportsReasoningEffort",
             !matches!(
                 provider,
@@ -1235,6 +1232,22 @@ fn is_gemini3_family(id: &str, family: &str) -> bool {
     !version.is_empty()
         && version.chars().all(|character| character.is_ascii_digit())
         && suffix.starts_with(family)
+}
+
+/// Give every assistant message an empty-string `field` when it lacks one.
+/// Some OpenAI-compatible providers reject replayed assistant messages that
+/// omit the `content` or `reasoning_content` field entirely.
+fn ensure_assistant_message_field(body: &mut Map<String, Value>, field: &str) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages.iter_mut().filter_map(Value::as_object_mut) {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            message
+                .entry(field.to_string())
+                .or_insert_with(|| Value::String(String::new()));
+        }
+    }
 }
 
 fn add_cache_control_to_message(message: &mut Value, cache_control: &Value) {

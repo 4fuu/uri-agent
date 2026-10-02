@@ -1303,9 +1303,7 @@ impl ConfigManager {
             .filter(|entry| entry.kind == "api_key")
             .and_then(|entry| entry.key.clone());
         for environment in api_key_environments(provider) {
-            if let Ok(value) = env::var(environment)
-                && !value.trim().is_empty()
-            {
+            if let Some(value) = non_empty_var(&environment) {
                 api_key = Some(value);
             }
         }
@@ -1408,16 +1406,23 @@ impl ConfigManager {
         Ok(report)
     }
 
+    /// The settings file a new persisted value is written to, with its path:
+    /// the project settings file when one exists, else the global settings
+    /// file. Persisted settings stay where earlier writes landed.
+    fn writable_settings<'a>(&self, files: &'a mut ConfigFiles) -> (&'a mut SettingsFile, PathBuf) {
+        if path_entry_exists(&self.project_path) {
+            (&mut files.project, self.project_path.clone())
+        } else {
+            (&mut files.global, self.settings_path())
+        }
+    }
+
     pub async fn set_model(&self, provider: &str, model: &str) -> Result<ActiveSettings> {
         if self.catalog.model(provider, model).await.is_none() {
             bail!("model {provider}/{model} is not runnable in the current catalog");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if path_entry_exists(&self.project_path) {
-            (&mut files.project, self.project_path.clone())
-        } else {
-            (&mut files.global, self.settings_path())
-        };
+        let (settings, path) = self.writable_settings(&mut files);
         settings.default_provider = Some(provider.to_string());
         settings.default_model = Some(model.to_string());
         write_json(&path, settings, false).await?;
@@ -1439,11 +1444,7 @@ impl ConfigManager {
             bail!("model {provider}/{model} does not support thinking effort {thinking}");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if path_entry_exists(&self.project_path) {
-            (&mut files.project, self.project_path.clone())
-        } else {
-            (&mut files.global, self.settings_path())
-        };
+        let (settings, path) = self.writable_settings(&mut files);
         settings.model_roles.insert(
             name.to_string(),
             ModelRoleConfig {
@@ -1527,11 +1528,7 @@ impl ConfigManager {
             bail!("output limit must be at least 1024 bytes");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if path_entry_exists(&self.project_path) {
-            (&mut files.project, self.project_path.clone())
-        } else {
-            (&mut files.global, self.settings_path())
-        };
+        let (settings, path) = self.writable_settings(&mut files);
         settings.output_limit = Some(output_limit);
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
@@ -1547,11 +1544,7 @@ impl ConfigManager {
             bail!("provider and model are required to save thinking effort");
         }
         let mut files = self.files.lock().await;
-        let (settings, path) = if path_entry_exists(&self.project_path) {
-            (&mut files.project, self.project_path.clone())
-        } else {
-            (&mut files.global, self.settings_path())
-        };
+        let (settings, path) = self.writable_settings(&mut files);
         settings
             .model_thinking_levels
             .insert(model_setting_key(provider, model), thinking);
@@ -1565,11 +1558,7 @@ impl ConfigManager {
             (!value.is_empty()).then_some(value)
         });
         let mut files = self.files.lock().await;
-        let (settings, path) = if path_entry_exists(&self.project_path) {
-            (&mut files.project, self.project_path.clone())
-        } else {
-            (&mut files.global, self.settings_path())
-        };
+        let (settings, path) = self.writable_settings(&mut files);
         settings.terminal = terminal;
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
@@ -1874,9 +1863,7 @@ async fn discovery_credential_candidates(
                     .filter(|entry| entry.kind == "oauth")
                     .and_then(|entry| oauth_token_from_entry("workbuddy", entry).ok())
             };
-            let base_url = env::var(WORKBUDDY_BASE_URL_VARIABLE)
-                .ok()
-                .filter(|value| !value.trim().is_empty());
+            let base_url = non_empty_var(WORKBUDDY_BASE_URL_VARIABLE);
             let session = match stored.as_ref() {
                 Some(token) => workbuddy_session_from_oauth(token, base_url.as_deref()),
                 None => process_workbuddy_session(
@@ -2039,16 +2026,12 @@ fn selected_provider(
         files.project.default_provider.clone(),
     );
     let settings_provider = provider.clone();
-    if let Ok(value) = env::var(ENV_PROVIDER)
-        && !value.trim().is_empty()
-    {
-        provider = value;
-        source = ValueSource::Environment(ENV_PROVIDER.to_string());
-    }
-    if let Some(value) = &invocation.provider {
-        provider.clone_from(value);
-        source = ValueSource::CommandLine;
-    }
+    override_string(
+        &mut provider,
+        &mut source,
+        ENV_PROVIDER,
+        invocation.provider.as_deref(),
+    );
     (provider, source, settings_provider)
 }
 
@@ -2068,22 +2051,21 @@ async fn calculate_active(
     } else {
         (String::new(), ValueSource::Default)
     };
-    if let Ok(value) = env::var(ENV_MODEL)
-        && !value.trim().is_empty()
-    {
-        model = value;
-        model_source = ValueSource::Environment(ENV_MODEL.to_string());
-    }
-    if let Some(value) = &invocation.model {
-        model.clone_from(value);
-        model_source = ValueSource::CommandLine;
-    }
+    override_string(
+        &mut model,
+        &mut model_source,
+        ENV_MODEL,
+        invocation.model.as_deref(),
+    );
 
     let (mut output_limit, mut output_limit_source) = setting(
         DEFAULT_OUTPUT_LIMIT,
         files.global.output_limit,
         files.project.output_limit,
     );
+    // Unlike the string settings, an empty URI_AGENT_OUTPUT_LIMIT is a parse
+    // error rather than an ignored value, so this environment layer stays
+    // explicit.
     if let Ok(value) = env::var(ENV_OUTPUT_LIMIT) {
         output_limit = value
             .parse()
@@ -2099,9 +2081,7 @@ async fn calculate_active(
     }
 
     let (mut thinking, mut thinking_source) = configured_thinking(files, &provider, &model);
-    if let Ok(value) = env::var(ENV_THINKING)
-        && !value.trim().is_empty()
-    {
+    if let Some(value) = non_empty_var(ENV_THINKING) {
         thinking = value
             .parse()
             .with_context(|| format!("invalid {ENV_THINKING}"))?;
@@ -2117,12 +2097,7 @@ async fn calculate_active(
         files.global.terminal.clone(),
         files.project.terminal.clone(),
     );
-    if let Ok(value) = env::var(ENV_TERMINAL)
-        && !value.trim().is_empty()
-    {
-        terminal = value;
-        terminal_source = ValueSource::Environment(ENV_TERMINAL.to_string());
-    }
+    override_string(&mut terminal, &mut terminal_source, ENV_TERMINAL, None);
     let terminal = (!terminal.trim().is_empty()).then_some(terminal.trim().to_string());
 
     let (mut key_display, _) = setting(
@@ -2130,18 +2105,14 @@ async fn calculate_active(
         files.global.key_display,
         files.project.key_display,
     );
-    if let Ok(value) = env::var(ENV_KEY_DISPLAY)
-        && !value.trim().is_empty()
-    {
+    if let Some(value) = non_empty_var(ENV_KEY_DISPLAY) {
         key_display = value
             .parse()
             .with_context(|| format!("invalid {ENV_KEY_DISPLAY}"))?;
     }
 
     let (mut layout, _) = setting(LayoutMode::Auto, files.global.layout, files.project.layout);
-    if let Ok(value) = env::var(ENV_LAYOUT)
-        && !value.trim().is_empty()
-    {
+    if let Some(value) = non_empty_var(ENV_LAYOUT) {
         layout = value
             .parse()
             .with_context(|| format!("invalid {ENV_LAYOUT}"))?;
@@ -2202,9 +2173,7 @@ async fn resolve_model_credential(
         kind = AuthKind::ApiKey;
     }
     if provider == "workbuddy" {
-        if let Ok(value) = env::var(ENV_CODEBUDDY_API_KEY)
-            && !value.trim().is_empty()
-        {
+        if let Some(value) = non_empty_var(ENV_CODEBUDDY_API_KEY) {
             api_key = Some(value);
             source = ValueSource::Environment(ENV_CODEBUDDY_API_KEY.to_string());
             kind = AuthKind::ApiKey;
@@ -2216,26 +2185,10 @@ async fn resolve_model_credential(
             source = ValueSource::ModelsFile;
             kind = AuthKind::ApiKey;
         }
-        if let Ok(value) = env::var(ENV_CODEBUDDY_AUTH_TOKEN)
-            && !value.trim().is_empty()
-        {
+        if let Some(value) = non_empty_var(ENV_CODEBUDDY_AUTH_TOKEN) {
             api_key = Some(value);
             source = ValueSource::Environment(ENV_CODEBUDDY_AUTH_TOKEN.to_string());
             kind = AuthKind::Oauth;
-        }
-        if include_generic_overrides {
-            if let Ok(value) = env::var(ENV_API_KEY)
-                && !value.trim().is_empty()
-            {
-                api_key = Some(value);
-                source = ValueSource::Environment(ENV_API_KEY.to_string());
-                kind = AuthKind::ApiKey;
-            }
-            if let Some(value) = &invocation.api_key {
-                api_key = Some(value.clone());
-                source = ValueSource::CommandLine;
-                kind = AuthKind::ApiKey;
-            }
         }
     } else if !private_oauth {
         let mut environments = api_key_environments(provider);
@@ -2243,9 +2196,7 @@ async fn resolve_model_credential(
             environments.insert(0, ENV_ANTHROPIC_AUTH_TOKEN.to_string());
         }
         for name in environments {
-            if let Ok(value) = env::var(&name)
-                && !value.trim().is_empty()
-            {
+            if let Some(value) = non_empty_var(&name) {
                 api_key = Some(value);
                 source = ValueSource::Environment(name.clone());
                 kind = if name.contains("OAUTH") {
@@ -2255,19 +2206,19 @@ async fn resolve_model_credential(
                 };
             }
         }
-        if include_generic_overrides {
-            if let Ok(value) = env::var(ENV_API_KEY)
-                && !value.trim().is_empty()
-            {
-                api_key = Some(value);
-                source = ValueSource::Environment(ENV_API_KEY.to_string());
-                kind = AuthKind::ApiKey;
-            }
-            if let Some(value) = &invocation.api_key {
-                api_key = Some(value.clone());
-                source = ValueSource::CommandLine;
-                kind = AuthKind::ApiKey;
-            }
+    }
+    // URI_AGENT_API_KEY and --api-key apply above every provider-specific
+    // source, but only when resolving the active model's own credential.
+    if !private_oauth && include_generic_overrides {
+        if let Some(value) = non_empty_var(ENV_API_KEY) {
+            api_key = Some(value);
+            source = ValueSource::Environment(ENV_API_KEY.to_string());
+            kind = AuthKind::ApiKey;
+        }
+        if let Some(value) = &invocation.api_key {
+            api_key = Some(value.clone());
+            source = ValueSource::CommandLine;
+            kind = AuthKind::ApiKey;
         }
     }
     if api_key.is_none() {
@@ -2336,6 +2287,32 @@ fn setting<T: Clone>(default: T, global: Option<T>, project: Option<T>) -> (T, V
         (value, ValueSource::Global)
     } else {
         (default, ValueSource::Default)
+    }
+}
+
+/// The value of process environment variable `name` when it is set to a
+/// nonempty, non-whitespace value.
+fn non_empty_var(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+/// Apply the environment-variable and command-line layers of the settings
+/// precedence chain to one string field that `setting` already resolved from
+/// the default, global, and project layers. Empty or whitespace-only
+/// environment values are ignored.
+fn override_string(
+    value: &mut String,
+    source: &mut ValueSource,
+    variable: &str,
+    cli: Option<&str>,
+) {
+    if let Some(raw) = non_empty_var(variable) {
+        *value = raw;
+        *source = ValueSource::Environment(variable.to_string());
+    }
+    if let Some(cli) = cli {
+        *value = cli.to_string();
+        *source = ValueSource::CommandLine;
     }
 }
 
@@ -2589,10 +2566,7 @@ pub fn config_directory() -> Result<PathBuf> {
 }
 
 fn overridden_config_directory() -> Option<PathBuf> {
-    env::var(ENV_CONFIG_DIR)
-        .ok()
-        .filter(|directory| !directory.trim().is_empty())
-        .map(PathBuf::from)
+    non_empty_var(ENV_CONFIG_DIR).map(PathBuf::from)
 }
 
 fn default_config_directory_from(

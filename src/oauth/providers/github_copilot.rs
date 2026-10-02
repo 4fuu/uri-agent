@@ -1,11 +1,13 @@
 use super::super::device::{self, Poll};
 use super::super::util::{decode_b64, extra_string, http_client, open_url, trusted_http_url};
-use super::super::{LoginSetup, OauthDisplay, OauthLogin, OauthToken, channels, set_display};
-use super::shared::{FormUrlEncoded, json_expires, json_interval, json_or_error, required_str};
+use super::super::{OauthLogin, OauthToken, set_display};
+use super::shared::{
+    FormUrlEncoded, LoginFlow, json_expires, json_interval, json_or_error, required_str,
+    spawn_login_flow,
+};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 const COPILOT_CLIENT_ID_B64: &str = "SXYxLmI1MDdhMDhjODdlY2ZlOTg=";
@@ -15,31 +17,24 @@ pub(in crate::oauth) fn start_github_copilot(
 ) -> Result<(OauthLogin, oneshot::Receiver<Result<OauthToken>>)> {
     let domain = normalize_github_domain(domain.cloned().unwrap_or_default())?;
     let enterprise = (domain != "github.com").then(|| domain.clone());
-    let LoginSetup {
-        login,
-        paste_rx: _,
-        cancel_rx,
-        done_tx,
-        done_rx,
-        display,
-    } = channels(
+    spawn_login_flow(
         format!("https://{domain}/login/device"),
         Some("starting…".to_string()),
         "Open GitHub, enter the device code, then return here.",
-    );
-    tokio::spawn(async move {
-        let result = github_copilot_login(domain, enterprise, cancel_rx, display).await;
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        move |flow| github_copilot_login(domain, enterprise, flow),
+    )
 }
 
 async fn github_copilot_login(
     domain: String,
     enterprise: Option<String>,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
-    display: Arc<Mutex<OauthDisplay>>,
+    flow: LoginFlow,
 ) -> Result<OauthToken> {
+    let LoginFlow {
+        paste_rx: _,
+        cancel_rx,
+        display,
+    } = flow;
     let client_id = decode_b64(COPILOT_CLIENT_ID_B64)?;
     let client = http_client()?;
     let response = client
