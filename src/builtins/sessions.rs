@@ -10,14 +10,13 @@ use crate::plugin::{
 use crate::prompts;
 use crate::protocol::{ProtocolContext, ProtocolOutput, ProtocolRequest};
 use crate::retrieval::{
-    ConversationDocument, CorpusCatalog, IndexSpec, SearchFilter, SearchMode,
-    conversation_snapshot, conversation_source_key, conversation_spec, index_checkpoint,
-    index_status, rebuild_index, search_index, sync_index,
+    ConversationDocument, CorpusCatalog, IndexSpec, LiveCorpus, SearchFilter, SearchMode,
+    conversation_snapshot, conversation_source_key, conversation_spec, index_status,
+    rebuild_live_corpus, search_live_corpus,
 };
 #[cfg(test)]
 use crate::session::EventKind;
 use crate::session::{ArchivedSessionSummary, SessionArchive};
-use crate::task::AutoTask;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -25,8 +24,8 @@ use serde_json::json;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::context::step_json;
@@ -42,8 +41,6 @@ const MAX_READ_BYTES: usize = 40 * 1024;
 const MAX_OUTPUT_BYTES: usize = 48 * 1024;
 const DEFAULT_AROUND_COUNT: usize = 10;
 const MAX_AROUND_TOTAL: usize = 50;
-const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
-const MAX_INDEX_RETRIES: usize = 3;
 const CONTEXT_SESSIONS_BASE_URI: &str = "context://sessions/";
 const MAX_QUERY_CHARS: usize = 500;
 
@@ -219,7 +216,13 @@ impl SessionsPlugin {
         context
             .tasks
             .spawn_with_cancellation(record, move |cancellation| async move {
-                rebuild_archive_index(&archive, &options, cancellation).await
+                rebuild_live_corpus(
+                    || archive_index(&archive, &options),
+                    "Session",
+                    "saved sessions changed repeatedly while rebuilding the semantic index",
+                    cancellation,
+                )
+                .await
             })
             .await;
         Ok(prompts::task_accepted(&id).into())
@@ -477,10 +480,29 @@ struct SearchResult {
 
 #[derive(Clone)]
 struct ArchiveIndex {
+    archive: SessionArchive,
     spec: IndexSpec,
     catalog: CorpusCatalog,
     summaries: HashMap<String, ArchivedSessionSummary>,
     records: BTreeMap<String, (String, u64)>,
+}
+
+impl LiveCorpus for ArchiveIndex {
+    fn spec(&self) -> &IndexSpec {
+        &self.spec
+    }
+
+    fn catalog(&self) -> &CorpusCatalog {
+        &self.catalog
+    }
+
+    fn snapshot(
+        &self,
+        sources: BTreeSet<String>,
+        _cancellation: CancellationToken,
+    ) -> impl Future<Output = Result<crate::retrieval::CorpusSnapshot>> + Send {
+        load_archive_sources(&self.archive, self, sources)
+    }
 }
 
 async fn archive_index(
@@ -536,6 +558,7 @@ async fn archive_index(
     let identity = format!("{}\nscope={scope_key}", archive.index_identity());
     let spec = conversation_spec("sessions", &identity, "Session", scope_identity)?;
     Ok(ArchiveIndex {
+        archive: archive.clone(),
         spec,
         catalog,
         summaries: summaries
@@ -590,32 +613,18 @@ async fn run_semantic_discover(
     mode: SearchMode,
     context: ProtocolContext,
 ) -> Result<ProtocolOutput> {
-    let record = context
-        .tasks
-        .allocate(
+    context
+        .run_auto_background(
             "context",
             format!("Search saved sessions ({})", options.index_scope_label()),
-        )
-        .await;
-    let auto_background_after = context.foreground_grace(AUTO_BACKGROUND_AFTER);
-    match context
-        .tasks
-        .run_with_auto_background(
-            record,
-            auto_background_after,
+            "session semantic search",
             move |cancellation| async move {
-                Ok(
-                    semantic_discover(&archive, options, &query, mode, cancellation)
-                        .await?
-                        .into_bytes(),
-                )
+                semantic_discover(&archive, options, &query, mode, cancellation)
+                    .await
+                    .map(String::into_bytes)
             },
         )
-        .await?
-    {
-        AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into()),
-        AutoTask::Terminal(record) => Ok(record.terminal_result("session semantic search")?.into()),
-    }
+        .await
 }
 
 async fn semantic_discover(
@@ -627,43 +636,41 @@ async fn semantic_discover(
 ) -> Result<String> {
     let types = options.record_types()?;
     let filter = SearchFilter::conversation(types.labels().into_iter().map(str::to_string), None);
-    let (indexed, hits) = 'attempts: {
-        for _ in 0..MAX_INDEX_RETRIES {
-            let indexed = archive_index(archive, &options).await?;
-            let checkpoint = index_checkpoint(&indexed.spec).await?;
-            let sources = indexed.catalog.changed_sources(&checkpoint);
-            let snapshot = load_archive_sources(archive, &indexed, sources).await?;
-            if !sync_index(
-                &indexed.spec,
-                &indexed.catalog,
-                snapshot,
-                cancellation.clone(),
-            )
-            .await?
-            {
-                continue;
-            }
-            let fresh = archive_index(archive, &options).await?;
-            if fresh.catalog != indexed.catalog {
-                continue;
-            }
-            let hits = search_index(
-                &indexed.spec,
-                &indexed.catalog,
-                query,
-                mode,
-                2_000,
-                filter.clone(),
-                cancellation.clone(),
-            )
-            .await?;
-            if archive_index(archive, &options).await?.catalog != indexed.catalog {
-                continue;
-            }
-            break 'attempts (indexed, hits);
-        }
-        bail!("saved sessions changed repeatedly while preparing semantic search; retry the read")
+    let (indexed, hits) = search_live_corpus(
+        || archive_index(archive, &options),
+        query,
+        mode,
+        2_000,
+        filter,
+        "saved sessions changed repeatedly while preparing semantic search; retry the read",
+        cancellation,
+    )
+    .await?;
+    let results = group_search_results(&indexed, hits);
+    let scope = options.scope_value().unwrap_or(Scope::Project);
+    let scope_label = match scope {
+        Scope::Project => "project",
+        Scope::All => "all",
     };
+    format_search_results(
+        results,
+        query,
+        (scope_label, options.cwd.as_deref().map(Path::new)),
+        (
+            options.offset.unwrap_or_default(),
+            normalize_limit(options.limit, DEFAULT_DISCOVERY_LIMIT),
+        ),
+        Some(&types),
+        Some(mode),
+    )
+}
+
+/// Groups ranked hits under their session summaries, keeping at most
+/// `MAX_MATCHES_PER_SESSION` matches per session.
+fn group_search_results(
+    indexed: &ArchiveIndex,
+    hits: Vec<crate::retrieval::SearchHit>,
+) -> Vec<SearchResult> {
     let mut results = Vec::<SearchResult>::new();
     let mut positions = HashMap::<String, usize>::new();
     for hit in hits {
@@ -691,39 +698,7 @@ async fn semantic_discover(
             });
         }
     }
-    let scope = options.scope_value().unwrap_or(Scope::Project);
-    let scope_label = match scope {
-        Scope::Project => "project",
-        Scope::All => "all",
-    };
-    format_search_results(
-        results,
-        query,
-        (scope_label, options.cwd.as_deref().map(Path::new)),
-        (
-            options.offset.unwrap_or_default(),
-            normalize_limit(options.limit, DEFAULT_DISCOVERY_LIMIT),
-        ),
-        Some(&types),
-        Some(mode),
-    )
-}
-
-async fn rebuild_archive_index(
-    archive: &SessionArchive,
-    options: &SessionsOptions,
-    cancellation: CancellationToken,
-) -> Result<Vec<u8>> {
-    for _ in 0..MAX_INDEX_RETRIES {
-        let index = archive_index(archive, options).await?;
-        let sources = index.catalog.all_sources();
-        let snapshot = load_archive_sources(archive, &index, sources).await?;
-        let status = rebuild_index(&index.spec, snapshot, cancellation.clone()).await?;
-        if archive_index(archive, options).await?.catalog == index.catalog {
-            return Ok(status.format("Session").into_bytes());
-        }
-    }
-    bail!("saved sessions changed repeatedly while rebuilding the semantic index")
+    results
 }
 
 async fn discover(
@@ -1265,7 +1240,8 @@ mod tests {
     use super::*;
     use crate::session::{Session, SessionContext};
     use crate::skill::SkillSnapshot;
-    use crate::task::TaskManager;
+    use crate::task::{AutoTask, TaskManager};
+    use std::time::Duration;
 
     fn session_context() -> SessionContext {
         SessionContext {

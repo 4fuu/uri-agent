@@ -1,10 +1,11 @@
-use super::{CorpusCatalog, CorpusSnapshot, Fragment, IndexSpec};
+use super::{CorpusCatalog, CorpusSnapshot, Fragment, IndexSpec, LiveCorpus};
 use crate::config::display_path;
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tokio_util::sync::CancellationToken;
@@ -23,11 +24,6 @@ pub(crate) struct CodeCorpus {
 }
 
 impl CodeCorpus {
-    pub(crate) async fn load_all(&self, cancellation: CancellationToken) -> Result<CorpusSnapshot> {
-        let sources = self.catalog.sources.keys().cloned().collect();
-        self.load_sources(sources, cancellation).await
-    }
-
     pub(crate) async fn load_sources(
         &self,
         sources: BTreeSet<String>,
@@ -65,6 +61,24 @@ impl CodeCorpus {
             fragments.insert(source.clone(), source_fragments);
         }
         CorpusSnapshot::new(self.catalog.clone(), fragments)
+    }
+}
+
+impl LiveCorpus for CodeCorpus {
+    fn spec(&self) -> &IndexSpec {
+        &self.spec
+    }
+
+    fn catalog(&self) -> &CorpusCatalog {
+        &self.catalog
+    }
+
+    fn snapshot(
+        &self,
+        sources: BTreeSet<String>,
+        cancellation: CancellationToken,
+    ) -> impl Future<Output = Result<CorpusSnapshot>> + Send {
+        self.load_sources(sources, cancellation)
     }
 }
 
@@ -319,7 +333,10 @@ mod tests {
         let corpus = code_corpus(&lexical_cwd, directory.path(), Some("**/*.rs"))
             .await
             .unwrap();
-        let snapshot = corpus.load_all(CancellationToken::new()).await.unwrap();
+        let snapshot = corpus
+            .snapshot(corpus.catalog.all_sources(), CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot.fragments["main.rs"][0].source, "main.rs");
     }

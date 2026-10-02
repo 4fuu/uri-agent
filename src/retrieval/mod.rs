@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -465,7 +466,7 @@ impl IndexManifest {
     }
 }
 
-pub(crate) async fn index_checkpoint(spec: &IndexSpec) -> Result<IndexCheckpoint> {
+async fn index_checkpoint(spec: &IndexSpec) -> Result<IndexCheckpoint> {
     let spec = spec.clone();
     run_blocking(move || {
         let _lock = IndexLock::shared(&spec.directory)?;
@@ -493,7 +494,7 @@ pub(crate) async fn index_status(spec: &IndexSpec, catalog: &CorpusCatalog) -> R
     .await
 }
 
-pub(crate) async fn rebuild_index(
+async fn rebuild_index(
     spec: &IndexSpec,
     snapshot: CorpusSnapshot,
     cancellation: CancellationToken,
@@ -502,7 +503,7 @@ pub(crate) async fn rebuild_index(
     run_blocking(move || rebuild_index_blocking(&spec, snapshot, &cancellation)).await
 }
 
-pub(crate) async fn sync_index(
+async fn sync_index(
     spec: &IndexSpec,
     catalog: &CorpusCatalog,
     snapshot: CorpusSnapshot,
@@ -541,6 +542,118 @@ pub(crate) async fn search_index(
         search_index_blocking(&spec, &catalog, &query, mode, limit, &filter, &cancellation)
     })
     .await
+}
+
+/// A corpus rebuilt from a live source (session events, a saved-session
+/// archive, or the filesystem) that can load indexed snapshots of its
+/// sources. Implemented by the conversation, saved-session, and code corpora
+/// so they can share one sync-and-search retry loop.
+pub(crate) trait LiveCorpus: Send + Sync {
+    fn spec(&self) -> &IndexSpec;
+    fn catalog(&self) -> &CorpusCatalog;
+
+    /// Loads the fragments for exactly `sources`: the sources changed since
+    /// a checkpoint for an incremental sync, or every source for a full
+    /// rebuild.
+    fn snapshot(
+        &self,
+        sources: BTreeSet<String>,
+        cancellation: CancellationToken,
+    ) -> impl Future<Output = Result<CorpusSnapshot>> + Send;
+}
+
+/// How often a ranked read or index rebuild retries when the live corpus
+/// changes while its semantic index is syncing.
+const MAX_INDEX_RETRIES: usize = 3;
+
+/// Incrementally syncs the semantic index for a corpus rebuilt from its live
+/// source, then searches it. `rebuild` is re-evaluated around every step;
+/// when the corpus changed mid-operation the attempt restarts, so the
+/// returned corpus and hits describe a corpus the caller still observes. A
+/// snapshot load failure retries the same way when the corpus changed and
+/// otherwise propagates.
+pub(crate) async fn search_live_corpus<C, Rebuild, RebuildFuture>(
+    rebuild: Rebuild,
+    query: &str,
+    mode: SearchMode,
+    limit: usize,
+    filter: SearchFilter,
+    retry_message: &str,
+    cancellation: CancellationToken,
+) -> Result<(C, Vec<SearchHit>)>
+where
+    C: LiveCorpus,
+    Rebuild: Fn() -> RebuildFuture + Send,
+    RebuildFuture: Future<Output = Result<C>> + Send,
+{
+    for _ in 0..MAX_INDEX_RETRIES {
+        let corpus = rebuild().await?;
+        let checkpoint = index_checkpoint(corpus.spec()).await?;
+        let changed = corpus.catalog().changed_sources(&checkpoint);
+        let snapshot = match corpus.snapshot(changed, cancellation.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if rebuild().await?.catalog() != corpus.catalog() {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if !sync_index(
+            corpus.spec(),
+            corpus.catalog(),
+            snapshot,
+            cancellation.clone(),
+        )
+        .await?
+        {
+            continue;
+        }
+        if rebuild().await?.catalog() != corpus.catalog() {
+            continue;
+        }
+        let hits = search_index(
+            corpus.spec(),
+            corpus.catalog(),
+            query,
+            mode,
+            limit,
+            filter.clone(),
+            cancellation.clone(),
+        )
+        .await?;
+        if rebuild().await?.catalog() == corpus.catalog() {
+            return Ok((corpus, hits));
+        }
+    }
+    bail!("{retry_message}")
+}
+
+/// Rebuilds the semantic index for a corpus rebuilt from its live source and
+/// returns its formatted status. The rebuild is redone while the corpus
+/// keeps changing; `corpus_label` names the index in the returned status.
+pub(crate) async fn rebuild_live_corpus<C, Rebuild, RebuildFuture>(
+    rebuild: Rebuild,
+    corpus_label: &str,
+    retry_message: &str,
+    cancellation: CancellationToken,
+) -> Result<Vec<u8>>
+where
+    C: LiveCorpus,
+    Rebuild: Fn() -> RebuildFuture + Send,
+    RebuildFuture: Future<Output = Result<C>> + Send,
+{
+    for _ in 0..MAX_INDEX_RETRIES {
+        let corpus = rebuild().await?;
+        let snapshot = corpus
+            .snapshot(corpus.catalog().all_sources(), cancellation.clone())
+            .await?;
+        let status = rebuild_index(corpus.spec(), snapshot, cancellation.clone()).await?;
+        if rebuild().await?.catalog() == corpus.catalog() {
+            return Ok(status.format(corpus_label).into_bytes());
+        }
+    }
+    bail!("{retry_message}")
 }
 
 fn rebuild_index_blocking(

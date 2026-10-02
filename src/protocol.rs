@@ -1,6 +1,6 @@
 use crate::output::OutputStore;
-use crate::prompts::PromptEntry;
-use crate::task::TaskManager;
+use crate::prompts::{PromptEntry, task_accepted};
+use crate::task::{AutoTask, TaskManager};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
@@ -10,10 +10,12 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub(crate) struct ProtocolHelpRequired {
@@ -85,7 +87,37 @@ impl ProtocolContext {
             default
         }
     }
+
+    /// Runs `work` as a managed task that starts in the foreground and, when
+    /// it is still running after the usual grace period, promotes to a
+    /// background task without restarting it. Returns the task-accepted
+    /// handle or the terminal result as protocol output.
+    pub(crate) async fn run_auto_background<F, Fut>(
+        &self,
+        protocol: &str,
+        label: String,
+        result_description: &str,
+        work: F,
+    ) -> Result<ProtocolOutput>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
+        let record = self.tasks.allocate(protocol, label).await;
+        match self
+            .tasks
+            .run_with_auto_background(record, self.foreground_grace(AUTO_BACKGROUND_AFTER), work)
+            .await?
+        {
+            AutoTask::Background(id) => Ok(task_accepted(&id).into()),
+            AutoTask::Terminal(record) => Ok(record.terminal_result(result_description)?.into()),
+        }
+    }
 }
+
+/// The usual grace period before a long foreground protocol operation is
+/// promoted to a background task.
+const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 
 /// A century of foreground patience for operations a later step references;
 /// `Duration::MAX` is avoided because waits saturate `Instant` arithmetic.
@@ -545,19 +577,8 @@ impl ProtocolRegistry {
                 "protocol does not support read: {name}; call help([{name:?}]) and use its documented exec operations"
             );
         }
-        self.reject_help_address(name, target)?;
-        let help_read = self.help_read.lock().await;
-        let dependencies: &[String] = protocol.help_dependencies();
-        if let Some(dependency) = dependencies
-            .iter()
-            .find(|dependency| !help_read.contains(*dependency))
-        {
-            return Err(ProtocolHelpRequired::dependency(dependency, name).into());
-        }
-        if !help_read.contains(name) {
-            return Err(ProtocolHelpRequired::new(name).into());
-        }
-        Ok(())
+        self.require_loaded_help(protocol.as_ref(), name, target)
+            .await
     }
 
     /// Load help pages for the requested protocols through the help tool.
@@ -698,33 +719,15 @@ impl ProtocolRegistry {
             bail!("protocol does not support read: {name}");
         }
         if require_help {
-            self.reject_help_address(name, target)?;
-            let help_read = self.help_read.lock().await;
-            if let Some(dependency) = protocol
-                .help_dependencies()
-                .iter()
-                .find(|dependency| !help_read.contains(*dependency))
-            {
-                return Err(ProtocolHelpRequired::dependency(dependency, name).into());
-            }
-            if !help_read.contains(name) {
-                return Err(ProtocolHelpRequired::new(name).into());
-            }
+            self.require_loaded_help(protocol.as_ref(), name, target)
+                .await?;
         }
         let mut context = self.context.clone();
         context.pinned_foreground = pinned_foreground;
         let response = protocol
             .read_output(ProtocolRequest { uri, target, input }, context)
             .await?;
-        let (content, json, images) = response.into_parts();
-        let text = String::from_utf8_lossy(&content).into_owned();
-        let output = self.output.present(content, name).await?;
-        Ok(PresentedProtocolOutput {
-            output,
-            text,
-            json,
-            images,
-        })
+        self.present_output(name, response).await
     }
 
     async fn dispatch_exec_output(
@@ -741,18 +744,8 @@ impl ProtocolRegistry {
             .await
             .ok_or_else(|| self.unknown_protocol_error(name, include_dynamic))?;
         if require_help {
-            self.reject_help_address(name, target)?;
-            let help_read = self.help_read.lock().await;
-            if let Some(dependency) = protocol
-                .help_dependencies()
-                .iter()
-                .find(|dependency| !help_read.contains(*dependency))
-            {
-                return Err(ProtocolHelpRequired::dependency(dependency, name).into());
-            }
-            if !help_read.contains(name) {
-                return Err(ProtocolHelpRequired::new(name).into());
-            }
+            self.require_loaded_help(protocol.as_ref(), name, target)
+                .await?;
         }
         let descriptor = protocol.descriptor();
         if !descriptor.can_exec {
@@ -763,10 +756,43 @@ impl ProtocolRegistry {
         }
         let mut context = self.context.clone();
         context.pinned_foreground = pinned_foreground;
-        let content = protocol
+        let response = protocol
             .exec(ProtocolRequest { uri, target, input }, context)
             .await?;
-        let (content, json, images) = content.into_parts();
+        self.present_output(name, response).await
+    }
+
+    /// Rejects `help` addresses and requires the protocol's help page plus
+    /// every shared prerequisite to be loaded.
+    async fn require_loaded_help(
+        &self,
+        protocol: &dyn Protocol,
+        name: &str,
+        target: &str,
+    ) -> Result<()> {
+        self.reject_help_address(name, target)?;
+        let help_read = self.help_read.lock().await;
+        if let Some(dependency) = protocol
+            .help_dependencies()
+            .iter()
+            .find(|dependency| !help_read.contains(*dependency))
+        {
+            return Err(ProtocolHelpRequired::dependency(dependency, name).into());
+        }
+        if !help_read.contains(name) {
+            return Err(ProtocolHelpRequired::new(name).into());
+        }
+        Ok(())
+    }
+
+    /// Splits a completed protocol operation into its presented output and
+    /// complete text.
+    async fn present_output(
+        &self,
+        name: &str,
+        response: ProtocolOutput,
+    ) -> Result<PresentedProtocolOutput> {
+        let (content, json, images) = response.into_parts();
         let text = String::from_utf8_lossy(&content).into_owned();
         let output = self.output.present(content, name).await?;
         Ok(PresentedProtocolOutput {
