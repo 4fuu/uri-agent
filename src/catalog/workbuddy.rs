@@ -209,8 +209,7 @@ mod tests {
     use super::*;
     use crate::catalog::WorkBuddyCatalogCredential;
     use crate::oauth::WorkBuddySession;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::test_http::{self, MockResponse};
 
     #[test]
     fn cloud_models_are_converted_and_media_generators_are_filtered() {
@@ -266,45 +265,25 @@ mod tests {
 
     #[tokio::test]
     async fn cloud_fetch_uses_the_authenticated_product_config_contract() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 4096];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&chunk[..count]);
-                if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let body = json!({
-                "code": 0,
-                "data": {"data": {"models": [{
-                    "id": "remote-chat",
-                    "name": "Remote Chat",
-                    "maxInputTokens": 128000,
-                    "maxOutputTokens": 16000,
-                    "supportsToolCall": true
-                }]}}
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8(request).unwrap()
-        });
+        let body = json!({
+            "code": 0,
+            "data": {"data": {"models": [{
+                "id": "remote-chat",
+                "name": "Remote Chat",
+                "maxInputTokens": 128000,
+                "maxOutputTokens": 16000,
+                "supportsToolCall": true
+            }]}}
+        })
+        .to_string();
+        let server = test_http::serve(vec![MockResponse::json(200, body)]).await;
         let credential = CatalogCredential {
             secret: "oauth-access".to_string(),
             oauth: true,
             radius_gateway: None,
             workbuddy: Some(WorkBuddyCatalogCredential {
                 session: WorkBuddySession {
-                    endpoint: format!("http://{address}/v2"),
+                    endpoint: server.url("v2"),
                     domain: Some("enterprise.example".to_string()),
                     account: Some(json!({
                         "uid": "user@example.com",
@@ -318,7 +297,7 @@ mod tests {
         };
 
         let models = discover(&Client::new(), &credential).await.unwrap();
-        let request = server.await.unwrap();
+        let request = server.requests().await[0].clone();
         let lower = request.to_ascii_lowercase();
 
         assert_eq!(models.len(), 1);

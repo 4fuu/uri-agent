@@ -2825,8 +2825,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use crate::test_http::{self, MockResponse};
 
     #[test]
     fn acpv1_cli_path_preserves_model_overrides_and_rejects_ui_session_modes() {
@@ -3121,52 +3120,8 @@ mod tests {
         assert!(!directory.join("auth.json.lock").exists());
     }
 
-    async fn read_http_request(socket: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 4096];
-            let count = socket.read(&mut chunk).await.unwrap();
-            assert!(count > 0, "client closed before finishing its request");
-            request.extend_from_slice(&chunk[..count]);
-            let Some(header_end) = request
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .map(|index| index + 4)
-            else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or_default();
-            if request.len() >= header_end + content_length {
-                return String::from_utf8(request).unwrap();
-            }
-        }
-    }
-
-    async fn token_server(
-        status: u16,
-        body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let request = read_http_request(&mut socket).await;
-            let response = format!(
-                "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            request
-        });
-        (format!("http://{address}"), server)
+    async fn token_server(status: u16, body: &'static str) -> test_http::MockServer {
+        test_http::serve(vec![MockResponse::json(status, body)]).await
     }
 
     #[tokio::test]
@@ -4055,8 +4010,9 @@ mod tests {
         let first = ConfigManager::load_for_test(&directory, &root.path().join("first"))
             .await
             .unwrap();
-        let (gateway, server) =
+        let server =
             token_server(200, r#"{"access_token":"fresh-access","expires_in":3600}"#).await;
+        let gateway = server.base.clone();
         let original = OauthToken {
             kind: "oauth".to_string(),
             refresh: "old-refresh".to_string(),
@@ -4085,9 +4041,9 @@ mod tests {
         assert_eq!(first_token.refresh, "old-refresh");
         assert_eq!(second_token.refresh, "old-refresh");
 
-        let request = server.await.unwrap();
-        assert!(request.starts_with("POST /v1/oauth/token HTTP/1.1"));
-        assert!(request.contains("refresh_token=old-refresh"));
+        let request = server.requests().await;
+        assert!(request[0].starts_with("POST /v1/oauth/token HTTP/1.1"));
+        assert!(request[0].contains("refresh_token=old-refresh"));
         let saved: AuthFile = read_json(&directory.join("auth.json")).await.unwrap();
         let saved = oauth_token_from_entry("radius", &saved.0["radius"]).unwrap();
         assert_eq!(saved.access, "fresh-access");
@@ -4101,18 +4057,18 @@ mod tests {
         let manager = ConfigManager::load_for_test(&directory, &root.path().join("project"))
             .await
             .unwrap();
-        let (gateway, server) = token_server(400, r#"{"error":"invalid_grant"}"#).await;
+        let server = token_server(400, r#"{"error":"invalid_grant"}"#).await;
         let original = OauthToken {
             kind: "oauth".to_string(),
             refresh: "old-refresh".to_string(),
             access: "expired-access".to_string(),
             expires: 0,
-            extra: BTreeMap::from([("gateway".to_string(), Value::String(gateway))]),
+            extra: BTreeMap::from([("gateway".to_string(), Value::String(server.base.clone()))]),
         };
         manager.set_oauth("radius", original.clone()).await.unwrap();
 
         assert!(manager.refresh_oauth("radius", false).await.is_err());
-        server.await.unwrap();
+        server.requests().await;
         assert_eq!(manager.oauth_token("radius").await.unwrap(), original);
         let saved: AuthFile = read_json(&directory.join("auth.json")).await.unwrap();
         assert_eq!(

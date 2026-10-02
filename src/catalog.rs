@@ -1627,41 +1627,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::test_http::{self, MockResponse};
 
-    async fn catalog_server(
-        responses: Vec<(u16, String)>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let base_url = format!("http://{address}");
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0_u8; 4096];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0, "client closed before sending HTTP headers");
-                    request.extend_from_slice(&chunk[..count]);
-                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                requests.push(String::from_utf8(request).unwrap());
-                let reason = if status == 200 { "OK" } else { "Forbidden" };
-                let body = body.replace("$BASE_URL", &base_url);
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        (format!("http://{address}"), server)
+    async fn catalog_server(responses: Vec<(u16, String)>) -> (String, test_http::MockServer) {
+        let server = test_http::serve(
+            responses
+                .into_iter()
+                .map(|(status, body)| MockResponse::json(status, body))
+                .collect(),
+        )
+        .await;
+        let base_url = server.base.clone();
+        (base_url, server)
     }
 
     #[tokio::test]
@@ -1695,7 +1672,7 @@ mod tests {
         )]);
 
         let report = catalog.refresh(true, &credentials).await.unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(requests.len(), 3);
         assert!(requests[2].starts_with("GET /v1/models "));
@@ -1757,7 +1734,7 @@ mod tests {
         )]);
 
         let report = catalog.refresh(true, &credentials).await.unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(requests.len(), 4);
         assert_eq!(report.pi_failures, 0);
@@ -1810,7 +1787,7 @@ mod tests {
         )]);
 
         let report = catalog.refresh(true, &credentials).await.unwrap();
-        server.await.unwrap();
+        server.requests().await;
 
         assert_eq!(report.pi_failures, 0);
         assert_eq!(report.discovery_failures, 0);
@@ -1868,7 +1845,7 @@ mod tests {
         assert_eq!(catalog.models("workbuddy").await[0].id, "cloud-chat");
 
         let second = catalog.refresh(true, &credentials).await.unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(second.discovery_failures, 1);
         assert_eq!(catalog.models("workbuddy").await[0].id, "cloud-chat");

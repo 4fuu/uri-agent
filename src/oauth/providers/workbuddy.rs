@@ -717,37 +717,7 @@ fn extra_string(token: &OauthToken, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    async fn read_request(socket: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 4096];
-            let count = socket.read(&mut chunk).await.unwrap();
-            assert!(count > 0, "client closed before finishing its request");
-            request.extend_from_slice(&chunk[..count]);
-            let Some(header_end) = request
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .map(|index| index + 4)
-            else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or_default();
-            if request.len() >= header_end + content_length {
-                return String::from_utf8(request).unwrap();
-            }
-        }
-    }
+    use crate::test_http::{self, MockResponse};
 
     #[test]
     fn authentication_identity_matches_workbuddy_china() {
@@ -819,21 +789,14 @@ mod tests {
 
     #[tokio::test]
     async fn login_tolerates_an_unavailable_optional_account_snapshot() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let _ = read_request(&mut socket).await;
-            let body = json!({"code": 1, "msg": "temporarily unavailable"}).to_string();
-            let response = format!(
-                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
+        let server = test_http::serve(vec![MockResponse::json(
+            503,
+            json!({"code": 1, "msg": "temporarily unavailable"}),
+        )])
+        .await;
         let accounts = fetch_accounts(
             &http_client().unwrap(),
-            &format!("http://{address}"),
+            &server.base,
             &json!({"accessToken": "access", "domain": "copilot.tencent.com"}),
             false,
         )
@@ -841,16 +804,14 @@ mod tests {
         .unwrap();
 
         assert!(accounts.is_empty());
-        server.await.unwrap();
+        server.requests().await;
     }
 
     #[tokio::test]
     async fn refresh_uses_workbuddy_headers_and_preserves_the_current_account() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for body in [
+        let server = test_http::serve(vec![
+            MockResponse::json(
+                200,
                 json!({
                     "code": 0,
                     "data": {
@@ -860,8 +821,10 @@ mod tests {
                         "domain": "enterprise.example",
                         "method": "github"
                     }
-                })
-                .to_string(),
+                }),
+            ),
+            MockResponse::json(
+                200,
                 json!({
                     "code": 0,
                     "data": {
@@ -875,20 +838,11 @@ mod tests {
                             {"uid": "selected", "enterpriseId": "two", "lastLogin": true}
                         ]
                     }
-                })
-                .to_string(),
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut socket).await);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        let endpoint = format!("http://{address}");
+                }),
+            ),
+        ])
+        .await;
+        let endpoint = server.base.clone();
         let token = OauthToken {
             kind: "oauth".to_string(),
             refresh: "old-refresh".to_string(),
@@ -923,7 +877,7 @@ mod tests {
         assert!(refreshed.extra[AUTH_EXTRA].get("accessToken").is_none());
         assert!(refreshed.extra[AUTH_EXTRA].get("refreshToken").is_none());
 
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
         let refresh = requests[0].to_ascii_lowercase();
         assert!(refresh.starts_with("post /v2/plugin/auth/token/refresh http/1.1"));
         assert!(refresh.contains("authorization: bearer old-access"));
@@ -945,12 +899,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_without_a_refresh_token_keeps_access_and_refreshes_accounts() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut socket).await;
-            let body = json!({
+        let server = test_http::serve(vec![MockResponse::json(
+            200,
+            json!({
                 "code": 0,
                 "data": {
                     "accounts": [
@@ -962,16 +913,10 @@ mod tests {
                         }
                     ]
                 }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            request
-        });
-        let endpoint = format!("http://{address}");
+            }),
+        )])
+        .await;
+        let endpoint = server.base.clone();
         let token = OauthToken {
             kind: "oauth".to_string(),
             refresh: String::new(),
@@ -1006,7 +951,7 @@ mod tests {
         assert_eq!(refreshed.extra[AUTH_EXTRA]["tokenType"], "Bearer");
         assert!(refreshed.extra[AUTH_EXTRA].get("accessToken").is_none());
 
-        let request = server.await.unwrap().to_ascii_lowercase();
+        let request = server.requests().await.remove(0).to_ascii_lowercase();
         assert!(request.starts_with("get /v2/plugin/accounts http/1.1"));
         assert!(request.contains("authorization: bearer stored-access"));
         assert!(request.contains("x-domain: enterprise.example"));

@@ -139,8 +139,7 @@ pub(super) fn enforce_transport(model: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::test_http::{self, MockResponse};
 
     #[test]
     fn roster_filters_media_and_prices_only_known_skus() {
@@ -168,16 +167,8 @@ mod tests {
 
     #[tokio::test]
     async fn request_uses_fixed_headers_and_does_not_follow_redirects() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 4096];
-            let count = socket.read(&mut request).await.unwrap();
-            let response = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            socket.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8(request[..count].to_vec()).unwrap()
-        });
+        let server =
+            test_http::serve(vec![MockResponse::redirect("http://127.0.0.1:1/stolen")]).await;
         let credential = CatalogCredential {
             secret: "muse-secret".into(),
             oauth: true,
@@ -186,14 +177,11 @@ mod tests {
         };
 
         assert!(
-            discover_at(
-                Url::parse(&format!("http://{address}/models")).unwrap(),
-                &credential
-            )
-            .await
-            .is_err()
+            discover_at(Url::parse(&server.url("models")).unwrap(), &credential)
+                .await
+                .is_err()
         );
-        let request = server.await.unwrap().to_ascii_lowercase();
+        let request = server.requests().await[0].to_ascii_lowercase();
         assert!(request.starts_with("get /models http/1.1\r\n"));
         assert!(request.contains("authorization: bearer muse-secret\r\n"));
         assert!(request.contains("accept: application/json\r\n"));

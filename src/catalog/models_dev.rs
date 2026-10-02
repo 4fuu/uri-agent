@@ -159,8 +159,7 @@ fn normalized_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::test_http::{self, MockResponse};
 
     fn api_fixture() -> Value {
         serde_json::json!({
@@ -180,36 +179,14 @@ mod tests {
         })
     }
 
-    async fn hint_server(
-        responses: Vec<(u16, String)>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0_u8; 4096];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0, "client closed before sending HTTP headers");
-                    request.extend_from_slice(&chunk[..count]);
-                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                requests.push(String::from_utf8(request).unwrap());
-                let reason = if status == 200 { "OK" } else { "Error" };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        (format!("http://{address}"), server)
+    async fn hint_server(responses: Vec<(u16, String)>) -> test_http::MockServer {
+        test_http::serve(
+            responses
+                .into_iter()
+                .map(|(status, body)| MockResponse::json(status, body))
+                .collect(),
+        )
+        .await
     }
 
     #[test]
@@ -258,7 +235,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_distills_and_round_trips_through_the_cache_file() {
         let root = tempfile::tempdir().unwrap();
-        let (url, server) = hint_server(vec![(200, api_fixture().to_string())]).await;
+        let server = hint_server(vec![(200, api_fixture().to_string())]).await;
+        let url = server.base.clone();
         let mut hints = ProtocolHints::default();
 
         refresh(
@@ -271,7 +249,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("GET / HTTP/1.1\r\n"));
@@ -289,7 +267,8 @@ mod tests {
     #[tokio::test]
     async fn failed_refresh_keeps_cached_hints_and_suppresses_retries() {
         let root = tempfile::tempdir().unwrap();
-        let (url, server) = hint_server(vec![(500, "{}".to_string())]).await;
+        let server = hint_server(vec![(500, "{}".to_string())]).await;
+        let url = server.base.clone();
         let mut hints =
             ProtocolHints::from_hints(&[("opencode-go", "union-alpha", "anthropic-messages")]);
 
@@ -315,7 +294,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(requests.len(), 1);
         assert_eq!(

@@ -668,6 +668,7 @@ fn usage(value: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{self, MockResponse};
     use rig::message::{ImageMediaType, ToolCallId, ToolResult};
 
     #[tokio::test]
@@ -684,47 +685,17 @@ mod tests {
 
     #[tokio::test]
     async fn radius_401_refreshes_once_then_streams_with_new_key() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let gateway = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in [
-                (401, r#"{"error":{"message":"expired"}}"#),
-                (
-                    200,
-                    r#"{"access_token":"fresh-key","refresh_token":"rotated","expires_in":3600}"#,
-                ),
-                (
-                    200,
-                    "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\ndata: {\"type\":\"done\",\"reason\":\"stop\",\"usage\":{\"input\":2,\"output\":1,\"totalTokens\":3}}\n\n",
-                ),
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                loop {
-                    let mut chunk = [0; 4096];
-                    let n = socket.read(&mut chunk).await.unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&chunk[..n]);
-                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
-                        let length = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length: "))
-                            .unwrap_or("0")
-                            .parse::<usize>()
-                            .unwrap();
-                        if bytes.len() >= end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                requests.push(String::from_utf8(bytes).unwrap());
-                socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-            requests
-        });
+        let server = test_http::serve(vec![
+            MockResponse::status(401).with_body(r#"{"error":{"message":"expired"}}"#),
+            MockResponse::status(200).with_body(
+                r#"{"access_token":"fresh-key","refresh_token":"rotated","expires_in":3600}"#,
+            ),
+            MockResponse::status(200).with_body(
+                "data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"ok\"}\n\ndata: {\"type\":\"done\",\"reason\":\"stop\",\"usage\":{\"input\":2,\"output\":1,\"totalTokens\":3}}\n\n",
+            ),
+        ])
+        .await;
+        let gateway = server.base.clone();
         let root = tempfile::tempdir().unwrap();
         let manager = ConfigManager::load_for_test(root.path(), root.path())
             .await
@@ -770,7 +741,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.context_tokens, Some(3));
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
         assert!(requests[0].starts_with("POST /v1/messages "));
         assert!(requests[0].contains("Bearer old-key"));
         assert!(requests[1].starts_with("POST /v1/oauth/token "));
@@ -782,27 +753,17 @@ mod tests {
     }
 
     async fn stream_fixture(line_ending: &str) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
         let body = format!(
             "data: {{\"type\":\"text_start\",\"contentIndex\":0}}{0}{0}data: {{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"ok\"}}{0}{0}data: {{\"type\":\"done\",\"reason\":\"stop\",\"usage\":{{}}}}",
             line_ending
         );
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            let _ = socket.read(&mut request).await.unwrap();
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
-            for byte in body.bytes() {
-                socket
-                    .write_all(format!("1\r\n{}\r\n", char::from(byte)).as_bytes())
-                    .await
-                    .unwrap();
-            }
-            socket.write_all(b"0\r\n\r\n").await.unwrap();
-        });
-        reqwest::get(format!("http://{address}")).await.unwrap()
+        // The mock keeps serving until its scripted response is consumed, so
+        // dropping the handle here cannot strand the streaming body.
+        let server = test_http::serve(vec![
+            MockResponse::text(200, "text/event-stream", body).chunked(),
+        ])
+        .await;
+        reqwest::get(server.base.clone()).await.unwrap()
     }
 
     #[tokio::test]

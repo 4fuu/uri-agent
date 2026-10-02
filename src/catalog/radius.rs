@@ -150,9 +150,8 @@ fn parse_config(value: Value, gateway: &Url) -> Result<Vec<CatalogModel>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{self, MockResponse};
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     #[test]
     fn gateway_config_preserves_published_metadata() {
@@ -194,29 +193,25 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_fetch_uses_origin_root_auth_and_rejects_cross_origin_config() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 4096];
-            let count = socket.read(&mut request).await.unwrap();
-            let body = r#"{"baseUrl":"https://attacker.test/v1","models":[]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8(request[..count].to_vec()).unwrap()
-        });
+        // The gateway path is rewritten to /v1/config, so the mock matches on
+        // the request target instead of the per-server prefix.
+        let server = test_http::serve_root(
+            vec![MockResponse::json(
+                200,
+                r#"{"baseUrl":"https://attacker.test/v1","models":[]}"#,
+            )],
+            "/v1/config",
+        )
+        .await;
         let credential = CatalogCredential {
             secret: "radius-secret".into(),
             oauth: false,
-            radius_gateway: Some(format!("http://{address}/ignored/path")),
+            radius_gateway: Some(format!("{}/ignored/path", server.base)),
             workbuddy: None,
         };
 
         assert!(discover(&Client::new(), &credential).await.is_err());
-        let request = server.await.unwrap().to_ascii_lowercase();
+        let request = server.requests().await[0].to_ascii_lowercase();
         assert!(request.starts_with("get /v1/config http/1.1\r\n"));
         assert!(request.contains("authorization: bearer radius-secret\r\n"));
         assert!(request.contains("accept: application/json\r\n"));

@@ -1063,9 +1063,7 @@ mod tests {
     use crate::config::ConfigManager;
     use crate::plugin::PluginCredentials;
     use crate::task::TaskManager;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
+    use crate::test_http::{self, MockResponse};
 
     async fn manager_with_keys(keys: &[(&str, &str)]) -> (tempfile::TempDir, Arc<ConfigManager>) {
         let root = tempfile::tempdir().unwrap();
@@ -1079,125 +1077,6 @@ mod tests {
                 .unwrap();
         }
         (root, manager)
-    }
-
-    async fn server_once(
-        status: &str,
-        content_type: &str,
-        body: String,
-    ) -> (Url, oneshot::Receiver<String>, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (request_tx, request_rx) = oneshot::channel();
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut stream).await;
-            let _ = request_tx.send(request);
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-        (
-            Url::parse(&format!("http://{address}/request")).unwrap(),
-            request_rx,
-            task,
-        )
-    }
-
-    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        let header_end = loop {
-            let count = stream.read(&mut buffer).await.unwrap();
-            if count == 0 {
-                panic!("client closed before sending HTTP headers");
-            }
-            request.extend_from_slice(&buffer[..count]);
-            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]);
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let count = stream.read(&mut buffer).await.unwrap();
-            if count == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..count]);
-        }
-        String::from_utf8_lossy(&request).into_owned()
-    }
-
-    async fn server_sequence(
-        bodies: Vec<String>,
-    ) -> (
-        Url,
-        oneshot::Receiver<Vec<String>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (requests_tx, requests_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for body in bodies {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut stream).await);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-            let _ = requests_tx.send(requests);
-        });
-        (
-            Url::parse(&format!("http://{address}/request")).unwrap(),
-            requests_rx,
-            task,
-        )
-    }
-
-    async fn redirect_server_once(location: &str) -> (Url, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let response = format!(
-            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // Read the full request before responding: closing the socket with
-            // unread request data makes Windows reset the connection, which
-            // discards the response before the client can read it.
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let count = stream.read(&mut buffer).await.unwrap();
-                if count == 0 {
-                    panic!("client closed before sending HTTP headers");
-                }
-                request.extend_from_slice(&buffer[..count]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            stream.write_all(response.as_bytes()).await.unwrap();
-            let _ = stream.shutdown().await;
-        });
-        (
-            Url::parse(&format!("http://{address}/redirect")).unwrap(),
-            task,
-        )
     }
 
     fn request_json(request: &str) -> Value {
@@ -1248,25 +1127,31 @@ mod tests {
         let (_root, manager) = manager_with_keys(&[]).await;
         let protocol = HttpsProtocol::new().with_credentials(PluginCredentials::new(manager));
         let body = "<html><body><nav>Menu</nav><main><h1>Title</h1><p>Hello <strong>web</strong>.</p></main></body></html>";
-        let (url, request, server) = server_once("200 OK", "text/html", body.to_string()).await;
+        let server =
+            test_http::serve(vec![MockResponse::text(200, "text/html", body.to_string())]).await;
+        let url = Url::parse(&server.url("request")).unwrap();
 
         let output = String::from_utf8(protocol.fetch_page(url.clone()).await.unwrap()).unwrap();
         assert!(output.contains(&format!("Source: {url}")));
         assert!(output.contains("# Title"));
         assert!(output.contains("Hello **web**."));
         assert!(!output.contains("Menu"));
-        assert!(request.await.unwrap().starts_with("GET /request HTTP/1.1"));
-        server.await.unwrap();
+        let requests = server.requests().await;
+        assert!(requests[0].starts_with("GET /request HTTP/1.1"));
     }
 
     #[tokio::test]
     async fn rejects_page_redirects_to_non_https_targets() {
         let protocol = HttpsProtocol::new();
-        let (url, server) = redirect_server_once("http://example.com/insecure").await;
+        let server =
+            test_http::serve(vec![MockResponse::redirect("http://example.com/insecure")]).await;
 
-        let error = protocol.fetch_page(url).await.unwrap_err();
+        let error = protocol
+            .fetch_page(Url::parse(&server.url("redirect")).unwrap())
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("non-HTTPS URL"));
-        server.await.unwrap();
+        server.requests().await;
     }
 
     #[tokio::test]
@@ -1285,7 +1170,8 @@ mod tests {
             "session_id": "session-1"
         })
         .to_string();
-        let (parallel_url, request, server) = server_once("200 OK", "application/json", body).await;
+        let parallel_server = test_http::serve(vec![MockResponse::json(200, body)]).await;
+        let parallel_url = Url::parse(&parallel_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1299,7 +1185,7 @@ mod tests {
         assert!(output.contains("Title: Extracted article"));
         assert!(!output.contains("Content-Type:"));
 
-        let request = request.await.unwrap();
+        let request = parallel_server.requests().await.remove(0);
         assert!(
             request
                 .to_ascii_lowercase()
@@ -1311,7 +1197,6 @@ mod tests {
             body["advanced_settings"]["full_content"]["max_chars_per_result"],
             MAX_EXTRACT_CHARS
         );
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1328,7 +1213,8 @@ mod tests {
             "statuses": [{"id": "https://example.com/app", "status": "success"}]
         })
         .to_string();
-        let (exa_url, request, server) = server_once("200 OK", "application/json", body).await;
+        let exa_server = test_http::serve(vec![MockResponse::json(200, body)]).await;
+        let exa_url = Url::parse(&exa_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1340,24 +1226,20 @@ mod tests {
         assert!(!output.contains("Provider:"));
         assert!(output.contains("# Exa Markdown"));
 
-        let request = request.await.unwrap();
+        let request = exa_server.requests().await.remove(0);
         assert!(request.to_ascii_lowercase().contains("x-api-key: exa-key"));
         let body = request_json(&request);
         assert_eq!(body["urls"][0], "https://example.com/app");
         assert_eq!(body["text"], true);
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn page_extraction_falls_back_from_parallel_to_exa() {
         let (_root, manager) =
             manager_with_keys(&[("parallel", "parallel-key"), ("exa", "exa-key")]).await;
-        let (parallel_url, parallel_request, parallel_server) = server_once(
-            "503 Service Unavailable",
-            "application/json",
-            r#"{"error":"unavailable"}"#.to_string(),
-        )
-        .await;
+        let parallel_server =
+            test_http::serve(vec![MockResponse::json(503, r#"{"error":"unavailable"}"#)]).await;
+        let parallel_url = Url::parse(&parallel_server.url("request")).unwrap();
         let exa_body = json!({
             "requestId": "contents-fallback",
             "results": [{
@@ -1367,8 +1249,8 @@ mod tests {
             "statuses": [{"id": "https://example.com/fallback", "status": "success"}]
         })
         .to_string();
-        let (exa_url, exa_request, exa_server) =
-            server_once("200 OK", "application/json", exa_body).await;
+        let exa_server = test_http::serve(vec![MockResponse::json(200, exa_body)]).await;
+        let exa_url = Url::parse(&exa_server.url("request")).unwrap();
         let unused_tinyfish = Url::parse("http://127.0.0.1:1/tinyfish").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1380,21 +1262,15 @@ mod tests {
         assert!(!output.contains("Provider:"));
         assert!(output.contains("# Extracted through Exa"));
         assert!(
-            parallel_request
-                .await
-                .unwrap()
+            parallel_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: parallel-key")
         );
         assert!(
-            exa_request
-                .await
-                .unwrap()
+            exa_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: exa-key")
         );
-        parallel_server.await.unwrap();
-        exa_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1411,7 +1287,8 @@ mod tests {
             }]
         })
         .to_string();
-        let (parallel_url, request, server) = server_once("200 OK", "application/json", body).await;
+        let parallel_server = test_http::serve(vec![MockResponse::json(200, body)]).await;
+        let parallel_url = Url::parse(&parallel_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1447,7 +1324,7 @@ mod tests {
         assert!(output.contains("Rust is a programming language."));
         assert!(output.contains("Warning: A provider warning"));
 
-        let request = request.await.unwrap();
+        let request = parallel_server.requests().await.remove(0);
         let lower = request.to_ascii_lowercase();
         assert!(lower.contains("x-api-key: saved-parallel-key"));
         assert!(!lower.contains("parallel-beta:"));
@@ -1476,7 +1353,6 @@ mod tests {
             body["advanced_settings"]["fetch_policy"]["disable_cache_fallback"],
             true
         );
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1502,8 +1378,8 @@ mod tests {
             ]
         })
         .to_string();
-        let (exa_url, exa_request, exa_server) =
-            server_once("200 OK", "application/json", exa_body).await;
+        let exa_server = test_http::serve(vec![MockResponse::json(200, exa_body)]).await;
+        let exa_url = Url::parse(&exa_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1534,7 +1410,7 @@ mod tests {
         assert!(output.contains("Subpage: Exa documentation"));
         assert!(output.contains("https://example.com/exa/docs"));
         assert!(!output.contains("http://example.com/insecure"));
-        let request = exa_request.await.unwrap();
+        let request = exa_server.requests().await.remove(0);
         assert!(request.to_ascii_lowercase().contains("x-api-key: exa-key"));
         let body = request_json(&request);
         assert_eq!(body["type"], "fast");
@@ -1547,19 +1423,15 @@ mod tests {
         assert_eq!(body["contents"]["subpages"], 1);
         assert_eq!(body["contents"]["subpageTarget"], json!(["docs"]));
         assert!(body["contents"].get("summary").is_none());
-        exa_server.await.unwrap();
     }
 
     #[tokio::test]
     async fn falls_back_from_parallel_to_exa() {
         let (_root, manager) =
             manager_with_keys(&[("parallel", "parallel-key"), ("exa", "exa-key")]).await;
-        let (parallel_url, parallel_request, parallel_server) = server_once(
-            "503 Service Unavailable",
-            "application/json",
-            r#"{"error":"unavailable"}"#.to_string(),
-        )
-        .await;
+        let parallel_server =
+            test_http::serve(vec![MockResponse::json(503, r#"{"error":"unavailable"}"#)]).await;
+        let parallel_url = Url::parse(&parallel_server.url("request")).unwrap();
         let exa_body = json!({
             "requestId": "exa-1",
             "results": [{
@@ -1569,8 +1441,8 @@ mod tests {
             }]
         })
         .to_string();
-        let (exa_url, exa_request, exa_server) =
-            server_once("200 OK", "application/json", exa_body).await;
+        let exa_server = test_http::serve(vec![MockResponse::json(200, exa_body)]).await;
+        let exa_url = Url::parse(&exa_server.url("request")).unwrap();
         let unused_tinyfish = Url::parse("http://127.0.0.1:1/tinyfish").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1587,21 +1459,15 @@ mod tests {
         assert!(!output.contains("Provider:"));
         assert!(output.contains("Found through Exa."));
         assert!(
-            parallel_request
-                .await
-                .unwrap()
+            parallel_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: parallel-key")
         );
         assert!(
-            exa_request
-                .await
-                .unwrap()
+            exa_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: exa-key")
         );
-        parallel_server.await.unwrap();
-        exa_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1834,7 +1700,8 @@ mod tests {
             "page": 0
         })
         .to_string();
-        let (tinyfish_url, request, server) = server_once("200 OK", "application/json", body).await;
+        let tinyfish_server = test_http::serve(vec![MockResponse::json(200, body)]).await;
+        let tinyfish_url = Url::parse(&tinyfish_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1866,7 +1733,7 @@ mod tests {
         assert!(output.contains("Published: 2017"));
         assert!(!output.contains("http://insecure.example.com/"));
 
-        let request = request.await.unwrap();
+        let request = tinyfish_server.requests().await.remove(0);
         let lower = request.to_ascii_lowercase();
         assert!(lower.contains("x-api-key: saved-tinyfish-key"));
         assert!(request.starts_with("GET /request?query=rust"));
@@ -1877,7 +1744,6 @@ mod tests {
         assert!(request.contains("include_domains=example.com"));
         assert!(request.contains("purpose=release"));
         assert!(!request.contains("page="));
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1897,8 +1763,12 @@ mod tests {
                 .collect::<Vec<_>>();
             json!({ "query": "paged", "results": results }).to_string()
         };
-        let (tinyfish_url, requests, server) =
-            server_sequence(vec![page(0, 10), page(10, 5)]).await;
+        let tinyfish_server = test_http::serve(vec![
+            MockResponse::json(200, page(0, 10)),
+            MockResponse::json(200, page(10, 5)),
+        ])
+        .await;
+        let tinyfish_url = Url::parse(&tinyfish_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1919,12 +1789,11 @@ mod tests {
         assert!(output.contains("15. Result 15"));
         assert!(!output.contains("16. Result 16"));
 
-        let requests = requests.await.unwrap();
+        let requests = tinyfish_server.requests().await;
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /request?query=paged"));
         assert!(!requests[0].contains("page="));
         assert!(requests[1].contains("page=1"));
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1941,7 +1810,8 @@ mod tests {
             "errors": []
         })
         .to_string();
-        let (tinyfish_url, request, server) = server_once("200 OK", "application/json", body).await;
+        let tinyfish_server = test_http::serve(vec![MockResponse::json(200, body)]).await;
+        let tinyfish_url = Url::parse(&tinyfish_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1955,7 +1825,7 @@ mod tests {
         assert!(output.contains("Published: 2026-08-21"));
         assert!(output.contains("# TinyFish Markdown"));
 
-        let request = request.await.unwrap();
+        let request = tinyfish_server.requests().await.remove(0);
         assert!(
             request
                 .to_ascii_lowercase()
@@ -1964,7 +1834,6 @@ mod tests {
         let body = request_json(&request);
         assert_eq!(body["urls"][0], "https://example.com/app");
         assert_eq!(body["format"], "markdown");
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1975,8 +1844,8 @@ mod tests {
             "errors": [{ "url": "https://example.com/blocked", "error": "bot_blocked" }]
         })
         .to_string();
-        let (tinyfish_url, _request, server) =
-            server_once("200 OK", "application/json", body).await;
+        let tinyfish_server = test_http::serve(vec![MockResponse::json(200, body)]).await;
+        let tinyfish_url = Url::parse(&tinyfish_server.url("request")).unwrap();
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -1986,7 +1855,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("TinyFish could not extract https://example.com/blocked"));
         assert!(message.contains("bot_blocked"));
-        server.await.unwrap();
+        tinyfish_server.requests().await;
     }
 
     #[tokio::test]
@@ -1997,18 +1866,12 @@ mod tests {
             ("tinyfish", "tinyfish-key"),
         ])
         .await;
-        let (parallel_url, parallel_request, parallel_server) = server_once(
-            "503 Service Unavailable",
-            "application/json",
-            r#"{"error":"unavailable"}"#.to_string(),
-        )
-        .await;
-        let (exa_url, exa_request, exa_server) = server_once(
-            "503 Service Unavailable",
-            "application/json",
-            r#"{"error":"unavailable"}"#.to_string(),
-        )
-        .await;
+        let parallel_server =
+            test_http::serve(vec![MockResponse::json(503, r#"{"error":"unavailable"}"#)]).await;
+        let parallel_url = Url::parse(&parallel_server.url("request")).unwrap();
+        let exa_server =
+            test_http::serve(vec![MockResponse::json(503, r#"{"error":"unavailable"}"#)]).await;
+        let exa_url = Url::parse(&exa_server.url("request")).unwrap();
         let tinyfish_body = json!({
             "query": "fallback",
             "results": [{
@@ -2022,8 +1885,8 @@ mod tests {
             "page": 0
         })
         .to_string();
-        let (tinyfish_url, tinyfish_request, tinyfish_server) =
-            server_once("200 OK", "application/json", tinyfish_body).await;
+        let tinyfish_server = test_http::serve(vec![MockResponse::json(200, tinyfish_body)]).await;
+        let tinyfish_url = Url::parse(&tinyfish_server.url("request")).unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
             .with_search_urls(parallel_url, exa_url, tinyfish_url);
@@ -2038,29 +1901,20 @@ mod tests {
         assert!(output.starts_with(UNTRUSTED_WEB_CONTENT));
         assert!(output.contains("Found through TinyFish."));
         assert!(
-            parallel_request
-                .await
-                .unwrap()
+            parallel_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: parallel-key")
         );
         assert!(
-            exa_request
-                .await
-                .unwrap()
+            exa_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: exa-key")
         );
         assert!(
-            tinyfish_request
-                .await
-                .unwrap()
+            tinyfish_server.requests().await[0]
                 .to_ascii_lowercase()
                 .contains("x-api-key: tinyfish-key")
         );
-        parallel_server.await.unwrap();
-        exa_server.await.unwrap();
-        tinyfish_server.await.unwrap();
     }
 
     #[tokio::test]

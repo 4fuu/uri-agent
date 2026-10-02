@@ -11,9 +11,9 @@ use rig::message::{AssistantContent, Message, ReasoningContent, ToolResultConten
 use serde_json::{Value, json};
 use std::time::Duration;
 
+use crate::test_http::{self, MockResponse};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::accept_hdr_async;
@@ -97,124 +97,77 @@ fn codex_model(base_url: String) -> CatalogModel {
     model
 }
 
-async fn server_once(
-    status: &str,
-    content_type: &str,
-    body: String,
-) -> (
-    String,
-    oneshot::Receiver<String>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (request_tx, request_rx) = oneshot::channel();
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Request-Id: codex-request-1\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let task = tokio::spawn(async move {
-        for attempt in 0..2 {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let header_end = loop {
-                let count = stream.read(&mut buffer).await.unwrap();
-                assert!(count > 0, "client closed before sending HTTP headers");
-                request.extend_from_slice(&buffer[..count]);
-                if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            if attempt == 0 {
-                assert!(headers.to_ascii_lowercase().contains("upgrade: websocket"));
-                stream
-                        .write_all(
-                            b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .unwrap();
-                continue;
-            }
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or_default();
-            while request.len() < header_end + content_length {
-                let count = stream.read(&mut buffer).await.unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..count]);
-            }
-            let _ = request_tx.send(String::from_utf8(request).unwrap());
-            stream.write_all(response.as_bytes()).await.unwrap();
-            break;
-        }
-    });
-    (format!("http://{address}/backend-api"), request_rx, task)
+/// The scripted pair a Codex backend sees over plain HTTP: it first attempts
+/// a websocket upgrade, which this mock refuses with 426, then repeats the
+/// request over HTTP and receives the given response. Returns the recorded
+/// requests (upgrade attempt first).
+async fn server_once(status: u16, content_type: &str, body: String) -> test_http::MockServer {
+    test_http::serve(vec![
+        MockResponse::status(426),
+        MockResponse::text(status, content_type, body)
+            .with_header("X-Request-Id", "codex-request-1"),
+    ])
+    .await
 }
 
-async fn streaming_server(
-    responses: Vec<String>,
-) -> (
-    String,
-    oneshot::Receiver<Vec<String>>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (requests_tx, requests_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        let mut requests = Vec::with_capacity(responses.len());
-        for body in responses {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let header_end = loop {
-                let count = stream.read(&mut buffer).await.unwrap();
-                assert!(count > 0, "client closed before sending HTTP headers");
-                request.extend_from_slice(&buffer[..count]);
-                if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or_default();
-            while request.len() < header_end + content_length {
-                let count = stream.read(&mut buffer).await.unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..count]);
-            }
-            requests.push(String::from_utf8(request).unwrap());
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        }
-        let _ = requests_tx.send(requests);
-    });
-    (format!("http://{address}/v1"), requests_rx, task)
+async fn streaming_server(bodies: Vec<String>) -> test_http::MockServer {
+    test_http::serve(
+        bodies
+            .into_iter()
+            .map(|body| MockResponse::text(200, "text/event-stream", body))
+            .collect(),
+    )
+    .await
 }
 
 fn request_json(request: &str) -> Value {
     let (_, body) = request.split_once("\r\n\r\n").unwrap();
     serde_json::from_str(body).unwrap()
+}
+
+/// Whether a websocket handshake targets this server's random prefix.
+/// Handshakes that miss it are local port probes and are refused, so they
+/// cannot consume a fixture's connection slot.
+fn websocket_target_matches(uri: &http::Uri, prefix: &str) -> bool {
+    uri.path()
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Accept the next websocket handshake addressed to `prefix`, refusing every
+/// other target. `on_handshake` observes the accepted request.
+#[allow(clippy::result_large_err)] // Required by tungstenite's handshake callback result type.
+async fn accept_prefixed_websocket<C>(
+    listener: &TcpListener,
+    prefix: &str,
+    mut on_handshake: C,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>
+where
+    C: FnMut(&WebSocketRequest),
+{
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut matched = false;
+        let handshake = accept_hdr_async(
+            stream,
+            |request: &WebSocketRequest, response: WebSocketResponse| {
+                if websocket_target_matches(request.uri(), prefix) {
+                    matched = true;
+                    on_handshake(request);
+                    Ok(response)
+                } else {
+                    Err(http::Response::builder()
+                        .status(404)
+                        .body(Some(String::new()))
+                        .expect("static handshake refusal"))
+                }
+            },
+        )
+        .await;
+        if matched {
+            return handshake.expect("websocket handshake under the test prefix failed");
+        }
+    }
 }
 
 fn codex_completed_event(response_id: &str, message_id: &str, text: &str) -> Value {
@@ -429,8 +382,8 @@ async fn openrouter_replays_encrypted_reasoning_across_tool_rounds() {
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
         }),
     ]);
-    let (base_url, requests_rx, server) =
-        streaming_server(vec![first_response, second_response]).await;
+    let server = streaming_server(vec![first_response, second_response]).await;
+    let base_url = server.url("v1");
     let mut model = catalog_model(
         "openai-completions",
         json!({
@@ -523,8 +476,7 @@ async fn openrouter_replays_encrypted_reasoning_across_tool_rounds() {
         Some(AssistantContent::Text(text)) if text.text == "README loaded"
     ));
 
-    let requests = requests_rx.await.unwrap();
-    server.await.unwrap();
+    let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
     for request in &requests {
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
@@ -632,25 +584,18 @@ fn codex_base_url_adds_the_backend_path_once() {
 }
 
 #[tokio::test]
-#[allow(clippy::result_large_err)] // Required by tungstenite's handshake callback result type.
 async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let (listener, base, prefix) = test_http::bind().await;
     let (handshake_tx, handshake_rx) = oneshot::channel();
     let (requests_tx, requests_rx) = oneshot::channel();
+    let task_prefix = prefix.clone();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
         let mut handshake_tx = Some(handshake_tx);
-        let mut websocket = accept_hdr_async(
-            stream,
-            move |request: &WebSocketRequest, response: WebSocketResponse| {
-                let capture = (request.uri().clone(), request.headers().clone());
-                let _ = handshake_tx.take().unwrap().send(capture);
-                Ok(response)
-            },
-        )
-        .await
-        .unwrap();
+        let mut websocket = accept_prefixed_websocket(&listener, &task_prefix, |request| {
+            let capture = (request.uri().clone(), request.headers().clone());
+            let _ = handshake_tx.take().unwrap().send(capture);
+        })
+        .await;
         let mut requests = Vec::new();
         for (index, (response_id, message_id, text)) in [
             ("resp_1", "msg_1", "first answer"),
@@ -667,7 +612,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
         let _ = websocket.close(None).await;
     });
     let backend = RigBackend::new(
-        &codex_model(format!("http://{address}/backend-api")),
+        &codex_model(format!("{base}/backend-api")),
         &codex_access_token(),
         &Default::default(),
         AuthKind::Oauth,
@@ -691,7 +636,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
         .await
         .unwrap();
     let resumed_backend = RigBackend::new(
-        &codex_model(format!("http://{address}/backend-api")),
+        &codex_model(format!("{base}/backend-api")),
         &codex_access_token(),
         &Default::default(),
         AuthKind::Oauth,
@@ -725,7 +670,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
     let requests = requests_rx.await.unwrap();
     server.await.unwrap();
 
-    assert_eq!(uri.path(), "/backend-api/codex/responses");
+    assert_eq!(uri.path(), format!("{prefix}/backend-api/codex/responses"));
     assert_eq!(headers["chatgpt-account-id"], "account-123");
     assert_eq!(headers["originator"], "pi");
     assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
@@ -761,12 +706,10 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
 
 #[tokio::test]
 async fn codex_websocket_retries_stale_continuation_with_full_input() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let (listener, base, prefix) = test_http::bind().await;
     let (requests_tx, requests_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut websocket = accept_prefixed_websocket(&listener, &prefix, |_| {}).await;
         let first = read_codex_websocket_request(&mut websocket).await;
         send_codex_websocket_response(&mut websocket, "resp_1", "msg_1", "first answer").await;
         let continuation = read_codex_websocket_request(&mut websocket).await;
@@ -793,15 +736,14 @@ async fn codex_websocket_retries_stale_continuation_with_full_input() {
             .await
             .unwrap();
 
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut retry_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut retry_websocket = accept_prefixed_websocket(&listener, &prefix, |_| {}).await;
         let retry = read_codex_websocket_request(&mut retry_websocket).await;
         send_codex_websocket_response(&mut retry_websocket, "resp_2", "msg_2", "second answer")
             .await;
         let _ = requests_tx.send(vec![first, continuation, retry]);
     });
     let backend = RigBackend::new(
-        &codex_model(format!("http://{address}/backend-api")),
+        &codex_model(format!("{base}/backend-api")),
         &codex_access_token(),
         &Default::default(),
         AuthKind::Oauth,
@@ -844,12 +786,10 @@ async fn codex_websocket_retries_stale_continuation_with_full_input() {
 
 #[tokio::test]
 async fn codex_websocket_retries_connection_limit_on_a_new_connection() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let (listener, base, prefix) = test_http::bind().await;
     let (requests_tx, requests_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut websocket = accept_prefixed_websocket(&listener, &prefix, |_| {}).await;
         let first = read_codex_websocket_request(&mut websocket).await;
         websocket
             .send(WebSocketMessage::Text(
@@ -866,15 +806,14 @@ async fn codex_websocket_retries_connection_limit_on_a_new_connection() {
             .await
             .unwrap();
 
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut retry_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut retry_websocket = accept_prefixed_websocket(&listener, &prefix, |_| {}).await;
         let retry = read_codex_websocket_request(&mut retry_websocket).await;
         send_codex_websocket_response(&mut retry_websocket, "resp_1", "msg_1", "retried answer")
             .await;
         let _ = requests_tx.send(vec![first, retry]);
     });
     let backend = RigBackend::new(
-        &codex_model(format!("http://{address}/backend-api")),
+        &codex_model(format!("{base}/backend-api")),
         &codex_access_token(),
         &Default::default(),
         AuthKind::Oauth,
@@ -900,12 +839,10 @@ async fn codex_websocket_retries_connection_limit_on_a_new_connection() {
 
 #[tokio::test]
 async fn codex_websocket_does_not_fall_back_after_output_starts() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let (listener, base, prefix) = test_http::bind().await;
     let (reconnected_tx, reconnected_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut websocket = accept_prefixed_websocket(&listener, &prefix, |_| {}).await;
         let _request = read_codex_websocket_request(&mut websocket).await;
         websocket
             .send(WebSocketMessage::Text(
@@ -923,13 +860,29 @@ async fn codex_websocket_does_not_fall_back_after_output_starts() {
             .await
             .unwrap();
         websocket.close(None).await.unwrap();
-        let reconnected = tokio::time::timeout(Duration::from_millis(500), listener.accept())
-            .await
-            .is_ok();
+        // Only a fresh request addressed to this mock's prefix counts as a
+        // reconnect; anything else is a probe of the listening port.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut reconnected = false;
+        while !reconnected {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                break;
+            };
+            let Ok(Ok((mut stream, _))) = tokio::time::timeout(remaining, listener.accept()).await
+            else {
+                break;
+            };
+            if let Some(request) = test_http::read_request(&mut stream).await
+                && test_http::target_has_prefix(&request, &prefix)
+            {
+                reconnected = true;
+            }
+        }
         let _ = reconnected_tx.send(reconnected);
     });
     let backend = RigBackend::new(
-        &codex_model(format!("http://{address}/backend-api")),
+        &codex_model(format!("{base}/backend-api")),
         &codex_access_token(),
         &Default::default(),
         AuthKind::Oauth,
@@ -1062,9 +1015,9 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
         .map(|event| format!("data: {event}\n\n"))
         .collect::<String>();
     sse.push_str(&format!("data: {terminal}"));
-    let (base_url, request_rx, server) = server_once("200 OK", "text/event-stream", sse).await;
+    let server = server_once(200, "text/event-stream", sse).await;
     let backend = RigBackend::new(
-        &codex_model(base_url),
+        &codex_model(server.url("backend-api")),
         &codex_access_token(),
         &Default::default(),
         AuthKind::Oauth,
@@ -1088,9 +1041,16 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
         )
         .await
         .unwrap();
-    let request = request_rx.await.unwrap();
-    server.await.unwrap();
-    let request_body = request_json(&request);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    // The first connection is the websocket upgrade attempt the mock refused.
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("upgrade: websocket")
+    );
+    let request = &requests[1];
+    let request_body = request_json(request);
     let request_headers = request
         .split_once("\r\n\r\n")
         .unwrap()
@@ -1205,12 +1165,12 @@ async fn codex_backend_requires_oauth_and_preserves_subscription_errors() {
 
     for (index, (status, body, expected)) in [
         (
-            "401 Unauthorized",
+            401,
             r#"{"error":{"message":"expired access token"}}"#,
             ModelFailureKind::Authentication,
         ),
         (
-            "429 Too Many Requests",
+            429,
             r#"{"error":{"message":"Monthly usage limit reached"}}"#,
             ModelFailureKind::Quota,
         ),
@@ -1218,11 +1178,10 @@ async fn codex_backend_requires_oauth_and_preserves_subscription_errors() {
     .into_iter()
     .enumerate()
     {
-        let (base_url, _request_rx, server) =
-            server_once(status, "application/json", body.to_string()).await;
+        let server = server_once(status, "application/json", body.to_string()).await;
         let session_id = format!("codex-provider-error-{index}");
         let backend = RigBackend::new(
-            &codex_model(base_url),
+            &codex_model(server.url("backend-api")),
             &codex_access_token(),
             &Default::default(),
             AuthKind::Oauth,
@@ -1246,7 +1205,13 @@ async fn codex_backend_requires_oauth_and_preserves_subscription_errors() {
             .await
             .err()
             .unwrap();
-        server.await.unwrap();
+        let requests = server.requests().await;
+        // The first connection is always the refused websocket upgrade.
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("upgrade: websocket")
+        );
         let failure = error.downcast_ref::<ModelFailure>().unwrap();
         assert_eq!(failure.kind(), expected);
         assert!(

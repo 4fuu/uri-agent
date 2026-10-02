@@ -416,8 +416,7 @@ fn ide_version(user_agent: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use crate::test_http::{self, MockResponse};
 
     fn test_identity(client_id: &str) -> ClientIdentity {
         ClientIdentity {
@@ -434,35 +433,6 @@ mod tests {
             access: "old-access".to_string(),
             expires: 0,
             extra: BTreeMap::new(),
-        }
-    }
-
-    async fn read_request(socket: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 4096];
-            let count = socket.read(&mut chunk).await.unwrap();
-            assert!(count > 0, "client closed before finishing its request");
-            request.extend_from_slice(&chunk[..count]);
-            let Some(header_end) = request
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .map(|index| index + 4)
-            else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or_default();
-            if request.len() >= header_end + content_length {
-                return String::from_utf8(request).unwrap();
-            }
         }
     }
 
@@ -537,38 +507,25 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_grant_is_confirmed_once_with_the_same_client() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in [
-                (400, r#"{"error":"invalid_grant"}"#),
-                (
-                    200,
-                    r#"{"access_token":"fresh-access","refresh_token":"rotated-refresh","expires_in":3600}"#,
-                ),
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut socket).await);
-                let response = format!(
-                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
+        let server = test_http::serve(vec![
+            MockResponse::json(400, r#"{"error":"invalid_grant"}"#),
+            MockResponse::json(
+                200,
+                r#"{"access_token":"fresh-access","refresh_token":"rotated-refresh","expires_in":3600}"#,
+            ),
+        ])
+        .await;
 
         let token = request_refresh_token(
             &test_identity("issuing-client"),
             "old-refresh",
-            &format!("http://{address}/token"),
+            &server.url("token"),
         )
         .await
         .unwrap();
         assert_eq!(token.access, "fresh-access");
         assert_eq!(token.refresh, "rotated-refresh");
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
         assert_eq!(requests.len(), 2);
         assert!(
             requests

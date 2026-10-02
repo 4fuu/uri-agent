@@ -618,38 +618,18 @@ mod tests {
     use super::*;
     use crate::catalog::WorkBuddyCatalogCredential;
     use crate::oauth::WorkBuddySession;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::test_http::{self, MockResponse};
 
-    async fn model_server(
-        bodies: Vec<&'static str>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for body in bodies {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0_u8; 4096];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0, "client closed before sending HTTP headers");
-                    request.extend_from_slice(&chunk[..count]);
-                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                requests.push(String::from_utf8(request).unwrap());
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        (format!("http://{address}"), server)
+    async fn model_server(bodies: Vec<&'static str>) -> (String, test_http::MockServer) {
+        let server = test_http::serve(
+            bodies
+                .into_iter()
+                .map(|body| MockResponse::json(200, body))
+                .collect(),
+        )
+        .await;
+        let endpoint = server.base.clone();
+        (endpoint, server)
     }
 
     fn model(provider: &str, id: &str, name: &str, api: &str, base_url: &str) -> CatalogModel {
@@ -927,7 +907,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, "glm-5.3-flash");
@@ -975,7 +955,7 @@ mod tests {
         )
         .await
         .unwrap();
-        server.await.unwrap();
+        server.requests().await;
 
         assert_eq!(discovered.len(), 1);
         let model = &discovered[0];
@@ -1089,7 +1069,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, "claude-new");
@@ -1134,7 +1114,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
 
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].id, "gemini-new");
