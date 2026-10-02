@@ -43,6 +43,31 @@ Available documents:
     output
 }
 
+/// Render the `uri-agent docs` output: the topic listing when `topic` is
+/// `None`, or the named document's content. The documents are the same
+/// embedded set the [`uri-agent-docs`] protocol serves.
+pub fn docs_output(topic: Option<&str>) -> Result<String> {
+    let Some(topic) = topic else {
+        let mut output = String::from(
+            "Documentation embedded in this binary; print one with `uri-agent docs <topic>`:\n\n",
+        );
+        for (name, _) in DOCUMENTS {
+            let _ = writeln!(output, "  {name}");
+        }
+        let _ = writeln!(
+            output,
+            "\n`README.md` is the index; `uri-agent-docs://README.md` lists every topic."
+        );
+        return Ok(output);
+    };
+    match DOCUMENTS.iter().find(|(name, _)| *name == topic) {
+        Some((_, content)) => Ok((*content).to_string()),
+        None => bail!(
+            "unknown documentation topic: {topic}; run `uri-agent docs` with no topic to list the exact filenames"
+        ),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct UriAgentDocsProtocol;
 
@@ -165,5 +190,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("takes no input fields"));
+    }
+
+    #[test]
+    fn docs_output_lists_every_embedded_topic() {
+        let listing = docs_output(None).unwrap();
+        for (name, _) in DOCUMENTS {
+            assert!(listing.contains(&format!("\n  {name}\n")), "{listing}");
+        }
+    }
+
+    #[test]
+    fn docs_output_prints_one_document_without_modification() {
+        let document = docs_output(Some("configuration.md")).unwrap();
+        assert_eq!(document, include_str!("../../docs/configuration.md"));
+    }
+
+    #[test]
+    fn docs_output_rejects_unknown_topics() {
+        let error = docs_output(Some("missing.md")).unwrap_err();
+        assert!(error.to_string().contains("unknown documentation topic"));
     }
 }

@@ -145,7 +145,7 @@ operation and checkpointing do not rewrite earlier events.
 
 Derived resume and semantic indexes are rebuildable caches, never the source of
 truth. Missing or invalid cache data falls back to authoritative events.
-Removing the semantic cache under `uri-agent/retrieval/v2/` loses no session
+Removing the semantic cache under `uri-agent/retrieval/v3/` loses no session
 data; a later ranked search rebuilds it.
 
 Transcript and model-replay forms of one completed message commit together.

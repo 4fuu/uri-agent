@@ -1382,79 +1382,121 @@ fn merge_value(base: &mut Value, overlay: Value) {
     }
 }
 
+/// Conventional provider credential variables, shared by credential
+/// resolution and the long `--help` reference. Each row lists the provider
+/// IDs it covers, the primary API-key variable, and lower-priority aliases
+/// consulted only while the primary variable is unset. Providers without a
+/// row read a generated name instead; see [`api_key_environment`].
+pub(crate) const PROVIDER_CREDENTIAL_ENVIRONMENTS: &[(&[&str], &str, &[&str])] = &[
+    (&["abliteration"], "ABLITERATION_API_KEY", &["ABLIT_KEY"]),
+    (&["amazon-bedrock"], "AWS_BEARER_TOKEN_BEDROCK", &[]),
+    (&["ant-ling"], "ANT_LING_API_KEY", &[]),
+    (&["anthropic"], "ANTHROPIC_API_KEY", &[]),
+    (&["azure-openai-responses"], "AZURE_OPENAI_API_KEY", &[]),
+    (&["baseten"], "BASETEN_API_KEY", &[]),
+    (&["cerebras"], "CEREBRAS_API_KEY", &[]),
+    (
+        // API_TOKEN names the credential according to Cloudflare's current
+        // contract. Keep API_KEY at lower precedence for existing installs.
+        &["cloudflare-ai-gateway"],
+        "CLOUDFLARE_API_TOKEN",
+        &["CLOUDFLARE_API_KEY"],
+    ),
+    (&["cloudflare-workers-ai"], "CLOUDFLARE_API_KEY", &[]),
+    (&["workbuddy"], "CODEBUDDY_API_KEY", &[]),
+    (&["deepseek"], "DEEPSEEK_API_KEY", &[]),
+    (&["fireworks"], "FIREWORKS_API_KEY", &[]),
+    (&["github-copilot"], "COPILOT_GITHUB_TOKEN", &[]),
+    (&["google"], "GEMINI_API_KEY", &[]),
+    (&["google-vertex"], "GOOGLE_CLOUD_API_KEY", &[]),
+    (&["groq"], "GROQ_API_KEY", &[]),
+    (&["huggingface"], "HF_TOKEN", &[]),
+    (&["kimi-coding"], "KIMI_API_KEY", &[]),
+    (&["minimax"], "MINIMAX_API_KEY", &[]),
+    (&["minimax-cn"], "MINIMAX_CN_API_KEY", &[]),
+    (&["mistral"], "MISTRAL_API_KEY", &[]),
+    (&["moonshotai", "moonshotai-cn"], "MOONSHOT_API_KEY", &[]),
+    (&["nvidia"], "NVIDIA_API_KEY", &[]),
+    (&["openai"], "OPENAI_API_KEY", &[]),
+    (&["opencode", "opencode-go"], "OPENCODE_API_KEY", &[]),
+    (&["openrouter"], "OPENROUTER_API_KEY", &[]),
+    (
+        &["qwen-token-plan", "qwen-token-plan-individual"],
+        "QWEN_TOKEN_PLAN_API_KEY",
+        &[],
+    ),
+    (&["qwen-token-plan-cn"], "QWEN_TOKEN_PLAN_CN_API_KEY", &[]),
+    (
+        // STEPFUN_API_KEY matches OpenCode and the generated conventional
+        // name. STEP_API_KEY remains a lower-priority docs alias.
+        &["stepfun"],
+        "STEPFUN_API_KEY",
+        &["STEP_API_KEY"],
+    ),
+    (&["together"], "TOGETHER_API_KEY", &[]),
+    (&["vercel-ai-gateway"], "AI_GATEWAY_API_KEY", &[]),
+    (&["xai"], "XAI_API_KEY", &[]),
+    (&["xiaomi"], "XIAOMI_API_KEY", &[]),
+    (
+        &["xiaomi-token-plan-ams"],
+        "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+        &[],
+    ),
+    (
+        &["xiaomi-token-plan-cn"],
+        "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+        &[],
+    ),
+    (
+        &["xiaomi-token-plan-sgp"],
+        "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+        &[],
+    ),
+    (&["zai"], "ZAI_API_KEY", &[]),
+    (&["zai-coding-cn"], "ZAI_CODING_CN_API_KEY", &[]),
+];
+
+fn provider_credential_entry(
+    provider: &str,
+) -> Option<(
+    &'static [&'static str],
+    &'static str,
+    &'static [&'static str],
+)> {
+    PROVIDER_CREDENTIAL_ENVIRONMENTS
+        .iter()
+        .find(|(providers, _, _)| providers.contains(&provider))
+        .map(|(providers, primary, aliases)| (*providers, *primary, *aliases))
+}
+
+fn conventional_api_key_environment(provider: &str) -> String {
+    format!(
+        "{}_API_KEY",
+        provider
+            .chars()
+            .map(|character| if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    )
+}
+
 pub fn api_key_environment(provider: &str) -> String {
-    match provider {
-        "abliteration" => "ABLITERATION_API_KEY",
-        "amazon-bedrock" => "AWS_BEARER_TOKEN_BEDROCK",
-        "ant-ling" => "ANT_LING_API_KEY",
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "azure-openai-responses" => "AZURE_OPENAI_API_KEY",
-        "baseten" => "BASETEN_API_KEY",
-        "cerebras" => "CEREBRAS_API_KEY",
-        "cloudflare-ai-gateway" => "CLOUDFLARE_API_TOKEN",
-        "cloudflare-workers-ai" => "CLOUDFLARE_API_KEY",
-        "workbuddy" => "CODEBUDDY_API_KEY",
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "fireworks" => "FIREWORKS_API_KEY",
-        "github-copilot" => "COPILOT_GITHUB_TOKEN",
-        "google" => "GEMINI_API_KEY",
-        "google-vertex" => "GOOGLE_CLOUD_API_KEY",
-        "groq" => "GROQ_API_KEY",
-        "huggingface" => "HF_TOKEN",
-        "kimi-coding" => "KIMI_API_KEY",
-        "minimax" => "MINIMAX_API_KEY",
-        "minimax-cn" => "MINIMAX_CN_API_KEY",
-        "mistral" => "MISTRAL_API_KEY",
-        "moonshotai" | "moonshotai-cn" => "MOONSHOT_API_KEY",
-        "nvidia" => "NVIDIA_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "opencode" | "opencode-go" => "OPENCODE_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "qwen-token-plan" | "qwen-token-plan-individual" => "QWEN_TOKEN_PLAN_API_KEY",
-        "qwen-token-plan-cn" => "QWEN_TOKEN_PLAN_CN_API_KEY",
-        "together" => "TOGETHER_API_KEY",
-        "vercel-ai-gateway" => "AI_GATEWAY_API_KEY",
-        "xai" => "XAI_API_KEY",
-        "xiaomi" => "XIAOMI_API_KEY",
-        "xiaomi-token-plan-ams" => "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
-        "xiaomi-token-plan-cn" => "XIAOMI_TOKEN_PLAN_CN_API_KEY",
-        "xiaomi-token-plan-sgp" => "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
-        "zai" => "ZAI_API_KEY",
-        "zai-coding-cn" => "ZAI_CODING_CN_API_KEY",
-        other => {
-            return format!(
-                "{}_API_KEY",
-                other
-                    .chars()
-                    .map(|character| if character.is_ascii_alphanumeric() {
-                        character.to_ascii_uppercase()
-                    } else {
-                        '_'
-                    })
-                    .collect::<String>()
-            );
-        }
-    }
-    .to_string()
+    provider_credential_entry(provider)
+        .map(|(_, primary, _)| (*primary).to_string())
+        .unwrap_or_else(|| conventional_api_key_environment(provider))
 }
 
 pub(crate) fn api_key_environments(provider: &str) -> Vec<String> {
-    match provider {
-        "abliteration" => vec!["ABLIT_KEY".to_string(), api_key_environment(provider)],
-        "cloudflare-ai-gateway" => {
-            // API_TOKEN names the credential according to Cloudflare's current
-            // contract. Keep API_KEY at lower precedence for existing installs.
-            vec![
-                "CLOUDFLARE_API_KEY".to_string(),
-                api_key_environment(provider),
-            ]
+    match provider_credential_entry(provider) {
+        Some((_, primary, aliases)) => {
+            let mut names: Vec<String> = aliases.iter().map(|alias| (*alias).to_string()).collect();
+            names.push((*primary).to_string());
+            names
         }
-        "stepfun" => {
-            // STEPFUN_API_KEY matches OpenCode and the generated conventional
-            // name. STEP_API_KEY remains a lower-priority docs alias.
-            vec!["STEP_API_KEY".to_string(), api_key_environment(provider)]
-        }
-        _ => vec![api_key_environment(provider)],
+        None => vec![api_key_environment(provider)],
     }
 }
 

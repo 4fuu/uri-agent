@@ -12,6 +12,10 @@ use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(uri_agent::config::Subcommand::Docs { topic }) = &cli.command {
+        print!("{}", uri_agent::builtins::docs_output(topic.as_deref())?);
+        return Ok(());
+    }
     if cli.acpv1 {
         return uri_agent::acp::v1::serve(cli).await;
     }

@@ -3145,7 +3145,7 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
         .context("cannot list sessions")
 }
 
-fn session_database_path(fallback: &Path) -> PathBuf {
+pub(crate) fn session_database_path(fallback: &Path) -> PathBuf {
     session_database_path_from(
         macos_session_config_directory(),
         dirs::data_dir().as_deref(),

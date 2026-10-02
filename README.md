@@ -197,10 +197,12 @@ lifecycle operations, and ownership constraints.
 | Report pane state to the Herdr terminal multiplexer | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
 | Notify the Moshi app of session lifecycle over moshi-hook | [Moshi reporting](docs/sessions.md#moshi-reporting) |
 
-The [`docs/` index](docs/README.md) includes contributor and release guides. At
-runtime, a protocol's page loaded through the `help` tool is the authoritative
-reference for its accepted URIs and `input` fields; `F1` and `:help` show the
-active interface reference.
+The [`docs/` index](docs/README.md) includes contributor and release guides. Run
+`uri-agent docs <topic>` to print any of these documents from the binary itself,
+or `uri-agent --help` for the complete CLI, environment, settings, and file
+reference. At runtime, a protocol's page loaded through the `help` tool is the
+authoritative reference for its accepted URIs and `input` fields; `F1` and
+`:help` show the active interface reference.
 
 ## Development
 

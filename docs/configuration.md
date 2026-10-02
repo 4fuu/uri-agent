@@ -260,7 +260,7 @@ files already present in the new location are kept.
 Sessions and complete outputs use platform data and cache locations described
 in [Sessions and context](sessions.md) and [Protocols, tasks, and
 output](protocols.md#complete-output-and-diagnostics). Semantic indexes under
-`<platform-cache-dir>/uri-agent/retrieval/v2/` are disposable and rebuilt or
+`<platform-cache-dir>/uri-agent/retrieval/v3/` are disposable and rebuilt or
 incrementally refreshed by ranked searches. Retrieval runtime assets are
 installed beside the executable.
 
@@ -405,7 +405,9 @@ resolved provider, model, and effort after the first durable submission.
 
 ## CLI modes
 
-Run `uri-agent --help` for current names, conflicts, and accepted values.
+Run `uri-agent --help` for current names, conflicts, accepted values, and the
+generated environment-variable, settings, and file-path reference; the `docs
+[<topic>]` subcommand lists or prints the documentation embedded in the binary.
 Notable modes are:
 
 - native TUI session selection remains scoped to canonical `--cwd`;

@@ -15,13 +15,18 @@ pub struct OutputStore {
     diagnostic_write: Mutex<()>,
 }
 
+/// Root of per-session complete-output and diagnostic files, shared by
+/// [`OutputStore`] and the long `--help` reference.
+pub(crate) fn outputs_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("uri-agent")
+        .join("outputs")
+}
+
 impl OutputStore {
     pub async fn new(session_id: &str, limit: usize) -> Result<Self> {
-        let base = dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("uri-agent")
-            .join("outputs")
-            .join(session_id);
+        let base = outputs_root().join(session_id);
         Ok(Self {
             directory: base,
             limit: AtomicUsize::new(limit),

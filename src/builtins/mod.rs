@@ -16,10 +16,12 @@ mod tasks;
 mod title;
 mod uri_agent_docs;
 
+pub(crate) use mcp::{GLOBAL_CONFIG as MCP_GLOBAL_CONFIG, PROJECT_CONFIG as MCP_PROJECT_CONFIG};
 pub use mcp::{
     SessionMcpProfile, SessionMcpServer, SessionMcpTransport, session_profile_owner,
     session_profile_record,
 };
+pub use uri_agent_docs::docs_output;
 pub(crate) const MCP_SESSION_PROFILE_OWNER: &str = mcp::SESSION_PROFILE_OWNER;
 
 use crate::config::display_path;
