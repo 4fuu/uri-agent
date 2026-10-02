@@ -65,7 +65,7 @@ matches an established reusable boundary.
 
 ## Linked Rust extensions
 
-A [`Plugin`](../src/plugin.rs) declares prompt fragments, permissions, session
+A [`Plugin`](../src/plugin.rs) declares prompt fragments, session
 records, protocols, typed model tools, commands, model roles, and generic TUI
 providers. `PluginRegistry` validates declarations against installed
 capabilities, rejects name collisions, and preserves prompt-fragment order
@@ -78,9 +78,10 @@ registry, and extension UI returns semantic state for generic panels, status,
 composer completion, or submission effects. Keep operational behavior in those
 registered interfaces rather than prompt prose.
 
-Environment, credentials, downloads, and Agents require declared
-permissions. These are source-audit markers for trusted code, not
-interactive approval. Model roles do not require permissions.
+Linked plugins are trusted first-party code: environment, credentials,
+downloads, and Agents are obtained directly from `PluginHost` during
+registration, with no permission declaration or approval flow. Sensitive
+access stays visible for source review in each plugin's `register`.
 
 URI Agent links one fixed native dynamic library for first-party zvec retrieval.
 It is not a general native plugin ABI; extension happens through the linked

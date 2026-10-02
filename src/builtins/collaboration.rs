@@ -538,6 +538,49 @@ fn parse_scope(input: &ReadInput) -> Result<bool> {
     }
 }
 
+/// Writes one participant's fields as `key: value` lines. `name_line` is the
+/// literal prefix of the first line (the list marks entries with a bullet),
+/// and `indent` prefixes every line including the first.
+fn write_participant(
+    output: &mut String,
+    participant: &CollaborationParticipant,
+    current_session_id: &str,
+    name_line: &str,
+    indent: &str,
+) {
+    let _ = writeln!(
+        output,
+        "{name_line}{}",
+        participant.name.as_deref().unwrap_or("(not set)")
+    );
+    let _ = writeln!(
+        output,
+        "{indent}session_id: {}{}",
+        participant.session_id,
+        if participant.session_id == current_session_id {
+            " (current)"
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(output, "{indent}status: {}", participant.status.as_str());
+    let _ = writeln!(output, "{indent}queued: {}", participant.queued);
+    let _ = writeln!(
+        output,
+        "{indent}model: {}/{}",
+        participant.provider, participant.model
+    );
+    let _ = writeln!(output, "{indent}cwd: {}", display_path(&participant.cwd));
+    let _ = writeln!(
+        output,
+        "{indent}summary: {}",
+        bounded_line(&participant.summary, MAX_SUMMARY_CHARS)
+    );
+    if let Some(last_seen) = participant.last_seen {
+        let _ = writeln!(output, "{indent}last_seen: {}", last_seen.to_rfc3339());
+    }
+}
+
 fn format_participants(
     participants: &[CollaborationParticipant],
     current_session_id: &str,
@@ -553,74 +596,20 @@ fn format_participants(
         return output;
     }
     for participant in participants {
-        let _ = writeln!(
-            output,
-            "\n- name: {}",
-            participant.name.as_deref().unwrap_or("(not set)")
+        write_participant(
+            &mut output,
+            participant,
+            current_session_id,
+            "\n- name: ",
+            "  ",
         );
-        let _ = writeln!(
-            output,
-            "  session_id: {}{}",
-            participant.session_id,
-            if participant.session_id == current_session_id {
-                " (current)"
-            } else {
-                ""
-            }
-        );
-        let _ = writeln!(output, "  status: {}", participant.status.as_str());
-        let _ = writeln!(output, "  queued: {}", participant.queued);
-        let _ = writeln!(
-            output,
-            "  model: {}/{}",
-            participant.provider, participant.model
-        );
-        let _ = writeln!(output, "  cwd: {}", display_path(&participant.cwd));
-        let _ = writeln!(
-            output,
-            "  summary: {}",
-            bounded_line(&participant.summary, MAX_SUMMARY_CHARS)
-        );
-        if let Some(last_seen) = participant.last_seen {
-            let _ = writeln!(output, "  last_seen: {}", last_seen.to_rfc3339());
-        }
     }
     output
 }
 
 fn format_participant(participant: &CollaborationParticipant, current_session_id: &str) -> String {
     let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "name: {}",
-        participant.name.as_deref().unwrap_or("(not set)")
-    );
-    let _ = writeln!(
-        output,
-        "session_id: {}{}",
-        participant.session_id,
-        if participant.session_id == current_session_id {
-            " (current)"
-        } else {
-            ""
-        }
-    );
-    let _ = writeln!(output, "status: {}", participant.status.as_str());
-    let _ = writeln!(output, "queued: {}", participant.queued);
-    let _ = writeln!(
-        output,
-        "model: {}/{}",
-        participant.provider, participant.model
-    );
-    let _ = writeln!(output, "cwd: {}", display_path(&participant.cwd));
-    let _ = writeln!(
-        output,
-        "summary: {}",
-        bounded_line(&participant.summary, MAX_SUMMARY_CHARS)
-    );
-    if let Some(last_seen) = participant.last_seen {
-        let _ = writeln!(output, "last_seen: {}", last_seen.to_rfc3339());
-    }
+    write_participant(&mut output, participant, current_session_id, "name: ", "");
     output
 }
 

@@ -1,7 +1,7 @@
 use crate::agent::{AgentSpec, AgentStatus, SubmitKind};
 use crate::plugin::{
-    Plugin, PluginAgents, PluginHost, PluginModelRoleResolver, PluginPermission, TuiEffect,
-    TuiSubmissionContext, TuiSubmissionProvider,
+    Plugin, PluginAgents, PluginHost, PluginModelRoleResolver, TuiEffect, TuiSubmissionContext,
+    TuiSubmissionProvider,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -80,10 +80,6 @@ impl TuiSubmissionProvider for TerminalTitleProvider {
 }
 
 impl Plugin for TerminalTitlePlugin {
-    fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Agents]
-    }
-
     fn model_roles(&self) -> Vec<String> {
         vec![ROLE_NAME.to_string()]
     }

@@ -2,8 +2,7 @@ use crate::agent::{AgentHandle, AgentSpec, AgentStatus, ROOT_AGENT_DEPTH, Submit
 use crate::catalog::ModelCatalog;
 use crate::config::{ConfigManager, ModelRole, display_path};
 use crate::plugin::{
-    Plugin, PluginAgents, PluginHost, PluginModelRoleResolver, PluginPermission,
-    SessionProtocolRecord,
+    Plugin, PluginAgents, PluginHost, PluginModelRoleResolver, SessionProtocolRecord,
 };
 use crate::prompts;
 use crate::protocol::{
@@ -181,10 +180,6 @@ impl Plugin for FinderPlugin {
             }
         }
         Ok(())
-    }
-
-    fn permissions(&self) -> Vec<PluginPermission> {
-        vec![PluginPermission::Agents]
     }
 
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {

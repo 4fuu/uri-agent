@@ -326,12 +326,7 @@ impl AcpV1State {
         reject_additional_directories(&request.additional_directories)?;
         let project = self.project(&request.cwd).await.map_err(invalid_params)?;
         let profile = mcp_profile(request.mcp_servers)?;
-        let (owner, payload) = session_profile_record(profile).map_err(internal_error)?;
-        let mut options = AgentOpenOptions {
-            collaboration_enabled: false,
-            ..AgentOpenOptions::default()
-        };
-        options.private_records.insert(owner, payload);
+        let options = mcp_open_options(profile)?;
         let initial = project.manager.current().await;
         let spec = AgentSpec::root(
             &initial.provider,
@@ -420,11 +415,7 @@ impl AcpV1State {
             Session::persisted_private_record(&project.cwd, session_id, session_profile_owner())
                 .await
                 .map_err(internal_error)?;
-        let mut options = AgentOpenOptions {
-            collaboration_enabled: false,
-            ..AgentOpenOptions::default()
-        };
-        match stored_profile {
+        let options = match stored_profile {
             Some(stored) => {
                 let stored: SessionMcpProfile = serde_json::from_value(stored)
                     .map_err(|_| internal_error("invalid stored MCP session profile"))?;
@@ -433,17 +424,18 @@ impl AcpV1State {
                         "MCP server names must match the session's frozen protocol set",
                     ));
                 }
-                let (owner, payload) =
-                    session_profile_record(requested_profile).map_err(internal_error)?;
-                options.private_records.insert(owner, payload);
+                mcp_open_options(requested_profile)?
             }
             None if !requested_profile.servers.is_empty() => {
                 return Err(invalid_params(
                     "cannot replace configured MCP protocols on an existing native session",
                 ));
             }
-            None => {}
-        }
+            None => AgentOpenOptions {
+                collaboration_enabled: false,
+                ..AgentOpenOptions::default()
+            },
+        };
         let agent = project
             .host
             .open_root_with_deferred_resume(Some(session_id), spec.clone(), options)
@@ -832,7 +824,10 @@ async fn pending_config_options(
     project: &AcpProject,
     spec: &AgentSpec,
 ) -> Vec<SessionConfigOption> {
-    let models = selectable_models(project, spec).await;
+    let models = project
+        .manager
+        .selectable_models(&spec.provider, &spec.model)
+        .await;
     let selected_model = model_value(&spec.provider, &spec.model);
     let mut grouped = BTreeMap::<String, Vec<SessionConfigSelectOption>>::new();
     for model in &models {
@@ -891,33 +886,18 @@ async fn pending_config_options(
     ]
 }
 
-async fn selectable_models(project: &AcpProject, spec: &AgentSpec) -> Vec<CatalogModel> {
-    project
-        .manager
-        .selectable_models(&spec.provider, &spec.model)
-        .await
-}
-
 async fn selectable_model(
     pending: &AcpPendingSession,
     provider: &str,
     model: &str,
 ) -> Option<CatalogModel> {
-    let providers = pending
-        .project
-        .manager
-        .model_providers_with_credentials(&pending.spec.provider)
-        .await;
-    if !providers.contains(provider) {
-        return None;
-    }
     pending
         .project
-        .catalog
-        .models(provider)
+        .manager
+        .selectable_models(&pending.spec.provider, &pending.spec.model)
         .await
         .into_iter()
-        .find(|candidate| candidate.id == model)
+        .find(|candidate| candidate.provider == provider && candidate.id == model)
 }
 
 fn frozen_config_options(spec: &AgentSpec) -> Vec<SessionConfigOption> {
@@ -1031,6 +1011,18 @@ fn reject_additional_directories(directories: &[PathBuf]) -> agent_client_protoc
             "additionalDirectories are not supported by uri-agent --acpv1",
         ))
     }
+}
+
+/// Open options carrying the session's private MCP profile record. ACP
+/// sessions never enable collaboration.
+fn mcp_open_options(profile: SessionMcpProfile) -> agent_client_protocol::Result<AgentOpenOptions> {
+    let (owner, payload) = session_profile_record(profile).map_err(internal_error)?;
+    let mut options = AgentOpenOptions {
+        collaboration_enabled: false,
+        ..AgentOpenOptions::default()
+    };
+    options.private_records.insert(owner, payload);
+    Ok(options)
 }
 
 fn mcp_profile(servers: Vec<McpServer>) -> agent_client_protocol::Result<SessionMcpProfile> {
@@ -1524,23 +1516,23 @@ fn acp_image_content(image: &rig::message::Image) -> Option<ImageContent> {
         Some(ImageMediaType::SVG) => "image/svg+xml",
         None => {
             let bytes = BASE64.decode(&data).ok()?;
-            match ProtocolImageMediaType::detect(&bytes)? {
-                ProtocolImageMediaType::Jpeg => "image/jpeg",
-                ProtocolImageMediaType::Png => "image/png",
-                ProtocolImageMediaType::Gif => "image/gif",
-                ProtocolImageMediaType::Webp => "image/webp",
-            }
+            ProtocolImageMediaType::detect(&bytes)?.mime_type()
         }
     };
     Some(ImageContent::new(data, mime_type))
 }
 
+/// Steps of a `protocol` tool call, used for titles and tool-kind display.
+fn protocol_steps(arguments: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    arguments
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+}
+
 fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     if name == "protocol"
-        && let Some(step) = arguments
-            .get("steps")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|steps| steps.first())
+        && let Some(step) = protocol_steps(arguments).and_then(|steps| steps.first())
     {
         let operation = if step.get("exec").is_some() {
             "Exec"
@@ -1564,9 +1556,7 @@ fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
 fn tool_kind(name: &str, arguments: &serde_json::Value) -> ToolKind {
     match name {
         "protocol" => {
-            let has_exec = arguments
-                .get("steps")
-                .and_then(serde_json::Value::as_array)
+            let has_exec = protocol_steps(arguments)
                 .is_some_and(|steps| steps.iter().any(|step| step.get("exec").is_some()));
             if has_exec {
                 ToolKind::Execute
