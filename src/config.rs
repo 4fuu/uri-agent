@@ -964,6 +964,7 @@ impl AgentEnvironment {
         self.values.read().await.0.keys().cloned().collect()
     }
 
+    #[cfg(test)]
     pub async fn get(&self, name: &str) -> Result<Option<String>> {
         validate_environment_name(name)?;
         Ok(self.values.read().await.0.get(name).cloned())
@@ -1786,23 +1787,6 @@ impl ConfigManager {
             .collect()
     }
 
-    pub async fn refresh_credentials(&self) -> Result<ActiveSettings> {
-        let providers = self
-            .files
-            .lock()
-            .await
-            .auth
-            .0
-            .iter()
-            .filter(|(_, entry)| entry.kind == "oauth")
-            .map(|(provider, _)| provider.clone())
-            .collect::<Vec<_>>();
-        for provider in providers {
-            let _ = self.refresh_oauth(&provider, false).await;
-        }
-        Ok(self.current().await)
-    }
-
     async fn recalculate(&self, files: &ConfigFiles) -> Result<ActiveSettings> {
         let candidates =
             discovery_credential_candidates(files, &self.catalog, &self.invocation).await;
@@ -1844,10 +1828,6 @@ impl ConfigManager {
 
     pub fn auth_path(&self) -> PathBuf {
         self.directory.join("auth.json")
-    }
-
-    pub fn project_settings_path(&self) -> &Path {
-        &self.project_path
     }
 }
 

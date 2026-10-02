@@ -1014,7 +1014,7 @@ mod tests {
         let error = resumed
             .services()
             .protocols
-            .exec("finder://", &question("where?"))
+            .exec_for_model("finder://", &question("where?"), false)
             .await
             .unwrap_err();
         assert!(

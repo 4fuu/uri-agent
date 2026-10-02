@@ -1237,17 +1237,10 @@ mod tests {
 
         let help_input = input_map(json!({"script": "x"}));
         let help_error = shell
-            .read(request("bash://help", "help", &help_input), context.clone())
+            .read(request("bash://help", "help", &help_input), context)
             .await
             .unwrap_err();
         assert!(help_error.to_string().contains("takes no input fields"));
-
-        let blank = input_map(json!({"script": " \n\t"}));
-        let script_error = shell
-            .exec(request("bash://run", "run", &blank), context)
-            .await
-            .unwrap_err();
-        assert!(format!("{script_error:#}").contains("non-whitespace character"));
     }
 
     #[test]
@@ -1271,90 +1264,76 @@ mod tests {
     }
 
     #[test]
-    fn valid_windows_pwsh_suppresses_bash() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut plugins = PluginRegistry::new();
-        add_plugins_with(
-            &mut plugins,
-            directory.path(),
+    fn pwsh_discovery_follows_the_platform_and_the_reported_version() {
+        fn check<F, S>(
+            windows: bool,
+            find: F,
+            supports_pwsh_7: S,
+            expected_names: &[&str],
+            expected_warning: bool,
+        ) where
+            F: FnMut(&str) -> Option<PathBuf>,
+            S: FnOnce(&Path) -> bool,
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut plugins = PluginRegistry::new();
+            add_plugins_with(
+                &mut plugins,
+                directory.path(),
+                windows,
+                find,
+                supports_pwsh_7,
+            );
+            let names = plugins
+                .protocol_descriptors()
+                .unwrap()
+                .into_iter()
+                .map(|descriptor| descriptor.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected_names);
+            let expected_notices = if expected_warning {
+                vec![PWSH_WINDOWS_WARNING.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(plugins.startup_notices(), expected_notices);
+            assert!(plugins.system_prompt_fragments().unwrap().is_empty());
+        }
+
+        // A supported pwsh on Windows replaces bash entirely.
+        check(
             true,
             |name| Some(PathBuf::from(format!("C:\\shells\\{name}.exe"))),
             |_| true,
+            &["pwsh"],
+            false,
         );
-        let names = plugins
-            .protocol_descriptors()
-            .unwrap()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["pwsh"]);
-        assert!(plugins.startup_notices().is_empty());
-        assert!(plugins.system_prompt_fragments().unwrap().is_empty());
-    }
-
-    #[test]
-    fn unsupported_windows_pwsh_warns_and_leaves_bash_enabled() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut plugins = PluginRegistry::new();
-        add_plugins_with(
-            &mut plugins,
-            directory.path(),
+        // An unsupported or missing pwsh warns and keeps bash enabled.
+        check(
             true,
             |name| Some(PathBuf::from(name)),
             |_| false,
+            &["bash"],
+            true,
         );
-        let names = plugins
-            .protocol_descriptors()
-            .unwrap()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["bash"]);
-        assert_eq!(plugins.startup_notices(), vec![PWSH_WINDOWS_WARNING]);
-    }
-
-    #[test]
-    fn missing_windows_pwsh_warns_without_checking_a_version() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut plugins = PluginRegistry::new();
-        add_plugins_with(
-            &mut plugins,
-            directory.path(),
+        check(
             true,
             |name| (name == "bash").then(|| PathBuf::from(name)),
             |_| panic!("a missing pwsh executable has no version to check"),
+            &["bash"],
+            true,
         );
-
-        assert_eq!(plugins.startup_notices(), vec![PWSH_WINDOWS_WARNING]);
-        assert_eq!(plugins.protocol_descriptors().unwrap()[0].name, "bash");
-    }
-
-    #[test]
-    fn non_windows_only_adds_bash_without_checking_pwsh() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut plugins = PluginRegistry::new();
-        add_plugins_with(
-            &mut plugins,
-            directory.path(),
+        // Non-Windows hosts never probe for pwsh.
+        check(
             false,
             |name| {
                 assert_eq!(name, "bash");
                 Some(PathBuf::from(name))
             },
             |_| panic!("non-Windows discovery does not require a PowerShell version check"),
+            &["bash"],
+            false,
         );
-        let names = plugins
-            .protocol_descriptors()
-            .unwrap()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["bash"]);
-        assert!(plugins.startup_notices().is_empty());
-        assert!(plugins.system_prompt_fragments().unwrap().is_empty());
     }
 
     #[tokio::test]

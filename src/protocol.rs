@@ -1,6 +1,5 @@
 use crate::output::OutputStore;
 use crate::prompts::PromptEntry;
-use crate::session::{EventKind, SessionEvent};
 use crate::task::TaskManager;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -8,7 +7,7 @@ use base64::Engine;
 use rig::message::{ImageMediaType, ToolResultContent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -214,26 +213,12 @@ impl ProtocolOutput {
         Self::new(text.into(), None, Vec::new())
     }
 
-    pub fn with_json(mut self, json: Value) -> Self {
-        self.json = Some(json);
-        self
-    }
-
-    pub fn with_images(mut self, images: Vec<ProtocolImage>) -> Self {
-        self.images = images;
-        self
-    }
-
     pub fn text_bytes(&self) -> &[u8] {
         &self.text
     }
 
     pub fn json(&self) -> Option<&Value> {
         self.json.as_ref()
-    }
-
-    pub fn images(&self) -> &[ProtocolImage] {
-        &self.images
     }
 
     pub(crate) fn into_parts(self) -> (Vec<u8>, Option<Value>, Vec<ProtocolImage>) {
@@ -454,16 +439,6 @@ impl ProtocolRegistry {
         descriptors
     }
 
-    pub fn prompt_protocols(&self) -> Vec<PromptEntry> {
-        self.descriptors()
-            .into_iter()
-            .map(|descriptor| PromptEntry {
-                name: descriptor.name,
-                description: descriptor.description,
-            })
-            .collect()
-    }
-
     pub(crate) fn prompt_protocols_for(
         &self,
         names: Option<&[String]>,
@@ -516,10 +491,6 @@ impl ProtocolRegistry {
     ) -> Result<PresentedProtocolOutput> {
         self.dispatch_read(uri, input, true, true, pinned_foreground)
             .await
-    }
-
-    pub async fn exec(&self, uri: &str, input: &Map<String, Value>) -> Result<String> {
-        self.dispatch_exec(uri, input, true, true, false).await
     }
 
     pub(crate) async fn exec_for_model(
@@ -676,50 +647,6 @@ impl ProtocolRegistry {
         Ok(())
     }
 
-    pub async fn restore_help_reads(&self, events: &[SessionEvent]) {
-        let mut pending = HashMap::new();
-        let mut restored = HashSet::new();
-        for event in events {
-            match &event.kind {
-                EventKind::ToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                } => {
-                    pending.remove(call_id);
-                    if name == "help"
-                        && let Some(protocols) =
-                            arguments.get("protocols").and_then(Value::as_array)
-                    {
-                        let names = protocols
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>();
-                        if !names.is_empty() {
-                            pending.insert(call_id.clone(), names);
-                        }
-                    }
-                }
-                EventKind::ToolResult {
-                    call_id,
-                    name,
-                    failed,
-                    ..
-                } => {
-                    if let Some(protocols) = pending.remove(call_id)
-                        && name == "help"
-                        && !failed
-                    {
-                        restored.extend(protocols);
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.help_read.lock().await.extend(restored);
-    }
-
     pub async fn restore_help_read_names(&self, protocols: HashSet<String>) {
         let mut restored = HashSet::new();
         for name in protocols {
@@ -798,20 +725,6 @@ impl ProtocolRegistry {
             json,
             images,
         })
-    }
-
-    async fn dispatch_exec(
-        &self,
-        uri: &str,
-        input: &Map<String, Value>,
-        include_dynamic: bool,
-        require_help: bool,
-        pinned_foreground: bool,
-    ) -> Result<String> {
-        Ok(self
-            .dispatch_exec_output(uri, input, include_dynamic, require_help, pinned_foreground)
-            .await?
-            .output)
     }
 
     async fn dispatch_exec_output(
@@ -1319,11 +1232,11 @@ mod tests {
         registry.load_help(&["capture".to_string()]).await.unwrap();
 
         let result = registry
-            .exec("capture://run?wait=30", &input)
+            .exec_for_model("capture://run?wait=30", &input, false)
             .await
             .unwrap();
 
-        assert_eq!(result, "ok");
+        assert_eq!(result.output, "ok");
         assert_eq!(
             capture.lock().unwrap().as_ref().unwrap(),
             &CapturedRequest {
@@ -1420,7 +1333,7 @@ mod tests {
                 .await
                 .unwrap_err(),
             registry
-                .exec("capture://run", &empty_input())
+                .exec_for_model("capture://run", &empty_input(), false)
                 .await
                 .unwrap_err(),
         ] {
@@ -1443,9 +1356,10 @@ mod tests {
         );
         assert_eq!(
             registry
-                .exec("capture://run", &empty_input())
+                .exec_for_model("capture://run", &empty_input(), false)
                 .await
-                .unwrap(),
+                .unwrap()
+                .output,
             "ok"
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
@@ -1469,7 +1383,7 @@ mod tests {
                 .await
                 .unwrap_err(),
             registry
-                .exec("capture://help", &empty_input())
+                .exec_for_model("capture://help", &empty_input(), false)
                 .await
                 .unwrap_err(),
         ] {
@@ -1583,54 +1497,6 @@ mod tests {
                 .await
                 .unwrap(),
             "dependent"
-        );
-        let _ = tokio::fs::remove_dir_all(output_directory).await;
-    }
-
-    #[tokio::test]
-    async fn restored_successful_help_read_unlocks_protocol() {
-        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
-        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
-        let output_directory = output.directory().to_path_buf();
-        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
-        registry
-            .register(CaptureProtocol {
-                capture: Arc::new(Mutex::new(None)),
-            })
-            .unwrap();
-        let events = vec![
-            SessionEvent {
-                sequence: 1,
-                at: chrono::Utc::now(),
-                kind: EventKind::ToolCall {
-                    call_id: "help-call".to_string(),
-                    name: "help".to_string(),
-                    arguments: serde_json::json!({
-                        "protocols": ["capture"]
-                    }),
-                },
-            },
-            SessionEvent {
-                sequence: 2,
-                at: chrono::Utc::now(),
-                kind: EventKind::ToolResult {
-                    call_id: "help-call".to_string(),
-                    name: "help".to_string(),
-                    output: "help".to_string(),
-                    failed: false,
-                    protocol_help_required: false,
-                },
-            },
-        ];
-
-        registry.restore_help_reads(&events).await;
-
-        assert_eq!(
-            registry
-                .read("capture://value", &empty_input())
-                .await
-                .unwrap(),
-            "ok"
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

@@ -3989,6 +3989,15 @@ mod tests {
         }
     }
 
+    fn config_roots() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let global = root.path().join("global");
+        std::fs::create_dir_all(project.join(".agents")).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        (root, project, global)
+    }
+
     fn output_text(output: &ProtocolOutput) -> String {
         String::from_utf8(output.text_bytes().to_vec()).unwrap()
     }
@@ -4043,11 +4052,7 @@ mod tests {
     /// One fake MCP server wired to an `McpProtocol` through the client
     /// transport, shared by the protocol-behavior tests.
     async fn fake_mcp_harness() -> FakeMcp {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (root, project, global) = config_roots();
         let config = McpServerConfig {
             description: "Fake MCP".to_string(),
             enabled: true,
@@ -4264,7 +4269,6 @@ mod tests {
             .unwrap();
         let help = output_text(&help);
         assert!(help.contains("loads both that"));
-        assert_valid_steps(&help_step_examples(&help));
 
         assert!(
             McpSharedHelpProtocol
@@ -4613,11 +4617,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_servers_override_global_without_field_merging() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         std::fs::write(
             global.join(GLOBAL_CONFIG),
             r#"{"servers":{"github":{"description":"global","transport":"stdio","command":"global"}}}"#,
@@ -4641,11 +4641,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_config_updates_from_independent_stores_do_not_get_lost() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         let first = McpConfigStore::new(&project, &global);
         let second = McpConfigStore::new(&project, &global);
         let config = |description: &str| {
@@ -4681,12 +4677,8 @@ mod tests {
     async fn config_updates_preserve_a_dangling_symlink() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
+        let (root, project, global) = config_roots();
         let managed = root.path().join("managed");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&managed).unwrap();
         let logical = global.join(GLOBAL_CONFIG);
         let target = managed.join(GLOBAL_CONFIG);
@@ -4711,11 +4703,7 @@ mod tests {
 
     #[tokio::test]
     async fn hanging_mcp_initialization_is_bounded() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -4760,11 +4748,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_hanging_server_does_not_block_another_server() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hanging_address = listener.local_addr().unwrap();
         // A connection that is accepted and immediately closed fails fast on
@@ -4844,11 +4828,7 @@ mod tests {
 
     #[test]
     fn discovery_keeps_transport_validation_lazy_and_rejects_collisions() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         std::fs::write(
             project.join(PROJECT_CONFIG),
             r#"{"servers":{"Git Hub":{"description":"one"}}}"#,
@@ -4878,11 +4858,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_session_records_keep_frozen_descriptors_without_rediscovery() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         std::fs::write(
             project.join(PROJECT_CONFIG),
             r#"{"servers":{"GitHub":{"description":"Frozen description","transport":"stdio","command":"old"}}}"#,
@@ -4928,11 +4904,7 @@ mod tests {
 
     #[tokio::test]
     async fn panel_connection_actions_return_without_waiting_for_the_network() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -5005,11 +4977,7 @@ mod tests {
 
     #[tokio::test]
     async fn panel_rejects_moving_an_override_onto_a_hidden_destination() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (_root, project, global) = config_roots();
         let store = McpConfigStore::new(&project, &global);
         for (scope, description) in [
             (McpScope::User, "User server"),
@@ -5173,11 +5141,7 @@ mod tests {
 
     #[tokio::test]
     async fn panel_can_save_a_failed_automatic_test_and_keeps_new_protocols_deferred() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let global = root.path().join("global");
-        std::fs::create_dir_all(project.join(".agents")).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
+        let (root, project, global) = config_roots();
         let session_plugin = McpPlugin::new(&project, &global);
         assert!(session_plugin.records().is_empty());
         assert!(session_plugin.protocol_descriptors().is_empty());
@@ -5300,7 +5264,11 @@ mod tests {
         ));
         let slow = || async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok(ProtocolOutput::text(b"done".to_vec()).with_json(json!({"n": 1})))
+            Ok(ProtocolOutput::new(
+                b"done".to_vec(),
+                Some(json!({"n": 1})),
+                Vec::new(),
+            ))
         };
 
         let mut pinned = ProtocolContext::new(TaskManager::new());

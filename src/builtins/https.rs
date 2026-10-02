@@ -1071,6 +1071,20 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
+    async fn manager_with_keys(keys: &[(&str, &str)]) -> (tempfile::TempDir, Arc<ConfigManager>) {
+        let root = tempfile::tempdir().unwrap();
+        let manager = ConfigManager::load_for_test(root.path(), root.path())
+            .await
+            .unwrap();
+        for (provider, key) in keys {
+            manager
+                .set_api_key(provider, key.to_string())
+                .await
+                .unwrap();
+        }
+        (root, manager)
+    }
+
     async fn server_once(
         status: &str,
         content_type: &str,
@@ -1235,10 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_html_as_clean_markdown() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[]).await;
         let protocol = HttpsProtocol::new().with_credentials(PluginCredentials::new(manager));
         let body = "<html><body><nav>Menu</nav><main><h1>Title</h1><p>Hello <strong>web</strong>.</p></main></body></html>";
         let (url, request, server) = server_once("200 OK", "text/html", body.to_string()).await;
@@ -1264,14 +1275,7 @@ mod tests {
 
     #[tokio::test]
     async fn extracts_pages_with_parallel_when_logged_in() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "parallel-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("parallel", "parallel-key")]).await;
         let body = json!({
             "extract_id": "extract-1",
             "results": [{
@@ -1316,14 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn extracts_pages_with_exa_when_parallel_is_not_logged_in() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("exa", "exa-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("exa", "exa-key")]).await;
         let body = json!({
             "requestId": "contents-1",
             "results": [{
@@ -1357,18 +1354,8 @@ mod tests {
 
     #[tokio::test]
     async fn page_extraction_falls_back_from_parallel_to_exa() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "parallel-key".to_string())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("exa", "exa-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) =
+            manager_with_keys(&[("parallel", "parallel-key"), ("exa", "exa-key")]).await;
         let (parallel_url, parallel_request, parallel_server) = server_once(
             "503 Service Unavailable",
             "application/json",
@@ -1416,14 +1403,7 @@ mod tests {
 
     #[tokio::test]
     async fn searches_parallel_with_a_login_key() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "saved-parallel-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("parallel", "saved-parallel-key")]).await;
         let body = json!({
             "search_id": "search-1",
             "warnings": [{"type": "warning", "message": "A provider warning"}],
@@ -1505,18 +1485,8 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_provider_selection_does_not_fall_back() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "parallel-key".to_string())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("exa", "exa-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) =
+            manager_with_keys(&[("parallel", "parallel-key"), ("exa", "exa-key")]).await;
         let exa_body = json!({
             "requestId": "exa-explicit",
             "results": [
@@ -1586,18 +1556,8 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_from_parallel_to_exa() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "parallel-key".to_string())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("exa", "exa-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) =
+            manager_with_keys(&[("parallel", "parallel-key"), ("exa", "exa-key")]).await;
         let (parallel_url, parallel_request, parallel_server) = server_once(
             "503 Service Unavailable",
             "application/json",
@@ -1650,10 +1610,7 @@ mod tests {
 
     #[tokio::test]
     async fn help_tells_the_model_to_request_login_when_no_provider_is_configured() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[]).await;
         let protocol =
             HttpsProtocol::new().with_credentials(PluginCredentials::new(manager.clone()));
 
@@ -1841,14 +1798,7 @@ mod tests {
 
     #[tokio::test]
     async fn searches_tinyfish_with_a_login_key() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "saved-tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("tinyfish", "saved-tinyfish-key")]).await;
         let body = json!({
             "query": "rust language",
             "results": [
@@ -1936,14 +1886,7 @@ mod tests {
 
     #[tokio::test]
     async fn tinyfish_search_fetches_more_pages_to_fill_the_limit() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("tinyfish", "tinyfish-key")]).await;
         let page = |offset: usize, count: usize| {
             let results = (offset..offset + count)
                 .map(|index| {
@@ -1990,14 +1933,7 @@ mod tests {
 
     #[tokio::test]
     async fn extracts_pages_with_tinyfish_when_logged_in() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("tinyfish", "tinyfish-key")]).await;
         let body = json!({
             "results": [{
                 "url": "https://example.com/app",
@@ -2037,14 +1973,7 @@ mod tests {
 
     #[tokio::test]
     async fn tinyfish_per_url_fetch_errors_fail_page_extraction() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("tinyfish", "tinyfish-key")]).await;
         let body = json!({
             "results": [],
             "errors": [{ "url": "https://example.com/blocked", "error": "bot_blocked" }]
@@ -2066,22 +1995,12 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_to_tinyfish_after_parallel_and_exa_fail() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "parallel-key".to_string())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("exa", "exa-key".to_string())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[
+            ("parallel", "parallel-key"),
+            ("exa", "exa-key"),
+            ("tinyfish", "tinyfish-key"),
+        ])
+        .await;
         let (parallel_url, parallel_request, parallel_server) = server_once(
             "503 Service Unavailable",
             "application/json",
@@ -2150,14 +2069,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_tinyfish_search_options() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("tinyfish", "tinyfish-key")]).await;
         let unused = Url::parse("http://127.0.0.1:1/unused").unwrap();
         let protocol = HttpsProtocol::new()
             .with_credentials(PluginCredentials::new(manager))
@@ -2282,14 +2194,7 @@ mod tests {
 
     #[tokio::test]
     async fn help_shows_tinyfish_options_when_tinyfish_is_the_default_provider() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = ConfigManager::load_for_test(root.path(), root.path())
-            .await
-            .unwrap();
-        manager
-            .set_api_key("tinyfish", "tinyfish-key".to_string())
-            .await
-            .unwrap();
+        let (_root, manager) = manager_with_keys(&[("tinyfish", "tinyfish-key")]).await;
         let protocol = HttpsProtocol::new().with_credentials(PluginCredentials::new(manager));
 
         let help = String::from_utf8(protocol.help().await.unwrap()).unwrap();

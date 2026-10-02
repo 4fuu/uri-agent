@@ -724,14 +724,6 @@ impl ModelCatalog {
     pub async fn warnings(&self) -> Vec<String> {
         self.inner.read().await.warnings.clone()
     }
-
-    pub fn store_path(&self) -> &Path {
-        &self.store_path
-    }
-
-    pub fn user_path(&self) -> &Path {
-        &self.user_path
-    }
 }
 
 async fn fetch_provider(

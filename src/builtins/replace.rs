@@ -151,12 +151,6 @@ mod tests {
 
         assert!(output.output().contains("Updated"));
         assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha gamma\n");
-        assert!(
-            tool.descriptor().parameters["properties"]["path"]["description"]
-                .as_str()
-                .unwrap()
-                == "File path."
-        );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }
 

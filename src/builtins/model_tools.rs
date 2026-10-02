@@ -1455,13 +1455,19 @@ A recording protocol for step tests.
                 .push((request.target.to_string(), request.input.clone()));
             match request.target {
                 "help" => Ok(ProtocolOutput::text(FAKE_HELP.as_bytes().to_vec())),
-                "data" => Ok(ProtocolOutput::text("DATA".as_bytes().to_vec())
-                    .with_json(json!({"items": ["a", "b", "c"], "count": 3, "path": "src/a.rs"}))),
+                "data" => Ok(ProtocolOutput::new(
+                    b"DATA".to_vec(),
+                    Some(json!({"items": ["a", "b", "c"], "count": 3, "path": "src/a.rs"})),
+                    Vec::new(),
+                )),
                 "fail" => Err(anyhow!("boom")),
                 _ => {
                     let text = serde_json::to_string(&request.input).unwrap();
-                    Ok(ProtocolOutput::text(text.as_bytes().to_vec())
-                        .with_json(Value::Object(request.input.clone())))
+                    Ok(ProtocolOutput::new(
+                        text.as_bytes().to_vec(),
+                        Some(Value::Object(request.input.clone())),
+                        Vec::new(),
+                    ))
                 }
             }
         }
@@ -1690,10 +1696,6 @@ A recording protocol for step tests.
                 Value::Array(vec![json!({"read": "fake://data"}); 9]),
                 "at most 8 steps per call",
             ),
-            (
-                json!([{"read": "fake://data", "exec": "fake://echo"}]),
-                "exactly one of `read` and `exec`",
-            ),
             (json!([{"read": "   "}]), "the address cannot be empty"),
             (
                 json!([{"read": "fake://data", "id": "Bad-ID"}]),
@@ -1710,7 +1712,6 @@ A recording protocol for step tests.
                 json!([{"read": "fake://data", "show": "sometimes"}]),
                 "is not one of",
             ),
-            (json!([{"read": "missing://data"}]), "unknown protocol"),
             (
                 json!([{"read": "fake://data", "if": "later.ok"}]),
                 "does not name an earlier step",

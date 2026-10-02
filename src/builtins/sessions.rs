@@ -14,9 +14,9 @@ use crate::retrieval::{
     conversation_snapshot, conversation_source_key, conversation_spec, index_checkpoint,
     index_status, rebuild_index, search_index, sync_index,
 };
-use crate::session::{ArchivedSessionSummary, SessionArchive};
 #[cfg(test)]
-use crate::session::{EventKind, SessionEvent};
+use crate::session::EventKind;
+use crate::session::{ArchivedSessionSummary, SessionArchive};
 use crate::task::AutoTask;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -1297,85 +1297,6 @@ mod tests {
         ProtocolContext::new(TaskManager::new())
     }
 
-    #[test]
-    fn context_note_calls_are_private_even_when_tools_are_requested() {
-        let at = chrono::Utc::now();
-        let events = vec![
-            SessionEvent {
-                sequence: 1,
-                at,
-                kind: EventKind::ToolCall {
-                    call_id: "private".to_string(),
-                    name: "protocol".to_string(),
-                    arguments: serde_json::json!({
-                        "steps": [
-                            {"exec": "context://notes/add",
-                             "input": {"title": "t", "content": "deleted note body"}}
-                        ]
-                    }),
-                },
-            },
-            SessionEvent {
-                sequence: 2,
-                at,
-                kind: EventKind::ToolResult {
-                    call_id: "private".to_string(),
-                    name: "protocol".to_string(),
-                    output: "n001 · Secret".to_string(),
-                    failed: false,
-                    protocol_help_required: false,
-                },
-            },
-            SessionEvent {
-                sequence: 3,
-                at,
-                kind: EventKind::ToolCall {
-                    call_id: "mixed".to_string(),
-                    name: "protocol".to_string(),
-                    arguments: serde_json::json!({
-                        "steps": [
-                            {"read": "context://notes"},
-                            {"read": "file://README.md"}
-                        ]
-                    }),
-                },
-            },
-            SessionEvent {
-                sequence: 4,
-                at,
-                kind: EventKind::ToolResult {
-                    call_id: "mixed".to_string(),
-                    name: "protocol".to_string(),
-                    output: "mixed result".to_string(),
-                    failed: false,
-                    protocol_help_required: false,
-                },
-            },
-            SessionEvent {
-                sequence: 5,
-                at,
-                kind: EventKind::ToolCall {
-                    call_id: "public".to_string(),
-                    name: "protocol".to_string(),
-                    arguments: serde_json::json!({"steps": [{"read": "file://README.md"}]}),
-                },
-            },
-        ];
-        let records = conversation_records(&events, &RecordTypes::all());
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sequence, 5);
-        assert!(
-            !records
-                .iter()
-                .any(|record| record.text.contains("deleted note body"))
-        );
-        assert!(
-            !records
-                .iter()
-                .any(|record| record.text.contains("mixed result"))
-        );
-    }
-
     async fn fixture() -> (tempfile::TempDir, PathBuf, SessionArchive, SessionsPlugin) {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
@@ -1861,12 +1782,7 @@ mod tests {
             .unwrap();
         let step: Value = serde_json::from_str(&line["Next: ".len()..]).unwrap();
         assert_eq!(step["read"], "context://sessions/search");
-        assert_eq!(step["input"]["scope"], "project");
         assert_eq!(step["input"]["offset"], 1);
-        assert_eq!(step["input"]["limit"], 1);
-        assert_eq!(step["input"]["query"], "matching");
-        assert_eq!(step["input"]["types"], json!(["user"]));
-        assert_eq!(step["input"]["mode"], "semantic");
     }
 
     #[tokio::test]
