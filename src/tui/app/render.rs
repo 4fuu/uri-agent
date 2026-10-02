@@ -3756,10 +3756,7 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
             );
         }
         ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            selection_marker(selected),
             Span::styled(
                 list_cell(
                     &format!(":{}", item.name),
@@ -3779,14 +3776,14 @@ pub(super) fn render_command(frame: &mut Frame<'_>, app: &mut App, area: Rect, b
                 Style::default().fg(MUTED),
             ),
         ]))
-        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        .style(selected_row_style(selected))
     });
-    let mut state = ListState::default().with_selected(Some(app.command_selected));
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         sections[1],
-        state.offset(),
+        Some(app.command_selected),
         commands.len(),
         row_height,
         |index| Some(AppHit::Palette(index)),
@@ -3885,10 +3882,7 @@ pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, 
         .map(|(index, item)| {
             let selected = index == completions.selected;
             Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(ACCENT),
-                ),
+                selection_marker(selected),
                 Span::styled(
                     list_cell(&item.label, label_content_width, selected, marquee_elapsed),
                     Style::default()
@@ -3910,7 +3904,7 @@ pub(super) fn render_composer_completions(frame: &mut Frame<'_>, app: &mut App, 
                     Style::default().fg(MUTED),
                 ),
             ])
-            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+            .style(selected_row_style(selected))
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), inner);
@@ -4040,24 +4034,21 @@ pub(super) fn render_delivery(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
                 );
             }
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(ACCENT),
-                ),
+                selection_marker(selected),
                 Span::styled(
                     format!("{title:<12}"),
                     Style::default().fg(if selected { ACCENT } else { TEXT }),
                 ),
                 Span::styled(*description, Style::default().fg(MUTED)),
             ]))
-            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+            .style(selected_row_style(selected))
         });
-    let mut state = ListState::default().with_selected(Some(delivery.selected));
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         sections[1],
-        state.offset(),
+        Some(delivery.selected),
         choices.len(),
         row_height,
         |index| Some(AppHit::Delivery(index)),
@@ -4130,10 +4121,7 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
             }
             Some(
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if selected { "› " } else { "  " },
-                        Style::default().fg(ACCENT),
-                    ),
+                    selection_marker(selected),
                     Span::styled(
                         list_cell(&item.title, title_width, selected, marquee_elapsed),
                         Style::default().fg(if selected { ACCENT } else { TEXT }),
@@ -4148,21 +4136,16 @@ pub(super) fn render_selector(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
                         Style::default().fg(MUTED),
                     ),
                 ]))
-                .style(Style::default().bg(if selected {
-                    ROW_ACTIVE
-                } else {
-                    SURFACE
-                })),
+                .style(selected_row_style(selected)),
             )
         });
-    let mut state = ListState::default().with_selected(Some(selector.selected));
-    let visible = selector.visible.len();
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         sections[1],
-        state.offset(),
-        visible,
+        Some(selector.selected),
+        selector.visible.len(),
         row_height,
         |position| Some(AppHit::Selector(position)),
     );
@@ -4195,7 +4178,20 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
     };
     let active_tab = hub.tab;
     let flow = hub.role_flow.clone();
-    render_model_hub_tabs(frame, app, sections[0], active_tab, flow.is_none());
+    let hub_tabs = ModelHubTab::ALL.map(|tab| tab.label());
+    let active_hub_tab = ModelHubTab::ALL
+        .iter()
+        .position(|tab| *tab == active_tab)
+        .unwrap_or_default();
+    render_tab_strip(
+        frame,
+        app,
+        sections[0],
+        active_hub_tab,
+        &hub_tabs,
+        flow.is_none(),
+        AppHit::ModelHubTab,
+    );
     frame.render_widget(
         Paragraph::new("─".repeat(sections[1].width as usize)).style(Style::default().fg(MUTED)),
         sections[1],
@@ -4219,42 +4215,6 @@ pub(super) fn render_models(frame: &mut Frame<'_>, app: &mut App, area: Rect, bl
         None => render_model_browser(frame, app, sections[2], None),
     }
     render_model_hub_footer(frame, app, sections[3], flow.as_ref());
-}
-
-fn render_model_hub_tabs(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-    active: ModelHubTab,
-    interactive: bool,
-) {
-    let mut spans = Vec::new();
-    let mut x = area.x;
-    for (index, tab) in ModelHubTab::ALL.into_iter().enumerate() {
-        let label = format!(" {} ", tab.label());
-        let width = label.width() as u16;
-        spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(if tab == active { ACCENT } else { MUTED })
-                .bg(if tab == active { ROW_ACTIVE } else { SURFACE })
-                .add_modifier(if tab == active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ));
-        if interactive {
-            app.hit_regions.push(HitRegion {
-                area: Rect::new(x, area.y, width, 1),
-                target: AppHit::ModelHubTab(index),
-            });
-        }
-        x = x.saturating_add(width);
-        spans.push(Span::raw("  "));
-        x = x.saturating_add(2);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: Option<&str>) {
@@ -4372,10 +4332,7 @@ fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: 
             );
         }
         ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            selection_marker(selected),
             Span::styled(current, Style::default().fg(MUTED)),
             Span::styled(
                 list_cell(
@@ -4395,16 +4352,15 @@ fn render_model_browser(frame: &mut Frame<'_>, app: &mut App, area: Rect, role: 
                 Style::default().fg(MUTED),
             ),
         ]))
-        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        .style(selected_row_style(selected))
     });
-    let mut state = ListState::default().with_selected(Some(selector.selected_position()));
-    let visible = selector.visible_len();
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         sections[1],
-        state.offset(),
-        visible,
+        Some(selector.selected_position()),
+        selector.visible_len(),
         row_height,
         |position| Some(AppHit::Model(position)),
     );
@@ -4498,10 +4454,7 @@ fn render_model_roles(frame: &mut Frame<'_>, app: &mut App, area: Rect, interact
             );
         }
         ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            selection_marker(selected),
             Span::styled(
                 list_cell(&role.name, name_width, selected, marquee_elapsed),
                 Style::default().fg(if selected { ACCENT } else { TEXT }),
@@ -4524,21 +4477,18 @@ fn render_model_roles(frame: &mut Frame<'_>, app: &mut App, area: Rect, interact
                 Style::default().fg(MUTED),
             ),
         ]))
-        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+        .style(selected_row_style(selected))
     });
-    let mut state = ListState::default().with_selected(Some(hub.selected_role));
-    frame.render_stateful_widget(List::new(items), area, &mut state);
-    if interactive {
-        let roles = hub.roles.len();
-        push_list_hits(
-            &mut app.hit_regions,
-            area,
-            state.offset(),
-            roles,
-            row_height,
-            |index| Some(AppHit::ModelRole(index)),
-        );
-    }
+    render_selection_list(
+        frame,
+        &mut app.hit_regions,
+        items,
+        area,
+        Some(hub.selected_role),
+        hub.roles.len(),
+        row_height,
+        |index| interactive.then_some(AppHit::ModelRole(index)),
+    );
 }
 
 fn render_model_role_effort(
@@ -4571,31 +4521,24 @@ fn render_model_role_effort(
     let items = options.iter().enumerate().map(|(index, level)| {
         let active = index == selected;
         ListItem::new(Line::from(vec![
-            Span::styled(
-                if active { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            selection_marker(active),
             Span::styled(
                 level.to_string(),
                 Style::default().fg(if active { ACCENT } else { TEXT }),
             ),
         ]))
-        .style(Style::default().bg(if active { ROW_ACTIVE } else { SURFACE }))
+        .style(selected_row_style(active))
     });
-    let mut state = ListState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(List::new(items), sections[1], &mut state);
-    for index in state.offset()..options.len() {
-        let y = sections[1]
-            .y
-            .saturating_add((index - state.offset()) as u16);
-        if y >= sections[1].bottom() {
-            break;
-        }
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(sections[1].x, y, sections[1].width, 1),
-            target: AppHit::ModelRoleEffort(index),
-        });
-    }
+    render_selection_list(
+        frame,
+        &mut app.hit_regions,
+        items,
+        sections[1],
+        Some(selected),
+        options.len(),
+        1,
+        |index| Some(AppHit::ModelRoleEffort(index)),
+    );
 }
 
 fn value_source_label(source: &ValueSource) -> String {
@@ -4736,7 +4679,20 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
             Constraint::Length(1),
         ])
         .split(inner);
-    render_settings_tabs(frame, app, sections[0], tab);
+    let settings_tabs = SettingsTab::ALL.map(|tab| tab.label());
+    let active_settings_tab = SettingsTab::ALL
+        .iter()
+        .position(|candidate| *candidate == tab)
+        .unwrap_or_default();
+    render_tab_strip(
+        frame,
+        app,
+        sections[0],
+        active_settings_tab,
+        &settings_tabs,
+        true,
+        AppHit::SettingsTab,
+    );
     frame.render_widget(
         Paragraph::new("─".repeat(sections[1].width as usize)).style(Style::default().fg(MUTED)),
         sections[1],
@@ -4755,34 +4711,6 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect, 
         Paragraph::new(Line::styled(hints, Style::default().fg(MUTED))),
         sections[3],
     );
-}
-
-fn render_settings_tabs(frame: &mut Frame<'_>, app: &mut App, area: Rect, active: SettingsTab) {
-    let mut spans = Vec::new();
-    let mut x = area.x;
-    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
-        let label = format!(" {} ", tab.label());
-        let width = label.width() as u16;
-        spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(if tab == active { ACCENT } else { MUTED })
-                .bg(if tab == active { ROW_ACTIVE } else { SURFACE })
-                .add_modifier(if tab == active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ));
-        app.hit_regions.push(HitRegion {
-            area: Rect::new(x, area.y, width, 1),
-            target: AppHit::SettingsTab(index),
-        });
-        x = x.saturating_add(width);
-        spans.push(Span::raw("  "));
-        x = x.saturating_add(2);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marquee_elapsed: usize) {
@@ -4905,10 +4833,7 @@ fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marque
                 );
             }
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(ACCENT),
-                ),
+                selection_marker(selected),
                 Span::styled(
                     list_cell(label, label_width, selected, marquee_elapsed),
                     Style::default().fg(if selected { ACCENT } else { MUTED }),
@@ -4922,14 +4847,14 @@ fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marque
                     Style::default().fg(MUTED),
                 ),
             ]))
-            .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+            .style(selected_row_style(selected))
         });
-    let mut state = ListState::default().with_selected(Some(settings.selected));
-    frame.render_stateful_widget(List::new(items), sections[0], &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         sections[0],
-        state.offset(),
+        Some(settings.selected),
         row_count,
         row_height,
         |index| Some(AppHit::Setting(index)),
@@ -5053,10 +4978,7 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
             );
         }
         ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            selection_marker(selected),
             Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
             Span::raw(" "),
             Span::styled(
@@ -5073,12 +4995,12 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
             ),
         ]))
     });
-    let mut state = ListState::default().with_selected(Some(app.selected_task));
-    frame.render_stateful_widget(List::new(items), list_area, &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         list_area,
-        state.offset(),
+        Some(app.selected_task),
         app.task_records.len(),
         row_height,
         |index| Some(AppHit::Task(index)),
@@ -5245,10 +5167,7 @@ pub(super) fn render_plugin_panel(
         let value_preview = single_line_preview(&value, value_limit);
         let description_width = value_width.saturating_sub(value_preview.chars().count());
         let mut spans = vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            selection_marker(selected),
             Span::styled(
                 format!(
                     "{:<width$}",
@@ -5272,19 +5191,15 @@ pub(super) fn render_plugin_panel(
                 Style::default().fg(MUTED),
             ));
         }
-        ListItem::new(Line::from(spans)).style(Style::default().bg(if selected {
-            ROW_ACTIVE
-        } else {
-            SURFACE
-        }))
+        ListItem::new(Line::from(spans)).style(selected_row_style(selected))
     });
     let selected = view.selected.filter(|index| *index < view.rows.len());
-    let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(List::new(items), sections[0], &mut state);
-    push_list_hits(
+    render_selection_list(
+        frame,
         &mut app.hit_regions,
+        items,
         sections[0],
-        state.offset(),
+        selected,
         view.rows.len(),
         row_height,
         |index| {
@@ -6391,24 +6306,92 @@ pub(super) fn list_row_height(compact: bool) -> u16 {
     if compact { 2 } else { 1 }
 }
 
+/// The marker span opening every selectable list row.
+fn selection_marker(selected: bool) -> Span<'static> {
+    Span::styled(
+        if selected { "› " } else { "  " },
+        Style::default().fg(ACCENT),
+    )
+}
+
+/// Row background: the selected row highlights.
+fn selected_row_style(selected: bool) -> Style {
+    Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE })
+}
+
 pub(super) fn compact_list_item(
     selected: bool,
     primary: Vec<Span<'static>>,
     secondary: Vec<Span<'static>>,
 ) -> ListItem<'static> {
-    let mut first = vec![Span::styled(
-        if selected { "› " } else { "  " },
-        Style::default().fg(ACCENT),
-    )];
+    let mut first = vec![selection_marker(selected)];
     first.extend(primary);
     let mut second = vec![Span::raw("  ")];
     second.extend(secondary);
-    ListItem::new(vec![Line::from(first), Line::from(second)])
-        .style(Style::default().bg(if selected { ROW_ACTIVE } else { SURFACE }))
+    ListItem::new(vec![Line::from(first), Line::from(second)]).style(selected_row_style(selected))
+}
+
+/// Renders a stateful selection list and registers one hit region per
+/// visible row. Takes only the hit-region vector because the item iterators
+/// borrow the rest of `app`.
+fn render_selection_list(
+    frame: &mut Frame<'_>,
+    hit_regions: &mut Vec<HitRegion<AppHit>>,
+    items: impl IntoIterator<Item = ListItem<'static>>,
+    area: Rect,
+    selected: Option<usize>,
+    count: usize,
+    row_height: u16,
+    target: impl FnMut(usize) -> Option<AppHit>,
+) {
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+    push_list_hits(hit_regions, area, state.offset(), count, row_height, target);
+}
+
+/// Shared tab strip for tabbed panels: the active tab highlighted, one hit
+/// region per tab while `interactive`.
+fn render_tab_strip(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    active: usize,
+    labels: &[&'static str],
+    interactive: bool,
+    target: fn(usize) -> AppHit,
+) {
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (index, label) in labels.iter().enumerate() {
+        let label = format!(" {label} ");
+        let width = label.width() as u16;
+        let active_tab = index == active;
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(if active_tab { ACCENT } else { MUTED })
+                .bg(if active_tab { ROW_ACTIVE } else { SURFACE })
+                .add_modifier(if active_tab {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ));
+        if interactive {
+            app.hit_regions.push(HitRegion {
+                area: Rect::new(x, area.y, width, 1),
+                target: target(index),
+            });
+        }
+        x = x.saturating_add(width);
+        spans.push(Span::raw("  "));
+        x = x.saturating_add(2);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Register one click target per visible list row, `row_height` cells tall.
-pub(super) fn push_list_hits(
+fn push_list_hits(
     hit_regions: &mut Vec<HitRegion<AppHit>>,
     area: Rect,
     offset: usize,

@@ -1193,6 +1193,27 @@ impl App {
         repeated
     }
 
+    /// Marks the run over: the busy flag, the activity label, and its timer
+    /// always reset together.
+    fn end_run(&mut self) {
+        self.busy = false;
+        self.activity = None;
+        self.busy_since = None;
+    }
+
+    /// A context checkpoint event: a manual checkpoint ends the run and
+    /// flashes; an automatic one keeps it running. Both push a fixed card.
+    fn push_context_checkpoint(&mut self, title: &str, text: String, manual: bool, flash: &str) {
+        self.token_rate.retry_response();
+        if manual {
+            self.end_run();
+            self.set_flash(flash);
+        } else {
+            self.activity = Some(Activity::Thinking);
+        }
+        self.push(BlockKind::Compaction, title, text, None, false, false);
+    }
+
     fn apply(&mut self, event: SessionEvent) {
         let settles_model_response = matches!(
             &event.kind,
@@ -1451,9 +1472,7 @@ impl App {
             }
             EventKind::Error { text } => {
                 self.token_rate.fail_turn();
-                self.busy = false;
-                self.activity = None;
-                self.busy_since = None;
+                self.end_run();
                 self.push(BlockKind::Error, "ERROR", text, None, true, true);
             }
             EventKind::Compaction {
@@ -1461,56 +1480,28 @@ impl App {
                 tokens_before,
                 replacement_history: _,
                 manual,
-            } => {
-                self.token_rate.retry_response();
-                if manual {
-                    self.busy = false;
-                    self.activity = None;
-                    self.busy_since = None;
-                    self.set_flash("Context compacted; original events retained");
-                } else {
-                    self.activity = Some(Activity::Thinking);
-                }
-                self.push(
-                    BlockKind::Compaction,
-                    "COMPACTION",
-                    format!("Context before compaction: {tokens_before} tokens\n\n{summary}"),
-                    None,
-                    false,
-                    false,
-                );
-            }
+            } => self.push_context_checkpoint(
+                "COMPACTION",
+                format!("Context before compaction: {tokens_before} tokens\n\n{summary}"),
+                manual,
+                "Context compacted; original events retained",
+            ),
             EventKind::ContextRollover {
                 window_id,
                 tokens_before,
                 replacement_history: _,
                 manual,
-            } => {
-                self.token_rate.retry_response();
-                if manual {
-                    self.busy = false;
-                    self.activity = None;
-                    self.busy_since = None;
-                    self.set_flash("Fresh context window started; original events retained");
-                } else {
-                    self.activity = Some(Activity::Thinking);
-                }
-                self.push(
-                    BlockKind::Compaction,
-                    "CONTEXT ROLLOVER",
-                    format!(
-                        "Started context window {window_id}; previous context used {tokens_before} tokens. Notes and raw history remain available through context://."
-                    ),
-                    None,
-                    false,
-                    false,
-                );
-            }
+            } => self.push_context_checkpoint(
+                "CONTEXT ROLLOVER",
+                format!(
+                    "Started context window {window_id}; previous context used {tokens_before} tokens. Notes and raw history remain available through context://."
+                ),
+                manual,
+                "Fresh context window started; original events retained",
+            ),
             EventKind::TurnFinished => {
                 self.token_rate.finish_turn();
-                self.busy = false;
-                self.activity = None;
-                self.busy_since = None;
+                self.end_run();
                 self.finish_current_turn(self.applying_sequence);
             }
         }
