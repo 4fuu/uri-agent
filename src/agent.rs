@@ -190,17 +190,9 @@ pub struct AgentSpecPatch {
     pub protocols: Option<CapabilitySelection>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CompactionContext {
-    pub session_id: String,
-    pub summary: String,
-    pub manual: bool,
-    pub spec: AgentSpec,
-}
-
 #[async_trait]
 pub trait CompactionCallback: Send + Sync {
-    async fn compacted(&self, context: CompactionContext) -> Result<Option<AgentSpecPatch>>;
+    async fn compacted(&self) -> Result<Option<AgentSpecPatch>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -362,10 +354,6 @@ impl AgentHost {
                 open_lock: Mutex::new(()),
             }),
         })
-    }
-
-    pub fn working_directory(&self) -> &PathBuf {
-        &self.inner.cwd
     }
 
     pub async fn create(
@@ -575,26 +563,6 @@ impl AgentHost {
             .is_some_and(|active| Arc::as_ptr(&active) as usize == instance)
         {
             active.remove(session_id);
-        }
-    }
-
-    pub async fn shutdown_all(&self) {
-        let instances = {
-            let mut active = self.inner.active.lock().await;
-            let instances = active
-                .values()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            active.clear();
-            instances
-        };
-        for instance in instances {
-            AgentHandle {
-                host: self.clone(),
-                instance,
-            }
-            .close()
-            .await;
         }
     }
 }

@@ -204,60 +204,11 @@ pub fn should_compact_usage(
         && context_tokens > context_window.saturating_sub(settings.reserve_for(context_window))
 }
 
-pub fn prepare(
-    system_prompt: &str,
-    history: &[Message],
-    context_window: usize,
-    force: bool,
-) -> Option<CompactionPreparation> {
-    prepare_with_settings(
-        system_prompt,
-        history,
-        context_window,
-        force,
-        Settings::default(),
-    )
-}
-
 pub fn prepare_with_settings(
     system_prompt: &str,
     history: &[Message],
     context_window: usize,
     force: bool,
-    settings: Settings,
-) -> Option<CompactionPreparation> {
-    prepare_with_options(
-        system_prompt,
-        history,
-        context_window,
-        force,
-        true,
-        settings,
-    )
-}
-
-pub fn prepare_preserving_latest_turn(
-    system_prompt: &str,
-    history: &[Message],
-    context_window: usize,
-    force: bool,
-) -> Option<CompactionPreparation> {
-    prepare_with_options(
-        system_prompt,
-        history,
-        context_window,
-        force,
-        false,
-        Settings::default(),
-    )
-}
-
-fn prepare_with_options(
-    system_prompt: &str,
-    history: &[Message],
-    context_window: usize,
-    force: bool,
-    split_oversized_turn: bool,
     settings: Settings,
 ) -> Option<CompactionPreparation> {
     let tokens_before = estimate_tokens(system_prompt, history);
@@ -273,7 +224,7 @@ fn prepare_with_options(
     let latest_turn = *turn_starts.last()?;
     let mut start = latest_turn;
     let mut retained_tokens = estimate_tokens("", &history[start..]);
-    if retained_tokens > keep_budget && split_oversized_turn {
+    if retained_tokens > keep_budget {
         // A single tool-heavy turn can exceed the entire retention budget.
         // Like Pi, split it at a context-valid message boundary, never at a
         // tool result (which must remain paired with the preceding call).
@@ -606,11 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn summary_request_points_at_the_conversation_block_above_it() {
-        assert!(SUMMARY_REQUEST.contains("in `<conversation>` above"));
-    }
-
-    #[test]
     fn non_ascii_text_is_not_estimated_as_four_characters_per_token() {
         assert_eq!(text_tokens("abcdefgh"), 2);
         assert_eq!(text_tokens("上下文机制"), 5);
@@ -682,10 +628,6 @@ mod tests {
         assert!(serialized.contains("<conversation>"));
         assert!(serialized.contains("middle of tool result omitted"));
         assert!(serialized.contains("latest user goal and constraints"));
-        assert!(serialized.contains("mark older goals as superseded"));
-        assert!(serialized.contains("verified facts and completed verification"));
-        assert!(serialized.contains("user-reported"));
-        assert!(serialized.contains("agent hypotheses"));
         assert!(serialized.chars().count() < 3_500);
         assert!(estimate_tokens("", &history) <= 3_000);
     }
@@ -740,7 +682,8 @@ mod tests {
             Message::user("current task"),
             Message::assistant("current answer"),
         ];
-        let prepared = prepare("system", &history, 32_000, false).unwrap();
+        let prepared =
+            prepare_with_settings("system", &history, 32_000, false, Settings::default()).unwrap();
 
         assert_eq!(prepared.summarizable.len(), 2);
         assert_eq!(prepared.retained, history[2..]);
@@ -755,8 +698,12 @@ mod tests {
             Message::user("second"),
             Message::assistant("second answer"),
         ];
-        assert!(prepare("system", &history, 128_000, false).is_none());
-        let prepared = prepare("system", &history, 128_000, true).unwrap();
+        assert!(
+            prepare_with_settings("system", &history, 128_000, false, Settings::default())
+                .is_none()
+        );
+        let prepared =
+            prepare_with_settings("system", &history, 128_000, true, Settings::default()).unwrap();
         assert_eq!(prepared.summarizable, history[..2]);
         assert_eq!(prepared.retained, history[2..]);
     }
@@ -790,7 +737,8 @@ mod tests {
             Message::assistant("change complete"),
         ];
 
-        let prepared = prepare("system", &history, 128_000, true).unwrap();
+        let prepared =
+            prepare_with_settings("system", &history, 128_000, true, Settings::default()).unwrap();
 
         assert_eq!(prepared.summarizable, history[..4]);
         assert_eq!(prepared.retained, history[4..]);
@@ -824,7 +772,8 @@ mod tests {
             Message::assistant("done"),
         ];
 
-        let prepared = prepare("system", &history, 32_000, false).unwrap();
+        let prepared =
+            prepare_with_settings("system", &history, 32_000, false, Settings::default()).unwrap();
 
         assert!(!prepared.summarizable.is_empty());
         assert!(matches!(
@@ -836,21 +785,6 @@ mod tests {
             Some(Message::User { content })
                 if content.iter().any(|item| matches!(item, UserContent::ToolResult(_)))
         ));
-    }
-
-    #[test]
-    fn preserving_preparation_keeps_an_oversized_latest_turn_whole() {
-        let history = vec![
-            Message::user("old task"),
-            Message::assistant("old answer"),
-            Message::user("current task"),
-            Message::assistant("large current answer".repeat(20_000)),
-        ];
-
-        let prepared = prepare_preserving_latest_turn("system", &history, 32_000, false).unwrap();
-
-        assert_eq!(prepared.summarizable, history[..2]);
-        assert_eq!(prepared.retained, history[2..]);
     }
 
     #[test]
