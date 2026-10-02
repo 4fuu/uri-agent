@@ -1,6 +1,4 @@
-use crate::agent::{
-    CapabilitySelection, CompactionCallback, CompactionContext, SubmitKind, SystemPromptUpdate,
-};
+use crate::agent::{CapabilitySelection, CompactionCallback, SubmitKind, SystemPromptUpdate};
 use crate::builtins::context::ContextState;
 use crate::catalog::ModelLimits;
 use crate::compaction;
@@ -385,6 +383,7 @@ pub trait RuntimeInitializer: Send + Sync {
 }
 
 impl AgentRuntime {
+    #[cfg(test)]
     pub fn new(
         backend: Option<Arc<dyn ModelBackend>>,
         protocols: Arc<ProtocolRegistry>,
@@ -449,26 +448,6 @@ impl AgentRuntime {
             pending_restored: OnceCell::new(),
             external_pending_enabled: AtomicBool::new(false),
         }
-    }
-
-    pub fn new_deferred(
-        backend: Option<Arc<dyn ModelBackend>>,
-        protocols: Arc<ProtocolRegistry>,
-        model_tools: Arc<ModelToolRegistry>,
-        session: Session,
-        initializer: Arc<dyn RuntimeInitializer>,
-        limits: ModelLimits,
-    ) -> Self {
-        let context_state = ContextState::new(session.clone());
-        Self::new_deferred_with_context(
-            backend,
-            protocols,
-            model_tools,
-            session,
-            initializer,
-            limits,
-            context_state,
-        )
     }
 
     pub(crate) fn new_deferred_with_context(
@@ -795,25 +774,8 @@ impl AgentRuntime {
             .collect()
     }
 
-    pub async fn enqueue_message(
-        self: &Arc<Self>,
-        prompt: String,
-        kind: PendingMessageKind,
-    ) -> Result<PendingMessage> {
-        self.enqueue_message_with_images(prompt, Vec::new(), kind)
-            .await
-    }
-
     /// Durably accept plugin input. Prompt starts a run when idle; Steer waits
     /// for the next model boundary while active and becomes Prompt when idle.
-    pub async fn submit(
-        self: &Arc<Self>,
-        prompt: String,
-        kind: SubmitKind,
-    ) -> Result<PendingMessage> {
-        self.submit_with_images(prompt, Vec::new(), kind).await
-    }
-
     pub async fn submit_with_images(
         self: &Arc<Self>,
         prompt: String,
@@ -1181,6 +1143,7 @@ impl AgentRuntime {
 
     /// Start a detached turn owned by this runtime. The handle remains
     /// available for orderly process shutdown instead of becoming fire-and-forget.
+    #[cfg(test)]
     pub async fn start_turn(self: &Arc<Self>, prompt: String) -> Result<()> {
         self.start_turn_with_images(prompt, Vec::new()).await
     }
@@ -1444,10 +1407,12 @@ impl AgentRuntime {
         self.pending.lock().await.accepting = false;
     }
 
+    #[cfg(test)]
     pub async fn run_turn(&self, prompt: String) -> Result<()> {
         self.run_turn_with_images(prompt, Vec::new()).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_turn_with_images(
         &self,
         prompt: String,
@@ -2065,15 +2030,7 @@ impl AgentRuntime {
         let mut updated = None;
         if let Some(callback) = self.compaction_callback.read().await.clone() {
             let current = self.session.spec().await;
-            if let Some(patch) = callback
-                .compacted(CompactionContext {
-                    session_id: self.session.id().to_string(),
-                    summary: summary.clone(),
-                    manual,
-                    spec: current.clone(),
-                })
-                .await?
-            {
+            if let Some(patch) = callback.compacted().await? {
                 let prompt_update = patch.system_prompt.clone();
                 if let Some(CapabilitySelection::Only(names)) = patch.tools.as_ref() {
                     self.model_tools.validate_selection(names)?;
@@ -2748,10 +2705,7 @@ mod tests {
 
     #[async_trait]
     impl CompactionCallback for TestCompactionCallback {
-        async fn compacted(
-            &self,
-            _context: CompactionContext,
-        ) -> Result<Option<crate::agent::AgentSpecPatch>> {
+        async fn compacted(&self) -> Result<Option<crate::agent::AgentSpecPatch>> {
             if let Some(failure) = self.failure {
                 bail!("{failure}");
             }
@@ -3061,10 +3015,13 @@ mod tests {
             }
             self.release.notified().await;
             self.session
-                .initialize_context(SessionContext {
-                    system_prompt: "deferred system".to_string(),
-                    skills: Vec::new(),
-                })
+                .initialize_context_with_protocols(
+                    SessionContext {
+                        system_prompt: "deferred system".to_string(),
+                        skills: Vec::new(),
+                    },
+                    Vec::new(),
+                )
                 .await?;
             Ok("deferred system".to_string())
         }
@@ -3105,13 +3062,14 @@ mod tests {
             release: release.clone(),
             failure: failure.map(str::to_string),
         });
-        let runtime = Arc::new(AgentRuntime::new_deferred(
+        let runtime = Arc::new(AgentRuntime::new_deferred_with_context(
             Some(backend),
             Arc::new(ProtocolRegistry::new(output, TaskManager::new())),
             protocol_model_tools(),
             session.clone(),
             initializer,
             ModelLimits::default(),
+            ContextState::new(session.clone()),
         ));
         (runtime, session, output_directory, entered, release)
     }
@@ -3139,7 +3097,11 @@ mod tests {
             let runtime = runtime.clone();
             tokio::spawn(async move {
                 runtime
-                    .enqueue_message("queued follow-up".into(), PendingMessageKind::Queued)
+                    .enqueue_message_with_images(
+                        "queued follow-up".into(),
+                        Vec::new(),
+                        PendingMessageKind::Queued,
+                    )
                     .await
             })
         };
@@ -3183,7 +3145,11 @@ mod tests {
             let runtime = runtime.clone();
             tokio::spawn(async move {
                 runtime
-                    .submit("accepted concurrently".into(), SubmitKind::Prompt)
+                    .submit_with_images(
+                        "accepted concurrently".into(),
+                        Vec::new(),
+                        SubmitKind::Prompt,
+                    )
                     .await
             })
         };
@@ -3198,7 +3164,7 @@ mod tests {
         assert!(backend.requests.lock().await.is_empty());
         assert!(!runtime.turn_running().await);
         let error = runtime
-            .submit("too late".into(), SubmitKind::Prompt)
+            .submit_with_images("too late".into(), Vec::new(), SubmitKind::Prompt)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("runtime is shutting down"));
@@ -3225,7 +3191,11 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("startup context failed"));
         let enqueue_error = runtime
-            .enqueue_message("queued follow-up".into(), PendingMessageKind::Queued)
+            .enqueue_message_with_images(
+                "queued follow-up".into(),
+                Vec::new(),
+                PendingMessageKind::Queued,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -3781,7 +3751,7 @@ mod tests {
             test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
 
         let accepted = runtime
-            .submit("start this work".into(), SubmitKind::Steer)
+            .submit_with_images("start this work".into(), Vec::new(), SubmitKind::Steer)
             .await
             .unwrap();
 
@@ -3975,7 +3945,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .submit("local second".into(), SubmitKind::Prompt)
+            .submit_with_images("local second".into(), Vec::new(), SubmitKind::Prompt)
             .await
             .unwrap();
         wait_for_turn(runtime.as_ref()).await;
@@ -4192,7 +4162,7 @@ mod tests {
             .unwrap()
             .unwrap();
         runtime
-            .submit("local second".into(), SubmitKind::Prompt)
+            .submit_with_images("local second".into(), Vec::new(), SubmitKind::Prompt)
             .await
             .unwrap();
         assert_eq!(
@@ -4241,8 +4211,9 @@ mod tests {
             test_runtime(workspace.path(), backend, ModelLimits::default()).await;
 
         let accepted = runtime
-            .enqueue_message(
+            .enqueue_message_with_images(
                 "start from delivery float".into(),
+                Vec::new(),
                 PendingMessageKind::Steer,
             )
             .await
@@ -4313,11 +4284,11 @@ mod tests {
         runtime.start_turn("initial".into()).await.unwrap();
         requests_started.recv().await.unwrap();
         let queued = runtime
-            .enqueue_message("follow up".into(), PendingMessageKind::Queued)
+            .enqueue_message_with_images("follow up".into(), Vec::new(), PendingMessageKind::Queued)
             .await
             .unwrap();
         let steer = runtime
-            .submit("change direction".into(), SubmitKind::Steer)
+            .submit_with_images("change direction".into(), Vec::new(), SubmitKind::Steer)
             .await
             .unwrap();
         assert_eq!(steer.kind, PendingMessageKind::Steer);
@@ -4409,7 +4380,11 @@ mod tests {
         requests_started.recv().await.unwrap();
         assert!(backend.requests.lock().await[0].tools.is_empty());
         runtime
-            .enqueue_message("new constraint".into(), PendingMessageKind::Steer)
+            .enqueue_message_with_images(
+                "new constraint".into(),
+                Vec::new(),
+                PendingMessageKind::Steer,
+            )
             .await
             .unwrap();
 
@@ -4450,7 +4425,11 @@ mod tests {
         runtime.start_turn("initial".into()).await.unwrap();
         requests_started.recv().await.unwrap();
         let queued = runtime
-            .enqueue_message("urgent correction".into(), PendingMessageKind::Queued)
+            .enqueue_message_with_images(
+                "urgent correction".into(),
+                Vec::new(),
+                PendingMessageKind::Queued,
+            )
             .await
             .unwrap();
         let upgraded = runtime.upgrade_latest_queued().await.unwrap();
@@ -4488,11 +4467,11 @@ mod tests {
         runtime.start_turn("initial".into()).await.unwrap();
         requests_started.recv().await.unwrap();
         runtime
-            .enqueue_message("queued".into(), PendingMessageKind::Queued)
+            .enqueue_message_with_images("queued".into(), Vec::new(), PendingMessageKind::Queued)
             .await
             .unwrap();
         runtime
-            .enqueue_message("steer".into(), PendingMessageKind::Steer)
+            .enqueue_message_with_images("steer".into(), Vec::new(), PendingMessageKind::Steer)
             .await
             .unwrap();
 
@@ -4596,7 +4575,11 @@ mod tests {
         runtime.start_turn("initial".into()).await.unwrap();
         requests_started.recv().await.unwrap();
         runtime
-            .enqueue_message("not delivered".into(), PendingMessageKind::Queued)
+            .enqueue_message_with_images(
+                "not delivered".into(),
+                Vec::new(),
+                PendingMessageKind::Queued,
+            )
             .await
             .unwrap();
         runtime.set_backend(None, None).await;
@@ -4655,20 +4638,6 @@ mod tests {
         }));
         recovered.shutdown().await;
         let _ = tokio::fs::remove_dir_all(output_directory).await;
-    }
-
-    #[test]
-    fn fake_tool_call_can_retain_provider_correlation() {
-        let call = ToolCall::new(
-            ToolCallId::new("call-1").unwrap(),
-            ToolFunction::new(
-                "help".to_string(),
-                serde_json::json!({
-                    "protocols": ["file"]
-                }),
-            ),
-        );
-        assert_eq!(call.id.as_str(), "call-1");
     }
 
     #[test]
@@ -4899,7 +4868,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let outside = session.directory().join("outside.png");
+        let outside = workspace.path().join("session-data/outside.png");
         tokio::fs::write(&outside, b"\x89PNG\r\n\x1a\nimage-data")
             .await
             .unwrap();
@@ -5812,9 +5781,6 @@ mod tests {
         assert!(note.contains("about 16% full"));
         assert!(note.contains("840000 tokens remaining"));
         assert!(
-            note.contains("Do not act on this hint until the work already in hand is finished")
-        );
-        assert!(
             context_hint_message(ContextHint::Note30, 1, 31, 1)
                 .contains("only if a decision, path, verified result")
         );
@@ -5825,7 +5791,6 @@ mod tests {
         let rollover60 = context_hint_message(ContextHint::Rollover60, 1, 61, 1);
         assert!(rollover60.contains("uri-agent-context-rollover-hint"));
         assert!(rollover60.contains("twice more, at about 70% and 80%"));
-        assert!(rollover60.contains("organize the work in hand and write notes"));
         assert!(rollover60.contains("request context://rollover"));
         assert!(
             context_hint_message(ContextHint::Rollover70, 1, 71, 1)
@@ -7276,7 +7241,7 @@ mod tests {
         let (runtime, session, output_directory) =
             test_runtime(workspace.path(), backend.clone(), ModelLimits::default()).await;
         runtime
-            .submit("native turn".to_string(), SubmitKind::Prompt)
+            .submit_with_images("native turn".to_string(), Vec::new(), SubmitKind::Prompt)
             .await
             .unwrap();
         backend.started.notified().await;

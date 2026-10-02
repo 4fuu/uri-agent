@@ -1030,7 +1030,6 @@ pub struct Session {
     created: bool,
     project: String,
     project_directory: PathBuf,
-    directory: PathBuf,
     database_path: PathBuf,
     connection: Connection,
     state: Arc<Mutex<State>>,
@@ -1062,7 +1061,7 @@ impl Session {
             .unwrap_or_else(|_| cwd.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let (_, connection) = open_database(session_database_path(cwd)).await?;
+        let connection = open_database(session_database_path(cwd)).await?;
         let id = id.to_string();
         connection
             .call(move |db| {
@@ -1109,7 +1108,7 @@ impl Session {
             .unwrap_or_else(|_| cwd.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let (_, connection) = open_database(session_database_path(cwd)).await?;
+        let connection = open_database(session_database_path(cwd)).await?;
         let id = id.to_string();
         let owner = owner.to_string();
         connection
@@ -1140,22 +1139,6 @@ impl Session {
             })
             .await
             .context("cannot read private session record")
-    }
-
-    pub async fn open(
-        requested: Option<&str>,
-        cwd: &Path,
-        spec: AgentSpec,
-        context: SessionContext,
-    ) -> Result<Self> {
-        Self::open_at_with_spec(
-            session_database_path(cwd),
-            requested,
-            cwd,
-            spec,
-            Some(context),
-        )
-        .await
     }
 
     pub async fn open_deferred(
@@ -1234,7 +1217,7 @@ impl Session {
         mut spec: AgentSpec,
         context: Option<SessionContext>,
     ) -> Result<Self> {
-        let (directory, connection) = open_database(database_path.clone()).await?;
+        let connection = open_database(database_path.clone()).await?;
         let project_directory = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let project = project_directory.to_string_lossy().into_owned();
 
@@ -1386,7 +1369,6 @@ impl Session {
             created: created_session,
             project,
             project_directory,
-            directory,
             database_path,
             connection,
             state: Arc::new(Mutex::new(State {
@@ -1995,11 +1977,6 @@ impl Session {
             .context("cannot deliver collaboration input")
     }
 
-    pub async fn initialize_context(&self, context: SessionContext) -> Result<()> {
-        self.initialize_context_with_protocols(context, Vec::new())
-            .await
-    }
-
     pub async fn initialize_context_with_protocols(
         &self,
         context: SessionContext,
@@ -2120,36 +2097,6 @@ impl Session {
         Ok(())
     }
 
-    /// Store frontend- or plugin-owned state outside the append-only transcript.
-    pub async fn set_private_record(&self, owner: &str, payload: Value) -> Result<()> {
-        let owner = owner.trim();
-        if owner.is_empty() {
-            bail!("private session record owner cannot be empty");
-        }
-        let serialized = serde_json::to_string(&payload)
-            .with_context(|| format!("cannot serialize private session record {owner}"))?;
-        let mut state = self.state.lock().await;
-        if state.persisted {
-            let session_id = self.id.clone();
-            let stored_owner = owner.to_string();
-            self.connection
-                .call(move |db| {
-                    db.execute(
-                        "INSERT INTO session_private_records
-                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(session_id, owner)
-                         DO UPDATE SET payload_json = excluded.payload_json",
-                        params![session_id, stored_owner, serialized],
-                    )?;
-                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-                })
-                .await
-                .with_context(|| format!("cannot persist private session record {owner}"))?;
-        }
-        state.private_records.insert(owner.to_string(), payload);
-        Ok(())
-    }
-
     pub(crate) async fn stage_private_record(&self, owner: &str, payload: Value) -> Result<()> {
         let owner = owner.trim();
         if owner.is_empty() {
@@ -2214,9 +2161,6 @@ impl Session {
 
     pub fn project_directory(&self) -> &Path {
         &self.project_directory
-    }
-    pub fn directory(&self) -> &Path {
-        &self.directory
     }
     pub fn database_path(&self) -> &Path {
         &self.database_path
@@ -3096,7 +3040,7 @@ async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec
         .unwrap_or_else(|_| cwd.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    let (_, connection) = open_database(database_path).await?;
+    let connection = open_database(database_path).await?;
     connection
         .call(move |db| {
             let mut statement = db.prepare(
@@ -3321,7 +3265,7 @@ async fn open_archive_database(path: &Path) -> Result<Option<Connection>> {
         .with_context(|| format!("cannot open session archive: {}", display_path(path)))
 }
 
-async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> {
+async fn open_database(database_path: PathBuf) -> Result<Connection> {
     let directory = database_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -3352,7 +3296,7 @@ async fn open_database(database_path: PathBuf) -> Result<(PathBuf, Connection)> 
         .call(initialize_database)
         .await
         .context("cannot initialize session database")?;
-    Ok((directory, connection))
+    Ok(connection)
 }
 
 /// `BEGIN IMMEDIATE` is the only statement in a session write transaction
@@ -4645,12 +4589,12 @@ mod tests {
         .await
         .unwrap();
         opened
-            .set_private_record("frontend", serde_json::json!({"token": "private-value"}))
+            .stage_private_record("frontend", serde_json::json!({"token": "private-value"}))
             .await
             .unwrap();
         assert!(opened.persist().await.is_err());
         opened
-            .initialize_context(context("prepared"))
+            .initialize_context_with_protocols(context("prepared"), Vec::new())
             .await
             .unwrap();
         opened.persist().await.unwrap();
@@ -4680,7 +4624,11 @@ mod tests {
             Some(serde_json::json!({"token": "private-value"}))
         );
         reopened
-            .set_private_record("frontend", serde_json::json!({"token": "replacement"}))
+            .stage_private_record("frontend", serde_json::json!({"token": "replacement"}))
+            .await
+            .unwrap();
+        reopened
+            .persist_private_records(&["frontend".to_string()])
             .await
             .unwrap();
         drop(reopened);
@@ -4931,7 +4879,7 @@ mod tests {
         assert!(error.to_string().contains("startup context is ready"));
 
         opened
-            .initialize_context(context("deferred"))
+            .initialize_context_with_protocols(context("deferred"), Vec::new())
             .await
             .unwrap();
         opened
@@ -5936,7 +5884,7 @@ mod tests {
             .unwrap();
         }
 
-        let (_, connection) = open_database(path).await.unwrap();
+        let connection = open_database(path).await.unwrap();
         let columns = connection
             .call(|db| {
                 let mut statement = db.prepare("PRAGMA table_info(session_resume_index)")?;
@@ -6272,7 +6220,7 @@ mod tests {
         .await
         .unwrap();
         prepared
-            .initialize_context(context("prepared"))
+            .initialize_context_with_protocols(context("prepared"), Vec::new())
             .await
             .unwrap();
         prepared.persist().await.unwrap();
