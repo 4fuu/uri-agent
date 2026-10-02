@@ -23,7 +23,10 @@ use zvec_rust::{
     SearchQuery,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+/// Semantic-index schema version; the cache lives under
+/// `<cache>/uri-agent/retrieval/v{SCHEMA_VERSION}/`. Shared by the store and
+/// the long `--help` reference.
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 const ZVEC_VERSION: &str = "0.7.0";
 const MODEL_SHA256: &str = "75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c";
 const TOKENIZER_SHA256: &str = "107bbdcbad4bff1d299b7a4c3a2fb17c52890688b7dd0e4c9deab79d3c4f3d45";

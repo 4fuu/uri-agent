@@ -108,42 +108,97 @@ pub struct ModelRoleInfo {
 }
 
 #[derive(Clone, Parser, Debug)]
-#[command(name = "uri-agent", version, about)]
+#[command(
+    name = "uri-agent",
+    version,
+    about,
+    long_about = LONG_ABOUT,
+    after_long_help = reference(),
+)]
 pub struct Cli {
-    /// Provider ID from the Pi model catalog, for example openai or anthropic.
-    #[arg(long)]
+    /// Provider ID from the pi model catalog, for example openai or anthropic.
+    #[arg(
+        long,
+        long_help = "Provider ID from the pi model catalog, for example openai or anthropic. \
+Overrides the defaultProvider setting and URI_AGENT_PROVIDER for this invocation. Selecting a \
+provider other than the configured default also drops the saved defaultModel unless --model is \
+set; run `:model` in the interface to pick a runnable model."
+    )]
     pub provider: Option<String>,
 
     /// Model ID from the selected provider.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "Model ID from the selected provider. Overrides the defaultModel setting and \
+URI_AGENT_MODEL for this invocation."
+    )]
     pub model: Option<String>,
 
     /// Provider API key for this invocation. Prefer auth.json or the provider environment variable.
-    #[arg(long, hide_env_values = true)]
+    #[arg(
+        long,
+        hide_env_values = true,
+        long_help = "Provider API key for this invocation only; the value is never written to \
+auth.json. Overrides auth.json, the provider environment variable, and URI_AGENT_API_KEY. Prefer \
+stored credentials or the provider environment variable in scripts and shells."
+    )]
     pub api_key: Option<String>,
 
     /// Override the number of bytes returned inline before URI Agent spills output to a file.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "Number of bytes a tool result may return inline before the complete bytes \
+spill to a file under the cache directory and the transcript keeps a readable address. Minimum \
+1024. Default 32768; also set by the outputLimit setting and URI_AGENT_OUTPUT_LIMIT."
+    )]
     pub output_limit: Option<usize>,
 
     /// Reasoning effort for capable models (off, minimal, low, medium, high, xhigh, or max).
-    #[arg(long, value_name = "LEVEL")]
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        long_help = "Reasoning effort for capable models: off, minimal, low, medium, high, \
+xhigh, or max. The selected model determines which values are selectable. Overrides the \
+defaultThinkingLevel and modelThinkingLevels settings and URI_AGENT_THINKING for this invocation."
+    )]
     pub thinking: Option<ThinkingLevel>,
 
     /// Disable cloud and provider model-catalog requests and use the local cache only.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "Disable cloud and provider model-catalog requests and use cached catalog \
+data only; already-configured models keep working. Same as setting URI_AGENT_OFFLINE=1 (or the \
+compatibility alias PI_OFFLINE=1)."
+    )]
     pub offline: bool,
 
     /// Resume the most recently updated session.
-    #[arg(long, conflicts_with = "session")]
+    #[arg(
+        long,
+        conflicts_with = "session",
+        long_help = "Resume the most recently updated session for the current project directory \
+(--cwd or the process working directory)."
+    )]
     pub continue_session: bool,
 
     /// Resume a session by ID.
-    #[arg(long, value_name = "ID")]
+    #[arg(
+        long,
+        value_name = "ID",
+        long_help = "Resume one session by its stable ID. The ID must belong to the current \
+project directory; `:resume` and `@@` completion inside the interface list candidates. Conflicts \
+with --continue-session."
+    )]
     pub session: Option<String>,
 
     /// Working directory exposed to file and shell plugins.
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        long_help = "Canonical working directory exposed to file and shell plugins. Also the \
+project boundary for sessions, project settings, AGENTS.md instructions, Skills, and project \
+MCP servers. Defaults to the current directory; it does not restrict filesystem access."
+    )]
     pub cwd: Option<PathBuf>,
 
     /// Run resident plugin callbacks without starting the terminal interface.
@@ -153,9 +208,292 @@ pub struct Cli {
     /// Serve stable Agent Client Protocol v1 over stdin/stdout.
     #[arg(
         long,
-        conflicts_with_all = ["continue_session", "session", "cwd", "background"]
+        conflicts_with_all = ["continue_session", "session", "cwd", "background"],
+        long_help = "Serve stable Agent Client Protocol v1 over stdin/stdout for an editor or \
+other ACP client instead of opening the terminal interface. The client supplies each session's \
+absolute project directory and may carry its own MCP server profile."
     )]
     pub acpv1: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Subcommand>,
+}
+
+/// Subcommands offered by the CLI. All global flags keep their flat form and
+/// behave exactly as before.
+#[derive(Clone, Debug, clap::Subcommand)]
+pub enum Subcommand {
+    /// List documentation topics embedded in this binary, or print one to stdout.
+    Docs {
+        /// Document filename to print, for example configuration.md.
+        topic: Option<String>,
+    },
+}
+
+/// Opening paragraph of `uri-agent --help`; `-h` keeps the one-line `about`.
+const LONG_ABOUT: &str = "A protocol-oriented coding agent with a focused terminal interface.
+
+URI Agent runs in three modes. Without mode flags it opens the interactive
+terminal interface in the current directory. In execute mode (-x, --execute
+[PROMPT]) it runs one prompt, taken from the argument or from standard input
+when the argument is omitted, with piped standard input appended when both are
+present, prints only the final assistant message, and exits non-zero when the
+run fails. With --acpv1 it serves Agent Client Protocol v1 over stdin/stdout to
+an editor or other client instead of opening the terminal interface. Run
+`uri-agent docs` to list the documentation embedded in this binary.";
+
+/// Example commands rendered into the long `--help` reference. The execute
+/// mode entries describe `-x`/`--execute`.
+const EXAMPLES: &[(&str, &str)] = &[
+    (
+        "uri-agent",
+        "Start the interactive interface in the current directory",
+    ),
+    (
+        "uri-agent --continue-session",
+        "Resume the most recently updated session",
+    ),
+    (
+        "uri-agent --session <ID>",
+        "Resume one session by its stable ID",
+    ),
+    (
+        "uri-agent -x \"find the failing test\"",
+        "Execute one prompt, print only the final reply, and exit",
+    ),
+    (
+        "echo \"explain the build failure\" | uri-agent -x",
+        "Execute with the prompt read from standard input instead",
+    ),
+    (
+        "uri-agent -x \"summarize this log\" < error.log",
+        "Pipe a file; standard input is appended to the argument prompt",
+    ),
+    (
+        "uri-agent --provider anthropic --model claude-sonnet-4-5",
+        "Choose the provider and model for this run",
+    ),
+    (
+        "uri-agent --acpv1",
+        "Serve ACP v1 over stdin/stdout to an editor or other client",
+    ),
+];
+
+/// Build the generated half of the long `--help` reference. Environment
+/// variables, provider credential names, settings fields, and platform
+/// paths all render from the tables and resolvers that own them, so this
+/// text cannot drift from behavior.
+fn reference() -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "Environment variables:");
+    let _ = writeln!(output);
+    let rows = ENVIRONMENT_REFERENCE
+        .iter()
+        .map(|(name, effect)| ((*name).to_string(), (*effect).to_string()))
+        .collect::<Vec<_>>();
+    let _ = write!(output, "{}", render_rows(&rows));
+
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Provider credentials are read from conventional variables per provider ID;"
+    );
+    let _ = writeln!(
+        output,
+        "aliases are consulted only while the primary variable is unset:"
+    );
+    let _ = writeln!(output);
+    let rows = crate::catalog::PROVIDER_CREDENTIAL_ENVIRONMENTS
+        .iter()
+        .map(|(providers, primary, aliases)| {
+            let right = if aliases.is_empty() {
+                (*primary).to_string()
+            } else {
+                format!("{primary} (aliases: {})", aliases.join(", "))
+            };
+            (providers.join(", "), right)
+        })
+        .collect::<Vec<_>>();
+    let _ = write!(output, "{}", render_rows(&rows));
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Any other provider ID reads <ID>_API_KEY with the ID upper-cased and each"
+    );
+    let _ = writeln!(output, "non-alphanumeric character replaced by '_'.");
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Files and directories:");
+    let _ = writeln!(output);
+    let _ = write!(output, "{}", files_reference());
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Settings reference:");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Settings resolve from lowest to highest priority: built-in default, global"
+    );
+    let _ = writeln!(
+        output,
+        "settings.json, project .uri-agent/settings.json, environment variable, then"
+    );
+    let _ = writeln!(output, "command-line flag.");
+    let _ = writeln!(output);
+    let rows = SETTINGS_REFERENCE
+        .iter()
+        .map(|(key, meaning, default)| {
+            (
+                (*key).to_string(),
+                format!("{meaning} (default: {default})"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let _ = write!(output, "{}", render_rows(&rows));
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Example settings.json:");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{EXAMPLE_SETTINGS_JSON}");
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Examples:");
+    let _ = writeln!(output);
+    let rows = EXAMPLES
+        .iter()
+        .map(|(command, effect)| ((*command).to_string(), (*effect).to_string()))
+        .collect::<Vec<_>>();
+    let _ = write!(output, "{}", render_rows(&rows));
+
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Embedded documentation:");
+    let _ = writeln!(output);
+    let rows = vec![
+        (
+            "uri-agent docs".to_string(),
+            "List the documents embedded in this binary".to_string(),
+        ),
+        (
+            "uri-agent docs configuration.md".to_string(),
+            "Print one embedded document to stdout".to_string(),
+        ),
+    ];
+    let _ = write!(output, "{}", render_rows(&rows));
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "The uri-agent-docs protocol serves the same documents to the model in a session."
+    );
+    output
+}
+
+/// Render aligned `left`/`right` rows on their own indented lines.
+fn render_rows(rows: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+
+    let width = rows
+        .iter()
+        .map(|(left, _)| left.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut output = String::new();
+    for (left, right) in rows {
+        let padding = " ".repeat(width - left.chars().count());
+        let _ = writeln!(output, "  {left}{padding}  {right}");
+    }
+    output
+}
+
+/// Resolve the files-and-directories rows of the long `--help` reference
+/// from the current platform's real locations.
+fn files_reference() -> String {
+    let config = config_directory()
+        .map(|directory| display_path(&directory))
+        .unwrap_or_else(|_| "<config>".to_string());
+    let cache = dirs::cache_dir()
+        .map(|directory| display_path(&directory))
+        .unwrap_or_else(|| "<cache>".to_string());
+    let sessions = display_path(&crate::session::session_database_path(Path::new(
+        "<project>",
+    )));
+    let outputs = display_path(&crate::output::outputs_root());
+    let retrieval = format!(
+        "{cache}/uri-agent/retrieval/v{}",
+        crate::retrieval::SCHEMA_VERSION
+    );
+
+    let rows = vec![
+        (
+            format!("{config}/"),
+            "Configuration directory; URI_AGENT_CONFIG_DIR replaces it".to_string(),
+        ),
+        (
+            format!("{config}/settings.json"),
+            "Global settings; see the settings reference below".to_string(),
+        ),
+        (
+            format!("{config}/auth.json"),
+            "Provider credentials: API keys and OAuth tokens".to_string(),
+        ),
+        (
+            format!("{config}/environment.json"),
+            "Agent environment values injected into Agent shell commands".to_string(),
+        ),
+        (
+            format!("{config}/models.json"),
+            "User-defined providers, models, and overrides".to_string(),
+        ),
+        (
+            format!("{config}/models-store.json"),
+            "Generated model-catalog and discovery cache".to_string(),
+        ),
+        (
+            format!("{config}/models-dev.json"),
+            "Cached models.dev protocol hints for OpenCode discovery".to_string(),
+        ),
+        (
+            format!("{config}/keymap.rhai"),
+            "Global keymap overrides".to_string(),
+        ),
+        (
+            format!("{config}/{}", crate::builtins::MCP_GLOBAL_CONFIG),
+            "User-scoped MCP servers".to_string(),
+        ),
+        (
+            "<project>/.uri-agent/settings.json".to_string(),
+            "Project settings; fields override matching global values".to_string(),
+        ),
+        (
+            "<project>/.uri-agent/keymap.rhai".to_string(),
+            "Project keymap overrides".to_string(),
+        ),
+        (
+            format!("<project>/{}", crate::builtins::MCP_PROJECT_CONFIG),
+            "Project-scoped MCP servers; replaces the same user name".to_string(),
+        ),
+        (
+            "<project>/AGENTS.md".to_string(),
+            "Project instructions included in new sessions' frozen startup context".to_string(),
+        ),
+        (sessions, "Append-only session storage (SQLite)".to_string()),
+        (
+            format!("{outputs}/<session-id>/"),
+            "Complete spilled tool output and diagnostics per session".to_string(),
+        ),
+        (
+            format!("{retrieval}/"),
+            "Disposable semantic indexes, rebuilt by ranked searches".to_string(),
+        ),
+    ];
+    use std::fmt::Write as _;
+    let mut output = render_rows(&rows);
+    let _ = writeln!(output);
+    let _ = writeln!(output, "  Skill discovery roots, highest priority first:");
+    for root in crate::skill::discovery_roots(Path::new("<project>")) {
+        let _ = writeln!(output, "    {}", display_path(&root));
+    }
+    output
 }
 
 pub struct Config {
@@ -179,9 +517,8 @@ impl Config {
             fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
         }
         let environment = Arc::new(AgentEnvironment::load(&directory).await?);
-        let offline = cli.offline
-            || environment_truthy("URI_AGENT_OFFLINE")
-            || environment_truthy("PI_OFFLINE");
+        let offline =
+            cli.offline || environment_truthy(ENV_OFFLINE) || environment_truthy(ENV_PI_OFFLINE);
         let catalog = Arc::new(ModelCatalog::load(&directory, offline).await?);
         let manager = Arc::new(
             ConfigManager::load(
@@ -358,6 +695,105 @@ struct CompactionFile {
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
+
+/// Every documented `settings.json` field, rendered into the long `--help`
+/// reference. Rows carry the JSON key (nested compaction fields use dotted
+/// keys), a one-line meaning, and the default applied when the field is
+/// absent. Tests pin this table against `SettingsFile`, `CompactionFile`,
+/// and the source defaults so the reference cannot drift from the loader.
+const SETTINGS_REFERENCE: &[(&str, &str, &str)] = &[
+    (
+        "defaultProvider",
+        "Default provider selected at startup",
+        "unset",
+    ),
+    ("defaultModel", "Default model for that provider", "unset"),
+    (
+        "outputLimit",
+        "Inline tool-result bytes before the complete bytes spill to a file",
+        "32768",
+    ),
+    (
+        "defaultThinkingLevel",
+        "Fallback reasoning effort for models without a stored choice",
+        "off",
+    ),
+    (
+        "modelThinkingLevels",
+        "Stored per-model effort keyed by \"provider/model\"",
+        "{}",
+    ),
+    (
+        "modelRoles",
+        "Named model routes declared by plugins, keyed by role name",
+        "{}",
+    ),
+    (
+        "pluginSettings",
+        "Plugin-owned values grouped by plugin namespace",
+        "{}",
+    ),
+    ("terminal", "Command opened by :terminal", "unset"),
+    ("keyDisplay", "Key-hint style: auto, macos, or text", "auto"),
+    (
+        "layout",
+        "Conversation layout: auto, wide, or compact",
+        "auto",
+    ),
+    (
+        "compaction.enabled",
+        "Create context checkpoints automatically",
+        "true",
+    ),
+    (
+        "compaction.strategy",
+        "Checkpoint strategy: rollover or summary",
+        "rollover",
+    ),
+    (
+        "compaction.reserveTokens",
+        "Context tokens reserved before a checkpoint",
+        "16384",
+    ),
+    (
+        "compaction.keepRecentTokens",
+        "Approximate recent history kept by summary checkpoints",
+        "20000",
+    ),
+];
+
+/// A complete `settings.json` example rendered by the long `--help`
+/// reference. Tests require it to use exactly the documented fields.
+const EXAMPLE_SETTINGS_JSON: &str = r#"{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-5",
+  "outputLimit": 32768,
+  "defaultThinkingLevel": "high",
+  "modelThinkingLevels": {
+    "openai/gpt-5.2": "medium"
+  },
+  "modelRoles": {
+    "finder": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "thinking": "high"
+    }
+  },
+  "pluginSettings": {
+    "terminal-title": {
+      "role": "title"
+    }
+  },
+  "terminal": "tmux new-window",
+  "keyDisplay": "auto",
+  "layout": "auto",
+  "compaction": {
+    "enabled": true,
+    "strategy": "rollover",
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  }
+}"#;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -1472,6 +1908,77 @@ async fn resolve_discovery_credentials(
     credentials
 }
 
+/// Process environment variables read by URI Agent. The loader reads each
+/// name through its constant, and the long `--help` reference renders
+/// [`ENVIRONMENT_REFERENCE`], so the two cannot drift.
+const ENV_PROVIDER: &str = "URI_AGENT_PROVIDER";
+const ENV_MODEL: &str = "URI_AGENT_MODEL";
+const ENV_API_KEY: &str = "URI_AGENT_API_KEY";
+const ENV_OUTPUT_LIMIT: &str = "URI_AGENT_OUTPUT_LIMIT";
+const ENV_THINKING: &str = "URI_AGENT_THINKING";
+const ENV_TERMINAL: &str = "URI_AGENT_TERMINAL";
+const ENV_KEY_DISPLAY: &str = "URI_AGENT_KEY_DISPLAY";
+const ENV_LAYOUT: &str = "URI_AGENT_LAYOUT";
+const ENV_CONFIG_DIR: &str = "URI_AGENT_CONFIG_DIR";
+const ENV_OFFLINE: &str = "URI_AGENT_OFFLINE";
+const ENV_PI_OFFLINE: &str = "PI_OFFLINE";
+const ENV_ANTHROPIC_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
+const ENV_CODEBUDDY_API_KEY: &str = "CODEBUDDY_API_KEY";
+const ENV_CODEBUDDY_AUTH_TOKEN: &str = "CODEBUDDY_AUTH_TOKEN";
+
+/// One line of the environment-variable section of the long `--help`
+/// reference: the variable name and its effect.
+const ENVIRONMENT_REFERENCE: &[(&str, &str)] = &[
+    (
+        ENV_PROVIDER,
+        "Provider used by this process; overrides the defaultProvider setting",
+    ),
+    (
+        ENV_MODEL,
+        "Model used by this process; overrides the defaultModel setting",
+    ),
+    (
+        ENV_API_KEY,
+        "API key used for every provider; overrides stored and provider credentials",
+    ),
+    (
+        ENV_OUTPUT_LIMIT,
+        "Inline output limit in bytes (minimum 1024); overrides the outputLimit setting",
+    ),
+    (
+        ENV_THINKING,
+        "Reasoning effort: off, minimal, low, medium, high, xhigh, or max",
+    ),
+    (ENV_TERMINAL, "Command opened by :terminal for this process"),
+    (ENV_KEY_DISPLAY, "Key-hint style: auto, macos, or text"),
+    (ENV_LAYOUT, "Conversation layout: auto, wide, or compact"),
+    (
+        ENV_CONFIG_DIR,
+        "Replaces the default configuration directory for this process",
+    ),
+    (
+        ENV_OFFLINE,
+        "Set to 1, true, or yes to disable catalog networking, like --offline",
+    ),
+    (ENV_PI_OFFLINE, "Compatibility alias of URI_AGENT_OFFLINE"),
+    (
+        ENV_ANTHROPIC_AUTH_TOKEN,
+        "anthropic credential alternative to ANTHROPIC_API_KEY",
+    ),
+    (
+        ENV_CODEBUDDY_API_KEY,
+        "workbuddy API-key credential; see the provider table below",
+    ),
+    (
+        ENV_CODEBUDDY_AUTH_TOKEN,
+        "workbuddy bearer-token credential above its API-key sources",
+    ),
+    (
+        crate::moshi::DISABLE_VARIABLE,
+        "Set to 0 to disable Moshi terminal-app reporting",
+    ),
+];
+
 fn selected_provider(
     files: &ConfigFiles,
     invocation: &InvocationOverrides,
@@ -1482,11 +1989,11 @@ fn selected_provider(
         files.project.default_provider.clone(),
     );
     let settings_provider = provider.clone();
-    if let Ok(value) = env::var("URI_AGENT_PROVIDER")
+    if let Ok(value) = env::var(ENV_PROVIDER)
         && !value.trim().is_empty()
     {
         provider = value;
-        source = ValueSource::Environment("URI_AGENT_PROVIDER".to_string());
+        source = ValueSource::Environment(ENV_PROVIDER.to_string());
     }
     if let Some(value) = &invocation.provider {
         provider.clone_from(value);
@@ -1511,11 +2018,11 @@ async fn calculate_active(
     } else {
         (String::new(), ValueSource::Default)
     };
-    if let Ok(value) = env::var("URI_AGENT_MODEL")
+    if let Ok(value) = env::var(ENV_MODEL)
         && !value.trim().is_empty()
     {
         model = value;
-        model_source = ValueSource::Environment("URI_AGENT_MODEL".to_string());
+        model_source = ValueSource::Environment(ENV_MODEL.to_string());
     }
     if let Some(value) = &invocation.model {
         model.clone_from(value);
@@ -1527,11 +2034,11 @@ async fn calculate_active(
         files.global.output_limit,
         files.project.output_limit,
     );
-    if let Ok(value) = env::var("URI_AGENT_OUTPUT_LIMIT") {
+    if let Ok(value) = env::var(ENV_OUTPUT_LIMIT) {
         output_limit = value
             .parse()
-            .context("URI_AGENT_OUTPUT_LIMIT must be a positive integer")?;
-        output_limit_source = ValueSource::Environment("URI_AGENT_OUTPUT_LIMIT".to_string());
+            .with_context(|| format!("{ENV_OUTPUT_LIMIT} must be a positive integer"))?;
+        output_limit_source = ValueSource::Environment(ENV_OUTPUT_LIMIT.to_string());
     }
     if let Some(value) = invocation.output_limit {
         output_limit = value;
@@ -1542,11 +2049,13 @@ async fn calculate_active(
     }
 
     let (mut thinking, mut thinking_source) = configured_thinking(files, &provider, &model);
-    if let Ok(value) = env::var("URI_AGENT_THINKING")
+    if let Ok(value) = env::var(ENV_THINKING)
         && !value.trim().is_empty()
     {
-        thinking = value.parse().context("invalid URI_AGENT_THINKING")?;
-        thinking_source = ValueSource::Environment("URI_AGENT_THINKING".to_string());
+        thinking = value
+            .parse()
+            .with_context(|| format!("invalid {ENV_THINKING}"))?;
+        thinking_source = ValueSource::Environment(ENV_THINKING.to_string());
     }
     if let Some(value) = invocation.thinking {
         thinking = value;
@@ -1558,11 +2067,11 @@ async fn calculate_active(
         files.global.terminal.clone(),
         files.project.terminal.clone(),
     );
-    if let Ok(value) = env::var("URI_AGENT_TERMINAL")
+    if let Ok(value) = env::var(ENV_TERMINAL)
         && !value.trim().is_empty()
     {
         terminal = value;
-        terminal_source = ValueSource::Environment("URI_AGENT_TERMINAL".to_string());
+        terminal_source = ValueSource::Environment(ENV_TERMINAL.to_string());
     }
     let terminal = (!terminal.trim().is_empty()).then_some(terminal.trim().to_string());
 
@@ -1571,17 +2080,21 @@ async fn calculate_active(
         files.global.key_display,
         files.project.key_display,
     );
-    if let Ok(value) = env::var("URI_AGENT_KEY_DISPLAY")
+    if let Ok(value) = env::var(ENV_KEY_DISPLAY)
         && !value.trim().is_empty()
     {
-        key_display = value.parse().context("invalid URI_AGENT_KEY_DISPLAY")?;
+        key_display = value
+            .parse()
+            .with_context(|| format!("invalid {ENV_KEY_DISPLAY}"))?;
     }
 
     let (mut layout, _) = setting(LayoutMode::Auto, files.global.layout, files.project.layout);
-    if let Ok(value) = env::var("URI_AGENT_LAYOUT")
+    if let Ok(value) = env::var(ENV_LAYOUT)
         && !value.trim().is_empty()
     {
-        layout = value.parse().context("invalid URI_AGENT_LAYOUT")?;
+        layout = value
+            .parse()
+            .with_context(|| format!("invalid {ENV_LAYOUT}"))?;
     }
 
     let compaction = compaction_settings(&files.global, &files.project)?;
@@ -1639,11 +2152,11 @@ async fn resolve_model_credential(
         kind = AuthKind::ApiKey;
     }
     if provider == "workbuddy" {
-        if let Ok(value) = env::var("CODEBUDDY_API_KEY")
+        if let Ok(value) = env::var(ENV_CODEBUDDY_API_KEY)
             && !value.trim().is_empty()
         {
             api_key = Some(value);
-            source = ValueSource::Environment("CODEBUDDY_API_KEY".to_string());
+            source = ValueSource::Environment(ENV_CODEBUDDY_API_KEY.to_string());
             kind = AuthKind::ApiKey;
         }
         // models.json supports `apiKey: "!command"`, which is URI Agent's
@@ -1653,19 +2166,19 @@ async fn resolve_model_credential(
             source = ValueSource::ModelsFile;
             kind = AuthKind::ApiKey;
         }
-        if let Ok(value) = env::var("CODEBUDDY_AUTH_TOKEN")
+        if let Ok(value) = env::var(ENV_CODEBUDDY_AUTH_TOKEN)
             && !value.trim().is_empty()
         {
             api_key = Some(value);
-            source = ValueSource::Environment("CODEBUDDY_AUTH_TOKEN".to_string());
+            source = ValueSource::Environment(ENV_CODEBUDDY_AUTH_TOKEN.to_string());
             kind = AuthKind::Oauth;
         }
         if include_generic_overrides {
-            if let Ok(value) = env::var("URI_AGENT_API_KEY")
+            if let Ok(value) = env::var(ENV_API_KEY)
                 && !value.trim().is_empty()
             {
                 api_key = Some(value);
-                source = ValueSource::Environment("URI_AGENT_API_KEY".to_string());
+                source = ValueSource::Environment(ENV_API_KEY.to_string());
                 kind = AuthKind::ApiKey;
             }
             if let Some(value) = &invocation.api_key {
@@ -1677,7 +2190,7 @@ async fn resolve_model_credential(
     } else if !private_oauth {
         let mut environments = api_key_environments(provider);
         if provider == "anthropic" {
-            environments.insert(0, "ANTHROPIC_AUTH_TOKEN".to_string());
+            environments.insert(0, ENV_ANTHROPIC_AUTH_TOKEN.to_string());
         }
         for name in environments {
             if let Ok(value) = env::var(&name)
@@ -1693,11 +2206,11 @@ async fn resolve_model_credential(
             }
         }
         if include_generic_overrides {
-            if let Ok(value) = env::var("URI_AGENT_API_KEY")
+            if let Ok(value) = env::var(ENV_API_KEY)
                 && !value.trim().is_empty()
             {
                 api_key = Some(value);
-                source = ValueSource::Environment("URI_AGENT_API_KEY".to_string());
+                source = ValueSource::Environment(ENV_API_KEY.to_string());
                 kind = AuthKind::ApiKey;
             }
             if let Some(value) = &invocation.api_key {
@@ -2038,7 +2551,7 @@ pub fn config_directory() -> Result<PathBuf> {
 }
 
 fn overridden_config_directory() -> Option<PathBuf> {
-    env::var("URI_AGENT_CONFIG_DIR")
+    env::var(ENV_CONFIG_DIR)
         .ok()
         .filter(|directory| !directory.trim().is_empty())
         .map(PathBuf::from)
@@ -3917,5 +4430,155 @@ mod tests {
             "old-db"
         );
         assert!(!old.exists());
+    }
+
+    fn populated_settings_file() -> SettingsFile {
+        SettingsFile {
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-5.2".to_string()),
+            output_limit: Some(4_096),
+            default_thinking_level: Some(ThinkingLevel::Medium),
+            model_thinking_levels: BTreeMap::from([(
+                "openai/gpt-5.2".to_string(),
+                ThinkingLevel::High,
+            )]),
+            model_roles: BTreeMap::from([(
+                "finder".to_string(),
+                ModelRoleConfig {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2".to_string(),
+                    thinking: Some(ThinkingLevel::High),
+                },
+            )]),
+            plugin_settings: BTreeMap::from([(
+                "terminal-title".to_string(),
+                BTreeMap::from([("role".to_string(), Value::String("title".to_string()))]),
+            )]),
+            terminal: Some("tmux new-window".to_string()),
+            key_display: Some(KeyDisplayStyle::Text),
+            layout: Some(LayoutMode::Compact),
+            compaction: Some(CompactionFile {
+                enabled: Some(false),
+                strategy: Some(compaction::Strategy::Summary),
+                reserve_tokens: Some(1_024),
+                keep_recent_tokens: Some(2_048),
+                extra: BTreeMap::new(),
+            }),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn settings_reference_covers_every_settings_file_field() {
+        let populated = populated_settings_file();
+        let value = serde_json::to_value(&populated).unwrap();
+        let mut serialized: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        serialized.sort_unstable();
+        let mut documented: Vec<String> = SETTINGS_REFERENCE
+            .iter()
+            .map(|(key, _, _)| key.split('.').next().unwrap().to_string())
+            .collect();
+        documented.sort_unstable();
+        documented.dedup();
+        let documented: Vec<&str> = documented.iter().map(String::as_str).collect();
+        assert_eq!(serialized, documented);
+
+        let compaction = serde_json::to_value(populated.compaction.unwrap()).unwrap();
+        let mut serialized: Vec<&str> = compaction
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        serialized.sort_unstable();
+        let mut documented: Vec<String> = SETTINGS_REFERENCE
+            .iter()
+            .filter_map(|(key, _, _)| key.strip_prefix("compaction."))
+            .map(str::to_string)
+            .collect();
+        documented.sort_unstable();
+        let documented: Vec<&str> = documented.iter().map(String::as_str).collect();
+        assert_eq!(serialized, documented);
+    }
+
+    #[test]
+    fn settings_reference_defaults_match_the_source() {
+        let compaction = compaction::Settings::default();
+        for (key, _, default) in SETTINGS_REFERENCE {
+            let expected = match *key {
+                "outputLimit" => DEFAULT_OUTPUT_LIMIT.to_string(),
+                "defaultThinkingLevel" => ThinkingLevel::default().to_string(),
+                "compaction.enabled" => compaction.enabled.to_string(),
+                "compaction.strategy" => compaction.strategy.to_string(),
+                "compaction.reserveTokens" => compaction.reserve_tokens.to_string(),
+                "compaction.keepRecentTokens" => compaction.keep_recent_tokens.to_string(),
+                _ => continue,
+            };
+            assert_eq!(default, &expected, "documented default for {key}");
+        }
+    }
+
+    #[test]
+    fn example_settings_json_uses_exactly_the_documented_fields() {
+        let value: Value = serde_json::from_str(EXAMPLE_SETTINGS_JSON).unwrap();
+        let file: SettingsFile = serde_json::from_value(value.clone()).unwrap();
+        assert!(file.extra.is_empty(), "example uses unknown fields");
+        assert!(
+            file.compaction
+                .map(|compaction| compaction.extra.is_empty())
+                .unwrap_or(true),
+            "example uses unknown compaction fields"
+        );
+        let documented: BTreeSet<&str> = SETTINGS_REFERENCE
+            .iter()
+            .map(|(key, _, _)| key.split('.').next().unwrap())
+            .collect();
+        let example: BTreeSet<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(documented, example);
+    }
+
+    #[test]
+    fn long_help_documents_every_setting_and_environment_variable() {
+        use clap::CommandFactory;
+
+        let long = Cli::command().render_long_help().to_string();
+        for (key, _, _) in SETTINGS_REFERENCE {
+            assert!(long.contains(key), "long help lacks settings key {key}");
+        }
+        for (name, _) in ENVIRONMENT_REFERENCE {
+            assert!(long.contains(name), "long help lacks variable {name}");
+        }
+        for (providers, primary, aliases) in crate::catalog::PROVIDER_CREDENTIAL_ENVIRONMENTS {
+            let _ = providers;
+            assert!(long.contains(primary), "long help lacks {primary}");
+            for alias in *aliases {
+                assert!(long.contains(alias), "long help lacks alias {alias}");
+            }
+        }
+        assert!(long.contains("uri-agent docs"));
+    }
+
+    #[test]
+    fn short_help_stays_brief() {
+        use clap::CommandFactory;
+
+        let short = Cli::command().render_help().to_string();
+        assert!(
+            short.lines().count() < 40,
+            "short help grew to {} lines:\n{short}",
+            short.lines().count()
+        );
+        assert!(!short.contains("Settings reference"));
+        assert!(!short.contains("Environment variables:"));
     }
 }

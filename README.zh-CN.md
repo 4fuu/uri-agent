@@ -140,7 +140,7 @@ uri-agent --acpv1
 | 通过 moshi-hook 向 Moshi 应用上报会话生命周期 | [Moshi reporting](docs/sessions.md#moshi-reporting) |
 | 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
-[`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和 `input` 字段以 `help` 工具加载的协议帮助页为准；当前生效的界面说明以 `F1` 和 `:help` 为准。
+[`docs/` 索引](docs/README.md)还包含开发与发布文档。运行 `uri-agent docs <topic>` 可直接从二进制打印这些文档；`uri-agent --help` 提供完整的 CLI、环境变量、设置和文件路径参考。程序运行时，协议支持的 URI 和 `input` 字段以 `help` 工具加载的协议帮助页为准；当前生效的界面说明以 `F1` 和 `:help` 为准。
 
 ## 开发
 

@@ -25,6 +25,10 @@
 //! stays completely inactive, and reporting failures never affect the
 //! conversation.
 
+/// Environment variable that disables Moshi reporting when set to `0`;
+/// shared by the reporter and the long `--help` reference.
+pub(crate) const DISABLE_VARIABLE: &str = "URI_AGENT_MOSHI";
+
 use crate::agent::AgentSpec;
 use crate::runtime::AgentRuntime;
 use crate::session::{EventKind, Session, SessionUpdate};
@@ -931,7 +935,7 @@ impl MoshiReporter {
     }
 
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        if lookup("URI_AGENT_MOSHI").as_deref() == Some("0") {
+        if lookup(DISABLE_VARIABLE).as_deref() == Some("0") {
             return None;
         }
         let socket_path = socket_path(&lookup)?;

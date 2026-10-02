@@ -189,6 +189,12 @@ impl Protocol for SkillProtocol {
 }
 
 pub fn discover(cwd: &Path) -> (Vec<SkillProtocol>, Vec<String>) {
+    discover_in(discovery_roots(cwd))
+}
+
+/// Skill discovery roots in priority order, shared by [`discover`] and the
+/// long `--help` reference.
+pub(crate) fn discovery_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = vec![
         cwd.join(".agents/skills"),
         cwd.join(".claude/skills"),
@@ -201,7 +207,7 @@ pub fn discover(cwd: &Path) -> (Vec<SkillProtocol>, Vec<String>) {
             home.join(".codex/skills"),
         ]);
     }
-    discover_in(roots)
+    roots
 }
 
 fn discover_in(roots: Vec<PathBuf>) -> (Vec<SkillProtocol>, Vec<String>) {
