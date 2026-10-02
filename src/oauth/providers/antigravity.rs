@@ -1,7 +1,9 @@
 use super::super::callback;
 use super::super::util::{encode, generate_pkce, http_client, open_url};
-use super::super::{LoginSetup, OauthLogin, OauthToken, channels};
-use super::shared::{FormUrlEncoded, random_hex, read_token_form, token_from_value};
+use super::super::{OauthLogin, OauthToken};
+use super::shared::{
+    FormUrlEncoded, random_hex, read_token_form, spawn_login_flow, token_from_value,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -48,21 +50,12 @@ pub(in crate::oauth) fn start_antigravity()
         encode(&pkce.challenge),
         encode(&state),
     );
-    let LoginSetup {
-        login,
-        mut paste_rx,
-        mut cancel_rx,
-        done_tx,
-        done_rx,
-        display: _,
-    } = channels(
-        url.clone(),
+    open_url(&url);
+    spawn_login_flow(
+        url,
         None,
         "Experimental private protocol. Complete Google sign-in, or paste the redirect URL / code.",
-    );
-    open_url(&url);
-    tokio::spawn(async move {
-        let result = async {
+        move |mut flow| async move {
             let callback = callback::bind(
                 "127.0.0.1",
                 8085,
@@ -74,18 +67,15 @@ pub(in crate::oauth) fn start_antigravity()
             .await;
             let (code, _) = callback::race_callback_or_paste(
                 &callback,
-                &mut paste_rx,
-                &mut cancel_rx,
+                &mut flow.paste_rx,
+                &mut flow.cancel_rx,
                 Some(&state),
             )
             .await?;
             let token = exchange_code(&identity, &code, &pkce.verifier).await?;
             enrich_token(token, &identity, true).await
-        }
-        .await;
-        let _ = done_tx.send(result);
-    });
-    Ok((login, done_rx))
+        },
+    )
 }
 
 pub(in crate::oauth) async fn refresh_antigravity(token: &OauthToken) -> Result<OauthToken> {
