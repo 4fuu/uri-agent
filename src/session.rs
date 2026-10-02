@@ -215,54 +215,14 @@ impl SessionArchive {
         };
         connection
             .call(|db| {
-                let mut statement = db.prepare(
-                    "SELECT id, updated_at, cwd, provider, model, thinking,
-                        (SELECT payload_json FROM events
-                         WHERE events.session_id = sessions.id AND kind = 'user'
-                         ORDER BY sequence ASC LIMIT 1),
-                        (SELECT COUNT(*) FROM events
-                         WHERE events.session_id = sessions.id AND kind = 'user')
+                let mut statement = db.prepare(&format!(
+                    "SELECT {ARCHIVED_SUMMARY_SELECT}
                      FROM sessions WHERE depth = 1
-                     ORDER BY updated_at DESC, id DESC",
-                )?;
-                let rows = statement.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
-                    ))
-                })?;
-                let mut sessions = Vec::new();
-                for row in rows {
-                    let (id, updated_at, cwd, provider, model, thinking, payload, message_count) =
-                        row?;
-                    let first_message = payload
-                        .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
-                        .and_then(|kind| match kind {
-                            EventKind::User { text } => Some(text),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    let updated_at = DateTime::parse_from_rfc3339(&updated_at)
-                        .map(|value| value.with_timezone(&Utc))
-                        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-                    sessions.push(ArchivedSessionSummary {
-                        id,
-                        updated_at,
-                        cwd: PathBuf::from(cwd),
-                        provider,
-                        model,
-                        thinking: thinking.parse().unwrap_or_default(),
-                        first_message,
-                        message_count: usize::try_from(message_count).unwrap_or_default(),
-                    });
-                }
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(sessions)
+                     ORDER BY updated_at DESC, id DESC"
+                ))?;
+                statement
+                    .query_map([], archived_summary_from_row)?
+                    .collect()
             })
             .await
             .context("cannot list archived sessions")
@@ -323,10 +283,10 @@ impl SessionArchive {
                     Ok(SearchableSessionRecord {
                         session_id: row.get(0)?,
                         sequence: u64::try_from(sequence).map_err(|error| {
-                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+                            sql_conversion_failure(
                                 1,
                                 tokio_rusqlite::rusqlite::types::Type::Integer,
-                                Box::new(error),
+                                error,
                             )
                         })?,
                     })
@@ -347,91 +307,56 @@ impl SessionArchive {
             .call(move |db| {
                 let summary = db
                     .query_row(
-                        "SELECT id, updated_at, cwd, provider, model, thinking,
-                            (SELECT payload_json FROM events
-                             WHERE events.session_id = sessions.id AND kind = 'user'
-                             ORDER BY sequence ASC LIMIT 1),
-                            (SELECT COUNT(*) FROM events
-                             WHERE events.session_id = sessions.id AND kind = 'user')
-                         FROM sessions WHERE id = ?1",
+                        &format!("SELECT {ARCHIVED_SUMMARY_SELECT} FROM sessions WHERE id = ?1"),
                         [&id],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, String>(4)?,
-                                row.get::<_, String>(5)?,
-                                row.get::<_, Option<String>>(6)?,
-                                row.get::<_, i64>(7)?,
-                            ))
-                        },
+                        archived_summary_from_row,
                     )
                     .optional()?;
-                let Some((id, updated_at, cwd, provider, model, thinking, payload, message_count)) =
-                    summary
-                else {
+                let Some(summary) = summary else {
                     return Ok::<_, tokio_rusqlite::rusqlite::Error>(None);
                 };
                 let mut statement = db.prepare(
                     "SELECT sequence, at, payload_json FROM events
                      WHERE session_id = ?1 ORDER BY sequence",
                 )?;
-                let rows = statement.query_map([&id], |row| {
-                    let sequence = row.get::<_, i64>(0)?;
-                    let at = row.get::<_, String>(1)?;
-                    let payload = row.get::<_, String>(2)?;
-                    let at = DateTime::parse_from_rfc3339(&at)
-                        .map_err(|error| {
-                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                tokio_rusqlite::rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?
-                        .with_timezone(&Utc);
-                    let kind = serde_json::from_str(&payload).map_err(|error| {
-                        tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            tokio_rusqlite::rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok(SessionEvent {
-                        sequence: sequence as u64,
-                        at,
-                        kind,
-                    })
-                })?;
-                let events = rows.collect::<Result<Vec<_>, _>>()?;
-                let first_message = payload
-                    .and_then(|payload| serde_json::from_str::<EventKind>(&payload).ok())
-                    .and_then(|kind| match kind {
-                        EventKind::User { text } => Some(text),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let updated_at = DateTime::parse_from_rfc3339(&updated_at)
-                    .map(|value| value.with_timezone(&Utc))
-                    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-                Ok(Some(ArchivedSession {
-                    summary: ArchivedSessionSummary {
-                        id,
-                        updated_at,
-                        cwd: PathBuf::from(cwd),
-                        provider,
-                        model,
-                        thinking: thinking.parse().unwrap_or_default(),
-                        first_message,
-                        message_count: usize::try_from(message_count).unwrap_or_default(),
-                    },
-                    events,
-                }))
+                let events = statement
+                    .query_map([&id], stored_event_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(ArchivedSession { summary, events }))
             })
             .await
             .context("cannot read archived session")
     }
+}
+
+/// Summary projection shared by archive listing and loading: identity and
+/// model fields plus the first user event and the user-event count.
+const ARCHIVED_SUMMARY_SELECT: &str = "id, updated_at, cwd, provider, model, thinking,
+    (SELECT payload_json FROM events
+     WHERE events.session_id = sessions.id AND kind = 'user'
+     ORDER BY sequence ASC LIMIT 1),
+    (SELECT COUNT(*) FROM events
+     WHERE events.session_id = sessions.id AND kind = 'user')";
+
+/// Map one row of [`ARCHIVED_SUMMARY_SELECT`] onto an archive summary. An
+/// undecodable timestamp or thinking level keeps its default rather than
+/// failing the whole listing.
+fn archived_summary_from_row(
+    row: &tokio_rusqlite::rusqlite::Row<'_>,
+) -> tokio_rusqlite::rusqlite::Result<ArchivedSessionSummary> {
+    let updated_at = row.get::<_, String>(1)?;
+    Ok(ArchivedSessionSummary {
+        id: row.get(0)?,
+        updated_at: DateTime::parse_from_rfc3339(&updated_at)
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+        cwd: PathBuf::from(row.get::<_, String>(2)?),
+        provider: row.get(3)?,
+        model: row.get(4)?,
+        thinking: row.get::<_, String>(5)?.parse().unwrap_or_default(),
+        first_message: collaboration_summary(row.get::<_, Option<String>>(6)?),
+        message_count: usize::try_from(row.get::<_, i64>(7)?).unwrap_or_default(),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -721,6 +646,16 @@ struct TokenCalibration {
     pending_usage: Option<(u64, u64)>,
 }
 
+impl TokenCalibration {
+    /// Drop the pending turn's calibration inputs: no completed assistant
+    /// message will consume them.
+    fn reset_pending(&mut self) {
+        self.pending_visible_units = 0;
+        self.pending_reasoning_visible = false;
+        self.pending_usage = None;
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ReplayState {
     history: Vec<Message>,
@@ -766,6 +701,58 @@ enum EventPage {
     After(u64, usize),
     Before(u64, usize),
     Tail(usize),
+}
+
+/// Build the opening events of a brand-new session and fold them into fresh
+/// resume and replay state: the creation event plus the frozen startup
+/// context when it is already known.
+fn seed_new_session(
+    spec: AgentSpec,
+    context: Option<SessionContext>,
+) -> (Vec<SessionEvent>, ResumeState, ReplayState) {
+    let at = Utc::now();
+    let mut existing = vec![SessionEvent {
+        sequence: 0,
+        at,
+        kind: EventKind::SessionCreated { spec },
+    }];
+    if let Some(context) = context {
+        existing.push(SessionEvent {
+            sequence: 1,
+            at,
+            kind: EventKind::SessionContext {
+                context,
+                protocols: Vec::new(),
+            },
+        });
+    }
+    let mut derived = ResumeState::default();
+    let mut replay = ReplayState::default();
+    for event in &existing {
+        apply_resume_event(&mut derived, event);
+        apply_replay_event(&mut replay, &event.kind);
+    }
+    (existing, derived, replay)
+}
+
+async fn load_private_records(connection: &Connection, id: &str) -> Result<HashMap<String, Value>> {
+    let id = id.to_string();
+    connection
+        .call(move |db| {
+            let mut statement = db.prepare(
+                "SELECT owner, payload_json FROM session_private_records
+                 WHERE session_id = ?1",
+            )?;
+            statement
+                .query_map([id], |row| {
+                    let owner = row.get::<_, String>(0)?;
+                    let payload = decode_json_column(1, &row.get::<_, String>(1)?)?;
+                    Ok((owner, payload))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()
+        })
+        .await
+        .context("cannot restore private session records")
 }
 
 fn restore_persisted_state(
@@ -827,51 +814,7 @@ fn restore_persisted_state(
             stored_event_from_row,
         )
         .optional()?;
-    let checkpoint = db
-        .query_row(
-            "SELECT version, through_sequence, payload_json, checksum
-             FROM session_resume_index WHERE session_id = ?1",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .and_then(|(version, through, payload, checksum)| {
-            let through = u64::try_from(through).ok()?;
-            if version != i64::from(RESUME_INDEX_VERSION) || through > authoritative_head {
-                return None;
-            }
-            if resume_checksum(id, through, &payload) != checksum {
-                return None;
-            }
-            let mut state = serde_json::from_str::<ResumeState>(&payload).ok()?;
-            if state.through_sequence != Some(through) {
-                return None;
-            }
-            let is_checkpoint = db
-                .query_row(
-                    "SELECT kind IN ('compaction', 'context_rollover') FROM events
-                     WHERE session_id = ?1 AND sequence = ?2",
-                    params![id, through as i64],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .unwrap_or(false);
-            if is_checkpoint {
-                state.latest_compaction_sequence = Some(through);
-            }
-            is_checkpoint.then_some((through, std::mem::take(&mut state)))
-        });
+    let checkpoint = resume_index_checkpoint(db, id, authoritative_head);
 
     let (mut derived, cursor) = if let Some((through, state)) = checkpoint {
         (state, Some(through))
@@ -888,7 +831,7 @@ fn restore_persisted_state(
         }
         state.context_sequence = context_sequence;
         if let Ok(payload) = serde_json::to_string(&state) {
-            let _ = persist_rebuilt_resume_index(db, id, checkpoint.sequence, &payload);
+            let _ = upsert_resume_index(db, id, checkpoint.sequence, &payload);
         }
         (state, Some(checkpoint.sequence))
     } else {
@@ -928,6 +871,60 @@ fn restore_persisted_state(
     })
 }
 
+/// Load the session's resume-index checkpoint, rejecting any index that does
+/// not match the current schema version, the authoritative head, its own
+/// checksum, or land exactly on a compaction or rollover event. A rejected
+/// index rebuilds from raw events instead.
+fn resume_index_checkpoint(
+    db: &SqliteConnection,
+    id: &str,
+    authoritative_head: u64,
+) -> Option<(u64, ResumeState)> {
+    let (version, through, payload, checksum) = db
+        .query_row(
+            "SELECT version, through_sequence, payload_json, checksum
+             FROM session_resume_index WHERE session_id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let through = u64::try_from(through).ok()?;
+    if version != i64::from(RESUME_INDEX_VERSION) || through > authoritative_head {
+        return None;
+    }
+    if resume_checksum(id, through, &payload) != checksum {
+        return None;
+    }
+    let mut state = serde_json::from_str::<ResumeState>(&payload).ok()?;
+    if state.through_sequence != Some(through) {
+        return None;
+    }
+    let is_checkpoint = db
+        .query_row(
+            "SELECT kind IN ('compaction', 'context_rollover') FROM events
+             WHERE session_id = ?1 AND sequence = ?2",
+            params![id, through as i64],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if is_checkpoint {
+        state.latest_compaction_sequence = Some(through);
+    }
+    is_checkpoint.then_some((through, state))
+}
+
 fn query_events(
     db: &SqliteConnection,
     id: &str,
@@ -949,6 +946,27 @@ fn query_events(
         .collect()
 }
 
+/// Report a row value that could not be decoded, naming the column and SQL
+/// type that held it.
+fn sql_conversion_failure(
+    column: usize,
+    sql_type: tokio_rusqlite::rusqlite::types::Type,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> SqliteError {
+    SqliteError::FromSqlConversionFailure(column, sql_type, Box::new(error))
+}
+
+/// Decode one JSON text column inside a row mapper, attributing failures to
+/// the column that held the payload.
+fn decode_json_column<T: serde::de::DeserializeOwned>(
+    column: usize,
+    text: &str,
+) -> tokio_rusqlite::rusqlite::Result<T> {
+    serde_json::from_str(text).map_err(|error| {
+        sql_conversion_failure(column, tokio_rusqlite::rusqlite::types::Type::Text, error)
+    })
+}
+
 fn stored_event_from_row(
     row: &tokio_rusqlite::rusqlite::Row<'_>,
 ) -> tokio_rusqlite::rusqlite::Result<SessionEvent> {
@@ -957,20 +975,10 @@ fn stored_event_from_row(
     let payload = row.get::<_, String>(2)?;
     let at = DateTime::parse_from_rfc3339(&at)
         .map_err(|error| {
-            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                1,
-                tokio_rusqlite::rusqlite::types::Type::Text,
-                Box::new(error),
-            )
+            sql_conversion_failure(1, tokio_rusqlite::rusqlite::types::Type::Text, error)
         })?
         .with_timezone(&Utc);
-    let kind = serde_json::from_str(&payload).map_err(|error| {
-        tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-            2,
-            tokio_rusqlite::rusqlite::types::Type::Text,
-            Box::new(error),
-        )
-    })?;
+    let kind = decode_json_column(2, &payload)?;
     Ok(SessionEvent {
         sequence: sequence as u64,
         at,
@@ -988,7 +996,9 @@ fn resume_checksum(session_id: &str, through: u64, payload: &str) -> String {
     crate::hex_lower(&digest.finalize())
 }
 
-fn persist_rebuilt_resume_index(
+/// Write the resume index for one session at `through`, checksummed and
+/// only ever moving the checkpoint forward.
+fn upsert_resume_index(
     db: &SqliteConnection,
     session_id: &str,
     through: u64,
@@ -1077,19 +1087,11 @@ impl Session {
                     )
                     .optional()?;
                 payload
-                    .map(|payload| {
-                        let kind =
-                            serde_json::from_str::<EventKind>(&payload).map_err(|error| {
-                                tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                    0,
-                                    tokio_rusqlite::rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?;
-                        match kind {
-                            EventKind::SessionCreated { spec } => Ok(spec),
-                            _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
-                        }
+                    .map(|payload| decode_json_column::<EventKind>(0, &payload))
+                    .transpose()?
+                    .map(|kind| match kind {
+                        EventKind::SessionCreated { spec } => Ok(spec),
+                        _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
                     })
                     .transpose()
             })
@@ -1126,15 +1128,7 @@ impl Session {
                     )
                     .optional()?;
                 payload
-                    .map(|payload| {
-                        serde_json::from_str(&payload).map_err(|error| {
-                            tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                tokio_rusqlite::rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    })
+                    .map(|payload| decode_json_column::<Value>(0, &payload))
                     .transpose()
             })
             .await
@@ -1289,32 +1283,16 @@ impl Session {
 
         if created_session {
             spec.working_directory.clone_from(&project_directory);
-            let at = Utc::now();
-            let created = EventKind::SessionCreated { spec: spec.clone() };
-            existing.push(SessionEvent {
-                sequence: 0,
-                at,
-                kind: created,
+            let (seeded, seed_derived, seed_replay) = seed_new_session(spec.clone(), context);
+            derived = seed_derived;
+            replay = seed_replay;
+            frozen_context = seeded.iter().rev().find_map(|event| match &event.kind {
+                EventKind::SessionContext { context, .. } => Some(context.clone()),
+                _ => None,
             });
-            if let Some(context) = context {
-                existing.push(SessionEvent {
-                    sequence: 1,
-                    at,
-                    kind: EventKind::SessionContext {
-                        context,
-                        protocols: Vec::new(),
-                    },
-                });
-            }
-            for event in &existing {
-                apply_resume_event(&mut derived, event);
-                apply_replay_event(&mut replay, &event.kind);
-                if let EventKind::SessionContext { context, .. } = &event.kind {
-                    frozen_context = Some(context.clone());
-                }
-            }
-            restored_spec = agent_spec_from_events(&existing);
-            head_sequence = existing.last().map(|event| event.sequence);
+            restored_spec = agent_spec_from_events(&seeded);
+            head_sequence = seeded.last().map(|event| event.sequence);
+            existing = seeded;
         } else if let Some((_, stored_head, _)) = stored_session {
             let authoritative_head = u64::try_from(stored_head)
                 .map_err(|_| anyhow!("session {id} has an invalid event head"))?;
@@ -1329,31 +1307,7 @@ impl Session {
             derived = restored.derived;
             replay = restored.replay;
             existing = restored.tail;
-            let lookup_id = id.clone();
-            private_records = connection
-                .call(move |db| {
-                    let mut statement = db.prepare(
-                        "SELECT owner, payload_json FROM session_private_records
-                         WHERE session_id = ?1",
-                    )?;
-                    statement
-                        .query_map([lookup_id], |row| {
-                            let owner = row.get::<_, String>(0)?;
-                            let payload = serde_json::from_str(&row.get::<_, String>(1)?).map_err(
-                                |error| {
-                                    tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                        1,
-                                        tokio_rusqlite::rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                },
-                            )?;
-                            Ok((owner, payload))
-                        })?
-                        .collect::<Result<HashMap<_, _>, _>>()
-                })
-                .await
-                .context("cannot restore private session records")?;
+            private_records = load_private_records(&connection, &id).await?;
         }
         let spec = restored_spec
             .ok_or_else(|| anyhow!("session {id} has no creation event and cannot be resumed"))?;
@@ -1413,10 +1367,6 @@ impl Session {
         visible: bool,
     ) -> Result<i64> {
         let session_id = self.id.clone();
-        let kind = match kind {
-            SubmitKind::Prompt => "prompt",
-            SubmitKind::Steer => "steer",
-        };
         let text = text.to_string();
         let content = serde_json::to_string(content).context("cannot serialize pending input")?;
         let created_at = Utc::now().to_rfc3339();
@@ -1426,11 +1376,14 @@ impl Session {
             return self
                 .connection
                 .call(move |db| {
-                    db.execute(
-                        "INSERT INTO pending_inputs
-                         (session_id, kind, text, content_json, visible, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![session_id, kind, text, content, visible, created_at],
+                    insert_pending_input_row(
+                        db,
+                        &session_id,
+                        kind,
+                        &text,
+                        &content,
+                        visible,
+                        &created_at,
                     )?;
                     Ok::<_, tokio_rusqlite::rusqlite::Error>(db.last_insert_rowid())
                 })
@@ -1444,83 +1397,33 @@ impl Session {
         let project = self.project.clone();
         let spec = state.spec.clone();
         let head_sequence = state.head_sequence.map_or(-1, |sequence| sequence as i64);
-        let stored_events = state
-            .events
-            .iter()
-            .map(|event| {
-                Ok::<_, anyhow::Error>((
-                    event.sequence as i64,
-                    event.at.to_rfc3339(),
-                    payload_kind(&event.kind).to_string(),
-                    serde_json::to_string(&event.kind).context("cannot serialize session event")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let private_records = state
-            .private_records
-            .iter()
-            .map(|(owner, payload)| {
-                Ok::<_, anyhow::Error>((
-                    owner.clone(),
-                    serde_json::to_string(payload).with_context(|| {
-                        format!("cannot serialize private session record {owner}")
-                    })?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let stored_events = stored_event_rows(&state.events)?;
+        let private_records = serialized_private_records(&state.private_records)?;
         let pending_id = self
             .connection
             .call(move |db| {
                 let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let draft = transaction
-                    .query_row(
-                        "SELECT draft FROM pending_drafts WHERE cwd = ?1",
-                        [&project],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .unwrap_or_default();
-                transaction.execute(
-                    "INSERT INTO sessions
-                     (id, created_at, updated_at, cwd, provider, model, thinking,
-                      parent_session_id, depth, head_sequence, draft)
-                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        session_id,
-                        created_at,
-                        project,
-                        spec.provider,
-                        spec.model,
-                        spec.thinking.to_string(),
-                        spec.parent_session_id,
-                        i64::from(spec.depth()),
-                        head_sequence,
-                        draft,
-                    ],
+                insert_prepared_session(
+                    &transaction,
+                    &session_id,
+                    &created_at,
+                    &project,
+                    &spec,
+                    head_sequence,
+                    &stored_events,
+                    &private_records,
+                    true,
                 )?;
-                for (sequence, event_at, event_kind, payload) in stored_events {
-                    transaction.execute(
-                        "INSERT INTO events
-                         (session_id, sequence, at, kind, payload_json)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![session_id, sequence, event_at, event_kind, payload],
-                    )?;
-                }
-                for (owner, payload) in private_records {
-                    transaction.execute(
-                        "INSERT INTO session_private_records
-                         (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
-                        params![session_id, owner, payload],
-                    )?;
-                }
-                transaction.execute(
-                    "INSERT INTO pending_inputs
-                     (session_id, kind, text, content_json, visible, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![session_id, kind, text, content, visible, created_at],
+                insert_pending_input_row(
+                    &transaction,
+                    &session_id,
+                    kind,
+                    &text,
+                    &content,
+                    visible,
+                    &created_at,
                 )?;
                 let pending_id = transaction.last_insert_rowid();
-                transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
                 transaction.commit()?;
                 Ok::<_, tokio_rusqlite::rusqlite::Error>(pending_id)
             })
@@ -1548,14 +1451,7 @@ impl Session {
                             "steer" => SubmitKind::Steer,
                             _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
                         };
-                        let content =
-                            serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
-                                tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
-                                    3,
-                                    tokio_rusqlite::rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?;
+                        let content = decode_json_column(3, &row.get::<_, String>(3)?)?;
                         Ok(PendingInput {
                             id: row.get(0)?,
                             kind,
@@ -1663,15 +1559,12 @@ impl Session {
                     .map(|name| allocate_collaboration_name(&transaction, &session_id, &name))
                     .transpose()?;
                 if let Some((name, normalized)) = &assigned {
-                    transaction.execute(
-                        "INSERT INTO collaboration_identities
-                         (session_id, name, normalized_name, updated_at)
-                         VALUES (?1, ?2, ?3, ?4)
-                         ON CONFLICT(session_id) DO UPDATE SET
-                           name = excluded.name,
-                           normalized_name = excluded.normalized_name,
-                           updated_at = excluded.updated_at",
-                        params![session_id, name, normalized, now_text],
+                    upsert_collaboration_identity(
+                        &transaction,
+                        &session_id,
+                        name,
+                        normalized,
+                        &now_text,
                     )?;
                 }
                 transaction.execute(
@@ -1739,15 +1632,12 @@ impl Session {
                 }
                 let (name, normalized) =
                     allocate_collaboration_name(&transaction, &session_id, &requested)?;
-                transaction.execute(
-                    "INSERT INTO collaboration_identities
-                     (session_id, name, normalized_name, updated_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                       name = excluded.name,
-                       normalized_name = excluded.normalized_name,
-                       updated_at = excluded.updated_at",
-                    params![session_id, name, normalized, now_text],
+                upsert_collaboration_identity(
+                    &transaction,
+                    &session_id,
+                    &name,
+                    &normalized,
+                    &now_text,
                 )?;
                 transaction.execute(
                     "INSERT INTO collaboration_presence
@@ -1931,10 +1821,6 @@ impl Session {
     ) -> Result<Option<i64>> {
         let target_session_id = target_session_id.to_string();
         let target_instance_id = target_instance_id.to_string();
-        let kind = match kind {
-            SubmitKind::Prompt => "prompt",
-            SubmitKind::Steer => "steer",
-        };
         let text = text.to_string();
         let content =
             serde_json::to_string(content).context("cannot serialize collaboration input")?;
@@ -1957,11 +1843,14 @@ impl Session {
                     transaction.commit()?;
                     return Ok(None);
                 }
-                transaction.execute(
-                    "INSERT INTO pending_inputs
-                     (session_id, kind, text, content_json, visible, created_at)
-                     VALUES (?1, ?2, ?3, ?4, 1, ?5)",
-                    params![target_session_id, kind, text, content, now_text],
+                insert_pending_input_row(
+                    &transaction,
+                    &target_session_id,
+                    kind,
+                    &text,
+                    &content,
+                    true,
+                    &now_text,
                 )?;
                 let pending_id = transaction.last_insert_rowid();
                 transaction.execute(
@@ -2022,68 +1911,25 @@ impl Session {
         let project = self.project.clone();
         let spec = state.spec.clone();
         let head_sequence = state.head_sequence.map_or(-1, |sequence| sequence as i64);
-        let stored_events = state
-            .events
-            .iter()
-            .map(|event| {
-                Ok::<_, anyhow::Error>((
-                    event.sequence as i64,
-                    event.at.to_rfc3339(),
-                    payload_kind(&event.kind).to_string(),
-                    serde_json::to_string(&event.kind).context("cannot serialize session event")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let private_records = state
-            .private_records
-            .iter()
-            .map(|(owner, payload)| {
-                Ok::<_, anyhow::Error>((
-                    owner.clone(),
-                    serde_json::to_string(payload).with_context(|| {
-                        format!("cannot serialize private session record {owner}")
-                    })?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let stored_events = stored_event_rows(&state.events)?;
+        let private_records = serialized_private_records(&state.private_records)?;
         self.connection
             .call(move |db| {
                 // Immediate: the SELECT below establishes a read snapshot, so
                 // a deferred upgrade to the write lock fails at once with
                 // SQLITE_BUSY whenever another connection commits in between.
                 with_immediate_transaction(db, |transaction| {
-                    transaction.execute(
-                        "INSERT INTO sessions
-                         (id, created_at, updated_at, cwd, provider, model, thinking,
-                          parent_session_id, depth, head_sequence, draft)
-                          VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '')",
-                        params![
-                            id,
-                            at,
-                            project,
-                            spec.provider,
-                            spec.model,
-                            spec.thinking.to_string(),
-                            spec.parent_session_id,
-                            i64::from(spec.depth()),
-                            head_sequence,
-                        ],
+                    insert_prepared_session(
+                        &transaction,
+                        &id,
+                        &at,
+                        &project,
+                        &spec,
+                        head_sequence,
+                        &stored_events,
+                        &private_records,
+                        false,
                     )?;
-                    for (sequence, event_at, kind, payload) in stored_events {
-                        transaction.execute(
-                            "INSERT INTO events
-                             (session_id, sequence, at, kind, payload_json)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![id, sequence, event_at, kind, payload],
-                        )?;
-                    }
-                    for (owner, payload) in private_records {
-                        transaction.execute(
-                            "INSERT INTO session_private_records
-                             (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
-                            params![id, owner, payload],
-                        )?;
-                    }
                     transaction.commit()?;
                     Ok::<_, tokio_rusqlite::rusqlite::Error>(())
                 })
@@ -2715,35 +2561,11 @@ impl Session {
                 return Ok(events);
             }
 
-            let mut stored_events = Vec::with_capacity(state.events.len() + events.len());
-            for stored in state.events.iter().chain(events.iter()) {
-                stored_events.push((
-                    stored.sequence as i64,
-                    stored.at.to_rfc3339(),
-                    payload_kind(&stored.kind).to_string(),
-                    serde_json::to_string(&stored.kind)
-                        .context("cannot serialize session event")?,
-                ));
-            }
-            let private_records = state
-                .private_records
-                .iter()
-                .map(|(owner, payload)| {
-                    Ok::<_, anyhow::Error>((
-                        owner.clone(),
-                        serde_json::to_string(payload).with_context(|| {
-                            format!("cannot serialize private session record {owner}")
-                        })?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let stored_events = stored_event_rows(state.events.iter().chain(events.iter()))?;
+            let private_records = serialized_private_records(&state.private_records)?;
             let id = self.id.clone();
             let project = self.project.clone();
-            let provider = next_spec.provider.clone();
-            let model = next_spec.model.clone();
-            let thinking = next_spec.thinking.to_string();
-            let parent_session_id = next_spec.parent_session_id.clone();
-            let depth = i64::from(next_spec.depth());
+            let flush_spec = next_spec.clone();
             let head_sequence = events
                 .last()
                 .expect("nonempty batch has a final event")
@@ -2755,49 +2577,17 @@ impl Session {
                     // with SQLITE_BUSY whenever another connection commits in
                     // between.
                     with_immediate_transaction(db, |transaction| {
-                        let draft = transaction
-                            .query_row(
-                                "SELECT draft FROM pending_drafts WHERE cwd = ?1",
-                                [&project],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .optional()?
-                            .unwrap_or_default();
-                        transaction.execute(
-                            "INSERT INTO sessions
-                             (id, created_at, updated_at, cwd, provider, model, thinking,
-                              parent_session_id, depth, head_sequence, draft)
-                              VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                            params![
-                                id,
-                                at_text,
-                                project,
-                                provider,
-                                model,
-                                thinking,
-                                parent_session_id,
-                                depth,
-                                head_sequence as i64,
-                                draft
-                            ],
+                        insert_prepared_session(
+                            &transaction,
+                            &id,
+                            &at_text,
+                            &project,
+                            &flush_spec,
+                            head_sequence as i64,
+                            &stored_events,
+                            &private_records,
+                            true,
                         )?;
-                        for (sequence, event_at, kind_name, payload) in stored_events {
-                            transaction.execute(
-                                "INSERT INTO events
-                                 (session_id, sequence, at, kind, payload_json)
-                                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                                params![id, sequence, event_at, kind_name, payload],
-                            )?;
-                        }
-                        for (owner, payload) in private_records {
-                            transaction.execute(
-                                "INSERT INTO session_private_records
-                                 (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
-                                params![id, owner, payload],
-                            )?;
-                        }
-                        transaction
-                            .execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
                         transaction.commit()?;
                         Ok::<_, tokio_rusqlite::rusqlite::Error>(())
                     })
@@ -2805,33 +2595,11 @@ impl Session {
                 .await
                 .context("cannot create session")?;
             state.persisted = true;
-            state.spec = next_spec;
-            let checkpoint = apply_committed_events(&mut state, &events, true);
-            // Without a checkpoint, SQLite is the only history source needed
-            // after persistence. A checkpointed session deliberately keeps
-            // its small post-checkpoint tail for the existing resume path.
-            if state.derived.latest_compaction_sequence.is_none() {
-                state.events = Vec::new();
-            }
-            self.publish_persisted(&events);
-            drop(state);
-            if let Some((through, payload)) = checkpoint {
-                self.persist_resume_index(through, payload).await;
-            }
-            return Ok(events);
+            return Ok(self.commit_durable_batch(state, next_spec, events).await);
         }
 
         let id = self.id.clone();
-        let stored_events = events
-            .iter()
-            .map(|event| {
-                Ok::<_, anyhow::Error>((
-                    event.sequence as i64,
-                    payload_kind(&event.kind).to_string(),
-                    serde_json::to_string(&event.kind).context("cannot serialize session event")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let stored_events = stored_event_rows(&events)?;
         let provider = next_spec.provider.clone();
         let model = next_spec.model.clone();
         let thinking = next_spec.thinking.to_string();
@@ -2854,11 +2622,11 @@ impl Session {
                     if head != expected_head {
                         return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
                     }
-                    for (sequence, kind_name, payload) in stored_events {
+                    for (sequence, at, kind_name, payload) in stored_events {
                         transaction.execute(
                             "INSERT INTO events (session_id, sequence, at, kind, payload_json)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![id, sequence, at_text, kind_name, payload],
+                            params![id, sequence, at, kind_name, payload],
                         )?;
                     }
                     transaction.execute(
@@ -2882,10 +2650,23 @@ impl Session {
             })
             .await
             .context("cannot append session event batch")?;
+        Ok(self.commit_durable_batch(state, next_spec, events).await)
+    }
+
+    /// Fold a durably committed batch into in-memory state and publish it:
+    /// apply the next spec, replay, and resume state, drop the unbounded
+    /// uncheckpointed transcript tail (SQLite is then the only history
+    /// source; a checkpointed session keeps its small post-checkpoint tail),
+    /// publish the boundary to subscribers, and rebuild the resume index
+    /// when the batch crossed a checkpoint.
+    async fn commit_durable_batch(
+        &self,
+        mut state: tokio::sync::MutexGuard<'_, State>,
+        next_spec: AgentSpec,
+        events: Vec<SessionEvent>,
+    ) -> Vec<SessionEvent> {
         state.spec = next_spec;
         let checkpoint = apply_committed_events(&mut state, &events, true);
-        // Do not retain an unbounded copy of an uncheckpointed transcript.
-        // Checkpointed sessions retain only their bounded post-checkpoint tail.
         if state.derived.latest_compaction_sequence.is_none() {
             state.events = Vec::new();
         }
@@ -2894,7 +2675,7 @@ impl Session {
         if let Some((through, payload)) = checkpoint {
             self.persist_resume_index(through, payload).await;
         }
-        Ok(events)
+        events
     }
 
     fn publish_persisted(&self, events: &[SessionEvent]) {
@@ -2905,30 +2686,9 @@ impl Session {
 
     async fn persist_resume_index(&self, through: u64, payload: String) {
         let id = self.id.clone();
-        let checksum = resume_checksum(&id, through, &payload);
         let _ = self
             .connection
-            .call(move |db| {
-                db.execute(
-                    "INSERT INTO session_resume_index
-                     (session_id, version, through_sequence, payload_json, checksum)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                       version = excluded.version,
-                       through_sequence = excluded.through_sequence,
-                       payload_json = excluded.payload_json,
-                       checksum = excluded.checksum
-                     WHERE excluded.through_sequence >= session_resume_index.through_sequence",
-                    params![
-                        id,
-                        i64::from(RESUME_INDEX_VERSION),
-                        through as i64,
-                        payload,
-                        checksum
-                    ],
-                )?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-            })
+            .call(move |db| upsert_resume_index(db, &id, through, &payload))
             .await;
     }
 
@@ -3156,6 +2916,28 @@ fn delete_stale_collaboration_presence(
     Ok(())
 }
 
+/// Remember a session's chosen collaboration name; the upsert keeps a
+/// rejoining session's identity row current.
+fn upsert_collaboration_identity(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    name: &str,
+    normalized: &str,
+    now_text: &str,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO collaboration_identities
+         (session_id, name, normalized_name, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET
+           name = excluded.name,
+           normalized_name = excluded.normalized_name,
+           updated_at = excluded.updated_at",
+        params![session_id, name, normalized, now_text],
+    )?;
+    Ok(())
+}
+
 fn allocate_collaboration_name(
     transaction: &Transaction<'_>,
     session_id: &str,
@@ -3337,6 +3119,130 @@ where
             Err(error) => return Err(error),
         }
     }
+}
+
+/// One serialized event row for a first persistence: `(sequence, at, kind,
+/// payload_json)`.
+type StoredEventRow = (i64, String, String, String);
+
+fn stored_event_rows<'a>(
+    events: impl IntoIterator<Item = &'a SessionEvent>,
+) -> Result<Vec<StoredEventRow>> {
+    events
+        .into_iter()
+        .map(|event| {
+            Ok((
+                event.sequence as i64,
+                event.at.to_rfc3339(),
+                payload_kind(&event.kind).to_string(),
+                serde_json::to_string(&event.kind).context("cannot serialize session event")?,
+            ))
+        })
+        .collect()
+}
+
+fn serialized_private_records(records: &HashMap<String, Value>) -> Result<Vec<(String, String)>> {
+    records
+        .iter()
+        .map(|(owner, payload)| {
+            Ok((
+                owner.clone(),
+                serde_json::to_string(payload)
+                    .with_context(|| format!("cannot serialize private session record {owner}"))?,
+            ))
+        })
+        .collect()
+}
+
+/// Write a prepared session's first durable rows inside an open transaction:
+/// the session row, every in-memory event, and the staged private records.
+///
+/// `carry_draft` moves a saved project draft onto the new session row and
+/// deletes it. `persist()` deliberately declines both: a prepared session has
+/// no composer text of its own, and the project draft must survive for the
+/// next session in that project.
+fn insert_prepared_session(
+    transaction: &Transaction<'_>,
+    id: &str,
+    at: &str,
+    project: &str,
+    spec: &AgentSpec,
+    head_sequence: i64,
+    stored_events: &[StoredEventRow],
+    private_records: &[(String, String)],
+    carry_draft: bool,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    let draft = if carry_draft {
+        transaction
+            .query_row(
+                "SELECT draft FROM pending_drafts WHERE cwd = ?1",
+                [project],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    transaction.execute(
+        "INSERT INTO sessions
+         (id, created_at, updated_at, cwd, provider, model, thinking,
+          parent_session_id, depth, head_sequence, draft)
+         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            id,
+            at,
+            project,
+            spec.provider,
+            spec.model,
+            spec.thinking.to_string(),
+            spec.parent_session_id,
+            i64::from(spec.depth()),
+            head_sequence,
+            draft
+        ],
+    )?;
+    for (sequence, event_at, kind_name, payload) in stored_events {
+        transaction.execute(
+            "INSERT INTO events
+             (session_id, sequence, at, kind, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, sequence, event_at, kind_name, payload],
+        )?;
+    }
+    for (owner, payload) in private_records {
+        transaction.execute(
+            "INSERT INTO session_private_records
+             (session_id, owner, payload_json) VALUES (?1, ?2, ?3)",
+            params![id, owner, payload],
+        )?;
+    }
+    if carry_draft {
+        transaction.execute("DELETE FROM pending_drafts WHERE cwd = ?1", [project])?;
+    }
+    Ok(())
+}
+
+fn insert_pending_input_row(
+    db: &SqliteConnection,
+    session_id: &str,
+    kind: SubmitKind,
+    text: &str,
+    content: &str,
+    visible: bool,
+    created_at: &str,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    let kind = match kind {
+        SubmitKind::Prompt => "prompt",
+        SubmitKind::Steer => "steer",
+    };
+    db.execute(
+        "INSERT INTO pending_inputs
+         (session_id, kind, text, content_json, visible, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![session_id, kind, text, content, visible, created_at],
+    )?;
+    Ok(())
 }
 
 fn initialize_database(db: &mut SqliteConnection) -> tokio_rusqlite::rusqlite::Result<()> {
@@ -3691,9 +3597,7 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
         }
         EventKind::Compaction { .. } => {
             state.latest_compaction_sequence = Some(event.sequence);
-            state.token_calibration.pending_visible_units = 0;
-            state.token_calibration.pending_reasoning_visible = false;
-            state.token_calibration.pending_usage = None;
+            state.token_calibration.reset_pending();
         }
         EventKind::ContextRollover { window_id, .. } => {
             state.latest_compaction_sequence = Some(event.sequence);
@@ -3703,9 +3607,7 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.context_hints_sent = 0;
             state.successful_help_reads.clear();
             state.pending_help_reads.clear();
-            state.token_calibration.pending_visible_units = 0;
-            state.token_calibration.pending_reasoning_visible = false;
-            state.token_calibration.pending_usage = None;
+            state.token_calibration.reset_pending();
         }
         EventKind::ContextReminder { window_id, hint } => {
             if state.context_hint_window_id != Some(*window_id) {
@@ -3718,9 +3620,7 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.reminded_context_window_id = Some(*window_id);
         }
         EventKind::ModelRetry { .. } | EventKind::Error { .. } => {
-            state.token_calibration.pending_visible_units = 0;
-            state.token_calibration.pending_reasoning_visible = false;
-            state.token_calibration.pending_usage = None;
+            state.token_calibration.reset_pending();
         }
         _ => {}
     }
@@ -5767,7 +5667,7 @@ mod tests {
         opened
             .connection
             .call(move |db| {
-                persist_rebuilt_resume_index(db, "monotonic-index", first.sequence, &first_payload)
+                upsert_resume_index(db, "monotonic-index", first.sequence, &first_payload)
             })
             .await
             .unwrap();

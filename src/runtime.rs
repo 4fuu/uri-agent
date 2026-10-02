@@ -1,4 +1,6 @@
-use crate::agent::{CapabilitySelection, CompactionCallback, SubmitKind, SystemPromptUpdate};
+use crate::agent::{
+    AgentSpec, CapabilitySelection, CompactionCallback, SubmitKind, SystemPromptUpdate,
+};
 use crate::builtins::context::ContextState;
 use crate::catalog::ModelLimits;
 use crate::compaction;
@@ -14,12 +16,12 @@ use crate::plugin::{ModelToolOutput, ModelToolRegistry};
 use crate::protocol::{
     ProtocolHelpRequired, ProtocolImage, ProtocolImageMediaType, ProtocolRegistry,
 };
-use crate::session::{ContextHint, EventKind, PendingInput, Session};
+use crate::session::{ContextHint, EventKind, PendingInput, Session, SessionContext};
 use crate::task::{TaskManager, TaskRecord};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
-use rig::completion::{FinishReason, Usage};
+use rig::completion::{FinishReason, ToolDefinition, Usage};
 use rig::message::{
     AssistantContent, ImageMediaType, Message, Text, ToolCall, ToolResultContent, UserContent,
 };
@@ -332,10 +334,7 @@ fn pending_entry(input: PendingInput) -> PendingMessageEntry {
         message: PendingMessage {
             id: u64::try_from(input.id).unwrap_or_default(),
             text: input.text,
-            kind: match input.kind {
-                SubmitKind::Prompt => PendingMessageKind::Queued,
-                SubmitKind::Steer => PendingMessageKind::Steer,
-            },
+            kind: AgentRuntime::pending_message_kind(input.kind),
         },
         content: input.content,
         clipboard_images: Vec::new(),
@@ -617,14 +616,20 @@ impl AgentRuntime {
         self.limits.read().await.context_window
     }
 
-    async fn build_model_request(&self) -> Result<ModelRequest> {
-        let system = self.system_prompt().await?;
+    /// Read the model history once, measure the context the next request
+    /// would carry, and refresh the shared usage meter. One history read
+    /// keeps the returned history and usage consistent even when another
+    /// task appends concurrently.
+    async fn measured_history(
+        &self,
+        system: &str,
+        tools: &[ToolDefinition],
+    ) -> (Vec<Message>, compaction::ContextUsage) {
         let model = self.session.model_settings().await;
-        let tools = self.model_tools.definitions();
         let (history, usage) = self
             .session
             .with_model_history(&model.provider, &model.model, |history, latest, after| {
-                let usage = compaction::context_usage(&system, history, &tools, latest, after);
+                let usage = compaction::context_usage(system, history, tools, latest, after);
                 (history.to_vec(), usage)
             })
             .await;
@@ -633,9 +638,16 @@ impl AgentRuntime {
             .write()
             .expect("context usage lock poisoned") = usage;
         let context_window = self.limits.read().await.context_window.max(1);
-        let base_context_tokens = compaction::estimate_request_tokens(&system, &[], &tools);
+        let base_context_tokens = compaction::estimate_request_tokens(system, &[], tools);
         self.context_state
             .update_meter(context_window, base_context_tokens, usage);
+        (history, usage)
+    }
+
+    async fn build_model_request(&self) -> Result<ModelRequest> {
+        let system = self.system_prompt().await?;
+        let tools = self.model_tools.definitions();
+        let (history, usage) = self.measured_history(&system, &tools).await;
         Ok(ModelRequest {
             system,
             history,
@@ -649,22 +661,8 @@ impl AgentRuntime {
         let Ok(system) = self.system_prompt().await else {
             return;
         };
-        let model = self.session.model_settings().await;
         let tools = self.model_tools.definitions();
-        let usage = self
-            .session
-            .with_model_history(&model.provider, &model.model, |history, latest, after| {
-                compaction::context_usage(&system, history, &tools, latest, after)
-            })
-            .await;
-        *self
-            .context_usage
-            .write()
-            .expect("context usage lock poisoned") = usage;
-        let context_window = self.limits.read().await.context_window.max(1);
-        let base_context_tokens = compaction::estimate_request_tokens(&system, &[], &tools);
-        self.context_state
-            .update_meter(context_window, base_context_tokens, usage);
+        self.measured_history(&system, &tools).await;
     }
 
     pub async fn set_compaction_settings(&self, settings: compaction::Settings) {
@@ -774,18 +772,71 @@ impl AgentRuntime {
             .collect()
     }
 
-    /// Durably accept plugin input. Prompt starts a run when idle; Steer waits
-    /// for the next model boundary while active and becomes Prompt when idle.
-    pub async fn submit_with_images(
-        self: &Arc<Self>,
+    /// Map a durable input kind onto its queued-message kind.
+    fn pending_message_kind(kind: SubmitKind) -> PendingMessageKind {
+        match kind {
+            SubmitKind::Prompt => PendingMessageKind::Queued,
+            SubmitKind::Steer => PendingMessageKind::Steer,
+        }
+    }
+
+    /// Persist one accepted input durably and build its in-memory entry.
+    async fn persist_pending_entry(
+        &self,
+        kind: SubmitKind,
+        prompt: &str,
+        content: Vec<UserContent>,
+        clipboard_images: Vec<ImageAttachment>,
+        visible: bool,
+    ) -> Result<PendingMessageEntry> {
+        let persistent_id = self
+            .session
+            .add_pending_input(kind, prompt, &content, visible)
+            .await?;
+        Ok(PendingMessageEntry {
+            persistent_id: Some(persistent_id),
+            message: PendingMessage {
+                id: u64::try_from(persistent_id).unwrap_or_default(),
+                text: prompt.to_string(),
+                kind: Self::pending_message_kind(kind),
+            },
+            content,
+            clipboard_images,
+            visible,
+            task_notification_ids: Vec::new(),
+        })
+    }
+
+    /// Take the active-turn slot for a new turn. Returns `true` when a live
+    /// turn still owns the slot (it is restored unchanged); otherwise waits
+    /// for the finished turn's handle to settle and leaves the slot vacant.
+    async fn take_finished_turn(
+        active: &mut tokio::sync::MutexGuard<'_, Option<ActiveTurn>>,
+    ) -> bool {
+        if let Some(previous) = active.take() {
+            if previous.handle.is_finished() {
+                let _ = previous.handle.await;
+            } else {
+                **active = Some(previous);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Validate one submitted prompt and assemble its model content: reject
+    /// shutdown and empty text, restore startup context, and inline the
+    /// attached images. Returns the trimmed prompt with its content and the
+    /// memory-held attachments.
+    async fn prepared_submission(
+        &self,
         prompt: String,
         images: Vec<ProtocolImage>,
-        kind: SubmitKind,
-    ) -> Result<PendingMessage> {
+    ) -> Result<(String, Vec<UserContent>, Vec<ImageAttachment>)> {
         if self.shutting_down.load(Ordering::Acquire) {
             bail!("Agent runtime is shutting down")
         }
-        let prompt = prompt.trim();
+        let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             bail!("message is empty")
         }
@@ -794,34 +845,31 @@ impl AgentRuntime {
             .into_iter()
             .map(ImageAttachment::from_protocol)
             .collect::<Vec<_>>();
-        let mut content = vec![UserContent::text(prompt)];
+        let mut content = vec![UserContent::text(prompt.as_str())];
         content.extend(memory_image_attachments(&images));
+        Ok((prompt, content, images))
+    }
+
+    /// Durably accept plugin input. Prompt starts a run when idle; Steer waits
+    /// for the next model boundary while active and becomes Prompt when idle.
+    pub async fn submit_with_images(
+        self: &Arc<Self>,
+        prompt: String,
+        images: Vec<ProtocolImage>,
+        kind: SubmitKind,
+    ) -> Result<PendingMessage> {
+        let (prompt, content, images) = self.prepared_submission(prompt, images).await?;
         let (message, kind) = {
             let mut pending = self.pending.lock().await;
             let kind = match kind {
                 SubmitKind::Steer if !pending.accepting => SubmitKind::Prompt,
                 kind => kind,
             };
-            let persistent_id = self
-                .session
-                .add_pending_input(kind, prompt, &content, true)
+            let entry = self
+                .persist_pending_entry(kind, &prompt, content, images, true)
                 .await?;
-            let message = PendingMessage {
-                id: u64::try_from(persistent_id).unwrap_or_default(),
-                text: prompt.to_string(),
-                kind: match kind {
-                    SubmitKind::Prompt => PendingMessageKind::Queued,
-                    SubmitKind::Steer => PendingMessageKind::Steer,
-                },
-            };
-            pending.messages.push_back(PendingMessageEntry {
-                persistent_id: Some(persistent_id),
-                message: message.clone(),
-                content,
-                clipboard_images: images,
-                visible: true,
-                task_notification_ids: Vec::new(),
-            });
+            let message = entry.message.clone();
+            pending.messages.push_back(entry);
             self.publish_pending(&pending);
             (message, kind)
         };
@@ -840,56 +888,26 @@ impl AgentRuntime {
         prompt: String,
         images: Vec<ProtocolImage>,
     ) -> Result<PendingMessage> {
-        if self.shutting_down.load(Ordering::Acquire) {
-            bail!("Agent runtime is shutting down")
-        }
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            bail!("message is empty")
-        }
-        self.prepare_context().await?;
-        let images = images
-            .into_iter()
-            .map(ImageAttachment::from_protocol)
-            .collect::<Vec<_>>();
-        let mut content = vec![UserContent::text(prompt)];
-        content.extend(memory_image_attachments(&images));
+        let (prompt, content, images) = self.prepared_submission(prompt, images).await?;
 
         let mut active = self.active_turn.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
             bail!("Agent runtime is shutting down")
         }
-        if let Some(previous) = active.take() {
-            if !previous.handle.is_finished() {
-                *active = Some(previous);
-                bail!("the session is busy with another turn")
-            }
-            let _ = previous.handle.await;
+        if Self::take_finished_turn(&mut active).await {
+            bail!("the session is busy with another turn")
         }
         let input = {
             let mut pending = self.pending.lock().await;
             if pending.accepting || !pending.messages.is_empty() {
                 bail!("the session has pending native input")
             }
-            let persistent_id = self
-                .session
-                .add_pending_input(SubmitKind::Prompt, prompt, &content, true)
+            let input = self
+                .persist_pending_entry(SubmitKind::Prompt, &prompt, content, images, true)
                 .await?;
-            let message = PendingMessage {
-                id: u64::try_from(persistent_id).unwrap_or_default(),
-                text: prompt.to_string(),
-                kind: PendingMessageKind::Queued,
-            };
             pending.accepting = true;
             self.publish_pending(&pending);
-            PendingMessageEntry {
-                persistent_id: Some(persistent_id),
-                message,
-                content,
-                clipboard_images: images,
-                visible: true,
-                task_notification_ids: Vec::new(),
-            }
+            input
         };
         let message = input.message.clone();
         let (cancel, receiver) = watch::channel(None);
@@ -1050,23 +1068,11 @@ impl AgentRuntime {
             PendingMessageKind::Queued => SubmitKind::Prompt,
             PendingMessageKind::Steer => SubmitKind::Steer,
         };
-        let persistent_id = self
-            .session
-            .add_pending_input(submit_kind, prompt, &content, true)
+        let entry = self
+            .persist_pending_entry(submit_kind, prompt, content, clipboard_images, true)
             .await?;
-        let message = PendingMessage {
-            id: u64::try_from(persistent_id).unwrap_or_default(),
-            text: prompt.to_string(),
-            kind: effective_kind,
-        };
-        pending.messages.push_back(PendingMessageEntry {
-            persistent_id: Some(persistent_id),
-            message: message.clone(),
-            content,
-            clipboard_images,
-            visible: true,
-            task_notification_ids: Vec::new(),
-        });
+        let message = entry.message.clone();
+        pending.messages.push_back(entry);
         self.publish_pending(&pending);
         drop(pending);
         if start {
@@ -1157,12 +1163,8 @@ impl AgentRuntime {
         if self.shutting_down.load(Ordering::Acquire) {
             bail!("Agent runtime is shutting down")
         }
-        if let Some(previous) = active.take() {
-            if !previous.handle.is_finished() {
-                *active = Some(previous);
-                bail!("a turn is already running")
-            }
-            let _ = previous.handle.await;
+        if Self::take_finished_turn(&mut active).await {
+            bail!("a turn is already running")
         }
         {
             let mut pending = self.pending.lock().await;
@@ -1201,22 +1203,9 @@ impl AgentRuntime {
             self.stop_accepting_pending().await;
             bail!("Agent runtime is shutting down")
         }
-        let persistent_id = self
-            .session
-            .add_pending_input(SubmitKind::Prompt, &prompt, &content, true)
+        let input = self
+            .persist_pending_entry(SubmitKind::Prompt, &prompt, content, images, true)
             .await?;
-        let input = PendingMessageEntry {
-            persistent_id: Some(persistent_id),
-            message: PendingMessage {
-                id: u64::try_from(persistent_id).unwrap_or_default(),
-                text: prompt,
-                kind: PendingMessageKind::Queued,
-            },
-            content,
-            clipboard_images: images,
-            visible: true,
-            task_notification_ids: Vec::new(),
-        };
         {
             let mut pending = self.pending.lock().await;
             pending.messages.push_back(input);
@@ -1238,12 +1227,8 @@ impl AgentRuntime {
         }
 
         let mut active = self.active_turn.lock().await;
-        if let Some(previous) = active.take() {
-            if !previous.handle.is_finished() {
-                *active = Some(previous);
-                return;
-            }
-            let _ = previous.handle.await;
+        if Self::take_finished_turn(&mut active).await {
+            return;
         }
         let records = task_notification_batch(self.tasks.pending_terminal_notifications().await);
         if records.is_empty() {
@@ -1715,55 +1700,9 @@ impl AgentRuntime {
                 self.append_reconciled_steer(true, has_model_response)
                     .await?;
             }
-            let mut model_retries = HashMap::new();
-            let (response, force_post_compaction) = loop {
-                match self.complete_once(backend.as_ref(), cancel).await {
-                    Ok(response) => {
-                        let settings = *self.compaction_settings.read().await;
-                        let context_window = self.limits.read().await.context_window.max(1);
-                        if settings.enabled
-                            && !overflow_retried
-                            && is_recoverable_length(
-                                &response,
-                                context_window,
-                                backend.desired_max_output_tokens(),
-                            )
-                            && self
-                                .compact_with(Some(backend.as_ref()), true, false, cancel)
-                                .await?
-                        {
-                            overflow_retried = true;
-                            self.record_usage(response.usage, response.context_tokens, false)
-                                .await?;
-                            continue;
-                        }
-                        let force_post_compaction = settings.enabled
-                            && is_successful_context_overflow(&response, context_window);
-                        break (response, force_post_compaction);
-                    }
-                    Err(error) if !overflow_retried && is_context_overflow(&error, &provider) => {
-                        if !self.compaction_settings.read().await.enabled {
-                            return Err(error);
-                        }
-                        overflow_retried = true;
-                        if !self
-                            .compact_with(Some(backend.as_ref()), true, false, cancel)
-                            .await?
-                        {
-                            return Err(error);
-                        }
-                    }
-                    Err(error) => {
-                        if self
-                            .retry_model_failure(&error, &mut model_retries, cancel)
-                            .await?
-                        {
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                }
-            };
+            let (response, force_post_compaction) = self
+                .complete_with_recovery(&backend, &provider, &mut overflow_retried, cancel)
+                .await?;
             steer_ready = false;
             let assistant_message = Message::Assistant {
                 id: None,
@@ -1837,6 +1776,69 @@ impl AgentRuntime {
                         .await?;
                 }
                 return Ok(());
+            }
+        }
+    }
+
+    /// Complete one model request, recovering a length-truncated or
+    /// overflowed response through one forced compaction and retrying
+    /// transient failures. `overflow_retried` carries the one-shot overflow
+    /// recovery across this turn's iterations. Returns the response and
+    /// whether the following idle boundary must force a post-compaction.
+    async fn complete_with_recovery(
+        &self,
+        backend: &Arc<dyn ModelBackend>,
+        provider: &str,
+        overflow_retried: &mut bool,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
+    ) -> Result<(ModelResponse, bool)> {
+        let mut model_retries = HashMap::new();
+        loop {
+            match self.complete_once(backend.as_ref(), cancel).await {
+                Ok(response) => {
+                    let settings = *self.compaction_settings.read().await;
+                    let context_window = self.limits.read().await.context_window.max(1);
+                    if settings.enabled
+                        && !*overflow_retried
+                        && is_recoverable_length(
+                            &response,
+                            context_window,
+                            backend.desired_max_output_tokens(),
+                        )
+                        && self
+                            .compact_with(Some(backend.as_ref()), true, false, cancel)
+                            .await?
+                    {
+                        *overflow_retried = true;
+                        self.record_usage(response.usage, response.context_tokens, false)
+                            .await?;
+                        continue;
+                    }
+                    let force_post_compaction = settings.enabled
+                        && is_successful_context_overflow(&response, context_window);
+                    return Ok((response, force_post_compaction));
+                }
+                Err(error) if !*overflow_retried && is_context_overflow(&error, provider) => {
+                    if !self.compaction_settings.read().await.enabled {
+                        return Err(error);
+                    }
+                    *overflow_retried = true;
+                    if !self
+                        .compact_with(Some(backend.as_ref()), true, false, cancel)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    if self
+                        .retry_model_failure(&error, &mut model_retries, cancel)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -1977,8 +1979,40 @@ impl AgentRuntime {
             tools: Vec::new(),
             max_output_tokens: Some(summary_output_tokens),
         };
+        let (response, summary) = self.request_summary(backend, request, cancel).await?;
+        let updated = self.compaction_spec_update().await?;
+        self.record_usage(response.usage, response.context_tokens, false)
+            .await?;
+        let replacement = compaction::replacement_history(&summary, &preparation.retained);
+        self.session
+            .append_compaction_with_spec(
+                summary,
+                preparation.tokens_before,
+                replacement,
+                manual,
+                updated.clone(),
+            )
+            .await?;
+        if let Some((spec, context)) = updated {
+            self.model_tools.select(capability_names(&spec.tools))?;
+            self.protocols.select(capability_names(&spec.protocols))?;
+            *self.system_prompt_override.write().await = Some(context.system_prompt);
+        }
+        self.refresh_context_estimate().await;
+        Ok(true)
+    }
+
+    /// Run one checkpoint summary request, retrying transient model failures
+    /// and empty summaries, and stopping for cancellation. Returns the
+    /// response and its non-empty summary text.
+    async fn request_summary(
+        &self,
+        backend: &dyn ModelBackend,
+        request: ModelRequest,
+        cancel: &mut watch::Receiver<Option<TurnCancellation>>,
+    ) -> Result<(ModelResponse, String)> {
         let mut model_retries = HashMap::new();
-        let (response, summary) = loop {
+        loop {
             let (deltas, _receiver) = mpsc::unbounded_channel();
             let completion = backend.complete(request.clone(), deltas);
             tokio::pin!(completion);
@@ -2005,7 +2039,7 @@ impl AgentRuntime {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !summary.trim().is_empty() {
-                        break (response, summary);
+                        return Ok((response, summary));
                     }
                     let error = anyhow::Error::new(ModelFailure::empty_response());
                     if self
@@ -2026,89 +2060,77 @@ impl AgentRuntime {
                     return Err(error).context("context compaction model request failed");
                 }
             }
+        }
+    }
+
+    /// Ask the compaction callback for a spec patch and fold it into the
+    /// spec and context the compaction event must persist. Returns `None`
+    /// when no callback is installed or the callback reports no patch.
+    async fn compaction_spec_update(&self) -> Result<Option<(AgentSpec, SessionContext)>> {
+        let Some(callback) = self.compaction_callback.read().await.clone() else {
+            return Ok(None);
         };
-        let mut updated = None;
-        if let Some(callback) = self.compaction_callback.read().await.clone() {
-            let current = self.session.spec().await;
-            if let Some(patch) = callback.compacted().await? {
-                let prompt_update = patch.system_prompt.clone();
-                if let Some(CapabilitySelection::Only(names)) = patch.tools.as_ref() {
-                    self.model_tools.validate_selection(names)?;
-                }
-                if let Some(CapabilitySelection::Only(names)) = patch.protocols.as_ref() {
-                    self.protocols.validate_selection(names)?;
-                }
-                let mut next = current;
-                if let Some(update) = patch.system_prompt {
-                    next.system_prompt = match update {
-                        SystemPromptUpdate::Append(fragment) => {
-                            validate_prompt_update(&fragment)?;
-                            match next.system_prompt {
-                                crate::agent::SystemPromptSelection::Inherit => {
-                                    crate::agent::SystemPromptSelection::Append(fragment)
-                                }
-                                crate::agent::SystemPromptSelection::Append(existing) => {
-                                    crate::agent::SystemPromptSelection::Append(format!(
-                                        "{existing}\n\n{fragment}"
-                                    ))
-                                }
-                                crate::agent::SystemPromptSelection::Replace(existing) => {
-                                    crate::agent::SystemPromptSelection::Replace(format!(
-                                        "{existing}\n\n{fragment}"
-                                    ))
-                                }
-                            }
+        let current = self.session.spec().await;
+        let Some(patch) = callback.compacted().await? else {
+            return Ok(None);
+        };
+        let prompt_update = patch.system_prompt.clone();
+        if let Some(CapabilitySelection::Only(names)) = patch.tools.as_ref() {
+            self.model_tools.validate_selection(names)?;
+        }
+        if let Some(CapabilitySelection::Only(names)) = patch.protocols.as_ref() {
+            self.protocols.validate_selection(names)?;
+        }
+        let mut next = current;
+        if let Some(update) = patch.system_prompt {
+            next.system_prompt = match update {
+                SystemPromptUpdate::Append(fragment) => {
+                    validate_prompt_update(&fragment)?;
+                    match next.system_prompt {
+                        crate::agent::SystemPromptSelection::Inherit => {
+                            crate::agent::SystemPromptSelection::Append(fragment)
                         }
-                        SystemPromptUpdate::Replace(prompt) => {
-                            validate_prompt_update(&prompt)?;
-                            crate::agent::SystemPromptSelection::Replace(prompt)
+                        crate::agent::SystemPromptSelection::Append(existing) => {
+                            crate::agent::SystemPromptSelection::Append(format!(
+                                "{existing}\n\n{fragment}"
+                            ))
                         }
-                    };
-                }
-                if let Some(tools) = patch.tools {
-                    next.tools = tools;
-                }
-                if let Some(protocols) = patch.protocols {
-                    next.protocols = protocols;
-                }
-                let next_prompt = if let Some(initializer) = &self.initializer
-                    && let Some(prompt) = initializer.render_system_prompt(&next).await?
-                {
-                    prompt
-                } else {
-                    let current_prompt = self.system_prompt().await?;
-                    match prompt_update {
-                        Some(SystemPromptUpdate::Append(fragment)) => {
-                            format!("{current_prompt}\n\n{fragment}")
+                        crate::agent::SystemPromptSelection::Replace(existing) => {
+                            crate::agent::SystemPromptSelection::Replace(format!(
+                                "{existing}\n\n{fragment}"
+                            ))
                         }
-                        Some(SystemPromptUpdate::Replace(prompt)) => prompt,
-                        None => current_prompt,
                     }
-                };
-                let mut context = self.session.context().await;
-                context.system_prompt = next_prompt;
-                updated = Some((next, context));
+                }
+                SystemPromptUpdate::Replace(prompt) => {
+                    validate_prompt_update(&prompt)?;
+                    crate::agent::SystemPromptSelection::Replace(prompt)
+                }
+            };
+        }
+        if let Some(tools) = patch.tools {
+            next.tools = tools;
+        }
+        if let Some(protocols) = patch.protocols {
+            next.protocols = protocols;
+        }
+        let next_prompt = if let Some(initializer) = &self.initializer
+            && let Some(prompt) = initializer.render_system_prompt(&next).await?
+        {
+            prompt
+        } else {
+            let current_prompt = self.system_prompt().await?;
+            match prompt_update {
+                Some(SystemPromptUpdate::Append(fragment)) => {
+                    format!("{current_prompt}\n\n{fragment}")
+                }
+                Some(SystemPromptUpdate::Replace(prompt)) => prompt,
+                None => current_prompt,
             }
-        }
-        self.record_usage(response.usage, response.context_tokens, false)
-            .await?;
-        let replacement = compaction::replacement_history(&summary, &preparation.retained);
-        self.session
-            .append_compaction_with_spec(
-                summary,
-                preparation.tokens_before,
-                replacement,
-                manual,
-                updated.clone(),
-            )
-            .await?;
-        if let Some((spec, context)) = updated {
-            self.model_tools.select(capability_names(&spec.tools))?;
-            self.protocols.select(capability_names(&spec.protocols))?;
-            *self.system_prompt_override.write().await = Some(context.system_prompt);
-        }
-        self.refresh_context_estimate().await;
-        Ok(true)
+        };
+        let mut context = self.session.context().await;
+        context.system_prompt = next_prompt;
+        Ok(Some((next, context)))
     }
 
     /// Persist one response's token usage, priced with the active model's
