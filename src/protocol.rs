@@ -942,11 +942,52 @@ impl ProtocolRegistry {
         drop(allowed);
         names.sort();
         if names.is_empty() {
-            anyhow!("unknown protocol: {name}")
-        } else {
+            return anyhow!("unknown protocol: {name}");
+        }
+        let close = close_protocol_names(name, &names);
+        if close.is_empty() {
             anyhow!("unknown protocol: {name}; available: {}", names.join(", "))
+        } else {
+            anyhow!(
+                "unknown protocol: {name}; did you mean {}? available: {}",
+                close.join(", "),
+                names.join(", ")
+            )
         }
     }
+}
+
+/// Registered names that differ from `name` only in case and punctuation, or
+/// that contain it or are contained in it, so `Bash` and `files` point to
+/// `bash` and `file`.
+fn close_protocol_names<'a>(name: &str, names: &'a [String]) -> Vec<&'a str> {
+    let comparable = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    let wanted = comparable(name);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let exact = names
+        .iter()
+        .filter(|candidate| comparable(candidate) == wanted)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return exact;
+    }
+    names
+        .iter()
+        .filter(|candidate| {
+            let candidate = comparable(candidate);
+            !candidate.is_empty() && (candidate.contains(&wanted) || wanted.contains(&candidate))
+        })
+        .take(5)
+        .map(String::as_str)
+        .collect()
 }
 
 pub(crate) fn validate_descriptor(descriptor: &ProtocolDescriptor) -> Result<()> {
@@ -1366,6 +1407,17 @@ mod tests {
             "unknown protocol: first; available: second"
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
+    }
+
+    #[test]
+    fn unknown_protocol_names_close_matches() {
+        let names = ["bash", "file", "github-mcp", "search"].map(String::from);
+        assert_eq!(close_protocol_names("Bash", &names), ["bash"]);
+        assert_eq!(close_protocol_names("files", &names), ["file"]);
+        assert_eq!(close_protocol_names("github_mcp", &names), ["github-mcp"]);
+        assert_eq!(close_protocol_names("github", &names), ["github-mcp"]);
+        assert!(close_protocol_names("tasks", &names).is_empty());
+        assert!(close_protocol_names("://", &names).is_empty());
     }
 
     #[tokio::test]

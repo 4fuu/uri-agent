@@ -85,10 +85,11 @@ boolean.
 The whole call is validated before anything runs: field presence and types,
 protocol existence, loaded help, `read`/`exec` support, reference targets and
 ordering, `for`/`max` pairing, and expression syntax. A rejected call runs
-nothing. A step whose `input`, address, or `for` source references a failed or
-skipped step is skipped with that reason; an `if` may still read `.ok` of a
-failed step. A call expands to at most 64 operations; further steps are
-reported as skipped.
+nothing; an unknown protocol name is reported with close matches and the
+available names. A step whose `input`, address, or `for` source references a
+failed or skipped step is skipped with that reason; an `if` may still read
+`.ok` of a failed step. Steps that already ran are not undone. A call expands
+to at most 64 operations; further steps are reported as skipped.
 
 A protocol may declare shared-help prerequisites; `help` loads them
 automatically ahead of the requested protocol, and using the dependent protocol
