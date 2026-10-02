@@ -254,7 +254,7 @@ impl HerdrReporter {
         if let Some(worker) = self.inner.worker.lock().await.take() {
             let _ = worker.await;
         }
-        let seq = self.inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = self.inner.next_seq();
         run_command(&self.inner.target, self.inner.target.release_arguments(seq)).await;
     }
 }
@@ -273,6 +273,14 @@ impl HerdrInner {
             .expect("herdr title lock poisoned")
             .as_ref()
             .map(|receiver| receiver.borrow().clone())
+    }
+
+    /// The next report sequence number. Herdr ignores stale sequence numbers
+    /// from one source, so the strictly increasing counter keeps
+    /// last-writer-wins even when two dispatched reports race inside Herdr's
+    /// CLI.
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -293,7 +301,7 @@ async fn run(inner: Arc<HerdrInner>) {
             generation = current;
             reported = None;
             if reported_title.take().is_some() {
-                let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let seq = inner.next_seq();
                 let arguments = inner.target.metadata_clear_arguments(seq);
                 run_command(&inner.target, arguments).await;
             }
@@ -308,17 +316,14 @@ async fn run(inner: Arc<HerdrInner>) {
             .as_ref()
             .is_none_or(|last| last.0 != state || last.1 != session_id)
         {
-            // Herdr ignores stale sequence numbers from one source, so the
-            // strictly increasing counter keeps last-writer-wins even when
-            // two dispatched reports race inside Herdr's CLI.
-            let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let seq = inner.next_seq();
             let arguments = inner.target.report_arguments(state, &session_id, seq);
             dispatch(&inner.target, arguments);
             reported = Some((state, session_id));
         }
         let title = inner.current_title().filter(|title| !title.is_empty());
         if title.is_some() && title != reported_title {
-            let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let seq = inner.next_seq();
             let arguments = inner
                 .target
                 .metadata_arguments(title.as_deref().unwrap_or_default(), seq);
@@ -330,20 +335,28 @@ async fn run(inner: Arc<HerdrInner>) {
     // the metadata guard only matches while that source still holds pane
     // authority.
     if reported_title.is_some() {
-        let seq = inner.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = inner.next_seq();
         let arguments = inner.target.metadata_clear_arguments(seq);
         run_command(&inner.target, arguments).await;
     }
 }
 
-fn dispatch(target: &HerdrTarget, arguments: Vec<String>) {
+/// Spawn one Herdr CLI call with all output discarded. Herdr's CLI is
+/// best-effort: a missing or older binary resolves to `None` and the
+/// conversation continues unaffected.
+fn spawn_herdr(target: &HerdrTarget, arguments: Vec<String>) -> Option<tokio::process::Child> {
     let mut command = Command::new(&target.bin);
     command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(mut child) = command.spawn() {
+    command.spawn().ok()
+}
+
+/// Fire-and-forget one report; the worker never waits for routine reports.
+fn dispatch(target: &HerdrTarget, arguments: Vec<String>) {
+    if let Some(mut child) = spawn_herdr(target, arguments) {
         tokio::spawn(async move {
             let _ = child.wait().await;
         });
@@ -353,13 +366,7 @@ fn dispatch(target: &HerdrTarget, arguments: Vec<String>) {
 /// Run one Herdr CLI call to completion. Used where later commands depend on
 /// the effect, such as clearing display metadata before releasing the pane.
 async fn run_command(target: &HerdrTarget, arguments: Vec<String>) {
-    let mut command = Command::new(&target.bin);
-    command
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Ok(mut child) = command.spawn() {
+    if let Some(mut child) = spawn_herdr(target, arguments) {
         let _ = tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await;
     }
 }

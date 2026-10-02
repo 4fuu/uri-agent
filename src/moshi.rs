@@ -1046,18 +1046,17 @@ async fn run(inner: Arc<MoshiInner>) {
                     session_title: Some(title.clone()),
                     context_remaining: context_remaining(&current.runtime).await,
                 };
-                let endpoint = inner.endpoint.read().expect("endpoint lock poisoned").clone();
-                let frame = frame_for(
+                deliver_action(
+                    &inner,
                     &MoshiAction::TitleUpdated {
                         title,
                         prompt: state.turn.prompt.clone(),
                     },
                     &current.context,
-                    &endpoint,
                     &facts,
-                    Utc::now(),
-                );
-                deliver(&inner, frame, &mut backoff_until).await;
+                    &mut backoff_until,
+                )
+                .await;
             }
             update = next_update(&mut state.events) => {
                 let (kind, persisted) = match update {
@@ -1125,11 +1124,8 @@ async fn run(inner: Arc<MoshiInner>) {
                         session_title: state.session_title.clone(),
                         context_remaining: context_remaining(&current.runtime).await,
                     };
-                    let endpoint =
-                        inner.endpoint.read().expect("endpoint lock poisoned").clone();
-                    let frame =
-                        frame_for(&action, &current.context, &endpoint, &facts, Utc::now());
-                    deliver(&inner, frame, &mut backoff_until).await;
+                    deliver_action(&inner, &action, &current.context, &facts, &mut backoff_until)
+                        .await;
                 }
             }
         }
@@ -1150,20 +1146,15 @@ async fn run(inner: Arc<MoshiInner>) {
                 .filter(|_| visible_id.as_deref() == Some(context.session_id.as_str())),
             context_remaining: None,
         };
-        let endpoint = inner
-            .endpoint
-            .read()
-            .expect("endpoint lock poisoned")
-            .clone();
-        let frame = frame_for(
+        let mut no_backoff = None;
+        deliver_action(
+            &inner,
             &MoshiAction::SessionClosed,
             &context,
-            &endpoint,
             &facts,
-            Utc::now(),
-        );
-        let mut no_backoff = None;
-        deliver(&inner, frame, &mut no_backoff).await;
+            &mut no_backoff,
+        )
+        .await;
     }
 }
 
@@ -1214,11 +1205,7 @@ async fn attach(
     let Some(current) = state.watched.as_ref() else {
         return;
     };
-    let endpoint = inner
-        .endpoint
-        .read()
-        .expect("endpoint lock poisoned")
-        .clone();
+    let endpoint = current_endpoint(inner);
     if endpoint.has_pane() {
         let frame = frame_for(
             &MoshiAction::Bind,
@@ -1290,6 +1277,28 @@ async fn deliver(inner: &MoshiInner, frame: MoshiFrame, backoff_until: &mut Opti
         // event rebuilds the inbox row.
         _ => *backoff_until = Some(Instant::now() + FAILURE_BACKOFF),
     }
+}
+
+/// Snapshot the watched terminal endpoint for outgoing frames.
+fn current_endpoint(inner: &MoshiInner) -> Endpoint {
+    inner
+        .endpoint
+        .read()
+        .expect("endpoint lock poisoned")
+        .clone()
+}
+
+/// Build one action's frame against the current endpoint and deliver it.
+async fn deliver_action(
+    inner: &MoshiInner,
+    action: &MoshiAction,
+    context: &FrameContext,
+    facts: &FrameFacts,
+    backoff_until: &mut Option<Instant>,
+) {
+    let endpoint = current_endpoint(inner);
+    let frame = frame_for(action, context, &endpoint, facts, Utc::now());
+    deliver(inner, frame, backoff_until).await;
 }
 
 #[cfg(test)]

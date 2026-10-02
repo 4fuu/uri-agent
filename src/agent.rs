@@ -579,6 +579,37 @@ fn validate_plugin_open(spec: &AgentSpec, bound_parent: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Resolve a session's model backend and limits, falling back to the catalog
+/// model's limits when no backend can be configured. The returned warning,
+/// when set, reports why configuration was unusable and belongs in the
+/// transcript's startup notices.
+pub async fn resolve_session_backend(
+    active: &crate::config::ActiveSettings,
+    catalog: &ModelCatalog,
+    session_id: &str,
+    manager: &Arc<ConfigManager>,
+) -> (
+    Option<Arc<dyn crate::model::ModelBackend>>,
+    ModelLimits,
+    Option<String>,
+) {
+    let configured = configured_backend(active, catalog, Some(session_id), manager.clone()).await;
+    let warning = match &configured {
+        Err(error) => Some(format!("model configuration is not usable: {error:#}")),
+        Ok(_) => None,
+    };
+    match configured {
+        Ok(Some((backend, limits))) => (Some(backend), limits, None),
+        _ => {
+            let limits = active
+                .catalog_model(catalog)
+                .await
+                .map_or_else(ModelLimits::default, |model| model.limits());
+            (None, limits, warning)
+        }
+    }
+}
+
 fn validate_spec(spec: &AgentSpec) -> Result<()> {
     if spec.parent_session_id.is_some() {
         if spec.provider.trim().is_empty() {
@@ -702,31 +733,17 @@ impl AgentHost {
 
         let mut startup_notices = startup_notices;
         startup_notices.extend(self.inner.catalog.warnings().await);
-        let configured = match configured_backend(
+        let (backend, limits, configuration_warning) = resolve_session_backend(
             &active,
             &self.inner.catalog,
-            Some(session.id()),
-            self.inner.manager.clone(),
+            session.id(),
+            &self.inner.manager,
         )
-        .await
-        {
-            Ok(configured) => configured,
-            Err(error) => {
-                startup_notices.push(format!("model configuration is not usable: {error:#}"));
-                None
-            }
-        };
-        let model_ready = configured.is_some();
-        let (backend, limits) = match configured {
-            Some((backend, limits)) => (Some(backend), limits),
-            None => (
-                None,
-                active
-                    .catalog_model(&self.inner.catalog)
-                    .await
-                    .map_or_else(ModelLimits::default, |model| model.limits()),
-            ),
-        };
+        .await;
+        if let Some(warning) = configuration_warning {
+            startup_notices.push(warning);
+        }
+        let model_ready = backend.is_some();
         let context_window = limits.context_window;
         let initializer = Arc::new(AgentInitializer {
             session: session.clone(),

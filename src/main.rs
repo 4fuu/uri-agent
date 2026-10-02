@@ -1,10 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use uri_agent::agent::{AgentHandle, AgentHost, AgentSpec};
-use uri_agent::catalog::ModelLimits;
 use uri_agent::config::{Cli, Config};
 use uri_agent::herdr::HerdrReporter;
-use uri_agent::model::configured_backend;
 use uri_agent::moshi::MoshiReporter;
 use uri_agent::session::{EventKind, SessionChoice};
 use uri_agent::tui::{TuiInfo, TuiOutcome, TuiServices, TuiTerminal};
@@ -219,35 +217,17 @@ async fn run_retained_session_inner(
         .manager
         .for_session(&settings.provider, &settings.model, settings.thinking)
         .await?;
-    let configured = match configured_backend(
+    let (backend, limits, configuration_warning) = uri_agent::agent::resolve_session_backend(
         &active,
         &config.catalog,
-        Some(session.id()),
-        config.manager.clone(),
+        session.id(),
+        &config.manager,
     )
-    .await
-    {
-        Ok(configured) => configured,
-        Err(error) => {
-            session
-                .append(EventKind::Notice {
-                    text: format!("model configuration is not usable: {error:#}"),
-                })
-                .await?;
-            None
-        }
-    };
-    let model_ready = configured.is_some();
-    let (backend, limits) = match configured {
-        Some((backend, limits)) => (Some(backend), limits),
-        None => (
-            None,
-            active
-                .catalog_model(&config.catalog)
-                .await
-                .map_or_else(ModelLimits::default, |model| model.limits()),
-        ),
-    };
+    .await;
+    if let Some(warning) = configuration_warning {
+        session.append(EventKind::Notice { text: warning }).await?;
+    }
+    let model_ready = backend.is_some();
     let context_window = limits.context_window;
     runtime.set_backend(backend, Some(limits)).await;
     agent.services().output.set_limit(active.output_limit);
