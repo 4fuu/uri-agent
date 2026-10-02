@@ -52,6 +52,9 @@ supported providers.
 - **ACP editor integration:** use URI Agent from compatible editors through
   stable ACP v1 over stdio. Each session can select its model, and its
   conversation can later reopen in the normal TUI.
+- **Scriptable one-shot runs:** `uri-agent -x "<prompt>"` runs one
+  non-interactive turn and exits: the reply goes to stdout, one-line progress
+  to stderr, and the session is saved for later resume.
 - **Broad model access:** choose from the pi.dev catalog, use provider-specific
   sign-in, and discover account models without leaving the model selector.
 - **Durable work:** let long commands continue as managed tasks and resume work

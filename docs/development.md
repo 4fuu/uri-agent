@@ -39,6 +39,7 @@ discovery.
 | `src/acp/` | ACP v1 transport, sessions, content mapping, and MCP handoff |
 | `src/catalog.rs`, `src/catalog/` | Pi, built-in, provider, and user model catalogs |
 | `src/config.rs` | CLI, settings, credentials, environment, and precedence |
+| `src/execute.rs` | Non-interactive execute mode: prompt assembly, the one-turn runner, and stderr progress |
 | `src/oauth/` | Provider login and refresh flows |
 | `src/model/` | Model contracts, request transforms, and provider adapters |
 | `src/agent.rs` | Process-wide Agent ownership, depth, and lifecycle |
