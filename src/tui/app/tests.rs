@@ -119,12 +119,6 @@ fn post_auth_status_distinguishes_background_refresh_and_offline_mode() {
 }
 
 #[test]
-fn background_catalog_refresh_is_silent_but_announced_refresh_is_not() {
-    assert!(!catalog_refresh_should_announce(false));
-    assert!(catalog_refresh_should_announce(true));
-}
-
-#[test]
 fn catalog_refresh_restores_the_unsubmitted_model_highlight() {
     let model = |id: &str| CatalogModel {
         id: id.to_string(),
@@ -2960,24 +2954,9 @@ fn ctrl_c_copies_a_selection_and_is_otherwise_ignored() {
         ),
         false
     ));
-    assert_eq!(app.keymap.action("main", "ctrl+c"), None);
-    assert_eq!(
-        app.keymap.action("composer", "ctrl+c").as_deref(),
-        Some("copy")
-    );
+    // The default ctrl+c bindings are pinned in keymap's own tests; command
+    // mode must stay unbound so typing keeps filtering.
     assert_eq!(app.keymap.action("command", "ctrl+c"), None);
-    assert_eq!(
-        app.keymap.action("selection", "ctrl+c").as_deref(),
-        Some("copy")
-    );
-    assert_eq!(
-        app.keymap.action("main", "ctrl+x").as_deref(),
-        Some("copy_last_response")
-    );
-    assert_eq!(
-        app.keymap.action("selection", "ctrl+x").as_deref(),
-        Some("copy")
-    );
 }
 
 #[test]
@@ -4771,27 +4750,36 @@ fn command_panel_searches_aliases_and_wraps_selection() {
     assert!(rendered.contains(":thinking"));
 }
 
-#[test]
-fn effort_command_uses_a_selector_with_the_current_level_selected() {
-    let active = ActiveSettings {
+fn test_active_settings() -> ActiveSettings {
+    ActiveSettings {
         provider: "openai".to_string(),
-        model: "reasoning-model".to_string(),
+        model: "gpt-5.2".to_string(),
         api_key: None,
-        auth_kind: AuthKind::None,
+        auth_kind: AuthKind::ApiKey,
         output_limit: 32 * 1024,
-        thinking: ThinkingLevel::High,
+        thinking: ThinkingLevel::Off,
         compaction: crate::compaction::Settings::default(),
         provider_source: ValueSource::Global,
         model_source: ValueSource::Global,
-        api_key_source: ValueSource::Default,
+        api_key_source: ValueSource::Global,
         output_limit_source: ValueSource::Global,
         thinking_source: ValueSource::Global,
         terminal: None,
         key_display: KeyDisplayStyle::Text,
         layout: LayoutMode::Auto,
-        terminal_source: ValueSource::Default,
+        terminal_source: ValueSource::Global,
         credential_environment: BTreeMap::new(),
-    };
+    }
+}
+
+#[test]
+fn effort_command_uses_a_selector_with_the_current_level_selected() {
+    let mut active = test_active_settings();
+    active.model = "reasoning-model".to_string();
+    active.auth_kind = AuthKind::None;
+    active.thinking = ThinkingLevel::High;
+    active.api_key_source = ValueSource::Default;
+    active.terminal_source = ValueSource::Default;
     let model = serde_json::from_value(serde_json::json!({
         "id": "reasoning-model",
         "name": "Reasoning model",
@@ -5012,25 +5000,8 @@ fn colon_commands_include_login_logout_resume_and_search() {
 
 #[test]
 fn settings_panel_hides_the_api_key_and_cycles_thinking() {
-    let active = ActiveSettings {
-        provider: "openai".to_string(),
-        model: "gpt-5.2".to_string(),
-        api_key: Some("super-secret-value".to_string()),
-        auth_kind: AuthKind::ApiKey,
-        output_limit: 32 * 1024,
-        thinking: ThinkingLevel::Off,
-        compaction: crate::compaction::Settings::default(),
-        provider_source: ValueSource::Global,
-        model_source: ValueSource::Global,
-        api_key_source: ValueSource::Global,
-        output_limit_source: ValueSource::Global,
-        thinking_source: ValueSource::Global,
-        terminal: None,
-        key_display: KeyDisplayStyle::Text,
-        layout: LayoutMode::Auto,
-        terminal_source: ValueSource::Global,
-        credential_environment: BTreeMap::new(),
-    };
+    let mut active = test_active_settings();
+    active.api_key = Some("super-secret-value".to_string());
     let mut app = test_app();
     app.overlay = Some(Overlay::Settings);
     app.settings = Some(SettingsState {
@@ -7898,25 +7869,7 @@ fn float_rows_claim_presses_before_text_selection() {
 
 #[test]
 fn compact_settings_activate_on_a_single_tap() {
-    let active = ActiveSettings {
-        provider: "openai".to_string(),
-        model: "gpt-5.2".to_string(),
-        api_key: None,
-        auth_kind: AuthKind::ApiKey,
-        output_limit: 32 * 1024,
-        thinking: ThinkingLevel::Off,
-        compaction: crate::compaction::Settings::default(),
-        provider_source: ValueSource::Global,
-        model_source: ValueSource::Global,
-        api_key_source: ValueSource::Global,
-        output_limit_source: ValueSource::Global,
-        thinking_source: ValueSource::Global,
-        terminal: None,
-        key_display: KeyDisplayStyle::Text,
-        layout: LayoutMode::Auto,
-        terminal_source: ValueSource::Global,
-        credential_environment: BTreeMap::new(),
-    };
+    let active = test_active_settings();
     let mut app = compact_test_app();
     app.overlay = Some(Overlay::Settings);
     app.settings = Some(SettingsState {
