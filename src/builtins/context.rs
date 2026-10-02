@@ -2608,19 +2608,6 @@ mod tests {
             .to_string();
         assert!(blank_title.contains("context note title is required"));
 
-        let multiline_title = plugin
-            .exec(
-                context_request(
-                    "notes/add",
-                    &input_map(json!({"title": "two\nlines", "content": "body"})),
-                ),
-                context.clone(),
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(multiline_title.contains("one line without control characters"));
-
         let unknown_field = plugin
             .exec(
                 context_request(

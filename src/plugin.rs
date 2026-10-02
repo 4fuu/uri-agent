@@ -376,11 +376,6 @@ impl TuiPanelRow {
         self.selectable = selectable;
         self
     }
-
-    pub fn cursor(mut self, cursor: Option<usize>) -> Self {
-        self.cursor = cursor;
-        self
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -587,7 +582,6 @@ where
 
 #[derive(Clone)]
 pub struct TuiPanelSpec {
-    pub id: String,
     pub provider: Arc<dyn TuiPanelProvider>,
 }
 
@@ -611,9 +605,8 @@ impl TuiRegistry {
             bail!("TUI panel is already registered: {id}");
         }
         self.panels.insert(
-            id.clone(),
+            id,
             TuiPanelSpec {
-                id,
                 provider: Arc::new(provider),
             },
         );
@@ -733,6 +726,7 @@ impl ModelToolOutput {
         Self { output, images }
     }
 
+    #[cfg(test)]
     pub fn output(&self) -> &str {
         &self.output
     }
@@ -997,6 +991,7 @@ impl PluginEnvironment {
         Self { environment }
     }
 
+    #[cfg(test)]
     pub async fn get(&self, name: &str) -> Result<Option<String>> {
         self.environment.get(name).await
     }
@@ -1074,16 +1069,6 @@ impl PluginAgents {
             spec.parent_session_id = Some(parent.clone());
         }
         self.host.create(spec, callback).await
-    }
-
-    pub async fn open(
-        &self,
-        session_id: &str,
-        callback: Option<Arc<dyn CompactionCallback>>,
-    ) -> Result<AgentHandle> {
-        self.host
-            .open_plugin(session_id, self.parent_session_id.as_deref(), callback)
-            .await
     }
 }
 

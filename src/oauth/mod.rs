@@ -18,7 +18,6 @@ pub(crate) use providers::{
 pub(crate) use providers::{
     WORKBUDDY_ENDPOINT_EXTRA, WORKBUDDY_ENVIRONMENT_EXTRA, WORKBUDDY_USER_AGENT,
 };
-pub use util::parse_authorization_input;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OauthProvider {
@@ -163,10 +162,6 @@ impl OauthProvider {
     pub fn offers_api_key(self) -> bool {
         !matches!(self, Self::Antigravity | Self::OpenAiCodex)
     }
-}
-
-pub fn oauth_enabled(provider: &str) -> bool {
-    OauthProvider::from_id(provider).is_some()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -366,18 +361,18 @@ mod tests {
     #[test]
     fn pi_oauth_providers_are_registered() {
         assert_eq!(OauthProvider::ALL.len(), 9);
-        assert!(oauth_enabled("antigravity"));
-        assert!(oauth_enabled("workbuddy"));
-        assert!(oauth_enabled("openrouter"));
-        assert!(oauth_enabled("openai-codex"));
-        assert!(oauth_enabled("github-copilot"));
-        assert!(oauth_enabled("kimi-coding"));
-        assert!(oauth_enabled("muse-code"));
-        assert!(oauth_enabled("xai"));
-        assert!(oauth_enabled("radius"));
-        assert!(!oauth_enabled("openai"));
-        assert!(!oauth_enabled("anthropic"));
-        assert!(!oauth_enabled("codebuddy"));
+        assert!(OauthProvider::from_id("antigravity").is_some());
+        assert!(OauthProvider::from_id("workbuddy").is_some());
+        assert!(OauthProvider::from_id("openrouter").is_some());
+        assert!(OauthProvider::from_id("openai-codex").is_some());
+        assert!(OauthProvider::from_id("github-copilot").is_some());
+        assert!(OauthProvider::from_id("kimi-coding").is_some());
+        assert!(OauthProvider::from_id("muse-code").is_some());
+        assert!(OauthProvider::from_id("xai").is_some());
+        assert!(OauthProvider::from_id("radius").is_some());
+        assert!(OauthProvider::from_id("openai").is_none());
+        assert!(OauthProvider::from_id("anthropic").is_none());
+        assert!(OauthProvider::from_id("codebuddy").is_none());
         assert_eq!(OauthProvider::Antigravity.name(), "Google Antigravity");
         assert_eq!(OauthProvider::WorkBuddy.name(), "WorkBuddy");
         assert_eq!(OauthProvider::WorkBuddy.methods().len(), 1);

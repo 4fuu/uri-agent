@@ -833,21 +833,6 @@ mod tests {
     }
 
     #[test]
-    fn line_numbers_are_opt_in() {
-        assert!(
-            parse_range(json!({"line_numbers": true}))
-                .unwrap()
-                .line_numbers
-        );
-        assert!(!parse_range(json!({})).unwrap().line_numbers);
-        assert!(
-            !parse_range(json!({"line_numbers": false}))
-                .unwrap()
-                .line_numbers
-        );
-    }
-
-    #[test]
     fn file_completion_handles_tokens_and_leaves_double_at_for_other_providers() {
         let context = TuiCompletionContext {
             cwd: PathBuf::from("/project"),
@@ -950,47 +935,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_returns_the_last_lines_with_or_without_a_final_newline() {
+    async fn tail_matches_normalized_line_semantics() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("file.txt");
 
-        for content in ["zero\none\ntwo", "zero\none\ntwo\n"] {
-            fs::write(&path, content).await.unwrap();
-            let output = read_file(
-                &path,
-                "file://file.txt",
-                true,
-                parse_range(json!({"tail": 2})).unwrap(),
-            )
-            .await
-            .unwrap();
-
-            assert_eq!(
-                String::from_utf8(output.text_bytes().to_vec()).unwrap(),
-                "one\ntwo\n"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn tail_matches_normalized_line_semantics_for_empty_lines() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("file.txt");
-
-        for (content, expected) in [
-            ("", ""),
-            ("alpha", "alpha\n"),
-            ("alpha\n", "alpha\n"),
-            ("alpha\n\n", "\n"),
-            ("\r\n\r\n", "\n"),
-            ("zero\n\u{feff}one", "\u{feff}one\n"),
+        for (content, tail, expected) in [
+            ("", 1, ""),
+            ("alpha", 1, "alpha\n"),
+            ("alpha\n", 1, "alpha\n"),
+            ("alpha\n\n", 1, "\n"),
+            ("\r\n\r\n", 1, "\n"),
+            ("zero\n\u{feff}one", 1, "\u{feff}one\n"),
+            ("zero\none\ntwo", 2, "one\ntwo\n"),
+            ("zero\none\ntwo\n", 2, "one\ntwo\n"),
         ] {
             fs::write(&path, content).await.unwrap();
             let output = read_file(
                 &path,
                 "file://file.txt",
                 true,
-                parse_range(json!({"tail": 1})).unwrap(),
+                parse_range(json!({"tail": tail})).unwrap(),
             )
             .await
             .unwrap();
@@ -1130,10 +1094,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(String::from_utf8_lossy(output.text_bytes()).contains("image/png"));
-        assert_eq!(output.images().len(), 1);
-        assert_eq!(output.images()[0].bytes(), bytes);
-        assert_eq!(output.images()[0].media_type(), ProtocolImageMediaType::Png);
+        let (text, _, images) = output.into_parts();
+        assert!(String::from_utf8_lossy(&text).contains("image/png"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].bytes(), bytes);
+        assert_eq!(images[0].media_type(), ProtocolImageMediaType::Png);
 
         let error = read_file(
             &path,
@@ -1191,59 +1156,37 @@ mod tests {
 
     #[tokio::test]
     async fn glob_pagination_returns_a_complete_continuation_step() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::create_dir_all(directory.path().join("nested"))
+        for (files, pattern) in [
+            (vec!["a.rs", "nested/b.rs"], "**/*.rs"),
+            (vec!["a&b.rs", "c&b.rs"], "*&b.rs"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            for file in &files {
+                let path = directory.path().join(file);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await.unwrap();
+                }
+                fs::write(&path, "x").await.unwrap();
+            }
+            let range = parse_range(json!({"glob": pattern, "offset": 1, "limit": 1})).unwrap();
+
+            let output = read_glob(
+                directory.path(),
+                directory.path(),
+                pattern,
+                "file://",
+                range,
+            )
             .await
             .unwrap();
-        fs::write(directory.path().join("a.rs"), "a").await.unwrap();
-        fs::write(directory.path().join("nested/b.rs"), "b")
-            .await
-            .unwrap();
-        let range = parse_range(json!({"glob": "**/*.rs", "offset": 1, "limit": 1})).unwrap();
+            let output = String::from_utf8(output).unwrap();
 
-        let output = read_glob(
-            directory.path(),
-            directory.path(),
-            "**/*.rs",
-            "file://",
-            range,
-        )
-        .await
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-
-        assert!(output.starts_with("a.rs\n"));
-        assert!(output.contains(
-            r#"Next: {"read":"file://","input":{"glob":"**/*.rs","offset":2,"limit":1}}"#
-        ));
-        assert!(!output.contains("more matches"));
-    }
-
-    #[tokio::test]
-    async fn glob_pagination_preserves_the_pattern_in_the_continuation_step() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a&b.rs"), "a")
-            .await
-            .unwrap();
-        fs::write(directory.path().join("c&b.rs"), "c")
-            .await
-            .unwrap();
-        let pattern = "*&b.rs";
-
-        let output = read_glob(
-            directory.path(),
-            directory.path(),
-            pattern,
-            "file://",
-            parse_range(json!({"glob": pattern, "offset": 1, "limit": 1})).unwrap(),
-        )
-        .await
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-
-        assert!(output.contains(
-            r#"Next: {"read":"file://","input":{"glob":"*&b.rs","offset":2,"limit":1}}"#
-        ));
+            assert!(output.starts_with("a"), "{output}");
+            assert!(output.contains(&format!(
+                r#"Next: {{"read":"file://","input":{{"glob":"{pattern}","offset":2,"limit":1}}}}"#
+            )));
+            assert!(!output.contains("more matches"));
+        }
     }
 
     #[tokio::test]

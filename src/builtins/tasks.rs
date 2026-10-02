@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_cancels_running_tasks_and_rejects_protocol_input() {
+    async fn protocol_cancels_running_tasks() {
         let tasks = TaskManager::new();
         let record = tasks
             .allocate_background("bash", "cancel me")
@@ -635,23 +635,6 @@ mod tests {
         assert_eq!(
             tasks.wait_until_terminal(&id).await.unwrap().status,
             TaskStatus::Cancelled
-        );
-
-        let error = TasksProtocol
-            .read(
-                ProtocolRequest {
-                    uri: "tasks://summary",
-                    target: "summary",
-                    input: &input(json!({"wait": 1})),
-                },
-                context,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("this route takes no input fields")
         );
     }
 

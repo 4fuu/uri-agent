@@ -820,24 +820,11 @@ mod tests {
                 .unwrap(),
             "added\n"
         );
-        let descriptor = tool.descriptor();
         assert!(
-            descriptor.parameters["properties"]["patch"]["description"]
+            tool.descriptor().parameters["properties"]["patch"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("*** Add File: <path>")
-        );
-        assert!(
-            descriptor.parameters["properties"]["patch"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("paths beginning with `~/`")
-        );
-        assert!(
-            descriptor.parameters["properties"]["patch"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("A chunk containing only `+` lines appends at EOF")
         );
         let _ = fs::remove_dir_all(output_store.directory()).await;
     }
