@@ -253,6 +253,7 @@ pub(crate) fn looks_like_context_overflow(message: &str) -> bool {
             "exceeded model token limit",
             "model_context_window_exceeded",
             "prompt too long",
+            "prompt exceeds max length",
             "configured context size",
             "range of input length should be",
             "context_length_exceeded",
@@ -361,12 +362,7 @@ pub(super) fn parse_retry_after_at(
     let requested = DateTime::parse_from_rfc2822(value)
         .ok()?
         .with_timezone(&Utc);
-    Some(
-        requested
-            .signed_duration_since(now)
-            .to_std()
-            .unwrap_or_default(),
-    )
+    requested.signed_duration_since(now).to_std().ok()
 }
 
 fn parse_nonnegative_number(value: &str) -> Option<f64> {

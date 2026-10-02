@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-const CODEX_CLIENT_VERSION: &str = "0.155.1";
+const CODEX_CLIENT_VERSION: &str = "0.159.0";
 
 /// Original tool parameter schemas for the current request, shared between
 /// the backend that owns the request and the request transform that rewrites
@@ -292,6 +292,34 @@ impl ModelRequestTransform {
             Some(Value::Null) => None,
             Some(value) => Some(value.clone()),
             None => Some(Value::String("none".to_string())),
+        }
+    }
+
+    fn insert_thinking_off(&self, body: &mut Map<String, Value>) {
+        if self.off_mapping().is_some() {
+            body.insert("thinking".to_string(), json!({"type": "disabled"}));
+        }
+    }
+
+    /// The `max_tokens` to request for a caller cap: the cap is the requested
+    /// answer size, so the thinking budget gets room on top of it, bounded by
+    /// the model's output ceiling. Mirrors the Antigravity `maxOutputTokens`
+    /// headroom.
+    fn with_thinking_headroom(&self, cap: u64) -> u64 {
+        cap.saturating_add(self.thinking.budget())
+            .min(self.model.max_tokens())
+    }
+
+    /// Raises a request's `max_tokens` cap by the thinking budget so
+    /// effort-driven thinking cannot consume the caller's whole cap. No-op
+    /// without an explicit cap or when the model ceiling cannot fit more.
+    fn raise_max_tokens_for_thinking(&self, body: &mut Map<String, Value>) {
+        let Some(cap) = body.get("max_tokens").and_then(Value::as_u64) else {
+            return;
+        };
+        let raised = self.with_thinking_headroom(cap);
+        if raised > cap {
+            body.insert("max_tokens".to_string(), Value::from(raised));
         }
     }
 
@@ -795,6 +823,7 @@ impl ModelRequestTransform {
         }
         if self.compat_bool("supportsMidConvoEffort", false) {
             body.remove("temperature");
+            self.raise_max_tokens_for_thinking(body);
             let effort = self.anthropic_effort();
             if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
                 let original = std::mem::take(messages);
@@ -830,13 +859,12 @@ impl ModelRequestTransform {
             return;
         }
         if !self.thinking.enabled() {
-            if self.off_mapping().is_some() {
-                body.insert("thinking".to_string(), json!({"type": "disabled"}));
-            }
+            self.insert_thinking_off(body);
             return;
         }
-        body.remove("temperature");
         if self.compat_bool("forceAdaptiveThinking", false) {
+            self.raise_max_tokens_for_thinking(body);
+            body.remove("temperature");
             body.insert(
                 "thinking".to_string(),
                 json!({"type": "adaptive", "display": "summarized"}),
@@ -854,11 +882,24 @@ impl ModelRequestTransform {
             });
             body.insert("output_config".to_string(), json!({"effort": effort}));
         } else {
-            let ceiling = body
-                .get("max_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(|| self.model.max_tokens());
+            let requested = body.get("max_tokens").and_then(Value::as_u64);
+            let ceiling = match requested {
+                Some(cap) => self.with_thinking_headroom(cap),
+                None => self.model.max_tokens(),
+            };
             let budget = self.thinking.budget().min(ceiling.saturating_sub(1_024));
+            if budget < 1_024 {
+                // Anthropic rejects budget_tokens below 1024; fall back to
+                // disabled thinking when the ceiling cannot fit one.
+                self.insert_thinking_off(body);
+                return;
+            }
+            if let Some(cap) = requested
+                && ceiling > cap
+            {
+                body.insert("max_tokens".to_string(), Value::from(ceiling));
+            }
+            body.remove("temperature");
             body.insert(
                 "thinking".to_string(),
                 json!({"type": "enabled", "budget_tokens": budget, "display": "summarized"}),

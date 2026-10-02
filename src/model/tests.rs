@@ -583,7 +583,7 @@ fn codex_request_transform_matches_current_routing_contract() {
     let body: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(headers["openai-beta"], "responses=experimental");
-    assert_eq!(headers["version"], "0.155.1");
+    assert_eq!(headers["version"], "0.159.0");
     assert_eq!(
         headers["x-codex-routing-hint"],
         "model=gpt-5.4;tier=priority"
@@ -729,7 +729,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
     assert_eq!(headers["chatgpt-account-id"], "account-123");
     assert_eq!(headers["originator"], "pi");
     assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
-    assert_eq!(headers["version"], "0.155.1");
+    assert_eq!(headers["version"], "0.159.0");
     assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5.4");
     assert_eq!(headers["session-id"], "codex-reuse-session");
     assert_eq!(headers["x-client-request-id"], "codex-reuse-session");
@@ -1102,7 +1102,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
     assert!(request_headers.contains("chatgpt-account-id: account-123"));
     assert!(request_headers.contains("originator: pi"));
     assert!(request_headers.contains("openai-beta: responses=experimental"));
-    assert!(request_headers.contains("version: 0.155.1"));
+    assert!(request_headers.contains("version: 0.159.0"));
     assert!(request_headers.contains("x-codex-routing-hint: model=gpt-5.4"));
     assert!(request_headers.contains("session-id: codex-sse-stream-session"));
     assert!(request_headers.contains("x-client-request-id: codex-sse-stream-session"));
@@ -1484,6 +1484,32 @@ fn retry_after_accepts_seconds_and_http_dates() {
         parse_retry_after_at(Some(&headers), now),
         Some(Duration::from_secs(30))
     );
+}
+
+#[test]
+fn retry_after_in_the_past_falls_back_to_exponential_delay() {
+    let now = DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:28:00 GMT")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::RETRY_AFTER,
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:27:00 GMT"),
+    );
+    assert_eq!(parse_retry_after_at(Some(&headers), now), None);
+    assert_eq!(parse_retry_after_at(None, now), None);
+}
+
+#[test]
+fn zai_cn_prompt_length_overflow_is_classified_as_context_overflow() {
+    let failure = ModelFailure::from_completion_error(
+        CompletionError::from_provider_body(
+            r#"{"code":"1261","message":"Prompt exceeds max length"}"#,
+        ),
+        ModelFailurePhase::Request,
+        "zai-coding-cn",
+    );
+    assert_eq!(failure.kind(), ModelFailureKind::ContextOverflow);
 }
 
 #[test]
@@ -1962,6 +1988,65 @@ fn anthropic_force_adaptive_thinking_matches_pi_request_shape() {
     assert_eq!(body["thinking"]["display"], "summarized");
     assert_eq!(body["output_config"]["effort"], "max");
     assert!(body.get("temperature").is_none());
+}
+
+#[test]
+fn anthropic_thinking_budget_gets_headroom_over_the_caller_cap() {
+    let model = catalog_model(
+        "anthropic-messages",
+        json!({"reasoning": true, "maxTokens": 64000}),
+    );
+    // A subagent-style cap must stay the requested answer size: the low
+    // budget (2048) rides on top of it instead of squeezing the answer
+    // space, and the enabled budget respects Anthropic's 1024-token floor.
+    let body = transformed(
+        model,
+        ThinkingLevel::Low,
+        json!({"max_tokens": 512, "temperature": 0.4}),
+    );
+    assert_eq!(body["max_tokens"], 512 + 2048);
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 512 + 2048 - 1024);
+    assert!(body.get("temperature").is_none());
+}
+
+#[test]
+fn anthropic_thinking_budget_below_the_minimum_disables_thinking() {
+    // A model ceiling that cannot fit a 1024 budget must disable thinking
+    // instead of sending a rejected budget_tokens value.
+    let uncapped = catalog_model(
+        "anthropic-messages",
+        json!({"reasoning": true, "maxTokens": 1500}),
+    );
+    let body = transformed(uncapped, ThinkingLevel::Low, json!({"temperature": 0.4}));
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert_eq!(body["temperature"], 0.4);
+    assert!(body.get("max_tokens").is_none());
+
+    // A capped request keeps its cap untouched when the headroomed ceiling
+    // still cannot fit the minimum budget.
+    let capped = catalog_model(
+        "anthropic-messages",
+        json!({"reasoning": true, "maxTokens": 1800}),
+    );
+    let body = transformed(capped, ThinkingLevel::Low, json!({"max_tokens": 512}));
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert_eq!(body["max_tokens"], 512);
+}
+
+#[test]
+fn anthropic_adaptive_thinking_gets_headroom_over_the_caller_cap() {
+    let model = catalog_model(
+        "anthropic-messages",
+        json!({
+            "reasoning": true,
+            "maxTokens": 64000,
+            "compat": {"forceAdaptiveThinking": true}
+        }),
+    );
+    let body = transformed(model, ThinkingLevel::Low, json!({"max_tokens": 512}));
+    assert_eq!(body["max_tokens"], 512 + 2048);
+    assert_eq!(body["thinking"]["type"], "adaptive");
 }
 
 #[test]
