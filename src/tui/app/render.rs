@@ -6334,6 +6334,7 @@ pub(super) fn compact_list_item(
 /// Renders a stateful selection list and registers one hit region per
 /// visible row. Takes only the hit-region vector because the item iterators
 /// borrow the rest of `app`.
+#[allow(clippy::too_many_arguments)]
 fn render_selection_list(
     frame: &mut Frame<'_>,
     hit_regions: &mut Vec<HitRegion<AppHit>>,

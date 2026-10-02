@@ -298,12 +298,14 @@ fn notes_from_events(events: &[SessionEvent]) -> BTreeMap<String, NoteRecord> {
             } => apply_note_event(
                 &mut notes,
                 id,
-                *revision,
-                title,
-                Some(content),
-                *window_id,
-                *context_sequence,
-                false,
+                NoteRevision {
+                    revision: *revision,
+                    title: title.clone(),
+                    content: Some(content.clone()),
+                    window_id: *window_id,
+                    context_sequence: *context_sequence,
+                    deleted: false,
+                },
             ),
             EventKind::ContextNoteDeleted {
                 id,
@@ -314,12 +316,14 @@ fn notes_from_events(events: &[SessionEvent]) -> BTreeMap<String, NoteRecord> {
             } => apply_note_event(
                 &mut notes,
                 id,
-                *revision,
-                title,
-                None,
-                *window_id,
-                *context_sequence,
-                true,
+                NoteRevision {
+                    revision: *revision,
+                    title: title.clone(),
+                    content: None,
+                    window_id: *window_id,
+                    context_sequence: *context_sequence,
+                    deleted: true,
+                },
             ),
             _ => {}
         }
@@ -329,40 +333,24 @@ fn notes_from_events(events: &[SessionEvent]) -> BTreeMap<String, NoteRecord> {
 
 /// Replays one note event onto the accumulated note state: the newest event
 /// for an ID wins, and every event appends a revision snapshot.
-fn apply_note_event(
-    notes: &mut BTreeMap<String, NoteRecord>,
-    id: &str,
-    revision: u64,
-    title: &str,
-    content: Option<&str>,
-    window_id: u64,
-    context_sequence: u64,
-    deleted: bool,
-) {
+fn apply_note_event(notes: &mut BTreeMap<String, NoteRecord>, id: &str, event: NoteRevision) {
     let note = notes.entry(id.to_string()).or_insert_with(|| NoteRecord {
         id: id.to_string(),
-        title: title.to_string(),
-        revision,
-        content: content.map(str::to_string),
-        window_id,
-        context_sequence,
-        deleted,
+        title: String::new(),
+        revision: 0,
+        content: None,
+        window_id: 0,
+        context_sequence: 0,
+        deleted: false,
         revisions: Vec::new(),
     });
-    note.title = title.to_string();
-    note.revision = revision;
-    note.content = content.map(str::to_string);
-    note.window_id = window_id;
-    note.context_sequence = context_sequence;
-    note.deleted = deleted;
-    note.revisions.push(NoteRevision {
-        revision,
-        title: title.to_string(),
-        content: content.map(str::to_string),
-        window_id,
-        context_sequence,
-        deleted,
-    });
+    note.title.clone_from(&event.title);
+    note.revision = event.revision;
+    note.content.clone_from(&event.content);
+    note.window_id = event.window_id;
+    note.context_sequence = event.context_sequence;
+    note.deleted = event.deleted;
+    note.revisions.push(event);
 }
 
 /// Estimated tokens used by one note's current title and content.

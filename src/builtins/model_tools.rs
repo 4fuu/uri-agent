@@ -961,7 +961,7 @@ async fn validate_step(
                          `issue in issues.json.items`",
                 ));
             };
-            check_reference_root(root, number, "for", &ids, None)?;
+            check_reference_root(root, number, "for", ids, None)?;
             Some(LoopSpec {
                 variable: variable.to_string(),
                 source,
@@ -987,7 +987,7 @@ async fn validate_step(
                 .map_err(|error| step_field_error(number, "if", format!("{error:#}")))?;
             for root in expression.roots() {
                 let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
-                check_reference_root(root, number, "if", &ids, loop_variable)?;
+                check_reference_root(root, number, "if", ids, loop_variable)?;
             }
             Some(expression)
         }
@@ -1003,7 +1003,7 @@ async fn validate_step(
             }
         }
         for root in &data_refs {
-            check_reference_root(root, number, "input", &ids, loop_variable)?;
+            check_reference_root(root, number, "input", ids, loop_variable)?;
         }
     }
     for (_, _, inner) in address_placeholders(address)
@@ -1012,7 +1012,7 @@ async fn validate_step(
         let operand = parse_operand_str(&inner)
             .map_err(|error| step_field_error(number, field, format!("{error:#}")))?;
         if let Some(root) = operand.root() {
-            check_reference_root(root, number, field, &ids, loop_variable)?;
+            check_reference_root(root, number, field, ids, loop_variable)?;
             data_refs.push(root.to_string());
         }
     }
