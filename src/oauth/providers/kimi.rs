@@ -98,10 +98,8 @@ fn kimi_refresh_retryable(status: reqwest::StatusCode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::shared::test_http::read_request;
     use super::*;
-    use tokio::io::AsyncWriteExt as _;
-    use tokio::net::TcpListener;
+    use crate::test_http::{self, MockResponse};
 
     #[test]
     fn refresh_retries_only_transient_statuses() {
@@ -117,34 +115,19 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_retries_transient_failure_and_accepts_rotation() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in [
-                (500, r#"{"error":"temporary"}"#),
-                (
-                    200,
-                    r#"{"access_token":"fresh-access","refresh_token":"rotated-refresh","expires_in":3600}"#,
-                ),
-            ] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut socket).await);
-                let response = format!(
-                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-            requests
-        });
+        let server = test_http::serve(vec![
+            MockResponse::json(500, r#"{"error":"temporary"}"#),
+            MockResponse::json(
+                200,
+                r#"{"access_token":"fresh-access","refresh_token":"rotated-refresh","expires_in":3600}"#,
+            ),
+        ])
+        .await;
 
-        let token = refresh_kimi_at(&format!("http://{address}"), "old-refresh")
-            .await
-            .unwrap();
+        let token = refresh_kimi_at(&server.base, "old-refresh").await.unwrap();
         assert_eq!(token.access, "fresh-access");
         assert_eq!(token.refresh, "rotated-refresh");
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
         assert_eq!(requests.len(), 2);
         assert!(
             requests

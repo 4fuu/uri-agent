@@ -23,6 +23,8 @@ pub mod session;
 pub mod skill;
 pub mod task;
 pub mod terminal;
+#[cfg(test)]
+mod test_http;
 mod text_metrics;
 mod tool_download;
 pub mod tui;

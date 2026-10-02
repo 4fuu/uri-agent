@@ -1106,9 +1106,9 @@ fn instance_error(error: impl std::fmt::Display) -> rig::http_client::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{self, MockResponse};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct TestCredentials {
         current: OauthToken,
@@ -1133,100 +1133,34 @@ mod tests {
         body: Value,
     }
 
-    fn decode_chunked_body(bytes: &[u8]) -> Option<Vec<u8>> {
-        let mut decoded = Vec::new();
-        let mut offset = 0;
-        loop {
-            let line_end = bytes[offset..]
-                .windows(2)
-                .position(|part| part == b"\r\n")?
-                + offset;
-            let size = std::str::from_utf8(&bytes[offset..line_end])
-                .ok()?
-                .split(';')
-                .next()
-                .and_then(|size| usize::from_str_radix(size.trim(), 16).ok())?;
-            offset = line_end + 2;
-            if size == 0 {
-                return (bytes.get(offset..offset + 2) == Some(b"\r\n")).then_some(decoded);
-            }
-            let data_end = offset.checked_add(size)?;
-            if bytes.get(data_end..data_end + 2) != Some(b"\r\n") {
-                return None;
-            }
-            decoded.extend_from_slice(bytes.get(offset..data_end)?);
-            offset = data_end + 2;
+    fn capture(request: &str) -> CapturedRequest {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        CapturedRequest {
+            head: head.to_string(),
+            body: serde_json::from_str(body).unwrap(),
         }
     }
 
     async fn mock_server(
         responses: Vec<(u16, &'static str, &'static str)>,
     ) -> (String, tokio::task::JoinHandle<Vec<CapturedRequest>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let mut captured = Vec::new();
-            for (status, content_type, response_body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let (header_end, body) = loop {
-                    let mut chunk = [0; 4096];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0);
-                    bytes.extend_from_slice(&chunk[..count]);
-                    if let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
-                    {
-                        let header_end = header_end + 4;
-                        let head = String::from_utf8_lossy(&bytes[..header_end]);
-                        let content_length = head.lines().find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().unwrap())
-                        });
-                        if let Some(content_length) = content_length
-                            && bytes.len() >= header_end + content_length
-                        {
-                            break (
-                                header_end,
-                                bytes[header_end..header_end + content_length].to_vec(),
-                            );
-                        }
-                        if head.lines().any(|line| {
-                            line.split_once(':').is_some_and(|(name, value)| {
-                                name.eq_ignore_ascii_case("transfer-encoding")
-                                    && value.trim().eq_ignore_ascii_case("chunked")
-                            })
-                        }) && let Some(body) = decode_chunked_body(&bytes[header_end..])
-                        {
-                            break (header_end, body);
-                        }
-                    }
-                };
-                captured.push(CapturedRequest {
-                    head: String::from_utf8_lossy(&bytes[..header_end]).into_owned(),
-                    body: serde_json::from_slice(&body).unwrap(),
-                });
-                let reason = match status {
-                    200 => "OK",
-                    400 => "Bad Request",
-                    401 => "Unauthorized",
-                    503 => "Service Unavailable",
-                    _ => "Response",
-                };
-                socket
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                            response_body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-            }
-            captured
+        let server = test_http::serve(
+            responses
+                .into_iter()
+                .map(|(status, content_type, body)| MockResponse::text(status, content_type, body))
+                .collect(),
+        )
+        .await;
+        let endpoint = server.base.clone();
+        let captured = tokio::spawn(async move {
+            server
+                .requests()
+                .await
+                .iter()
+                .map(|request| capture(request))
+                .collect::<Vec<_>>()
         });
-        (format!("http://{address}"), handle)
+        (endpoint, captured)
     }
 
     fn token(access: &str) -> OauthToken {

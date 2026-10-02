@@ -336,6 +336,7 @@ fn trusted_meta_verification_url(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_http::{self, MockResponse};
 
     #[test]
     fn key_response_stores_minted_key_identity_and_valid_usage() {
@@ -375,52 +376,25 @@ mod tests {
         assert!(trusted_meta_verification_url("https://meta.com.evil.test/device").is_err());
     }
 
-    async fn fixture(
-        responses: Vec<(u16, Value)>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0; 4096];
-                    let n = socket.read(&mut chunk).await.unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&chunk[..n]);
-                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-                        let length = headers
-                            .lines()
-                            .find_map(|line| line.strip_prefix("content-length: "))
-                            .unwrap_or("0")
-                            .parse::<usize>()
-                            .unwrap();
-                        if request.len() >= end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                requests.push(String::from_utf8(request).unwrap());
-                let body = body.to_string();
-                socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        (format!("http://{address}"), task)
+    async fn fixture(responses: Vec<(u16, Value)>) -> test_http::MockServer {
+        test_http::serve(
+            responses
+                .into_iter()
+                .map(|(status, body)| MockResponse::json(status, body.to_string()))
+                .collect(),
+        )
+        .await
     }
 
     #[tokio::test]
     async fn device_exchange_mints_once_and_uses_separate_credentials() {
-        let (url, server) = fixture(vec![
+        let server = fixture(vec![
             (200, json!({"device_code":"device","user_code":"ABCD","verification_uri":"https://auth.meta.com/device","interval":1,"expires_in":60})),
             (400, json!({"error":"authorization_pending"})),
             (200, json!({"access_token":"account-secret"})),
             (200, json!({"api_key":"model-secret","user_id":"account"})),
         ]).await;
+        let url = server.base.clone();
         let setup = channels(String::new(), None, "test");
         let token = login_flow(
             &format!("{url}/device"),
@@ -434,7 +408,7 @@ mod tests {
         .unwrap();
         assert_eq!(token.access, "model-secret");
         assert!(!token.expired());
-        let requests = server.await.unwrap();
+        let requests = server.requests().await;
         assert_eq!(requests.len(), 4);
         assert!(requests[0].contains("client_id=1031625952748946"));
         assert!(!requests[0].contains("scope="));
@@ -446,12 +420,12 @@ mod tests {
 
     #[tokio::test]
     async fn key_exchange_429_is_not_retried_or_leaked() {
-        let (url, server) = fixture(vec![(429, json!({"api_key":"response-secret"}))]).await;
-        let error = mint_key(&Client::new(), &url, "account-secret")
+        let server = fixture(vec![(429, json!({"api_key":"response-secret"}))]).await;
+        let error = mint_key(&Client::new(), &server.base, "account-secret")
             .await
             .unwrap_err();
         assert!(error.to_string().contains("429"));
         assert!(!format!("{error:#}").contains("secret"));
-        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(server.requests().await.len(), 1);
     }
 }
