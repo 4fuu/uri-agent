@@ -603,6 +603,7 @@ pub(super) async fn run_loop(
     let mut animation_clock = AnimationClock::new(now);
     let mut scheduler = RenderScheduler::new(now);
     let mut redraw = true;
+    let mut task_tail_refreshed = Instant::now();
     let mut task_updates_open = true;
     loop {
         let now = Instant::now();
@@ -646,6 +647,15 @@ pub(super) async fn run_loop(
                 // Reaching a scheduled deadline always gets a final draw,
                 // even when that deadline ends the underlying demand.
                 redraw = true;
+                // Streamed task output sends no task notice, so the open task
+                // manager rereads records on the task tick to keep its tail live.
+                if app.overlay == Some(Overlay::Tasks)
+                    && app.active_task_count > 0
+                    && task_tail_refreshed.elapsed() >= TASK_TICK
+                {
+                    refresh_task_state(app, &services.tasks).await;
+                    task_tail_refreshed = Instant::now();
+                }
             },
             _ = pty_wake => {
                 scheduler.request_coalesced();
@@ -752,7 +762,16 @@ pub(super) async fn run_loop(
             },
             task = task_receiver.recv(), if task_updates_open => {
                 match task {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    Ok(notice) => {
+                        if let Some(message) =
+                            task_settle_message(&notice, &services.tasks).await
+                        {
+                            app.set_flash(message);
+                        }
+                        refresh_task_state(app, &services.tasks).await;
+                        scheduler.request_coalesced();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         refresh_task_state(app, &services.tasks).await;
                         scheduler.request_coalesced();
                     }
@@ -784,14 +803,24 @@ pub(super) async fn refresh_task_state(app: &mut App, tasks: &TaskManager) {
         .task_records
         .get(app.selected_task)
         .map(|task| task.id.clone());
-    let records = tasks.list().await;
+    let mut records = tasks.list().await;
     app.active_task_count = records
         .iter()
         .filter(|task| task.background && !task.status.terminal())
         .count();
+    app.footer_task = records
+        .iter()
+        .filter(|task| task.background && !task.status.terminal())
+        .max_by_key(|task| task.started_at)
+        .map(|task| FooterTask {
+            id: task.id.clone(),
+            label: task.label.clone(),
+            started_at: task.started_at,
+        });
     if app.overlay != Some(Overlay::Tasks) {
         return;
     }
+    order_task_records(&mut records);
     app.task_records = records;
     app.selected_task = selected_id
         .and_then(|id| app.task_records.iter().position(|task| task.id == id))
@@ -799,6 +828,44 @@ pub(super) async fn refresh_task_state(app: &mut App, tasks: &TaskManager) {
             app.selected_task
                 .min(app.task_records.len().saturating_sub(1))
         });
+}
+
+/// Selects the footer badge's task in the freshly loaded task records.
+pub(super) fn focus_footer_task(app: &mut App) {
+    let Some(id) = app.footer_task.as_ref().map(|task| task.id.clone()) else {
+        return;
+    };
+    if let Some(index) = app.task_records.iter().position(|task| task.id == id) {
+        app.selected_task = index;
+    }
+}
+
+/// Transient settle notice for a background task that reached a terminal
+/// state while the interface is open: `✓ task <label> completed in 1m 12s`.
+pub(super) async fn task_settle_message(
+    notice: &crate::task::TaskNotice,
+    tasks: &TaskManager,
+) -> Option<String> {
+    if !notice.background || !notice.status.terminal() {
+        return None;
+    }
+    let record = tasks.get(&notice.id).await?;
+    let elapsed = format_elapsed(
+        record
+            .finished_at
+            .unwrap_or_else(chrono::Utc::now)
+            .signed_duration_since(record.started_at)
+            .to_std()
+            .unwrap_or_default(),
+    );
+    let label = single_line_preview(&record.label, 48);
+    let notice = match record.status {
+        TaskStatus::Completed => format!("✓ task {label} completed in {elapsed}"),
+        TaskStatus::Failed => format!("× task {label} failed in {elapsed}"),
+        TaskStatus::Cancelled => format!("⊘ task {label} cancelled in {elapsed}"),
+        TaskStatus::Pending | TaskStatus::Running => return None,
+    };
+    Some(notice)
 }
 
 pub(super) async fn persist_and_exit(
@@ -1878,6 +1945,43 @@ pub(super) async fn handle_overlay_key(
                 }
                 Action::Continue
             }
+            // Interrupt routes through the task manager's interrupt signal,
+            // the same path the `tasks` protocol's `/interrupt` target uses.
+            Some("interrupt") => {
+                if let Some(record) = app.task_records.get(app.selected_task) {
+                    let id = record.id.clone();
+                    if !record.interruptible() {
+                        app.set_flash(format!(
+                            "Task {id} is not an interactive shell command; cancel terminates it"
+                        ));
+                    } else if services.tasks.interrupt(&id).await {
+                        app.set_flash(format!("Interrupt requested for task {id}"));
+                    } else {
+                        app.set_flash(format!("Task {id} is no longer running"));
+                    }
+                }
+                Action::Continue
+            }
+            Some("open") => {
+                if let Some(record) = app.task_records.get(app.selected_task) {
+                    let (title, body) = task_document(record);
+                    app.document = Some((title, body));
+                    app.overlay_scroll = 0;
+                    app.overlay = Some(Overlay::Document);
+                }
+                Action::Continue
+            }
+            Some("copy") => {
+                match app.task_records.get(app.selected_task) {
+                    Some(record) if !record.content.is_empty() => {
+                        let output = String::from_utf8_lossy(&record.content).into_owned();
+                        copy_text_with_osc52(app, &output);
+                    }
+                    Some(_) => app.set_flash("The task has no output yet"),
+                    None => {}
+                }
+                Action::Continue
+            }
             Some("page_up") => {
                 app.selected_task = bounded_index(
                     app.selected_task,
@@ -2951,12 +3055,11 @@ pub(super) async fn handle_mouse(
                     }
                 }
                 AppHit::TaskStatus => {
-                    return dispatch_ui_command(
-                        app,
-                        CommandTarget::Core(CoreCommand::Tasks),
-                        services,
-                    )
-                    .await;
+                    let action =
+                        dispatch_ui_command(app, CommandTarget::Core(CoreCommand::Tasks), services)
+                            .await;
+                    focus_footer_task(app);
+                    return action;
                 }
                 AppHit::Status => open_status(app),
             }
@@ -4937,6 +5040,8 @@ pub(super) async fn finish_background(
                 app.busy_since = None;
                 app.activity = None;
                 app.clear_transient_blocks();
+                // The failed start leaves no turn, so drop its empty card.
+                app.settle_live_process();
                 app.restore_to_draft(&prompt);
                 app.set_flash(format!("Cannot start turn: {error:#}"));
             }

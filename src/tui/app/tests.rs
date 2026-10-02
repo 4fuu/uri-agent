@@ -582,7 +582,7 @@ fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
     assert_eq!(app.filtered_indices(), vec![0, 1, 5]);
 
     let collapsed = render_to_string(&mut app, 100, 24);
-    assert!(collapsed.contains("Process · 3 steps  ▸ Enter to expand"));
+    assert!(collapsed.contains("Read 1 file  ▸ Enter to expand"));
     assert!(collapsed.contains("The final response stays visible."));
     assert!(!collapsed.contains("Thought"));
     assert!(!collapsed.contains("Read src/tui.rs"));
@@ -590,7 +590,7 @@ fn completed_turn_folds_its_process_and_keeps_the_final_response_visible() {
     app.selected_block = 1;
     app.toggle_selected();
     let expanded = render_to_string(&mut app, 100, 24);
-    assert!(expanded.contains("Process · 3 steps  ▾"));
+    assert!(expanded.contains("Read 1 file  ▾"));
     assert!(expanded.contains("◇ Thought  ▸ Enter to expand"));
     assert!(expanded.contains("✓ Read src/tui.rs  ▸"));
     assert!(expanded.contains("The final response stays visible."));
@@ -660,6 +660,401 @@ fn completed_turns_have_independent_process_folds() {
             .filter(|block| block.kind == BlockKind::Process)
             .all(|block| !block.expanded)
     );
+}
+
+/// Drives one live turn: reasoning, six completed reads, and a running
+/// `replace`. Returns the app with the turn still running.
+fn live_card_app() -> App {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "inspect the renderer".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::AssistantReasoning {
+            text: "plan the reads".into(),
+        },
+    );
+    for index in 0..6 {
+        apply_event(
+            &mut app,
+            2 + index as u64 * 2,
+            EventKind::ToolCall {
+                call_id: format!("read-{index}"),
+                name: "protocol".into(),
+                arguments: serde_json::json!({
+                    "steps": [{"read": format!("file://file-{index}.rs")}]
+                }),
+            },
+        );
+        apply_event(
+            &mut app,
+            3 + index as u64 * 2,
+            EventKind::ToolResult {
+                call_id: format!("read-{index}"),
+                name: "protocol".into(),
+                output: format!("content {index}"),
+                failed: false,
+                protocol_help_required: false,
+            },
+        );
+    }
+    apply_event(
+        &mut app,
+        14,
+        EventKind::ToolCall {
+            call_id: "edit".into(),
+            name: "replace".into(),
+            arguments: serde_json::json!({
+                "path": "src/main.rs",
+                "old_text": "fn old() {}",
+                "new_text": "fn new() {}",
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        15,
+        EventKind::AssistantText {
+            text: "Still streaming.".into(),
+        },
+    );
+    app
+}
+
+/// Applies one durable tool-calling model response: optional text, one
+/// read call, the response boundary, and the call's result.
+fn apply_tool_response(app: &mut App, sequence: &mut u64, text: Option<&str>, path: &str) {
+    let mut next = |app: &mut App, kind: EventKind| {
+        apply_event(app, *sequence, kind);
+        *sequence += 1;
+    };
+    if let Some(text) = text {
+        next(app, EventKind::AssistantText { text: text.into() });
+    }
+    let call_id = format!("call-{path}");
+    next(
+        app,
+        EventKind::ToolCall {
+            call_id: call_id.clone(),
+            name: "protocol".into(),
+            arguments: serde_json::json!({"steps": [{"read": format!("file://{path}")}]}),
+        },
+    );
+    next(
+        app,
+        EventKind::ModelMessage {
+            message: rig::message::Message::assistant(text.unwrap_or_default()),
+        },
+    );
+    next(
+        app,
+        EventKind::ToolResult {
+            call_id,
+            name: "protocol".into(),
+            output: "ok".into(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+}
+
+#[test]
+fn live_card_keeps_intermediate_text_on_its_last_rows() {
+    let mut app = test_app();
+    let mut sequence = 1;
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "fix the build".into(),
+        },
+    );
+    apply_tool_response(&mut app, &mut sequence, None, "a.rs");
+    apply_tool_response(
+        &mut app,
+        &mut sequence,
+        Some("The renderer is at fault; checking the cache next."),
+        "b.rs",
+    );
+
+    // Text from a response that called a tool is intermediate: it folds into
+    // the card and stays on its last row, below the activity, exactly once.
+    let rendered = render_to_string(&mut app, 100, 24);
+    let rows = rendered.lines().map(str::trim_end).collect::<Vec<_>>();
+    let narration = rows
+        .iter()
+        .position(|row| row.contains("❝ The renderer is at fault; checking the cache next."))
+        .expect("narration row");
+    let latest_tool = rows
+        .iter()
+        .position(|row| row.contains("✓ Read b.rs"))
+        .expect("latest tool row");
+    assert!(narration > latest_tool);
+    assert_eq!(rendered.matches("The renderer is at fault").count(), 1);
+
+    // New text from the next response replaces it: the streamed text shows
+    // below the card and the card drops the old narration.
+    app.apply_transient(EventKind::AssistantText {
+        text: "Now patching the cache.".into(),
+    });
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(!rendered.contains("The renderer is at fault"));
+    assert!(rendered.contains("Now patching the cache."));
+    assert!(!rendered.contains("❝ Now patching"));
+
+    // Once that response calls a tool, the new text becomes the narration.
+    app.apply_transient(EventKind::AssistantToolCallDelta {
+        text: "protocol".into(),
+    });
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("❝ Now patching the cache."));
+}
+
+#[test]
+fn live_card_narration_leaves_after_later_tool_rounds() {
+    let mut app = test_app();
+    let mut sequence = 1;
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "fix the build".into(),
+        },
+    );
+    apply_tool_response(&mut app, &mut sequence, Some("Checking the cache."), "a.rs");
+    apply_tool_response(&mut app, &mut sequence, None, "b.rs");
+    assert!(render_to_string(&mut app, 100, 24).contains("❝ Checking the cache."));
+
+    // Two later tool rounds without new text push it out of the card.
+    apply_tool_response(&mut app, &mut sequence, None, "c.rs");
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(!rendered.contains("Checking the cache."));
+
+    // The finished turn keeps its final answer outside the process, and the
+    // expanded process lists the intermediate text in event order.
+    apply_event(
+        &mut app,
+        sequence,
+        EventKind::AssistantText {
+            text: "Fixed.".into(),
+        },
+    );
+    apply_event(&mut app, sequence + 1, EventKind::TurnFinished);
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(rendered.contains("Fixed."));
+    assert!(!rendered.contains("Checking the cache."));
+    app.selected_block = 1;
+    app.toggle_selected();
+    let rendered = render_to_string(&mut app, 100, 30);
+    let rows = rendered.lines().collect::<Vec<_>>();
+    let position = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
+    assert!(position("Checking the cache.") < position("Read a.rs"));
+    assert!(position("Read a.rs") < position("Read b.rs"));
+}
+
+#[test]
+fn live_card_narration_wraps_to_a_bounded_height() {
+    let mut app = test_app();
+    let mut sequence = 1;
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "explain".into(),
+        },
+    );
+    let long = "word ".repeat(80);
+    apply_tool_response(&mut app, &mut sequence, Some(&long), "a.rs");
+    let rendered = render_to_string(&mut app, 60, 30);
+    let narration_rows = rendered
+        .lines()
+        .filter(|row| row.contains("word"))
+        .collect::<Vec<_>>();
+    assert_eq!(narration_rows.len(), 3);
+    assert!(narration_rows[0].contains("❝ word"));
+    // Continuation rows, the cut one included, keep the text column.
+    assert_eq!(
+        narration_rows[1].find("word"),
+        narration_rows[2].find("word")
+    );
+    assert!(
+        narration_rows[2]
+            .trim_end()
+            .trim_end_matches(['│', '┃'])
+            .trim_end()
+            .ends_with('…')
+    );
+}
+
+#[test]
+fn live_process_card_bounds_turn_activity_to_a_summary_and_tail() {
+    let mut app = live_card_app();
+
+    // The card sits where the finished process row will, and the turn's
+    // blocks are its children.
+    assert_eq!(app.blocks[0].kind, BlockKind::User);
+    assert_eq!(app.blocks[1].kind, BlockKind::Process);
+    assert_eq!(app.blocks.last().unwrap().kind, BlockKind::Assistant);
+    let process_id = app.blocks[1].process.as_ref().unwrap().id;
+    assert_eq!(
+        app.blocks
+            .iter()
+            .filter(|block| block.parent_process == Some(process_id))
+            .count(),
+        8
+    );
+
+    let spinner = animation::spinner(app.animation_phase);
+    let rendered = render_to_string(&mut app, 100, 30);
+    // The summary line counts every tool step and keeps the last four
+    // activity rows behind an earlier marker. Static markers flag what is
+    // in progress; the footer keeps the turn's only spinner.
+    assert!(rendered.contains("◆ Read 6 files · edited 1 file  ▸"));
+    assert!(rendered.contains("… 4 earlier steps"));
+    assert!(rendered.contains("✓ Read file-3.rs"));
+    assert!(rendered.contains("✓ Read file-5.rs"));
+    assert!(rendered.contains("› Edited src/main.rs"));
+    assert_eq!(rendered.matches(spinner).count(), 1);
+    assert!(!rendered.contains("file-2"));
+    // Reasoning and tool output stay inside the card; the streaming
+    // response and the user message stay in the transcript.
+    assert!(!rendered.contains("plan the reads"));
+    assert!(!rendered.contains("content 0"));
+    assert!(rendered.contains("inspect the renderer"));
+    assert!(rendered.contains("Still streaming."));
+
+    // Expanding the card lists the full activity in place.
+    app.selected_block = 1;
+    app.toggle_selected();
+    let rendered = render_to_string(&mut app, 100, 30);
+    assert!(rendered.contains("◇ Thought"));
+    assert!(rendered.contains("✓ Read file-0.rs"));
+    assert!(!rendered.contains("earlier steps"));
+
+    // A tool jump from the collapsed card expands it and selects the tool.
+    app.selected_block = 1;
+    app.toggle_selected();
+    app.jump_to(JumpKind::Tool);
+    assert!(app.blocks[1].expanded);
+    assert!(app.blocks[app.selected_block].tool.is_some());
+    // The card's document still carries every child.
+    app.selected_block = 1;
+    app.open_selected_document();
+    let (_, document) = app.document.clone().unwrap();
+    assert!(document.contains("plan the reads"));
+    assert!(document.contains("content 5"));
+}
+
+#[test]
+fn compact_live_process_card_keeps_fewer_tail_rows() {
+    let mut app = live_card_app();
+    app.info.layout = LayoutMode::Compact;
+
+    // The compact layout keeps fewer tail rows and hides more behind the
+    // earlier marker.
+    let rendered = render_to_string(&mut app, 49, 30);
+    assert!(rendered.contains("… 6 earlier steps"));
+    assert!(rendered.contains("✓ Read file-5.rs"));
+    assert!(!rendered.contains("file-4"));
+    assert!(!rendered.contains("plan the reads"));
+}
+
+#[test]
+fn process_summary_counts_every_step_and_survives_the_turn() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        0,
+        EventKind::User {
+            text: "run the checks".into(),
+        },
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "batch".into(),
+            name: "protocol".into(),
+            arguments: serde_json::json!({
+                "steps": [
+                    {"read": "file://src/main.rs"},
+                    {"exec": "bash://run", "input": {"script": "cargo test"}},
+                    {"read": "search://src", "input": {"query": "render"}}
+                ]
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "batch".into(),
+            name: "protocol".into(),
+            output: "*** Result 1 of 3: ok\nsource\n\n*** Result 2 of 3: ok\ndone\n\n*** Result 3 of 3: error\nboom".to_string(),
+            failed: true,
+            protocol_help_required: false,
+        },
+    );
+    apply_event(
+        &mut app,
+        3,
+        EventKind::ToolCall {
+            call_id: "patch".into(),
+            name: "apply_patch".into(),
+            arguments: serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: src/a.rs\n*** Update File: src/b.rs\n*** End Patch"
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        4,
+        EventKind::ToolResult {
+            call_id: "patch".into(),
+            name: "apply_patch".into(),
+            output: String::new(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+    let summary = "Ran 1 command · read 1 file · edited 2 files · searched 1 time · 1 failed";
+
+    // Every protocol step counts once, classified by what it did, plus the
+    // failed call; the live card and the tail carry the same picture.
+    let rendered = render_to_string(&mut app, 100, 30);
+    assert!(rendered.contains(summary));
+    assert!(rendered.contains("× Read search://src"));
+    assert!(rendered.contains("✓ $ cargo test"));
+
+    apply_event(
+        &mut app,
+        5,
+        EventKind::AssistantText {
+            text: "checks done".into(),
+        },
+    );
+    apply_event(&mut app, 6, EventKind::TurnFinished);
+    // The settled process row keeps the same summary, and replaying the
+    // same events (a resumed session) renders it identically.
+    let rendered = render_to_string(&mut app, 100, 30);
+    assert!(rendered.contains(&format!("◇ {summary}  ▸")));
+    assert!(rendered.contains("checks done"));
+
+    // A narrow row drops the expand hint and shortens the activity text,
+    // but the failure count stays visible.
+    let narrow = render_to_string(&mut app, 50, 30);
+    let heading = narrow
+        .lines()
+        .find(|line| line.contains("◇ Ran 1 command"))
+        .expect("process heading");
+    assert!(heading.contains("… · 1 failed  ▸"), "{heading}");
+    assert!(!heading.contains("Enter to expand"));
 }
 
 #[test]
@@ -1025,6 +1420,331 @@ async fn task_state_refresh_follows_the_manager_and_preserves_panel_selection() 
 
     tasks.cancel(&first_id).await;
     tasks.shutdown().await;
+}
+
+async fn running_task(tasks: &TaskManager, protocol: &str, label: &str) -> String {
+    let record = tasks.allocate_background(protocol, label).await.unwrap();
+    let id = record.id.clone();
+    tasks
+        .spawn(record, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(Vec::new())
+        })
+        .await;
+    // `spawn` only queues the worker; wait for its Running commit so tests
+    // never observe the brief Pending state.
+    while tasks.get(&id).await.unwrap().status != TaskStatus::Running {
+        tokio::task::yield_now().await;
+    }
+    id
+}
+
+async fn settled_task(tasks: &TaskManager, label: &str, result: anyhow::Result<Vec<u8>>) -> String {
+    let record = tasks.allocate_background("bash", label).await.unwrap();
+    let id = record.id.clone();
+    tasks.spawn(record, async move { result }).await;
+    tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
+    id
+}
+
+#[tokio::test]
+async fn tasks_panel_orders_running_first_then_recent_finished_with_glyphs() {
+    let tasks = TaskManager::new();
+    let older = settled_task(&tasks, "first build", Ok(b"built".to_vec())).await;
+    let failed = settled_task(&tasks, "sweep logs", Err(anyhow!("boom"))).await;
+    let watching = running_task(&tasks, "bash", "watch tests").await;
+
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Tasks);
+    refresh_task_state(&mut app, &tasks).await;
+
+    let order = app
+        .task_records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [watching.as_str(), failed.as_str(), older.as_str()],
+        "running tasks come first, then the most recent finished"
+    );
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    let row = |label: &str| {
+        rendered
+            .lines()
+            .position(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("missing row for {label}"))
+    };
+    let (running_row, failed_row, done_row) =
+        (row("watch tests"), row("sweep logs"), row("first build"));
+    assert!(running_row < failed_row && failed_row < done_row);
+    let running_line = rendered.lines().nth(running_row).unwrap();
+    assert!(
+        running_line.contains('⠋') && running_line.contains("bash"),
+        "running rows carry the live spinner glyph and protocol: {running_line}"
+    );
+    assert!(
+        rendered.lines().nth(failed_row).unwrap().contains('×'),
+        "failed rows carry the failure glyph"
+    );
+    assert!(
+        rendered.lines().nth(done_row).unwrap().contains('✓'),
+        "completed rows carry the success glyph"
+    );
+    assert!(
+        rendered.contains("cancel"),
+        "the panel title exposes its key hints"
+    );
+}
+
+#[tokio::test]
+async fn tasks_panel_detail_tails_sanitized_live_output() {
+    let tasks = TaskManager::new();
+    let id = running_task(&tasks, "bash", "cargo build").await;
+    tasks
+        .append_latest_output(
+            &id,
+            b"alpha\ncompiling core\n\x1b[31mwarning\x1b[0m: unused variable\r\nlinking\x07done\n",
+        )
+        .await;
+
+    let mut app = test_app();
+    app.overlay = Some(Overlay::Tasks);
+    refresh_task_state(&mut app, &tasks).await;
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(
+        rendered.contains(&format!("{id} · bash · running")),
+        "the detail header identifies the selected task"
+    );
+    assert!(rendered.contains("started"), "the detail shows timestamps");
+    assert!(
+        rendered.contains("… 1 earlier line"),
+        "a bounded tail marks the lines it dropped"
+    );
+    assert!(
+        rendered.contains("warning: unused") && rendered.contains("linking·done"),
+        "the tail keeps the newest lines"
+    );
+    assert!(
+        !rendered.contains("\x1b[31m") && !rendered.contains('\x1b'),
+        "escape sequences never reach the cell buffer"
+    );
+
+    tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn tasks_panel_keeps_two_line_rows_in_the_compact_layout() {
+    let tasks = TaskManager::new();
+    let _ = running_task(&tasks, "pwsh", "watch logs").await;
+
+    let mut app = test_app();
+    app.info.layout = LayoutMode::Auto;
+    app.overlay = Some(Overlay::Tasks);
+    refresh_task_state(&mut app, &tasks).await;
+    let rendered = render_to_string(&mut app, 64, 18);
+
+    let label_row = rendered
+        .lines()
+        .position(|line| line.contains("watch logs"))
+        .expect("compact primary line");
+    let detail_line = rendered
+        .lines()
+        .nth(label_row + 1)
+        .expect("compact secondary line");
+    assert!(
+        detail_line.contains("pwsh · running"),
+        "compact rows keep protocol and status on the second line: {detail_line}"
+    );
+
+    let squeezed = render_to_string(&mut app, 64, 8);
+    assert!(
+        squeezed.contains("TASKS") && squeezed.contains("watch logs"),
+        "a minimal panel height still renders rows without panicking"
+    );
+
+    tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn footer_badge_reports_the_newest_running_task_and_opens_the_panel_on_it() {
+    let tasks = TaskManager::new();
+    let older = running_task(&tasks, "bash", "slow import").await;
+    let newest = running_task(&tasks, "bash", "cargo test").await;
+
+    let mut app = test_app();
+    app.push(
+        BlockKind::Assistant,
+        "AGENT",
+        "answer".to_string(),
+        None,
+        false,
+        false,
+    );
+    refresh_task_state(&mut app, &tasks).await;
+    assert_eq!(app.active_task_count, 2);
+    assert_eq!(
+        app.footer_task.as_ref().map(|task| task.id.as_str()),
+        Some(newest.as_str())
+    );
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(
+        rendered
+            .lines()
+            .last()
+            .unwrap()
+            .contains("● 2 tasks · cargo test"),
+        "the footer names the newest running task"
+    );
+    assert!(
+        app.hit_regions
+            .iter()
+            .any(|region| region.target == AppHit::TaskStatus),
+        "the labeled badge stays a mouse target"
+    );
+
+    app.overlay = Some(Overlay::Tasks);
+    refresh_task_state(&mut app, &tasks).await;
+    app.selected_task = app
+        .task_records
+        .iter()
+        .position(|record| record.id == older)
+        .unwrap();
+    focus_footer_task(&mut app);
+    assert_eq!(
+        app.task_records[app.selected_task].id, newest,
+        "the footer focus selects its own task, not the oldest runner"
+    );
+
+    tasks.shutdown().await;
+}
+
+#[test]
+fn footer_task_badge_degrades_instead_of_overflowing() {
+    let badge = |label: &str, age_secs: i64| FooterTask {
+        id: "001".to_string(),
+        label: label.to_string(),
+        started_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
+    };
+    let long = badge("run integration suite", 65);
+    let wide = badge("nightly test sweep", 65);
+    assert!(
+        footer_task_badge(Some(&wide), 3, 12, 100)
+            .unwrap()
+            .starts_with("● 3 tasks · nightly test sweep "),
+        "a wide footer shows label and elapsed time"
+    );
+    // A short label fits the compact form between the count-only and labeled
+    // full thresholds; a long one falls back to the bare count.
+    let short = badge("build", 30);
+    let compact = footer_task_badge(Some(&short), 3, 12, 34).unwrap();
+    assert!(
+        compact.starts_with("●3 build "),
+        "a narrow footer keeps the label beside the count: {compact}"
+    );
+    assert_eq!(
+        footer_task_badge(Some(&long), 3, 12, 34).unwrap(),
+        "●3",
+        "a long label degrades to the compact count instead of overflowing"
+    );
+    assert_eq!(
+        footer_task_badge(None, 2, 12, 100).unwrap(),
+        "● 2 tasks",
+        "a count-only badge keeps its old shape"
+    );
+    assert_eq!(
+        footer_task_badge(None, 1, 12, 16),
+        None,
+        "an unusable width drops the badge entirely"
+    );
+}
+
+#[tokio::test]
+async fn settling_background_tasks_announce_through_the_flash_notice() {
+    let tasks = TaskManager::new();
+    let record = tasks
+        .allocate_background("bash", "sweep logs")
+        .await
+        .unwrap();
+    let id = record.id.clone();
+    tasks.spawn(record, async { Ok(b"done".to_vec()) }).await;
+    let settled = tasks.wait(&id, Duration::from_secs(1)).await.unwrap();
+
+    let notice = |background| crate::task::TaskNotice {
+        id: id.clone(),
+        protocol: "bash".to_string(),
+        label: "sweep logs".to_string(),
+        status: settled.status,
+        background,
+    };
+    let message = task_settle_message(&notice(true), &tasks).await.unwrap();
+    assert!(
+        message.starts_with("✓ task sweep logs completed in "),
+        "{message}"
+    );
+    assert!(
+        task_settle_message(&notice(false), &tasks).await.is_none(),
+        "foreground work settles without a flash"
+    );
+
+    let mut app = test_app();
+    app.set_flash(message);
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(
+        rendered.contains("✓ task sweep logs completed in"),
+        "the settle notice reaches the rendered surface"
+    );
+
+    let failing = tasks.allocate_background("bash", "doomed").await.unwrap();
+    let failing_id = failing.id.clone();
+    tasks
+        .spawn(failing, async {
+            Err::<Vec<u8>, _>(anyhow::anyhow!("broken"))
+        })
+        .await;
+    let failed = tasks
+        .wait(&failing_id, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let message = task_settle_message(
+        &crate::task::TaskNotice {
+            id: failing_id,
+            protocol: "bash".to_string(),
+            label: "doomed".to_string(),
+            status: failed.status,
+            background: true,
+        },
+        &tasks,
+    )
+    .await
+    .unwrap();
+    assert!(message.starts_with("× task doomed failed in "), "{message}");
+}
+
+#[tokio::test]
+async fn interrupted_background_tasks_settle_as_cancelled_notices() {
+    let tasks = TaskManager::new();
+    let id = running_task(&tasks, "bash", "stuck build").await;
+    tasks.cancel(&id).await;
+    let cancelled = tasks.wait_until_terminal(&id).await.unwrap();
+    let message = task_settle_message(
+        &crate::task::TaskNotice {
+            id,
+            protocol: "bash".to_string(),
+            label: "stuck build".to_string(),
+            status: cancelled.status,
+            background: true,
+        },
+        &tasks,
+    )
+    .await
+    .unwrap();
+    assert!(
+        message.starts_with("⊘ task stuck build cancelled in "),
+        "{message}"
+    );
 }
 
 #[test]
@@ -2537,8 +3257,16 @@ fn live_reasoning_preview_follows_its_tail() {
         .join("\n");
     app.apply_transient(EventKind::AssistantReasoning { text: reasoning });
 
+    // While the turn runs, the reasoning folds into the live process card,
+    // which bounds it to a single Thinking row.
     let rendered = render_to_string(&mut app, 100, 40);
     assert!(rendered.contains("Thinking…"));
+    assert!(!rendered.contains("thought-06"));
+
+    // Expanding the card shows the live reasoning preview and its tail.
+    app.selected_block = 1;
+    app.toggle_selected();
+    let rendered = render_to_string(&mut app, 100, 40);
     assert!(rendered.contains("… 6 earlier lines"));
     assert!(!rendered.contains("thought-05"));
     assert!(rendered.contains("thought-06"));
@@ -2556,7 +3284,9 @@ fn live_reasoning_preview_follows_its_tail() {
     app.apply_transient(EventKind::AssistantText {
         text: "answer".into(),
     });
-    app.selected_block = 1;
+    // The streamed text folds the trailing reasoning again; expanding the
+    // nested row settles it into the head preview.
+    app.selected_block = 2;
     app.toggle_selected();
     let rendered = render_to_string(&mut app, 100, 40);
     assert!(rendered.contains("Thought"));
@@ -4768,7 +5498,9 @@ fn tool_call_and_result_share_one_block() {
     assert!(!collapsed.contains("CALL"));
     app.toggle_selected();
     let expanded = render_to_string(&mut app, 100, 24);
-    assert!(expanded.contains("↳ file://src/main.rs"));
+    // The title already shows the target, so the preview starts at the
+    // result instead of repeating the address.
+    assert!(!expanded.contains("↳ file://src/main.rs"));
     assert!(expanded.contains("└ complete tool output"));
     assert!(!expanded.contains("{\"uri\""));
 }
@@ -4970,19 +5702,21 @@ fn protocol_batch_tool_calls_show_every_step() {
         },
     );
 
-    // The summary row keeps the first request and reports the rest of the batch.
-    assert_eq!(app.blocks[0].title, "Read src/main.rs +2");
+    // The summary row keeps the batch's most significant step — its command —
+    // and reports the rest of the batch.
+    assert_eq!(app.blocks[0].title, "$ cargo test +2");
 
-    // Expanding the row lists every request address in call order.
-    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20);
+    // Expanding the row lists every step with its outcome from the result
+    // envelope.
+    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20, 20);
     let details = details
         .into_iter()
         .map(|(line, _)| line)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(details.contains("↳ file://src/main.rs"));
-    assert!(details.contains("↳ bash://run"));
-    assert!(details.contains("↳ search://src"));
+    assert!(details.contains("✓ Read src/main.rs"));
+    assert!(details.contains("✓ $ cargo test"));
+    assert!(details.contains("× Read search://src"));
 
     // The opened document numbers each step and keeps its input, so the
     // numbered result sections stay traceable to their steps.
@@ -5001,13 +5735,176 @@ fn protocol_batch_tool_calls_show_every_step() {
     assert!(!document.contains("\"steps\""));
 
     // The rendered transcript shows the batch summary, and the expanded row
-    // lists every request address on screen.
+    // lists every step with its outcome on screen. The envelope lines stay
+    // in the opened document only.
     app.blocks[0].expanded = true;
     let rendered = render_to_string(&mut app, 100, 24);
-    assert!(rendered.contains("✓ Read src/main.rs +2"));
-    assert!(rendered.contains("↳ file://src/main.rs"));
-    assert!(rendered.contains("↳ bash://run"));
-    assert!(rendered.contains("↳ search://src"));
+    assert!(rendered.contains("✓ $ cargo test +2"));
+    assert!(rendered.contains("✓ Read src/main.rs"));
+    assert!(rendered.contains("× Read search://src"));
+    assert!(!rendered.contains("*** Result"));
+}
+
+#[test]
+fn multi_line_scripts_preview_continuation_lines_without_flattening() {
+    let mut app = test_app();
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "script-call".to_string(),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({
+                "steps": [{
+                    "exec": "bash://run",
+                    "input": {
+                        "script": "cargo build 2>&1 | tail -20\necho done\nls target\nuname -a\npwd",
+                        "cwd": "/home/sifu/Projects/uri-agent",
+                        "timeout_ms": 120000,
+                        "env": {"API_TOKEN": "secret-token"}
+                    }
+                }]
+            }),
+        },
+    );
+
+    // The title keeps the script's first line, and the address it hides
+    // stays as the one detail line.
+    assert_eq!(app.blocks[0].title, "$ cargo build 2>&1 | tail -20");
+    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20, 20);
+    let text = details
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("↳ bash://run"));
+    // The script continues below the title without a `script:` prefix and
+    // is bounded to the three lines after the titled first one.
+    assert!(text.contains("echo done"));
+    assert!(text.contains("ls target"));
+    assert!(text.contains("uname -a"));
+    assert!(!text.contains("pwd"));
+    assert!(!text.contains("script:"));
+    // Other input fields stay, and sensitive ones stay redacted.
+    assert!(text.contains("cwd: /home/sifu/Projects/uri-agent"));
+    assert!(text.contains("timeout_ms: 120000"));
+    assert!(text.contains("env: [redacted]"));
+    assert!(!text.contains("secret-token"));
+}
+
+#[test]
+fn tool_output_previews_with_its_own_line_budget() {
+    let mut app = test_app();
+    let output = format!(
+        "*** Result 1 of 2: ok\n{}\n\n*** Result 2 of 2: error\nboom",
+        (0..20)
+            .map(|index| format!("out-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "long-call".to_string(),
+            name: "protocol".to_string(),
+            arguments: serde_json::json!({
+                "steps": [
+                    {"read": "file://src/main.rs"},
+                    {"exec": "bash://run", "input": {"script": "cargo test"}}
+                ]
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "long-call".to_string(),
+            name: "protocol".to_string(),
+            output,
+            failed: true,
+            protocol_help_required: false,
+        },
+    );
+
+    app.blocks[0].expanded = true;
+    let (details, extra) = tool_detail_lines(&app.blocks[0], 120, 8, 8);
+    let text = details
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The result envelope belongs to the opened document only.
+    assert!(!text.contains("*** Result"));
+    assert!(text.contains("└ out-00"));
+    assert!(text.contains("out-07"));
+    // The output keeps its own budget: it is not squeezed out by the
+    // argument lines, and truncation is reported separately.
+    assert!(!text.contains("out-08"));
+    assert!(!text.contains("boom"));
+    assert_eq!(extra, 14);
+}
+
+#[test]
+fn replace_previews_show_a_bounded_diff_of_the_edit() {
+    let mut app = test_app();
+    let old_text = (0..6)
+        .map(|index| format!("old line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    apply_event(
+        &mut app,
+        1,
+        EventKind::ToolCall {
+            call_id: "replace-call".to_string(),
+            name: "replace".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/tui.rs",
+                "old_text": old_text,
+                "new_text": "new line 0\nnew line 1",
+            }),
+        },
+    );
+    apply_event(
+        &mut app,
+        2,
+        EventKind::ToolResult {
+            call_id: "replace-call".to_string(),
+            name: "replace".to_string(),
+            output: String::new(),
+            failed: false,
+            protocol_help_required: false,
+        },
+    );
+
+    assert_eq!(app.blocks[0].title, "Edited src/tui.rs");
+    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20, 20);
+    let removed = details
+        .iter()
+        .filter(|(line, _)| line.starts_with("  - "))
+        .collect::<Vec<_>>();
+    let added = details
+        .iter()
+        .filter(|(line, _)| line.starts_with("  + "))
+        .collect::<Vec<_>>();
+    // Each side is bounded to four diff lines; the flattened summaries and
+    // the path the title already shows are gone.
+    assert_eq!(removed.len(), 4);
+    assert_eq!(added.len(), 2);
+    assert!(removed[0].0.contains("old line 0"));
+    assert!(added[0].0.contains("new line 0"));
+    assert_eq!(removed[0].1, ERROR);
+    assert_eq!(added[0].1, ACCENT);
+    let text = details
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("old line 4"));
+    assert!(!text.contains("old_text:"));
+    assert!(!text.contains("new_text:"));
+    assert!(!text.contains("path:"));
 }
 
 #[test]
@@ -5050,34 +5947,36 @@ fn tool_titles_and_details_render_step_arguments() {
     );
 
     // A single read step titles with the displayed target and keeps the
-    // protocol for the activity label.
+    // protocol for the activity label. The title already shows the address,
+    // so the preview does not repeat it.
     assert_eq!(app.blocks[0].title, "Read src/main.rs");
-    let (read_details, _) = tool_detail_lines(&app.blocks[0], 120, 20);
+    let (read_details, _) = tool_detail_lines(&app.blocks[0], 120, 20, 20);
     assert!(
         read_details
             .iter()
-            .any(|(line, _)| line == "↳ file://src/main.rs")
+            .any(|(line, _)| line == "Waiting for result…")
     );
 
-    // A shell exec step titles with the command and names the shell protocol.
+    // A shell exec step titles with the command and names the shell protocol;
+    // its preview keeps the address the title hides.
     assert_eq!(app.blocks[1].title, "$ cargo test");
     assert_eq!(
         tool_protocol(&app.blocks[1].tool.as_ref().unwrap().arguments).as_deref(),
         Some("bash")
     );
 
-    // A multi-step call summarizes the first step and counts the rest, and
-    // the details list every step address in call order.
-    assert_eq!(app.blocks[2].title, "Read src/main.rs +2");
-    let (multi_details, _) = tool_detail_lines(&app.blocks[2], 120, 20);
+    // A multi-step call titles with its first command and counts the rest,
+    // and the details list every step with its outcome in call order.
+    assert_eq!(app.blocks[2].title, "$ cargo test +2");
+    let (multi_details, _) = tool_detail_lines(&app.blocks[2], 120, 20, 20);
     let multi_details = multi_details
         .into_iter()
         .map(|(line, _)| line)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(multi_details.contains("↳ file://src/main.rs"));
-    assert!(multi_details.contains("↳ bash://run"));
-    assert!(multi_details.contains("↳ search://src"));
+    assert!(multi_details.contains("· Read src/main.rs"));
+    assert!(multi_details.contains("· $ cargo test"));
+    assert!(multi_details.contains("· Read search://src"));
     let document = block_document(&app.blocks[2]);
     assert!(document.contains("### Step 2 · Exec `bash://run`"));
     assert!(document.contains("```bash\ncargo test\n```"));
@@ -5115,7 +6014,7 @@ fn tool_details_redact_sensitive_dynamic_arguments() {
     );
 
     let document = block_document(&app.blocks[0]);
-    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20);
+    let (details, _) = tool_detail_lines(&app.blocks[0], 120, 20, 20);
     let details = details
         .into_iter()
         .map(|(line, _)| line)
@@ -5558,12 +6457,12 @@ fn activity_animation_stays_on_the_current_tool_instead_of_the_selection() {
     });
     app.selected_block = 1;
 
-    assert_eq!(app.active_transcript_block(), Some(2));
-    let spinner = animation::spinner(app.animation_phase);
+    // The running tool is the second child under the live card.
+    assert_eq!(app.active_transcript_block(), Some(3));
     let rendered = render_to_string(&mut app, 100, 24);
     assert!(rendered.contains("✓ Read old.rs"));
-    assert!(rendered.contains(&format!("{spinner} Read current.rs")));
-    assert!(!rendered.contains(&format!("{spinner} Read old.rs")));
+    assert!(rendered.contains("› Read current.rs"));
+    assert!(!rendered.contains("› Read old.rs"));
 }
 
 #[test]

@@ -6,6 +6,15 @@ use std::borrow::Cow;
 // second rendered copy of every historical block.
 const TRANSCRIPT_CACHE_CONTEXT_BLOCKS: usize = 64;
 
+// An expanded tool row previews arguments and output with separate budgets,
+// so a long result is never squeezed out by argument detail.
+const TOOL_PREVIEW_ARGUMENT_LINES: usize = 8;
+const TOOL_PREVIEW_OUTPUT_LINES: usize = 8;
+// Continuation lines shown after a multi-line shell script's titled first
+// line, and diff lines per side shown for a `replace` call.
+const TOOL_PREVIEW_SCRIPT_LINES: usize = 3;
+const REPLACE_PREVIEW_DIFF_LINES: usize = 4;
+
 pub(super) fn block_document(block: &DisplayBlock) -> String {
     block_document_with_level(block, 1)
 }
@@ -381,21 +390,48 @@ pub(super) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
     let Some(parsed) = steps.first() else {
         return name.to_string();
     };
-    let action = if parsed.operation == "exec" {
-        "Ran"
-    } else {
-        "Read"
-    };
-    let script = parsed
-        .input
-        .and_then(|input| input.get("script"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let title = protocol_step_title(action, parsed.address, script);
+    // A batch titles with its first command so an exec is never hidden
+    // behind a read's "+N"; read-only batches keep their first read.
+    let significant = steps
+        .iter()
+        .find(|step| step.operation == "exec")
+        .unwrap_or(parsed);
+    let title = step_title(significant);
     if steps.len() > 1 {
         return format!("{title} +{}", steps.len() - 1);
     }
     title
+}
+
+fn step_title(step: &ProtocolStep<'_>) -> String {
+    let action = if step.operation == "exec" {
+        "Ran"
+    } else {
+        "Read"
+    };
+    protocol_step_title(action, step.address, step_script(step))
+}
+
+fn step_script<'a>(step: &ProtocolStep<'a>) -> &'a str {
+    step.input
+        .and_then(|input| input.get("script"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn step_protocol<'a>(step: &ProtocolStep<'a>) -> &'a str {
+    step.address.split("://").next().unwrap_or_default()
+}
+
+fn step_is_shell_exec(step: &ProtocolStep<'_>) -> bool {
+    step.operation == "exec" && matches!(step_protocol(step), "bash" | "pwsh")
+}
+
+/// True when a step's title already displays its address, so a `↳` detail
+/// line would only repeat it. A shell command title shows the script's
+/// first line instead of the address.
+fn step_title_shows_address(step: &ProtocolStep<'_>) -> bool {
+    !(step_is_shell_exec(step) && !step_script(step).is_empty())
 }
 
 fn protocol_step_title(action: &str, address: &str, script: &str) -> String {
@@ -433,61 +469,173 @@ pub(super) fn patch_targets(patch: &str) -> Vec<String> {
     targets
 }
 
+/// One step's outcome parsed from a batch result envelope.
+#[derive(Clone, Copy)]
+enum StepOutcome {
+    Ok,
+    Error,
+    Skipped,
+}
+
+impl StepOutcome {
+    fn parse(status: &str) -> Option<Self> {
+        match status.trim() {
+            "ok" => Some(Self::Ok),
+            "error" => Some(Self::Error),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Ok => "✓",
+            Self::Error => "×",
+            Self::Skipped => "·",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Error => ERROR,
+            Self::Ok | Self::Skipped => MUTED,
+        }
+    }
+
+    /// The worse outcome wins, so a `for` step with one failed element
+    /// reports the step as failed.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Error, _) | (_, Self::Error) => Self::Error,
+            (Self::Skipped, _) | (_, Self::Skipped) => Self::Skipped,
+            (Self::Ok, _) => Self::Ok,
+        }
+    }
+}
+
+/// A batch result's `*** Result <n> of <m>: <status>` envelope line. The
+/// sections themselves belong to the full document; the preview only keeps
+/// the statuses.
+fn is_result_envelope_line(line: &str) -> bool {
+    line.starts_with("*** Result ")
+}
+
+/// Per-step outcomes of a batch call, parsed from its result envelope. Loop
+/// sections share a step number (`<n>.<k>`); the worst outcome wins.
+fn tool_step_statuses(output: &Option<String>, step_count: usize) -> Vec<Option<StepOutcome>> {
+    let mut statuses = vec![None; step_count];
+    let Some(output) = output else {
+        return statuses;
+    };
+    for line in output.lines() {
+        let Some((label, status)) = line
+            .strip_prefix("*** Result ")
+            .and_then(|rest| rest.split_once(": "))
+        else {
+            continue;
+        };
+        let Some((label, _)) = label.split_once(" of ") else {
+            continue;
+        };
+        let Some(outcome) = StepOutcome::parse(status) else {
+            continue;
+        };
+        let Some(index) = label
+            .split('.')
+            .next()
+            .and_then(|number| number.parse::<usize>().ok())
+            .filter(|index| (1..=step_count).contains(index))
+        else {
+            continue;
+        };
+        statuses[index - 1] = Some(match statuses[index - 1] {
+            Some(current) => current.merge(outcome),
+            None => outcome,
+        });
+    }
+    statuses
+}
+
 pub(super) fn tool_detail_lines(
     block: &DisplayBlock,
     width: usize,
-    limit: usize,
+    argument_limit: usize,
+    output_limit: usize,
 ) -> (Vec<(String, Color)>, usize) {
-    let mut logical = Vec::new();
+    let mut arguments = Vec::new();
+    let mut output = Vec::new();
     if let Some(tool) = &block.tool {
         let steps = parse_protocol_steps(&tool.arguments);
-        if !steps.is_empty() {
-            for step in &steps {
-                logical.push((format!("↳ {}", step.address), MUTED));
+        if steps.len() > 1 {
+            let statuses = tool_step_statuses(&tool.output, steps.len());
+            for (index, step) in steps.iter().enumerate() {
+                let (marker, color) = match statuses.get(index).copied().flatten() {
+                    Some(outcome) => (outcome.marker(), outcome.color()),
+                    None => ("·", if block.failed { ERROR } else { MUTED }),
+                };
+                arguments.push((format!("{marker} {}", step_title(step)), color));
             }
-        } else {
-            logical.push((format!("↳ {}", tool.name), MUTED));
+        } else if let Some(step) = steps.first().filter(|step| !step_title_shows_address(step)) {
+            arguments.push((format!("↳ {}", display_tool_uri(step.address)), MUTED));
+        } else if steps.is_empty() && block.title != tool.name {
+            arguments.push((format!("↳ {}", tool.name), MUTED));
         }
-        tool_argument_details(&tool.arguments, &mut logical);
-        if let Some(output) = &tool.output {
-            for (index, line) in output.lines().enumerate() {
-                logical.push((
-                    format!("{} {line}", if index == 0 { "└" } else { " " }),
-                    if block.failed { ERROR } else { MUTED },
-                ));
-            }
+        tool_argument_details(&tool.arguments, &mut arguments);
+        if let Some(tool_output) = &tool.output {
+            push_output_preview(tool_output, block.failed, &mut output);
         }
     } else if let Some((_, result)) = block
         .text
         .split_once("\n\nRESULT\n")
         .or_else(|| block.text.split_once("\n\nERROR\n"))
     {
-        for (index, line) in result.lines().enumerate() {
-            logical.push((
-                format!("{} {line}", if index == 0 { "└" } else { " " }),
-                if block.failed { ERROR } else { MUTED },
-            ));
-        }
-    }
-    if logical.is_empty() {
-        logical.push(("Waiting for result…".to_string(), MUTED));
+        push_output_preview(result, block.failed, &mut output);
     }
 
     let mut wrapped = Vec::new();
-    for (line, color) in logical {
-        let lines = wrapped_block_lines(&line, width.max(1));
-        wrapped.extend(lines.into_iter().map(|line| (line, color)));
+    let mut extra = wrap_preview_lines(&arguments, width, argument_limit, &mut wrapped);
+    extra += wrap_preview_lines(&output, width, output_limit, &mut wrapped);
+    if wrapped.is_empty() {
+        wrapped.push(("Waiting for result…".to_string(), MUTED));
     }
-    let extra = wrapped.len().saturating_sub(limit);
-    wrapped.truncate(limit);
     (wrapped, extra)
+}
+
+fn push_output_preview(output: &str, failed: bool, lines: &mut Vec<(String, Color)>) {
+    for (index, line) in output
+        .lines()
+        .filter(|line| !is_result_envelope_line(line))
+        .enumerate()
+    {
+        lines.push((
+            format!("{} {line}", if index == 0 { "└" } else { " " }),
+            if failed { ERROR } else { MUTED },
+        ));
+    }
+}
+
+fn wrap_preview_lines(
+    logical: &[(String, Color)],
+    width: usize,
+    limit: usize,
+    wrapped: &mut Vec<(String, Color)>,
+) -> usize {
+    let mut section = Vec::new();
+    for (line, color) in logical {
+        let lines = wrapped_block_lines(line, width.max(1));
+        section.extend(lines.into_iter().map(|line| (line, *color)));
+    }
+    let extra = section.len().saturating_sub(limit);
+    wrapped.extend(section.into_iter().take(limit));
+    extra
 }
 
 pub(super) fn tool_argument_details(
     arguments: &serde_json::Value,
     lines: &mut Vec<(String, Color)>,
 ) {
-    let steps_consumed = !parse_protocol_steps(arguments).is_empty();
+    let steps = parse_protocol_steps(arguments);
+    let steps_consumed = !steps.is_empty();
     if let Some(fields) = arguments.as_object() {
         for (key, value) in fields {
             if steps_consumed && key == "steps" {
@@ -503,39 +651,264 @@ pub(super) fn tool_argument_details(
                 );
                 continue;
             }
+            if replace_edits(arguments).is_some()
+                && matches!(key.as_str(), "path" | "old_text" | "new_text")
+            {
+                // The title names the path; the edited pair is a diff below.
+                continue;
+            }
             lines.push((format!("  {key}: {}", argument_summary(key, value)), MUTED));
         }
+    }
+    if let Some((old_text, new_text)) = replace_edits(arguments) {
+        lines.extend(replace_diff_lines(old_text, new_text));
+        return;
     }
     let Some(body) = tool_body(arguments) else {
         return;
     };
-    match body {
-        serde_json::Value::String(value) => {
-            let files = patch_targets(value);
-            if !files.is_empty() {
-                lines.extend(files.into_iter().map(|file| (format!("  {file}"), MUTED)));
-            } else if value.lines().count() > 1 {
-                lines.extend(
-                    value
-                        .lines()
-                        .skip(1)
-                        .take(3)
-                        .map(|line| (format!("  {line}"), MUTED)),
-                );
+    if let Some(fields) = body.as_object() {
+        // A shell script's first line is already the row title; continue it
+        // as body text instead of flattening the whole script.
+        let titled_script = steps
+            .first()
+            .is_some_and(|step| step_is_shell_exec(step) && !step_script(step).is_empty());
+        if titled_script
+            && let Some(script) = fields.get("script").and_then(serde_json::Value::as_str)
+        {
+            lines.extend(
+                script
+                    .lines()
+                    .skip(1)
+                    .take(TOOL_PREVIEW_SCRIPT_LINES)
+                    .map(|line| (format!("  {line}"), MUTED)),
+            );
+        }
+        for (key, value) in fields {
+            if titled_script && key == "script" {
+                continue;
             }
+            lines.push((format!("  {key}: {}", argument_summary(key, value)), MUTED));
         }
-        serde_json::Value::Object(fields) => {
-            for (key, value) in fields {
-                lines.push((format!("  {key}: {}", argument_summary(key, value)), MUTED));
-            }
-        }
-        serde_json::Value::Array(values) => {
-            lines.push((format!("  body: {} items", values.len()), MUTED));
-        }
-        serde_json::Value::Number(value) => lines.push((format!("  body: {value}"), MUTED)),
-        serde_json::Value::Bool(value) => lines.push((format!("  body: {value}"), MUTED)),
-        serde_json::Value::Null => {}
     }
+}
+
+/// The edited text pair of a `replace` call, if these are its arguments.
+fn replace_edits(arguments: &serde_json::Value) -> Option<(&str, Option<&str>)> {
+    let old_text = arguments.get("old_text")?.as_str()?;
+    let new_text = arguments
+        .get("new_text")
+        .and_then(serde_json::Value::as_str);
+    Some((old_text, new_text))
+}
+
+fn replace_diff_lines(old_text: &str, new_text: Option<&str>) -> Vec<(String, Color)> {
+    let mut lines = Vec::new();
+    for (marker, color, text) in [
+        ("-", ERROR, old_text),
+        ("+", ACCENT, new_text.unwrap_or_default()),
+    ] {
+        lines.extend(
+            text.lines()
+                .take(REPLACE_PREVIEW_DIFF_LINES)
+                .map(|line| (format!("  {marker} {line}"), color)),
+        );
+    }
+    lines
+}
+
+/// The settled process row's fallback label when a turn had no tool steps.
+fn process_step_label(steps: usize) -> String {
+    format!(
+        "Process · {steps} step{}",
+        if steps == 1 { "" } else { "s" }
+    )
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// One activity line of a live process card's tail.
+struct ProcessActivityRow {
+    marker: String,
+    text: String,
+    color: Color,
+}
+
+/// Summarizes a turn's tool activity: every protocol step counts once and
+/// classifies by what it did. The failed-call count is returned apart so the
+/// heading can keep it visible when the activity text must be shortened.
+/// Reasoning-only turns have no summary and fall back to the step-count label.
+fn process_summary(children: &[&DisplayBlock]) -> Option<(String, usize)> {
+    let mut commands = 0;
+    let mut file_reads = 0;
+    let mut edits = 0;
+    let mut searches = 0;
+    let mut others = 0;
+    let mut failures = 0;
+    for child in children {
+        let Some(tool) = &child.tool else {
+            continue;
+        };
+        let steps = parse_protocol_steps(&tool.arguments);
+        if steps.is_empty() {
+            match tool.name.as_str() {
+                "replace" => edits += 1,
+                "apply_patch" => {
+                    edits += tool
+                        .arguments
+                        .get("patch")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|patch| patch_targets(patch).len())
+                        .filter(|files| *files > 0)
+                        .unwrap_or(1);
+                }
+                _ => others += 1,
+            }
+        } else {
+            for step in &steps {
+                let protocol = step_protocol(step);
+                if step_is_shell_exec(step) {
+                    commands += 1;
+                } else if step.operation == "read" && protocol == "file" {
+                    file_reads += 1;
+                } else if matches!(protocol, "search" | "finder") {
+                    searches += 1;
+                } else {
+                    others += 1;
+                }
+            }
+        }
+        failures += usize::from(child.failed);
+    }
+    let mut parts = Vec::new();
+    if commands > 0 {
+        parts.push(format!("Ran {commands} command{}", plural_suffix(commands)));
+    }
+    if file_reads > 0 {
+        parts.push(format!(
+            "read {file_reads} file{}",
+            plural_suffix(file_reads)
+        ));
+    }
+    if edits > 0 {
+        parts.push(format!("edited {edits} file{}", plural_suffix(edits)));
+    }
+    if searches > 0 {
+        parts.push(format!(
+            "searched {searches} time{}",
+            plural_suffix(searches)
+        ));
+    }
+    if others > 0 {
+        parts.push(format!("{others} other"));
+    }
+    let mut summary = parts.join(" · ");
+    if summary.is_empty() {
+        return None;
+    }
+    if let Some(first) = summary.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    Some((summary, failures))
+}
+
+/// One row per step of the turn's activity, newest last: reasoning blocks
+/// and direct tools get a row each, protocol calls get one row per step
+/// once their results carry per-step statuses.
+/// Marks a live card row or tool call that is still in progress.
+const IN_PROGRESS_MARKER: &str = "›";
+
+/// Intermediate text as at most `limit` wrapped rows under a `❝ ` lead,
+/// blank lines dropped; a cut ends its last row with `…`.
+fn narration_lines(text: &str, width: usize, limit: usize) -> Vec<String> {
+    let body_width = width.saturating_sub(2).max(1);
+    let mut wrapped = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .flat_map(|line| wrapped_block_lines(line.trim(), body_width))
+        .collect::<Vec<_>>();
+    if wrapped.len() > limit {
+        wrapped.truncate(limit);
+        if let Some(last) = wrapped.last_mut() {
+            let kept = single_line_preview(last, body_width.saturating_sub(1).max(1));
+            *last = format!("{}…", kept.trim_end_matches('…').trim_end());
+        }
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| format!("{}{line}", if index == 0 { "❝ " } else { "  " }))
+        .collect()
+}
+
+/// The footer owns the turn's only spinner; a row still in progress is
+/// marked with a static `›` instead. Assistant text is the card's
+/// narration, not an activity row.
+fn process_activity_rows(children: &[&DisplayBlock]) -> Vec<ProcessActivityRow> {
+    let mut rows = Vec::new();
+    for child in children {
+        match child.kind {
+            BlockKind::Assistant => {}
+            BlockKind::Reasoning => {
+                if child.transient {
+                    rows.push(ProcessActivityRow {
+                        marker: IN_PROGRESS_MARKER.to_string(),
+                        text: "Thinking…".to_string(),
+                        color: ACCENT,
+                    });
+                } else {
+                    rows.push(ProcessActivityRow {
+                        marker: "◇".to_string(),
+                        text: "Thought".to_string(),
+                        color: MUTED,
+                    });
+                }
+            }
+            BlockKind::Tool => {
+                let Some(tool) = &child.tool else {
+                    continue;
+                };
+                let steps = parse_protocol_steps(&tool.arguments);
+                if steps.len() > 1 && tool.output.is_some() {
+                    let statuses = tool_step_statuses(&tool.output, steps.len());
+                    for (index, step) in steps.iter().enumerate() {
+                        let outcome = statuses.get(index).copied().flatten();
+                        let (marker, color) = match outcome {
+                            Some(outcome) => (outcome.marker().to_string(), outcome.color()),
+                            None if child.failed => ("×".to_string(), ERROR),
+                            None => ("·".to_string(), MUTED),
+                        };
+                        rows.push(ProcessActivityRow {
+                            marker,
+                            text: step_title(step),
+                            color,
+                        });
+                    }
+                } else {
+                    let (marker, color) = if tool.output.is_none() {
+                        (IN_PROGRESS_MARKER.to_string(), ACCENT)
+                    } else if child.failed {
+                        ("×".to_string(), ERROR)
+                    } else {
+                        ("✓".to_string(), MUTED)
+                    };
+                    rows.push(ProcessActivityRow {
+                        marker,
+                        text: child.title.clone(),
+                        color,
+                    });
+                }
+            }
+            _ => rows.push(ProcessActivityRow {
+                marker: "·".to_string(),
+                text: child.title.clone(),
+                color: MUTED,
+            }),
+        }
+    }
+    rows
 }
 
 fn argument_summary(name: &str, value: &serde_json::Value) -> String {
@@ -919,6 +1292,60 @@ fn fitted_hints(hints: &str, width: usize) -> Option<String> {
         .find(|line| !line.is_empty() && line.width() <= width)
 }
 
+/// The footer's task badge: running count plus the newest running task's
+/// label and elapsed time. It degrades from labeled to count-only to compact
+/// so both layouts keep the model and context columns intact.
+pub(super) fn footer_task_badge(
+    task: Option<&FooterTask>,
+    count: usize,
+    context_width: usize,
+    available: usize,
+) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let noun = if count == 1 { "task" } else { "tasks" };
+    let count_full = format!("● {count} {noun}");
+    let count_compact = format!("●{count}");
+    let detail = task.map(|task| {
+        let elapsed = format_elapsed(
+            chrono::Utc::now()
+                .signed_duration_since(task.started_at)
+                .to_std()
+                .unwrap_or_default(),
+        );
+        format!("{} {elapsed}", single_line_preview(&task.label, 20))
+    });
+    let minimum_model_width = 12;
+    let fits_full = |text: &str| {
+        available
+            >= context_width
+                .saturating_add(text.width())
+                .saturating_add(minimum_model_width)
+                .saturating_add(4)
+    };
+    let fits_compact =
+        |text: &str| available >= context_width.saturating_add(text.width()).saturating_add(3);
+    let labeled_full = detail
+        .as_ref()
+        .map(|detail| format!("{count_full} · {detail}"));
+    let labeled_compact = detail.map(|detail| format!("{count_compact} {detail}"));
+    if let Some(full) = labeled_full.as_ref()
+        && fits_full(full)
+    {
+        return Some(full.clone());
+    }
+    if fits_full(&count_full) {
+        return Some(count_full);
+    }
+    if let Some(compact) = labeled_compact.as_ref()
+        && fits_compact(compact)
+    {
+        return Some(compact.clone());
+    }
+    fits_compact(&count_compact).then_some(count_compact)
+}
+
 /// Minimal conversation footer. Live activity follows the model while project,
 /// usage, and extension details stay in the bottom-anchored status panel.
 pub(super) fn render_footer(
@@ -957,32 +1384,12 @@ pub(super) fn render_footer(
     };
     let context_width = context.width();
     let task_count = app.active_task_count;
-    let task = if task_count == 0 {
-        None
-    } else {
-        let full = format!(
-            "● {task_count} {}",
-            if task_count == 1 { "task" } else { "tasks" }
-        );
-        let compact = format!("●{task_count}");
-        let minimum_model_width = 12;
-        if available
-            >= context_width
-                .saturating_add(full.width())
-                .saturating_add(minimum_model_width)
-                .saturating_add(4)
-        {
-            Some(full)
-        } else if available
-            >= context_width
-                .saturating_add(compact.width())
-                .saturating_add(3)
-        {
-            Some(compact)
-        } else {
-            None
-        }
-    };
+    let task = footer_task_badge(
+        app.footer_task.as_ref(),
+        task_count,
+        context_width,
+        available,
+    );
     let task_width = task.as_deref().map_or(0, UnicodeWidthStr::width);
     let task_context_gap = usize::from(task.is_some()) * 2;
     let model_limit = available.saturating_sub(
@@ -1181,6 +1588,125 @@ pub(super) fn format_elapsed(duration: Duration) -> String {
     } else {
         format!("{}d {}h", seconds / DAY, seconds % DAY / HOUR)
     }
+}
+
+/// Glyph and colour for one task status. Running borrows the live spinner
+/// frame so the row animates with the rest of the interface.
+pub(super) fn task_status_glyph(status: TaskStatus, animation_phase: f64) -> (char, Color) {
+    match status {
+        TaskStatus::Pending => ('…', WARM),
+        TaskStatus::Running => (animation::spinner(animation_phase), ACCENT),
+        TaskStatus::Completed => ('✓', ACCENT),
+        TaskStatus::Failed => ('×', ERROR),
+        TaskStatus::Cancelled => ('⊘', MUTED),
+    }
+}
+
+/// Live elapsed time while a task runs, total duration once it settled.
+pub(super) fn task_elapsed_text(record: &TaskRecord, now: chrono::DateTime<chrono::Utc>) -> String {
+    let end = record.finished_at.unwrap_or(now);
+    format_elapsed(
+        end.signed_duration_since(record.started_at)
+            .to_std()
+            .unwrap_or_default(),
+    )
+}
+
+pub(super) fn format_task_time(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
+/// Bounded, control-safe lines for on-screen output tails. Terminal escapes
+/// and control characters never reach the cell buffer, and only the last
+/// `max_lines` lines survive; the count of dropped lines is returned so the
+/// caller can mark the cut.
+pub(super) fn sanitize_output_tail(output: &[u8], max_lines: usize) -> (usize, Vec<String>) {
+    let text = String::from_utf8_lossy(output);
+    let mut lines = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(sanitize_output_line)
+        .collect::<Vec<_>>();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    let dropped = lines.len().saturating_sub(max_lines);
+    (dropped, lines.split_off(dropped))
+}
+
+/// Strips ANSI escape sequences and replaces remaining control characters so
+/// process output cannot smuggle terminal control into the interface.
+fn sanitize_output_line(line: &str) -> String {
+    let mut clean = String::with_capacity(line.len());
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\x1b' => match characters.peek().copied() {
+                // CSI: ESC [ parameters-and-intermediates final-byte.
+                Some('[') => {
+                    characters.next();
+                    for next in characters.by_ref() {
+                        if ('\x40'..='\x7e').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL or ST.
+                Some(']') => {
+                    characters.next();
+                    while let Some(next) = characters.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' && characters.peek() == Some(&'\\') {
+                            characters.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\t' => clean.push_str("    "),
+            control if control.is_control() => clean.push('·'),
+            other => clean.push(other),
+        }
+    }
+    clean
+}
+
+/// Complete-output document for the shared full-document viewer.
+pub(super) fn task_document(record: &TaskRecord) -> (String, String) {
+    let title = format!(
+        "Task {} — {}",
+        record.id,
+        single_line_preview(&record.label, 40)
+    );
+    let status = match record.status {
+        TaskStatus::Pending | TaskStatus::Running => "• Running",
+        TaskStatus::Completed => "✓ Completed",
+        TaskStatus::Failed => "× Failed",
+        TaskStatus::Cancelled => "⊘ Cancelled",
+    };
+    let mut times = format!("started {}", format_task_time(record.started_at));
+    if let Some(finished) = record.finished_at {
+        times.push_str(&format!(" · finished {}", format_task_time(finished)));
+    }
+    times.push_str(&format!(
+        " · elapsed {}",
+        task_elapsed_text(record, chrono::Utc::now())
+    ));
+    let protocol = record.protocol.as_str();
+    let mut body = format!("**{status}** · `{protocol}://`\n\n{times}\n\n## Output\n\n");
+    let output = String::from_utf8_lossy(&record.content);
+    if output.is_empty() {
+        body.push_str("_(no output yet)_\n");
+    } else {
+        body.push_str(&fenced_block(&output, "text"));
+    }
+    (title, body)
 }
 
 pub(super) fn compact_model(app: &App) -> String {
@@ -1770,7 +2296,15 @@ fn transcript_block_render_key(
     app: &App,
 ) -> TranscriptBlockRenderKey {
     let is_message = matches!(block.kind, BlockKind::User | BlockKind::Assistant);
-    let live = live && matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool);
+    // A live process card renders from its child blocks; child changes bump
+    // its revision, and its liveness joins the key like a live tool's.
+    let process_live = block.kind == BlockKind::Process
+        && block
+            .process
+            .as_ref()
+            .is_some_and(|process| app.busy && app.live_process == Some(process.id));
+    let live =
+        process_live || (live && matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool));
     TranscriptBlockRenderKey {
         revision: block.render_revision,
         message_width,
@@ -1783,11 +2317,6 @@ fn transcript_block_render_key(
         nested: block.parent_process.is_some(),
         selected: !is_message && selected,
         live,
-        status: if live && block.kind == BlockKind::Tool {
-            animation::spinner(app.animation_phase).to_string()
-        } else {
-            String::new()
-        },
         open_hint: if is_message {
             String::new()
         } else {
@@ -1914,27 +2443,114 @@ pub(super) fn transcript_block_items(
         }
         BlockKind::Process => {
             let steps = block.process.as_ref().map_or(0, |process| process.steps);
-            rows.push(transcript_block_item(
-                block,
-                vec![
-                    Span::styled("◇ ", Style::default().fg(MUTED)),
-                    Span::styled(
-                        format!(
-                            "Process · {steps} step{}",
-                            if steps == 1 { "" } else { "s" }
-                        ),
-                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if block.expanded {
-                            "  ▾".to_string()
-                        } else {
-                            collapsed_hint.clone()
-                        },
-                        Style::default().fg(MUTED),
-                    ),
-                ],
-            ));
+            let process_id = block.process.as_ref().map(|process| process.id);
+            let live = process_id.is_some_and(|id| app.busy && app.live_process == Some(id));
+            let children = app
+                .blocks
+                .iter()
+                .filter(|child| child.parent_process == process_id)
+                .collect::<Vec<_>>();
+            let (heading, failures) =
+                process_summary(&children).unwrap_or_else(|| (process_step_label(steps), 0));
+            let failures = (failures > 0).then(|| format!(" · {failures} failed"));
+            let mut marker = if block.expanded {
+                "  ▾".to_string()
+            } else if live {
+                // The card's own rows already show activity, so the summary
+                // row keeps only the fold marker.
+                "  ▸".to_string()
+            } else {
+                collapsed_hint.clone()
+            };
+            // Narrow rows shorten the expand hint, then the activity text;
+            // the failure count always stays on screen.
+            let indent = if block.parent_process.is_some() { 4 } else { 2 };
+            let failure_width = failures.as_deref().map_or(0, UnicodeWidthStr::width);
+            let fixed = indent + failure_width;
+            if fixed + heading.width() + marker.width() > process_width {
+                marker = if block.expanded { "  ▾" } else { "  ▸" }.to_string();
+            }
+            let heading_width = process_width.saturating_sub(fixed + marker.width()).max(1);
+            let mut spans = vec![
+                Span::styled(
+                    if live { "◆ " } else { "◇ " },
+                    Style::default().fg(if live { ACCENT } else { MUTED }),
+                ),
+                Span::styled(
+                    single_line_preview(&heading, heading_width),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if let Some(failures) = failures {
+                spans.push(Span::styled(
+                    failures,
+                    Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(marker, Style::default().fg(MUTED)));
+            rows.push(transcript_block_item(block, spans));
+            // While the turn runs, the collapsed process is a bounded card:
+            // the summary line above and the latest activity rows below.
+            if live && !block.expanded {
+                let tail_rows = if app.compact {
+                    PROCESS_CARD_TAIL_ROWS_COMPACT
+                } else {
+                    PROCESS_CARD_TAIL_ROWS
+                };
+                let activity = process_activity_rows(&children);
+                let earlier = activity.len().saturating_sub(tail_rows);
+                if earlier > 0 {
+                    rows.push(transcript_block_item(
+                        block,
+                        vec![Span::styled(
+                            format!(
+                                "  … {earlier} earlier step{}",
+                                if earlier == 1 { "" } else { "s" }
+                            ),
+                            Style::default().fg(MUTED),
+                        )],
+                    ));
+                }
+                for row in activity.into_iter().skip(earlier) {
+                    rows.push(transcript_block_item(
+                        block,
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(
+                                format!("{} ", row.marker),
+                                Style::default().fg(row.color),
+                            ),
+                            Span::styled(row.text, Style::default().fg(MUTED)),
+                        ],
+                    ));
+                }
+                // The latest intermediate text stays on the card's last rows,
+                // growing the card until newer text or later responses
+                // replace it.
+                let narration = app.live_narration.and_then(|narration| {
+                    children.iter().find(|child| {
+                        child.kind == BlockKind::Assistant && child.id == narration.block_id
+                    })
+                });
+                if let Some(narration) = narration {
+                    let limit = if app.compact {
+                        PROCESS_NARRATION_ROWS_COMPACT
+                    } else {
+                        PROCESS_NARRATION_ROWS
+                    };
+                    for line in
+                        narration_lines(&narration.text, process_width.saturating_sub(4), limit)
+                    {
+                        rows.push(transcript_block_item(
+                            block,
+                            vec![
+                                Span::raw("  "),
+                                Span::styled(line, Style::default().fg(TEXT)),
+                            ],
+                        ));
+                    }
+                }
+            }
         }
         BlockKind::Reasoning => {
             rows.push(transcript_block_item(
@@ -2007,7 +2623,7 @@ pub(super) fn transcript_block_items(
                 |tool| tool.output.is_some(),
             );
             let status = if live {
-                animation::spinner(app.animation_phase).to_string()
+                IN_PROGRESS_MARKER.to_string()
             } else if block.failed {
                 "×".to_string()
             } else if has_result {
@@ -2032,7 +2648,12 @@ pub(super) fn transcript_block_items(
                 ],
             ));
             if block.expanded {
-                let (lines, extra) = tool_detail_lines(block, process_width, 8);
+                let (lines, extra) = tool_detail_lines(
+                    block,
+                    process_width,
+                    TOOL_PREVIEW_ARGUMENT_LINES,
+                    TOOL_PREVIEW_OUTPUT_LINES,
+                );
                 for (line, color) in lines {
                     rows.push(transcript_block_item(
                         block,
@@ -2331,6 +2952,7 @@ pub(super) fn keymap_help(keymap: &Keymap) -> String {
         ("SELECTOR", "selector"),
         ("MODELS", "models"),
         ("SETTINGS", "settings"),
+        ("TASKS", "tasks"),
         ("OAUTH", "oauth"),
         ("TERMINAL", "terminal"),
         ("DOCUMENT", "document"),
@@ -4340,6 +4962,26 @@ fn render_settings_body(frame: &mut Frame<'_>, app: &mut App, area: Rect, marque
     frame.render_widget(Paragraph::new(detail_lines), sections[1]);
 }
 
+/// Task rows: running first (newest first), then finished (newest first).
+pub(super) fn order_task_records(records: &mut [TaskRecord]) {
+    records.sort_by_key(|record| {
+        (
+            record.status.terminal(),
+            std::cmp::Reverse(record.started_at),
+        )
+    });
+}
+
+const TASK_DETAIL_MAX_HEIGHT: u16 = 10;
+
+/// Detail height below the list: at most a third of the panel, and never
+/// below the three list rows a usable panel needs.
+fn task_detail_height(inner_height: u16) -> u16 {
+    TASK_DETAIL_MAX_HEIGHT
+        .min(inner_height / 2)
+        .min(inner_height.saturating_sub(3))
+}
+
 pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, block: Block<'_>) {
     if app.task_records.is_empty() {
         frame.render_widget(
@@ -4350,11 +4992,20 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
         );
         return;
     }
+    let interruptible = app
+        .task_records
+        .get(app.selected_task)
+        .is_some_and(TaskRecord::interruptible);
+    let mut hints = vec![("tasks", "open", "open"), ("tasks", "copy", "copy")];
+    if interruptible {
+        hints.push(("tasks", "interrupt", "interrupt"));
+    }
+    hints.push(("tasks", "cancel", "cancel"));
     let inner = block.inner(area);
     let title = overlay_title(
         app.compact,
         "TASKS",
-        action_hints(&app.keymap, &[("tasks", "cancel", "cancel")]),
+        action_hints(&app.keymap, &hints),
         area.width,
     );
     frame.render_widget(block.title(title), area);
@@ -4367,50 +5018,131 @@ pub(super) fn render_tasks(frame: &mut Frame<'_>, app: &mut App, area: Rect, blo
         .unwrap_or_default();
     let compact = app.compact;
     let row_height = list_row_height(compact);
-    let label_width = (inner.width as usize).saturating_sub(12);
+    let now = chrono::Utc::now();
+    let detail_height = task_detail_height(inner.height);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
+        .split(inner);
+    let (list_area, detail_area) = (sections[0], sections[1]);
+    app.overlay_viewport_rows = (list_area.height / row_height) as usize;
+    let row_width = list_area.width as usize;
+    let elapsed_width = 7;
+    let protocol_width = 8;
+    let label_width = row_width.saturating_sub(2 + 2 + protocol_width + elapsed_width);
     let items = app.task_records.iter().enumerate().map(|(index, task)| {
         let selected = index == app.selected_task;
+        let (glyph, glyph_color) = task_status_glyph(task.status, app.animation_phase);
+        let elapsed = task_elapsed_text(task, now);
         if compact {
-            let width = (inner.width as usize).saturating_sub(2);
-            let color = if selected { ACCENT } else { TEXT };
+            let width = row_width.saturating_sub(4);
             return compact_list_item(
                 selected,
+                vec![
+                    Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+                    Span::raw(" "),
+                    Span::styled(
+                        list_cell(&task.label, width, selected, marquee_elapsed),
+                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    ),
+                ],
                 vec![Span::styled(
-                    list_cell(&task.label, width, selected, marquee_elapsed),
-                    Style::default().fg(color),
-                )],
-                vec![Span::styled(
-                    task.status.as_str().to_string(),
+                    format!("{} · {} · {}", task.protocol, task.status.as_str(), elapsed),
                     Style::default().fg(MUTED),
                 )],
             );
         }
         ListItem::new(Line::from(vec![
-            Span::raw(if selected { "› " } else { "  " }),
-            Span::raw(format!("{:<10}", task.status.as_str())),
-            Span::raw(list_cell(
-                &task.label,
-                label_width,
-                selected,
-                marquee_elapsed,
-            )),
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+            Span::raw(" "),
+            Span::styled(
+                list_cell(task.protocol.as_str(), protocol_width, false, 0),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                list_cell(&task.label, label_width, selected, marquee_elapsed),
+                Style::default().fg(if selected { ACCENT } else { TEXT }),
+            ),
+            Span::styled(
+                format!("{elapsed:>elapsed_width$}"),
+                Style::default().fg(MUTED),
+            ),
         ]))
-        .style(Style::default().fg(if index == app.selected_task {
-            ACCENT
-        } else {
-            TEXT
-        }))
     });
     let mut state = ListState::default().with_selected(Some(app.selected_task));
-    frame.render_stateful_widget(List::new(items), inner, &mut state);
+    frame.render_stateful_widget(List::new(items), list_area, &mut state);
     push_list_hits(
         &mut app.hit_regions,
-        inner,
+        list_area,
         state.offset(),
         app.task_records.len(),
         row_height,
         |index| Some(AppHit::Task(index)),
     );
+    if let Some(record) = app.task_records.get(app.selected_task) {
+        render_task_detail(frame, record, detail_area, now, app.animation_phase);
+    }
+}
+
+/// Selected-task detail: identity, timestamps, and a live, sanitised tail of
+/// the newest output. The tail follows the record's bounded latest output;
+/// the complete output stays one `open` press away.
+fn render_task_detail(
+    frame: &mut Frame<'_>,
+    record: &TaskRecord,
+    area: Rect,
+    now: chrono::DateTime<chrono::Utc>,
+    animation_phase: f64,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let (glyph, glyph_color) = task_status_glyph(record.status, animation_phase);
+    let elapsed = task_elapsed_text(record, now);
+    let mut lines = vec![Line::styled("─".repeat(width), Style::default().fg(MUTED))];
+    lines.push(Line::from(vec![
+        Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+        Span::raw(" "),
+        Span::styled(
+            format!("{} · {}", record.id, record.protocol),
+            Style::default().fg(TEXT),
+        ),
+        Span::styled(
+            format!(" · {} · {elapsed}", record.status.as_str()),
+            Style::default().fg(glyph_color),
+        ),
+    ]));
+    let mut times = format!("started {}", format_task_time(record.started_at));
+    if let Some(finished) = record.finished_at {
+        times.push_str(&format!(" · finished {}", format_task_time(finished)));
+    }
+    lines.push(Line::styled(times, Style::default().fg(MUTED)));
+    let tail_rows = (area.height as usize).saturating_sub(3);
+    if record.latest_output.is_empty() {
+        lines.push(Line::styled("no output yet", Style::default().fg(MUTED)));
+    } else {
+        // Reserve one row for the cut marker when earlier lines are dropped.
+        let (dropped, tail) =
+            sanitize_output_tail(&record.latest_output, tail_rows.saturating_sub(1));
+        if dropped > 0 {
+            lines.push(Line::styled(
+                format!(
+                    "… {dropped} earlier line{}",
+                    if dropped == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(MUTED),
+            ));
+        }
+        lines.extend(tail.into_iter().map(|line| {
+            Line::styled(single_line_preview(&line, width), Style::default().fg(TEXT))
+        }));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 pub(super) fn panel_tone_style(tone: TuiPanelTone) -> Style {

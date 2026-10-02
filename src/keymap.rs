@@ -116,6 +116,9 @@ map("plugin_panel", "esc", "close");
 map("model_roles", "delete", "remove");
 
 map("tasks", "x", "cancel");
+map("tasks", "i", "interrupt");
+map("tasks", "o", "open");
+map("tasks", "c", "copy");
 
 map("command", "enter", "confirm");
 map("command", "esc", "cancel");

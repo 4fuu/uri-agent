@@ -17,15 +17,31 @@ wordmark draws fewer cells per pixel or falls back to its name, and the
 entry-point hints drop trailing entries before the line disappears.
 
 After the first record, the footer shows model, effort, and context usage. It
-also exposes active background-task count; `:tasks` opens the task manager.
-`:status` shows project, session, usage, model timing, checkpoint strategy,
-diagnostic path, and extension status.
+also exposes active background tasks: the running count plus the newest
+running task's label and elapsed time, degrading to the count alone when the
+footer narrows. Clicking the badge opens `:tasks` with that task selected;
+elapsed times tick once per second while tasks run. `:status` shows project,
+session, usage, model timing, checkpoint strategy, diagnostic path, and
+extension status.
 
-User messages, final assistant responses, and errors stay visible. Intermediate
-reasoning and tool activity remain in event order while a turn runs, then fold
-into one Process row. Select a process, reasoning, or tool row and press `Enter`
-or click to fold it. Press `o` or right-click to open the complete rendered
-document, and press `c` there to copy it.
+User messages, final assistant responses, and errors stay visible. While a
+turn runs, its intermediate reasoning and tool activity render as a bounded
+process card in the position the finished process row will occupy: a summary
+line ("Ran 2 commands · read 3 files · edited 1 file · 1 failed") followed
+by the latest activity rows, with an "… N earlier steps" marker above them
+and fewer rows in the compact layout. The summary counts every protocol step
+individually, classified as a command, file read, edit, or search, plus the
+failed calls; a narrow row shortens the counts but keeps the failures.
+Assistant text from a model response that also calls a tool is intermediate:
+once the call starts, the text joins the card and stays on its last rows
+(up to three wrapped rows, two in the compact layout) until newer text arrives
+or two further tool rounds complete. Only the footer animates; the card marks
+itself `◆` while running and the row still in progress `›`. When the turn
+finishes, the process row keeps the same summary. Select a process, reasoning, or tool row and press `Enter` or click
+to fold it: a collapsed process shows the card (while running) or the
+summary row, an expanded process lists the full activity inline. Press `o`
+or right-click to open the complete rendered document, and press `c` there
+to copy it.
 
 Restored sessions initially load the latest checkpoint and following transcript.
 Scrolling upward loads older complete turns in bounded pages. `Home`, transcript
@@ -45,7 +61,8 @@ In the compact layout:
 
 - a two-row action bar below the footer writes a message, opens commands,
   jumps to the latest output, and shows status, or stops the running turn;
-- the footer shows the model, effort, task count, and context percentage only;
+- the footer shows the model, effort, task count (with the newest running
+  task's label when it fits), and context percentage only;
 - the transcript has no scrollbar or side padding and fills the full width,
   leaving selection and swipe scrolling to the terminal client;
 - each mouse-wheel event scrolls 2 rows instead of 6, because a phone swipe
@@ -140,6 +157,25 @@ Server files, credential references, layering, and session behavior are in
 Settings opens the full name-only manager for adding, replacing, and deleting
 entries. Saved values apply to future Agent shell commands, not `:terminal`;
 see [Agent environment](configuration.md#agent-environment).
+
+### Task manager
+
+`:tasks` lists managed background work: running tasks first, then finished
+tasks newest first. Each row shows a status glyph (a live spinner while
+running, `✓` completed, `×` failed, `⊘` cancelled), the owning protocol, the
+label, and a live elapsed time that becomes the total duration once a task
+settles. Compact rows put protocol, status, and elapsed time on a second
+line.
+
+Below the list, the selected task shows its id, protocol, timestamps, and a
+bounded live tail of its newest output. Terminal escape sequences and other
+control characters are stripped from the tail; task output is untrusted
+process data. Actions: `x` cancels, `i` interrupts an interactive shell task,
+`o` opens the complete output in the shared document viewer, and `c` copies
+it. Interrupt uses the same signal the `tasks` protocol's `/interrupt`
+operation sends. When a background task settles while the conversation is
+open, a transient notice such as `✓ task <label> completed in 1m 12s>`
+appears at the bottom without opening the panel.
 
 ## Navigation and copy
 

@@ -33,7 +33,7 @@ use crate::runtime::{AgentRuntime, ImageAttachment, PendingMessage, PendingMessa
 use crate::session::{
     EventKind, Session, SessionEvent, SessionSummary, SessionTuiState, SessionUpdate,
 };
-use crate::task::{TaskManager, TaskRecord};
+use crate::task::{TaskManager, TaskRecord, TaskStatus};
 use crate::terminal::EmbeddedTerminal;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -91,6 +91,8 @@ const FLASH_MILLIS_PER_CHARACTER: u64 = 50;
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
 const COMPLETION_DEBOUNCE: Duration = Duration::from_millis(60);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+/// Redraw cadence while background tasks run, so their elapsed times tick.
+const TASK_TICK: Duration = Duration::from_secs(1);
 const LEGACY_ANIMATION_FRAME_DURATION: Duration = Duration::from_millis(90);
 const PRESENTATION_FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const SCROLL_ROWS: isize = 6;
@@ -99,6 +101,21 @@ const SCROLL_ROWS: isize = 6;
 const COMPACT_SCROLL_ROWS: isize = 2;
 const SMOOTH_SCROLL_CATCH_UP_FRAMES: usize = 8;
 const EXPANDED_PREVIEW_LINES: usize = 24;
+/// Activity rows a live process card keeps below its summary line. The
+/// compact layout keeps fewer because its columns are narrow.
+const PROCESS_CARD_TAIL_ROWS: usize = 4;
+const PROCESS_CARD_TAIL_ROWS_COMPACT: usize = 2;
+/// Live process blocks share their creating event with their first child
+/// block, so their anchor id sets a bit no session sequence reaches and
+/// block ids stay unique.
+const LIVE_PROCESS_ID_FLAG: u64 = 1 << 63;
+/// Wrapped rows a live card gives the latest intermediate assistant text.
+const PROCESS_NARRATION_ROWS: usize = 3;
+const PROCESS_NARRATION_ROWS_COMPACT: usize = 2;
+/// Completed model responses after which intermediate text leaves the live
+/// card: its own tool-calling response and the next two, so it stays for two
+/// rounds of tool work.
+const PROCESS_NARRATION_RESPONSES: usize = 3;
 const TAIL_BUTTON_LABEL: &str = " ↓ bottom ";
 const FLOATING_TAIL_BUTTON_LABEL: &str = " ↓ ";
 const TAIL_BUTTON_RIGHT_INSET: usize = 2;
@@ -172,7 +189,6 @@ struct TranscriptBlockRenderKey {
     nested: bool,
     selected: bool,
     live: bool,
-    status: String,
     open_hint: String,
     expand_hint: String,
 }
@@ -831,6 +847,25 @@ struct UsageTotals {
     cost: f64,
 }
 
+/// The footer's running-task summary: the newest running background task,
+/// kept without the records' bounded output so the badge stays cheap to
+/// refresh on every task notice.
+#[derive(Clone, Debug)]
+struct FooterTask {
+    id: String,
+    label: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Assistant text from a model response that also called tools. It belongs
+/// to the turn's process, and the live card keeps it on its last rows until
+/// newer text arrives or later responses push it out.
+#[derive(Clone, Copy, Debug)]
+struct LiveNarration {
+    block_id: u64,
+    responses: usize,
+}
+
 struct App {
     input: TextArea<'static>,
     blocks: Vec<DisplayBlock>,
@@ -839,6 +874,7 @@ struct App {
     active_task_count: usize,
     task_records: Vec<TaskRecord>,
     selected_task: usize,
+    footer_task: Option<FooterTask>,
     selected_block: usize,
     overlay: Option<Overlay>,
     delivery: Option<DeliveryState>,
@@ -854,6 +890,12 @@ struct App {
     busy: bool,
     activity: Option<Activity>,
     busy_since: Option<Instant>,
+    /// The process id of the running turn's live process card, whose child
+    /// blocks render inside the card until the turn finishes.
+    live_process: Option<u64>,
+    /// The latest intermediate assistant text shown at the bottom of the
+    /// live process card, and the model responses completed since.
+    live_narration: Option<LiveNarration>,
     animation_phase: f64,
     marquee: Option<MarqueeState>,
     transcript_body_width: usize,
@@ -946,6 +988,7 @@ impl App {
             active_task_count: 0,
             task_records: Vec::new(),
             selected_task: 0,
+            footer_task: None,
             selected_block: 0,
             overlay: None,
             delivery: None,
@@ -959,6 +1002,8 @@ impl App {
             busy: false,
             activity: None,
             busy_since: None,
+            live_process: None,
+            live_narration: None,
             animation_phase: 0.0,
             marquee: None,
             transcript_body_width: 72,
@@ -1065,9 +1110,13 @@ impl App {
             .as_ref()
             .filter(|_| self.busy)
             .map(|(_, at)| *at + DOUBLE_CLICK_INTERVAL);
+        // Live task elapsed times tick once per second; a full animation
+        // cadence would spin the whole interface for one changing column.
+        let task_tick = (self.active_task_count > 0).then(|| now + TASK_TICK);
         flash
             .into_iter()
             .chain(interrupt.filter(|deadline| *deadline > now))
+            .chain(task_tick)
             .min()
     }
 
@@ -1176,6 +1225,8 @@ impl App {
             .last_sequence
             .is_some_and(|sequence| event.sequence <= sequence)
         {
+            // A stale event can still have cleared transient card children.
+            self.refresh_live_process();
             return;
         }
         self.applying_sequence = event.sequence;
@@ -1193,6 +1244,19 @@ impl App {
         }
         let select_tail =
             self.blocks.is_empty() || self.selected_block == self.blocks.len().saturating_sub(1);
+        // Whether the event pushes or mutates blocks that can belong to the
+        // live process card; captured here because arms below move payloads.
+        let mutates_live_children = matches!(
+            &event.kind,
+            EventKind::AssistantReasoning { .. }
+                | EventKind::ToolCall { .. }
+                | EventKind::ToolResult { .. }
+                | EventKind::ModelRetry { .. }
+                | EventKind::Compaction { .. }
+                | EventKind::ContextRollover { .. }
+                | EventKind::Error { .. }
+                | EventKind::Notice { .. }
+        );
         match event.kind {
             EventKind::SessionCreated { .. }
             | EventKind::SessionContext { .. }
@@ -1204,11 +1268,15 @@ impl App {
             EventKind::ModelMessage { message } => {
                 if matches!(message, rig::message::Message::Assistant { .. }) {
                     self.token_rate.finish_response(Instant::now());
+                    self.count_narration_response();
                 }
             }
             EventKind::User { text } => {
                 self.token_rate.ensure_turn();
                 self.reasoning_folded_during_stream = false;
+                // A User event mid-run (a delivered steer) starts a new turn
+                // segment, so any previous live card renders as finished.
+                self.settle_live_process();
                 self.busy = true;
                 self.busy_since.get_or_insert_with(Instant::now);
                 self.activity = Some(Activity::Thinking);
@@ -1223,6 +1291,9 @@ impl App {
                 }
                 self.activity = Some(Activity::Writing);
                 self.append_or_push(BlockKind::Assistant, "AGENT", text, true);
+                // Newer text renders below the card and replaces the
+                // previous intermediate text there.
+                self.hide_narration();
             }
             EventKind::AssistantReasoning { text } => {
                 if self.applying_transient {
@@ -1243,6 +1314,10 @@ impl App {
                 if self.applying_transient {
                     self.token_rate
                         .observe_stream_text(&text, false, Instant::now());
+                    // A response that calls a tool is intermediate, so its
+                    // streamed text joins the live card as soon as the call
+                    // starts streaming.
+                    self.fold_response_text();
                 }
             }
             EventKind::ToolCall {
@@ -1255,6 +1330,7 @@ impl App {
                     .observe_response_text(&arguments.to_string(), false);
                 let protocol = tool_protocol(&arguments).unwrap_or_else(|| name.clone());
                 self.activity = Some(Activity::Tool(protocol));
+                self.fold_response_text();
                 let title = tool_title(&name, &arguments);
                 self.push(
                     BlockKind::Tool,
@@ -1438,6 +1514,14 @@ impl App {
                 self.finish_current_turn(self.applying_sequence);
             }
         }
+        // The live process card renders from its child blocks, so changed
+        // children must re-render the card itself; a finished turn settles
+        // the card into the fixed process row.
+        if !self.busy {
+            self.settle_live_process();
+        } else if self.live_process.is_some() && mutates_live_children {
+            self.refresh_live_process();
+        }
         if select_tail {
             self.selected_block = self
                 .blocks
@@ -1490,6 +1574,7 @@ impl App {
     }
 
     fn finish_current_turn(&mut self, process_id: u64) {
+        self.settle_live_process();
         let turn_start = self
             .blocks
             .iter()
@@ -1505,11 +1590,29 @@ impl App {
             let mut result = self.blocks.remove(index);
             result.expanded = true;
             result.turn_result = true;
+            result.parent_process = None;
             result.invalidate_render();
             result
         });
         let process_end = self.blocks.len();
-        if process_end == turn_start {
+        // The turn's live process card already sits at its start; reuse it
+        // so the row and its children keep their place.
+        let live_id = self
+            .blocks
+            .get(turn_start)
+            .filter(|block| block.kind == BlockKind::Process)
+            .and_then(|block| block.process.as_ref().map(|process| process.id));
+        let steps = self.blocks[turn_start..process_end]
+            .iter()
+            .filter(|block| block.kind != BlockKind::Process)
+            .count();
+        if steps == 0 {
+            if live_id.is_some() {
+                // Keep the no-empty-process invariant when a live card lost
+                // every child to a stale replay delta.
+                self.blocks.remove(turn_start);
+                self.selected_block = self.selected_block.min(self.blocks.len().saturating_sub(1));
+            }
             if let Some(result) = result {
                 self.blocks.push(result);
                 self.invalidate_transcript_layout_from(turn_start);
@@ -1520,36 +1623,47 @@ impl App {
             return;
         }
 
+        let fold_id = live_id.unwrap_or(process_id);
         for block in &mut self.blocks[turn_start..process_end] {
-            block.parent_process = Some(process_id);
+            if block.kind == BlockKind::Process {
+                continue;
+            }
+            block.parent_process = Some(fold_id);
             if matches!(block.kind, BlockKind::Reasoning | BlockKind::Tool) {
                 block.expanded = false;
             }
             block.invalidate_render();
         }
-        self.blocks.insert(
-            turn_start,
-            DisplayBlock {
-                id: process_id,
-                kind: BlockKind::Process,
-                title: "PROCESS".to_string(),
-                text: String::new(),
-                call_id: None,
-                failed: false,
-                protocol_help_required: false,
-                expanded: false,
-                tool: None,
-                transient: false,
-                turn_result: false,
-                parent_process: None,
-                process: Some(ProcessDisplay {
+        if let Some(block) = self.blocks.get_mut(turn_start)
+            && let Some(process) = block.process.as_mut()
+        {
+            process.steps = steps;
+        } else {
+            self.blocks.insert(
+                turn_start,
+                DisplayBlock {
                     id: process_id,
-                    steps: process_end - turn_start,
-                }),
-                render_revision: 0,
-                render_cache: RefCell::new(None),
-            },
-        );
+                    kind: BlockKind::Process,
+                    title: "PROCESS".to_string(),
+                    text: String::new(),
+                    call_id: None,
+                    failed: false,
+                    protocol_help_required: false,
+                    expanded: false,
+                    tool: None,
+                    transient: false,
+                    turn_result: false,
+                    parent_process: None,
+                    process: Some(ProcessDisplay {
+                        id: process_id,
+                        steps,
+                    }),
+                    render_revision: 0,
+                    render_cache: RefCell::new(None),
+                },
+            );
+        }
+        self.blocks[turn_start].invalidate_render();
         if let Some(result) = result {
             self.blocks.push(result);
         }
@@ -1568,6 +1682,7 @@ impl App {
         self.busy = false;
         self.activity = None;
         self.busy_since = None;
+        self.settle_live_process();
         for block in &mut self.blocks {
             let expanded = matches!(
                 block.kind,
@@ -1709,6 +1824,14 @@ impl App {
         failed: bool,
         expanded: bool,
     ) {
+        // While a model loop runs, intermediate blocks fold under the turn's
+        // live process card; user messages, assistant text, and manual
+        // compaction or rollover activity stay in the transcript.
+        let live_process = if self.folds_live_process(kind) {
+            Some(self.ensure_live_process())
+        } else {
+            None
+        };
         let index = self.blocks.len();
         self.blocks.push(DisplayBlock {
             id: self.applying_sequence,
@@ -1722,12 +1845,209 @@ impl App {
             tool: None,
             transient: self.applying_transient,
             turn_result: false,
-            parent_process: None,
+            parent_process: live_process,
             process: None,
             render_revision: 0,
             render_cache: RefCell::new(None),
         });
         self.invalidate_transcript_layout_appended(index);
+    }
+
+    /// True while a model loop runs and `kind` is intermediate activity that
+    /// belongs in the turn's live process card. Manual compaction and
+    /// rollover run outside any turn, so their rows stay visible.
+    fn folds_live_process(&self, kind: BlockKind) -> bool {
+        self.busy
+            && !matches!(kind, BlockKind::User | BlockKind::Assistant)
+            && matches!(
+                self.activity,
+                None | Some(
+                    Activity::Thinking
+                        | Activity::Reasoning
+                        | Activity::Writing
+                        | Activity::Tool(_)
+                        | Activity::Retrying { .. }
+                        | Activity::Interrupting,
+                )
+            )
+    }
+
+    /// The live process card at the start of the running turn, created on
+    /// the turn's first intermediate block. A resumed mid-turn session
+    /// already has its card, so it is adopted instead of duplicated.
+    fn ensure_live_process(&mut self) -> u64 {
+        if let Some(process_id) = self.live_process {
+            return process_id;
+        }
+        let turn_start = self
+            .blocks
+            .iter()
+            .rposition(|block| block.kind == BlockKind::User)
+            .map_or(0, |index| index + 1);
+        if let Some(process) = self
+            .blocks
+            .get(turn_start)
+            .filter(|block| block.kind == BlockKind::Process)
+            .and_then(|block| block.process.as_ref())
+        {
+            let id = process.id;
+            self.live_process = Some(id);
+            return id;
+        }
+        let id = self.applying_sequence | LIVE_PROCESS_ID_FLAG;
+        self.blocks.insert(
+            turn_start,
+            DisplayBlock {
+                id,
+                kind: BlockKind::Process,
+                title: "PROCESS".to_string(),
+                text: String::new(),
+                call_id: None,
+                failed: false,
+                protocol_help_required: false,
+                expanded: false,
+                tool: None,
+                transient: false,
+                turn_result: false,
+                parent_process: None,
+                process: Some(ProcessDisplay { id, steps: 0 }),
+                render_revision: 0,
+                render_cache: RefCell::new(None),
+            },
+        );
+        if self.selected_block >= turn_start {
+            self.selected_block += 1;
+        }
+        self.live_process = Some(id);
+        self.invalidate_transcript_layout_from(turn_start);
+        id
+    }
+
+    /// Re-derive the live process card after its child blocks changed: the
+    /// card's rows come from the children, so the card itself and the
+    /// layout from its position must refresh.
+    fn refresh_live_process(&mut self) {
+        let Some(process_id) = self.live_process else {
+            return;
+        };
+        let Some(index) = self.blocks.iter().position(|block| {
+            block
+                .process
+                .as_ref()
+                .is_some_and(|process| process.id == process_id)
+        }) else {
+            return;
+        };
+        let steps = self
+            .blocks
+            .iter()
+            .filter(|block| block.parent_process == Some(process_id))
+            .count();
+        let block = &mut self.blocks[index];
+        if let Some(process) = block.process.as_mut() {
+            process.steps = steps;
+        }
+        block.invalidate_render();
+        self.invalidate_transcript_layout_from(index);
+    }
+
+    /// End the live card: it renders as a settled process row, so its
+    /// changing row count must reflow the transcript once more. A card that
+    /// lost every child (a failed turn start, a stale replay delta) is
+    /// removed outright.
+    fn settle_live_process(&mut self) {
+        let Some(process_id) = self.live_process else {
+            return;
+        };
+        self.live_process = None;
+        self.live_narration = None;
+        let Some(index) = self.blocks.iter().position(|block| {
+            block
+                .process
+                .as_ref()
+                .is_some_and(|process| process.id == process_id)
+        }) else {
+            return;
+        };
+        let steps = self
+            .blocks
+            .iter()
+            .filter(|block| block.parent_process == Some(process_id))
+            .count();
+        if steps == 0 {
+            self.blocks.remove(index);
+            self.selected_block = self.selected_block.min(self.blocks.len().saturating_sub(1));
+            self.invalidate_transcript_layout_from(index);
+            return;
+        }
+        let block = &mut self.blocks[index];
+        if let Some(process) = block.process.as_mut() {
+            process.steps = steps;
+        }
+        block.invalidate_render();
+        self.invalidate_transcript_layout_from(index);
+    }
+
+    /// Folds the running turn's assistant text into the live card once its
+    /// response calls a tool: text from a tool-calling response is
+    /// intermediate, and only a response without tool calls is the turn's
+    /// final answer. The newest folded text becomes the card's narration.
+    fn fold_response_text(&mut self) {
+        if !self.folds_live_process(BlockKind::Tool) {
+            return;
+        }
+        let turn_start = self
+            .blocks
+            .iter()
+            .rposition(|block| block.kind == BlockKind::User)
+            .map_or(0, |index| index + 1);
+        let unfolded = |block: &DisplayBlock| {
+            block.kind == BlockKind::Assistant
+                && block.parent_process.is_none()
+                && !block.turn_result
+        };
+        if !self.blocks[turn_start..].iter().any(unfolded) {
+            return;
+        }
+        let process_id = self.ensure_live_process();
+        let mut first = None;
+        let mut latest = None;
+        for (index, block) in self.blocks.iter_mut().enumerate().skip(turn_start) {
+            if unfolded(block) {
+                block.parent_process = Some(process_id);
+                block.invalidate_render();
+                first.get_or_insert(index);
+                latest = Some(block.id);
+            }
+        }
+        if let Some(block_id) = latest {
+            self.live_narration = Some(LiveNarration {
+                block_id,
+                responses: 0,
+            });
+        }
+        if let Some(index) = first {
+            self.invalidate_transcript_layout_from(index);
+        }
+        self.refresh_live_process();
+    }
+
+    fn hide_narration(&mut self) {
+        if self.live_narration.take().is_some() {
+            self.refresh_live_process();
+        }
+    }
+
+    /// Counts completed responses since the narration's own; after
+    /// `PROCESS_NARRATION_RESPONSES` it leaves the card.
+    fn count_narration_response(&mut self) {
+        let Some(narration) = self.live_narration.as_mut() else {
+            return;
+        };
+        narration.responses += 1;
+        if narration.responses >= PROCESS_NARRATION_RESPONSES {
+            self.hide_narration();
+        }
     }
 
     fn append_or_push(&mut self, kind: BlockKind, title: &str, text: String, expanded: bool) {
