@@ -18,6 +18,16 @@ Examples:\n\n\
 {\"steps\": [{\"id\": \"tests\", \"exec\": \"bash://run\", \"input\": {\"script\": \"cargo test\"}, \"show\": \"errors\"}, {\"if\": \"not tests.ok\", \"read\": \"file://target/test.log\"}]}\n\n\
 {\"steps\": [{\"id\": \"issues\", \"exec\": \"github-mcp://tools/list_issues\", \"input\": {\"repo\": \"acme/api\"}, \"show\": \"none\"}, {\"for\": \"issue in issues.json.items\", \"max\": 20, \"if\": \"issue.comments > 0\", \"exec\": \"github-mcp://tools/get_issue\", \"input\": {\"repo\": \"acme/api\", \"number\": \"{{ issue.number }}\"}}]}";
 
+/// System-prompt fragment frozen into every new session created by
+/// non-interactive execute mode (`uri-agent -x`). See `src/execute.rs`.
+pub const EXECUTE_MODE_PROMPT: &str = "This session runs in non-interactive execute mode: the \
+prompt came from the command line and your final reply is returned to the caller. No one can \
+answer questions or approve actions during the run. State assumptions instead of asking, and \
+proceed with the task. Do not take the actions the operating rules say to ask about first, such \
+as modifying shared or external state or taking irreversible actions, unless this prompt \
+explicitly requests them; report what you would need in order to take them. Put the complete \
+answer in your final reply.";
+
 #[derive(Clone, Debug)]
 pub struct PromptEntry {
     pub name: String,
@@ -280,6 +290,21 @@ mod tests {
         {
             serde_json::from_str::<serde_json::Value>(example).expect("example is valid JSON");
         }
+    }
+
+    #[test]
+    fn execute_mode_fragment_states_non_interactive_constraints() {
+        assert!(
+            EXECUTE_MODE_PROMPT.starts_with("This session runs in non-interactive execute mode")
+        );
+        assert!(EXECUTE_MODE_PROMPT.contains("No one can answer questions or approve actions"));
+        assert!(EXECUTE_MODE_PROMPT.contains("State assumptions instead of asking"));
+        assert!(EXECUTE_MODE_PROMPT.contains("unless this prompt explicitly requests them"));
+        assert!(EXECUTE_MODE_PROMPT.contains("report what you would need"));
+        assert!(
+            !EXECUTE_MODE_PROMPT.contains('\n'),
+            "the fragment stays one prompt paragraph"
+        );
     }
 
     #[test]

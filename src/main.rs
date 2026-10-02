@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
     if cli.acpv1 {
         return uri_agent::acp::v1::serve(cli).await;
     }
+    let execute_prompt = uri_agent::execute::read_prompt(cli.execute.as_deref()).await?;
     let mut config = Config::load(cli).await?;
     let host = AgentHost::new(
         config.manager.clone(),
@@ -23,6 +24,9 @@ async fn main() -> Result<()> {
         config.cwd.clone(),
     )
     .await?;
+    if let Some(prompt) = execute_prompt {
+        return uri_agent::execute::run(&host, &config, &prompt).await;
+    }
     if config.background {
         return host.run_background().await;
     }

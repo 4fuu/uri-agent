@@ -156,6 +156,19 @@ pub struct Cli {
         conflicts_with_all = ["continue_session", "session", "cwd", "background"]
     )]
     pub acpv1: bool,
+
+    /// Run one non-interactive prompt turn and exit: print the final reply to
+    /// stdout and one-line progress to stderr. Without a value, read the prompt
+    /// from stdin; piped stdin is appended to a given prompt.
+    #[arg(
+        short = 'x',
+        long,
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "acpv1"
+    )]
+    pub execute: Option<String>,
 }
 
 pub struct Config {
@@ -2326,6 +2339,69 @@ mod tests {
                 arguments.push("value");
             }
             assert!(Cli::try_parse_from(arguments).is_err(), "{conflicting}");
+        }
+    }
+
+    #[test]
+    fn execute_cli_takes_an_optional_value_and_rejects_acpv1() {
+        assert_eq!(
+            Cli::try_parse_from(["uri-agent", "-x", "clean up"])
+                .unwrap()
+                .execute
+                .as_deref(),
+            Some("clean up")
+        );
+        assert_eq!(
+            Cli::try_parse_from(["uri-agent", "--execute=clean up"])
+                .unwrap()
+                .execute
+                .as_deref(),
+            Some("clean up")
+        );
+        assert_eq!(
+            Cli::try_parse_from(["uri-agent", "-x", "--offline"])
+                .unwrap()
+                .execute
+                .as_deref(),
+            Some(""),
+        );
+        assert_eq!(Cli::try_parse_from(["uri-agent"]).unwrap().execute, None);
+
+        for conflicting in [
+            vec!["uri-agent", "-x", "prompt", "--acpv1"],
+            vec!["uri-agent", "--acpv1", "-x"],
+        ] {
+            assert!(
+                Cli::try_parse_from(conflicting).is_err(),
+                "execute and acpv1 cannot combine"
+            );
+        }
+
+        let cli = Cli::try_parse_from([
+            "uri-agent",
+            "-x",
+            "prompt",
+            "--provider",
+            "example",
+            "--model",
+            "model",
+            "--thinking",
+            "high",
+            "--cwd",
+            ".",
+            "--offline",
+            "--api-key",
+            "key",
+            "--output-limit",
+            "4096",
+        ])
+        .unwrap();
+        assert_eq!(cli.execute.as_deref(), Some("prompt"));
+        for resumable in [
+            vec!["uri-agent", "-x", "prompt", "--continue-session"],
+            vec!["uri-agent", "-x", "prompt", "--session", "id"],
+        ] {
+            assert!(Cli::try_parse_from(resumable).is_ok());
         }
     }
 

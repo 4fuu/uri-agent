@@ -418,7 +418,38 @@ Notable modes are:
 - `--background` runs opted-in resident plugins under external supervision and
   does not daemonize or schedule jobs;
 - `--acpv1` serves ACP over stdin/stdout, with project directories supplied by
-  the client. See [ACP v1](acp.md).
+  the client. See [ACP v1](acp.md);
+- `-x "<prompt>"` or `--execute` runs one non-interactive turn and exits,
+  without the terminal interface. The final assistant reply goes to stdout;
+  one-line progress (tool calls starting and finishing, task changes, model
+  retries, notices, errors) goes to stderr, plain text with no ANSI escapes.
+  `--provider`, `--model`, `--thinking`, `--cwd`, `--offline`, `--api-key`,
+  and `--output-limit` apply as usual, and the flag cannot be combined with
+  `--acpv1`.
+
+The prompt for `-x` comes from the flag value, from stdin, or from both:
+
+```bash
+uri-agent -x "summarize the failing tests"
+cat error.log | uri-agent -x "explain this failure"
+uri-agent -x < prompt.txt
+```
+
+`-x` without a value reads the prompt from stdin; when stdin is piped and a
+prompt is also given, the piped text is appended after a blank line. An empty
+prompt is an error. The turn commits to the session like any other (the
+session id is printed on stderr when the run starts), so a later
+`uri-agent --continue-session` or `--session <ID>` reopens the conversation,
+and a resumed session can be continued with `-x` the same way. A run exits `0`
+when it prints a reply and non-zero when the turn fails, is cancelled with
+Ctrl-C, or ends without an answer; Ctrl-C cancels the turn and waits for it to
+settle before exiting.
+
+New sessions created by `-x` freeze an execute-mode system-prompt fragment
+that tells the model the run is non-interactive: it states assumptions
+instead of asking questions and leaves approval-requiring actions undone and
+reported unless the prompt explicitly requests them. Resumed sessions keep
+the startup context they froze when they were created.
 
 ## Custom providers and dynamic values
 
