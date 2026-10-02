@@ -17,7 +17,6 @@ const DOCUMENTS: &[(&str, &str)] = &[
     ("context.md", include_str!("../../docs/context.md")),
     ("development.md", include_str!("../../docs/development.md")),
     ("interface.md", include_str!("../../docs/interface.md")),
-    ("plugins.md", include_str!("../../docs/plugins.md")),
     ("protocols.md", include_str!("../../docs/protocols.md")),
     ("release.md", include_str!("../../docs/release.md")),
     ("sessions.md", include_str!("../../docs/sessions.md")),

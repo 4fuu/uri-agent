@@ -43,26 +43,10 @@ def main() -> None:
 
     replace_once("Cargo.toml", r'^version = "\d+\.\d+\.\d+"$', f'version = "{version}"')
     replace_once(
-        "Cargo.toml",
-        r'^(uri-agent-plugin-sdk = \{ version = ")=\d+\.\d+\.\d+(".*)$',
-        rf'\g<1>={version}\g<2>',
-    )
-    replace_once(
-        "sdk/Cargo.toml",
-        r'^version = "\d+\.\d+\.\d+"$',
-        f'version = "{version}"',
-    )
-    replace_once(
-        "sdk/README.md",
-        r'^(uri-agent-plugin-sdk = ")\d+\.\d+\.\d+("$)',
+        "Cargo.lock",
+        rf'^(name = "uri-agent"\nversion = ")\d+\.\d+\.\d+("$)',
         rf'\g<1>{version}\g<2>',
     )
-    for package in ("uri-agent", "uri-agent-plugin-sdk"):
-        replace_once(
-            "Cargo.lock",
-            rf'^(name = "{package}"\nversion = ")\d+\.\d+\.\d+("$)',
-            rf'\g<1>{version}\g<2>',
-        )
 
     subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -70,7 +54,7 @@ def main() -> None:
         stdout=subprocess.DEVNULL,
         check=True,
     )
-    print(f"Set URI Agent and plugin SDK versions to {version}")
+    print(f"Set URI Agent version to {version}")
 
 
 if __name__ == "__main__":

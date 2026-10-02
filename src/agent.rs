@@ -7,14 +7,12 @@ use crate::output::OutputStore;
 use crate::plugin::{
     CommandRegistry, ModelToolRegistry, PluginAgents, PluginHost, PluginRegistry, TuiRegistry,
 };
-use crate::plugin_state::{PLUGIN_STATE_DATABASE, PluginStateStore};
 use crate::prompts::PromptEntry;
 use crate::protocol::{ProtocolImage, ProtocolRegistry};
 use crate::runtime::{AgentRuntime, RuntimeInitializer, forward_task_notices};
 use crate::session::{EventKind, Session, SessionContext};
 use crate::skill::{SkillProtocol, SkillProtocolSource};
 use crate::task::TaskManager;
-use crate::wasm_plugin::WasmPluginManager;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -223,7 +221,6 @@ pub struct AgentServices {
     pub context_window: usize,
     pub model_ready: bool,
     plugins: Arc<PluginRegistry>,
-    wasm_plugins: WasmPluginManager,
 }
 
 impl AgentServices {
@@ -325,7 +322,6 @@ impl AgentHandle {
         if self.instance.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self.instance.services.wasm_plugins.shutdown().await;
         self.instance.services.runtime.shutdown().await;
         let _ = self.instance.services.plugins.shutdown().await;
         self.host
@@ -339,7 +335,6 @@ struct AgentHostInner {
     environment: Arc<AgentEnvironment>,
     catalog: Arc<ModelCatalog>,
     cwd: PathBuf,
-    plugin_state: PluginStateStore,
     active: Mutex<HashMap<String, Weak<AgentInstance>>>,
     open_lock: Mutex<()>,
 }
@@ -357,15 +352,12 @@ impl AgentHost {
         cwd: PathBuf,
     ) -> Result<Self> {
         let cwd = cwd.canonicalize()?;
-        let plugin_state =
-            PluginStateStore::open(manager.directory().join(PLUGIN_STATE_DATABASE), &cwd).await?;
         Ok(Self {
             inner: Arc::new(AgentHostInner {
                 manager,
                 environment,
                 catalog,
                 cwd,
-                plugin_state,
                 active: Mutex::new(HashMap::new()),
                 open_lock: Mutex::new(()),
             }),
@@ -530,7 +522,6 @@ impl AgentHost {
         if !private_record_owners.is_empty()
             && let Err(error) = services.runtime.prepare_context().await
         {
-            let _ = services.wasm_plugins.shutdown().await;
             services.runtime.shutdown().await;
             let _ = services.plugins.shutdown().await;
             return Err(error);
@@ -539,7 +530,6 @@ impl AgentHost {
             .persist_private_records(&private_record_owners)
             .await
         {
-            let _ = services.wasm_plugins.shutdown().await;
             services.runtime.shutdown().await;
             let _ = services.plugins.shutdown().await;
             return Err(error);
@@ -586,65 +576,6 @@ impl AgentHost {
         {
             active.remove(session_id);
         }
-    }
-
-    pub async fn run_background(&self) -> Result<()> {
-        let mut plugins = crate::builtins::plugins(&self.inner.cwd, self.inner.manager.directory());
-        let wasm_plugins =
-            WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
-        plugins.add(wasm_plugins.clone());
-
-        let active = self.inner.manager.current().await;
-        let output = Arc::new(OutputStore::new("background", active.output_limit).await?);
-        wasm_plugins.bind_output(output.clone())?;
-        let tasks = TaskManager::new();
-        let mut protocols = ProtocolRegistry::new(output, tasks);
-        let mut model_tools = ModelToolRegistry::new();
-        let mut commands = CommandRegistry::with_core_commands();
-        let mut tui = TuiRegistry::default();
-        plugins.install(
-            &mut PluginHost::new(
-                &mut protocols,
-                &mut model_tools,
-                &mut commands,
-                &mut tui,
-                self.inner.environment.clone(),
-            )
-            .with_credentials(self.inner.manager.clone())
-            .with_agents(PluginAgents::new(self.clone(), None))
-            .with_state(self.inner.plugin_state.clone()),
-        )?;
-        wasm_plugins.set_reserved_protocols(
-            protocols
-                .descriptors()
-                .into_iter()
-                .map(|descriptor| descriptor.name),
-        )?;
-        wasm_plugins.set_reserved_model_tools(
-            model_tools
-                .descriptors()
-                .into_iter()
-                .map(|descriptor| descriptor.name),
-        )?;
-        let protocols = Arc::new(protocols);
-        wasm_plugins.bind_host(Arc::downgrade(&protocols))?;
-
-        #[cfg(unix)]
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let result = plugins
-            .run_residents(async move {
-                #[cfg(unix)]
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = terminate.recv() => {}
-                }
-                #[cfg(not(unix))]
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await;
-        self.shutdown_all().await;
-        result
     }
 
     pub async fn shutdown_all(&self) {
@@ -758,9 +689,6 @@ impl AgentHost {
         if let Some(state) = &collaboration_state {
             plugins.add(CollaborationPlugin::new(state.clone()));
         }
-        let wasm_plugins =
-            WasmPluginManager::new(self.inner.manager.directory(), &self.inner.cwd).await?;
-        plugins.add(wasm_plugins.clone());
         if !session.is_new() {
             plugins.restore_session_protocol_records(&session.session_protocol_records().await)?;
         }
@@ -777,7 +705,6 @@ impl AgentHost {
             .for_session(&spec.provider, &spec.model, spec.thinking)
             .await?;
         let output = Arc::new(OutputStore::new(session.id(), active.output_limit).await?);
-        wasm_plugins.bind_output(output.clone())?;
         let mut protocols = ProtocolRegistry::new(output.clone(), tasks.clone());
         let mut model_tools = ModelToolRegistry::new();
         let mut commands = CommandRegistry::with_core_commands();
@@ -794,26 +721,16 @@ impl AgentHost {
             .with_agents(PluginAgents::new(
                 self.clone(),
                 Some(session.id().to_string()),
-            ))
-            .with_state(self.inner.plugin_state.clone()),
+            )),
         )?;
-        wasm_plugins.set_reserved_model_tools(
-            model_tools
-                .descriptors()
-                .into_iter()
-                .map(|descriptor| descriptor.name),
-        )?;
-        model_tools.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
         let skill_source = SkillProtocolSource::default();
         protocols.set_dynamic_source(Arc::new(skill_source.clone()))?;
-        protocols.set_dynamic_source(Arc::new(wasm_plugins.clone()))?;
         protocols
             .restore_help_read_names(session.successful_protocol_help_reads().await)
             .await;
         let protocols = Arc::new(protocols);
         let model_tools = Arc::new(model_tools);
         let plugins = Arc::new(plugins);
-        wasm_plugins.bind_host(Arc::downgrade(&protocols))?;
 
         let mut startup_notices = startup_notices;
         startup_notices.extend(self.inner.catalog.warnings().await);
@@ -851,7 +768,6 @@ impl AgentHost {
             protocols: protocols.clone(),
             model_tools: model_tools.clone(),
             skill_source,
-            wasm_plugins: wasm_plugins.clone(),
             startup_notices,
         });
         let runtime = Arc::new(AgentRuntime::new_deferred_with_context(
@@ -884,7 +800,6 @@ impl AgentHost {
             context_window,
             model_ready,
             plugins,
-            wasm_plugins,
         })
     }
 }
@@ -904,7 +819,6 @@ struct AgentInitializer {
     protocols: Arc<ProtocolRegistry>,
     model_tools: Arc<ModelToolRegistry>,
     skill_source: SkillProtocolSource,
-    wasm_plugins: WasmPluginManager,
     startup_notices: Vec<String>,
 }
 
@@ -991,23 +905,9 @@ impl RuntimeInitializer for AgentInitializer {
             }
             (skills, context.skills)
         };
-        let mut reserved = self.reserved_protocols.clone();
-        reserved.extend(skills.iter().map(|skill| skill.protocol_name().to_string()));
         self.skill_source.replace(skills);
-        self.wasm_plugins.set_reserved_protocols(reserved)?;
 
         let spec = self.session.spec().await;
-        let needs_dynamic = matches!(spec.tools, CapabilitySelection::Only(_))
-            || matches!(spec.protocols, CapabilitySelection::Only(_));
-        if needs_dynamic {
-            let report = self.wasm_plugins.initialize().await?;
-            if !report.diagnostics.is_empty() {
-                notices.push(format!(
-                    "skipped {} WASM plugin(s); call help([\"wasm_plugin\"]) for diagnostics",
-                    report.diagnostics.len()
-                ));
-            }
-        }
         self.model_tools.select(capability_names(&spec.tools))?;
         self.protocols.select(capability_names(&spec.protocols))?;
 
@@ -1027,23 +927,6 @@ impl RuntimeInitializer for AgentInitializer {
             self.session.context().await.system_prompt
         };
 
-        if !needs_dynamic {
-            let wasm_plugins = self.wasm_plugins.clone();
-            let session = self.session.clone();
-            tokio::spawn(async move {
-                let notice = match wasm_plugins.initialize().await {
-                    Ok(report) if !report.diagnostics.is_empty() => Some(format!(
-                        "skipped {} WASM plugin(s); call help([\"wasm_plugin\"]) for diagnostics",
-                        report.diagnostics.len()
-                    )),
-                    Ok(_) => None,
-                    Err(error) => Some(format!("WASM plugin initialization failed: {error:#}")),
-                };
-                if let Some(text) = notice {
-                    let _ = session.append(EventKind::Notice { text }).await;
-                }
-            });
-        }
         notices.extend(self.startup_notices.clone());
         for text in notices {
             self.session.append(EventKind::Notice { text }).await?;
@@ -1256,5 +1139,101 @@ mod tests {
             protocol_names,
         );
         reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn resumed_sessions_keep_help_reads_for_removed_protocols() {
+        // A session saved while a protocol such as `wasm_plugin` was
+        // registered must still resume once that protocol is no longer
+        // registered: restored help-read names are recorded verbatim and
+        // never validated against the current registry.
+        let workspace = tempfile::tempdir().unwrap();
+        let config_directory = workspace.path().join("config");
+        tokio::fs::create_dir_all(&config_directory).await.unwrap();
+        let manager = ConfigManager::load_for_test(&config_directory, workspace.path())
+            .await
+            .unwrap();
+        let environment = Arc::new(
+            crate::config::AgentEnvironment::load(&config_directory)
+                .await
+                .unwrap(),
+        );
+        let catalog = Arc::new(ModelCatalog::load(&config_directory, true).await.unwrap());
+        let host = AgentHost::new(
+            manager.clone(),
+            environment,
+            catalog,
+            workspace.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let initial = manager.current().await;
+        let spec = AgentSpec::root(
+            &initial.provider,
+            &initial.model,
+            initial.thinking,
+            workspace.path(),
+        );
+        let created = host.open_root(None, spec.clone()).await.unwrap();
+        created.services().runtime.prepare_context().await.unwrap();
+        created
+            .services()
+            .runtime
+            .session()
+            .append_batch(vec![
+                EventKind::ToolCall {
+                    call_id: "stale-help".to_string(),
+                    name: "help".to_string(),
+                    arguments: serde_json::json!({"protocols": ["context", "wasm_plugin"]}),
+                },
+                EventKind::ToolResult {
+                    call_id: "stale-help".to_string(),
+                    name: "help".to_string(),
+                    output: "loaded".to_string(),
+                    failed: false,
+                    protocol_help_required: false,
+                },
+            ])
+            .await
+            .unwrap();
+        created
+            .services()
+            .runtime
+            .session()
+            .persist()
+            .await
+            .unwrap();
+        let session_id = created.session_id().to_string();
+        created.close().await;
+
+        let resumed = host.open_root(Some(&session_id), spec).await.unwrap();
+        resumed.services().runtime.prepare_context().await.unwrap();
+        let restored = resumed
+            .services()
+            .runtime
+            .session()
+            .successful_protocol_help_reads()
+            .await;
+        assert!(restored.contains("wasm_plugin"));
+        assert!(restored.contains("context"));
+        // The still-registered protocol stays unlocked by its frozen read...
+        assert!(
+            resumed
+                .services()
+                .protocols
+                .read("context://notes", &serde_json::Map::new())
+                .await
+                .is_ok()
+        );
+        // ...while the removed protocol degrades to an unknown-protocol
+        // dispatch error instead of breaking the resumed session.
+        let error = resumed
+            .services()
+            .protocols
+            .read("wasm_plugin://help/load", &serde_json::Map::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown protocol"));
+        resumed.close().await;
     }
 }

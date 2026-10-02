@@ -532,25 +532,6 @@ impl ProtocolRegistry {
             .await
     }
 
-    pub(crate) async fn read_static(
-        &self,
-        uri: &str,
-        input: &Map<String, Value>,
-    ) -> Result<String> {
-        Ok(self
-            .dispatch_read(uri, input, false, false, false)
-            .await?
-            .output)
-    }
-
-    pub(crate) async fn exec_static(
-        &self,
-        uri: &str,
-        input: &Map<String, Value>,
-    ) -> Result<String> {
-        self.dispatch_exec(uri, input, false, false, false).await
-    }
-
     /// Input fields the named protocol executes verbatim; the `protocol`
     /// tool leaves `{{ reference }}` placeholders in them untouched. Unknown
     /// protocols report no literal fields.
@@ -1602,49 +1583,6 @@ mod tests {
                 .await
                 .unwrap(),
             "dependent"
-        );
-        let _ = tokio::fs::remove_dir_all(output_directory).await;
-    }
-
-    #[tokio::test]
-    async fn static_calls_bypass_the_help_gate() {
-        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
-        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
-        let output_directory = output.directory().to_path_buf();
-        let mut registry = ProtocolRegistry::new(output, TaskManager::new());
-        registry
-            .register(CaptureProtocol {
-                capture: Arc::new(Mutex::new(None)),
-            })
-            .unwrap();
-
-        assert!(
-            registry
-                .read("capture://value", &empty_input())
-                .await
-                .unwrap_err()
-                .downcast_ref::<ProtocolHelpRequired>()
-                .is_some()
-        );
-        registry
-            .read_static("capture://value", &empty_input())
-            .await
-            .unwrap();
-        registry
-            .exec_static("capture://run", &empty_input())
-            .await
-            .unwrap();
-        registry
-            .read_static("capture://help", &empty_input())
-            .await
-            .unwrap();
-        assert!(
-            registry
-                .read("capture://value", &empty_input())
-                .await
-                .unwrap_err()
-                .downcast_ref::<ProtocolHelpRequired>()
-                .is_some()
         );
         let _ = tokio::fs::remove_dir_all(output_directory).await;
     }

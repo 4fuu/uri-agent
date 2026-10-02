@@ -23,9 +23,6 @@ async fn main() -> Result<()> {
         config.cwd.clone(),
     )
     .await?;
-    if config.background {
-        return host.run_background().await;
-    }
     let mut terminal = TuiTerminal::new()?;
     let herdr = HerdrReporter::from_env();
     let moshi = MoshiReporter::from_env();

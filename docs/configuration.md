@@ -253,7 +253,6 @@ files already present in the new location are kept.
 | `<config>/models-dev.json` | Cached models.dev protocol hints for OpenCode discovery |
 | `<config>/keymap.rhai` | Global keymap overrides |
 | `<config>/mcp.json` | User-scoped MCP servers |
-| `<config>/wasm-plugins/` | Trusted WASM modules |
 | `<project>/.agents/mcp.json` | Project-scoped MCP servers |
 | `<project>/.uri-agent/settings.json` | Project settings |
 | `<project>/.uri-agent/keymap.rhai` | Project keymap overrides |
@@ -277,7 +276,7 @@ portable form `[A-Za-z_][A-Za-z0-9_]*`.
 Values are global, stored as plaintext in private `environment.json`, and
 injected into future Agent `bash` and `pwsh` commands. They override inherited
 variables with the same name but do not modify URI Agent's process or the
-user-controlled `:terminal` PTY. Trusted linked and WASM plugins must explicitly
+user-controlled `:terminal` PTY. Trusted linked plugins must explicitly
 declare whole-environment access before using the host interface.
 
 ## MCP servers
@@ -338,7 +337,6 @@ Global and project settings use camel-case JSON fields:
 | `defaultThinkingLevel` | Fallback reasoning effort | `off` |
 | `modelThinkingLevels` | Per-model effort by `provider/model` | `{}` |
 | `modelRoles` | Named model routes for plugins | `{}` |
-| `pluginSettings` | Plugin-owned values grouped by namespace | `{}` |
 | `terminal` | Command opened by `:terminal` | unset |
 | `keyDisplay` | `auto`, `macos`, or `text` hints | `auto` |
 | `layout` | `auto`, `wide`, or `compact` [conversation layout](interface.md#compact-layout) | `auto` |
@@ -377,16 +375,15 @@ per-model choice in `modelThinkingLevels`. `defaultThinkingLevel` is the file
 fallback, while `URI_AGENT_THINKING` and `--thinking` override it for one
 invocation.
 
-### Model roles and plugin settings
+### Model roles
 
 Every model role is declared by a plugin and resolved dynamically: `finder`
 backs the `finder://` delegated-search protocol described in
-[Protocols, tasks, and output](protocols.md#delegated-search), `title`
-generates terminal titles, and WASM plugins declare their own roles in the
-manifest. `:model-roles` lists declared roles even while unassigned and is the
-only way to configure them; assigning a model to `finder` registers the
-protocol for new depth-1 sessions. Global and project assignments are layered
-by complete role name:
+[Protocols, tasks, and output](protocols.md#delegated-search), and `title`
+generates terminal titles. `:model-roles` lists declared roles even while
+unassigned and is the only way to configure them; assigning a model to `finder`
+registers the protocol for new depth-1 sessions. Global and project assignments
+are layered by complete role name:
 
 ```json
 {
@@ -406,17 +403,12 @@ the model-specific choice and then the default. Plugins resolve roles
 dynamically without changing the conversation model; an Agent freezes its
 resolved provider, model, and effort after the first durable submission.
 
-`pluginSettings` is a separate, project-overridable JSON namespace for trusted
-plugin configuration. It is not a credential store or permission boundary.
-
 ## CLI modes
 
 Run `uri-agent --help` for current names, conflicts, and accepted values.
 Notable modes are:
 
 - native TUI session selection remains scoped to canonical `--cwd`;
-- `--background` runs opted-in resident plugins under external supervision and
-  does not daemonize or schedule jobs;
 - `--acpv1` serves ACP over stdin/stdout, with project directories supplied by
   the client. See [ACP v1](acp.md).
 

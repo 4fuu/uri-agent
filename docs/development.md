@@ -55,11 +55,8 @@ discovery.
 | `src/runtime.rs` | User turns, model/tool loop, retries, and checkpoint triggers |
 | `src/keymap.rs`, `src/terminal.rs` | Key bindings and embedded PTY behavior |
 | `src/tui.rs`, `src/tui/` | Conversation state, controllers, rendering, and UI tests |
-| `src/wasm_plugin.rs` | WASM discovery, ABI, permissions, and dynamic dispatch |
-| `src/plugin_state.rs` | Global and project plugin-state databases |
 | `src/process.rs`, `src/atomic_file.rs` | Process-tree and atomic-file primitives |
 | `src/tool_download.rs` | Pinned fallback downloads for plugin-managed tools |
-| `sdk/`, `examples/wasm-plugin/` | Guest ABI, SDK, and buildable example |
 
 Put behavior in the module that owns its state and contract. Add a helper or
 type only when it enforces a named invariant, removes real duplication, or
@@ -80,14 +77,13 @@ registry, and extension UI returns semantic state for generic panels, status,
 composer completion, or submission effects. Keep operational behavior in those
 registered interfaces rather than prompt prose.
 
-Environment, credentials, downloads, Agents, and separate plugin state require
-declared permissions. These are source-audit markers for trusted code, not
-interactive approval. Model roles and project-overridable plugin settings do
-not require permissions.
+Environment, credentials, downloads, and Agents require declared
+permissions. These are source-audit markers for trusted code, not
+interactive approval. Model roles do not require permissions.
 
 URI Agent links one fixed native dynamic library for first-party zvec retrieval.
-It is not a general native plugin ABI; third-party runtime extensions use the
-trusted [WASM path](plugins.md).
+It is not a general native plugin ABI; extension happens through the linked
+plugin declarations described here.
 
 ## Native retrieval assets
 
@@ -198,10 +194,6 @@ When changing a direct model tool, keep the schema strict, register it through
 the owning plugin, and test validation, dispatch, presentation, and failure
 paths. Do not add runtime branches for its name.
 
-WASM ABI changes require synchronized host, SDK, example, ABI version,
-compatibility tests, and plugin documentation. Reject unsupported versions
-explicitly rather than guessing compatibility.
-
 For session, Agent, model, Skill, ACP, or TUI changes, preserve the applicable
 contracts above and read the owning focused document before editing. Test both
 fresh and restored state when persistence is involved, and keyboard plus mouse
@@ -238,8 +230,6 @@ For documentation-only changes, verify instead:
 - [`docs/protocols.md`](protocols.md) owns cross-protocol, task, and output
   concepts; runtime help owns exact protocol syntax.
 - [`docs/context.md`](context.md) owns project instructions and Skills.
-- [`docs/plugins.md`](plugins.md) and [`sdk/README.md`](../sdk/README.md) own WASM
-  runtime and guest SDK usage.
 - [`docs/configuration.md`](configuration.md) owns models, authentication,
   settings, MCP configuration, and precedence; `uri-agent --help` owns exact
   CLI syntax.

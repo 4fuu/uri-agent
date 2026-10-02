@@ -1,9 +1,9 @@
 # Release process
 
-URI Agent and `uri-agent-plugin-sdk` share a calendar version in the form
-`YYYY.MDD.REVISION`, using the date in `Asia/Hong_Kong`. The month is not padded,
-the day is two digits, and the first release of a day uses revision zero. For
-example, `2026.823.0` is the first release on 2026-08-23.
+URI Agent versions use a calendar version in the form `YYYY.MDD.REVISION`,
+using the date in `Asia/Hong_Kong`. The month is not padded, the day is two
+digits, and the first release of a day uses revision zero. For example,
+`2026.823.0` is the first release on 2026-08-23.
 
 ## Prepare a release
 
@@ -20,15 +20,15 @@ cargo check
 Manually dispatch `release.yml` with the same version. Its date must match the
 current date in `Asia/Hong_Kong`.
 
-The workflow verifies again, publishes the SDK crate, builds Linux x86-64 and
-ARM64, Apple Silicon macOS, and 64-bit Windows archives, generates checksums,
-updates the Homebrew formula and Scoop manifest, commits package metadata to
-`main`, creates the GitHub release, and tests all installation paths. It aborts
-if `main` moves while the jobs run.
+The workflow verifies again, builds Linux x86-64 and ARM64, Apple Silicon
+macOS, and 64-bit Windows archives, generates checksums, updates the Homebrew
+formula and Scoop manifest, commits package metadata to `main`, creates the
+GitHub release, and tests all installation paths. It aborts if `main` moves
+while the jobs run.
 
-The application crate has `publish = false`. Release archives are the supported
-distribution unit because the executable requires matched native retrieval
-assets.
+The application crate has `publish = false` and no crate is published; release
+archives are the supported distribution unit because the executable requires
+matched native retrieval assets.
 
 ## Bundled retrieval runtime
 

@@ -13,7 +13,6 @@ pub mod moshi;
 pub mod oauth;
 pub mod output;
 pub mod plugin;
-pub mod plugin_state;
 mod process;
 pub mod prompts;
 pub mod protocol;
@@ -27,7 +26,6 @@ mod text_metrics;
 mod tool_download;
 pub mod tui;
 mod update;
-pub mod wasm_plugin;
 
 /// Lowercase hexadecimal encoding for digest and checksum bytes.
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {

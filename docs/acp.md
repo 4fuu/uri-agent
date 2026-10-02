@@ -20,10 +20,9 @@ uri-agent --acpv1
 ```
 
 `--acpv1` reserves stdout for ACP JSON-RPC and does not initialize the terminal
-interface or background resident mode. It conflicts with `--cwd`,
-`--continue-session`, `--session`, and `--background`; the ACP request supplies
-the session working directory. Model, provider, thinking, credential, catalog,
-offline, and output-limit overrides remain available.
+interface. It conflicts with `--cwd`, `--continue-session`, and `--session`; the
+ACP request supplies the session working directory. Model, provider, thinking,
+credential, catalog, offline, and output-limit overrides remain available.
 
 Each newline-delimited JSON-RPC message on stdin is limited to 16 MiB. URI
 Agent closes the ACP transport if a client exceeds that limit.

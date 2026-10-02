@@ -232,8 +232,8 @@ mod tests {
                     description: "Read.".to_string(),
                 },
                 PromptEntry {
-                    name: "a-wasm-tool".to_string(),
-                    description: "Dynamic.".to_string(),
+                    name: "a-dynamic-tool".to_string(),
+                    description: "Linked.".to_string(),
                 },
             ],
             &[],
@@ -243,7 +243,7 @@ mod tests {
         let positions = ["- help:", "- protocol:", "- replace:", "- apply_patch:"]
             .map(|marker| prompt.find(marker).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(prompt.find("- apply_patch:").unwrap() < prompt.find("- a-wasm-tool:").unwrap());
+        assert!(prompt.find("- apply_patch:").unwrap() < prompt.find("- a-dynamic-tool:").unwrap());
         assert!(prompt.contains(
             "- Edit files with replace for one exact change and apply_patch for several hunks or \
              files, not with shell commands"

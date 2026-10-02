@@ -28,7 +28,7 @@ substituted.
 Capabilities with a small input surface are registered as protocols and
 publish their operational instructions through the `help` tool. Prefer a typed
 direct tool for complex or escape-heavy arguments. All model tools are
-registered by linked or WASM plugins; do not special-case tool names in the
+registered by linked plugins; do not special-case tool names in the
 runtime or place every capability in the initial system prompt.
 
 ## Read before changing
@@ -40,7 +40,6 @@ Before changing code, read the applicable repository map, change rules, and veri
 | ACP v1 transport, session lifecycle, content mapping, MCP handoff | [`docs/acp.md`](docs/acp.md) |
 | Protocol routing, built-ins, tasks, output | [`docs/protocols.md`](docs/protocols.md) |
 | Project instructions, Skills, frozen startup context | [`docs/context.md`](docs/context.md) |
-| WASM installation, reload, ABI, permissions, SDK | [`docs/plugins.md`](docs/plugins.md) |
 | Models, authentication, configuration, CLI overrides, custom providers | [`docs/configuration.md`](docs/configuration.md) |
 | Conversation UI, composer, commands, navigation | [`docs/interface.md`](docs/interface.md) |
 | Keymaps, embedded terminal, selection, attachments | [`docs/terminal.md`](docs/terminal.md) |

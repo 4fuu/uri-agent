@@ -44,8 +44,8 @@ Agents. See [ACP v1](acp.md#project-and-session-lifecycle).
 
 ## AgentHost and Agent specifications
 
-Each project runtime owns one `AgentHost`. The TUI, linked and WASM plugins,
-child Agents, and resident plugins use the same persisted Agent runtime.
+Each project runtime owns one `AgentHost`. The TUI, linked plugins, and
+child Agents use the same persisted Agent runtime.
 
 An `AgentSpec` selects provider, model, thinking effort, working directory,
 parent session, system-prompt mode (`inherit`, `append`, or `replace`), exact or
@@ -108,7 +108,7 @@ A model turn that is running, or queued input waiting to start one, reports `wor
 
 A second display source publishes the terminal title the interface applies (the terminal-title plugin in [Terminal interface](interface.md) generates it after the first prompt): the pane's agent entry is renamed to the title and the same text is exposed as Herdr's `$summary` token for sidebar rows. The rename is tied to the lifecycle source, and session switches or process exit retract it.
 
-Reporting is best effort and never blocks the conversation: a missing or older Herdr only means missing reports. Process exit releases the reporting source so Herdr stops tracking the pane. The integration stays inactive outside Herdr panes, and ACP mode, background resident mode, and depth-2 child Agents never report.
+Reporting is best effort and never blocks the conversation: a missing or older Herdr only means missing reports. Process exit releases the reporting source so Herdr stops tracking the pane. The integration stays inactive outside Herdr panes, and ACP mode and depth-2 child Agents never report.
 
 ## Moshi reporting
 
@@ -122,7 +122,7 @@ The Moshi event API rejects `source: "uri-agent"`. The reporter therefore sends 
 
 The daemon acks every accepted frame. That ack is not a phone notification, and a successful upload is not written to the default hook log: the publish line is debug-only. A missing log line after an ack means the frame was accepted, not that reporting failed. A rejection is a warning. Session switches move reporting and rebind the pane to the newly visible session without ending the previous conversation. Process exit closes every session whose inbox row was opened.
 
-Reporting is best effort and never blocks the conversation. A line that was written counts as delivered even if the daemon never acks; socket failures back off for thirty seconds and drop frames rather than retrying. Like Herdr reporting, ACP mode, background resident mode, and depth-2 child Agents never report.
+Reporting is best effort and never blocks the conversation. A line that was written counts as delivered even if the daemon never acks; socket failures back off for thirty seconds and drop frames rather than retrying. Like Herdr reporting, ACP mode and depth-2 child Agents never report.
 
 ## Frozen startup context
 

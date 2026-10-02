@@ -104,7 +104,7 @@ Routing is deliberately generic:
 
 The registry does not parse protocol-specific paths or input fields. Protocol
 names are unique, and duplicate registration fails rather than replacing an
-existing capability. Runtime-loaded WASM plugins may add typed direct tools.
+existing capability.
 
 ## Built-in capabilities
 
@@ -119,7 +119,6 @@ existing capability. Runtime-loaded WASM plugins may add typed direct tools.
 | `finder` | `exec` | Delegate a multi-step lookup to a finder Agent and return its final answer |
 | `tasks` | `read`, `exec` | Inspect, wait for, feed input to, and cancel managed work |
 | `bash` or `pwsh` | `read`, `exec` | Run shell commands, optionally with runtime input |
-| `wasm_plugin` | `read`, `exec` | Inspect and reload trusted WASM plugins |
 | `<name>-skill` | `read` | Load a discovered [Skill](context.md#skills) and its resources |
 | `mcp` | `read` | Load shared MCP routing and argument help |
 | `<name>-mcp` | `read`, `exec` | Use one configured MCP server |
@@ -303,7 +302,7 @@ single `tasks://` read instruction instead of polling or rerunning the work.
 When a tool result exceeds the configured inline limit, URI Agent stores the
 complete bytes under the session output directory and returns a readable
 head-and-tail preview with a `file://` address. This applies to protocol calls,
-WASM tools, and formatted failures.
+typed tools, and formatted failures.
 
 Each session output directory also contains `diagnostics.jsonl`. Diagnostics
 record lifecycle metadata such as call IDs, field names and sizes, timing,
@@ -316,7 +315,6 @@ limit.
 
 Use a protocol when a capability has a simple string input and a typed direct
 tool when common calls would otherwise require complex or escape-heavy nested
-serialization. Linked Rust extensions and trusted WASM modules can register
-both; Skills register read-only protocols. See [WASM plugins](plugins.md),
-[Startup context and Skills](context.md), and the [development
-guide](development.md#linked-rust-extensions).
+serialization. Linked Rust extensions can register both; Skills register
+read-only protocols. See [Startup context and Skills](context.md) and the
+[development guide](development.md#linked-rust-extensions).

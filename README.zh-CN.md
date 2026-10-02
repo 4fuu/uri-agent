@@ -19,17 +19,17 @@ replace(path: string, old_text: string, new_text: string)
 apply_patch(patch: string)
 ```
 
-`help` 按需加载协议契约。`protocol` 工具接收一到八个步骤对象，每个步骤带有一个 `read` 或 `exec` URI 地址和可选的 `input` 对象，并经 URI 协议路由；后续步骤可以引用先前步骤的结果。结构复杂或需要大量转义的参数由有类型工具处理。可信 WASM 插件可以在运行时添加协议和有类型工具。
+`help` 按需加载协议契约。`protocol` 工具接收一到八个步骤对象，每个步骤带有一个 `read` 或 `exec` URI 地址和可选的 `input` 对象，并经 URI 协议路由；后续步骤可以引用先前步骤的结果。结构复杂或需要大量转义的参数由有类型工具处理。
 
 > [!WARNING]
-> URI Agent 不提供沙箱。文件与 Shell 协议以及已启用的 WASM 插件都拥有 `uri-agent` 进程的用户权限。请只使用可信的项目、配置和插件。
+> URI Agent 不提供沙箱。文件与 Shell 协议都拥有 `uri-agent` 进程的用户权限。请只使用可信的项目、配置和插件。
 
 URI Agent 仍处于早期发布阶段，不同日期版本之间可能发生变化。模型请求及其上下文会发送给你选择的模型服务商；除非启用离线模式，URI Agent 还会从 pi.dev 和受支持的服务商获取模型目录元数据。
 
 ## 为什么使用 URI Agent
 
 - **渐进式上下文：**仅在需要时加载协议契约、Skill 资源、内置文档和超长输出。
-- **可扩展工具：**通过内置 Rust 插件和可信 WASM 插件添加协议或有类型工具，无需修改运行时分发逻辑。
+- **可扩展工具：**通过内置 Rust 插件添加协议或有类型工具，无需修改运行时分发逻辑。
 - **内置 MCP 桥接：**使用 `:mcp` 连接 stdio 和 Streamable HTTP 服务器。每个服务器都会成为按需加载的 `<name>-mcp://` 协议；工具参数以步骤的 `input` 对象原样透传。
 - **ACP 编辑器集成：**通过稳定的 ACP v1 stdio 接口，在兼容的编辑器中使用 URI Agent。每个会话都能选择模型，对话之后还可以在普通 TUI 中重新打开。
 - **广泛模型支持：**直接在模型选择器中使用 pi.dev 目录、模型服务商专属登录和账户模型实时发现。
@@ -138,7 +138,6 @@ uri-agent --acpv1
 | 恢复会话，或了解协作、笔记、上下文滚动与持久化 | [Sessions and context](docs/sessions.md) |
 | 在 Herdr 终端复用器中上报面板状态 | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
 | 通过 moshi-hook 向 Moshi 应用上报会话生命周期 | [Moshi reporting](docs/sessions.md#moshi-reporting) |
-| 构建或审计扩展 | [WASM plugins](docs/plugins.md) |
 
 [`docs/` 索引](docs/README.md)还包含开发与发布文档。程序运行时，协议支持的 URI 和 `input` 字段以 `help` 工具加载的协议帮助页为准；当前生效的界面说明以 `F1` 和 `:help` 为准。
 

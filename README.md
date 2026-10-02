@@ -28,12 +28,12 @@ apply_patch(patch: string)
 eight step objects, each with a `read` or `exec` URI address and an optional
 `input` object, and routes them through URI protocols; later steps can
 reference earlier results. Typed tools handle structured or escape-heavy
-arguments. Trusted WASM plugins can add protocols and typed tools at runtime.
+arguments.
 
 > [!WARNING]
-> URI Agent is not a sandbox. File and shell protocols, and enabled WASM
-> plugins, run with the authority of the `uri-agent` process. Use only projects,
-> configuration, and plugins you trust.
+> URI Agent is not a sandbox. File and shell protocols run with the authority
+> of the `uri-agent` process. Use only projects, configuration, and plugins
+> you trust.
 
 URI Agent is an early release and may change between dated versions. Model
 requests and their context are sent to the provider you select. Unless offline
@@ -45,7 +45,7 @@ supported providers.
 - **Progressive context:** load protocol contracts, Skill resources, embedded
   documentation, and oversized output only when they are needed.
 - **Extensible tools:** add protocols or typed tools through linked Rust plugins
-  and trusted WASM plugins without changing runtime dispatch.
+  without changing runtime dispatch.
 - **Built-in MCP bridge:** connect stdio and Streamable HTTP servers with
   `:mcp`. Each server becomes an on-demand `<name>-mcp://` protocol, with
   tool arguments passed through as the step's `input` object unchanged.
@@ -196,7 +196,6 @@ lifecycle operations, and ownership constraints.
 | Resume sessions or understand collaboration, notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
 | Report pane state to the Herdr terminal multiplexer | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
 | Notify the Moshi app of session lifecycle over moshi-hook | [Moshi reporting](docs/sessions.md#moshi-reporting) |
-| Build or audit an extension | [WASM plugins](docs/plugins.md) |
 
 The [`docs/` index](docs/README.md) includes contributor and release guides. At
 runtime, a protocol's page loaded through the `help` tool is the authoritative

@@ -9,7 +9,6 @@ The root [README](../README.md) explains what URI Agent is and provides the shor
 | Connect an editor or other ACP client, manage ACP sessions, or supply session-scoped MCP servers | [ACP v1](acp.md) |
 | Understand the `protocol` tool, direct tools, protocol routing, MCP operations, built-ins, tasks, or output preservation | [Protocols, tasks, and output](protocols.md) |
 | Understand project instructions, or create and troubleshoot a Skill | [Startup context and Skills](context.md) |
-| Build, install, reload, or audit a trusted WASM plugin | [WASM plugins](plugins.md) |
 | Configure a model, credentials, MCP server, Agent environment variables, reasoning effort, output limits, offline mode, or a custom endpoint | [Models and configuration](configuration.md) |
 | Use the conversation, composer, commands, MCP manager, and navigation | [Terminal interface](interface.md) |
 | Customize keys, use the embedded terminal, copy text, or attach images | [Keymaps, terminal, and attachments](terminal.md) |
@@ -24,7 +23,6 @@ These documents explain stable concepts and cross-cutting behavior. More specifi
 - `uri-agent --help` defines the current command-line interface.
 - The active model-tool schemas define direct-tool arguments; a protocol's page loaded through the `help` tool defines its accepted addresses, `input` fields, execution behavior, result routes, and limits.
 - `uri-agent-docs://README.md` exposes this documentation embedded in the running binary, independent of its startup working directory.
-- The `wasm_plugin` help page publishes active WASM plugin state and routes to separate loading and authoring help pages.
 - `F1` and `:help` show the active command and keymap reference after global and project overrides are applied.
 - The [pi model catalog](https://github.com/earendil-works/pi) plus local `models.json` defines the available providers and models.
 - [`AGENTS.md`](../AGENTS.md) is the concise entry point for coding agents; the [development guide](development.md) contains the detailed repository rules it references.

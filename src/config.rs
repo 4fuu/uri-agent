@@ -146,15 +146,8 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub cwd: Option<PathBuf>,
 
-    /// Run resident plugin callbacks without starting the terminal interface.
-    #[arg(long, conflicts_with_all = ["continue_session", "session"])]
-    pub background: bool,
-
     /// Serve stable Agent Client Protocol v1 over stdin/stdout.
-    #[arg(
-        long,
-        conflicts_with_all = ["continue_session", "session", "cwd", "background"]
-    )]
+    #[arg(long, conflicts_with_all = ["continue_session", "session", "cwd"])]
     pub acpv1: bool,
 }
 
@@ -164,7 +157,6 @@ pub struct Config {
     pub catalog: Arc<ModelCatalog>,
     pub session: SessionChoice,
     pub cwd: PathBuf,
-    pub background: bool,
 }
 
 impl Config {
@@ -211,7 +203,6 @@ impl Config {
             catalog,
             session,
             cwd,
-            background: cli.background,
         })
     }
 }
@@ -321,8 +312,6 @@ struct SettingsFile {
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_roles: BTreeMap<String, ModelRoleConfig>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    plugin_settings: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -584,7 +573,7 @@ impl ConfigManager {
         self.active.read().await.clone()
     }
 
-    /// Resolve a configured model role for a linked or WASM plugin. Project
+    /// Resolve a configured model role for a linked plugin. Project
     /// settings override a same-named global role. Role lookup is dynamic and
     /// does not change the active conversation model.
     pub async fn model_role(&self, name: &str) -> Result<Option<ModelRole>> {
@@ -672,86 +661,6 @@ impl ConfigManager {
             });
         }
         Ok(roles)
-    }
-
-    /// Read one project-overridable value from a plugin-owned settings
-    /// namespace. Plugin settings are independent from model-role routes.
-    pub async fn plugin_setting(&self, plugin: &str, key: &str) -> Result<Option<Value>> {
-        validate_plugin_setting_name("plugin", plugin)?;
-        validate_plugin_setting_name("plugin setting key", key)?;
-        let files = self.files.lock().await;
-        Ok(files
-            .project
-            .plugin_settings
-            .get(plugin)
-            .and_then(|settings| settings.get(key))
-            .or_else(|| {
-                files
-                    .global
-                    .plugin_settings
-                    .get(plugin)
-                    .and_then(|settings| settings.get(key))
-            })
-            .cloned())
-    }
-
-    /// Persist one value in a plugin-owned settings namespace. The value is
-    /// written to the project file when that file already exists, matching
-    /// other interactive settings.
-    pub async fn set_plugin_setting(&self, plugin: &str, key: &str, value: Value) -> Result<()> {
-        validate_plugin_setting_name("plugin", plugin)?;
-        validate_plugin_setting_name("plugin setting key", key)?;
-        if serde_json::to_vec(&value)?.len() > 1024 * 1024 {
-            bail!("plugin setting value exceeds 1 MiB");
-        }
-        let mut files = self.files.lock().await;
-        let (settings, path) = if path_entry_exists(&self.project_path) {
-            (&mut files.project, self.project_path.clone())
-        } else {
-            (&mut files.global, self.settings_path())
-        };
-        settings
-            .plugin_settings
-            .entry(plugin.to_string())
-            .or_default()
-            .insert(key.to_string(), value);
-        write_json(&path, settings, false).await
-    }
-
-    pub async fn remove_plugin_setting(&self, plugin: &str, key: &str) -> Result<bool> {
-        validate_plugin_setting_name("plugin", plugin)?;
-        validate_plugin_setting_name("plugin setting key", key)?;
-        let mut files = self.files.lock().await;
-        let (settings, path) = if files
-            .project
-            .plugin_settings
-            .get(plugin)
-            .is_some_and(|settings| settings.contains_key(key))
-        {
-            (&mut files.project, self.project_path.clone())
-        } else if files
-            .global
-            .plugin_settings
-            .get(plugin)
-            .is_some_and(|settings| settings.contains_key(key))
-        {
-            (&mut files.global, self.settings_path())
-        } else {
-            return Ok(false);
-        };
-        let plugin_is_empty =
-            settings
-                .plugin_settings
-                .get_mut(plugin)
-                .is_some_and(|plugin_settings| {
-                    plugin_settings.remove(key);
-                    plugin_settings.is_empty()
-                });
-        if plugin_is_empty {
-            settings.plugin_settings.remove(plugin);
-        }
-        write_json(&path, settings, false).await?;
-        Ok(true)
     }
 
     /// Return catalog providers that currently have a configured model
@@ -1821,18 +1730,6 @@ pub fn validate_model_role_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_plugin_setting_name(kind: &str, name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 128
-        || name
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '.' | '/' | '\\'))
-    {
-        bail!("invalid {kind} {name:?}");
-    }
-    Ok(())
-}
-
 static COMMAND_VALUE_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub(crate) async fn resolve_config_value(
@@ -2320,7 +2217,7 @@ mod tests {
         assert_eq!(cli.provider.as_deref(), Some("example"));
         assert_eq!(cli.model.as_deref(), Some("model"));
 
-        for conflicting in ["--continue-session", "--session", "--cwd", "--background"] {
+        for conflicting in ["--continue-session", "--session", "--cwd"] {
             let mut arguments = vec!["uri-agent", "--acpv1", conflicting];
             if matches!(conflicting, "--session" | "--cwd") {
                 arguments.push("value");
@@ -2755,7 +2652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_roles_and_plugin_settings_use_project_precedence() {
+    async fn declared_model_roles_are_listed_and_resolved_by_name() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("config");
         let project = root.path().join("project");
@@ -2771,13 +2668,7 @@ mod tests {
         .unwrap();
         fs::write(
             directory.join("settings.json"),
-            br#"{"defaultProvider":"example","defaultModel":"active-model","modelRoles":{"review":{"provider":"example","model":"custom-model"}},"pluginSettings":{"terminal-title":{"role":"small","format":{"words":5}}}}"#,
-        )
-        .await
-        .unwrap();
-        fs::write(
-            project.join(".uri-agent/settings.json"),
-            br#"{"pluginSettings":{"terminal-title":{"role":"large"}}}"#,
+            br#"{"defaultProvider":"example","defaultModel":"active-model","modelRoles":{"review":{"provider":"example","model":"custom-model"}}}"#,
         )
         .await
         .unwrap();
@@ -2785,20 +2676,6 @@ mod tests {
         let manager = ConfigManager::load_for_test(&directory, &project)
             .await
             .unwrap();
-        assert_eq!(
-            manager
-                .plugin_setting("terminal-title", "role")
-                .await
-                .unwrap(),
-            Some(Value::String("large".to_string()))
-        );
-        assert_eq!(
-            manager
-                .plugin_setting("terminal-title", "format")
-                .await
-                .unwrap(),
-            Some(serde_json::json!({"words": 5}))
-        );
 
         manager
             .set_model_role("title", "example", "custom-model", ThinkingLevel::Off)
@@ -2817,50 +2694,8 @@ mod tests {
         // A configured name that no plugin declares stays resolvable by name
         // but never appears in the listed roles.
         assert!(manager.model_role("review").await.unwrap().is_some());
-        manager
-            .set_plugin_setting("terminal-title", "role", Value::String("title".to_string()))
-            .await
-            .unwrap();
-        assert_eq!(
-            manager
-                .plugin_setting("terminal-title", "role")
-                .await
-                .unwrap(),
-            Some(Value::String("title".to_string()))
-        );
         assert!(manager.remove_model_role("title").await.unwrap());
         assert_eq!(manager.model_role("title").await.unwrap(), None);
-        assert_eq!(
-            manager
-                .plugin_setting("terminal-title", "role")
-                .await
-                .unwrap(),
-            Some(Value::String("title".to_string()))
-        );
-
-        let project_settings: Value = serde_json::from_slice(
-            &fs::read(project.join(".uri-agent/settings.json"))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            project_settings["pluginSettings"]["terminal-title"]["role"],
-            "title"
-        );
-        assert!(
-            manager
-                .remove_plugin_setting("terminal-title", "role")
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            manager
-                .plugin_setting("terminal-title", "role")
-                .await
-                .unwrap(),
-            Some(Value::String("small".to_string()))
-        );
     }
 
     #[tokio::test]
@@ -3852,7 +3687,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let old = root.path().join("Application Support").join("uri-agent");
         let new = root.path().join(".config").join("uri-agent");
-        fs::create_dir_all(old.join("wasm-plugins")).await.unwrap();
+        fs::create_dir_all(old.join("cache")).await.unwrap();
         fs::write(old.join("settings.json"), "{}\n").await.unwrap();
         fs::write(old.join("auth.json"), "{\"providers\":{}}\n")
             .await
@@ -3861,7 +3696,7 @@ mod tests {
         fs::write(old.join("sessions-v2.db-wal"), b"wal")
             .await
             .unwrap();
-        fs::write(old.join("wasm-plugins").join("demo.wasm"), b"wasm")
+        fs::write(old.join("cache").join("demo.bin"), b"cached")
             .await
             .unwrap();
 
@@ -3878,10 +3713,8 @@ mod tests {
             b"wal"
         );
         assert_eq!(
-            fs::read(new.join("wasm-plugins").join("demo.wasm"))
-                .await
-                .unwrap(),
-            b"wasm"
+            fs::read(new.join("cache").join("demo.bin")).await.unwrap(),
+            b"cached"
         );
         assert!(!old.exists());
     }

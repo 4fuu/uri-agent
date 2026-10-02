@@ -1,6 +1,5 @@
 use crate::agent::{AgentHandle, AgentHost, AgentSpec, CompactionCallback};
 use crate::config::{AgentEnvironment, ConfigManager, ModelRole, validate_model_role_name};
-use crate::plugin_state::{PluginState, PluginStateScope, PluginStateStore};
 use crate::protocol::{
     ProtocolDescriptor, ProtocolImage, ProtocolRegistry, validate_descriptor,
     validate_help_dependencies,
@@ -13,16 +12,10 @@ use rig::completion::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
 use tokio::sync::Notify;
-use tokio::time::Instant;
-
-const RESIDENT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(60);
-const MIN_RESIDENT_WAKE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreCommand {
@@ -776,15 +769,9 @@ pub trait ModelTool: Send + Sync {
     ) -> Result<ModelToolOutput>;
 }
 
-pub trait DynamicModelToolSource: Send + Sync {
-    fn descriptors(&self) -> Vec<ModelToolDescriptor>;
-    fn tool(&self, name: &str) -> Option<Arc<dyn ModelTool>>;
-}
-
 #[derive(Default)]
 pub struct ModelToolRegistry {
     tools: BTreeMap<String, Arc<dyn ModelTool>>,
-    dynamic: Option<Arc<dyn DynamicModelToolSource>>,
     allowed: RwLock<Option<HashSet<String>>>,
 }
 
@@ -804,24 +791,6 @@ impl ModelToolRegistry {
             bail!("model tool name is already registered: {}", descriptor.name);
         }
         self.tools.insert(descriptor.name, tool);
-        Ok(())
-    }
-
-    pub fn set_dynamic_source(&mut self, source: Arc<dyn DynamicModelToolSource>) -> Result<()> {
-        if self.dynamic.is_some() {
-            bail!("dynamic model tool source is already registered");
-        }
-        let mut names = HashSet::new();
-        for descriptor in source.descriptors() {
-            validate_model_tool_descriptor(&descriptor)?;
-            if self.tools.contains_key(&descriptor.name) || !names.insert(descriptor.name.clone()) {
-                bail!(
-                    "dynamic model tool name is already registered: {}",
-                    descriptor.name
-                );
-            }
-        }
-        self.dynamic = Some(source);
         Ok(())
     }
 
@@ -853,15 +822,10 @@ impl ModelToolRegistry {
     }
 
     fn all_descriptors(&self) -> Vec<ModelToolDescriptor> {
-        let mut descriptors = self
-            .tools
+        self.tools
             .values()
             .map(|tool| tool.descriptor())
-            .collect::<Vec<_>>();
-        if let Some(dynamic) = &self.dynamic {
-            descriptors.extend(dynamic.descriptors());
-        }
-        descriptors
+            .collect::<Vec<_>>()
     }
 
     pub(crate) fn descriptors_for(
@@ -919,8 +883,7 @@ impl ModelToolRegistry {
             .tools
             .get(name)
             .cloned()
-            .or_else(|| self.dynamic.as_ref().and_then(|source| source.tool(name)));
-        let tool = tool.ok_or_else(|| unknown_model_tool(name, protocols))?;
+            .ok_or_else(|| unknown_model_tool(name, protocols))?;
         tool.execute(arguments, protocols).await
     }
 }
@@ -1022,8 +985,6 @@ pub enum PluginPermission {
     /// This declaration is an audit marker for trusted plugin code, not an
     /// interactive approval boundary.
     Agents,
-    /// Read and write the plugin's separate persistent state namespace.
-    State,
 }
 
 #[derive(Clone)]
@@ -1080,39 +1041,6 @@ impl PluginModelRoleResolver {
 
     pub async fn resolve(&self, name: &str) -> Result<Option<ModelRole>> {
         self.manager.model_role(name).await
-    }
-}
-
-#[derive(Clone)]
-pub struct PluginSettings {
-    manager: Arc<ConfigManager>,
-    plugin: String,
-}
-
-impl PluginSettings {
-    pub(crate) fn new(manager: Arc<ConfigManager>, plugin: impl Into<String>) -> Self {
-        Self {
-            manager,
-            plugin: plugin.into(),
-        }
-    }
-
-    pub async fn get(&self, key: &str) -> Result<Option<Value>> {
-        self.manager.plugin_setting(&self.plugin, key).await
-    }
-
-    pub async fn set(&self, key: &str, value: Value) -> Result<()> {
-        self.manager
-            .set_plugin_setting(&self.plugin, key, value)
-            .await
-    }
-
-    pub async fn remove(&self, key: &str) -> Result<bool> {
-        self.manager.remove_plugin_setting(&self.plugin, key).await
-    }
-
-    pub(crate) fn scoped(&self, plugin: impl Into<String>) -> Self {
-        Self::new(self.manager.clone(), plugin)
     }
 }
 
@@ -1189,7 +1117,6 @@ pub struct PluginHost<'a> {
     environment: Arc<AgentEnvironment>,
     credentials: Option<Arc<ConfigManager>>,
     agents: Option<PluginAgents>,
-    state: Option<PluginStateStore>,
     downloads: PluginDownloads,
     permissions: HashSet<PluginPermission>,
 }
@@ -1210,7 +1137,6 @@ impl<'a> PluginHost<'a> {
             environment,
             credentials: None,
             agents: None,
-            state: None,
             downloads: PluginDownloads::new(),
             permissions: HashSet::new(),
         }
@@ -1224,12 +1150,6 @@ impl<'a> PluginHost<'a> {
     #[doc(hidden)]
     pub fn with_agents(mut self, agents: PluginAgents) -> Self {
         self.agents = Some(agents);
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn with_state(mut self, state: PluginStateStore) -> Self {
-        self.state = Some(state);
         self
     }
 
@@ -1259,14 +1179,6 @@ impl<'a> PluginHost<'a> {
         Ok(PluginModelRoleResolver::new(manager))
     }
 
-    pub fn settings(&self, plugin: impl Into<String>) -> Result<PluginSettings> {
-        let manager = self
-            .credentials
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("plugin settings are not attached"))?;
-        Ok(PluginSettings::new(manager, plugin))
-    }
-
     pub fn agents(&self) -> Result<PluginAgents> {
         if !self.permissions.contains(&PluginPermission::Agents) {
             bail!("plugin did not request Agent access");
@@ -1274,16 +1186,6 @@ impl<'a> PluginHost<'a> {
         self.agents
             .clone()
             .ok_or_else(|| anyhow::anyhow!("plugin Agent access is not attached"))
-    }
-
-    pub fn state(&self, plugin: impl Into<String>, scope: PluginStateScope) -> Result<PluginState> {
-        if !self.permissions.contains(&PluginPermission::State) {
-            bail!("plugin did not request persistent state access");
-        }
-        self.state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("plugin state access is not attached"))?
-            .state(plugin, scope)
     }
 
     pub fn downloads(&self) -> Result<PluginDownloads> {
@@ -1363,12 +1265,6 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// Opt into the process-resident lifecycle used by `uri-agent --background`.
-    /// Plugins that return `None` remain ordinary request-driven plugins.
-    fn resident(&self) -> Option<Arc<dyn ResidentPlugin>> {
-        None
-    }
-
     fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
 
     /// Release request-driven resources such as remote connections when the
@@ -1376,33 +1272,6 @@ pub trait Plugin: Send + Sync {
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResidentEvent {
-    Start,
-    Wake,
-    Shutdown,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ResidentResponse {
-    pub wake_after: Option<Duration>,
-}
-
-impl ResidentResponse {
-    pub fn wake_after(delay: Duration) -> Self {
-        Self {
-            wake_after: Some(delay),
-        }
-    }
-}
-
-#[async_trait]
-pub trait ResidentPlugin: Send + Sync {
-    fn name(&self) -> &str;
-
-    async fn handle(&self, event: ResidentEvent) -> Result<ResidentResponse>;
 }
 
 #[derive(Default)]
@@ -1571,91 +1440,6 @@ impl PluginRegistry {
         Ok(fragments)
     }
 
-    pub async fn run_residents(&self, shutdown: impl Future<Output = ()>) -> Result<()> {
-        let residents = self.residents()?;
-        let mut started = Vec::with_capacity(residents.len());
-        let mut schedule = Vec::with_capacity(residents.len());
-        let mut failure = None;
-        for resident in residents {
-            match resident_call(&resident, ResidentEvent::Start).await {
-                Ok(response) => {
-                    schedule.push((resident.clone(), next_wake(response)));
-                    started.push(resident);
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            }
-        }
-
-        if failure.is_none() {
-            tokio::pin!(shutdown);
-            loop {
-                let next = schedule.iter().filter_map(|(_, wake)| *wake).min();
-                match next {
-                    Some(next) => tokio::select! {
-                        () = &mut shutdown => break,
-                        () = tokio::time::sleep_until(next) => {
-                            let now = Instant::now();
-                            for (resident, wake) in &mut schedule {
-                                if wake.is_none_or(|wake| wake > now) {
-                                    continue;
-                                }
-                                match resident_call(resident, ResidentEvent::Wake).await {
-                                    Ok(response) => *wake = next_wake(response),
-                                    Err(error) => {
-                                        failure = Some(error);
-                                        break;
-                                    }
-                                }
-                            }
-                            if failure.is_some() {
-                                break;
-                            }
-                        }
-                    },
-                    None => {
-                        shutdown.await;
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut shutdown_failure = None;
-        for resident in started.into_iter().rev() {
-            if let Err(error) = resident_call(&resident, ResidentEvent::Shutdown).await
-                && shutdown_failure.is_none()
-            {
-                shutdown_failure = Some(error);
-            }
-        }
-        match (failure, shutdown_failure) {
-            (Some(error), _) | (None, Some(error)) => Err(error),
-            (None, None) => Ok(()),
-        }
-    }
-
-    fn residents(&self) -> Result<Vec<Arc<dyn ResidentPlugin>>> {
-        let mut names = HashSet::new();
-        let mut residents = Vec::new();
-        for plugin in &self.plugins {
-            let Some(resident) = plugin.resident() else {
-                continue;
-            };
-            validate_name(resident.name())?;
-            if !names.insert(resident.name().to_string()) {
-                bail!(
-                    "resident plugin name is already registered: {}",
-                    resident.name()
-                );
-            }
-            residents.push(resident);
-        }
-        Ok(residents)
-    }
-
     pub fn install(&self, host: &mut PluginHost<'_>) -> Result<()> {
         let expected_protocols = self
             .protocol_descriptors()?
@@ -1740,33 +1524,6 @@ impl PluginRegistry {
     }
 }
 
-async fn resident_call(
-    resident: &Arc<dyn ResidentPlugin>,
-    event: ResidentEvent,
-) -> Result<ResidentResponse> {
-    tokio::time::timeout(RESIDENT_CALLBACK_TIMEOUT, resident.handle(event))
-        .await
-        .with_context(|| {
-            format!(
-                "resident plugin {} {event:?} callback exceeded {} seconds",
-                resident.name(),
-                RESIDENT_CALLBACK_TIMEOUT.as_secs()
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "resident plugin {} {event:?} callback failed",
-                resident.name()
-            )
-        })
-}
-
-fn next_wake(response: ResidentResponse) -> Option<Instant> {
-    response
-        .wake_after
-        .map(|delay| Instant::now() + delay.max(MIN_RESIDENT_WAKE_DELAY))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1774,137 +1531,6 @@ mod tests {
     use crate::output::OutputStore;
     use crate::protocol::{Protocol, ProtocolDescriptor};
     use crate::task::TaskManager;
-
-    struct ResidentFixture {
-        name: &'static str,
-        events: Arc<std::sync::Mutex<Vec<(&'static str, ResidentEvent)>>>,
-        wake_after_start: Option<Duration>,
-        fail_on: Option<ResidentEvent>,
-    }
-
-    #[async_trait]
-    impl ResidentPlugin for ResidentFixture {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        async fn handle(&self, event: ResidentEvent) -> Result<ResidentResponse> {
-            self.events.lock().unwrap().push((self.name, event));
-            if self.fail_on == Some(event) {
-                bail!("{} failed on {event:?}", self.name);
-            }
-            Ok(if event == ResidentEvent::Start {
-                ResidentResponse {
-                    wake_after: self.wake_after_start,
-                }
-            } else {
-                ResidentResponse::default()
-            })
-        }
-    }
-
-    struct ResidentFixturePlugin(Arc<ResidentFixture>);
-
-    impl Plugin for ResidentFixturePlugin {
-        fn resident(&self) -> Option<Arc<dyn ResidentPlugin>> {
-            Some(self.0.clone())
-        }
-
-        fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    fn resident_fixture(
-        name: &'static str,
-        events: Arc<std::sync::Mutex<Vec<(&'static str, ResidentEvent)>>>,
-        wake_after_start: Option<Duration>,
-        fail_on: Option<ResidentEvent>,
-    ) -> ResidentFixturePlugin {
-        ResidentFixturePlugin(Arc::new(ResidentFixture {
-            name,
-            events,
-            wake_after_start,
-            fail_on,
-        }))
-    }
-
-    #[tokio::test]
-    async fn resident_plugins_start_wake_and_shutdown_in_lifecycle_order() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut registry = PluginRegistry::new();
-        registry.add(resident_fixture(
-            "first",
-            events.clone(),
-            Some(Duration::from_millis(1)),
-            None,
-        ));
-        registry.add(resident_fixture("second", events.clone(), None, None));
-
-        registry
-            .run_residents(tokio::time::sleep(Duration::from_millis(140)))
-            .await
-            .unwrap();
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                ("first", ResidentEvent::Start),
-                ("second", ResidentEvent::Start),
-                ("first", ResidentEvent::Wake),
-                ("second", ResidentEvent::Shutdown),
-                ("first", ResidentEvent::Shutdown),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn resident_wake_delays_are_clamped_and_start_failure_cleans_up_in_reverse() {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut clamped = PluginRegistry::new();
-        clamped.add(resident_fixture(
-            "clamped",
-            events.clone(),
-            Some(Duration::ZERO),
-            None,
-        ));
-        clamped
-            .run_residents(tokio::time::sleep(Duration::from_millis(30)))
-            .await
-            .unwrap();
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                ("clamped", ResidentEvent::Start),
-                ("clamped", ResidentEvent::Shutdown),
-            ]
-        );
-
-        events.lock().unwrap().clear();
-        let mut failing = PluginRegistry::new();
-        failing.add(resident_fixture("first", events.clone(), None, None));
-        failing.add(resident_fixture("second", events.clone(), None, None));
-        failing.add(resident_fixture(
-            "failing",
-            events.clone(),
-            None,
-            Some(ResidentEvent::Start),
-        ));
-        let error = failing
-            .run_residents(std::future::pending())
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("failing"));
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                ("first", ResidentEvent::Start),
-                ("second", ResidentEvent::Start),
-                ("failing", ResidentEvent::Start),
-                ("second", ResidentEvent::Shutdown),
-                ("first", ResidentEvent::Shutdown),
-            ]
-        );
-    }
 
     struct StaticPanel;
 
@@ -2167,10 +1793,6 @@ mod tests {
         model_roles: Arc<std::sync::OnceLock<PluginModelRoleResolver>>,
     }
 
-    struct SettingsPlugin {
-        settings: Arc<std::sync::OnceLock<PluginSettings>>,
-    }
-
     struct AgentPlugin {
         requests_agents: bool,
         agents: Arc<std::sync::OnceLock<PluginAgents>>,
@@ -2283,14 +1905,6 @@ mod tests {
             self.model_roles
                 .set(host.model_roles()?)
                 .map_err(|_| anyhow::anyhow!("model roles were already captured"))
-        }
-    }
-
-    impl Plugin for SettingsPlugin {
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            self.settings
-                .set(host.settings("test-plugin")?)
-                .map_err(|_| anyhow::anyhow!("settings were already captured"))
         }
     }
 
@@ -2827,44 +2441,6 @@ mod tests {
                 thinking: ThinkingLevel::High,
             })
         );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_store_dynamic_json_values_in_their_own_namespace() {
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let manager = ConfigManager::load_for_test(&output, &output)
-            .await
-            .unwrap();
-        let capture = Arc::new(std::sync::OnceLock::new());
-        let mut plugins = PluginRegistry::new();
-        plugins.add(SettingsPlugin {
-            settings: capture.clone(),
-        });
-        plugins
-            .install(
-                &mut PluginHost::new(
-                    &mut protocols,
-                    &mut model_tools,
-                    &mut commands,
-                    &mut tui,
-                    environment,
-                )
-                .with_credentials(manager),
-            )
-            .unwrap();
-        let settings = capture.get().unwrap();
-        settings
-            .set("options", serde_json::json!({"role": "small", "words": 5}))
-            .await
-            .unwrap();
-        assert_eq!(
-            settings.get("options").await.unwrap(),
-            Some(serde_json::json!({"role": "small", "words": 5}))
-        );
-        assert!(settings.remove("options").await.unwrap());
-        assert_eq!(settings.get("options").await.unwrap(), None);
         let _ = tokio::fs::remove_dir_all(output).await;
     }
 

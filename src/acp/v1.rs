@@ -299,7 +299,6 @@ impl AcpV1State {
         cli.cwd = Some(cwd.clone());
         cli.continue_session = false;
         cli.session = None;
-        cli.background = false;
         let config = Config::load(cli).await?;
         let manager = config.manager.clone();
         let catalog = config.catalog.clone();
