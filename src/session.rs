@@ -3161,6 +3161,7 @@ fn serialized_private_records(records: &HashMap<String, Value>) -> Result<Vec<(S
 /// deletes it. `persist()` deliberately declines both: a prepared session has
 /// no composer text of its own, and the project draft must survive for the
 /// next session in that project.
+#[allow(clippy::too_many_arguments)]
 fn insert_prepared_session(
     transaction: &Transaction<'_>,
     id: &str,
