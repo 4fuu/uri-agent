@@ -792,225 +792,16 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
     let mut ids = HashSet::new();
     let mut all_reference_roots = Vec::new();
     for (index, raw_step) in raw.iter().enumerate() {
-        let number = index + 1;
-        check_step_shape(number, raw_step)?;
-        let step: StepArgument = serde_json::from_value(raw_step.clone())
-            .map_err(|error| anyhow!("invalid protocol arguments: step {number}: {error}"))?;
-        let (operation, address, field) = match (&step.read, &step.exec) {
-            (Some(_), Some(_)) => bail!(
-                "invalid protocol arguments: step {number}: specify exactly one of `read` and \
-                 `exec`; example: {STEP_SHAPE_EXAMPLE}"
-            ),
-            (None, None) => bail!(
-                "invalid protocol arguments: step {number}: specify one of `read` or `exec`; \
-                 example: {STEP_SHAPE_EXAMPLE}"
-            ),
-            (Some(address), None) => (ProtocolOperation::Read, address, "read"),
-            (None, Some(address)) => (ProtocolOperation::Exec, address, "exec"),
-        };
-        if address.trim().is_empty() {
-            return Err(step_field_error(
-                number,
-                field,
-                "the address cannot be empty",
-            ));
-        }
-        let (protocol_name, target) = split_address(address).map_err(|error| {
-            step_field_error(
-                number,
-                field,
-                format!("{error}; example: {STEP_SHAPE_EXAMPLE}"),
+        steps.push(
+            validate_step(
+                index + 1,
+                raw_step,
+                &mut ids,
+                &mut all_reference_roots,
+                protocols,
             )
-        })?;
-        if !protocol_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            || protocol_name.is_empty()
-        {
-            return Err(step_field_error(
-                number,
-                field,
-                format!(
-                    "the protocol name {protocol_name:?} is invalid; addresses are \
-                     `<protocol>://<target>`"
-                ),
-            ));
-        }
-        let exec = operation == ProtocolOperation::Exec;
-        protocols
-            .validate_step_operation(protocol_name, target, exec)
-            .await
-            .map_err(|error| step_field_error_from(number, field, error))?;
-        let literal_fields = protocols.literal_input_fields(protocol_name).await;
-
-        let id = match &step.id {
-            Some(id) => {
-                if !valid_id(id) {
-                    return Err(step_field_error(
-                        number,
-                        "id",
-                        format!(
-                            "{id:?} must match `[a-z][a-z0-9_]*`, must not be one of not, true, \
-                             false, or null, and must be unique within the call"
-                        ),
-                    ));
-                }
-                // The id joins `ids` only after this step's own references
-                // are checked, so a step cannot reference itself.
-                if ids.contains(id) {
-                    return Err(step_field_error(
-                        number,
-                        "id",
-                        format!("{id:?} is already used by an earlier step"),
-                    ));
-                }
-                Some(id.clone())
-            }
-            None => None,
-        };
-
-        let show = match step.show.as_deref() {
-            None | Some("all") => Show::All,
-            Some("errors") => Show::Errors,
-            Some("none") => Show::None,
-            Some(other) => {
-                return Err(step_field_error(
-                    number,
-                    "show",
-                    format!("{other:?} is not one of \"all\", \"errors\", or \"none\""),
-                ));
-            }
-        };
-
-        let loop_spec = match (&step.r#for, step.max) {
-            (Some(text), Some(max)) => {
-                if !(1..=MAX_FOR_ELEMENTS as i64).contains(&max) {
-                    return Err(step_field_error(
-                        number,
-                        "max",
-                        format!("{max} is outside 1..={MAX_FOR_ELEMENTS}"),
-                    ));
-                }
-                let (variable, source_text) = text.split_once(" in ").ok_or_else(|| {
-                    step_field_error(
-                        number,
-                        "for",
-                        format!("{text:?} must be `<name> in <reference>`"),
-                    )
-                })?;
-                let variable = variable.trim();
-                if !valid_id(variable) {
-                    return Err(step_field_error(
-                        number,
-                        "for",
-                        format!(
-                            "the variable name {variable:?} must match `[a-z][a-z0-9_]*` and must \
-                             not be one of not, true, false, or null"
-                        ),
-                    ));
-                }
-                if ids.contains(variable) || id.as_deref() == Some(variable) {
-                    return Err(step_field_error(
-                        number,
-                        "for",
-                        format!(
-                            "the variable name {variable:?} is already a step `id`; choose a \
-                             different name"
-                        ),
-                    ));
-                }
-                let source = parse_operand_str(source_text.trim())
-                    .map_err(|error| step_field_error(number, "for", format!("{error:#}")))?;
-                let Operand::Reference { root, .. } = &source else {
-                    return Err(step_field_error(
-                        number,
-                        "for",
-                        "the source must be a reference to an earlier step, for example \
-                         `issue in issues.json.items`",
-                    ));
-                };
-                check_reference_root(root, number, "for", &ids, None)?;
-                Some(LoopSpec {
-                    variable: variable.to_string(),
-                    source,
-                })
-            }
-            (Some(_), None) => {
-                return Err(step_field_error(
-                    number,
-                    "for",
-                    "`for` requires `max`, the maximum number of elements",
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(step_field_error(number, "max", "`max` requires `for`"));
-            }
-            (None, None) => None,
-        };
-        let max = step.max.unwrap_or(0).max(0) as usize;
-
-        let condition = match &step.r#if {
-            Some(text) => {
-                let expression = parse_expression(text)
-                    .map_err(|error| step_field_error(number, "if", format!("{error:#}")))?;
-                for root in expression.roots() {
-                    let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
-                    check_reference_root(root, number, "if", &ids, loop_variable)?;
-                }
-                Some(expression)
-            }
-            None => None,
-        };
-
-        let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
-        let mut data_refs = Vec::new();
-        if let Some(input) = &step.input {
-            for (key, value) in input {
-                if !literal_fields.contains(key) {
-                    collect_input_roots(value, &mut data_refs);
-                }
-            }
-            for root in &data_refs {
-                check_reference_root(root, number, "input", &ids, loop_variable)?;
-            }
-        }
-        for (_, _, inner) in address_placeholders(address)
-            .map_err(|error| step_field_error(number, field, format!("{error:#}")))?
-        {
-            let operand = parse_operand_str(&inner)
-                .map_err(|error| step_field_error(number, field, format!("{error:#}")))?;
-            if let Some(root) = operand.root() {
-                check_reference_root(root, number, field, &ids, loop_variable)?;
-                data_refs.push(root.to_string());
-            }
-        }
-        if let Some(spec) = &loop_spec
-            && let Operand::Reference { root, .. } = &spec.source
-        {
-            data_refs.push(root.clone());
-        }
-        if let Some(condition) = &condition {
-            for root in condition.roots() {
-                all_reference_roots.push(root.to_string());
-            }
-        }
-        all_reference_roots.extend(data_refs.iter().cloned());
-        if let Some(id) = &id {
-            ids.insert(id.clone());
-        }
-        steps.push(ValidatedStep {
-            operation,
-            address: address.clone(),
-            input: step.input,
-            literal_fields,
-            id,
-            condition,
-            loop_spec,
-            max,
-            show,
-            data_refs,
-            referenced_later: false,
-        });
+            .await?,
+        );
     }
     for step in &mut steps {
         if let Some(id) = &step.id
@@ -1022,6 +813,238 @@ async fn validate_steps(raw: &[Value], protocols: &ProtocolRegistry) -> Result<V
     Ok(steps)
 }
 
+/// Validates one planned step: shape, address, protocol support and loaded
+/// help, `id` uniqueness, the `for` spec, the `if` condition, and every
+/// reference naming an earlier step or `for` variable. The step's `id` joins
+/// `ids` only after its own references are checked, and every reference root
+/// is recorded in `all_reference_roots` for the referenced-later pass above.
+async fn validate_step(
+    number: usize,
+    raw_step: &Value,
+    ids: &mut HashSet<String>,
+    all_reference_roots: &mut Vec<String>,
+    protocols: &ProtocolRegistry,
+) -> Result<ValidatedStep> {
+    check_step_shape(number, raw_step)?;
+    let step: StepArgument = serde_json::from_value(raw_step.clone())
+        .map_err(|error| anyhow!("invalid protocol arguments: step {number}: {error}"))?;
+    let (operation, address, field) = match (&step.read, &step.exec) {
+        (Some(_), Some(_)) => bail!(
+            "invalid protocol arguments: step {number}: specify exactly one of `read` and \
+                 `exec`; example: {STEP_SHAPE_EXAMPLE}"
+        ),
+        (None, None) => bail!(
+            "invalid protocol arguments: step {number}: specify one of `read` or `exec`; \
+                 example: {STEP_SHAPE_EXAMPLE}"
+        ),
+        (Some(address), None) => (ProtocolOperation::Read, address, "read"),
+        (None, Some(address)) => (ProtocolOperation::Exec, address, "exec"),
+    };
+    if address.trim().is_empty() {
+        return Err(step_field_error(
+            number,
+            field,
+            "the address cannot be empty",
+        ));
+    }
+    let (protocol_name, target) = split_address(address).map_err(|error| {
+        step_field_error(
+            number,
+            field,
+            format!("{error}; example: {STEP_SHAPE_EXAMPLE}"),
+        )
+    })?;
+    if !protocol_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || protocol_name.is_empty()
+    {
+        return Err(step_field_error(
+            number,
+            field,
+            format!(
+                "the protocol name {protocol_name:?} is invalid; addresses are \
+                     `<protocol>://<target>`"
+            ),
+        ));
+    }
+    let exec = operation == ProtocolOperation::Exec;
+    protocols
+        .validate_step_operation(protocol_name, target, exec)
+        .await
+        .map_err(|error| step_field_error_from(number, field, error))?;
+    let literal_fields = protocols.literal_input_fields(protocol_name).await;
+
+    let id = match &step.id {
+        Some(id) => {
+            if !valid_id(id) {
+                return Err(step_field_error(
+                    number,
+                    "id",
+                    format!(
+                        "{id:?} must match `[a-z][a-z0-9_]*`, must not be one of not, true, \
+                             false, or null, and must be unique within the call"
+                    ),
+                ));
+            }
+            // The id joins `ids` only after this step's own references
+            // are checked, so a step cannot reference itself.
+            if ids.contains(id) {
+                return Err(step_field_error(
+                    number,
+                    "id",
+                    format!("{id:?} is already used by an earlier step"),
+                ));
+            }
+            Some(id.clone())
+        }
+        None => None,
+    };
+
+    let show = match step.show.as_deref() {
+        None | Some("all") => Show::All,
+        Some("errors") => Show::Errors,
+        Some("none") => Show::None,
+        Some(other) => {
+            return Err(step_field_error(
+                number,
+                "show",
+                format!("{other:?} is not one of \"all\", \"errors\", or \"none\""),
+            ));
+        }
+    };
+
+    let loop_spec = match (&step.r#for, step.max) {
+        (Some(text), Some(max)) => {
+            if !(1..=MAX_FOR_ELEMENTS as i64).contains(&max) {
+                return Err(step_field_error(
+                    number,
+                    "max",
+                    format!("{max} is outside 1..={MAX_FOR_ELEMENTS}"),
+                ));
+            }
+            let (variable, source_text) = text.split_once(" in ").ok_or_else(|| {
+                step_field_error(
+                    number,
+                    "for",
+                    format!("{text:?} must be `<name> in <reference>`"),
+                )
+            })?;
+            let variable = variable.trim();
+            if !valid_id(variable) {
+                return Err(step_field_error(
+                    number,
+                    "for",
+                    format!(
+                        "the variable name {variable:?} must match `[a-z][a-z0-9_]*` and must \
+                             not be one of not, true, false, or null"
+                    ),
+                ));
+            }
+            if ids.contains(variable) || id.as_deref() == Some(variable) {
+                return Err(step_field_error(
+                    number,
+                    "for",
+                    format!(
+                        "the variable name {variable:?} is already a step `id`; choose a \
+                             different name"
+                    ),
+                ));
+            }
+            let source = parse_operand_str(source_text.trim())
+                .map_err(|error| step_field_error(number, "for", format!("{error:#}")))?;
+            let Operand::Reference { root, .. } = &source else {
+                return Err(step_field_error(
+                    number,
+                    "for",
+                    "the source must be a reference to an earlier step, for example \
+                         `issue in issues.json.items`",
+                ));
+            };
+            check_reference_root(root, number, "for", &ids, None)?;
+            Some(LoopSpec {
+                variable: variable.to_string(),
+                source,
+            })
+        }
+        (Some(_), None) => {
+            return Err(step_field_error(
+                number,
+                "for",
+                "`for` requires `max`, the maximum number of elements",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(step_field_error(number, "max", "`max` requires `for`"));
+        }
+        (None, None) => None,
+    };
+    let max = step.max.unwrap_or(0).max(0) as usize;
+
+    let condition = match &step.r#if {
+        Some(text) => {
+            let expression = parse_expression(text)
+                .map_err(|error| step_field_error(number, "if", format!("{error:#}")))?;
+            for root in expression.roots() {
+                let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
+                check_reference_root(root, number, "if", &ids, loop_variable)?;
+            }
+            Some(expression)
+        }
+        None => None,
+    };
+
+    let loop_variable = loop_spec.as_ref().map(|spec| spec.variable.as_str());
+    let mut data_refs = Vec::new();
+    if let Some(input) = &step.input {
+        for (key, value) in input {
+            if !literal_fields.contains(key) {
+                collect_input_roots(value, &mut data_refs);
+            }
+        }
+        for root in &data_refs {
+            check_reference_root(root, number, "input", &ids, loop_variable)?;
+        }
+    }
+    for (_, _, inner) in address_placeholders(address)
+        .map_err(|error| step_field_error(number, field, format!("{error:#}")))?
+    {
+        let operand = parse_operand_str(&inner)
+            .map_err(|error| step_field_error(number, field, format!("{error:#}")))?;
+        if let Some(root) = operand.root() {
+            check_reference_root(root, number, field, &ids, loop_variable)?;
+            data_refs.push(root.to_string());
+        }
+    }
+    if let Some(spec) = &loop_spec
+        && let Operand::Reference { root, .. } = &spec.source
+    {
+        data_refs.push(root.clone());
+    }
+    if let Some(condition) = &condition {
+        for root in condition.roots() {
+            all_reference_roots.push(root.to_string());
+        }
+    }
+    all_reference_roots.extend(data_refs.iter().cloned());
+    if let Some(id) = &id {
+        ids.insert(id.clone());
+    }
+
+    Ok(ValidatedStep {
+        operation,
+        address: address.clone(),
+        input: step.input,
+        literal_fields,
+        id,
+        condition,
+        loop_spec,
+        max,
+        show,
+        data_refs,
+        referenced_later: false,
+    })
+}
 fn collect_input_roots(value: &Value, roots: &mut Vec<String>) {
     match value {
         Value::String(text) => {

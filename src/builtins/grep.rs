@@ -8,17 +8,15 @@ use crate::protocol::{
     Protocol, ProtocolContext, ProtocolDescriptor, ProtocolOutput, ProtocolRequest,
 };
 use crate::retrieval::{
-    SearchFilter, SearchHit, SearchMode, code_corpus, index_checkpoint, index_status,
-    rebuild_index, search_index, sync_index,
+    SearchFilter, SearchHit, SearchMode, code_corpus, index_status, rebuild_live_corpus,
+    search_live_corpus,
 };
-use crate::task::AutoTask;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -29,8 +27,6 @@ const MAX_SEMANTIC_LIMIT: usize = 50;
 const DEFAULT_SEMANTIC_LIMIT: usize = 7;
 const MAX_CONTEXT: usize = 20;
 const RIPGREP_VERSION: &str = "14.1.1";
-const AUTO_BACKGROUND_AFTER: Duration = Duration::from_secs(60);
-const MAX_INDEX_RETRIES: usize = 3;
 const SEARCH_SCHEME: &str = "search";
 
 fn help(cwd: &Path, scheme: &str) -> String {
@@ -134,19 +130,12 @@ impl GrepProtocol {
         limit: usize,
         context: ProtocolContext,
     ) -> Result<ProtocolOutput> {
-        let record = context
-            .tasks
-            .allocate(
+        let cwd = self.cwd.clone();
+        context
+            .run_auto_background(
                 SEARCH_SCHEME,
                 format!("Search code under {}", display_path(&root)),
-            )
-            .await;
-        let cwd = self.cwd.clone();
-        match context
-            .tasks
-            .run_with_auto_background(
-                record,
-                context.foreground_grace(AUTO_BACKGROUND_AFTER),
+                "semantic search",
                 move |cancellation| async move {
                     semantic_grep(
                         &cwd,
@@ -160,11 +149,7 @@ impl GrepProtocol {
                     .await
                 },
             )
-            .await?
-        {
-            AutoTask::Background(id) => Ok(prompts::task_accepted(&id).into()),
-            AutoTask::Terminal(record) => Ok(record.terminal_result("semantic search")?.into()),
-        }
+            .await
     }
 }
 
@@ -285,7 +270,13 @@ impl Protocol for GrepProtocol {
         context
             .tasks
             .spawn_with_cancellation(record, move |cancellation| async move {
-                rebuild_code_index(&cwd, &resolved, glob.as_deref(), cancellation).await
+                rebuild_live_corpus(
+                    || code_corpus(&cwd, &resolved, glob.as_deref()),
+                    "Code",
+                    "code changed repeatedly while rebuilding the semantic index",
+                    cancellation,
+                )
+                .await
             })
             .await;
         Ok(prompts::task_accepted(&id).into())
@@ -301,64 +292,17 @@ async fn semantic_grep(
     limit: usize,
     cancellation: CancellationToken,
 ) -> Result<Vec<u8>> {
-    for _ in 0..MAX_INDEX_RETRIES {
-        let corpus = code_corpus(cwd, root, glob).await?;
-        let checkpoint = index_checkpoint(&corpus.spec).await?;
-        let sources = corpus.catalog.changed_sources(&checkpoint);
-        let snapshot = match corpus.load_sources(sources, cancellation.clone()).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                if code_corpus(cwd, root, glob).await?.catalog != corpus.catalog {
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        if !sync_index(
-            &corpus.spec,
-            &corpus.catalog,
-            snapshot,
-            cancellation.clone(),
-        )
-        .await?
-        {
-            continue;
-        }
-        if code_corpus(cwd, root, glob).await?.catalog != corpus.catalog {
-            continue;
-        }
-        let hits = search_index(
-            &corpus.spec,
-            &corpus.catalog,
-            query,
-            mode,
-            limit,
-            SearchFilter::default(),
-            cancellation.clone(),
-        )
-        .await?;
-        if code_corpus(cwd, root, glob).await?.catalog == corpus.catalog {
-            return Ok(format_semantic_results(&hits, mode).into_bytes());
-        }
-    }
-    bail!("code changed repeatedly while preparing semantic search; retry the read")
-}
-
-async fn rebuild_code_index(
-    cwd: &Path,
-    root: &Path,
-    glob: Option<&str>,
-    cancellation: CancellationToken,
-) -> Result<Vec<u8>> {
-    for _ in 0..MAX_INDEX_RETRIES {
-        let corpus = code_corpus(cwd, root, glob).await?;
-        let snapshot = corpus.load_all(cancellation.clone()).await?;
-        let status = rebuild_index(&corpus.spec, snapshot, cancellation.clone()).await?;
-        if code_corpus(cwd, root, glob).await?.catalog == corpus.catalog {
-            return Ok(status.format("Code").into_bytes());
-        }
-    }
-    bail!("code changed repeatedly while rebuilding the semantic index")
+    let (_corpus, hits) = search_live_corpus(
+        || code_corpus(cwd, root, glob),
+        query,
+        mode,
+        limit,
+        SearchFilter::default(),
+        "code changed repeatedly while preparing semantic search; retry the read",
+        cancellation,
+    )
+    .await?;
+    Ok(format_semantic_results(&hits, mode).into_bytes())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
