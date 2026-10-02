@@ -18,8 +18,11 @@ const DEFAULT_CLIENT_ID: &str =
 const DEFAULT_CLIENT_SECRET: &str = "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";
 const DEFAULT_USER_AGENT_VERSION: &str = "4.3.0";
 const CONTROL_BASE_URLS: [&str; 3] = [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    // Daily carries all official IDE traffic; the sandbox endpoint rejects
+    // compliant accounts in some regions with a terminal 400, so it stays as
+    // a fallback rather than the first attempt.
     "https://daily-cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
 ];
 const SCOPES: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
