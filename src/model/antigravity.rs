@@ -309,10 +309,7 @@ async fn send_once(
     route: &AntigravityRoute,
     include_project_header: bool,
 ) -> Result<reqwest::Response> {
-    let user_agent = env::var("ANTIGRAVITY_USER_AGENT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_generation_user_agent);
+    let user_agent = generation_user_agent();
     let mut headers = HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
@@ -522,10 +519,15 @@ fn default_generation_user_agent() -> String {
     )
 }
 
-/// User-Agent the generation endpoints and roster discovery send. Respects
-/// the `ANTIGRAVITY_USER_AGENT` override, then this generated default.
+/// User-Agent for the generation endpoints and roster discovery: the
+/// `ANTIGRAVITY_USER_AGENT` override when set, otherwise the generated
+/// default carrying the resolved client version.
 pub(crate) fn generation_user_agent() -> String {
-    default_generation_user_agent()
+    env::var("ANTIGRAVITY_USER_AGENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_generation_user_agent)
 }
 
 fn process_session_id() -> &'static str {

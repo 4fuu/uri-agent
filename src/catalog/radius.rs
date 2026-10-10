@@ -208,6 +208,7 @@ mod tests {
             oauth: false,
             radius_gateway: Some(format!("{}/ignored/path", server.base)),
             workbuddy: None,
+            antigravity_account: None,
         };
 
         assert!(discover(&Client::new(), &credential).await.is_err());

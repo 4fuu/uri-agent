@@ -97,9 +97,17 @@ pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredent
     hash.update(provider.as_bytes());
     hash.update([u8::from(credential.oauth)]);
     if provider == antigravity::PROVIDER {
-        // Antigravity stores one credential per provider and its access
-        // token rotates hourly, so the scope keys on the credential kind
-        // alone; a replaced account simply refreshes under the same scope.
+        // The access token rotates hourly, so the discovery scope keys on the
+        // stable account identity instead: the same account keeps its cached
+        // roster across token refreshes, and a different account gets its own
+        // scope. A credential without an identity falls back to the kind.
+        hash.update(
+            credential
+                .antigravity_account
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         return format!("sha256-{}", crate::hex_lower(&hash.finalize()));
     }
     if provider == radius::PROVIDER {
@@ -703,6 +711,7 @@ mod tests {
                 },
                 api_key: false,
             }),
+            antigravity_account: None,
         };
 
         let original = credential_fingerprint("workbuddy", &credential("old-access", "user-1"));
@@ -729,11 +738,36 @@ mod tests {
             oauth: false,
             radius_gateway: Some(gateway.to_string()),
             workbuddy: None,
+            antigravity_account: None,
         };
         assert_ne!(
             credential_fingerprint("radius", &credential("https://one.example")),
             credential_fingerprint("radius", &credential("https://two.example"))
         );
+    }
+
+    #[test]
+    fn antigravity_cache_scope_keys_on_the_account_not_the_rotating_token() {
+        let credential = |secret: &str, account: Option<&str>| CatalogCredential {
+            secret: secret.to_string(),
+            oauth: true,
+            radius_gateway: None,
+            workbuddy: None,
+            antigravity_account: account.map(str::to_string),
+        };
+        let original =
+            credential_fingerprint("antigravity", &credential("old-access", Some("project-1")));
+        let rotated =
+            credential_fingerprint("antigravity", &credential("new-access", Some("project-1")));
+        let other_account =
+            credential_fingerprint("antigravity", &credential("new-access", Some("project-2")));
+        let email_scoped = credential_fingerprint(
+            "antigravity",
+            &credential("new-access", Some("user@example.com")),
+        );
+        assert_eq!(original, rotated);
+        assert_ne!(original, other_account);
+        assert_ne!(original, email_scoped);
     }
 
     #[test]
@@ -923,6 +957,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
             &catalog,
             &ProtocolHints::default(),
@@ -971,6 +1006,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
             &catalog,
             &hints,
@@ -1085,6 +1121,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
             &catalog,
             &ProtocolHints::default(),
@@ -1130,6 +1167,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
             &catalog,
             &ProtocolHints::default(),

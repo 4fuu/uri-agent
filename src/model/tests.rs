@@ -672,7 +672,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
 
     assert_eq!(uri.path(), format!("{prefix}/backend-api/codex/responses"));
     assert_eq!(headers["chatgpt-account-id"], "account-123");
-    assert_eq!(headers["originator"], "uri-agent");
+    assert_eq!(headers["originator"], "pi");
     assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
     assert_eq!(headers["version"], "0.159.0");
     assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5.4");
@@ -1060,7 +1060,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
     assert!(request.starts_with("POST /backend-api/codex/responses HTTP/1.1"));
     assert!(request_headers.contains("authorization: bearer header."));
     assert!(request_headers.contains("chatgpt-account-id: account-123"));
-    assert!(request_headers.contains("originator: uri-agent"));
+    assert!(request_headers.contains("originator: pi"));
     assert!(request_headers.contains("openai-beta: responses=experimental"));
     assert!(request_headers.contains("version: 0.159.0"));
     assert!(request_headers.contains("x-codex-routing-hint: model=gpt-5.4"));

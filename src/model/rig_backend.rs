@@ -406,9 +406,13 @@ impl RigBackend {
                         .http_headers(headers)
                         .http_client(request_client)
                         .default_instructions("")
-                        .originator("uri-agent")
+                        // The originator stays "pi": upstream only
+                        // parameterized this value, and the ChatGPT Codex
+                        // backend has not been observed accepting another
+                        // agent name.
+                        .originator("pi")
                         .user_agent(format!(
-                            "uri-agent/{} ({} {})",
+                            "uri-agent/{} ({} {}; pi)",
                             env!("CARGO_PKG_VERSION"),
                             std::env::consts::OS,
                             std::env::consts::ARCH

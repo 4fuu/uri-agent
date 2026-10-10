@@ -31,6 +31,10 @@ pub(crate) struct CatalogCredential {
     pub oauth: bool,
     pub radius_gateway: Option<String>,
     pub workbuddy: Option<WorkBuddyCatalogCredential>,
+    /// Stable Antigravity account identity (Cloud Code project, or the
+    /// account email). The access token in `secret` rotates hourly, so the
+    /// discovery scope keys on this instead.
+    pub antigravity_account: Option<String>,
 }
 
 #[derive(Clone)]
@@ -937,10 +941,19 @@ fn merge_catalog(
             continue;
         };
         let models = raw.entry(provider.clone()).or_default();
-        if matches!(
-            provider.as_str(),
-            muse_code::PROVIDER | radius::PROVIDER | antigravity::PROVIDER
-        ) && discovered.succeeded()
+        if provider == antigravity::PROVIDER {
+            // Antigravity rosters are authoritative for availability, not
+            // identity: built-in logical models survive while any of their
+            // route targets remains in the account roster, and uncovered
+            // roster rows are appended. A failed lookup (including one with
+            // no cached success) keeps the built-in list untouched.
+            if discovered.succeeded() {
+                antigravity::merge_roster(models, &discovered.models);
+            }
+            continue;
+        }
+        if matches!(provider.as_str(), muse_code::PROVIDER | radius::PROVIDER)
+            && discovered.succeeded()
         {
             models.clear();
         }
@@ -950,10 +963,7 @@ fn merge_catalog(
             };
             if matches!(
                 provider.as_str(),
-                workbuddy::PROVIDER
-                    | muse_code::PROVIDER
-                    | radius::PROVIDER
-                    | antigravity::PROVIDER
+                workbuddy::PROVIDER | muse_code::PROVIDER | radius::PROVIDER
             ) {
                 models.insert(model.id.clone(), value);
             } else {
@@ -1687,6 +1697,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
         )]);
 
@@ -1749,6 +1760,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
         )]);
 
@@ -1802,6 +1814,7 @@ mod tests {
                 oauth: false,
                 radius_gateway: None,
                 workbuddy: None,
+                antigravity_account: None,
             },
         )]);
 
@@ -1855,6 +1868,7 @@ mod tests {
                     },
                     api_key: false,
                 }),
+                antigravity_account: None,
             },
         )]);
 
@@ -1870,6 +1884,113 @@ mod tests {
         assert_eq!(catalog.models("workbuddy").await[0].id, "cloud-chat");
         assert!(requests[1].starts_with("GET /v3/config "));
         assert!(requests[3].starts_with("GET /v3/config "));
+    }
+
+    #[test]
+    fn antigravity_roster_prunes_built_ins_by_route_coverage_in_merge_catalog() {
+        let roster_model = |id: &str| {
+            serde_json::from_value::<CatalogModel>(serde_json::json!({
+                "id": id,
+                "name": id,
+                "api": "antigravity",
+                "provider": "antigravity",
+                "baseUrl": "https://cloudcode-pa.googleapis.com",
+                "reasoning": true,
+                "input": ["text"],
+                "contextWindow": 200000,
+                "maxTokens": 64000,
+                "discovered": true,
+                "compat": {"antigravityRoutes": {"low": {"model": id}, "high": {"model": id}}}
+            }))
+            .unwrap()
+        };
+        let store = BTreeMap::from([(
+            "antigravity".to_string(),
+            StoreEntry {
+                models: Vec::new(),
+                last_modified: None,
+                checked_at: Some(0),
+                etag: None,
+                discoveries: BTreeMap::from([(
+                    "scope-1".to_string(),
+                    DiscoveryStoreEntry {
+                        models: vec![
+                            roster_model("gemini-3.1-pro-low"),
+                            roster_model("gemini-pro-agent"),
+                            roster_model("claude-sonnet-4-6"),
+                            roster_model("brand-new-model"),
+                        ],
+                        checked_at: 0,
+                        succeeded: Some(true),
+                    },
+                )]),
+            },
+        )]);
+        let scopes = BTreeMap::from([("antigravity".to_string(), "scope-1".to_string())]);
+        let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &scopes);
+        assert!(warnings.is_empty());
+        let models = &merged["antigravity"];
+        // Only gemini-3.1-pro (targets gemini-3.1-pro-low / gemini-pro-agent)
+        // and claude-sonnet-4-6 (self-targeting routes) survive from the
+        // built-ins; every other built-in has no route target in the roster.
+        // Roster rows covered by a built-in route are not duplicated, and
+        // brand-new-model joins as a discovered row.
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["brand-new-model", "claude-sonnet-4-6", "gemini-3.1-pro"]
+        );
+        let gemini = models
+            .iter()
+            .find(|model| model.id == "gemini-3.1-pro")
+            .unwrap();
+        // The surviving built-in keeps its logical identity and tuned routes.
+        assert_eq!(gemini.name, "Gemini 3.1 Pro");
+        assert_eq!(
+            gemini
+                .compat("antigravityRoutes")
+                .and_then(|routes| routes.get("low"))
+                .and_then(|route| route.get("thinkingBudget")),
+            Some(&serde_json::json!(1001))
+        );
+        let brand_new = models
+            .iter()
+            .find(|model| model.id == "brand-new-model")
+            .unwrap();
+        assert!(brand_new.metadata.contains_key("discovered"));
+    }
+
+    #[test]
+    fn failed_antigravity_roster_lookups_keep_the_built_in_models() {
+        let store = BTreeMap::from([(
+            "antigravity".to_string(),
+            StoreEntry {
+                models: Vec::new(),
+                last_modified: None,
+                checked_at: Some(0),
+                etag: None,
+                discoveries: BTreeMap::from([(
+                    "scope-1".to_string(),
+                    DiscoveryStoreEntry {
+                        models: Vec::new(),
+                        checked_at: 0,
+                        succeeded: Some(false),
+                    },
+                )]),
+            },
+        )]);
+        let scopes = BTreeMap::from([("antigravity".to_string(), "scope-1".to_string())]);
+        let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &scopes);
+        assert!(warnings.is_empty());
+        let models = &merged["antigravity"];
+        assert_eq!(models.len(), 7);
+        assert!(
+            models
+                .iter()
+                .all(|model| !model.metadata.contains_key("discovered"))
+        );
     }
 
     #[test]

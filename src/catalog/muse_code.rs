@@ -174,6 +174,7 @@ mod tests {
             oauth: true,
             radius_gateway: None,
             workbuddy: None,
+            antigravity_account: None,
         };
 
         assert!(

@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use http::header::{ACCEPT, AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 pub(crate) const PROVIDER: &str = "antigravity";
@@ -159,6 +159,55 @@ fn positive_or(value: Option<u64>, fallback: u64) -> u64 {
     value.filter(|value| *value > 0).unwrap_or(fallback)
 }
 
+fn route_targets_of(value: &Value) -> Option<&serde_json::Map<String, Value>> {
+    value
+        .get("compat")
+        .and_then(|compat| compat.get("antigravityRoutes"))
+        .and_then(Value::as_object)
+}
+
+/// Merge a successful account roster into the provider's raw catalog rows.
+///
+/// The built-in Antigravity rows are logical models whose per-effort routes
+/// target different upstream IDs (with tuned budgets and output caps), so
+/// the roster is authoritative for *availability*, not identity: a built-in
+/// row survives while any of its route targets remains in the account
+/// roster, and roster models that no built-in route targets are appended as
+/// discovered rows. An empty successful roster therefore removes every
+/// built-in row, while a failed lookup never reaches this function and
+/// keeps the built-in list.
+pub(super) fn merge_roster(models: &mut BTreeMap<String, Value>, roster: &[CatalogModel]) {
+    let available = roster
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let covered_by_built_ins = models
+        .values()
+        .filter_map(|value| Some(route_targets_of(value)?.values()))
+        .flatten()
+        .filter_map(|route| route.get("model").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    models.retain(|_, value| {
+        route_targets_of(value).is_none_or(|routes| {
+            routes.values().any(|route| {
+                route
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|target| available.contains(target))
+            })
+        })
+    });
+    for model in roster {
+        if covered_by_built_ins.contains(model.id.as_str()) {
+            continue;
+        }
+        if let Ok(value) = serde_json::to_value(model) {
+            models.insert(model.id.clone(), value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +219,7 @@ mod tests {
             oauth: true,
             radius_gateway: None,
             workbuddy: None,
+            antigravity_account: None,
         }
     }
 
@@ -240,6 +290,78 @@ mod tests {
     #[test]
     fn missing_models_object_is_an_error() {
         assert!(parse_roster(json!({"agentModelSorts": []})).is_err());
+    }
+
+    fn raw_built_in(id: &str, routes: Value) -> (String, Value) {
+        (
+            id.to_string(),
+            json!({
+                "id": id,
+                "name": id,
+                "api": "antigravity",
+                "provider": PROVIDER,
+                "baseUrl": "https://cloudcode-pa.googleapis.com",
+                "compat": {"antigravityRoutes": routes}
+            }),
+        )
+    }
+
+    #[test]
+    fn merge_roster_prunes_unavailable_built_ins_and_appends_uncovered_rows() {
+        let mut models = BTreeMap::from([
+            raw_built_in(
+                "gemini-3.1-pro",
+                json!({
+                    "low": {"model": "gemini-3.1-pro-low", "thinkingBudget": 1001},
+                    "medium": {"model": "gemini-pro-agent", "thinkingBudget": 10001}
+                }),
+            ),
+            raw_built_in(
+                "gemini-3.8-flash",
+                json!({
+                    "low": {"model": "gemini-3.8-flash-low"},
+                    "high": {"model": "gemini-3.8-flash-high"}
+                }),
+            ),
+            raw_built_in(
+                "claude-sonnet-4-6",
+                json!({"low": {"model": "claude-sonnet-4-6"}}),
+            ),
+        ]);
+        let roster = parse_roster(json!({
+            "models": {
+                "gemini-3.1-pro-low": {"supportsThinking": true},
+                "gemini-pro-agent": {"supportsThinking": true},
+                "claude-sonnet-4-6": {"supportsThinking": true},
+                "brand-new-model": {"supportsThinking": true}
+            }
+        }))
+        .unwrap();
+        merge_roster(&mut models, &roster);
+
+        // gemini-3.1-pro survives through its covered route targets with the
+        // tuned budgets intact; gemini-3.8-flash has no target left and is
+        // pruned; roster rows covered by a built-in route are not duplicated,
+        // and brand-new-model is appended as a discovered row.
+        assert_eq!(
+            models.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["brand-new-model", "claude-sonnet-4-6", "gemini-3.1-pro"]
+        );
+        let routes = models["gemini-3.1-pro"]["compat"]["antigravityRoutes"].clone();
+        assert_eq!(routes["low"]["model"], "gemini-3.1-pro-low");
+        assert_eq!(routes["low"]["thinkingBudget"], 1001);
+        // Metadata is flattened on serialization.
+        assert_eq!(models["brand-new-model"]["discovered"], true);
+    }
+
+    #[test]
+    fn an_empty_successful_roster_removes_every_built_in() {
+        let mut models = BTreeMap::from([raw_built_in(
+            "gemini-3.1-pro",
+            json!({"low": {"model": "gemini-3.1-pro-low"}}),
+        )]);
+        merge_roster(&mut models, &[]);
+        assert!(models.is_empty());
     }
 
     #[tokio::test]

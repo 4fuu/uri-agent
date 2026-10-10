@@ -199,11 +199,12 @@ The client version sent as `x-client-version` resolves from the environment
 override above, then the latest release published by Antigravity's official
 update manifest (fetched once per process, silently falling back to a pinned
 version when offline), so newly version-gated models stay reachable. When a
-credential is active, the account's `fetchAvailableModels` roster replaces the
-built-in model list: accounts without a bundled model stop being offered it,
-while a failed roster lookup keeps the built-in rows. The browser login
-prefers its fixed loopback callback port and otherwise binds an OS-assigned
-one.
+credential is active, the account's `fetchAvailableModels` roster filters the
+built-in model list by availability: a built-in logical model stays while any
+of its effort-route targets remains in the roster, roster models no built-in
+route covers join as discovered rows, and a failed lookup keeps the built-in
+list. The browser login prefers its fixed loopback callback port and
+otherwise binds an OS-assigned one.
 
 ## Authentication and credential precedence
 

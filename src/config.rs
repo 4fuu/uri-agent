@@ -1077,6 +1077,7 @@ struct DiscoveryCredentialCandidate {
     environment: BTreeMap<String, String>,
     workbuddy: Option<WorkBuddyCatalogCredential>,
     radius_gateway: Option<String>,
+    antigravity_account: Option<String>,
 }
 
 pub struct ConfigManager {
@@ -1893,6 +1894,17 @@ async fn discovery_credential_candidates(
                     .map(str::to_owned)
             })
             .flatten();
+        let antigravity_account = (provider == "antigravity")
+            .then(|| {
+                let extra = &files.auth.0.get("antigravity")?.extra;
+                ["projectId", "email"]
+                    .into_iter()
+                    .find_map(|key| extra.get(key))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .flatten();
         candidates.push(DiscoveryCredentialCandidate {
             provider,
             value,
@@ -1900,6 +1912,7 @@ async fn discovery_credential_candidates(
             environment: credential.environment,
             workbuddy,
             radius_gateway,
+            antigravity_account,
         });
     }
     candidates
@@ -1938,6 +1951,7 @@ async fn resolve_discovery_credentials(
                     oauth: candidate.oauth,
                     workbuddy: candidate.workbuddy,
                     radius_gateway: candidate.radius_gateway,
+                    antigravity_account: candidate.antigravity_account,
                 },
             );
         }
@@ -4129,6 +4143,7 @@ mod tests {
             environment: BTreeMap::new(),
             workbuddy: None,
             radius_gateway: None,
+            antigravity_account: None,
         };
 
         let credentials = resolve_discovery_credentials(vec![candidate()], false).await;
@@ -4156,6 +4171,7 @@ mod tests {
             environment: BTreeMap::new(),
             workbuddy: None,
             radius_gateway: None,
+            antigravity_account: None,
         };
 
         let credentials = resolve_discovery_credentials(

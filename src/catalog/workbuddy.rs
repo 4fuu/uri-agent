@@ -294,6 +294,7 @@ mod tests {
                 },
                 api_key: false,
             }),
+            antigravity_account: None,
         };
 
         let models = discover(&Client::new(), &credential).await.unwrap();
