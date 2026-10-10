@@ -166,7 +166,13 @@ fn text_tokens(text: &str) -> usize {
             (counts.0, counts.1 + 1)
         }
     });
-    ascii.div_ceil(4).saturating_add(non_ascii)
+    ascii_tokens(ascii).saturating_add(non_ascii)
+}
+
+/// ASCII token estimate at 3.5 characters per token, matching the upstream
+/// calibration that leaves more room for output caps on large inputs.
+fn ascii_tokens(ascii: usize) -> usize {
+    (ascii.saturating_mul(2)).div_ceil(7)
 }
 
 pub fn estimate_text_tokens(text: &str) -> usize {
@@ -482,7 +488,7 @@ fn take_tokens(characters: impl Iterator<Item = char>, limit: usize) -> String {
     for character in characters {
         let next_ascii = ascii + usize::from(character.is_ascii());
         let next_non_ascii = non_ascii + usize::from(!character.is_ascii());
-        if next_ascii.div_ceil(4).saturating_add(next_non_ascii) > limit {
+        if ascii_tokens(next_ascii).saturating_add(next_non_ascii) > limit {
             break;
         }
         ascii = next_ascii;
@@ -557,10 +563,14 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_text_is_not_estimated_as_four_characters_per_token() {
-        assert_eq!(text_tokens("abcdefgh"), 2);
+    fn ascii_text_is_estimated_at_three_and_a_half_characters_per_token() {
+        // ceil(8 / 3.5) = 3 and ceil(7 / 3.5) = 2, leaving more output room
+        // on large inputs than the previous four-characters-per-token floor.
+        assert_eq!(text_tokens("abcdefgh"), 3);
+        assert_eq!(text_tokens("abcdefg"), 2);
         assert_eq!(text_tokens("上下文机制"), 5);
-        assert_eq!(text_tokens("abcd上下文"), 4);
+        // ceil(4 / 3.5) = 2 plus one token per non-ASCII character.
+        assert_eq!(text_tokens("abcd上下文"), 5);
     }
 
     #[test]

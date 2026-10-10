@@ -1,6 +1,6 @@
 use super::super::callback;
 use super::super::util::{encode, generate_pkce, http_client, open_url};
-use super::super::{OauthLogin, OauthToken};
+use super::super::{OauthLogin, OauthToken, set_display};
 use super::shared::{
     FormUrlEncoded, random_hex, read_token_form, spawn_login_flow, token_from_value,
 };
@@ -14,7 +14,6 @@ use tokio::sync::oneshot;
 const AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USER_INFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-const REDIRECT_URI: &str = "http://localhost:8085/callback";
 const DEFAULT_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const DEFAULT_CLIENT_SECRET: &str = "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";
@@ -42,29 +41,40 @@ pub(in crate::oauth) fn start_antigravity()
     let identity = client_identity();
     let pkce = generate_pkce()?;
     let state = random_hex(24)?;
-    let url = format!(
-        "{AUTHORIZE_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent&include_granted_scopes=true",
-        encode(&identity.client_id),
-        encode(REDIRECT_URI),
-        encode(SCOPES),
-        encode(&pkce.challenge),
-        encode(&state),
-    );
-    open_url(&url);
     spawn_login_flow(
-        url,
+        String::new(),
         None,
         "Experimental private protocol. Complete Google sign-in, or paste the redirect URL / code.",
         move |mut flow| async move {
-            let callback = callback::bind(
+            // Bind before building the authorize URL. Google accepts any
+            // loopback port for this desktop client (RFC 8252 §7.3), so an
+            // excluded or occupied 8085 falls back to an OS-assigned port
+            // instead of degrading the login to paste-only.
+            let callback = callback::bind_preferred(
                 "127.0.0.1",
                 8085,
                 "/callback",
-                REDIRECT_URI,
+                "localhost",
                 Some(&state),
                 "Antigravity authentication completed. You can close this window.",
             )
             .await;
+            let redirect_uri = callback.redirect_uri.clone();
+            let url = format!(
+                "{AUTHORIZE_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent&include_granted_scopes=true",
+                encode(&identity.client_id),
+                encode(&redirect_uri),
+                encode(SCOPES),
+                encode(&pkce.challenge),
+                encode(&state),
+            );
+            set_display(
+                &flow.display,
+                url.clone(),
+                None,
+                "Experimental private protocol. Complete Google sign-in, or paste the redirect URL / code.",
+            );
+            open_url(&url);
             let (code, _) = callback::race_callback_or_paste(
                 &callback,
                 &mut flow.paste_rx,
@@ -72,7 +82,7 @@ pub(in crate::oauth) fn start_antigravity()
                 Some(&state),
             )
             .await?;
-            let token = exchange_code(&identity, &code, &pkce.verifier).await?;
+            let token = exchange_code(&identity, &code, &pkce.verifier, &redirect_uri).await?;
             enrich_token(token, &identity, true).await
         },
     )
@@ -115,6 +125,7 @@ async fn exchange_code(
     identity: &ClientIdentity,
     code: &str,
     verifier: &str,
+    redirect_uri: &str,
 ) -> Result<OauthToken> {
     let response = http_client()?
         .post(TOKEN_URL)
@@ -123,7 +134,7 @@ async fn exchange_code(
             ("client_id", &identity.client_id),
             ("client_secret", &identity.client_secret),
             ("code", code),
-            ("redirect_uri", REDIRECT_URI),
+            ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
             ("code_verifier", verifier),
         ])

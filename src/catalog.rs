@@ -1,3 +1,4 @@
+mod antigravity;
 mod discovery;
 mod models_dev;
 mod muse_code;
@@ -145,6 +146,19 @@ impl CatalogModel {
     pub fn sampling_params(&self) -> Option<&serde_json::Map<String, Value>> {
         self.metadata
             .get("samplingParams")
+            .and_then(Value::as_object)
+    }
+
+    /// Sampling overrides keyed by the requested thinking level, applied on
+    /// top of `samplingParams`. Keys follow the shared effort vocabulary
+    /// (`off` … `max`); a missing level inherits the model defaults.
+    pub fn sampling_params_by_thinking_level(
+        &self,
+        level: ThinkingLevel,
+    ) -> Option<&serde_json::Map<String, Value>> {
+        self.metadata
+            .get("samplingParamsByThinkingLevel")
+            .and_then(|value| value.get(level.as_str()))
             .and_then(Value::as_object)
     }
 
@@ -923,8 +937,10 @@ fn merge_catalog(
             continue;
         };
         let models = raw.entry(provider.clone()).or_default();
-        if matches!(provider.as_str(), muse_code::PROVIDER | radius::PROVIDER)
-            && discovered.succeeded()
+        if matches!(
+            provider.as_str(),
+            muse_code::PROVIDER | radius::PROVIDER | antigravity::PROVIDER
+        ) && discovered.succeeded()
         {
             models.clear();
         }
@@ -934,7 +950,10 @@ fn merge_catalog(
             };
             if matches!(
                 provider.as_str(),
-                workbuddy::PROVIDER | muse_code::PROVIDER | radius::PROVIDER
+                workbuddy::PROVIDER
+                    | muse_code::PROVIDER
+                    | radius::PROVIDER
+                    | antigravity::PROVIDER
             ) {
                 models.insert(model.id.clone(), value);
             } else {

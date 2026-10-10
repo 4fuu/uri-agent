@@ -406,9 +406,9 @@ impl RigBackend {
                         .http_headers(headers)
                         .http_client(request_client)
                         .default_instructions("")
-                        .originator("pi")
+                        .originator("uri-agent")
                         .user_agent(format!(
-                            "uri-agent/{} ({} {}; pi)",
+                            "uri-agent/{} ({} {})",
                             env!("CARGO_PKG_VERSION"),
                             std::env::consts::OS,
                             std::env::consts::ARCH

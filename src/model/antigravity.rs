@@ -21,6 +21,15 @@ const STREAM_PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
 const DUMMY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_ANTIGRAVITY_VERSION: &str = "4.3.0";
+/// Official electron-builder update manifest. The latest release version
+/// gates which models the Antigravity backend serves, so a stale pin loses
+/// access to newly announced models.
+const ANTIGRAVITY_VERSION_MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Failed manifest lookups suppress retries for this long, so request paths
+/// never stall on a per-call basis.
+const ANTIGRAVITY_VERSION_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 const ANTHROPIC_BETA: &str =
     "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
 
@@ -143,6 +152,11 @@ impl AntigravityTransport {
         client: reqwest::Client,
         request: Request<Bytes>,
     ) -> rig::http_client::Result<rig::http_client::StreamingResponse> {
+        // Refresh the manifest-discovered client version once per process
+        // before the first request; failures fall back to the pin silently.
+        if let Some(manifest) = self.endpoints.version_manifest.clone() {
+            ensure_version_from(&client, &manifest, global_version_state()).await;
+        }
         let inner = serde_json::from_slice::<Value>(request.body())
             .context("Rig produced an invalid Gemini request")
             .and_then(|value| {
@@ -258,6 +272,9 @@ struct Endpoints {
     sandbox: String,
     prod: String,
     daily: String,
+    /// Update-manifest URL for client-version discovery, or `None` to skip
+    /// the lookup entirely (tests and offline construction).
+    version_manifest: Option<String>,
 }
 
 impl Default for Endpoints {
@@ -266,6 +283,7 @@ impl Default for Endpoints {
             sandbox: SANDBOX_BASE_URL.to_string(),
             prod: PROD_BASE_URL.to_string(),
             daily: DAILY_BASE_URL.to_string(),
+            version_manifest: Some(ANTIGRAVITY_VERSION_MANIFEST_URL.to_string()),
         }
     }
 }
@@ -344,11 +362,152 @@ async fn send_once(
 }
 
 fn antigravity_version() -> String {
+    antigravity_version_override()
+        .or_else(|| global_version_state().discovered_version())
+        .unwrap_or_else(|| DEFAULT_ANTIGRAVITY_VERSION.to_string())
+}
+
+fn antigravity_version_override() -> Option<String> {
     env::var("ANTIGRAVITY_USER_AGENT_VERSION")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_ANTIGRAVITY_VERSION.to_string())
+}
+
+/// Cached client-version discovery state. `discovered` and `failed_at` are
+/// only written between awaits, never while held, so sync readers can take
+/// their locks momentarily; `lookup` serializes concurrent fetches.
+struct VersionDiscovery {
+    discovered: std::sync::Mutex<Option<String>>,
+    failed_at: std::sync::Mutex<Option<std::time::Instant>>,
+    lookup: tokio::sync::Mutex<()>,
+}
+
+impl VersionDiscovery {
+    fn new() -> Self {
+        Self {
+            discovered: std::sync::Mutex::new(None),
+            failed_at: std::sync::Mutex::new(None),
+            lookup: tokio::sync::Mutex::const_new(()),
+        }
+    }
+
+    fn discovered_version(&self) -> Option<String> {
+        self.discovered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn failure_age(&self) -> Option<std::time::Duration> {
+        self.failed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|failed_at| failed_at.elapsed())
+    }
+
+    fn record(&self, version: Option<String>) {
+        let mut discovered = self
+            .discovered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut failed_at = self
+            .failed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match version {
+            Some(version) => {
+                *discovered = Some(version);
+                *failed_at = None;
+            }
+            None => *failed_at = Some(std::time::Instant::now()),
+        }
+    }
+}
+
+static GLOBAL_VERSION_DISCOVERY: OnceLock<VersionDiscovery> = OnceLock::new();
+
+fn global_version_state() -> &'static VersionDiscovery {
+    GLOBAL_VERSION_DISCOVERY.get_or_init(VersionDiscovery::new)
+}
+
+/// Resolve the latest Antigravity client version from the update manifest
+/// into the process-wide cache. Success is cached for the process lifetime;
+/// failures are silent (the pinned fallback stays valid) and suppress further
+/// lookups for [`ANTIGRAVITY_VERSION_RETRY_INTERVAL`]. Skipped entirely when
+/// the env override is set.
+pub(crate) async fn ensure_antigravity_version(client: &reqwest::Client) {
+    ensure_version_from(
+        client,
+        ANTIGRAVITY_VERSION_MANIFEST_URL,
+        global_version_state(),
+    )
+    .await;
+}
+
+async fn ensure_version_from(
+    client: &reqwest::Client,
+    manifest_url: &str,
+    state: &VersionDiscovery,
+) {
+    if antigravity_version_override().is_some()
+        || state.discovered_version().is_some()
+        || state
+            .failure_age()
+            .is_some_and(|age| age < ANTIGRAVITY_VERSION_RETRY_INTERVAL)
+    {
+        return;
+    }
+    let _serialized = state.lookup.lock().await;
+    // Re-check after the wait: another caller may have finished the lookup.
+    if state.discovered_version().is_some()
+        || state
+            .failure_age()
+            .is_some_and(|age| age < ANTIGRAVITY_VERSION_RETRY_INTERVAL)
+    {
+        return;
+    }
+    let version = fetch_manifest_version(client, manifest_url).await;
+    state.record(version);
+}
+
+async fn fetch_manifest_version(client: &reqwest::Client, manifest_url: &str) -> Option<String> {
+    let response = client
+        .get(manifest_url)
+        .header("Cache-Control", "no-cache")
+        .header("User-Agent", "electron-builder")
+        .timeout(ANTIGRAVITY_VERSION_FETCH_TIMEOUT)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .ok()?;
+    let body = response.text().await.ok()?;
+    parse_antigravity_manifest_version(&body)
+}
+
+/// Extract the client version from an electron-builder update manifest: the
+/// first `version:` line, quoted or bare, when it is a plain `major.minor.
+/// patch` value.
+fn parse_antigravity_manifest_version(yaml: &str) -> Option<String> {
+    for line in yaml.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("version") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let value = rest.split('#').next().unwrap_or_default().trim();
+        let value = value.trim_matches('"').trim_matches('\'');
+        let valid = !value.is_empty()
+            && value.split('.').count() == 3
+            && value.split('.').all(|part| {
+                !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+            });
+        return valid.then(|| value.to_string());
+    }
+    None
 }
 
 fn default_generation_user_agent() -> String {
@@ -361,6 +520,12 @@ fn default_generation_user_agent() -> String {
         "Antigravity/{} ({platform}) Chrome/132.0.6834.160 Electron/39.2.3",
         antigravity_version()
     )
+}
+
+/// User-Agent the generation endpoints and roster discovery send. Respects
+/// the `ANTIGRAVITY_USER_AGENT` override, then this generated default.
+pub(crate) fn generation_user_agent() -> String {
+    default_generation_user_agent()
 }
 
 fn process_session_id() -> &'static str {
@@ -1110,6 +1275,81 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn manifest_version_lines_parse_bare_quoted_and_commented_forms() {
+        assert_eq!(
+            parse_antigravity_manifest_version("version: 4.9.2\nfiles: []\n"),
+            Some("4.9.2".to_string())
+        );
+        assert_eq!(
+            parse_antigravity_manifest_version("version: \"5.0.0\""),
+            Some("5.0.0".to_string())
+        );
+        assert_eq!(
+            parse_antigravity_manifest_version(
+                "# leading comment\n  version:   6.1.0 # build 42\n"
+            ),
+            Some("6.1.0".to_string())
+        );
+        // Unrelated keys never match, and malformed first version lines win
+        // over later valid ones.
+        assert_eq!(
+            parse_antigravity_manifest_version("url: x\nhash: y\n"),
+            None
+        );
+        assert_eq!(parse_antigravity_manifest_version("versionCode: 7\n"), None);
+        assert_eq!(parse_antigravity_manifest_version("version: 4.9"), None);
+        assert_eq!(
+            parse_antigravity_manifest_version("version: beta.1\n"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn version_lookup_reads_the_manifest_and_caches_success() {
+        let server = test_http::serve(vec![MockResponse::text(
+            200,
+            "text/yaml",
+            "version: 4.9.6\npath: antigravity-mac.zip\n",
+        )])
+        .await;
+        let state = VersionDiscovery::new();
+        ensure_version_from(&reqwest::Client::new(), &server.base, &state).await;
+        assert_eq!(state.discovered_version().as_deref(), Some("4.9.6"));
+        assert!(state.failure_age().is_none());
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("user-agent: electron-builder"));
+        assert!(requests[0].contains("cache-control: no-cache"));
+    }
+
+    #[tokio::test]
+    async fn version_lookup_skips_when_discovered_or_within_failure_backoff() {
+        // Already discovered: no fetch happens even though the URL is dead.
+        let cached = VersionDiscovery::new();
+        cached.record(Some("9.9.9".to_string()));
+        ensure_version_from(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:9/manifest.yml",
+            &cached,
+        )
+        .await;
+        assert_eq!(cached.discovered_version().as_deref(), Some("9.9.9"));
+
+        // A recent failure suppresses the retry window entirely.
+        let backed_off = VersionDiscovery::new();
+        backed_off.record(None);
+        let server = test_http::serve(vec![MockResponse::text(
+            200,
+            "text/yaml",
+            "version: 4.9.6\n",
+        )])
+        .await;
+        ensure_version_from(&reqwest::Client::new(), &server.base, &backed_off).await;
+        assert_eq!(backed_off.discovered_version(), None);
+        assert!(backed_off.failure_age().is_some());
+    }
+
     struct TestCredentials {
         current: OauthToken,
         refreshed: OauthToken,
@@ -1202,6 +1442,7 @@ mod tests {
                 sandbox: endpoint.clone(),
                 prod: endpoint.clone(),
                 daily: endpoint,
+                version_manifest: None,
             },
         }
     }
@@ -1364,6 +1605,7 @@ mod tests {
             sandbox: "https://sandbox.test".to_string(),
             prod: "https://prod.test".to_string(),
             daily: "https://daily.test".to_string(),
+            version_manifest: None,
         };
         assert_eq!(
             endpoints

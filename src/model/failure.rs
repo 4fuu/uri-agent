@@ -180,6 +180,9 @@ fn classify_model_failure(
                 "temporarily unavailable",
                 "server is overloaded",
                 "currently experiencing high demand",
+                "model is at capacity",
+                "server_busy",
+                "servers are currently busy",
             ],
         ) {
             return ModelFailureKind::Server;
@@ -242,6 +245,12 @@ pub(crate) fn looks_like_context_overflow(message: &str) -> bool {
             "input is too long for requested model",
             "exceeds the context window",
             "maximum context length",
+            // Strata reports overflow as "prompt (N tokens) + max tokens (N)
+            // exceeds the context (N)" or "... leaves no room to answer in
+            // the context (N)"; both must trigger compaction, while its
+            // output-limit phrasing "exceeds the output limit" must not.
+            "exceeds the context (",
+            "leaves no room to answer",
             "input token count",
             "maximum prompt length",
             "reduce the length of the messages",
@@ -314,6 +323,9 @@ fn looks_like_network_failure(message: &str) -> bool {
             "premature end",
             "stream ended",
             "incomplete message",
+            // ERR_HTTP2_STREAM_CANCEL: the pending stream was canceled before
+            // the request was ever sent, so a retry is safe.
+            "pending stream has been canceled",
             "dns error",
             "failed to lookup address",
             "enotfound",

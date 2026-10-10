@@ -31,6 +31,39 @@ pub async fn bind(
     }
 }
 
+/// Bind the preferred fixed port, or let the OS assign a free loopback port
+/// when it is excluded or already taken. The redirect URI always names the
+/// port actually bound, so the authorize URL and the token exchange agree.
+/// Use only for authorization servers that accept any loopback port (RFC
+/// 8252 §7.3); protocol-pinned ports must keep [`bind`].
+pub async fn bind_preferred(
+    host: &str,
+    preferred_port: u16,
+    path: &str,
+    public_host: &str,
+    expected_state: Option<&str>,
+    success: &str,
+) -> CallbackListener {
+    let listener = match TcpListener::bind((host, preferred_port)).await {
+        Ok(listener) => Some(listener),
+        Err(_) => TcpListener::bind((host, 0)).await.ok(),
+    };
+    // `None` only when even the OS-assigned bind failed, which is practically
+    // impossible on loopback; the paste-only fallback then stays alive.
+    let port = listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port())
+        .unwrap_or(preferred_port);
+    CallbackListener {
+        listener,
+        redirect_uri: format!("http://{public_host}:{port}{path}"),
+        expected_path: path.to_string(),
+        expected_state: expected_state.map(str::to_string),
+        success: success.to_string(),
+    }
+}
+
 pub async fn bind_ephemeral(
     host: &str,
     path: &str,
@@ -201,4 +234,30 @@ fn escape_html(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_preferred_uses_the_fixed_port_when_available() {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let callback = bind_preferred("127.0.0.1", port, "/cb", "localhost", None, "done").await;
+        assert_eq!(callback.redirect_uri, format!("http://localhost:{port}/cb"));
+        assert!(callback.listener.is_some());
+    }
+
+    #[tokio::test]
+    async fn bind_preferred_falls_back_to_an_os_assigned_port() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let callback = bind_preferred("127.0.0.1", port, "/cb", "localhost", None, "done").await;
+        assert_ne!(callback.redirect_uri, format!("http://localhost:{port}/cb"));
+        assert!(callback.redirect_uri.starts_with("http://localhost:"));
+        assert!(callback.redirect_uri.ends_with("/cb"));
+        assert!(callback.listener.is_some());
+    }
 }

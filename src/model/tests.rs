@@ -672,7 +672,7 @@ async fn codex_websocket_reuses_connection_and_sends_only_new_input() {
 
     assert_eq!(uri.path(), format!("{prefix}/backend-api/codex/responses"));
     assert_eq!(headers["chatgpt-account-id"], "account-123");
-    assert_eq!(headers["originator"], "pi");
+    assert_eq!(headers["originator"], "uri-agent");
     assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
     assert_eq!(headers["version"], "0.159.0");
     assert_eq!(headers["x-codex-routing-hint"], "model=gpt-5.4");
@@ -1060,7 +1060,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
     assert!(request.starts_with("POST /backend-api/codex/responses HTTP/1.1"));
     assert!(request_headers.contains("authorization: bearer header."));
     assert!(request_headers.contains("chatgpt-account-id: account-123"));
-    assert!(request_headers.contains("originator: pi"));
+    assert!(request_headers.contains("originator: uri-agent"));
     assert!(request_headers.contains("openai-beta: responses=experimental"));
     assert!(request_headers.contains("version: 0.159.0"));
     assert!(request_headers.contains("x-codex-routing-hint: model=gpt-5.4"));
@@ -1478,6 +1478,63 @@ fn zai_cn_prompt_length_overflow_is_classified_as_context_overflow() {
 }
 
 #[test]
+fn strata_overflow_phrasings_compact_while_output_limit_errors_do_not() {
+    let overflow = |message: &str| {
+        ModelFailure::from_completion_error(
+            CompletionError::from_provider_body(message),
+            ModelFailurePhase::Request,
+            "custom-gateway",
+        )
+        .kind()
+    };
+    assert_eq!(
+        overflow("prompt (180000 tokens) + max tokens (32768) exceeds the context (131072)"),
+        ModelFailureKind::ContextOverflow
+    );
+    assert_eq!(
+        overflow("prompt (130000 tokens) leaves no room to answer in the context (131072)"),
+        ModelFailureKind::ContextOverflow
+    );
+    assert_ne!(
+        overflow("max tokens (32768) exceeds the output limit (8192)"),
+        ModelFailureKind::ContextOverflow
+    );
+}
+
+#[test]
+fn capacity_and_busy_server_phrasings_retry_as_server_failures() {
+    let server_failure = |message: &str| {
+        ModelFailure::from_completion_error(
+            CompletionError::from_provider_body(message),
+            ModelFailurePhase::Stream,
+            "openai",
+        )
+        .kind()
+    };
+    for message in [
+        "Selected model is at capacity",
+        r#"{"error":{"type":"server_busy"}}"#,
+        "Our servers are currently busy",
+    ] {
+        assert_eq!(
+            server_failure(message),
+            ModelFailureKind::Server,
+            "message should retry: {message}"
+        );
+    }
+}
+
+#[test]
+fn pending_http2_stream_cancellation_retries_as_network_failure() {
+    let failure = ModelFailure::from_completion_error(
+        CompletionError::from_provider_body("The pending stream has been canceled"),
+        ModelFailurePhase::Stream,
+        "openai",
+    );
+    assert_eq!(failure.kind(), ModelFailureKind::Network);
+}
+
+#[test]
 fn gpt_6_astra_catalog_supports_api_and_codex_basic_requests() {
     for (provider, api, base_url, minimal) in [
         (
@@ -1569,6 +1626,148 @@ fn responses_uses_catalog_thinking_map_and_sampling_params() {
     assert_eq!(body["reasoning"]["summary"], "auto");
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["service_tier"], "priority");
+}
+
+#[test]
+fn sampling_params_by_thinking_level_refine_model_defaults() {
+    let model = catalog_model(
+        "openai-completions",
+        json!({
+            "reasoning": true,
+            "samplingParams": {"temperature": 0.7, "top_p": 0.9},
+            "samplingParamsByThinkingLevel": {
+                "high": {"temperature": 0.2, "top_k": 40},
+                "off": {"temperature": 1.0}
+            }
+        }),
+    );
+    let high = transformed(
+        model.clone(),
+        ThinkingLevel::High,
+        json!({"model": "test-model", "stream": true}),
+    );
+    // The level override wins per key; unspecified keys keep the defaults.
+    assert_eq!(high["temperature"], 0.2);
+    assert_eq!(high["top_p"], 0.9);
+    assert_eq!(high["top_k"], 40);
+
+    let off = transformed(
+        model.clone(),
+        ThinkingLevel::Off,
+        json!({"model": "test-model", "stream": true}),
+    );
+    assert_eq!(off["temperature"], 1.0);
+    assert_eq!(off["top_p"], 0.9);
+    assert!(off.get("top_k").is_none());
+
+    // An unsupported level clamps to the nearest supported one before the
+    // lookup: without a thinkingLevelMap, xhigh clamps to high.
+    let clamped = transformed(
+        model,
+        ThinkingLevel::Xhigh,
+        json!({"model": "test-model", "stream": true}),
+    );
+    assert_eq!(clamped["temperature"], 0.2);
+    assert_eq!(clamped["top_k"], 40);
+}
+
+#[test]
+fn official_anthropic_requests_trim_oldest_inline_images_to_the_byte_budget() {
+    let model = |provider: &str, base_url: &str| CatalogModel {
+        id: "claude-test".to_string(),
+        name: "Claude Test".to_string(),
+        api: "anthropic-messages".to_string(),
+        provider: provider.to_string(),
+        base_url: base_url.to_string(),
+        headers: Default::default(),
+        metadata: Default::default(),
+    };
+    let image = |data: String| json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}});
+    // 12 MB + 12 MB + 1 MB = 25 MB of inline base64: the oldest image is
+    // trimmed to bring the total under the 24 MB budget.
+    let body = json!({
+        "model": "claude-test",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": [
+                image("a".repeat(12_000_000)),
+                {"type": "text", "text": "first screenshot"}
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    image("b".repeat(12_000_000))
+                ]},
+                image("c".repeat(1_000_000))
+            ]}
+        ]
+    });
+    let trimmed = transformed(
+        model("anthropic", "https://api.anthropic.com"),
+        ThinkingLevel::Off,
+        body.clone(),
+    );
+    assert_eq!(
+        trimmed["messages"][0]["content"][0],
+        json!({"type": "text", "text": "[image removed to fit the request size limit]"})
+    );
+    assert_eq!(trimmed["messages"][0]["content"][1]["type"], "text");
+    assert_eq!(
+        trimmed["messages"][2]["content"][0]["content"][0]["type"],
+        "image"
+    );
+    assert_eq!(trimmed["messages"][2]["content"][1]["type"], "image");
+
+    // A custom gateway keeps every image: it defines its own body limits.
+    let gateway = transformed(
+        model("custom-gateway", "https://gw.example.test"),
+        ThinkingLevel::Off,
+        body,
+    );
+    assert_eq!(gateway["messages"][0]["content"][0]["type"], "image");
+    assert_eq!(
+        gateway["messages"][2]["content"][0]["content"][0]["type"],
+        "image"
+    );
+}
+
+#[test]
+fn oversized_tool_result_images_are_also_trimmed_when_plain_images_run_out() {
+    let model = CatalogModel {
+        id: "claude-test".to_string(),
+        name: "Claude Test".to_string(),
+        api: "anthropic-messages".to_string(),
+        provider: "anthropic".to_string(),
+        base_url: "https://api.anthropic.com".to_string(),
+        headers: Default::default(),
+        metadata: Default::default(),
+    };
+    let image = |data: String| json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}});
+    // 1 MB plain + 24.5 MB nested: both must go for the total to fit.
+    let trimmed = transformed(
+        model,
+        ThinkingLevel::Off,
+        json!({
+            "model": "claude-test",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [image("a".repeat(1_000_000))]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        image("b".repeat(24_500_000))
+                    ]}
+                ]}
+            ]
+        }),
+    );
+    assert_eq!(
+        trimmed["messages"][0]["content"][0],
+        json!({"type": "text", "text": "[image removed to fit the request size limit]"})
+    );
+    assert_eq!(
+        trimmed["messages"][1]["content"][0]["content"][0],
+        json!({"type": "text", "text": "[image removed to fit the request size limit]"})
+    );
 }
 
 #[test]

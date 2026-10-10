@@ -258,7 +258,12 @@ fn wire_model_id(model: &CatalogModel) -> Result<String> {
         return Ok(model.id.clone());
     }
     let namespace = match model.api.as_str() {
-        "anthropic-messages" => "anthropic",
+        "anthropic-messages" => {
+            // Catalog listings (models.dev) publish dotted Claude versions
+            // such as `claude-opus-5.5`, but the gateway's Anthropic
+            // passthrough only accepts dashed IDs (`claude-opus-5-5`).
+            return Ok(format!("anthropic/{}", model.id.replace('.', "-")));
+        }
         "openai-responses" | "openai-completions" => "openai",
         _ => bail!("Cloudflare model has unsupported API {:?}", model.api),
     };
@@ -343,6 +348,24 @@ mod tests {
             workers.compat("maxTokensField").and_then(Value::as_str),
             Some("max_tokens")
         );
+    }
+
+    #[test]
+    fn anthropic_gateway_model_ids_convert_dotted_versions_to_dashes() {
+        let (dotted, _) = request_model(
+            &model("claude-opus-5.5", "anthropic-messages"),
+            &credential(),
+        )
+        .unwrap();
+        let (dashed, _) = request_model(
+            &model("claude-opus-5-5", "anthropic-messages"),
+            &credential(),
+        )
+        .unwrap();
+        // Catalog listings publish dotted Claude versions, but the gateway's
+        // Anthropic passthrough only accepts dashed IDs.
+        assert_eq!(dotted.id, "anthropic/claude-opus-5-5");
+        assert_eq!(dashed.id, "anthropic/claude-opus-5-5");
     }
 
     #[test]

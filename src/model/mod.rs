@@ -24,6 +24,7 @@ use rig::message::{AssistantContent, Message};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+pub(crate) use crate::model::antigravity::{ensure_antigravity_version, generation_user_agent};
 pub(crate) use cloudflare::{
     ACCOUNT_ID_METADATA as CLOUDFLARE_ACCOUNT_ID_METADATA,
     DEFAULT_GATEWAY_ID as CLOUDFLARE_DEFAULT_GATEWAY_ID,

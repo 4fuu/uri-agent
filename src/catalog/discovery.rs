@@ -1,5 +1,6 @@
 use super::{
-    CatalogCredential, CatalogModel, models_dev::ProtocolHints, muse_code, radius, workbuddy,
+    CatalogCredential, CatalogModel, antigravity, models_dev::ProtocolHints, muse_code, radius,
+    workbuddy,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use http::header::{ACCEPT, AUTHORIZATION};
@@ -19,11 +20,15 @@ enum DiscoveryKind {
     MuseCode,
     Radius,
     WorkBuddy,
+    Antigravity,
 }
 
 const PROVIDERS: &[(&str, DiscoveryKind)] = &[
     ("abliteration", DiscoveryKind::OpenAi),
     ("ant-ling", DiscoveryKind::OpenAi),
+    // The built-in Antigravity rows are a fixed snapshot; roster discovery
+    // replaces them with the account's actually available models.
+    ("antigravity", DiscoveryKind::Antigravity),
     ("anthropic", DiscoveryKind::Anthropic),
     ("baseten", DiscoveryKind::OpenAi),
     ("cerebras", DiscoveryKind::OpenAi),
@@ -91,6 +96,12 @@ pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredent
     hash.update(b"uri-agent-model-discovery\0");
     hash.update(provider.as_bytes());
     hash.update([u8::from(credential.oauth)]);
+    if provider == antigravity::PROVIDER {
+        // Antigravity stores one credential per provider and its access
+        // token rotates hourly, so the scope keys on the credential kind
+        // alone; a replaced account simply refreshes under the same scope.
+        return format!("sha256-{}", crate::hex_lower(&hash.finalize()));
+    }
     if provider == radius::PROVIDER {
         hash.update(
             credential
@@ -160,6 +171,9 @@ pub(super) async fn discover(
     if kind == DiscoveryKind::Radius {
         return radius::discover(client, credential).await;
     }
+    if kind == DiscoveryKind::Antigravity {
+        return antigravity::discover(client, credential).await;
+    }
     let references = catalog
         .get(provider)
         .ok_or_else(|| anyhow!("provider {provider} has no catalog models"))?;
@@ -170,8 +184,10 @@ pub(super) async fn discover(
         }
         DiscoveryKind::Anthropic => fetch_anthropic(client, endpoint, credential).await?,
         DiscoveryKind::Gemini => fetch_gemini(client, endpoint, credential).await?,
-        DiscoveryKind::WorkBuddy => unreachable!("WorkBuddy discovery returned above"),
-        DiscoveryKind::MuseCode | DiscoveryKind::Radius => {
+        DiscoveryKind::WorkBuddy
+        | DiscoveryKind::MuseCode
+        | DiscoveryKind::Radius
+        | DiscoveryKind::Antigravity => {
             unreachable!("provider-owned discovery returned above")
         }
     };
@@ -194,9 +210,10 @@ fn discovery_endpoint(
             .iter()
             .find(|model| model.base_url.trim_end_matches('/').ends_with("/v1"))
             .or_else(|| references.first()),
-        DiscoveryKind::WorkBuddy | DiscoveryKind::MuseCode | DiscoveryKind::Radius => {
-            unreachable!("provider has a provider-owned endpoint")
-        }
+        DiscoveryKind::WorkBuddy
+        | DiscoveryKind::MuseCode
+        | DiscoveryKind::Radius
+        | DiscoveryKind::Antigravity => unreachable!("provider has a provider-owned endpoint"),
         _ => references.first(),
     }
     .map(|model| model.base_url.trim_end_matches('/'))
@@ -213,9 +230,10 @@ fn discovery_endpoint(
                 format!("{base_url}/v1/models")
             }
         }
-        DiscoveryKind::WorkBuddy | DiscoveryKind::MuseCode | DiscoveryKind::Radius => {
-            unreachable!("provider has a provider-owned endpoint")
-        }
+        DiscoveryKind::WorkBuddy
+        | DiscoveryKind::MuseCode
+        | DiscoveryKind::Radius
+        | DiscoveryKind::Antigravity => unreachable!("provider has a provider-owned endpoint"),
     };
     Url::parse(&endpoint).with_context(|| format!("invalid discovery URL for {provider}"))
 }
@@ -450,7 +468,10 @@ fn materialize_one(
             .api(provider, &record.id)
             .or_else(|| prefixed.map(|model| model.api.as_str()))
             .unwrap_or_else(|| open_code_api(provider, &record.id)),
-        DiscoveryKind::MuseCode | DiscoveryKind::Radius | DiscoveryKind::WorkBuddy => {
+        DiscoveryKind::MuseCode
+        | DiscoveryKind::Radius
+        | DiscoveryKind::WorkBuddy
+        | DiscoveryKind::Antigravity => {
             unreachable!("provider-owned discovery does not use generic materialization")
         }
         _ => single_supported_api(references)?,
@@ -651,7 +672,7 @@ mod tests {
 
     #[test]
     fn discovery_is_limited_to_supported_provider_contracts() {
-        assert_eq!(provider_ids().count(), 34);
+        assert_eq!(provider_ids().count(), 35);
         assert!(supports_provider("abliteration"));
         assert!(supports_provider("stepfun"));
         assert!(supports_provider("workbuddy"));
@@ -660,6 +681,7 @@ mod tests {
         assert!(supports_provider("google"));
         assert!(supports_provider("muse-code"));
         assert!(supports_provider("radius"));
+        assert!(supports_provider("antigravity"));
         assert!(!supports_provider("amazon-bedrock"));
         assert!(!supports_provider("openai-codex"));
     }

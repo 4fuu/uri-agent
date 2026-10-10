@@ -195,6 +195,16 @@ OAuth process. New logins bind refresh to their issuing client ID. Set
 `ANTIGRAVITY_IDENTITY_PROMPT` before launch only when an experiment requires a
 custom identity prefix.
 
+The client version sent as `x-client-version` resolves from the environment
+override above, then the latest release published by Antigravity's official
+update manifest (fetched once per process, silently falling back to a pinned
+version when offline), so newly version-gated models stay reachable. When a
+credential is active, the account's `fetchAvailableModels` roster replaces the
+built-in model list: accounts without a bundled model stop being offered it,
+while a failed roster lookup keeps the built-in rows. The browser login
+prefers its fixed loopback callback port and otherwise binds an OS-assigned
+one.
+
 ## Authentication and credential precedence
 
 `:login` accepts API keys and supports these provider-specific flows:

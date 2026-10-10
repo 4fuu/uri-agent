@@ -8,6 +8,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const CODEX_CLIENT_VERSION: &str = "0.159.0";
+/// The official Anthropic Messages endpoint rejects request bodies over
+/// 32 MB. Inline base64 images replay in every request, so long sessions
+/// with repeated screenshots eventually exceed the cap each time. Trimming
+/// past this budget leaves room for text, tools, and JSON framing; custom
+/// gateways define their own limits and are never trimmed.
+const INLINE_IMAGE_BYTE_BUDGET: usize = 24_000_000;
+const REMOVED_IMAGE_PLACEHOLDER: &str = "[image removed to fit the request size limit]";
 
 /// Catalog provider IDs whose OpenAI-completions compatibility is loose
 /// enough that optional OpenAI fields must not be sent by default, and the
@@ -393,6 +400,13 @@ impl ModelRequestTransform {
     fn apply_sampling_params(&self, body: &mut Map<String, Value>) {
         if let Some(params) = self.model.sampling_params() {
             body.extend(params.clone());
+        }
+        // Effort-keyed overrides refine the model defaults key by key; the
+        // requested level is clamped to one the model supports first, and a
+        // level without an entry keeps the defaults.
+        let level = clamp_thinking_level(&self.model, self.thinking);
+        if let Some(overrides) = self.model.sampling_params_by_thinking_level(level) {
+            body.extend(overrides.clone());
         }
     }
 
@@ -814,6 +828,7 @@ impl ModelRequestTransform {
     }
 
     fn anthropic(&self, body: &mut Map<String, Value>) {
+        self.trim_inline_images_to_budget(body);
         self.apply_anthropic_request_compat(body);
         if !self.compat_bool("supportsTemperature", true) {
             body.remove("temperature");
@@ -921,6 +936,81 @@ impl ModelRequestTransform {
             }
             .to_string(),
         )
+    }
+
+    /// Replace the oldest inline base64 images with a placeholder once they
+    /// exceed [`INLINE_IMAGE_BYTE_BUDGET`]. Images live directly in message
+    /// `content` arrays and nested inside `tool_result` blocks; the
+    /// placeholder keeps the fact that an image existed so the model is not
+    /// confused by a missing attachment.
+    fn trim_inline_images_to_budget(&self, body: &mut Map<String, Value>) {
+        if self.model.provider != "anthropic"
+            || !self
+                .model
+                .base_url
+                .trim_end_matches('/')
+                .contains("api.anthropic.com")
+        {
+            return;
+        }
+        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+            return;
+        };
+        // (message index, content-block index, nested tool-result block index, base64 length)
+        let mut images: Vec<(usize, usize, Option<usize>, usize)> = Vec::new();
+        let mut total = 0usize;
+        for (message_index, message) in messages.iter().enumerate() {
+            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (block_index, block) in blocks.iter().enumerate() {
+                if let Some(length) = base64_image_length(block) {
+                    images.push((message_index, block_index, None, length));
+                    total += length;
+                } else if let Some(nested) = block.get("content").and_then(Value::as_array) {
+                    for (nested_index, nested) in nested.iter().enumerate() {
+                        if let Some(length) = base64_image_length(nested) {
+                            images.push((message_index, block_index, Some(nested_index), length));
+                            total += length;
+                        }
+                    }
+                }
+            }
+        }
+        if total <= INLINE_IMAGE_BYTE_BUDGET {
+            return;
+        }
+        let mut remaining = total;
+        for (message_index, block_index, nested_index, length) in images {
+            if remaining <= INLINE_IMAGE_BYTE_BUDGET {
+                break;
+            }
+            remaining = remaining.saturating_sub(length);
+            let placeholder = json!({"type": "text", "text": REMOVED_IMAGE_PLACEHOLDER});
+            let message = &mut messages[message_index];
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            match nested_index {
+                Some(nested_index) => {
+                    let Some(nested) = blocks
+                        .get_mut(block_index)
+                        .and_then(|block| block.get_mut("content"))
+                        .and_then(Value::as_array_mut)
+                    else {
+                        continue;
+                    };
+                    if let Some(block) = nested.get_mut(nested_index) {
+                        *block = placeholder;
+                    }
+                }
+                None => {
+                    if let Some(block) = blocks.get_mut(block_index) {
+                        *block = placeholder;
+                    }
+                }
+            }
+        }
     }
 
     fn apply_anthropic_request_compat(&self, body: &mut Map<String, Value>) {
@@ -1248,6 +1338,18 @@ fn ensure_assistant_message_field(body: &mut Map<String, Value>, field: &str) {
                 .or_insert_with(|| Value::String(String::new()));
         }
     }
+}
+
+/// Length of an Anthropic base64 image block's inline data, or `None` for
+/// any other block. URL-sourced images carry no inline bytes and are ignored.
+fn base64_image_length(block: &Value) -> Option<usize> {
+    let is_image = block.get("type").and_then(Value::as_str) == Some("image");
+    let data = block
+        .get("source")
+        .filter(|source| source.get("type").and_then(Value::as_str) == Some("base64"))
+        .and_then(|source| source.get("data"))
+        .and_then(Value::as_str)?;
+    is_image.then_some(data.len())
 }
 
 fn add_cache_control_to_message(message: &mut Value, cache_control: &Value) {
