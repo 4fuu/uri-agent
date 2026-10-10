@@ -2,8 +2,8 @@
 //!
 //! The built-in Antigravity rows describe a fixed snapshot; accounts without
 //! a bundled model receive `404 Requested entity was not found` on every
-//! request for it. A successful `fetchAvailableModels` roster replaces the
-//! built-in list, while failures keep it untouched.
+//! request for it. A successful `fetchAvailableModels` roster filters the
+//! built-in list by availability, while failures keep it untouched.
 
 use super::{CatalogCredential, CatalogModel};
 use crate::model::{ensure_antigravity_version, generation_user_agent};
@@ -173,9 +173,13 @@ fn route_targets_of(value: &Value) -> Option<&serde_json::Map<String, Value>> {
 /// the roster is authoritative for *availability*, not identity: a built-in
 /// row survives while any of its route targets remains in the account
 /// roster, and roster models that no built-in route targets are appended as
-/// discovered rows. An empty successful roster therefore removes every
-/// built-in row, while a failed lookup never reaches this function and
-/// keeps the built-in list.
+/// discovered rows. Accounts that carry only part of a model's effort tiers
+/// keep the logical row, but the effort levels whose route targets the
+/// roster lacks are marked unsupported in its `thinkingLevelMap`, so they
+/// can no longer be selected into a request that would 404. Rows without an
+/// enumerated map keep their default support rules. An empty successful
+/// roster therefore removes every built-in row, while a failed lookup never
+/// reaches this function and keeps the built-in list.
 pub(super) fn merge_roster(models: &mut BTreeMap<String, Value>, roster: &[CatalogModel]) {
     let available = roster
         .iter()
@@ -204,6 +208,38 @@ pub(super) fn merge_roster(models: &mut BTreeMap<String, Value>, roster: &[Catal
         }
         if let Ok(value) = serde_json::to_value(model) {
             models.insert(model.id.clone(), value);
+        }
+    }
+    // Mark effort levels whose route target the account lacks as
+    // unsupported. Appended discovered rows route every level at a roster
+    // id, so this only ever rewrites surviving built-in rows.
+    for value in models.values_mut() {
+        let selectable_levels = route_targets_of(value)
+            .map(|routes| {
+                routes
+                    .iter()
+                    .filter(|(_, route)| {
+                        route
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .is_some_and(|target| available.contains(target))
+                    })
+                    .map(|(level, _)| level.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let Some(levels) = value
+            .get_mut("thinkingLevelMap")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for mapped in levels.values_mut() {
+            if let Some(level) = mapped.as_str()
+                && !selectable_levels.contains(level)
+            {
+                *mapped = Value::Null;
+            }
         }
     }
 }
@@ -362,6 +398,45 @@ mod tests {
         )]);
         merge_roster(&mut models, &[]);
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn partially_available_models_lose_only_the_missing_effort_levels() {
+        let mut models = BTreeMap::from([(
+            "gemini-x".to_string(),
+            json!({
+                "id": "gemini-x",
+                "name": "Gemini X",
+                "api": "antigravity",
+                "provider": PROVIDER,
+                "baseUrl": "https://cloudcode-pa.googleapis.com",
+                "reasoning": true,
+                "thinkingLevelMap": {
+                    "off": null, "minimal": null, "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": null, "max": "max"
+                },
+                "compat": {"antigravityRoutes": {
+                    "low": {"model": "gemini-x-low", "thinkingBudget": 1000},
+                    "medium": {"model": "gemini-x-pro", "thinkingBudget": 4000},
+                    "high": {"model": "gemini-x-pro", "thinkingBudget": 10000},
+                    "max": {"model": "gemini-x-max", "thinkingBudget": 20000}
+                }}
+            }),
+        )]);
+        // Only the low tier's target is in the account roster.
+        let roster =
+            parse_roster(json!({"models": {"gemini-x-low": {"supportsThinking": true}}})).unwrap();
+        merge_roster(&mut models, &roster);
+
+        assert_eq!(models.len(), 1);
+        let levels = models["gemini-x"]["thinkingLevelMap"].clone();
+        assert_eq!(levels["low"], "low");
+        assert_eq!(levels["medium"], Value::Null);
+        assert_eq!(levels["high"], Value::Null);
+        assert_eq!(levels["max"], Value::Null);
+        // The surviving route keeps its tuned budget untouched.
+        let routes = models["gemini-x"]["compat"]["antigravityRoutes"].clone();
+        assert_eq!(routes["low"]["thinkingBudget"], 1000);
     }
 
     #[tokio::test]
