@@ -477,7 +477,7 @@ impl ModelCatalog {
         state.discovery_scopes = scopes;
         let (models, warnings) = merge_catalog(&state.store, &state.user, &state.discovery_scopes);
         state.models = models;
-        state.warnings.extend(warnings);
+        state.warnings = warnings;
     }
 
     pub(crate) async fn refresh(
@@ -528,7 +528,7 @@ impl ModelCatalog {
         state.store.extend(refreshed);
         state.user = read_json(&self.user_path).await?;
         let (base_models, warnings) = merge_catalog(&state.store, &state.user, &BTreeMap::new());
-        state.warnings.extend(warnings);
+        state.warnings = warnings;
         let mut protocol_hints = state.protocol_hints.clone();
         drop(state);
 
@@ -595,7 +595,7 @@ impl ModelCatalog {
             })
             .count();
         state.models = models;
-        state.warnings.extend(warnings);
+        state.warnings = warnings;
         Ok(report)
     }
 
@@ -605,7 +605,7 @@ impl ModelCatalog {
         let (models, warnings) = merge_catalog(&state.store, &user, &state.discovery_scopes);
         state.user = user;
         state.models = models;
-        state.warnings.extend(warnings);
+        state.warnings = warnings;
         Ok(())
     }
 
@@ -1030,6 +1030,12 @@ fn merge_catalog(
     let models = raw
         .into_iter()
         .map(|(provider, entries)| {
+            // Pi rows for providers the user never configured can
+            // legitimately lack an endpoint (for example Azure rows, whose
+            // baseUrl is per-deployment). Skipping them silently matches
+            // unsupported pi rows; only a configured provider's missing
+            // endpoint signals a configuration problem worth a warning.
+            let configured = user.providers.contains_key(&provider);
             let mut parsed = entries
                 .into_values()
                 .filter_map(
@@ -1043,10 +1049,12 @@ fn merge_catalog(
                             Some(model)
                         }
                         Ok(model) => {
-                            warnings.push(format!(
-                                "catalog skipped {provider}/{} without api or baseUrl",
-                                model.id
-                            ));
+                            if configured {
+                                warnings.push(format!(
+                                    "catalog skipped {provider}/{} without api or baseUrl",
+                                    model.id
+                                ));
+                            }
                             None
                         }
                         Err(error) => {
@@ -2281,6 +2289,90 @@ mod tests {
         let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &BTreeMap::new());
         assert!(warnings.is_empty());
         assert_eq!(merged["azure-openai-responses"].len(), 1);
+    }
+
+    // Mirrors the pi.dev azure payload: supported API family, but the
+    // per-deployment baseUrl stays empty until the user configures it.
+    fn azure_store() -> BTreeMap<String, StoreEntry> {
+        let models = parse_provider_payload(
+            "azure",
+            serde_json::json!({
+                "deepseek-v4-pro": {
+                    "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro",
+                    "api": "openai-completions", "baseUrl": ""
+                },
+                "gpt-4": {
+                    "id": "gpt-4", "name": "GPT-4",
+                    "api": "azure-openai-responses", "baseUrl": ""
+                }
+            }),
+        )
+        .unwrap();
+        BTreeMap::from([(
+            "azure".to_string(),
+            StoreEntry {
+                models,
+                ..StoreEntry::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn pi_rows_without_endpoints_skip_silently_for_unconfigured_providers() {
+        let (merged, warnings) =
+            merge_catalog(&azure_store(), &ModelsFile::default(), &BTreeMap::new());
+        assert!(warnings.is_empty());
+        let azure = &merged["azure"];
+        assert!(!azure.iter().any(|model| model.id == "deepseek-v4-pro"));
+        // Unsupported rows stay cached even without an endpoint.
+        assert!(azure.iter().any(|model| model.id == "gpt-4"));
+    }
+
+    #[test]
+    fn configured_provider_without_endpoint_still_warns() {
+        let user: ModelsFile = serde_json::from_value(serde_json::json!({
+            "providers": {"azure": {"apiKey": "stored-key"}}
+        }))
+        .unwrap();
+        let (merged, warnings) = merge_catalog(&azure_store(), &user, &BTreeMap::new());
+        assert_eq!(
+            warnings,
+            vec!["catalog skipped azure/deepseek-v4-pro without api or baseUrl".to_string()]
+        );
+        assert!(
+            merged["azure"]
+                .iter()
+                .all(|model| model.id != "deepseek-v4-pro")
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_warnings_do_not_accumulate_across_reloads() {
+        let root = tempfile::tempdir().unwrap();
+        let store: BTreeMap<String, StoreEntry> = serde_json::from_value(serde_json::json!({
+            "azure": {
+                "models": [{
+                    "id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro",
+                    "api": "openai-completions", "provider": "azure", "baseUrl": ""
+                }]
+            }
+        }))
+        .unwrap();
+        write_json(&root.path().join("models-store.json"), &store)
+            .await
+            .unwrap();
+        fs::write(
+            root.path().join("models.json"),
+            serde_json::json!({"providers": {"azure": {"apiKey": "stored-key"}}}).to_string(),
+        )
+        .await
+        .unwrap();
+        let catalog = ModelCatalog::load(root.path(), false).await.unwrap();
+        assert_eq!(catalog.warnings().await.len(), 1);
+        catalog.reload_user_overrides().await.unwrap();
+        assert_eq!(catalog.warnings().await.len(), 1);
+        catalog.activate_discovery(&BTreeMap::new()).await;
+        assert_eq!(catalog.warnings().await.len(), 1);
     }
 
     #[test]
