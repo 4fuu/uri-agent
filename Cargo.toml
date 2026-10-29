@@ -1,6 +1,6 @@
 [package]
 name = "uri-agent"
-version = "2026.1002.0"
+version = "2026.1029.0"
 edition = "2024"
 publish = false
 license = "MIT"
