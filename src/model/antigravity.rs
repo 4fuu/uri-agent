@@ -18,7 +18,16 @@ const PROD_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
 const DAILY_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const SANDBOX_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const STREAM_PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
-const DUMMY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+/// Placeholder thought signature the official Antigravity client sends to
+/// bypass Gemini's signature validator: the validator's own name, Base64
+/// coded. Claude models reject any placeholder signature, and
+/// thinking-level models never validate one, so it is only injected for
+/// Flash models.
+const DUMMY_THOUGHT_SIGNATURE: &str = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=";
+/// Pre-Base64 sentinel form still stored in older sessions. It is recognized
+/// on the way out so replayed history is upgraded instead of sending the
+/// retired value.
+const LEGACY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_ANTIGRAVITY_VERSION: &str = "4.3.0";
 /// Official electron-builder update manifest. The latest release version
@@ -39,6 +48,11 @@ pub(super) struct AntigravityRoute {
     pub(super) thinking_budget: u64,
     pub(super) max_output_tokens: u64,
     pub(super) include_thoughts: bool,
+    /// Tier the roster advertises for thinking-level models (Gemini 4+ /
+    /// Claude 5+ families). Present means the route must send
+    /// `thinkingLevel` instead of a numeric `thinkingBudget`, which those
+    /// models reject.
+    pub(super) thinking_level: Option<String>,
 }
 
 pub(super) fn resolve_route(
@@ -61,6 +75,11 @@ pub(super) fn resolve_route(
         .get("thinkingBudget")
         .and_then(Value::as_u64)
         .unwrap_or_else(|| thinking.budget());
+    let thinking_level = route
+        .get("thinkingLevel")
+        .and_then(Value::as_str)
+        .map(|level| level.to_ascii_uppercase())
+        .filter(|level| matches!(level.as_str(), "LOW" | "MEDIUM" | "HIGH"));
     Some(AntigravityRoute {
         model: upstream.to_string(),
         thinking_budget,
@@ -73,6 +92,7 @@ pub(super) fn resolve_route(
             .get("includeThoughts")
             .and_then(Value::as_bool)
             .unwrap_or(thinking_budget > 0),
+        thinking_level,
     })
 }
 
@@ -1158,7 +1178,7 @@ fn normalize_request_parts(body: &mut Map<String, Value>, upstream_model: &str) 
             let Some(object) = part.as_object_mut() else {
                 continue;
             };
-            mirror_thought_signature(object);
+            mirror_thought_signature(object, claude);
             let is_function_call = object.contains_key("functionCall");
             if flash
                 && model_content
@@ -1199,17 +1219,38 @@ fn normalize_request_parts(body: &mut Map<String, Value>, upstream_model: &str) 
     }
 }
 
-fn mirror_thought_signature(object: &mut Map<String, Value>) {
+fn mirror_thought_signature(object: &mut Map<String, Value>, claude: bool) {
     let signature = object
         .get("thoughtSignature")
         .or_else(|| object.get("thought_signature"))
-        .cloned();
-    if let Some(signature) = signature {
-        object
-            .entry("thoughtSignature")
-            .or_insert_with(|| signature.clone());
-        object.entry("thought_signature").or_insert(signature);
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(signature) = signature else {
+        return;
+    };
+    if claude && is_sentinel_signature(&signature) {
+        // Claude targets reject placeholder signatures outright, so Gemini
+        // turns carrying one are scrubbed before the request leaves.
+        object.remove("thoughtSignature");
+        object.remove("thought_signature");
+        return;
     }
+    // The validator stopped accepting the plain sentinel; upgrade it so
+    // replayed history keeps working.
+    let signature = if signature == LEGACY_THOUGHT_SIGNATURE {
+        DUMMY_THOUGHT_SIGNATURE.to_string()
+    } else {
+        signature
+    };
+    object.insert(
+        "thoughtSignature".to_string(),
+        Value::String(signature.clone()),
+    );
+    object.insert("thought_signature".to_string(), Value::String(signature));
+}
+
+fn is_sentinel_signature(value: &str) -> bool {
+    value == DUMMY_THOUGHT_SIGNATURE || value == LEGACY_THOUGHT_SIGNATURE
 }
 
 fn repair_thought_signatures(value: &mut Value) -> bool {
@@ -1437,6 +1478,7 @@ mod tests {
                 thinking_budget: 10_000,
                 max_output_tokens: 65_536,
                 include_thoughts: true,
+                thinking_level: None,
             },
             session_id: "-123".to_string(),
             identity_prompt: None,
@@ -1795,6 +1837,9 @@ mod tests {
                     {"functionCall": {"name": "unsigned", "args": {}}}
                 ]},
                 {"role": "model", "parts": [
+                    {"functionCall": {"name": "legacy", "args": {}}, "thoughtSignature": "skip_thought_signature_validator"}
+                ]},
+                {"role": "model", "parts": [
                     {"functionCall": {"name": "next-message", "args": {}}}
                 ]}
             ]
@@ -1811,6 +1856,14 @@ mod tests {
             flash["contents"][2]["parts"][0]["thoughtSignature"],
             DUMMY_THOUGHT_SIGNATURE
         );
+        assert_eq!(
+            flash["contents"][2]["parts"][0]["thought_signature"],
+            DUMMY_THOUGHT_SIGNATURE
+        );
+        assert_eq!(
+            flash["contents"][3]["parts"][0]["thoughtSignature"],
+            DUMMY_THOUGHT_SIGNATURE
+        );
 
         let mut claude = json!({
             "contents": [
@@ -1819,6 +1872,10 @@ mod tests {
                 ]},
                 {"role": "user", "parts": [
                     {"functionResponse": {"name": "read", "response": {}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "from-gemini", "args": {}},
+                     "thoughtSignature": "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="}
                 ]}
             ]
         });
@@ -1830,6 +1887,18 @@ mod tests {
         assert_eq!(
             claude["contents"][1]["parts"][0]["functionResponse"]["id"],
             "call_read_0"
+        );
+        // Claude targets reject placeholder signatures: the sentinel carried
+        // over from a Gemini turn is dropped, not mirrored.
+        assert!(
+            claude["contents"][2]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
+        assert!(
+            claude["contents"][2]["parts"][0]
+                .get("thought_signature")
+                .is_none()
         );
     }
 

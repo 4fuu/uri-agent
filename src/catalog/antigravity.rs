@@ -87,7 +87,11 @@ fn parse_roster(value: Value) -> Result<Vec<CatalogModel>> {
     let models = records
         .iter()
         .filter(|(id, _)| !DENYLIST.contains(&id.as_str()))
-        .filter(|(_, record)| record.get("isInternal").and_then(Value::as_bool) != Some(true))
+        .filter(|(id, _)| !id.ends_with("-disabled") && !id.ends_with("_disabled"))
+        .filter(|(_, record)| {
+            record.get("disabled").and_then(Value::as_bool) != Some(true)
+                && record.get("isInternal").and_then(Value::as_bool) != Some(true)
+        })
         .map(|(id, record)| (id.clone(), model(id, record)))
         .collect::<BTreeMap<_, _>>()
         .into_values()
@@ -113,7 +117,12 @@ fn model(id: &str, record: &Value) -> CatalogModel {
         .unwrap_or(id);
     // The roster only names models; route every effort at the roster id
     // itself and let the transport defaults derive budgets and output caps.
-    let identity_route = json!({"model": id});
+    // Thinking-level models additionally pin their advertised tier so the
+    // transport sends `thinkingLevel` instead of a numeric budget.
+    let identity_route = match roster_thinking_level(id, record) {
+        Some(level) => json!({"model": id, "thinkingLevel": level}),
+        None => json!({"model": id}),
+    };
     let mut metadata = BTreeMap::from([
         ("reasoning".to_string(), Value::Bool(reasoning)),
         (
@@ -157,6 +166,50 @@ fn model(id: &str, record: &Value) -> CatalogModel {
 
 fn positive_or(value: Option<u64>, fallback: u64) -> u64 {
     value.filter(|value| *value > 0).unwrap_or(fallback)
+}
+
+/// The tier a roster record advertises for models controlled by
+/// `thinkingLevel` instead of a numeric budget. Google publishes the tier as
+/// a string or a number; only new-generation families (Gemini 4+, Claude 5+)
+/// take the level channel, because 2.5-era records reuse the field while
+/// staying budget-controlled.
+fn roster_thinking_level(id: &str, record: &Value) -> Option<&'static str> {
+    if !uses_thinking_level_channel(id) {
+        return None;
+    }
+    match record.get("thinkingLevel")? {
+        Value::String(level) => match level.trim().to_ascii_uppercase().as_str() {
+            "LOW" | "1" => Some("LOW"),
+            "MEDIUM" | "2" => Some("MEDIUM"),
+            "HIGH" | "3" => Some("HIGH"),
+            _ => None,
+        },
+        Value::Number(level) => match level.as_i64() {
+            Some(1) => Some("LOW"),
+            Some(2) => Some("MEDIUM"),
+            Some(3) => Some("HIGH"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn uses_thinking_level_channel(id: &str) -> bool {
+    let version = id
+        .strip_prefix("gemini-")
+        .and_then(|rest| {
+            rest.split(|character: char| !character.is_ascii_digit() && character != '.')
+                .next()
+        })
+        .and_then(|version| version.parse::<f32>().ok());
+    if version.is_some_and(|version| version >= 4.0) {
+        return true;
+    }
+    // `claude-<family>-<major>-<minor>[-tier]`, e.g. claude-opus-5-5-high.
+    id.strip_prefix("claude-")
+        .and_then(|rest| rest.split('-').nth(1))
+        .and_then(|minor| minor.parse::<u32>().ok())
+        .is_some_and(|minor| minor >= 5)
 }
 
 fn route_targets_of(value: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -273,7 +326,9 @@ mod tests {
                 "gemini-3.1-pro": {"supportsThinking": true},
                 "gemini-2.5-pro": {"supportsThinking": true},
                 "chat_20706": {},
-                "internal-model": {"isInternal": true}
+                "internal-model": {"isInternal": true},
+                "grey-model-disabled": {"supportsThinking": true},
+                "retired-model": {"disabled": true, "supportsThinking": true}
             }
         }))
         .unwrap();
@@ -314,6 +369,39 @@ mod tests {
     }
 
     #[test]
+    fn tiered_roster_models_route_a_thinking_level() {
+        let models = parse_roster(json!({
+            "models": {
+                "gemini-4-argon-high": {"supportsThinking": true, "thinkingLevel": 3},
+                "claude-opus-5-5-low": {"supportsThinking": true, "thinkingLevel": "1"},
+                "gemini-4-argon": {"supportsThinking": true, "thinkingLevel": "MEDIUM"},
+                // Budget-controlled families ignore the field entirely.
+                "gemini-2.5-flash": {"supportsThinking": true, "thinkingLevel": 3},
+                "claude-sonnet-4-6": {"supportsThinking": true, "thinkingLevel": 3},
+                "gemini-4-argon-tiered": {"supportsThinking": true, "thinkingLevel": 9}
+            }
+        }))
+        .unwrap();
+        let route_level = |id: &str, level: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.compat("antigravityRoutes"))
+                .and_then(|routes| routes.get(level))
+                .and_then(|route| route.get("thinkingLevel"))
+                .and_then(Value::as_str)
+        };
+        assert_eq!(route_level("gemini-4-argon-high", "high"), Some("HIGH"));
+        assert_eq!(route_level("claude-opus-5-5-low", "low"), Some("LOW"));
+        assert_eq!(route_level("gemini-4-argon", "medium"), Some("MEDIUM"));
+        // Budget-controlled families ignore the field entirely.
+        assert_eq!(route_level("gemini-2.5-flash", "high"), None);
+        assert_eq!(route_level("claude-sonnet-4-6", "high"), None);
+        // Unknown tier numbers do not invent a level channel.
+        assert_eq!(route_level("gemini-4-argon-tiered", "high"), None);
+    }
+
+    #[test]
     fn empty_roster_is_authoritative() {
         assert!(parse_roster(json!({"models": {}})).unwrap().is_empty());
         assert!(
@@ -349,7 +437,7 @@ mod tests {
                 "gemini-3.1-pro",
                 json!({
                     "low": {"model": "gemini-3.1-pro-low", "thinkingBudget": 1001},
-                    "medium": {"model": "gemini-pro-agent", "thinkingBudget": 10001}
+                    "medium": {"model": "gemini-3.1-pro-high", "thinkingBudget": 10001}
                 }),
             ),
             raw_built_in(
@@ -367,7 +455,7 @@ mod tests {
         let roster = parse_roster(json!({
             "models": {
                 "gemini-3.1-pro-low": {"supportsThinking": true},
-                "gemini-pro-agent": {"supportsThinking": true},
+                "gemini-3.1-pro-high": {"supportsThinking": true},
                 "claude-sonnet-4-6": {"supportsThinking": true},
                 "brand-new-model": {"supportsThinking": true}
             }

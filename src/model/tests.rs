@@ -2594,8 +2594,8 @@ fn antigravity_uses_numeric_route_budgets_and_v1internal_generation_fields() {
             "compat": {
                 "antigravityRoutes": {
                     "low": {"model": "gemini-3.1-pro-low", "thinkingBudget": 1001, "maxOutputTokens": 65535},
-                    "medium": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535},
-                    "high": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535}
+                    "medium": {"model": "gemini-3.1-pro-high", "thinkingBudget": 10001, "maxOutputTokens": 65535},
+                    "high": {"model": "gemini-3.1-pro-high", "thinkingBudget": 10001, "maxOutputTokens": 65535}
                 }
             }
         }),
@@ -2641,4 +2641,35 @@ fn antigravity_uses_numeric_route_budgets_and_v1internal_generation_fields() {
         claude_body["generationConfig"]["thinkingConfig"]["includeThoughts"],
         true
     );
+}
+
+#[test]
+fn antigravity_tiered_routes_send_a_thinking_level_instead_of_a_budget() {
+    let mut argon = catalog_model(
+        "antigravity",
+        json!({
+            "reasoning": true,
+            "maxTokens": 65536,
+            "compat": {
+                "antigravityRoutes": {
+                    "off": {"model": "gemini-4-argon-high", "thinkingLevel": "HIGH"},
+                    "low": {"model": "gemini-4-argon-high", "thinkingLevel": "HIGH"},
+                    "medium": {"model": "gemini-4-argon-high", "thinkingLevel": "HIGH"},
+                    "high": {"model": "gemini-4-argon-high", "thinkingLevel": "HIGH"}
+                }
+            }
+        }),
+    );
+    argon.id = "gemini-4-argon-high".to_string();
+    let thinking = |level: ThinkingLevel| {
+        transformed(argon.clone(), level, json!({}))["generationConfig"]["thinkingConfig"].clone()
+    };
+    let high = thinking(ThinkingLevel::High);
+    assert_eq!(high["thinkingLevel"], "HIGH");
+    assert_eq!(high["includeThoughts"], true);
+    assert!(high.get("thinkingBudget").is_none());
+    // Efforts map onto the tier the way the official client maps them;
+    // disabled thinking clamps to LOW instead of a numeric budget.
+    assert_eq!(thinking(ThinkingLevel::Medium)["thinkingLevel"], "MEDIUM");
+    assert_eq!(thinking(ThinkingLevel::Off)["thinkingLevel"], "LOW");
 }

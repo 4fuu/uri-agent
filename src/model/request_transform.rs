@@ -1201,7 +1201,18 @@ impl ModelRequestTransform {
             .expect("generationConfig was normalized to an object");
         config.entry("topK").or_insert(json!(40));
         config.entry("topP").or_insert(json!(1.0));
-        if route.thinking_budget > 0 {
+        if route.thinking_level.is_some() {
+            // New-generation tiered models (Gemini 4+, Claude 5+) are
+            // controlled by a thinking level; a numeric budget alongside it
+            // is rejected upstream with a 400.
+            config.insert(
+                "thinkingConfig".to_string(),
+                json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": antigravity_thinking_level(self.thinking)
+                }),
+            );
+        } else if route.thinking_budget > 0 {
             config.insert(
                 "thinkingConfig".to_string(),
                 json!({
@@ -1291,6 +1302,17 @@ fn copilot_initiator(body: &[u8]) -> &'static str {
         "agent"
     } else {
         "user"
+    }
+}
+
+/// Wire thinking level for Antigravity's tiered models: the selected effort
+/// maps onto the model's LOW/MEDIUM/HIGH tiers, matching the official
+/// client's mapping where disabled and minimal thinking clamp to LOW.
+fn antigravity_thinking_level(thinking: ThinkingLevel) -> &'static str {
+    match thinking {
+        ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => "LOW",
+        ThinkingLevel::Medium => "MEDIUM",
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "HIGH",
     }
 }
 

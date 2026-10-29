@@ -204,6 +204,12 @@ built-in model list by availability: a built-in logical model stays while any
 of its effort-route targets remains in the roster, effort levels whose
 targets the roster lacks become unselectable, roster models no built-in route
 covers join as discovered rows, and a failed lookup keeps the built-in list.
+Roster entries that upstream marks `disabled`, and `-disabled` model ids, are
+ignored rather than offered. Discovered tiered models of the new generation
+(Gemini 4+ and Claude 5+ families) publish a `thinkingLevel`; requests to
+them send `thinkingLevel` (`LOW`, `MEDIUM`, or `HIGH`, derived from the
+selected effort) instead of a numeric `thinkingBudget`, which those models
+reject.
 The browser login prefers its fixed loopback callback port and otherwise
 binds an OS-assigned one.
 

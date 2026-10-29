@@ -1109,8 +1109,8 @@ fn built_in_catalog() -> BTreeMap<String, BTreeMap<String, Value>> {
     });
     let gemini_31_routes = serde_json::json!({
         "low": {"model": "gemini-3.1-pro-low", "thinkingBudget": 1001, "maxOutputTokens": 65535},
-        "medium": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535},
-        "high": {"model": "gemini-pro-agent", "thinkingBudget": 10001, "maxOutputTokens": 65535}
+        "medium": {"model": "gemini-3.1-pro-high", "thinkingBudget": 10001, "maxOutputTokens": 65535},
+        "high": {"model": "gemini-3.1-pro-high", "thinkingBudget": 10001, "maxOutputTokens": 65535}
     });
     let claude_sonnet_routes = serde_json::json!({
         "off": {"model": "claude-sonnet-4-6", "thinkingBudget": 0, "maxOutputTokens": 64000, "includeThoughts": false},
@@ -1924,7 +1924,7 @@ mod tests {
                     DiscoveryStoreEntry {
                         models: vec![
                             roster_model("gemini-3.1-pro-low"),
-                            roster_model("gemini-pro-agent"),
+                            roster_model("gemini-3.1-pro-high"),
                             roster_model("claude-sonnet-4-6"),
                             roster_model("brand-new-model"),
                         ],
@@ -1938,7 +1938,7 @@ mod tests {
         let (merged, warnings) = merge_catalog(&store, &ModelsFile::default(), &scopes);
         assert!(warnings.is_empty());
         let models = &merged["antigravity"];
-        // Only gemini-3.1-pro (targets gemini-3.1-pro-low / gemini-pro-agent)
+        // Only gemini-3.1-pro (targets gemini-3.1-pro-low / gemini-3.1-pro-high)
         // and claude-sonnet-4-6 (self-targeting routes) survive from the
         // built-ins; every other built-in has no route target in the roster.
         // Roster rows covered by a built-in route are not duplicated, and
