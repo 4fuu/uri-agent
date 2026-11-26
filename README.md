@@ -14,6 +14,11 @@ contracts, instructions, and resources only when selected, much like Skills in
 other agents. At first, the model sees only each tool's compact name and
 description.
 
+> [!NOTE]
+> The URI-protocol implementation described here is preserved on the
+> [`legacy/uri-protocol`](https://github.com/4fuu/uri-agent/tree/legacy/uri-protocol)
+> branch. Its last version is `2026.1030.0`.
+
 Four built-in tools give the model a compact interface for loading, reading,
 executing, and editing:
 

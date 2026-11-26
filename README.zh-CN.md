@@ -10,6 +10,11 @@
 
 URI Agent 是一个可扩展的终端编程 Agent，让模型上下文集中在当前任务上。工具通过 URI 协议按需加载完整契约、指令和资源，使用方式与其他 Agent 中的 Skills 类似。模型起初只看到每个工具的精简名称和描述。
 
+> [!NOTE]
+> 这里描述的 URI 协议实现保留在
+> [`legacy/uri-protocol`](https://github.com/4fuu/uri-agent/tree/legacy/uri-protocol)
+> 分支，最后版本为 `2026.1030.0`。
+
 四个内置工具为模型提供精简的加载、读取、执行和编辑接口：
 
 ```text
