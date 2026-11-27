@@ -49,7 +49,7 @@ Available documents:
 pub fn docs_output(topic: Option<&str>) -> Result<String> {
     let Some(topic) = topic else {
         let mut output = String::from(
-            "Documentation embedded in this binary; print one with `uri-agent docs <topic>`:\n\n",
+            "Documentation embedded in this binary; print one with `uat docs <topic>`:\n\n",
         );
         for (name, _) in DOCUMENTS {
             let _ = writeln!(output, "  {name}");
@@ -63,7 +63,7 @@ pub fn docs_output(topic: Option<&str>) -> Result<String> {
     match DOCUMENTS.iter().find(|(name, _)| *name == topic) {
         Some((_, content)) => Ok((*content).to_string()),
         None => bail!(
-            "unknown documentation topic: {topic}; run `uri-agent docs` with no topic to list the exact filenames"
+            "unknown documentation topic: {topic}; run `uat docs` with no topic to list the exact filenames"
         ),
     }
 }

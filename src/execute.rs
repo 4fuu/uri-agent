@@ -79,11 +79,10 @@ pub fn assemble_prompt(argument: Option<&str>, stdin: &str) -> Result<String> {
 
 /// Run one non-interactive prompt turn and print the final reply to stdout.
 ///
-/// The session is chosen like a TUI launch: a new session by default, or the
-/// one named by `--session`/`--continue-session`. New sessions freeze the
-/// execute-mode prompt fragment; resumed sessions keep the prompt they
-/// froze.
-pub async fn run(host: &AgentHost, config: &Config, prompt: &str) -> Result<()> {
+/// The default run uses the simple tool set (`read`, `write`, `edit`, `bash`,
+/// `apply_patch`) and no URI protocols. `legacy` selects the old protocol
+/// tools for one release while the migration is in progress.
+pub async fn run(host: &AgentHost, config: &Config, prompt: &str, legacy: bool) -> Result<()> {
     let requested = match &config.session {
         SessionChoice::New => None,
         SessionChoice::Latest => Some("latest"),
@@ -93,7 +92,7 @@ pub async fn run(host: &AgentHost, config: &Config, prompt: &str) -> Result<()> 
     if requested.is_none() {
         if !initial.model_configured() {
             bail!(
-                "no model is configured: pass --model <provider>/<id>; `uri-agent models` lists \
+                "no model is configured: pass --model <provider>/<id>; `uat models` lists \
 runnable IDs"
             );
         }
@@ -106,7 +105,7 @@ runnable IDs"
             initial = config.manager.current().await;
             if initial.catalog_model(&config.catalog).await.is_none() {
                 bail!(
-                    "model {}/{} is not in the model catalog; `uri-agent models` lists runnable \
+                    "model {}/{} is not in the model catalog; `uat models` lists runnable \
 IDs",
                     initial.provider,
                     initial.model
@@ -114,17 +113,60 @@ IDs",
             }
         }
     }
-    let spec = AgentSpec::root(
-        &initial.provider,
-        &initial.model,
-        initial.thinking,
-        &config.cwd,
-    )
-    .append_system_prompt(prompts::EXECUTE_MODE_PROMPT);
+    let spec = if legacy {
+        AgentSpec::root(
+            &initial.provider,
+            &initial.model,
+            initial.thinking,
+            &config.cwd,
+        )
+        .append_system_prompt(prompts::EXECUTE_MODE_PROMPT)
+        .with_tools(["help", "protocol", "replace", "apply_patch"])
+    } else {
+        simple_spec(
+            &initial.provider,
+            &initial.model,
+            initial.thinking,
+            &config.cwd,
+            true,
+        )
+    };
     let agent = host.open_root(requested, spec).await?;
     let result = run_agent(&agent, prompt).await;
     agent.close().await;
     result
+}
+
+/// Build the tool-only simple session used by `uat -x`, `uat serve`, and the
+/// line REPL. Protocols that still back internal context and task machinery
+/// are selected but never appear in the simple system prompt.
+pub(crate) fn simple_spec(
+    provider: &str,
+    model: &str,
+    thinking: crate::catalog::ThinkingLevel,
+    cwd: &std::path::Path,
+    non_interactive: bool,
+) -> AgentSpec {
+    let spec = AgentSpec::root(provider, model, thinking, cwd)
+        .with_tools([
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "search",
+            "notes",
+            "steer",
+            "codemode",
+            "mcp",
+            "apply_patch",
+        ])
+        .with_protocols(["context", "tasks"])
+        .with_simple_prompt();
+    if non_interactive {
+        spec.append_system_prompt(prompts::EXECUTE_MODE_PROMPT)
+    } else {
+        spec
+    }
 }
 
 async fn run_agent(agent: &AgentHandle, prompt: &str) -> Result<()> {

@@ -76,7 +76,7 @@ impl ModelTool for ReplaceTool {
     }
 }
 
-async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()> {
+pub(super) async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()> {
     if old_text.is_empty() {
         bail!("old_text cannot be empty");
     }

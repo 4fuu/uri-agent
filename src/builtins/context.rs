@@ -811,6 +811,82 @@ async fn mutate_note(
     Ok(result)
 }
 
+/// List this session's notes without a protocol address.
+pub(crate) async fn notes_list_tool(state: &ContextState) -> Result<String> {
+    let events = state.events().await?;
+    format_notes_index(state, &events)
+}
+
+/// Read one note without a protocol address. A deleted note returns its
+/// tombstone summary, matching the old read behavior.
+pub(crate) async fn notes_read_tool(
+    state: &ContextState,
+    id: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String> {
+    validate_note_id(id)?;
+    let events = state.events().await?;
+    let notes = notes_from_events(&events);
+    let note = notes
+        .get(id)
+        .ok_or_else(|| anyhow!("context note not found: {id}"))?;
+    if note.deleted {
+        return Ok(note.summary_line());
+    }
+    let content = note.content.as_deref().unwrap_or_default();
+    let limit = limit
+        .unwrap_or(DEFAULT_NOTE_READ_CHARS)
+        .clamp(1, MAX_NOTE_READ_CHARS);
+    let (page, next) = character_page(content, offset, limit)?;
+    let mut output = format!(
+        "{} · {} · revision={} · window={} · anchor={}\n\n{}",
+        note.id,
+        note.title,
+        note.revision,
+        note.window_id,
+        record_id(note.context_sequence),
+        page
+    );
+    if let Some(offset) = next {
+        let _ = write!(output, "\n\nNext: offset {offset}");
+    }
+    Ok(output)
+}
+
+pub(crate) async fn notes_add_tool(
+    state: &ContextState,
+    title: &str,
+    content: &str,
+) -> Result<String> {
+    let title = validate_note_title(title)?;
+    mutate_note(state, NoteMutation::Add { title }, content).await
+}
+
+pub(crate) async fn notes_replace_tool(
+    state: &ContextState,
+    id: &str,
+    title: &str,
+    content: &str,
+) -> Result<String> {
+    validate_note_id(id)?;
+    let title = validate_note_title(title)?;
+    mutate_note(
+        state,
+        NoteMutation::Replace {
+            id: id.to_string(),
+            title,
+        },
+        content,
+    )
+    .await
+}
+
+pub(crate) async fn notes_delete_tool(state: &ContextState, id: &str) -> Result<String> {
+    validate_note_id(id)?;
+    mutate_note(state, NoteMutation::Delete { id: id.to_string() }, "").await
+}
+
 fn format_status(state: &ContextState, events: &[SessionEvent]) -> Result<String> {
     let usage = *state
         .inner

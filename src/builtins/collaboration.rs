@@ -275,64 +275,94 @@ impl CollaborationPlugin {
     async fn send(&self, target: &str, request: &ProtocolRequest<'_>) -> Result<ProtocolOutput> {
         let input = request.input_struct::<SendInput>()?;
         let options = SendOptions::parse(&input)?;
-        let body = input.message;
-        if body.trim().is_empty() {
-            bail!("collaboration message cannot be empty")
-        }
-        if body.len() > MAX_MESSAGE_BYTES {
-            bail!("collaboration message cannot exceed 32 KiB")
-        }
-        let source_name = self.state.ensure_presence().await?;
-        let target = self
-            .state
-            .inner
-            .session
-            .collaboration_participant(target, options.all_projects, false)
+        Ok(send_message(&self.state, target, &input.message, options)
             .await?
-            .ok_or_else(|| anyhow!("active collaboration participant not found: {target}"))?;
-        if target.session_id == self.state.inner.session.id() {
-            bail!("cannot send a collaboration message to the current session")
-        }
-        let target_instance = target
-            .instance_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("collaboration participant is no longer active"))?;
-        let message_id = format!("cm_{}", Uuid::now_v7().simple());
-        let reply_scope_all = target.cwd != self.state.inner.session.project_directory();
-        let envelope = collaboration_envelope(
-            self.state.inner.session.id(),
-            source_name.as_deref(),
-            &message_id,
-            options.delivery,
-            options.reply_requested,
-            options.in_reply_to.as_deref(),
-            reply_scope_all,
-            &body,
-        );
-        let preview =
-            collaboration_preview(source_name.as_deref(), self.state.inner.session.id(), &body);
-        let pending_id = self
-            .state
-            .inner
-            .session
-            .deliver_collaboration_input(
-                &target.session_id,
-                target_instance,
-                options.delivery.submit_kind(),
-                &preview,
-                &[UserContent::text(envelope)],
-            )
-            .await?
-            .ok_or_else(|| anyhow!("collaboration participant stopped before accepting message"))?;
-        Ok(format!(
-            "Collaboration message accepted.\nmessage_id: {message_id}\ntarget_name: {}\ntarget_session_id: {}\ndelivery: {}\npending_input_id: {pending_id}\nreply_requested: {}",
-            target.name.as_deref().unwrap_or("(not set)"),
-            target.session_id,
-            options.delivery.as_str(),
-            options.reply_requested,
-        )
-        .into())
+            .into())
     }
+}
+
+/// Send a collaboration message from a traditional tool without constructing a
+/// protocol request. The string options use the same values as the legacy
+/// collaboration protocol: delivery is `queue` or `steer`, reply is `none` or
+/// `requested`, and scope is `project` or `all`.
+pub(crate) async fn send_tool_message(
+    state: &CollaborationState,
+    target: &str,
+    message: &str,
+    delivery: Option<&str>,
+    reply: Option<&str>,
+    scope: Option<&str>,
+    in_reply_to: Option<&str>,
+) -> Result<String> {
+    let input = SendInput {
+        message: message.to_string(),
+        delivery: delivery.map(str::to_string),
+        reply: reply.map(str::to_string),
+        scope: scope.map(str::to_string),
+        in_reply_to: in_reply_to.map(str::to_string),
+    };
+    let options = SendOptions::parse(&input)?;
+    send_message(state, target, &input.message, options).await
+}
+
+async fn send_message(
+    state: &CollaborationState,
+    target: &str,
+    body: &str,
+    options: SendOptions,
+) -> Result<String> {
+    if body.trim().is_empty() {
+        bail!("collaboration message cannot be empty")
+    }
+    if body.len() > MAX_MESSAGE_BYTES {
+        bail!("collaboration message cannot exceed 32 KiB")
+    }
+    let source_name = state.ensure_presence().await?;
+    let target = state
+        .inner
+        .session
+        .collaboration_participant(target, options.all_projects, false)
+        .await?
+        .ok_or_else(|| anyhow!("active collaboration participant not found: {target}"))?;
+    if target.session_id == state.inner.session.id() {
+        bail!("cannot send a collaboration message to the current session")
+    }
+    let target_instance = target
+        .instance_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("collaboration participant is no longer active"))?;
+    let message_id = format!("cm_{}", Uuid::now_v7().simple());
+    let reply_scope_all = target.cwd != state.inner.session.project_directory();
+    let envelope = collaboration_envelope(
+        state.inner.session.id(),
+        source_name.as_deref(),
+        &message_id,
+        options.delivery,
+        options.reply_requested,
+        options.in_reply_to.as_deref(),
+        reply_scope_all,
+        body,
+    );
+    let preview = collaboration_preview(source_name.as_deref(), state.inner.session.id(), body);
+    let pending_id = state
+        .inner
+        .session
+        .deliver_collaboration_input(
+            &target.session_id,
+            target_instance,
+            options.delivery.submit_kind(),
+            &preview,
+            &[UserContent::text(envelope)],
+        )
+        .await?
+        .ok_or_else(|| anyhow!("collaboration participant stopped before accepting message"))?;
+    Ok(format!(
+        "Collaboration message accepted.\nmessage_id: {message_id}\ntarget_name: {}\ntarget_session_id: {}\ndelivery: {}\npending_input_id: {pending_id}\nreply_requested: {}",
+        target.name.as_deref().unwrap_or("(not set)"),
+        target.session_id,
+        options.delivery.as_str(),
+        options.reply_requested,
+    ))
 }
 
 /// Input shape for `collaboration://participants` and

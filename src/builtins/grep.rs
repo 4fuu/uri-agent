@@ -299,6 +299,60 @@ async fn semantic_grep(
     Ok(format_semantic_results(&hits, mode).into_bytes())
 }
 
+/// Exact search without a protocol address. The returned text is the same
+/// `path:line:text` form the old search protocol produced.
+pub(crate) async fn exact_search(
+    downloads: &PluginDownloads,
+    cwd: &Path,
+    root: &str,
+    query: &str,
+    glob: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String> {
+    let resolved = resolve_path(cwd, root)?;
+    validate_root(&resolved, "search").await?;
+    let input = ReadInput {
+        query: Some(query.to_string()),
+        mode: Some("exact".to_string()),
+        glob: glob.map(str::to_string),
+        literal: None,
+        ignore_case: None,
+        context: None,
+        limit,
+    };
+    let options = GrepOptions::from_read_input(&input, "search")?;
+    let rg = downloads.ensure(&ripgrep_download()?).await?;
+    let root_argument = grep_root_argument(cwd, root, &resolved);
+    run_grep(&rg, cwd, &root_argument, query, &options, "search").await
+}
+
+/// Semantic or hybrid search without a protocol address.
+pub(crate) async fn semantic_search(
+    cwd: &Path,
+    root: &str,
+    query: &str,
+    mode: SearchMode,
+    glob: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String> {
+    let resolved = resolve_path(cwd, root)?;
+    validate_root(&resolved, "search").await?;
+    let limit = limit
+        .unwrap_or(DEFAULT_SEMANTIC_LIMIT)
+        .clamp(1, MAX_SEMANTIC_LIMIT);
+    let bytes = semantic_grep(
+        cwd,
+        &resolved,
+        glob,
+        query,
+        mode,
+        limit,
+        CancellationToken::new(),
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GrepMode {
     Exact,

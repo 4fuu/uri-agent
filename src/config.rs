@@ -109,7 +109,7 @@ pub struct ModelRoleInfo {
 
 #[derive(Clone, Parser, Debug)]
 #[command(
-    name = "uri-agent",
+    name = "uat",
     version,
     about,
     long_about = LONG_ABOUT,
@@ -126,12 +126,12 @@ set; run `:model` in the interface to pick a runnable model."
     )]
     pub provider: Option<String>,
 
-    /// Model ID from the selected provider, or `<provider>/<id>` as `uri-agent models` prints it.
+    /// Model ID from the selected provider, or `<provider>/<id>` as `uat models` prints it.
     #[arg(
         long,
         long_help = "Model ID from the selected provider. Overrides the defaultModel setting and \
 URI_AGENT_MODEL for this invocation. Without --provider, the `<provider>/<id>` form that \
-`uri-agent models` prints selects both at once; IDs that themselves contain `/` still work."
+`uat models` prints selects both at once; IDs that themselves contain `/` still work."
     )]
     pub model: Option<String>,
 
@@ -145,7 +145,7 @@ stored credentials or the provider environment variable in scripts and shells."
     )]
     pub api_key: Option<String>,
 
-    /// Override the number of bytes returned inline before URI Agent spills output to a file.
+    /// Override the number of bytes returned inline before UAT spills output to a file.
     #[arg(
         long,
         long_help = "Number of bytes a tool result may return inline before the complete bytes \
@@ -225,6 +225,14 @@ absolute project directory and may carry its own MCP server profile."
     )]
     pub execute: Option<String>,
 
+    /// Use the legacy URI protocol tools with --execute instead of the simple tool set.
+    #[arg(long, hide = true)]
+    pub legacy: bool,
+
+    /// Open the legacy full-screen terminal interface instead of the line REPL.
+    #[arg(long, hide = true)]
+    pub legacy_tui: bool,
+
     #[command(subcommand)]
     pub command: Option<Subcommand>,
 }
@@ -251,61 +259,58 @@ warning on stderr. Global flags such as --offline, --provider, and --cwd go befo
         #[arg(long)]
         all: bool,
     },
+    /// Serve the simple text API over HTTP instead of opening the interface.
+    Serve {
+        /// Address to bind, for example 127.0.0.1:8737.
+        #[arg(long, default_value = "127.0.0.1:8737")]
+        listen: String,
+    },
 }
 
-/// Opening paragraph of `uri-agent --help`; `-h` keeps the one-line `about`.
-const LONG_ABOUT: &str = "A protocol-oriented coding agent with a focused terminal interface.
+/// Opening paragraph of `uat --help`; `-h` keeps the one-line `about`.
+const LONG_ABOUT: &str = "A terminal coding agent with traditional tools and codemode.
 
-URI Agent runs in three modes. Without mode flags it opens the interactive
-terminal interface in the current directory. In execute mode (-x, --execute
-[PROMPT]) it runs one prompt, taken from the argument or from standard input
-when the argument is omitted, with piped standard input appended when both are
-present, prints only the final assistant message, and exits non-zero when the
-run fails. With --acpv1 it serves Agent Client Protocol v1 over stdin/stdout to
-an editor or other client instead of opening the terminal interface. Run
-`uri-agent docs` to list the documentation embedded in this binary.";
+UAT runs in three modes. Without mode flags it opens a line-oriented REPL in
+the current directory. In execute mode (-x, --execute [PROMPT]) it runs one
+prompt, taken from the argument or from standard input when the argument is
+omitted, with piped standard input appended when both are present, prints only
+the final assistant message, and exits non-zero when the run fails. With
+--acpv1 it serves Agent Client Protocol v1 over stdin/stdout to an editor or
+other client instead of opening the terminal interface. Run `uat docs` to list
+the documentation embedded in this binary.";
 
 /// Example commands rendered into the long `--help` reference. The execute
 /// mode entries describe `-x`/`--execute`.
 const EXAMPLES: &[(&str, &str)] = &[
+    ("uat", "Start the line REPL in the current directory"),
     (
-        "uri-agent",
-        "Start the interactive interface in the current directory",
-    ),
-    (
-        "uri-agent --continue-session",
+        "uat --continue-session",
         "Resume the most recently updated session",
     ),
+    ("uat --session <ID>", "Resume one session by its stable ID"),
     (
-        "uri-agent --session <ID>",
-        "Resume one session by its stable ID",
-    ),
-    (
-        "uri-agent -x \"find the failing test\"",
+        "uat -x \"find the failing test\"",
         "Execute one prompt, print only the final reply, and exit",
     ),
     (
-        "echo \"explain the build failure\" | uri-agent -x",
+        "echo \"explain the build failure\" | uat -x",
         "Execute with the prompt read from standard input instead",
     ),
     (
-        "uri-agent -x \"summarize this log\" < error.log",
+        "uat -x \"summarize this log\" < error.log",
         "Pipe a file; standard input is appended to the argument prompt",
     ),
     (
-        "uri-agent --provider anthropic --model claude-sonnet-4-5",
+        "uat --provider anthropic --model claude-sonnet-4-5",
         "Choose the provider and model for this run",
     ),
+    ("uat models", "List runnable model IDs as <provider>/<id>"),
     (
-        "uri-agent models",
-        "List runnable model IDs as <provider>/<id>",
+        "uat -x \"review the diff\" --model anthropic/claude-sonnet-4-5",
+        "Execute one prompt with a model ID copied from `uat models`",
     ),
     (
-        "uri-agent -x \"review the diff\" --model anthropic/claude-sonnet-4-5",
-        "Execute one prompt with a model ID copied from `uri-agent models`",
-    ),
-    (
-        "uri-agent --acpv1",
+        "uat --acpv1",
         "Serve ACP v1 over stdin/stdout to an editor or other client",
     ),
 ];
@@ -402,11 +407,11 @@ fn reference() -> String {
     let _ = writeln!(output);
     let rows = vec![
         (
-            "uri-agent docs".to_string(),
+            "uat docs".to_string(),
             "List the documents embedded in this binary".to_string(),
         ),
         (
-            "uri-agent docs configuration.md".to_string(),
+            "uat docs configuration.md".to_string(),
             "Print one embedded document to stdout".to_string(),
         ),
     ];
@@ -4632,7 +4637,7 @@ mod tests {
                 assert!(long.contains(alias), "long help lacks alias {alias}");
             }
         }
-        assert!(long.contains("uri-agent docs"));
+        assert!(long.contains("uat docs"));
     }
 
     #[test]

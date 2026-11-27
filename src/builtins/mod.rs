@@ -14,6 +14,7 @@ mod sessions;
 mod shell;
 mod tasks;
 mod title;
+pub(crate) mod traditional;
 mod uri_agent_docs;
 
 pub(crate) use mcp::{GLOBAL_CONFIG as MCP_GLOBAL_CONFIG, PROJECT_CONFIG as MCP_PROJECT_CONFIG};
@@ -153,6 +154,7 @@ fn add_agent_plugins(
     plugins.add(https::HttpsProtocol::new());
     plugins.add(replace::ReplaceTool::new(cwd));
     plugins.add(apply_patch::ApplyPatchTool::new(cwd));
+    plugins.add(traditional::TraditionalToolsPlugin::new(cwd));
     plugins.add(sessions::SessionCompletionPlugin::new(cwd));
     plugins.add(tasks::TasksProtocol);
     shell::add_plugins(plugins, cwd);
@@ -242,6 +244,20 @@ mod tests {
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<Vec<_>>();
-        assert_eq!(model_tools, ["apply_patch", "help", "protocol", "replace"]);
+        assert_eq!(
+            model_tools,
+            [
+                "apply_patch",
+                "bash",
+                "edit",
+                "help",
+                "mcp",
+                "protocol",
+                "read",
+                "replace",
+                "search",
+                "write"
+            ]
+        );
     }
 }

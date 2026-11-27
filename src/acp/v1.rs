@@ -333,7 +333,8 @@ impl AcpV1State {
             &initial.model,
             initial.thinking,
             &project.cwd,
-        );
+        )
+        .with_tools(["help", "protocol", "replace", "apply_patch"]);
         let config_options = pending_config_options(&project, &spec).await;
         let session_id = Session::new_id();
         let session = Arc::new(AcpSession {

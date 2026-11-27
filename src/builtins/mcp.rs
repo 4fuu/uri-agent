@@ -23,12 +23,13 @@ use protocol::{McpProtocol, McpSharedHelpProtocol};
 use runtime::McpRuntime;
 
 use crate::plugin::{
-    CommandSpec, CommandTarget, Plugin, PluginHost, SessionProtocolRecord, TuiStatusItem,
-    TuiStatusTone,
+    CommandSpec, CommandTarget, ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin,
+    PluginHost, SessionProtocolRecord, TuiStatusItem, TuiStatusTone,
 };
-use crate::protocol::ProtocolDescriptor;
+use crate::protocol::{ProtocolDescriptor, ProtocolRegistry};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -96,6 +97,109 @@ struct McpPluginState {
     discovery_error: Option<String>,
 }
 
+/// One traditional tool for every configured MCP server. The server and tool
+/// are chosen at call time so the model-facing surface stays at one tool while
+/// the server's own function catalog remains discoverable through its
+/// `tools` route or the MCP panel.
+struct McpTool {
+    runtime: Arc<McpRuntime>,
+    servers: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpArguments {
+    server: String,
+    tool: String,
+    arguments: Option<Value>,
+}
+
+fn server_descriptions(records: &[SessionProtocolRecord]) -> Vec<(String, String)> {
+    records
+        .iter()
+        .map(|record| {
+            (
+                record.identity.clone(),
+                record.descriptor.description.clone(),
+            )
+        })
+        .collect()
+}
+
+fn mcp_tool_descriptor(servers: &[(String, String)]) -> ModelToolDescriptor {
+    let servers = if servers.is_empty() {
+        "No MCP servers are configured.".to_string()
+    } else {
+        format!(
+            "Configured MCP servers: {}.",
+            servers
+                .iter()
+                .map(|(name, description)| format!("{name} ({description})"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+    ModelToolDescriptor {
+        name: "mcp".to_string(),
+        description: format!(
+            "Call a tool on a configured MCP server. {servers} Pass the tool's argument object as `arguments`."
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "description": "Configured MCP server name."},
+                "tool": {"type": "string", "description": "Tool name as the server lists it."},
+                "arguments": {"type": "object", "description": "Tool argument object.", "additionalProperties": true}
+            },
+            "required": ["server", "tool"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+#[async_trait]
+impl ModelTool for McpTool {
+    fn descriptor(&self) -> ModelToolDescriptor {
+        mcp_tool_descriptor(&self.servers)
+    }
+
+    async fn execute(
+        &self,
+        arguments: &Value,
+        _protocols: &ProtocolRegistry,
+    ) -> Result<ModelToolOutput> {
+        let arguments: McpArguments = serde_json::from_value(arguments.clone())
+            .map_err(|error| anyhow!("invalid mcp tool arguments: {error}"))?;
+        let server = arguments.server;
+        let tool = arguments.tool;
+        if !self.servers.iter().any(|(name, _)| name == &server) {
+            bail!(
+                "unknown MCP server: {server}; configured: {}",
+                self.servers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let arguments = match arguments
+            .arguments
+            .unwrap_or_else(|| Value::Object(Default::default()))
+        {
+            Value::Object(map) => map,
+            _ => bail!("mcp arguments must be an object"),
+        };
+        let output = self
+            .runtime
+            .clone()
+            .call_tool(&server, tool, arguments)
+            .await?;
+        Ok(String::from_utf8_lossy(output.text_bytes())
+            .into_owned()
+            .into())
+    }
+}
+
 pub(super) struct McpPlugin {
     store: McpConfigStore,
     resolver: McpResolver,
@@ -154,6 +258,11 @@ impl McpPlugin {
 
 #[async_trait]
 impl Plugin for McpPlugin {
+    fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
+        let records = self.records();
+        vec![mcp_tool_descriptor(&server_descriptions(&records))]
+    }
+
     fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
         let records = self.records();
         let uses_shared_help = records_use_shared_help(&records);
@@ -219,6 +328,7 @@ impl Plugin for McpPlugin {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.clone());
         let records = self.records();
+        let servers = server_descriptions(&records);
         if records_use_shared_help(&records) {
             host.protocols.register(McpSharedHelpProtocol)?;
         }
@@ -228,6 +338,10 @@ impl Plugin for McpPlugin {
                 runtime: runtime.clone(),
             })?;
         }
+        host.model_tools.register(McpTool {
+            runtime: runtime.clone(),
+            servers,
+        })?;
         host.commands.register(CommandSpec::new(
             "mcp",
             "Manage MCP servers",

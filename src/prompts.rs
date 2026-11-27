@@ -78,6 +78,42 @@ pub fn system_prompt(
     prompt.push_str(
         "- Completion of background tasks is delivered automatically. Continue independent work instead of polling, and never rerun an operation that already succeeded.\n",
     );
+    push_operating_rules(&mut prompt);
+    push_fragments(&mut prompt, fragments);
+
+    prompt
+}
+
+/// System prompt for the simple tool-only mode: no protocols, no URI
+/// addresses, and no help loading. The model sees exactly the selected tools.
+pub fn simple_system_prompt(tools: &[PromptEntry], fragments: &[String]) -> String {
+    let mut prompt =
+        String::from("You are a general-purpose agent running in UAT.\n\nAvailable tools:\n");
+    let mut tools = tools.to_vec();
+    tools.sort_by(|left, right| {
+        tool_order(&left.name)
+            .cmp(&tool_order(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    write_entries(&mut prompt, &tools);
+    prompt.push_str(
+        "\nUse the tools to inspect the workspace, run commands, and make changes. Issue independent tool calls together in one turn. Search before reading when you do not know where something lives, and read the relevant code before changing it.\n",
+    );
+    if tools
+        .iter()
+        .any(|tool| matches!(tool.name.as_str(), "edit" | "apply_patch"))
+    {
+        prompt.push_str(
+            "- Edit files with edit for one exact change and apply_patch for several hunks or files, not with shell commands; they need no shell escaping and leave files unchanged when the old text does not match.\n",
+        );
+    }
+    push_operating_rules(&mut prompt);
+    push_fragments(&mut prompt, fragments);
+    prompt
+}
+
+/// Appends the operating rules shared by every system-prompt style.
+fn push_operating_rules(prompt: &mut String) {
     prompt.push_str(
         "\nOperating rules:\n\
          - For clear requests, inspect relevant sources, carry the work through, and verify the result.\n\
@@ -89,7 +125,9 @@ pub fn system_prompt(
          - Report verification honestly. Never claim a check passed unless it ran successfully; state why relevant verification could not be completed.\n\
          - Keep the final reply concise: lead with the outcome, then what changed and how it was verified, citing paths where they help.\n",
     );
+}
 
+fn push_fragments(prompt: &mut String, fragments: &[String]) {
     for fragment in fragments {
         prompt.push('\n');
         prompt.push_str(fragment);
@@ -97,8 +135,6 @@ pub fn system_prompt(
             prompt.push('\n');
         }
     }
-
-    prompt
 }
 
 fn write_entries(prompt: &mut String, entries: &[PromptEntry]) {
@@ -120,6 +156,14 @@ fn tool_order(name: &str) -> usize {
         "protocol" => 1,
         "replace" => 3,
         "apply_patch" => 4,
+        "read" => 0,
+        "write" => 1,
+        "edit" => 2,
+        "bash" => 3,
+        "codemode" => 5,
+        "steer" => 6,
+        "task" => 7,
+        "tool_search" => 8,
         _ => 5,
     }
 }
@@ -290,6 +334,48 @@ mod tests {
         {
             serde_json::from_str::<serde_json::Value>(example).expect("example is valid JSON");
         }
+    }
+
+    #[test]
+    fn simple_prompt_has_no_protocol_surface() {
+        let prompt = simple_system_prompt(
+            &[
+                PromptEntry {
+                    name: "edit".to_string(),
+                    description: "Edit files.".to_string(),
+                },
+                PromptEntry {
+                    name: "read".to_string(),
+                    description: "Read files.".to_string(),
+                },
+                PromptEntry {
+                    name: "bash".to_string(),
+                    description: "Run commands.".to_string(),
+                },
+            ],
+            &[],
+        );
+        assert!(prompt.starts_with("You are a general-purpose agent running in UAT."));
+        assert!(prompt.contains("- read: Read files."));
+        assert!(prompt.contains("- edit: Edit files."));
+        assert!(prompt.contains("- bash: Run commands."));
+        assert!(prompt.contains("Edit files with edit"));
+        assert!(prompt.contains("Operating rules:"));
+        assert!(!prompt.contains("protocol"));
+        assert!(!prompt.contains("://"));
+        assert!(!prompt.contains("help("));
+    }
+
+    #[test]
+    fn simple_prompt_omits_edit_guidance_without_edit_tools() {
+        let prompt = simple_system_prompt(
+            &[PromptEntry {
+                name: "bash".to_string(),
+                description: "Run commands.".to_string(),
+            }],
+            &[],
+        );
+        assert!(!prompt.contains("Edit files with edit"));
     }
 
     #[test]

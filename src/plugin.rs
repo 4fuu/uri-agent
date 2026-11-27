@@ -725,6 +725,12 @@ impl ModelToolOutput {
         Self { output, images }
     }
 
+    /// The complete text output, used by codemode to chain tool results
+    /// without a model round trip.
+    pub fn text(&self) -> &str {
+        &self.output
+    }
+
     #[cfg(test)]
     pub fn output(&self) -> &str {
         &self.output

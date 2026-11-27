@@ -80,6 +80,14 @@ pub enum CapabilitySelection {
     Only(Vec<String>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptStyle {
+    #[default]
+    Protocol,
+    Simple,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSpec {
@@ -92,6 +100,8 @@ pub struct AgentSpec {
     pub tools: CapabilitySelection,
     pub protocols: CapabilitySelection,
     pub max_output_tokens: Option<usize>,
+    #[serde(default)]
+    pub prompt_style: PromptStyle,
     depth: u8,
 }
 
@@ -113,6 +123,7 @@ impl AgentSpec {
             tools: CapabilitySelection::All,
             protocols: CapabilitySelection::All,
             max_output_tokens: None,
+            prompt_style: PromptStyle::Protocol,
             depth: 0,
         }
     }
@@ -134,8 +145,14 @@ impl AgentSpec {
             tools: CapabilitySelection::All,
             protocols: CapabilitySelection::All,
             max_output_tokens: None,
+            prompt_style: PromptStyle::Protocol,
             depth: ROOT_AGENT_DEPTH,
         }
+    }
+
+    pub fn with_simple_prompt(mut self) -> Self {
+        self.prompt_style = PromptStyle::Simple;
+        self
     }
 
     pub fn append_system_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -656,12 +673,15 @@ impl AgentHost {
         let context_state = ContextState::new(session.clone());
         let spec = session.spec().await;
         let collaboration_enabled = collaboration_enabled
-            && match &spec.protocols {
+            && (match &spec.protocols {
                 CapabilitySelection::All => true,
                 CapabilitySelection::Only(protocols) => {
                     protocols.iter().any(|protocol| protocol == "collaboration")
                 }
-            };
+            } || match &spec.tools {
+                CapabilitySelection::All => true,
+                CapabilitySelection::Only(tools) => tools.iter().any(|tool| tool == "steer"),
+            });
         let collaboration_state =
             collaboration_enabled.then(|| CollaborationState::new(session.clone()));
         let mcp_profile = session
@@ -722,13 +742,23 @@ impl AgentHost {
                 Some(session.id().to_string()),
             )),
         )?;
+        if let Some(state) = &collaboration_state {
+            model_tools.register(crate::builtins::traditional::SteerTool::new(state.clone()))?;
+        }
+        model_tools.register(crate::builtins::traditional::NotesTool::new(
+            context_state.clone(),
+        ))?;
         let skill_source = SkillProtocolSource::default();
         protocols.set_dynamic_source(Arc::new(skill_source.clone()))?;
         protocols
             .restore_help_read_names(session.successful_protocol_help_reads().await)
             .await;
         let protocols = Arc::new(protocols);
+        let codemode =
+            crate::builtins::traditional::CodemodeTool::new(protocols.clone(), output.clone());
+        model_tools.register(codemode.clone())?;
         let model_tools = Arc::new(model_tools);
+        codemode.bind(Arc::downgrade(&model_tools));
         let plugins = Arc::new(plugins);
 
         let mut startup_notices = startup_notices;
@@ -822,7 +852,10 @@ impl AgentInitializer {
             .protocols
             .prompt_protocols_for(capability_names(&spec.protocols))?;
         let fragments = self.plugins.system_prompt_fragments()?;
-        let generated = crate::prompts::system_prompt(&tools, &protocols, &fragments);
+        let generated = match spec.prompt_style {
+            PromptStyle::Protocol => crate::prompts::system_prompt(&tools, &protocols, &fragments),
+            PromptStyle::Simple => crate::prompts::simple_system_prompt(&tools, &fragments),
+        };
         match &spec.system_prompt {
             SystemPromptSelection::Inherit => Ok(generated),
             SystemPromptSelection::Append(fragment) => {

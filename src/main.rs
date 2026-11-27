@@ -18,12 +18,21 @@ async fn main() -> Result<()> {
         Some(uri_agent::config::Subcommand::Models { all }) => Some(*all),
         _ => None,
     };
+    let serve_listen = match &cli.command {
+        Some(uri_agent::config::Subcommand::Serve { listen }) => Some(listen.clone()),
+        _ => None,
+    };
     if models.is_some() && (cli.acpv1 || cli.execute.is_some()) {
         anyhow::bail!("`models` cannot be combined with --acpv1 or --execute");
+    }
+    if serve_listen.is_some() && (cli.acpv1 || cli.execute.is_some()) {
+        anyhow::bail!("`serve` cannot be combined with --acpv1 or --execute");
     }
     if cli.acpv1 {
         return uri_agent::acp::v1::serve(cli).await;
     }
+    let legacy = cli.legacy;
+    let legacy_tui = cli.legacy_tui;
     let execute_prompt = uri_agent::execute::read_prompt(cli.execute.as_deref()).await?;
     let mut config = Config::load(cli).await?;
     if let Some(all) = models {
@@ -33,7 +42,7 @@ async fn main() -> Result<()> {
         let listing = config.model_listing(all).await;
         if listing.is_empty() {
             eprintln!(
-                "no runnable models: configure a provider credential (see `uri-agent --help`), \
+                "no runnable models: configure a provider credential (see `uat --help`), \
 or pass --all to list every catalog model"
             );
         }
@@ -47,8 +56,14 @@ or pass --all to list every catalog model"
         config.cwd.clone(),
     )
     .await?;
+    if let Some(listen) = serve_listen {
+        return uri_agent::serve::serve(host, config, &listen).await;
+    }
     if let Some(prompt) = execute_prompt {
-        return uri_agent::execute::run(&host, &config, &prompt).await;
+        return uri_agent::execute::run(&host, &config, &prompt, legacy).await;
+    }
+    if !legacy_tui {
+        return uri_agent::repl::run(&host, &config).await;
     }
     let mut terminal = TuiTerminal::new()?;
     let herdr = HerdrReporter::from_env();
@@ -141,7 +156,8 @@ async fn run_session(
                 &initial.model,
                 initial.thinking,
                 &config.cwd,
-            ),
+            )
+            .with_tools(["help", "protocol", "replace", "apply_patch"]),
         )
         .await?;
     let (terminal_title, title_receiver) = tokio::sync::watch::channel(String::new());
