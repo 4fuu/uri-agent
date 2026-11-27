@@ -50,7 +50,7 @@ async fn login_flow(
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("uri-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("uat/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let response = client
         .post(device_url)

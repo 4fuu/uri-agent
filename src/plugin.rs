@@ -1,701 +1,19 @@
-use crate::agent::{AgentHandle, AgentHost, AgentSpec, CompactionCallback};
-use crate::config::{AgentEnvironment, ConfigManager, ModelRole, validate_model_role_name};
-use crate::protocol::{
-    ProtocolDescriptor, ProtocolImage, ProtocolRegistry, validate_descriptor,
-    validate_help_dependencies,
-};
+//! Model-tool registration and the linked-plugin boundary. A plugin declares
+//! the tools it installs; `PluginRegistry::install` verifies the declaration
+//! against the installed registry so a tool cannot appear or disappear
+//! silently.
+
+use crate::config::AgentEnvironment;
 use crate::tool_download::BinaryDownloader;
-pub use crate::tool_download::{BinaryDownload, DownloadArchive};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use rig::completion::ToolDefinition;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::RwLock;
-use tokio::sync::Notify;
+use std::sync::{Arc, RwLock};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CoreCommand {
-    Compose,
-    Copy,
-    Tasks,
-    Protocols,
-    Status,
-    Models,
-    ModelRoles,
-    RefreshCatalog,
-    Effort,
-    Settings,
-    Login,
-    Logout,
-    Resume,
-    Search,
-    NewSession,
-    Compact,
-    ContextStrategy,
-    Help,
-    Quit,
-    SetEnvironment,
-    SetTerminal,
-    Terminal,
-    Layout,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CommandTarget {
-    Core(CoreCommand),
-    Panel(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandSpec {
-    pub id: String,
-    pub title: String,
-    pub description: String,
-    pub aliases: Vec<String>,
-    pub target: CommandTarget,
-}
-
-impl CommandSpec {
-    pub fn new(
-        id: impl Into<String>,
-        title: impl Into<String>,
-        description: impl Into<String>,
-        aliases: impl IntoIterator<Item = impl Into<String>>,
-        target: CommandTarget,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            title: title.into(),
-            description: description.into(),
-            aliases: aliases.into_iter().map(Into::into).collect(),
-            target,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ResolvedCommand {
-    pub spec: CommandSpec,
-    pub arguments: String,
-}
-
-#[derive(Default)]
-pub struct CommandRegistry {
-    commands: BTreeMap<String, CommandSpec>,
-    names: HashMap<String, String>,
-}
-
-impl CommandRegistry {
-    pub fn with_core_commands() -> Self {
-        let mut registry = Self::default();
-        for spec in core_commands() {
-            registry
-                .register(spec)
-                .expect("built-in command names are valid and unique");
-        }
-        registry
-    }
-
-    pub fn register(&mut self, spec: CommandSpec) -> Result<()> {
-        validate_name(&spec.id)?;
-        if spec.title.trim().is_empty() || spec.description.trim().is_empty() {
-            bail!("command {} requires a title and description", spec.id);
-        }
-        let mut names = Vec::with_capacity(spec.aliases.len() + 1);
-        names.push(spec.id.clone());
-        for alias in &spec.aliases {
-            validate_name(alias)?;
-            names.push(alias.clone());
-        }
-        let mut unique = HashSet::new();
-        for name in &names {
-            if !unique.insert(name) {
-                bail!("command {} repeats name or alias {name:?}", spec.id);
-            }
-            if let Some(owner) = self.names.get(name) {
-                bail!("command name or alias {name:?} is already registered by {owner}");
-            }
-        }
-        let id = spec.id.clone();
-        for name in names {
-            self.names.insert(name, id.clone());
-        }
-        self.commands.insert(id, spec);
-        Ok(())
-    }
-
-    pub fn resolve(&self, input: &str) -> Option<ResolvedCommand> {
-        let input = input.trim().trim_start_matches([':', '：']).trim_start();
-        let split = input.find(char::is_whitespace).unwrap_or(input.len());
-        let name = &input[..split];
-        let id = self.names.get(name)?;
-        Some(ResolvedCommand {
-            spec: self.commands.get(id)?.clone(),
-            arguments: input[split..].trim().to_string(),
-        })
-    }
-
-    pub fn target_for_action(&self, action: &str) -> Option<CommandTarget> {
-        self.commands.get(action).map(|spec| spec.target.clone())
-    }
-
-    pub fn list(&self) -> Vec<CommandSpec> {
-        self.commands.values().cloned().collect()
-    }
-}
-
-fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        bail!("invalid command name or alias: {name:?}");
-    }
-    Ok(())
-}
-
-fn core_commands() -> Vec<CommandSpec> {
-    use CoreCommand::*;
-    vec![
-        CommandSpec::new(
-            "insert",
-            "Compose message",
-            "open the floating composer",
-            ["compose"],
-            CommandTarget::Core(Compose),
-        ),
-        CommandSpec::new(
-            "copy",
-            "Copy panel",
-            "copy the selection or visible panel with OSC52",
-            ["yank"],
-            CommandTarget::Core(Copy),
-        ),
-        CommandSpec::new(
-            "tasks",
-            "Managed tasks",
-            "inspect asynchronous protocol work",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Tasks),
-        ),
-        CommandSpec::new(
-            "protocols",
-            "Protocols",
-            "show registered read and exec routes",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Protocols),
-        ),
-        CommandSpec::new(
-            "status",
-            "Session status",
-            "expand project, model, usage, and plugin status",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Status),
-        ),
-        CommandSpec::new(
-            "model",
-            "Select model",
-            "search all runnable models from the Pi catalog",
-            ["models"],
-            CommandTarget::Core(Models),
-        ),
-        CommandSpec::new(
-            "model-roles",
-            "Model roles",
-            "assign models to plugin-declared roles",
-            ["roles"],
-            CommandTarget::Core(ModelRoles),
-        ),
-        CommandSpec::new(
-            "refresh-catalog",
-            "Refresh model catalog",
-            "force-refresh and apply model configurations from Pi",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(RefreshCatalog),
-        ),
-        CommandSpec::new(
-            "effort",
-            "Thinking effort",
-            "select thinking effort for the active model",
-            ["thinking"],
-            CommandTarget::Core(Effort),
-        ),
-        CommandSpec::new(
-            "settings",
-            "Settings",
-            "model, credentials, thinking, output limit, and Agent environment",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Settings),
-        ),
-        CommandSpec::new(
-            "login",
-            "Log in",
-            "save an API key or complete provider OAuth",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Login),
-        ),
-        CommandSpec::new(
-            "logout",
-            "Log out",
-            "remove a stored provider credential",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Logout),
-        ),
-        CommandSpec::new(
-            "resume",
-            "Resume session",
-            "switch to another session in this project",
-            ["sessions"],
-            CommandTarget::Core(Resume),
-        ),
-        CommandSpec::new(
-            "search",
-            "Search conversation",
-            "find text already shown in this conversation",
-            ["find"],
-            CommandTarget::Core(Search),
-        ),
-        CommandSpec::new(
-            "new",
-            "New session",
-            "start a new session in this project",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(NewSession),
-        ),
-        CommandSpec::new(
-            "compact",
-            "Summarize context",
-            "summarize older history into a checkpoint (summary strategy only)",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Compact),
-        ),
-        CommandSpec::new(
-            "context-strategy",
-            "Context strategy",
-            "toggle rollover/summary, or set one explicitly",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(ContextStrategy),
-        ),
-        CommandSpec::new(
-            "help",
-            "Help",
-            "active keymap and command reference",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Help),
-        ),
-        CommandSpec::new(
-            "quit",
-            "Quit",
-            "close URI Agent",
-            ["q"],
-            CommandTarget::Core(Quit),
-        ),
-        CommandSpec::new(
-            "set-env",
-            "Add environment variable",
-            "add or replace an Agent environment variable with a masked value prompt",
-            ["environment-add"],
-            CommandTarget::Core(SetEnvironment),
-        ),
-        CommandSpec::new(
-            "set-terminal",
-            "Set default terminal",
-            "save the command used by :terminal",
-            ["terminal-set"],
-            CommandTarget::Core(SetTerminal),
-        ),
-        CommandSpec::new(
-            "terminal",
-            "Open terminal",
-            "open the default terminal in a float",
-            ["term"],
-            CommandTarget::Core(Terminal),
-        ),
-        CommandSpec::new(
-            "layout",
-            "Layout",
-            "toggle the compact phone layout, or set auto, wide, or compact",
-            std::iter::empty::<&str>(),
-            CommandTarget::Core(Layout),
-        ),
-    ]
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TuiPanelTone {
-    #[default]
-    Default,
-    Accent,
-    Muted,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiPanelRow {
-    pub id: String,
-    pub label: String,
-    pub value: String,
-    pub description: String,
-    pub tone: TuiPanelTone,
-    pub selectable: bool,
-    /// Character cursor rendered within `value` while the provider is editing
-    /// this row. Providers retain the authoritative value and cursor state.
-    pub cursor: Option<usize>,
-}
-
-impl TuiPanelRow {
-    pub fn item(id: impl Into<String>, label: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            label: label.into(),
-            value: value.into(),
-            description: String::new(),
-            tone: TuiPanelTone::Default,
-            selectable: true,
-            cursor: None,
-        }
-    }
-
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = description.into();
-        self
-    }
-
-    pub fn tone(mut self, tone: TuiPanelTone) -> Self {
-        self.tone = tone;
-        self
-    }
-
-    pub fn selectable(mut self, selectable: bool) -> Self {
-        self.selectable = selectable;
-        self
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiPanelHint {
-    pub key: String,
-    pub label: String,
-    pub action: Option<String>,
-}
-
-impl TuiPanelHint {
-    pub fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            label: label.into(),
-            action: None,
-        }
-    }
-
-    pub fn action(mut self, action: impl Into<String>) -> Self {
-        self.action = Some(action.into());
-        self
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiPanelView {
-    pub title: String,
-    pub rows: Vec<TuiPanelRow>,
-    pub selected: Option<usize>,
-    pub message: Option<(String, TuiPanelTone)>,
-    pub hints: Vec<TuiPanelHint>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TuiPanelEvent {
-    Action(String),
-    Page(isize),
-    Text(char),
-    Select(usize),
-    Activate(usize),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TuiPanelControl {
-    Continue,
-    Close,
-}
-
-#[derive(Clone, Default)]
-pub struct TuiPanelWake {
-    notify: Arc<Notify>,
-}
-
-impl std::fmt::Debug for TuiPanelWake {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("TuiPanelWake").finish()
-    }
-}
-
-impl TuiPanelWake {
-    pub fn wake(&self) {
-        self.notify.notify_one();
-    }
-
-    pub(crate) async fn notified(&self) {
-        self.notify.notified().await;
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TuiPanelContext {
-    pub cwd: PathBuf,
-    pub session_id: String,
-    pub arguments: String,
-    pub wake: TuiPanelWake,
-}
-
-#[async_trait]
-pub trait TuiPanelSession: Send {
-    fn view(&mut self) -> TuiPanelView;
-
-    async fn handle(&mut self, event: TuiPanelEvent) -> Result<TuiPanelControl>;
-
-    fn paste(&mut self, _text: String) -> Result<TuiPanelControl> {
-        Ok(TuiPanelControl::Continue)
-    }
-}
-
-#[async_trait]
-pub trait TuiPanelProvider: Send + Sync {
-    async fn open(&self, context: TuiPanelContext) -> Result<Box<dyn TuiPanelSession>>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TuiTextPosition {
-    pub line: usize,
-    pub column: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TuiTextRange {
-    pub start: TuiTextPosition,
-    pub end: TuiTextPosition,
-}
-
-#[derive(Clone, Debug)]
-pub struct TuiCompletionContext {
-    pub cwd: PathBuf,
-    pub session_id: String,
-    pub lines: Vec<String>,
-    pub cursor: TuiTextPosition,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiCompletionItem {
-    pub insert_text: String,
-    pub label: String,
-    pub description: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiCompletions {
-    pub replacement: TuiTextRange,
-    pub items: Vec<TuiCompletionItem>,
-}
-
-#[async_trait]
-pub trait TuiCompletionProvider: Send + Sync {
-    async fn complete(&self, context: &TuiCompletionContext) -> Result<Option<TuiCompletions>>;
-}
-
-#[derive(Clone, Debug)]
-pub struct TuiSubmissionContext {
-    pub cwd: PathBuf,
-    pub session_id: String,
-    pub prompt: String,
-    pub first_user_message: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TuiEffect {
-    TerminalTitle(String),
-}
-
-#[async_trait]
-pub trait TuiSubmissionProvider: Send + Sync {
-    async fn submitted(&self, context: &TuiSubmissionContext) -> Result<Option<TuiEffect>>;
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TuiStatusTone {
-    #[default]
-    Default,
-    Accent,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiStatusItem {
-    pub label: String,
-    pub value: String,
-    pub tone: TuiStatusTone,
-}
-
-impl TuiStatusItem {
-    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            value: value.into(),
-            tone: TuiStatusTone::Default,
-        }
-    }
-
-    pub fn with_tone(mut self, tone: TuiStatusTone) -> Self {
-        self.tone = tone;
-        self
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TuiStatusContext {
-    pub cwd: PathBuf,
-    pub session_id: String,
-    /// Providers may return a richer value when the expanded status panel
-    /// requests one.
-    pub expanded: bool,
-}
-
-/// Keep status providers fast and non-blocking: the TUI evaluates them while
-/// drawing each frame. Providers can own shared state when their value changes.
-pub trait TuiStatusProvider: Send + Sync {
-    fn status(&self, context: &TuiStatusContext) -> Option<TuiStatusItem>;
-}
-
-impl<F> TuiStatusProvider for F
-where
-    F: Fn(&TuiStatusContext) -> Option<TuiStatusItem> + Send + Sync,
-{
-    fn status(&self, context: &TuiStatusContext) -> Option<TuiStatusItem> {
-        self(context)
-    }
-}
-
-#[derive(Default)]
-pub struct TuiRegistry {
-    panels: BTreeMap<String, Arc<dyn TuiPanelProvider>>,
-    status: BTreeMap<String, Arc<dyn TuiStatusProvider>>,
-    completions: BTreeMap<String, Arc<dyn TuiCompletionProvider>>,
-    submissions: BTreeMap<String, Arc<dyn TuiSubmissionProvider>>,
-}
-
-impl TuiRegistry {
-    fn register_unique<T>(
-        map: &mut BTreeMap<String, T>,
-        kind: &str,
-        id: &str,
-        value: T,
-    ) -> Result<()> {
-        validate_name(id)?;
-        if map.contains_key(id) {
-            bail!("{kind} is already registered: {id}");
-        }
-        map.insert(id.to_string(), value);
-        Ok(())
-    }
-
-    pub fn register_panel(
-        &mut self,
-        id: impl Into<String>,
-        provider: impl TuiPanelProvider + 'static,
-    ) -> Result<()> {
-        let id = id.into();
-        Self::register_unique(&mut self.panels, "TUI panel", &id, Arc::new(provider))
-    }
-
-    pub async fn open_panel(
-        &self,
-        id: &str,
-        context: TuiPanelContext,
-    ) -> Result<Box<dyn TuiPanelSession>> {
-        let Some(provider) = self.panels.get(id) else {
-            bail!("unknown TUI panel: {id}");
-        };
-        provider.open(context).await
-    }
-
-    pub fn register_status(
-        &mut self,
-        id: impl Into<String>,
-        provider: impl TuiStatusProvider + 'static,
-    ) -> Result<()> {
-        let id = id.into();
-        Self::register_unique(
-            &mut self.status,
-            "TUI status provider",
-            &id,
-            Arc::new(provider),
-        )
-    }
-
-    pub fn status_items(&self, context: &TuiStatusContext) -> Vec<TuiStatusItem> {
-        self.status
-            .values()
-            .filter_map(|provider| provider.status(context))
-            .collect()
-    }
-
-    pub fn register_completion(
-        &mut self,
-        id: impl Into<String>,
-        provider: impl TuiCompletionProvider + 'static,
-    ) -> Result<()> {
-        let id = id.into();
-        Self::register_unique(
-            &mut self.completions,
-            "TUI completion provider",
-            &id,
-            Arc::new(provider),
-        )
-    }
-
-    pub async fn completions(
-        &self,
-        context: &TuiCompletionContext,
-    ) -> Result<Option<TuiCompletions>> {
-        for provider in self.completions.values() {
-            if let Some(completions) = provider.complete(context).await?
-                && !completions.items.is_empty()
-            {
-                return Ok(Some(completions));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn register_submission(
-        &mut self,
-        id: impl Into<String>,
-        provider: impl TuiSubmissionProvider + 'static,
-    ) -> Result<()> {
-        let id = id.into();
-        Self::register_unique(
-            &mut self.submissions,
-            "TUI submission provider",
-            &id,
-            Arc::new(provider),
-        )
-    }
-
-    pub async fn submission_effects(&self, context: &TuiSubmissionContext) -> Vec<TuiEffect> {
-        let mut effects = Vec::new();
-        for provider in self.submissions.values() {
-            if let Ok(Some(effect)) = provider.submitted(context).await {
-                effects.push(effect);
-            }
-        }
-        effects
-    }
-}
+pub use crate::tool_download::{BinaryDownload, DownloadArchive};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelToolDescriptor {
@@ -717,43 +35,31 @@ impl ModelToolDescriptor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelToolOutput {
     output: String,
-    images: Vec<ProtocolImage>,
 }
 
 impl ModelToolOutput {
-    pub fn new(output: String, images: Vec<ProtocolImage>) -> Self {
-        Self { output, images }
+    pub fn new(output: String) -> Self {
+        Self { output }
     }
 
-    /// The complete text output, used by codemode to chain tool results
-    /// without a model round trip.
     pub fn text(&self) -> &str {
         &self.output
     }
 
-    #[cfg(test)]
-    pub fn output(&self) -> &str {
-        &self.output
-    }
-
-    pub fn images(&self) -> &[ProtocolImage] {
-        &self.images
-    }
-
-    pub(crate) fn into_parts(self) -> (String, Vec<ProtocolImage>) {
-        (self.output, self.images)
+    pub(crate) fn into_text(self) -> String {
+        self.output
     }
 }
 
 impl From<String> for ModelToolOutput {
     fn from(output: String) -> Self {
-        Self::new(output, Vec::new())
+        Self::new(output)
     }
 }
 
 impl From<&str> for ModelToolOutput {
     fn from(output: &str) -> Self {
-        output.to_string().into()
+        Self::new(output.to_string())
     }
 }
 
@@ -761,11 +67,7 @@ impl From<&str> for ModelToolOutput {
 pub trait ModelTool: Send + Sync {
     fn descriptor(&self) -> ModelToolDescriptor;
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput>;
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput>;
 }
 
 #[derive(Default)]
@@ -794,9 +96,7 @@ impl ModelToolRegistry {
     }
 
     pub fn select(&self, names: Option<&[String]>) -> Result<()> {
-        let selected = names
-            .map(|names| self.validate_selection(names))
-            .transpose()?;
+        let selected = self.selection(names)?;
         *self
             .allowed
             .write()
@@ -804,20 +104,24 @@ impl ModelToolRegistry {
         Ok(())
     }
 
-    pub(crate) fn validate_selection(&self, names: &[String]) -> Result<HashSet<String>> {
-        let available = self
-            .all_descriptors()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<HashSet<_>>();
-        let selected = names.iter().cloned().collect::<HashSet<_>>();
-        if selected.len() != names.len() {
-            bail!("Agent model tool is selected more than once");
+    pub fn validate_selection(&self, names: &[String]) -> Result<()> {
+        self.selection(Some(names)).map(|_| ())
+    }
+
+    fn selection(&self, names: Option<&[String]>) -> Result<Option<HashSet<String>>> {
+        match names {
+            None => Ok(None),
+            Some(names) => {
+                let selected = names.iter().cloned().collect::<HashSet<_>>();
+                if selected.len() != names.len() {
+                    bail!("Agent model tool is selected more than once");
+                }
+                if let Some(name) = selected.iter().find(|name| !self.tools.contains_key(*name)) {
+                    bail!("unknown Agent model tool: {name}");
+                }
+                Ok(Some(selected))
+            }
         }
-        if let Some(name) = selected.iter().find(|name| !available.contains(*name)) {
-            bail!("unknown Agent model tool: {name}");
-        }
-        Ok(selected)
     }
 
     fn all_descriptors(&self) -> Vec<ModelToolDescriptor> {
@@ -832,7 +136,16 @@ impl ModelToolRegistry {
         names: Option<&[String]>,
     ) -> Result<Vec<ModelToolDescriptor>> {
         let selected = names
-            .map(|names| self.validate_selection(names))
+            .map(|names| {
+                let selected = names.iter().cloned().collect::<HashSet<_>>();
+                if selected.len() != names.len() {
+                    bail!("Agent model tool is selected more than once");
+                }
+                if let Some(name) = selected.iter().find(|name| !self.tools.contains_key(*name)) {
+                    bail!("unknown Agent model tool: {name}");
+                }
+                Ok::<_, anyhow::Error>(selected)
+            })
             .transpose()?;
         let mut descriptors = self.all_descriptors();
         if let Some(selected) = selected {
@@ -844,12 +157,11 @@ impl ModelToolRegistry {
 
     pub fn descriptors(&self) -> Vec<ModelToolDescriptor> {
         let mut descriptors = self.all_descriptors();
-        if let Some(allowed) = self
+        let allowed = self
             .allowed
             .read()
-            .expect("model tool selection lock poisoned")
-            .as_ref()
-        {
+            .expect("model tool selection lock poisoned");
+        if let Some(allowed) = allowed.as_ref() {
             descriptors.retain(|descriptor| allowed.contains(&descriptor.name));
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
@@ -863,107 +175,85 @@ impl ModelToolRegistry {
             .collect()
     }
 
-    pub async fn dispatch(
-        &self,
-        name: &str,
-        arguments: &Value,
-        protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
-        if self
-            .allowed
-            .read()
-            .expect("model tool selection lock poisoned")
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(name))
+    pub async fn dispatch(&self, name: &str, arguments: &Value) -> Result<ModelToolOutput> {
         {
-            return Err(unknown_model_tool(name, protocols));
+            let allowed = self
+                .allowed
+                .read()
+                .expect("model tool selection lock poisoned");
+            if let Some(selected) = allowed.as_ref()
+                && !selected.contains(name)
+            {
+                bail!("unknown model tool: {name}");
+            }
         }
         let tool = self
             .tools
             .get(name)
             .cloned()
-            .ok_or_else(|| unknown_model_tool(name, protocols))?;
-        tool.execute(arguments, protocols).await
+            .ok_or_else(|| anyhow!("unknown model tool: {name}"))?;
+        tool.execute(arguments).await
     }
 }
 
-/// Error for a name that is not a registered model tool. `read` and `exec`
-/// were separate model tools before they merged into `protocol`, so calls
-/// replayed from sessions recorded before that merge, and protocol names
-/// mistaken for tool names, get routing guidance instead of a bare
-/// rejection.
-fn unknown_model_tool(name: &str, protocols: &ProtocolRegistry) -> anyhow::Error {
-    let is_protocol = protocols
-        .descriptors()
-        .iter()
-        .any(|descriptor| descriptor.name == name);
-    if matches!(name, "read" | "exec") || is_protocol {
-        anyhow::anyhow!(
-            "unknown model tool: {name}; protocols are not tools: call it through the \
-             `protocol` tool with its <protocol>:// address in a step's `read` or `exec` \
-             field, with `input` fields defined by its help page"
-        )
-    } else {
-        anyhow::anyhow!("unknown model tool: {name}")
-    }
-}
-
-pub fn validate_model_tool_descriptor(descriptor: &ModelToolDescriptor) -> Result<()> {
-    validate_name(&descriptor.name)?;
-    if descriptor.description.trim().is_empty() {
-        bail!("model tool {} requires a description", descriptor.name);
-    }
-    let schema = descriptor.parameters.as_object().ok_or_else(|| {
-        anyhow::anyhow!(
-            "model tool {} parameters must be a JSON Schema object",
+fn validate_model_tool_descriptor(descriptor: &ModelToolDescriptor) -> Result<()> {
+    if descriptor.name.is_empty()
+        || !descriptor
+            .name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        bail!(
+            "model tool name must be a nonempty identifier: {}",
             descriptor.name
-        )
-    })?;
+        );
+    }
+    if descriptor.description.trim().is_empty() {
+        bail!("model tool {} has an empty description", descriptor.name);
+    }
+    let Some(schema) = descriptor.parameters.as_object() else {
+        bail!("model tool {} schema must be an object", descriptor.name);
+    };
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         bail!(
-            "model tool {} parameters must declare type object",
+            "model tool {} schema must have type object",
             descriptor.name
         );
     }
-    let properties = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "model tool {} parameters must declare an object properties map",
-                descriptor.name
-            )
-        })?;
     if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
         bail!(
-            "model tool {} parameters must set additionalProperties to false",
+            "model tool {} schema must set additionalProperties false",
             descriptor.name
         );
     }
-    if let Some(required) = schema.get("required") {
-        let required = required.as_array().ok_or_else(|| {
-            anyhow::anyhow!("model tool {} required must be an array", descriptor.name)
-        })?;
-        let mut names = HashSet::new();
-        for name in required {
-            let name = name.as_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "model tool {} required names must be strings",
-                    descriptor.name
-                )
-            })?;
-            if !properties.contains_key(name) {
-                bail!(
-                    "model tool {} requires undeclared property {name}",
-                    descriptor.name
-                );
-            }
-            if !names.insert(name) {
-                bail!(
-                    "model tool {} requires property {name} more than once",
-                    descriptor.name
-                );
-            }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        bail!("model tool {} schema must have properties", descriptor.name);
+    };
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        bail!(
+            "model tool {} schema must have a required array",
+            descriptor.name
+        );
+    };
+    let mut names = HashSet::new();
+    for value in required {
+        let Some(name) = value.as_str() else {
+            bail!(
+                "model tool {} required entries must be strings",
+                descriptor.name
+            );
+        };
+        if !properties.contains_key(name) {
+            bail!(
+                "model tool {} requires undeclared property {name}",
+                descriptor.name
+            );
+        }
+        if !names.insert(name) {
+            bail!(
+                "model tool {} requires property {name} more than once",
+                descriptor.name
+            );
         }
     }
     Ok(())
@@ -998,69 +288,6 @@ impl PluginEnvironment {
 }
 
 #[derive(Clone)]
-pub struct PluginCredentials {
-    manager: Arc<ConfigManager>,
-}
-
-impl PluginCredentials {
-    pub(crate) fn new(manager: Arc<ConfigManager>) -> Self {
-        Self { manager }
-    }
-
-    pub async fn api_key(&self, provider: &str) -> Result<Option<String>> {
-        self.manager.provider_api_key(provider).await
-    }
-}
-
-#[derive(Clone)]
-pub struct PluginModelRoleResolver {
-    manager: Arc<ConfigManager>,
-}
-
-impl PluginModelRoleResolver {
-    pub(crate) fn new(manager: Arc<ConfigManager>) -> Self {
-        Self { manager }
-    }
-
-    pub async fn resolve(&self, name: &str) -> Result<Option<ModelRole>> {
-        self.manager.model_role(name).await
-    }
-}
-
-#[derive(Clone)]
-pub struct PluginAgents {
-    host: AgentHost,
-    parent_session_id: Option<String>,
-}
-
-impl PluginAgents {
-    pub(crate) fn new(host: AgentHost, parent_session_id: Option<String>) -> Self {
-        Self {
-            host,
-            parent_session_id,
-        }
-    }
-
-    pub async fn create(
-        &self,
-        mut spec: AgentSpec,
-        callback: Option<Arc<dyn CompactionCallback>>,
-    ) -> Result<AgentHandle> {
-        if let Some(parent) = &self.parent_session_id {
-            if spec
-                .parent_session_id
-                .as_deref()
-                .is_some_and(|id| id != parent)
-            {
-                bail!("plugin Agent parent does not match the calling Agent");
-            }
-            spec.parent_session_id = Some(parent.clone());
-        }
-        self.host.create(spec, callback).await
-    }
-}
-
-#[derive(Clone)]
 pub struct PluginDownloads {
     downloader: BinaryDownloader,
 }
@@ -1072,82 +299,28 @@ impl PluginDownloads {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self::new()
-    }
-
     pub async fn ensure(&self, spec: &BinaryDownload) -> Result<PathBuf> {
         self.downloader.ensure(spec).await
     }
 }
 
 pub struct PluginHost<'a> {
-    pub protocols: &'a mut ProtocolRegistry,
     pub model_tools: &'a mut ModelToolRegistry,
-    pub commands: &'a mut CommandRegistry,
-    pub tui: &'a mut TuiRegistry,
     environment: Arc<AgentEnvironment>,
-    credentials: Option<Arc<ConfigManager>>,
-    agents: Option<PluginAgents>,
     downloads: PluginDownloads,
 }
 
 impl<'a> PluginHost<'a> {
-    pub fn new(
-        protocols: &'a mut ProtocolRegistry,
-        model_tools: &'a mut ModelToolRegistry,
-        commands: &'a mut CommandRegistry,
-        tui: &'a mut TuiRegistry,
-        environment: Arc<AgentEnvironment>,
-    ) -> Self {
+    pub fn new(model_tools: &'a mut ModelToolRegistry, environment: Arc<AgentEnvironment>) -> Self {
         Self {
-            protocols,
             model_tools,
-            commands,
-            tui,
             environment,
-            credentials: None,
-            agents: None,
             downloads: PluginDownloads::new(),
         }
     }
 
-    pub fn with_credentials(mut self, manager: Arc<ConfigManager>) -> Self {
-        self.credentials = Some(manager);
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn with_agents(mut self, agents: PluginAgents) -> Self {
-        self.agents = Some(agents);
-        self
-    }
-
     pub fn environment(&self) -> Result<PluginEnvironment> {
         Ok(PluginEnvironment::new(self.environment.clone()))
-    }
-
-    pub fn credentials(&self) -> Result<PluginCredentials> {
-        let manager = self
-            .credentials
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("plugin credential access is not attached"))?;
-        Ok(PluginCredentials::new(manager))
-    }
-
-    pub fn model_roles(&self) -> Result<PluginModelRoleResolver> {
-        let manager = self
-            .credentials
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("plugin model roles are not attached"))?;
-        Ok(PluginModelRoleResolver::new(manager))
-    }
-
-    pub fn agents(&self) -> Result<PluginAgents> {
-        self.agents
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("plugin Agent access is not attached"))
     }
 
     pub fn downloads(&self) -> Result<PluginDownloads> {
@@ -1155,73 +328,24 @@ impl<'a> PluginHost<'a> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SessionProtocolRecord {
-    pub owner: String,
-    pub identity: String,
-    pub descriptor: ProtocolDescriptor,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub help_dependencies: Vec<String>,
-}
-
 #[async_trait]
 pub trait Plugin: Send + Sync {
-    /// Protocols contributed by this plugin. These declarations are used to
-    /// freeze a new session's system prompt before the runtime registries exist.
-    fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
-        Vec::new()
-    }
-
-    /// Stable owner for protocols whose descriptor set is frozen per session.
-    /// Static plugins should leave this unset.
-    fn session_protocol_owner(&self) -> Option<&str> {
-        None
-    }
-
-    /// Records discovered for a new session. The record keeps only stable
-    /// identity and prompt metadata; mutable operational configuration remains
-    /// owned by the plugin and is resolved when the protocol is called.
-    fn session_protocol_records(&self) -> Result<Vec<SessionProtocolRecord>> {
-        Ok(Vec::new())
-    }
-
-    /// Restore the exact records frozen by an existing session before protocol
-    /// declarations and registrations are evaluated.
-    fn restore_session_protocol_records(&self, records: &[SessionProtocolRecord]) -> Result<()> {
-        if !records.is_empty() {
-            bail!("plugin does not restore session-scoped protocols");
-        }
-        Ok(())
-    }
-
-    /// Direct model tools contributed by this plugin. Prefer a direct tool
-    /// when structured arguments would otherwise require nested serialization.
     fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
         Vec::new()
     }
 
-    /// Notices contributed by this plugin for the current application startup.
+    fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn system_prompt_fragments(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn startup_notices(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Optional content appended to a new session's system prompt before it is
-    /// frozen. A plugin may contribute prompt content without adding a protocol.
-    fn system_prompt_fragment(&self) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    /// Names of the model roles this plugin resolves. Declared roles stay
-    /// assignable through model-role settings even while unassigned, and the
-    /// plugin resolves them dynamically at use time.
-    fn model_roles(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn register(&self, host: &mut PluginHost<'_>) -> Result<()>;
-
-    /// Release request-driven resources such as remote connections when the
-    /// owning Agent session closes.
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
@@ -1229,7 +353,7 @@ pub trait Plugin: Send + Sync {
 
 #[derive(Default)]
 pub struct PluginRegistry {
-    plugins: Vec<Box<dyn Plugin>>,
+    plugins: Vec<Arc<dyn Plugin>>,
 }
 
 impl PluginRegistry {
@@ -1238,106 +362,7 @@ impl PluginRegistry {
     }
 
     pub fn add(&mut self, plugin: impl Plugin + 'static) {
-        self.plugins.push(Box::new(plugin));
-    }
-
-    pub fn session_protocol_records(&self) -> Result<Vec<SessionProtocolRecord>> {
-        let mut records = Vec::new();
-        let mut owners = HashSet::new();
-        let mut identities = HashSet::new();
-        let mut protocols = HashSet::new();
-        for plugin in &self.plugins {
-            let Some(owner) = plugin.session_protocol_owner() else {
-                continue;
-            };
-            validate_name(owner)?;
-            if !owners.insert(owner.to_string()) {
-                bail!("session protocol owner is declared more than once: {owner}");
-            }
-            for record in plugin.session_protocol_records()? {
-                if record.owner != owner {
-                    bail!(
-                        "session protocol record owner {} does not match plugin owner {owner}",
-                        record.owner
-                    );
-                }
-                if record.identity.trim().is_empty() {
-                    bail!("session protocol record identity cannot be empty");
-                }
-                validate_descriptor(&record.descriptor)?;
-                validate_help_dependencies(&record.descriptor.name, &record.help_dependencies)?;
-                if !identities.insert((record.owner.clone(), record.identity.clone())) {
-                    bail!(
-                        "session protocol identity is declared more than once: {}/{}",
-                        record.owner,
-                        record.identity
-                    );
-                }
-                if !protocols.insert(record.descriptor.name.clone()) {
-                    bail!(
-                        "session protocol name is declared more than once: {}",
-                        record.descriptor.name
-                    );
-                }
-                records.push(record);
-            }
-        }
-        records.sort_by(|left, right| left.descriptor.name.cmp(&right.descriptor.name));
-        Ok(records)
-    }
-
-    pub fn restore_session_protocol_records(
-        &self,
-        records: &[SessionProtocolRecord],
-    ) -> Result<()> {
-        for record in records {
-            if record.identity.trim().is_empty() {
-                bail!("session protocol record identity cannot be empty");
-            }
-            validate_descriptor(&record.descriptor)?;
-            validate_help_dependencies(&record.descriptor.name, &record.help_dependencies)?;
-        }
-        let mut remaining = records.iter().collect::<Vec<_>>();
-        let mut owners = HashSet::new();
-        for plugin in &self.plugins {
-            let Some(owner) = plugin.session_protocol_owner() else {
-                continue;
-            };
-            validate_name(owner)?;
-            if !owners.insert(owner.to_string()) {
-                bail!("session protocol owner is declared more than once: {owner}");
-            }
-            let owned = records
-                .iter()
-                .filter(|record| record.owner == owner)
-                .cloned()
-                .collect::<Vec<_>>();
-            plugin.restore_session_protocol_records(&owned)?;
-            remaining.retain(|record| record.owner != owner);
-        }
-        if let Some(record) = remaining.first() {
-            bail!("session protocol owner is not available: {}", record.owner);
-        }
-        Ok(())
-    }
-
-    pub fn protocol_descriptors(&self) -> Result<Vec<ProtocolDescriptor>> {
-        let mut descriptors = Vec::new();
-        let mut names = HashSet::new();
-        for plugin in &self.plugins {
-            for descriptor in plugin.protocol_descriptors() {
-                validate_descriptor(&descriptor)?;
-                if !names.insert(descriptor.name.clone()) {
-                    bail!(
-                        "plugin protocol name is declared more than once: {}",
-                        descriptor.name
-                    );
-                }
-                descriptors.push(descriptor);
-            }
-        }
-        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(descriptors)
+        self.plugins.push(Arc::new(plugin));
     }
 
     pub fn model_tool_descriptors(&self) -> Result<Vec<ModelToolDescriptor>> {
@@ -1359,6 +384,14 @@ impl PluginRegistry {
         Ok(descriptors)
     }
 
+    pub fn system_prompt_fragments(&self) -> Result<Vec<String>> {
+        Ok(self
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.system_prompt_fragments())
+            .collect())
+    }
+
     pub fn startup_notices(&self) -> Vec<String> {
         self.plugins
             .iter()
@@ -1366,91 +399,32 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Model-role names declared by the linked plugins, in registration order.
-    /// Names are validated and must be declared by at most one plugin.
-    pub fn model_roles(&self) -> Result<Vec<String>> {
-        let mut names = Vec::new();
-        let mut seen = HashSet::new();
-        for plugin in &self.plugins {
-            for name in plugin.model_roles() {
-                validate_model_role_name(&name)?;
-                if !seen.insert(name.clone()) {
-                    bail!("model role is declared more than once: {name}");
-                }
-                names.push(name);
-            }
-        }
-        Ok(names)
-    }
-
-    pub fn system_prompt_fragments(&self) -> Result<Vec<String>> {
-        let mut fragments = Vec::new();
-        for plugin in &self.plugins {
-            if let Some(fragment) = plugin.system_prompt_fragment()? {
-                fragments.push(fragment);
-            }
-        }
-        Ok(fragments)
-    }
-
     pub fn install(&self, host: &mut PluginHost<'_>) -> Result<()> {
-        let expected_protocols = self
-            .protocol_descriptors()?
-            .into_iter()
-            .map(|descriptor| (descriptor.name.clone(), descriptor))
-            .collect::<BTreeMap<_, _>>();
-        let before = host
-            .protocols
-            .descriptors()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<HashSet<_>>();
-        if let Some(name) = expected_protocols
-            .keys()
-            .find(|name| before.contains(*name))
-        {
-            bail!("plugin protocol name is already registered: {name}");
-        }
         let expected_tools = self
             .model_tool_descriptors()?
             .into_iter()
             .map(|descriptor| (descriptor.name.clone(), descriptor))
             .collect::<BTreeMap<_, _>>();
-        let tools_before = host
+        let before = host
             .model_tools
             .descriptors()
             .into_iter()
             .map(|descriptor| descriptor.name)
             .collect::<HashSet<_>>();
-        if let Some(name) = expected_tools
-            .keys()
-            .find(|name| tools_before.contains(*name))
-        {
+        if let Some(name) = expected_tools.keys().find(|name| before.contains(*name)) {
             bail!("plugin model tool name is already registered: {name}");
         }
-
         for plugin in &self.plugins {
-            plugin.register(host).context("failed to register plugin")?;
+            plugin.register(host)?;
         }
-
         let installed = host
-            .protocols
+            .model_tools
             .descriptors()
             .into_iter()
             .filter(|descriptor| !before.contains(&descriptor.name))
             .map(|descriptor| (descriptor.name.clone(), descriptor))
             .collect::<BTreeMap<_, _>>();
-        if installed != expected_protocols {
-            bail!("plugin protocol declarations do not match installed protocols");
-        }
-        let installed_tools = host
-            .model_tools
-            .descriptors()
-            .into_iter()
-            .filter(|descriptor| !tools_before.contains(&descriptor.name))
-            .map(|descriptor| (descriptor.name.clone(), descriptor))
-            .collect::<BTreeMap<_, _>>();
-        if installed_tools != expected_tools {
+        if installed != expected_tools {
             bail!("plugin model tool declarations do not match installed model tools");
         }
         Ok(())
@@ -1465,919 +439,68 @@ impl PluginRegistry {
                 failure = Some(error);
             }
         }
-        failure.map_or(Ok(()), Err)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::ThinkingLevel;
-    use crate::output::OutputStore;
-    use crate::protocol::{Protocol, ProtocolDescriptor};
-    use crate::task::TaskManager;
+    use serde_json::json;
 
-    struct StaticPanel;
-
-    struct StaticPanelSession {
-        body: String,
-    }
+    struct Echo;
 
     #[async_trait]
-    impl TuiPanelSession for StaticPanelSession {
-        fn view(&mut self) -> TuiPanelView {
-            TuiPanelView {
-                title: "Plugin panel".to_string(),
-                rows: vec![TuiPanelRow::item("body", "Context", &self.body)],
-                selected: Some(0),
-                message: None,
-                hints: Vec::new(),
-            }
-        }
-
-        async fn handle(&mut self, event: TuiPanelEvent) -> Result<TuiPanelControl> {
-            Ok(match event {
-                TuiPanelEvent::Action(action) if action == "close" => TuiPanelControl::Close,
-                _ => TuiPanelControl::Continue,
-            })
-        }
-    }
-
-    #[async_trait]
-    impl TuiPanelProvider for StaticPanel {
-        async fn open(&self, context: TuiPanelContext) -> Result<Box<dyn TuiPanelSession>> {
-            Ok(Box::new(StaticPanelSession {
-                body: format!("{} {}", context.session_id, context.arguments),
-            }))
-        }
-    }
-
-    #[test]
-    fn command_ids_and_aliases_resolve_through_one_registry() {
-        let registry = CommandRegistry::with_core_commands();
-        assert_eq!(
-            registry.resolve(":model").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Models)
-        );
-        assert_eq!(
-            registry.resolve("：login").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Login)
-        );
-        assert_eq!(
-            registry.resolve(":status").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Status)
-        );
-        assert_eq!(
-            registry.resolve(":quit").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Quit)
-        );
-        assert_eq!(
-            registry.resolve(":q").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Quit)
-        );
-        assert_eq!(
-            registry.resolve(":insert").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Compose)
-        );
-        assert_eq!(
-            registry.resolve(":compose").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Compose)
-        );
-        assert_eq!(
-            registry.resolve(":yank").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Copy)
-        );
-        assert_eq!(
-            registry.resolve(":models").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Models)
-        );
-        assert_eq!(
-            registry.resolve(":roles").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::ModelRoles)
-        );
-        assert_eq!(
-            registry.resolve(":refresh-catalog").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::RefreshCatalog)
-        );
-        assert_eq!(
-            registry.resolve(":term").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Terminal)
-        );
-        assert_eq!(registry.resolve("compact now").unwrap().arguments, "now");
-        assert_eq!(
-            registry.resolve(":thinking high").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Effort)
-        );
-        assert_eq!(
-            registry.resolve(":sessions").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Resume)
-        );
-        assert_eq!(
-            registry.resolve(":search").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Search)
-        );
-        assert_eq!(
-            registry.resolve(":find").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::Search)
-        );
-        assert_eq!(
-            registry.resolve(":terminal-set").unwrap().spec.target,
-            CommandTarget::Core(CoreCommand::SetTerminal)
-        );
-        assert_eq!(registry.resolve(":effort high").unwrap().arguments, "high");
-        let strategy = registry.resolve(":context-strategy summary").unwrap();
-        assert_eq!(
-            strategy.spec.target,
-            CommandTarget::Core(CoreCommand::ContextStrategy)
-        );
-        assert_eq!(strategy.arguments, "summary");
-    }
-
-    #[test]
-    fn command_conflicts_are_rejected_before_the_tui_starts() {
-        let mut registry = CommandRegistry::with_core_commands();
-        let error = registry
-            .register(CommandSpec::new(
-                "other",
-                "Other",
-                "Other command",
-                ["settings"],
-                CommandTarget::Panel("other".to_string()),
-            ))
-            .unwrap_err();
-        assert!(error.to_string().contains("already registered"));
-
-        let error = CommandRegistry::default()
-            .register(CommandSpec::new(
-                "duplicate",
-                "Duplicate",
-                "Duplicate command",
-                ["duplicate"],
-                CommandTarget::Panel("duplicate".to_string()),
-            ))
-            .unwrap_err();
-        assert!(error.to_string().contains("repeats"));
-    }
-
-    #[test]
-    fn registry_collects_declared_model_roles_and_rejects_duplicates() {
-        struct RolePlugin(&'static str);
-        impl Plugin for RolePlugin {
-            fn model_roles(&self) -> Vec<String> {
-                vec![self.0.to_string()]
-            }
-            fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
-                Ok(())
-            }
-        }
-
-        let mut plugins = PluginRegistry::new();
-        plugins.add(RolePlugin("finder"));
-        plugins.add(RolePlugin("title"));
-        assert_eq!(
-            plugins.model_roles().unwrap(),
-            ["finder".to_string(), "title".to_string()]
-        );
-
-        let mut duplicate = PluginRegistry::new();
-        duplicate.add(RolePlugin("finder"));
-        duplicate.add(RolePlugin("finder"));
-        assert!(
-            duplicate
-                .model_roles()
-                .unwrap_err()
-                .to_string()
-                .contains("declared more than once")
-        );
-
-        let mut invalid = PluginRegistry::new();
-        invalid.add(RolePlugin("invalid role"));
-        assert!(
-            invalid
-                .model_roles()
-                .unwrap_err()
-                .to_string()
-                .contains("invalid model role name")
-        );
-    }
-
-    #[tokio::test]
-    async fn registered_tui_panels_receive_session_context_and_arguments() {
-        let mut registry = TuiRegistry::default();
-        registry.register_panel("demo", StaticPanel).unwrap();
-        let panel = registry
-            .open_panel(
-                "demo",
-                TuiPanelContext {
-                    cwd: PathBuf::from("/work"),
-                    session_id: "session".to_string(),
-                    arguments: "argument".to_string(),
-                    wake: TuiPanelWake::default(),
-                },
-            )
-            .await
-            .unwrap();
-        let mut panel = panel;
-        let view = panel.view();
-        assert_eq!(view.title, "Plugin panel");
-        assert_eq!(view.rows[0].value, "session argument");
-    }
-
-    #[test]
-    fn registered_status_providers_receive_context_and_reject_collisions() {
-        let mut registry = TuiRegistry::default();
-        registry
-            .register_status("build", |context: &TuiStatusContext| {
-                Some(
-                    TuiStatusItem::new(
-                        "build",
-                        if context.expanded {
-                            format!("clean · {}", context.session_id)
-                        } else {
-                            "clean".to_string()
-                        },
-                    )
-                    .with_tone(TuiStatusTone::Accent),
-                )
-            })
-            .unwrap();
-        let context = TuiStatusContext {
-            cwd: PathBuf::from("/work"),
-            session_id: "session".to_string(),
-            expanded: true,
-        };
-        assert_eq!(
-            registry.status_items(&context),
-            vec![TuiStatusItem::new("build", "clean · session").with_tone(TuiStatusTone::Accent)]
-        );
-
-        let error = registry
-            .register_status("build", |_context: &TuiStatusContext| None)
-            .unwrap_err();
-        assert!(error.to_string().contains("already registered"));
-    }
-
-    #[derive(Clone)]
-    struct DeclaredProtocolPlugin {
-        declares_protocol: bool,
-    }
-
-    struct PromptOnlyPlugin;
-
-    struct EnvironmentPlugin {
-        environment: Arc<std::sync::OnceLock<PluginEnvironment>>,
-    }
-
-    struct CredentialPlugin {
-        credentials: Arc<std::sync::OnceLock<PluginCredentials>>,
-    }
-
-    struct ModelRolePlugin {
-        model_roles: Arc<std::sync::OnceLock<PluginModelRoleResolver>>,
-    }
-
-    struct AgentPlugin {
-        agents: Arc<std::sync::OnceLock<PluginAgents>>,
-    }
-
-    #[derive(Clone)]
-    struct DeclaredModelToolPlugin {
-        declares_tool: bool,
-    }
-
-    struct NamedModelTool(&'static str);
-
-    struct DownloadPlugin {
-        downloads: Arc<std::sync::OnceLock<PluginDownloads>>,
-    }
-
-    #[async_trait]
-    impl ModelTool for DeclaredModelToolPlugin {
+    impl ModelTool for Echo {
         fn descriptor(&self) -> ModelToolDescriptor {
             ModelToolDescriptor {
-                name: "declared_tool".to_string(),
-                description: "Declared test model tool".to_string(),
-                parameters: serde_json::json!({
+                name: "echo".to_string(),
+                description: "Echo text.".to_string(),
+                parameters: json!({
                     "type": "object",
-                    "properties": {},
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
                     "additionalProperties": false
                 }),
             }
         }
 
-        async fn execute(
-            &self,
-            _arguments: &Value,
-            _protocols: &ProtocolRegistry,
-        ) -> Result<ModelToolOutput> {
-            Ok("ok".into())
+        async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
+            Ok(format!("echo:{}", arguments["text"].as_str().unwrap_or_default()).into())
         }
     }
 
-    #[async_trait]
-    impl ModelTool for NamedModelTool {
-        fn descriptor(&self) -> ModelToolDescriptor {
-            ModelToolDescriptor {
-                name: self.0.to_string(),
-                description: "Named test model tool".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-            }
-        }
+    struct EchoPlugin;
 
-        async fn execute(
-            &self,
-            _arguments: &Value,
-            _protocols: &ProtocolRegistry,
-        ) -> Result<ModelToolOutput> {
-            Ok(self.0.into())
-        }
-    }
-
-    impl Plugin for PromptOnlyPlugin {
-        fn startup_notices(&self) -> Vec<String> {
-            vec!["plugin startup notice".to_string()]
-        }
-
-        fn system_prompt_fragment(&self) -> Result<Option<String>> {
-            Ok(Some("<prompt-only>content</prompt-only>".to_string()))
-        }
-
-        fn register(&self, _host: &mut PluginHost<'_>) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    impl Plugin for EnvironmentPlugin {
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            self.environment
-                .set(host.environment()?)
-                .map_err(|_| anyhow::anyhow!("environment was already captured"))
-        }
-    }
-
-    impl Plugin for CredentialPlugin {
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            self.credentials
-                .set(host.credentials()?)
-                .map_err(|_| anyhow::anyhow!("credentials were already captured"))
-        }
-    }
-
-    impl Plugin for ModelRolePlugin {
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            self.model_roles
-                .set(host.model_roles()?)
-                .map_err(|_| anyhow::anyhow!("model roles were already captured"))
-        }
-    }
-
-    impl Plugin for AgentPlugin {
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            self.agents
-                .set(host.agents()?)
-                .map_err(|_| anyhow::anyhow!("Agents were already captured"))
-        }
-    }
-
-    impl Plugin for DeclaredModelToolPlugin {
+    impl Plugin for EchoPlugin {
         fn model_tool_descriptors(&self) -> Vec<ModelToolDescriptor> {
-            self.declares_tool
-                .then(|| <Self as ModelTool>::descriptor(self))
-                .into_iter()
-                .collect()
+            vec![Echo.descriptor()]
         }
 
         fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            host.model_tools.register(self.clone())
+            host.model_tools.register(Echo)
         }
-    }
-
-    impl Plugin for DownloadPlugin {
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            self.downloads
-                .set(host.downloads()?)
-                .map_err(|_| anyhow::anyhow!("download handle was already captured"))
-        }
-    }
-
-    #[async_trait]
-    impl Protocol for DeclaredProtocolPlugin {
-        fn descriptor(&self) -> ProtocolDescriptor {
-            ProtocolDescriptor {
-                name: "declared".to_string(),
-                description: "Declared test protocol".to_string(),
-                can_read: true,
-                can_exec: false,
-            }
-        }
-    }
-
-    impl Plugin for DeclaredProtocolPlugin {
-        fn protocol_descriptors(&self) -> Vec<ProtocolDescriptor> {
-            self.declares_protocol
-                .then(|| self.descriptor())
-                .into_iter()
-                .collect()
-        }
-
-        fn register(&self, host: &mut PluginHost<'_>) -> Result<()> {
-            host.protocols.register(self.clone())
-        }
-    }
-
-    async fn empty_host() -> (
-        ProtocolRegistry,
-        ModelToolRegistry,
-        CommandRegistry,
-        TuiRegistry,
-        PathBuf,
-    ) {
-        let session_id = format!("test{}", uuid::Uuid::now_v7().simple());
-        let output = Arc::new(OutputStore::new(&session_id, 1024).await.unwrap());
-        let directory = output.directory().to_path_buf();
-        (
-            ProtocolRegistry::new(output, TaskManager::new()),
-            ModelToolRegistry::new(),
-            CommandRegistry::with_core_commands(),
-            TuiRegistry::default(),
-            directory,
-        )
-    }
-
-    #[test]
-    fn plugins_can_contribute_startup_notices_and_prompt_content_without_protocols() {
-        let mut plugins = PluginRegistry::new();
-        plugins.add(PromptOnlyPlugin);
-
-        assert!(plugins.protocol_descriptors().unwrap().is_empty());
-        assert_eq!(
-            plugins.system_prompt_fragments().unwrap(),
-            vec!["<prompt-only>content</prompt-only>".to_string()]
-        );
-        assert_eq!(
-            plugins.startup_notices(),
-            vec!["plugin startup notice".to_string()]
-        );
     }
 
     #[tokio::test]
-    async fn plugins_declare_protocols_before_installing_the_same_runtime_contract() {
+    async fn registry_selects_and_dispatches_only_installed_tools() {
         let mut plugins = PluginRegistry::new();
-        plugins.add(DeclaredProtocolPlugin {
-            declares_protocol: true,
-        });
-        assert_eq!(
-            plugins.protocol_descriptors().unwrap(),
-            vec![
-                DeclaredProtocolPlugin {
-                    declares_protocol: true,
-                }
-                .descriptor()
-            ]
-        );
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-
+        plugins.add(EchoPlugin);
+        let mut tools = ModelToolRegistry::new();
+        let temp = tempfile::tempdir().unwrap();
+        let environment = Arc::new(AgentEnvironment::load(temp.path()).await.unwrap());
         plugins
-            .install(&mut PluginHost::new(
-                &mut protocols,
-                &mut model_tools,
-                &mut commands,
-                &mut tui,
-                environment,
-            ))
+            .install(&mut PluginHost::new(&mut tools, environment))
             .unwrap();
-
-        assert_eq!(
-            protocols.descriptors(),
-            plugins.protocol_descriptors().unwrap()
-        );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugin_install_rejects_an_undeclared_protocol() {
-        let mut plugins = PluginRegistry::new();
-        plugins.add(DeclaredProtocolPlugin {
-            declares_protocol: false,
-        });
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-
-        let error = plugins
-            .install(&mut PluginHost::new(
-                &mut protocols,
-                &mut model_tools,
-                &mut commands,
-                &mut tui,
-                environment,
-            ))
-            .unwrap_err();
-
-        assert!(error.to_string().contains("declarations do not match"));
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_declare_and_install_the_same_model_tool_contract() {
-        let mut plugins = PluginRegistry::new();
-        let plugin = DeclaredModelToolPlugin {
-            declares_tool: true,
-        };
-        plugins.add(plugin.clone());
-        assert_eq!(
-            plugins.model_tool_descriptors().unwrap(),
-            vec![<DeclaredModelToolPlugin as ModelTool>::descriptor(&plugin)]
-        );
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-
-        plugins
-            .install(&mut PluginHost::new(
-                &mut protocols,
-                &mut model_tools,
-                &mut commands,
-                &mut tui,
-                environment,
-            ))
-            .unwrap();
-
-        assert_eq!(
-            model_tools.descriptors(),
-            plugins.model_tool_descriptors().unwrap()
-        );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn selection_limits_model_tool_descriptors_and_dispatch() {
-        let (protocols, mut model_tools, _commands, _tui, output) = empty_host().await;
-        model_tools.register(NamedModelTool("first")).unwrap();
-        model_tools.register(NamedModelTool("second")).unwrap();
-
-        model_tools.select(Some(&["second".to_string()])).unwrap();
-
-        assert_eq!(
-            model_tools
-                .descriptors()
-                .into_iter()
-                .map(|descriptor| descriptor.name)
-                .collect::<Vec<_>>(),
-            vec!["second"]
-        );
-        assert_eq!(
-            model_tools
-                .dispatch("second", &serde_json::json!({}), &protocols)
-                .await
-                .unwrap(),
-            ModelToolOutput::from("second")
-        );
-        assert_eq!(
-            model_tools
-                .dispatch("first", &serde_json::json!({}), &protocols)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "unknown model tool: first"
-        );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn unknown_model_tool_errors_route_protocols_through_the_protocol_tool() {
-        let (mut protocols, model_tools, _commands, _tui, output) = empty_host().await;
-        protocols
-            .register(DeclaredProtocolPlugin {
-                declares_protocol: true,
-            })
-            .unwrap();
-
-        for name in ["read", "exec", "declared"] {
-            let error = model_tools
-                .dispatch(name, &serde_json::json!({}), &protocols)
-                .await
-                .unwrap_err();
-            let error = format!("{error:#}");
-            assert!(error.contains("unknown model tool"), "{name}: {error}");
-            assert!(
-                error.contains("call it through the `protocol` tool"),
-                "{name}: {error}"
-            );
-        }
-        let error = model_tools
-            .dispatch("missing", &serde_json::json!({}), &protocols)
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "unknown model tool: missing");
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[test]
-    fn model_tool_descriptors_require_a_strict_object_schema() {
-        let descriptor = |parameters| ModelToolDescriptor {
-            name: "strict_tool".to_string(),
-            description: "Strict test tool".to_string(),
-            parameters,
-        };
-
-        assert!(
-            validate_model_tool_descriptor(&descriptor(serde_json::json!({
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"],
-                "additionalProperties": false
-            })))
-            .is_ok()
-        );
-        assert!(
-            validate_model_tool_descriptor(&descriptor(serde_json::json!({
-                "type": "string",
-                "properties": {},
-                "additionalProperties": false
-            })))
-            .unwrap_err()
-            .to_string()
-            .contains("type object")
-        );
-        assert!(
-            validate_model_tool_descriptor(&descriptor(serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": ["missing"],
-                "additionalProperties": false
-            })))
-            .unwrap_err()
-            .to_string()
-            .contains("undeclared property")
-        );
-        assert!(
-            validate_model_tool_descriptor(&descriptor(serde_json::json!({
-                "type": "object",
-                "properties": {}
-            })))
-            .unwrap_err()
-            .to_string()
-            .contains("additionalProperties")
-        );
-    }
-
-    #[tokio::test]
-    async fn model_tool_declarations_reject_undeclared_installs_and_collisions() {
-        let mut undeclared = PluginRegistry::new();
-        undeclared.add(DeclaredModelToolPlugin {
-            declares_tool: false,
-        });
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let error = undeclared
-            .install(&mut PluginHost::new(
-                &mut protocols,
-                &mut model_tools,
-                &mut commands,
-                &mut tui,
-                environment,
-            ))
-            .unwrap_err();
-        assert!(error.to_string().contains("declarations do not match"));
-
-        let mut duplicate = PluginRegistry::new();
-        duplicate.add(DeclaredModelToolPlugin {
-            declares_tool: true,
-        });
-        duplicate.add(DeclaredModelToolPlugin {
-            declares_tool: true,
-        });
-        let error = duplicate.model_tool_descriptors().unwrap_err();
-        assert!(error.to_string().contains("declared more than once"));
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_receive_the_binary_download_handle_at_install() {
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let capture = Arc::new(std::sync::OnceLock::new());
-        let mut plugins = PluginRegistry::new();
-        plugins.add(DownloadPlugin {
-            downloads: capture.clone(),
-        });
-        let mut host = PluginHost::new(
-            &mut protocols,
-            &mut model_tools,
-            &mut commands,
-            &mut tui,
-            environment,
-        );
-
-        plugins.install(&mut host).unwrap();
-        assert!(capture.get().is_some());
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_read_the_agent_environment_dynamically() {
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        environment
-            .set("NPM_TOKEN", "first".to_string())
+        tools.select(Some(&["echo".to_string()])).unwrap();
+        let output = tools
+            .dispatch("echo", &json!({"text": "hi"}))
             .await
             .unwrap();
-
-        let capture = Arc::new(std::sync::OnceLock::new());
-        let mut plugins = PluginRegistry::new();
-        plugins.add(EnvironmentPlugin {
-            environment: capture.clone(),
-        });
-        let mut host = PluginHost::new(
-            &mut protocols,
-            &mut model_tools,
-            &mut commands,
-            &mut tui,
-            environment.clone(),
-        );
-        plugins.install(&mut host).unwrap();
-        let reader = capture.get().unwrap();
-        assert_eq!(
-            reader.get("NPM_TOKEN").await.unwrap().as_deref(),
-            Some("first")
-        );
-
-        environment
-            .set("DYNAMIC_TOKEN", "added later".to_string())
-            .await
-            .unwrap();
-        assert_eq!(
-            reader.get("DYNAMIC_TOKEN").await.unwrap().as_deref(),
-            Some("added later")
-        );
-        assert_eq!(reader.snapshot().await.len(), 2);
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_read_credentials_dynamically_once_attached() {
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let manager = ConfigManager::load_for_test(&output, &output)
-            .await
-            .unwrap();
-        manager
-            .set_api_key("parallel", "first".to_string())
-            .await
-            .unwrap();
-
-        let capture = Arc::new(std::sync::OnceLock::new());
-        let mut plugins = PluginRegistry::new();
-        plugins.add(CredentialPlugin {
-            credentials: capture.clone(),
-        });
-        let mut host = PluginHost::new(
-            &mut protocols,
-            &mut model_tools,
-            &mut commands,
-            &mut tui,
-            environment,
-        )
-        .with_credentials(manager.clone());
-        plugins.install(&mut host).unwrap();
-        let reader = capture.get().unwrap();
-        assert_eq!(
-            reader.api_key("parallel").await.unwrap().as_deref(),
-            Some("first")
-        );
-
-        manager
-            .set_api_key("exa", "added later".to_string())
-            .await
-            .unwrap();
-        assert_eq!(
-            reader.api_key("exa").await.unwrap().as_deref(),
-            Some("added later")
-        );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_resolve_model_roles_dynamically() {
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        tokio::fs::create_dir_all(&output).await.unwrap();
-        tokio::fs::write(
-            output.join("models.json"),
-            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"first","name":"First"},{"id":"second","name":"Second"}]}}}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            output.join("settings.json"),
-            br#"{"modelRoles":{"review":{"provider":"example","model":"first","thinking":"low"}}}"#,
-        )
-        .await
-        .unwrap();
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let manager = ConfigManager::load_for_test(&output, &output)
-            .await
-            .unwrap();
-        let capture = Arc::new(std::sync::OnceLock::new());
-        let mut plugins = PluginRegistry::new();
-        plugins.add(ModelRolePlugin {
-            model_roles: capture.clone(),
-        });
-        let mut host = PluginHost::new(
-            &mut protocols,
-            &mut model_tools,
-            &mut commands,
-            &mut tui,
-            environment,
-        )
-        .with_credentials(manager.clone());
-        plugins.install(&mut host).unwrap();
-        let roles = capture.get().unwrap();
-        assert_eq!(
-            roles.resolve("review").await.unwrap(),
-            Some(ModelRole {
-                provider: "example".to_string(),
-                model: "first".to_string(),
-                thinking: ThinkingLevel::Low,
-            })
-        );
-
-        tokio::fs::write(
-            output.join("settings.json"),
-            br#"{"modelRoles":{"review":{"provider":"example","model":"second","thinking":"high"}}}"#,
-        )
-        .await
-        .unwrap();
-        manager.reload().await.unwrap();
-        assert_eq!(
-            roles.resolve("review").await.unwrap(),
-            Some(ModelRole {
-                provider: "example".to_string(),
-                model: "second".to_string(),
-                thinking: ThinkingLevel::High,
-            })
-        );
-        let _ = tokio::fs::remove_dir_all(output).await;
-    }
-
-    #[tokio::test]
-    async fn plugins_receive_agent_access_once_attached() {
-        let (mut protocols, mut model_tools, mut commands, mut tui, output) = empty_host().await;
-        let environment = Arc::new(AgentEnvironment::load(&output).await.unwrap());
-        let manager = ConfigManager::load_for_test(&output, &output)
-            .await
-            .unwrap();
-        let agent_host = crate::agent::AgentHost::new(
-            manager.clone(),
-            environment.clone(),
-            Arc::new(
-                crate::catalog::ModelCatalog::load(&output, true)
-                    .await
-                    .unwrap(),
-            ),
-            output.clone(),
-        )
-        .await
-        .unwrap();
-        let capture = Arc::new(std::sync::OnceLock::new());
-        let mut plugins = PluginRegistry::new();
-        plugins.add(AgentPlugin {
-            agents: capture.clone(),
-        });
-        let mut host = PluginHost::new(
-            &mut protocols,
-            &mut model_tools,
-            &mut commands,
-            &mut tui,
-            environment,
-        )
-        .with_credentials(manager)
-        .with_agents(PluginAgents::new(agent_host, None));
-
-        // Agent access stays unavailable until the host carries it.
-        let (
-            mut detached_protocols,
-            mut detached_tools,
-            mut detached_commands,
-            mut detached_tui,
-            detached_directory,
-        ) = empty_host().await;
-        let detached = PluginHost::new(
-            &mut detached_protocols,
-            &mut detached_tools,
-            &mut detached_commands,
-            &mut detached_tui,
-            Arc::new(AgentEnvironment::load(&detached_directory).await.unwrap()),
-        );
-        assert!(detached.agents().is_err());
-        let _ = tokio::fs::remove_dir_all(detached_directory).await;
-
-        plugins.install(&mut host).unwrap();
-        assert!(capture.get().is_some());
-        assert!(host.agents().is_ok());
-        let _ = tokio::fs::remove_dir_all(output).await;
+        assert_eq!(output.text(), "echo:hi");
+        assert!(tools.dispatch("missing", &json!({})).await.is_err());
     }
 }

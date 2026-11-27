@@ -1,18 +1,13 @@
-//! MCP connection runtime: client transport setup, connection reuse and
-//! gating, status tracking, and tool, prompt, and resource result formatting.
+//! MCP connection runtime: client transport setup, connection reuse, and
+//! text result formatting.
 
 use super::UNTRUSTED_MCP_CONTENT;
 use super::config::{
-    EffectiveServer, McpConfigStore, McpResolver, McpServerConfig, McpTransportConfig, McpValueMode,
+    McpConfigStore, McpResolver, McpServerConfig, McpTransportConfig, McpValueMode,
 };
-use super::protocol::render_json;
-use crate::config::display_path;
-use crate::output::OutputStore;
 use crate::plugin::PluginEnvironment;
 use crate::process::ProcessTree;
-use crate::protocol::ProtocolOutput;
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock,
@@ -31,7 +26,6 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -39,12 +33,6 @@ use tokio::sync::Mutex;
 
 const MCP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub(super) struct McpStatusSnapshot {
-    pub(super) configured: usize,
-    pub(super) connected: usize,
-    pub(super) failed: usize,
-}
 
 type McpService = RunningService<RoleClient, ClientConfig>;
 
@@ -68,78 +56,25 @@ impl McpConnection {
 }
 
 pub(super) struct McpRuntime {
-    pub(super) store: McpConfigStore,
     pub(super) resolver: McpResolver,
     environment: PluginEnvironment,
-    output: Arc<OutputStore>,
     pub(super) connections: Mutex<HashMap<String, Arc<McpConnection>>>,
     connection_gates: SyncMutex<HashMap<String, Arc<Mutex<()>>>>,
-    status: SyncMutex<HashMap<String, Result<(), String>>>,
-    configured: AtomicUsize,
 }
 
 impl McpRuntime {
-    #[cfg(test)]
-    pub(super) fn new(
-        store: McpConfigStore,
-        environment: PluginEnvironment,
-        output: Arc<OutputStore>,
-    ) -> Self {
-        let resolver = McpResolver::Configured(store.clone());
-        Self::new_with_resolver(store, resolver, environment, output)
+    pub(super) fn new(store: McpConfigStore, environment: PluginEnvironment) -> Self {
+        let resolver = McpResolver::new(store);
+        Self::new_with_resolver(resolver, environment)
     }
 
-    pub(super) fn new_with_resolver(
-        store: McpConfigStore,
-        resolver: McpResolver,
-        environment: PluginEnvironment,
-        output: Arc<OutputStore>,
-    ) -> Self {
-        let configured = resolver
-            .effective_sync()
-            .map(|servers| servers.len())
-            .unwrap_or_default();
+    pub(super) fn new_with_resolver(resolver: McpResolver, environment: PluginEnvironment) -> Self {
         Self {
-            store,
             resolver,
             environment,
-            output,
             connections: Mutex::new(HashMap::new()),
             connection_gates: SyncMutex::new(HashMap::new()),
-            status: SyncMutex::new(HashMap::new()),
-            configured: AtomicUsize::new(configured),
         }
-    }
-
-    pub(super) fn status_snapshot(&self) -> McpStatusSnapshot {
-        let status = self
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        McpStatusSnapshot {
-            configured: self.configured.load(Ordering::Relaxed),
-            connected: status.values().filter(|result| result.is_ok()).count(),
-            failed: status.values().filter(|result| result.is_err()).count(),
-        }
-    }
-
-    pub(super) fn refresh_configured(&self, count: usize) {
-        self.configured.store(count, Ordering::Relaxed);
-    }
-
-    pub(super) fn connection_status(&self, name: &str) -> Option<Result<(), String>> {
-        self.status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(name)
-            .cloned()
-    }
-
-    fn set_status(&self, name: &str, result: Result<(), String>) {
-        self.status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(name.to_string(), result);
     }
 
     fn connection_gate(&self, name: &str) -> Arc<Mutex<()>> {
@@ -166,7 +101,6 @@ impl McpRuntime {
             Ok(config) => config,
             Err(error) => {
                 self.remove_connection(name).await;
-                self.set_status(name, Err(format!("{error:#}")));
                 return Err(error);
             }
         };
@@ -193,25 +127,10 @@ impl McpRuntime {
                     .lock()
                     .await
                     .insert(name.to_string(), connection.clone());
-                self.set_status(name, Ok(()));
                 Ok(connection)
             }
-            Err(error) => {
-                self.set_status(name, Err(format!("{error:#}")));
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) async fn connect_with_timeout(
-        &self,
-        name: &str,
-        config: McpServerConfig,
-        timeout: Duration,
-    ) -> Result<McpConnection> {
-        self.connect_with_timeout_mode(name, config, McpValueMode::EnvironmentReferences, timeout)
-            .await
     }
 
     pub(super) async fn connect_with_timeout_mode(
@@ -285,7 +204,7 @@ impl McpRuntime {
             McpTransportConfig::StreamableHttp { url, headers } => {
                 let headers =
                     self.expand_headers(name, headers, &environment_values, value_mode)?;
-                // TODO: Add OAuth when URI Agent has an MCP OAuth credential flow.
+                // TODO: Add OAuth when UAT gains an MCP OAuth credential flow.
                 let mut transport_config =
                     StreamableHttpClientTransportConfig::with_uri(url.clone())
                         .custom_headers(headers)
@@ -359,12 +278,24 @@ impl McpRuntime {
         self.resolver.project_directory()
     }
 
-    pub(super) async fn effective_servers(&self) -> Result<Vec<EffectiveServer>> {
-        let servers = match &self.resolver {
-            McpResolver::Configured(_) => self.store.effective().await?,
-            McpResolver::Session { .. } => self.resolver.effective_sync()?,
-        };
-        Ok(servers.into_values().collect())
+    async fn remove_connection(&self, name: &str) {
+        let connection = self.connections.lock().await.remove(name);
+        if let Some(connection) = connection {
+            connection.close().await;
+        }
+    }
+
+    pub(super) async fn shutdown(&self) {
+        let connections = self
+            .connections
+            .lock()
+            .await
+            .drain()
+            .map(|(_, connection)| connection)
+            .collect::<Vec<_>>();
+        for connection in connections {
+            connection.close().await;
+        }
     }
 
     fn expand_headers(
@@ -392,57 +323,12 @@ impl McpRuntime {
         }
         Ok(headers)
     }
-
-    pub(super) async fn invalidate(&self, name: &str) {
-        let gate = self.connection_gate(name);
-        let _connecting = gate.lock().await;
-        self.remove_connection(name).await;
-        self.status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(name);
-    }
-
-    async fn remove_connection(&self, name: &str) {
-        let connection = self.connections.lock().await.remove(name);
-        if let Some(connection) = connection {
-            connection.close().await;
-        }
-    }
-
-    pub(super) async fn shutdown(&self) {
-        let connections = self
-            .connections
-            .lock()
-            .await
-            .drain()
-            .map(|(_, connection)| connection)
-            .collect::<Vec<_>>();
-        for connection in connections {
-            connection.close().await;
-        }
-    }
-
-    pub(super) async fn test_config(&self, name: &str, config: &McpServerConfig) -> Result<()> {
-        let value_mode = if self.resolver.session_scoped() {
-            config.validate_session(name)?;
-            McpValueMode::Literal
-        } else {
-            config.validate(name)?;
-            McpValueMode::EnvironmentReferences
-        };
-        let connection = self
-            .connect_with_timeout_mode(name, config.clone(), value_mode, MCP_CONNECTION_TIMEOUT)
-            .await?;
-        connection.close().await;
-        Ok(())
-    }
 }
 
 pub(super) fn mcp_client_info() -> ClientConfig {
     ClientConfig::new(
         ClientCapabilities::default(),
-        Implementation::new("uri-agent", env!("CARGO_PKG_VERSION")),
+        Implementation::new("uat", env!("CARGO_PKG_VERSION")),
     )
     .with_protocol_version(ProtocolVersion::V_2026_07_28)
 }
@@ -503,7 +389,7 @@ impl McpRuntime {
         identity: &str,
         name: String,
         arguments: JsonObject,
-    ) -> Result<ProtocolOutput> {
+    ) -> Result<String> {
         let connection = self.connection(identity).await?;
         let result = connection
             .peer
@@ -512,18 +398,13 @@ impl McpRuntime {
         self.format_tool_result(&name, result).await
     }
 
-    async fn format_tool_result(
-        &self,
-        name: &str,
-        result: CallToolResult,
-    ) -> Result<ProtocolOutput> {
-        let json = tool_call_json(&result);
+    async fn format_tool_result(&self, name: &str, result: CallToolResult) -> Result<String> {
         let mut output = self.format_content_blocks(name, result.content).await?;
         if let Some(structured) = result.structured_content {
             if !output.is_empty() {
                 output.push_str("\n\n");
             }
-            output.push_str(&render_json(&structured)?);
+            output.push_str(&render_json(&structured));
         }
         if output.is_empty() {
             output.push_str("(no output)");
@@ -532,10 +413,10 @@ impl McpRuntime {
         if result.is_error.unwrap_or(false) {
             bail!(output);
         }
-        Ok(ProtocolOutput::new(output.into_bytes(), json, Vec::new()))
+        Ok(output)
     }
 
-    pub(super) async fn format_prompt_result(&self, result: GetPromptResult) -> Result<Vec<u8>> {
+    pub(super) async fn format_prompt_result(&self, result: GetPromptResult) -> Result<String> {
         let mut output = result
             .description
             .map(|description| format!("{description}\n\n"))
@@ -549,13 +430,13 @@ impl McpRuntime {
             );
             output.push_str("\n\n");
         }
-        Ok(format!("{UNTRUSTED_MCP_CONTENT}\n\n{}", output.trim_end()).into_bytes())
+        Ok(format!("{UNTRUSTED_MCP_CONTENT}\n\n{}", output.trim_end()))
     }
 
     pub(super) async fn format_resource_result(
         &self,
         result: ReadResourceResult,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<String> {
         let mut output = Vec::new();
         for content in result.contents {
             match content {
@@ -568,108 +449,66 @@ impl McpRuntime {
                     blob,
                     ..
                 } => {
-                    let bytes = BASE64
-                        .decode(blob)
-                        .with_context(|| format!("invalid base64 MCP resource {uri}"))?;
-                    let extension = extension_for_mime(mime_type.as_deref());
-                    let path = self
-                        .output
-                        .preserve_with_extension(&bytes, "mcp-resource", extension)
-                        .await?;
-                    output.push(format!("## {uri}\n\nfile://{}", display_path(&path)));
+                    output.push(format!(
+                        "## {uri}\n\n[binary {} content omitted: {} base64 bytes]",
+                        mime_type.as_deref().unwrap_or("unknown"),
+                        blob.len()
+                    ));
                 }
-                other => output.push(render_json(&other)?),
+                other => output.push(render_json(
+                    &serde_json::to_value(&other).unwrap_or_default(),
+                )),
             }
         }
-        Ok(format!("{UNTRUSTED_MCP_CONTENT}\n\n{}", output.join("\n\n")).into_bytes())
+        Ok(format!(
+            "{UNTRUSTED_MCP_CONTENT}\n\n{}",
+            output.join("\n\n")
+        ))
     }
 
-    async fn format_content_blocks(&self, hint: &str, blocks: Vec<ContentBlock>) -> Result<String> {
+    async fn format_content_blocks(
+        &self,
+        _hint: &str,
+        blocks: Vec<ContentBlock>,
+    ) -> Result<String> {
         let mut output = Vec::new();
         for block in blocks {
             match block {
                 ContentBlock::Text(text) => output.push(text.text),
                 ContentBlock::Image(image) => {
-                    output.push(
-                        self.preserve_media(hint, &image.data, &image.mime_type, "image")
-                            .await?,
-                    );
+                    output.push(format!(
+                        "[image {} omitted from the text interface: {} base64 bytes]",
+                        image.mime_type,
+                        image.data.len()
+                    ));
                 }
                 ContentBlock::Audio(audio) => {
-                    output.push(
-                        self.preserve_media(hint, &audio.data, &audio.mime_type, "audio")
-                            .await?,
-                    );
+                    output.push(format!(
+                        "[audio {} omitted from the text interface: {} base64 bytes]",
+                        audio.mime_type,
+                        audio.data.len()
+                    ));
                 }
                 ContentBlock::Resource(resource) => {
                     output.push(
-                        String::from_utf8(
-                            self.format_resource_result(ReadResourceResult::new(vec![
-                                resource.resource,
-                            ]))
-                            .await?,
-                        )
-                        .context("MCP resource output was not UTF-8")?,
+                        self.format_resource_result(ReadResourceResult::new(vec![
+                            resource.resource,
+                        ]))
+                        .await?,
                     );
                 }
                 ContentBlock::ResourceLink(resource) => {
                     output.push(format!("{} ({})", resource.name, resource.uri));
                 }
-                other => output.push(render_json(&other)?),
+                other => output.push(render_json(
+                    &serde_json::to_value(&other).unwrap_or_default(),
+                )),
             }
         }
         Ok(output.join("\n\n"))
     }
-
-    /// Decodes base64 media content and preserves it as a bounded output file.
-    async fn preserve_media(
-        &self,
-        hint: &str,
-        data: &str,
-        mime_type: &str,
-        label: &str,
-    ) -> Result<String> {
-        let bytes = BASE64
-            .decode(data)
-            .with_context(|| format!("invalid base64 MCP {label}"))?;
-        let path = self
-            .output
-            .preserve_with_extension(&bytes, hint, extension_for_mime(Some(mime_type)))
-            .await?;
-        Ok(format!("file://{}", display_path(&path)))
-    }
 }
 
-/// The structured output a tool call exposes as step `.json`:
-/// `structuredContent` when the server provides one; otherwise the parsed
-/// single text content block when its text is JSON; otherwise none.
-pub(super) fn tool_call_json(result: &CallToolResult) -> Option<Value> {
-    if let Some(structured) = result.structured_content.as_ref() {
-        return Some(structured.clone());
-    }
-    let mut blocks = result.content.iter();
-    match (blocks.next(), blocks.next()) {
-        (Some(ContentBlock::Text(text)), None) => serde_json::from_str(&text.text).ok(),
-        _ => None,
-    }
-}
-
-fn extension_for_mime(mime: Option<&str>) -> &'static str {
-    match mime
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-    {
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "audio/mpeg" => "mp3",
-        "audio/wav" | "audio/x-wav" => "wav",
-        "audio/ogg" => "ogg",
-        "application/json" => "json",
-        "text/plain" => "txt",
-        _ => "bin",
-    }
+fn render_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }

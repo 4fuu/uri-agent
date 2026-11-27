@@ -39,10 +39,10 @@ jobs:
           }
           mapfile -t versions < <(
             cargo metadata --locked --no-deps --format-version 1 |
-              jq -r '.packages[] | select(.name == "uri-agent") | .version'
+              jq -r '.packages[] | select(.name == "uat") | .version'
           )
           [[ ${#versions[@]} -eq 1 ]] || {
-            echo "expected exactly one uri-agent package" >&2
+            echo "expected exactly one uat package" >&2
             exit 1
           }
           VERSION=${versions[0]}
@@ -137,10 +137,10 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         env:
-          URI_AGENT_TEST_RETRIEVAL_ASSETS: ${{ runner.temp }}/stage
+          UAT_TEST_RETRIEVAL_ASSETS: ${{ runner.temp }}/stage
           ZVEC_LIB_DIR: ${{ runner.temp }}/stage
           LD_LIBRARY_PATH: ${{ runner.temp }}/stage
-        run: cargo test --locked --package uri-agent --lib retrieval::tests::bundled_assets_rebuild_and_search -- --ignored --exact
+        run: cargo test --locked --package uat --lib retrieval::tests::bundled_assets_rebuild_and_search -- --ignored --exact
       - name: Build Linux binary against target glibc ceiling
         if: runner.os == 'Linux'
         shell: bash
@@ -148,12 +148,12 @@ jobs:
           TARGET: ${{ matrix.target }}
           GLIBC: ${{ matrix.glibc }}
           ZVEC_LIB_DIR: ${{ runner.temp }}/stage
-        run: cargo zigbuild --locked --release --package uri-agent --target "$TARGET.$GLIBC"
+        run: cargo zigbuild --locked --release --package uat --target "$TARGET.$GLIBC"
       - name: Build binary on macOS and Windows
         if: runner.os != 'Linux'
         env:
           ZVEC_LIB_DIR: ${{ runner.temp }}/stage
-        run: cargo build --locked --release --package uri-agent --target ${{ matrix.target }}
+        run: cargo build --locked --release --package uat --target ${{ matrix.target }}
       - name: Stage and verify Unix bundle
         if: matrix.format == 'tar'
         shell: bash
@@ -164,20 +164,20 @@ jobs:
         run: |
           set -euo pipefail
           STAGE="$RUNNER_TEMP/stage"
-          cp "target/$TARGET/release/uri-agent" LICENSE README.md README.zh-CN.md "$STAGE/"
+          cp "target/$TARGET/release/uat" LICENSE README.md README.zh-CN.md "$STAGE/"
           if [[ "$RUNNER_OS" == Linux ]]; then
-            patchelf --set-rpath '$ORIGIN' "$STAGE/uri-agent"
-            patchelf --print-rpath "$STAGE/uri-agent" | grep -Fx '$ORIGIN'
-            ldd "$STAGE/uri-agent" | grep -F 'libzvec_c_api.so =>'
-            max_glibc=$(readelf --version-info "$STAGE/uri-agent" "$STAGE/libzvec_c_api.so" |
+            patchelf --set-rpath '$ORIGIN' "$STAGE/uat"
+            patchelf --print-rpath "$STAGE/uat" | grep -Fx '$ORIGIN'
+            ldd "$STAGE/uat" | grep -F 'libzvec_c_api.so =>'
+            max_glibc=$(readelf --version-info "$STAGE/uat" "$STAGE/libzvec_c_api.so" |
               grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
             [[ "$(printf '%s\n' "GLIBC_$GLIBC" "$max_glibc" | sort -V | tail -1)" == "GLIBC_$GLIBC" ]]
           else
-            install_name_tool -add_rpath @executable_path "$STAGE/uri-agent" 2>/dev/null || true
-            otool -l "$STAGE/uri-agent" | grep -A2 LC_RPATH | grep -F '@executable_path'
-            otool -L "$STAGE/uri-agent" | grep -F 'libzvec_c_api.dylib'
+            install_name_tool -add_rpath @executable_path "$STAGE/uat" 2>/dev/null || true
+            otool -l "$STAGE/uat" | grep -A2 LC_RPATH | grep -F '@executable_path'
+            otool -L "$STAGE/uat" | grep -F 'libzvec_c_api.dylib'
           fi
-          "$STAGE/uri-agent" --version | grep -F "uri-agent $VERSION"
+          "$STAGE/uat" --version | grep -F "uat $VERSION"
           python3 scripts/prepare-retrieval-assets.py --target "$TARGET" --output "$STAGE" --verify-only
       - name: Create Unix archive
         if: matrix.format == 'tar'
@@ -188,7 +188,7 @@ jobs:
         run: |
           set -euo pipefail
           STAGE="$RUNNER_TEMP/stage"
-          tar -czf "uri-agent-$VERSION-$TARGET.tar.gz" -C "$STAGE" .
+          tar -czf "uat-$VERSION-$TARGET.tar.gz" -C "$STAGE" .
       - name: Stage and verify Windows bundle
         if: matrix.format == 'zip'
         shell: pwsh
@@ -197,11 +197,11 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "stage"
-          Copy-Item "target/$env:TARGET/release/uri-agent.exe", "LICENSE", "README.md", "README.zh-CN.md" -Destination $stage
+          Copy-Item "target/$env:TARGET/release/uat.exe", "LICENSE", "README.md", "README.zh-CN.md" -Destination $stage
           python scripts/prepare-retrieval-assets.py --target $env:TARGET --output $stage --verify-only
           Remove-Item "$stage/zvec_c_api.lib"
-          $output = & "$stage/uri-agent.exe" --version
-          if ($output -ne "uri-agent $env:VERSION") { throw "Unexpected version: $output" }
+          $output = & "$stage/uat.exe" --version
+          if ($output -ne "uat $env:VERSION") { throw "Unexpected version: $output" }
       - name: Create Windows archive
         if: matrix.format == 'zip'
         shell: pwsh
@@ -210,12 +210,12 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "stage"
-          Compress-Archive -Path "$stage/*" -DestinationPath "uri-agent-$env:VERSION-$env:TARGET.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath "uat-$env:VERSION-$env:TARGET.zip"
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: uri-agent-${{ matrix.target }}
-          path: uri-agent-${{ needs.validate.outputs.version }}-${{ matrix.target }}.*
+          name: uat-${{ matrix.target }}
+          path: uat-${{ needs.validate.outputs.version }}-${{ matrix.target }}.*
           if-no-files-found: error
           retention-days: 7
 
@@ -248,7 +248,7 @@ jobs:
             echo "main moved from $expected_sha to $actual_sha during the release" >&2
             exit 1
           }
-          (cd release && sha256sum uri-agent-* > SHA256SUMS)
+          (cd release && sha256sum uat-* > SHA256SUMS)
           python3 scripts/update-package-metadata.py "$VERSION" release/SHA256SUMS
           jq --exit-status . bucket/uri-agent.json >/dev/null
       - name: Commit package-manager metadata
@@ -274,13 +274,13 @@ jobs:
             gh release create "$TAG" release/* \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --title "URI Agent $VERSION" \
+              --title "UAT $VERSION" \
               --generate-notes
           else
             gh release create "$TAG" release/* \
               --repo "$GITHUB_REPOSITORY" \
               --target "$release_sha" \
-              --title "URI Agent $VERSION" \
+              --title "UAT $VERSION" \
               --generate-notes
           fi
 

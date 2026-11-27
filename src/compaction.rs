@@ -1,13 +1,12 @@
 use rig::completion::ToolDefinition;
 use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const DEFAULT_RESERVE_TOKENS: usize = 16_384;
 pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
 const IMAGE_TOKENS: usize = 1_200;
 const MAX_SUMMARY_TOOL_RESULT_CHARS: usize = 2_000;
-const SUMMARY_HANDOFF_PREFIX: &str = "<uri-agent-compaction-handoff>";
+const SUMMARY_HANDOFF_PREFIX: &str = "<uat-compaction-handoff>";
 
 pub const SUMMARY_SYSTEM_PROMPT: &str = r#"You are a context checkpoint summarizer.
 
@@ -24,39 +23,9 @@ behavior, agent hypotheses, and checks still pending. Preserve technical names, 
 blockers, and unresolved questions that matter. Use concise Markdown sections for current goal and
 constraints, progress and results, decisions, files, open questions, and exact next steps."#;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Strategy {
-    #[default]
-    Rollover,
-    Summary,
-}
-
-impl std::fmt::Display for Strategy {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rollover => formatter.write_str("rollover"),
-            Self::Summary => formatter.write_str("summary"),
-        }
-    }
-}
-
-impl std::str::FromStr for Strategy {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "rollover" => Ok(Self::Rollover),
-            "summary" => Ok(Self::Summary),
-            _ => anyhow::bail!("context strategy must be rollover or summary"),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
     pub enabled: bool,
-    pub strategy: Strategy,
     pub reserve_tokens: usize,
     pub keep_recent_tokens: usize,
 }
@@ -65,7 +34,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: true,
-            strategy: Strategy::Rollover,
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
         }
@@ -321,11 +289,11 @@ pub fn summary_history(
 pub fn replacement_history(summary: &str, retained: &[Message]) -> Vec<Message> {
     let mut history = Vec::with_capacity(retained.len() + 1);
     history.push(Message::user(format!(
-        "<uri-agent-compaction-handoff>\n\
+        "<uat-compaction-handoff>\n\
          The following is a durable summary of older history. It is context, not a new user request.\n\
          <conversation-summary>\n{}\n</conversation-summary>\n\
          Continue from the retained conversation that follows without asking the user to repeat captured information.\n\
-         </uri-agent-compaction-handoff>",
+         </uat-compaction-handoff>",
         summary.trim()
     )));
     history.extend_from_slice(retained);
@@ -554,7 +522,7 @@ mod tests {
             &history,
             &[ToolDefinition {
                 name: "read".to_string(),
-                description: "Read through a protocol".to_string(),
+                description: "Read a file".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
             }],
         );
@@ -723,10 +691,7 @@ mod tests {
         let call_id = ToolCallId::new("call-1").unwrap();
         let tool_call = ToolCall::new(
             call_id.clone(),
-            ToolFunction::new(
-                "help".to_string(),
-                serde_json::json!({"protocols": ["file"]}),
-            ),
+            ToolFunction::new("help".to_string(), serde_json::json!({"path": "README.md"})),
         );
         let history = vec![
             Message::user("inspect the project"),
@@ -762,7 +727,7 @@ mod tests {
             id: None,
             content: vec![AssistantContent::ToolCall(ToolCall::new(
                 id,
-                ToolFunction::new("read".to_string(), serde_json::json!({"uri": "file://x"})),
+                ToolFunction::new("read".to_string(), serde_json::json!({"path": "README.md"})),
             ))],
         };
         let result = |id: ToolCallId| Message::User {

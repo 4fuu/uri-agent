@@ -1,72 +1,93 @@
 # AGENTS.md
 
-Guidance for coding agents working anywhere in this repository. This file is the entry point; detailed contracts belong to the linked documents.
+Guidance for coding agents working anywhere in this repository. This file is the
+entry point; detailed contracts belong to the linked documents.
 
 ## Project contract
 
-URI Agent is a Rust terminal coding agent with a plugin-registered model-facing
-interface. The linked built-ins provide:
+UAT is a text-only Rust coding agent for script composition. It registers a
+small set of ordinary tools and a codemode:
 
 ```text
-help(protocols: string[])
-protocol(steps: object[])
-replace(path: string, old_text: string, new_text: string)
-apply_patch(patch: string)
+read(path, offset?, limit?)
+write(path, content)
+edit(path, old_text, new_text)
+bash(command, cwd?, timeout_ms?)
+search(query, mode?, root?, glob?, limit?)
+notes(op, id?, title?, content?, offset?, limit?)
+steer(op?, target?, message?, name?, delivery?, reply?, scope?, in_reply_to?)
+mcp(op?, server?, tool?, arguments?, uri?, prompt?)
+apply_patch(patch)
+codemode(code)
 ```
 
-`help` loads one or more protocols' model-facing contract pages; every other
-protocol call requires that protocol's contract to be loaded first. The `read`
-and `exec` tools are merged into `protocol`, which takes one to eight step
-objects and executes them in order. Each step is a JSON object with exactly
-one of `read` or `exec` — the `<protocol>://<target>` address — an optional
-`input` object holding the protocol's input fields, and optional control
-fields (`id`, `if`, `for` with `max`, `show`). Later steps may reference
-earlier `id`s through `{{ reference }}` substitution in `input` values and
-addresses; each protocol's help page lists the `input` fields it accepts, and
-input text a protocol executes verbatim (a shell `script`) is never
-substituted.
-Capabilities with a small input surface are registered as protocols and
-publish their operational instructions through the `help` tool. Prefer a typed
-direct tool for complex or escape-heavy arguments. All model tools are
-registered by linked plugins; do not special-case tool names in the
-runtime or place every capability in the initial system prompt.
+There is no URI/protocol address form, no help-loading gate, no command palette,
+and no TUI. The model-facing interface is exactly the selected tool schemas.
+`codemode` runs Rhai against the same tool registry; only `text(...)`, `print`
+output, and a non-void return value reach the model.
+
+UAT exposes three entry modes:
+
+- no prompt: a line-oriented REPL;
+- `-x [PROMPT]`: one non-interactive turn, final reply to stdout, progress to
+  stderr;
+- `serve`: HTTP text ingress with session, steer, cancel, and health routes.
+
+Input and output are text. UAT does not write final answers to files on its own.
+Callers compose processes with scripts and HTTP.
 
 ## Read before changing
 
-Before changing code, read the applicable repository map, change rules, and verification guidance in [`docs/development.md`](docs/development.md). Then read every focused document that owns the affected behavior:
+Read the applicable repository map, change rules, and verification guidance in
+[`docs/development.md`](docs/development.md). Then read every focused document
+that owns the affected behavior:
 
 | Area | Authoritative detail |
 | --- | --- |
-| ACP v1 transport, session lifecycle, content mapping, MCP handoff | [`docs/acp.md`](docs/acp.md) |
-| Protocol routing, built-ins, tasks, output | [`docs/protocols.md`](docs/protocols.md) |
-| Project instructions, Skills, frozen startup context | [`docs/context.md`](docs/context.md) |
-| Models, authentication, configuration, CLI overrides, custom providers | [`docs/configuration.md`](docs/configuration.md) |
-| Conversation UI, composer, commands, navigation | [`docs/interface.md`](docs/interface.md) |
-| Keymaps, embedded terminal, selection, attachments | [`docs/terminal.md`](docs/terminal.md) |
-| Session persistence, scoping, model/tool loop, retries, compaction | [`docs/sessions.md`](docs/sessions.md) |
-| Module ownership, linked Rust extensions, invariants, change rules, verification | [`docs/development.md`](docs/development.md) |
-| Versioning and release workflow | [`docs/release.md`](docs/release.md) |
+| Tools, codemode, search, notes, MCP, steering | [`docs/tools.md`](docs/tools.md) |
+| Models, authentication, configuration, CLI, MCP files | [`docs/configuration.md`](docs/configuration.md) |
+| HTTP ingress, sessions, queue/steer, retries, compaction | [`docs/sessions.md`](docs/sessions.md) |
+| Project instructions and frozen startup context | [`docs/context.md`](docs/context.md) |
+| Module ownership, invariants, verification | [`docs/development.md`](docs/development.md) |
+| Versioning and release | [`docs/release.md`](docs/release.md) |
 | Documentation ownership or an unclear destination | [`docs/README.md`](docs/README.md) |
 
-Read all applicable documents for a cross-domain change; unrelated documents are not required. `uri-agent --help` defines the exact CLI contract, while a protocol's page loaded through the `help` tool defines its exact model-facing contract. If implementation, tests, help, or documentation disagree, make them consistent.
+`uat --help` defines the exact CLI. Tool descriptors define the exact
+model-facing contract. If implementation, tests, and documentation disagree,
+make them consistent.
 
 ## Working rules
 
-- Preserve the project contract and the architectural contracts in the applicable focused document.
-- Put behavior in the module that owns its state and contract; prefer changing the source of truth over adding a wrapper or duplicated type.
-- Make the smallest complete change. Leave unrelated refactors, formatting, and speculative configurability alone.
-- Follow references when removing behavior and remove code that exists only for that behavior.
-- Do not commit credentials, generated sessions, complete-output files, `.uri-agent/`, `.amp/`, or `target/` artifacts.
+- Keep the tool surface small. Prefer `codemode` or MCP over another
+  always-visible tool.
+- Put behavior in the module that owns its state and contract. Change the
+  source of truth instead of adding a wrapper or duplicate type.
+- Preserve sessions, steering, notes, search, and frozen project context when
+  changing the runtime.
+- Do not introduce URI addresses, protocol nouns, help pages, or TUI code.
+- Make the smallest complete change. Leave unrelated refactors alone.
+- Follow references when removing behavior and remove code that exists only for
+  that behavior.
+- Do not commit credentials, generated sessions, complete-output files,
+  `.uat/`, `.amp/`, or `target/` artifacts.
 
 ## Verification
 
-Use stable Rust. Add focused tests beside changed behavior, then run the checks required by [`docs/development.md#verification`](docs/development.md#verification). Tests must not require live credentials or network access.
+Use stable Rust. Add focused tests beside changed behavior, then run the checks
+required by [`docs/development.md#verification`](docs/development.md#verification).
+Tests must not require live credentials or network access. Unset provider API
+keys before running model-listing tests if the shell has them.
 
-For documentation-only changes, use the documentation verification path in that section; the full Rust suite is unnecessary unless code or documentation generation changed.
+For documentation-only changes, run the embedded-docs tests and verify that
+`uat docs` lists the updated document set. The full Rust suite is unnecessary
+unless code or documentation generation changed.
 
 ## Documentation changes
 
-- Keep `README.md` and `README.zh-CN.md` equivalent and focused on adoption, first success, critical warnings, and navigation.
+- Keep `README.md` and `README.zh-CN.md` equivalent and focused on adoption,
+  first success, critical warnings, and navigation.
 - Update both root READMEs when public setup or top-level behavior changes.
-- Update the owning detailed document when domain behavior changes; do not copy mutable detail into other layers.
-- Update a protocol's help page whenever its model-facing operations change.
+- Update the owning detailed document when domain behavior changes; do not copy
+  mutable detail into other layers.
+- Update tool descriptors and [Tools](docs/tools.md) together when a
+  model-facing operation changes.

@@ -1,16 +1,13 @@
 use crate::agent::{AgentSpec, SubmitKind};
 use crate::catalog::ThinkingLevel;
 use crate::config::display_path;
-use crate::plugin::SessionProtocolRecord;
-use crate::skill::SkillSnapshot;
-use crate::task::{TaskReport, TaskStatus};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rig::message::{AssistantContent, Message, UserContent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,13 +16,13 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{
     Connection,
     rusqlite::{
-        Connection as SqliteConnection, Error as SqliteError, ErrorCode, OpenFlags,
-        OptionalExtension, Transaction, TransactionBehavior, ffi, params,
+        Connection as SqliteConnection, Error as SqliteError, ErrorCode, OptionalExtension,
+        Transaction, TransactionBehavior, ffi, params,
     },
 };
 use uuid::Uuid;
 
-const SESSION_DATABASE_FILE: &str = "sessions-v6.db";
+const SESSION_DATABASE_FILE: &str = "sessions-v7.db";
 const SESSION_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WRITE_BEGIN_ATTEMPTS: usize = 3;
 const RESUME_INDEX_VERSION: u32 = 5;
@@ -45,40 +42,8 @@ const RESUME_EVENT_KINDS: &[&str] = &[
     "usage",
     "error",
     "compaction",
-    "context_rollover",
     "context_reminder",
 ];
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SessionTuiState {
-    pub(crate) head_sequence: Option<u64>,
-    pub(crate) latest_compaction_sequence: Option<u64>,
-    pub(crate) usage: SessionTuiUsage,
-    pub(crate) token_calibration: SessionTuiTokenCalibration,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SessionTuiUsage {
-    pub(crate) input: u64,
-    pub(crate) output: u64,
-    pub(crate) cache_read: u64,
-    pub(crate) cache_write: u64,
-    pub(crate) cost: f64,
-    pub(crate) last_cache_hit: Option<f64>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SessionTuiTokenCalibration {
-    pub(crate) visible_units: u64,
-    pub(crate) output_tokens: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SessionEventHeader {
-    pub(crate) sequence: u64,
-    pub(crate) starts_turn: bool,
-    pub(crate) finishes_turn: bool,
-}
 
 #[derive(Clone, Debug)]
 pub enum SessionChoice {
@@ -137,228 +102,6 @@ pub(crate) struct CollaborationParticipant {
     pub(crate) instance_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct ArchivedSessionSummary {
-    pub id: String,
-    pub updated_at: DateTime<Utc>,
-    pub cwd: PathBuf,
-    pub provider: String,
-    pub model: String,
-    pub thinking: ThinkingLevel,
-    pub first_message: String,
-    pub message_count: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct ArchivedSession {
-    pub summary: ArchivedSessionSummary,
-    pub events: Vec<SessionEvent>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SearchableSessionRecord {
-    pub(crate) session_id: String,
-    pub(crate) sequence: u64,
-}
-
-/// Read-only access to saved sessions for linked extensions.
-///
-/// Archive reads never initialize, migrate, or otherwise write the database.
-#[derive(Clone, Debug)]
-pub struct SessionArchive {
-    database_path: PathBuf,
-    project: PathBuf,
-}
-
-impl SessionArchive {
-    pub fn for_project(cwd: &Path) -> Self {
-        Self::at(session_database_path(cwd), cwd)
-    }
-
-    pub(crate) fn index_identity(&self) -> String {
-        self.database_path.to_string_lossy().into_owned()
-    }
-
-    pub(crate) fn project_path(&self) -> &Path {
-        &self.project
-    }
-
-    pub(crate) fn at(database_path: PathBuf, cwd: &Path) -> Self {
-        Self {
-            database_path,
-            project: cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()),
-        }
-    }
-
-    pub async fn list_for_project(&self) -> Result<Vec<ArchivedSessionSummary>> {
-        let project = self.project.clone();
-        Ok(self
-            .list_all()
-            .await?
-            .into_iter()
-            .filter(|session| {
-                if cfg!(windows) {
-                    session
-                        .cwd
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&project.to_string_lossy())
-                } else {
-                    session.cwd == project
-                }
-            })
-            .collect())
-    }
-
-    pub async fn list_all(&self) -> Result<Vec<ArchivedSessionSummary>> {
-        let Some(connection) = open_archive_database(&self.database_path).await? else {
-            return Ok(Vec::new());
-        };
-        connection
-            .call(|db| {
-                let mut statement = db.prepare(&format!(
-                    "SELECT {ARCHIVED_SUMMARY_SELECT}
-                     FROM sessions WHERE depth = 1
-                     ORDER BY updated_at DESC, id DESC"
-                ))?;
-                statement
-                    .query_map([], archived_summary_from_row)?
-                    .collect()
-            })
-            .await
-            .context("cannot list archived sessions")
-    }
-
-    pub(crate) async fn searchable_records(
-        &self,
-        cwd: Option<&Path>,
-    ) -> Result<Vec<SearchableSessionRecord>> {
-        let Some(connection) = open_archive_database(&self.database_path).await? else {
-            return Ok(Vec::new());
-        };
-        let cwd = cwd.map(|cwd| {
-            cwd.canonicalize()
-                .unwrap_or_else(|_| cwd.to_path_buf())
-                .to_string_lossy()
-                .into_owned()
-        });
-        connection
-            .call(move |db| {
-                let mut statement = db.prepare(
-                    "SELECT events.session_id, events.sequence
-                     FROM events
-                     JOIN sessions ON sessions.id = events.session_id
-                     WHERE (?1 IS NULL OR sessions.cwd = ?1)
-                       AND events.kind IN ('user', 'assistant_text', 'tool_call', 'tool_result', 'error')
-                       AND NOT (
-                         events.kind = 'tool_call'
-                         AND EXISTS (
-                           SELECT 1 FROM json_each(events.payload_json, '$.arguments.steps') AS step
-                           WHERE CASE WHEN step.type = 'object' THEN
-                               COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
-                               OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
-                           ELSE 0 END
-                         )
-                       )
-                       AND NOT (
-                         events.kind = 'tool_result'
-                         AND EXISTS (
-                           SELECT 1 FROM events AS calls
-                           WHERE calls.session_id = events.session_id
-                             AND calls.kind = 'tool_call'
-                             AND json_extract(calls.payload_json, '$.call_id') =
-                                 json_extract(events.payload_json, '$.call_id')
-                             AND EXISTS (
-                               SELECT 1 FROM json_each(calls.payload_json, '$.arguments.steps') AS step
-                               WHERE CASE WHEN step.type = 'object' THEN
-                                   COALESCE(json_extract(step.value, '$.read'), '') LIKE 'context://%'
-                                   OR COALESCE(json_extract(step.value, '$.exec'), '') LIKE 'context://%'
-                               ELSE 0 END
-                             )
-                         )
-                       )
-                     ORDER BY events.session_id, events.sequence",
-                )?;
-                let rows = statement.query_map([cwd], |row| {
-                    let sequence = row.get::<_, i64>(1)?;
-                    Ok(SearchableSessionRecord {
-                        session_id: row.get(0)?,
-                        sequence: u64::try_from(sequence).map_err(|error| {
-                            sql_conversion_failure(
-                                1,
-                                tokio_rusqlite::rusqlite::types::Type::Integer,
-                                error,
-                            )
-                        })?,
-                    })
-                })?;
-                rows.collect::<Result<Vec<_>, _>>()
-            })
-            .await
-            .context("cannot list searchable archived session records")
-    }
-
-    pub async fn load(&self, id: &str) -> Result<Option<ArchivedSession>> {
-        validate_session_id(id)?;
-        let Some(connection) = open_archive_database(&self.database_path).await? else {
-            return Ok(None);
-        };
-        let id = id.to_string();
-        connection
-            .call(move |db| {
-                let summary = db
-                    .query_row(
-                        &format!("SELECT {ARCHIVED_SUMMARY_SELECT} FROM sessions WHERE id = ?1"),
-                        [&id],
-                        archived_summary_from_row,
-                    )
-                    .optional()?;
-                let Some(summary) = summary else {
-                    return Ok::<_, tokio_rusqlite::rusqlite::Error>(None);
-                };
-                let mut statement = db.prepare(
-                    "SELECT sequence, at, payload_json FROM events
-                     WHERE session_id = ?1 ORDER BY sequence",
-                )?;
-                let events = statement
-                    .query_map([&id], stored_event_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Some(ArchivedSession { summary, events }))
-            })
-            .await
-            .context("cannot read archived session")
-    }
-}
-
-/// Summary projection shared by archive listing and loading: identity and
-/// model fields plus the first user event and the user-event count.
-const ARCHIVED_SUMMARY_SELECT: &str = "id, updated_at, cwd, provider, model, thinking,
-    (SELECT payload_json FROM events
-     WHERE events.session_id = sessions.id AND kind = 'user'
-     ORDER BY sequence ASC LIMIT 1),
-    (SELECT COUNT(*) FROM events
-     WHERE events.session_id = sessions.id AND kind = 'user')";
-
-/// Map one row of [`ARCHIVED_SUMMARY_SELECT`] onto an archive summary. An
-/// undecodable timestamp or thinking level keeps its default rather than
-/// failing the whole listing.
-fn archived_summary_from_row(
-    row: &tokio_rusqlite::rusqlite::Row<'_>,
-) -> tokio_rusqlite::rusqlite::Result<ArchivedSessionSummary> {
-    let updated_at = row.get::<_, String>(1)?;
-    Ok(ArchivedSessionSummary {
-        id: row.get(0)?,
-        updated_at: DateTime::parse_from_rfc3339(&updated_at)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
-        cwd: PathBuf::from(row.get::<_, String>(2)?),
-        provider: row.get(3)?,
-        model: row.get(4)?,
-        thinking: row.get::<_, String>(5)?.parse().unwrap_or_default(),
-        first_message: collaboration_summary(row.get::<_, Option<String>>(6)?),
-        message_count: usize::try_from(row.get::<_, i64>(7)?).unwrap_or_default(),
-    })
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct SessionModelSettings {
     pub provider: String,
@@ -377,7 +120,6 @@ pub struct SessionEvent {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SessionContext {
     pub system_prompt: String,
-    pub skills: Vec<SkillSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -394,14 +136,11 @@ pub enum ContextHint {
     Note15 = 0,
     Note30 = 1,
     Note50 = 2,
-    Rollover60 = 3,
-    Rollover70 = 4,
-    Rollover80 = 5,
-    Final = 6,
+    Final = 3,
 }
 
 impl ContextHint {
-    pub const ALL: u8 = (1 << 7) - 1;
+    pub const ALL: u8 = (1 << 4) - 1;
 
     pub fn bit(self) -> u8 {
         1_u8 << (self as u8)
@@ -420,8 +159,6 @@ pub enum EventKind {
     },
     SessionContext {
         context: SessionContext,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        protocols: Vec<SessionProtocolRecord>,
     },
     User {
         text: String,
@@ -447,8 +184,6 @@ pub enum EventKind {
         name: String,
         output: String,
         failed: bool,
-        #[serde(default)]
-        protocol_help_required: bool,
     },
     ModelMessage {
         message: Message,
@@ -456,12 +191,10 @@ pub enum EventKind {
     AgentSpecUpdated {
         spec: AgentSpec,
         context: SessionContext,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        protocols: Vec<SessionProtocolRecord>,
     },
     Task {
         id: String,
-        protocol: String,
+        source: String,
         label: String,
         status: TaskStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,12 +234,6 @@ pub enum EventKind {
     },
     Compaction {
         summary: String,
-        tokens_before: usize,
-        replacement_history: Vec<Message>,
-        manual: bool,
-    },
-    ContextRollover {
-        window_id: u64,
         tokens_before: usize,
         replacement_history: Vec<Message>,
         manual: bool,
@@ -579,7 +306,7 @@ pub(crate) struct CollaborationOwnershipConflict;
 
 impl std::fmt::Display for CollaborationOwnershipConflict {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("this session is already active in another URI Agent process")
+        formatter.write_str("this session is already active in another UAT process")
     }
 }
 
@@ -600,11 +327,7 @@ struct ResumeState {
     through_sequence: Option<u64>,
     context_sequence: Option<u64>,
     #[serde(default)]
-    session_protocols: Vec<SessionProtocolRecord>,
-    #[serde(default)]
     latest_compaction_sequence: Option<u64>,
-    #[serde(default)]
-    latest_rollover_window_id: Option<u64>,
     #[serde(default)]
     reminded_context_window_id: Option<u64>,
     #[serde(default)]
@@ -613,11 +336,44 @@ struct ResumeState {
     context_hints_sent: u8,
     spec: Option<AgentSpec>,
     has_user: bool,
-    successful_help_reads: HashSet<String>,
-    pending_help_reads: HashMap<String, Vec<String>>,
     tasks: HashMap<String, TaskPointers>,
     usage: UsageTotals,
     token_calibration: TokenCalibration,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn terminal(self) -> bool {
+        self != Self::Running
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskReport {
+    pub id: String,
+    pub source: String,
+    pub label: String,
+    pub status: TaskStatus,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub content: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -720,10 +476,7 @@ fn seed_new_session(
         existing.push(SessionEvent {
             sequence: 1,
             at,
-            kind: EventKind::SessionContext {
-                context,
-                protocols: Vec::new(),
-            },
+            kind: EventKind::SessionContext { context },
         });
     }
     let mut derived = ResumeState::default();
@@ -773,7 +526,7 @@ fn restore_persisted_state(
     let context_sequence = context_event
         .as_ref()
         .and_then(|(sequence, _)| u64::try_from(*sequence).ok());
-    let context_and_protocols = context_event
+    let context = context_event
         .map(|(_, payload)| {
             let kind = serde_json::from_str::<EventKind>(&payload).map_err(|error| {
                 tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
@@ -783,18 +536,12 @@ fn restore_persisted_state(
                 )
             })?;
             match kind {
-                EventKind::SessionContext { context, protocols } => Ok((context, protocols)),
-                EventKind::AgentSpecUpdated {
-                    context, protocols, ..
-                } => Ok((context, protocols)),
+                EventKind::SessionContext { context } => Ok(context),
+                EventKind::AgentSpecUpdated { context, .. } => Ok(context),
                 _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             }
         })
         .transpose()?;
-    let (context, session_protocols) = context_and_protocols
-        .map_or((None, Vec::new()), |(context, protocols)| {
-            (Some(context), protocols)
-        });
     let has_creation = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM events
          WHERE session_id = ?1 AND kind = 'session_created')",
@@ -808,7 +555,7 @@ fn restore_persisted_state(
     let latest_checkpoint = db
         .query_row(
             "SELECT sequence, at, payload_json FROM events
-             WHERE session_id = ?1 AND kind IN ('compaction', 'context_rollover')
+             WHERE session_id = ?1 AND kind IN ('compaction')
              ORDER BY sequence DESC LIMIT 1",
             [id],
             stored_event_from_row,
@@ -842,9 +589,6 @@ fn restore_persisted_state(
     for event in &tail {
         apply_resume_event(&mut derived, event);
     }
-    if !session_protocols.is_empty() {
-        derived.session_protocols = session_protocols;
-    }
     derived.context_sequence = derived.context_sequence.or(context_sequence);
     derived.through_sequence = Some(authoritative_head);
 
@@ -873,7 +617,7 @@ fn restore_persisted_state(
 
 /// Load the session's resume-index checkpoint, rejecting any index that does
 /// not match the current schema version, the authoritative head, its own
-/// checksum, or land exactly on a compaction or rollover event. A rejected
+/// checksum, or land exactly on a compaction event. A rejected
 /// index rebuilds from raw events instead.
 fn resume_index_checkpoint(
     db: &SqliteConnection,
@@ -910,7 +654,7 @@ fn resume_index_checkpoint(
     }
     let is_checkpoint = db
         .query_row(
-            "SELECT kind IN ('compaction', 'context_rollover') FROM events
+            "SELECT kind IN ('compaction') FROM events
              WHERE session_id = ?1 AND sequence = ?2",
             params![id, through as i64],
             |row| row.get::<_, bool>(0),
@@ -1056,6 +800,7 @@ pub(crate) struct SessionEventReadAudit {
 }
 
 impl Session {
+    #[allow(dead_code)]
     pub(crate) fn new_id() -> String {
         new_session_id()
     }
@@ -1866,11 +1611,7 @@ impl Session {
             .context("cannot deliver collaboration input")
     }
 
-    pub async fn initialize_context_with_protocols(
-        &self,
-        context: SessionContext,
-        protocols: Vec<SessionProtocolRecord>,
-    ) -> Result<()> {
+    pub async fn initialize_context(&self, context: SessionContext) -> Result<()> {
         let mut state = self.state.lock().await;
         if state.context.is_some() {
             return Ok(());
@@ -1883,9 +1624,9 @@ impl Session {
                 .head_sequence
                 .map_or(0, |sequence| sequence.saturating_add(1)),
             at: Utc::now(),
-            kind: EventKind::SessionContext { context, protocols },
+            kind: EventKind::SessionContext { context },
         };
-        if let EventKind::SessionContext { context, .. } = &event.kind {
+        if let EventKind::SessionContext { context } = &event.kind {
             state.context = Some(context.clone());
         }
         state.head_sequence = Some(event.sequence);
@@ -1943,6 +1684,7 @@ impl Session {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn stage_private_record(&self, owner: &str, payload: Value) -> Result<()> {
         let owner = owner.trim();
         if owner.is_empty() {
@@ -1958,6 +1700,7 @@ impl Session {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn persist_private_records(&self, owners: &[String]) -> Result<()> {
         if owners.is_empty() {
             return Ok(());
@@ -2090,26 +1833,6 @@ impl Session {
         self.query_event_page(EventPage::All).await
     }
 
-    pub(crate) async fn tui_state(&self) -> SessionTuiState {
-        let state = self.state.lock().await;
-        SessionTuiState {
-            head_sequence: state.head_sequence,
-            latest_compaction_sequence: state.derived.latest_compaction_sequence,
-            usage: SessionTuiUsage {
-                input: state.derived.usage.input,
-                output: state.derived.usage.output,
-                cache_read: state.derived.usage.cache_read,
-                cache_write: state.derived.usage.cache_write,
-                cost: state.derived.usage.cost,
-                last_cache_hit: state.derived.usage.last_cache_hit,
-            },
-            token_calibration: SessionTuiTokenCalibration {
-                visible_units: state.derived.token_calibration.visible_units,
-                output_tokens: state.derived.token_calibration.output_tokens,
-            },
-        }
-    }
-
     pub async fn task_reports(&self) -> Result<Vec<TaskReport>> {
         let (persisted, tasks, in_memory) = {
             let state = self.state.lock().await;
@@ -2197,30 +1920,12 @@ impl Session {
             .expect("session context is validated when the session opens")
     }
 
-    pub async fn session_protocol_records(&self) -> Vec<SessionProtocolRecord> {
-        self.state.lock().await.derived.session_protocols.clone()
-    }
-
     pub async fn has_user_message(&self) -> bool {
         self.state.lock().await.derived.has_user
     }
 
-    pub async fn successful_protocol_help_reads(&self) -> HashSet<String> {
-        self.state
-            .lock()
-            .await
-            .derived
-            .successful_help_reads
-            .clone()
-    }
-
     pub(crate) async fn context_window_id(&self) -> u64 {
-        self.state
-            .lock()
-            .await
-            .derived
-            .latest_rollover_window_id
-            .unwrap_or(1)
+        1
     }
 
     pub(crate) async fn context_hints_sent(&self, window_id: u64) -> u8 {
@@ -2257,83 +1962,11 @@ impl Session {
             .await
     }
 
-    pub(crate) async fn event_headers_before(
-        &self,
-        sequence: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEventHeader>> {
-        let sequence = sequence.min(i64::MAX as u64);
-        let limit = limit.min(MAX_EVENT_PAGE);
-        let state = self.state.lock().await;
-        if !state.persisted {
-            let mut headers = state
-                .events
-                .iter()
-                .rev()
-                .filter(|event| event.sequence < sequence)
-                .take(limit)
-                .map(event_header)
-                .collect::<Vec<_>>();
-            headers.reverse();
-            #[cfg(test)]
-            self.record_header_page(&headers);
-            return Ok(headers);
-        }
-        drop(state);
-
-        let id = self.id.clone();
-        let headers = self
-            .connection
-            .call(move |db| {
-                let mut statement = db.prepare(
-                    "SELECT sequence, kind FROM (
-                       SELECT sequence, kind FROM events
-                       WHERE session_id = ?1 AND sequence < ?2
-                       ORDER BY sequence DESC LIMIT ?3
-                     ) ORDER BY sequence",
-                )?;
-                statement
-                    .query_map(params![id, sequence as i64, limit as i64], |row| {
-                        let sequence = row.get::<_, i64>(0)?;
-                        let kind = row.get::<_, String>(1)?;
-                        Ok(SessionEventHeader {
-                            sequence: sequence as u64,
-                            starts_turn: kind == "user",
-                            finishes_turn: kind == "turn_finished",
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .await
-            .context("cannot read session event headers")?;
-        #[cfg(test)]
-        self.record_header_page(&headers);
-        Ok(headers)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_event_read_audit(&self) {
-        *self.event_read_audit.lock().unwrap() = SessionEventReadAudit::default();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn event_read_audit(&self) -> SessionEventReadAudit {
-        self.event_read_audit.lock().unwrap().clone()
-    }
-
-    #[cfg(test)]
-    fn record_header_page(&self, headers: &[SessionEventHeader]) {
-        self.event_read_audit
-            .lock()
-            .unwrap()
-            .header_pages
-            .push(headers.iter().map(|header| header.sequence).collect());
-    }
-
     pub async fn model_history(&self) -> Vec<Message> {
         self.state.lock().await.replay.history.clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn has_model_history(&self) -> bool {
         !self.state.lock().await.replay.history.is_empty()
     }
@@ -2417,11 +2050,7 @@ impl Session {
     ) -> Result<SessionEvent> {
         let mut events = Vec::with_capacity(2);
         if let Some((spec, context)) = updated {
-            events.push(EventKind::AgentSpecUpdated {
-                spec,
-                context,
-                protocols: self.session_protocol_records().await,
-            });
+            events.push(EventKind::AgentSpecUpdated { spec, context });
         }
         events.push(EventKind::Compaction {
             summary,
@@ -2434,22 +2063,6 @@ impl Session {
             .into_iter()
             .next_back()
             .ok_or_else(|| anyhow!("compaction append produced no event"))
-    }
-
-    pub(crate) async fn append_context_rollover(
-        &self,
-        window_id: u64,
-        tokens_before: usize,
-        replacement_history: Vec<Message>,
-        manual: bool,
-    ) -> Result<SessionEvent> {
-        self.append(EventKind::ContextRollover {
-            window_id,
-            tokens_before,
-            replacement_history,
-            manual,
-        })
-        .await
     }
 
     pub async fn update_new_model_settings(
@@ -2543,7 +2156,7 @@ impl Session {
                     || spec.depth() != state.spec.depth()
                     || spec.max_output_tokens != state.spec.max_output_tokens)
             {
-                bail!("compaction may only update an Agent's prompt, tools, and protocols");
+                bail!("compaction may only update an Agent's prompt and tools");
             }
         }
         let mut next_spec = state.spec.clone();
@@ -2786,14 +2399,6 @@ impl Session {
     }
 }
 
-fn event_header(event: &SessionEvent) -> SessionEventHeader {
-    SessionEventHeader {
-        sequence: event.sequence,
-        starts_turn: matches!(&event.kind, EventKind::User { .. }),
-        finishes_turn: matches!(&event.kind, EventKind::TurnFinished),
-    }
-}
-
 async fn list_project_sessions(database_path: PathBuf, cwd: &Path) -> Result<Vec<SessionSummary>> {
     let project = cwd
         .canonicalize()
@@ -2874,8 +2479,8 @@ fn session_database_path_from(
         return directory.join(SESSION_DATABASE_FILE);
     }
     platform_data_dir
-        .map(|path| path.join("uri-agent").join(SESSION_DATABASE_FILE))
-        .unwrap_or_else(|| fallback.join(".uri-agent").join(SESSION_DATABASE_FILE))
+        .map(|path| path.join("uat").join(SESSION_DATABASE_FILE))
+        .unwrap_or_else(|| fallback.join(".uat").join(SESSION_DATABASE_FILE))
 }
 
 pub(crate) fn validate_collaboration_name(name: &str) -> Result<String> {
@@ -3032,19 +2637,6 @@ fn offline_collaboration_participant(row: OfflineCollaborationRow) -> Collaborat
         last_seen: None,
         instance_id: None,
     }
-}
-
-async fn open_archive_database(path: &Path) -> Result<Option<Connection>> {
-    if !fs::try_exists(path)
-        .await
-        .with_context(|| format!("cannot inspect session database: {}", display_path(path)))?
-    {
-        return Ok(None);
-    }
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .await
-        .map(Some)
-        .with_context(|| format!("cannot open session archive: {}", display_path(path)))
 }
 
 async fn open_database(database_path: PathBuf) -> Result<Connection> {
@@ -3379,7 +2971,6 @@ fn payload_kind(kind: &EventKind) -> &'static str {
         EventKind::Usage { .. } => "usage",
         EventKind::Error { .. } => "error",
         EventKind::Compaction { .. } => "compaction",
-        EventKind::ContextRollover { .. } => "context_rollover",
         EventKind::ContextReminder { .. } => "context_reminder",
         EventKind::ContextNote { .. } => "context_note",
         EventKind::ContextNoteDeleted { .. } => "context_note_deleted",
@@ -3409,10 +3000,7 @@ fn apply_committed_events(
         }
         state.head_sequence = Some(event.sequence);
         state.events.push(event.clone());
-        if matches!(
-            event.kind,
-            EventKind::Compaction { .. } | EventKind::ContextRollover { .. }
-        ) {
+        if matches!(event.kind, EventKind::Compaction { .. }) {
             checkpoint = serde_json::to_string(&state.derived)
                 .ok()
                 .map(|payload| (event.sequence, payload));
@@ -3436,16 +3024,6 @@ fn apply_replay_event(replay: &mut ReplayState, kind: &EventKind) {
             replay.pending_usage = None;
             replay.after_compaction = true;
             replay.latest_compaction_summary = Some(summary.clone());
-        }
-        EventKind::ContextRollover {
-            replacement_history,
-            ..
-        } => {
-            replay.history.clone_from(replacement_history);
-            replay.usage_before_assistant = vec![None; replacement_history.len()];
-            replay.pending_usage = None;
-            replay.after_compaction = false;
-            replay.latest_compaction_summary = None;
         }
         EventKind::Usage {
             total,
@@ -3478,41 +3056,22 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
         EventKind::SessionCreated { spec } => {
             state.spec = Some(spec.clone());
         }
-        EventKind::SessionContext { protocols, .. } => {
+        EventKind::SessionContext { .. } => {
             state.context_sequence = Some(event.sequence);
-            state.session_protocols.clone_from(protocols);
         }
-        EventKind::AgentSpecUpdated {
-            spec, protocols, ..
-        } => {
+        EventKind::AgentSpecUpdated { spec, .. } => {
             state.spec = Some(spec.clone());
             state.context_sequence = Some(event.sequence);
-            state.session_protocols.clone_from(protocols);
         }
         EventKind::User { .. } => state.has_user = true,
         EventKind::ToolCall {
-            call_id,
-            name,
-            arguments,
+            name, arguments, ..
         } => {
-            state.pending_help_reads.remove(call_id);
-            if name == "help"
-                && let Some(protocols) = arguments.get("protocols").and_then(Value::as_array)
-            {
-                let names = protocols
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                if !names.is_empty() {
-                    state.pending_help_reads.insert(call_id.clone(), names);
-                }
-            }
             state.token_calibration.pending_visible_units = state
                 .token_calibration
                 .pending_visible_units
-                .saturating_add(crate::text_metrics::visible_units(name) as u64)
-                .saturating_add(crate::text_metrics::visible_units(&arguments.to_string()) as u64);
+                .saturating_add(name.chars().count() as u64)
+                .saturating_add(arguments.to_string().chars().count() as u64);
         }
         EventKind::ToolResult {
             call_id,
@@ -3520,12 +3079,7 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             failed,
             ..
         } => {
-            if let Some(protocols) = state.pending_help_reads.remove(call_id)
-                && name == "help"
-                && !failed
-            {
-                state.successful_help_reads.extend(protocols);
-            }
+            let _ = (call_id, name, failed);
         }
         EventKind::Task { id, output, .. } => {
             let pointers = state.tasks.entry(id.clone()).or_insert(TaskPointers {
@@ -3566,14 +3120,14 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
             state.token_calibration.pending_visible_units = state
                 .token_calibration
                 .pending_visible_units
-                .saturating_add(crate::text_metrics::visible_units(text) as u64);
+                .saturating_add(text.chars().count() as u64);
         }
         EventKind::AssistantReasoning { text } => {
             state.token_calibration.pending_reasoning_visible |= !text.is_empty();
             state.token_calibration.pending_visible_units = state
                 .token_calibration
                 .pending_visible_units
-                .saturating_add(crate::text_metrics::visible_units(text) as u64);
+                .saturating_add(text.chars().count() as u64);
         }
         EventKind::ModelMessage {
             message: Message::Assistant { .. },
@@ -3598,16 +3152,9 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
         }
         EventKind::Compaction { .. } => {
             state.latest_compaction_sequence = Some(event.sequence);
-            state.token_calibration.reset_pending();
-        }
-        EventKind::ContextRollover { window_id, .. } => {
-            state.latest_compaction_sequence = Some(event.sequence);
-            state.latest_rollover_window_id = Some(*window_id);
-            state.reminded_context_window_id = None;
             state.context_hint_window_id = None;
             state.context_hints_sent = 0;
-            state.successful_help_reads.clear();
-            state.pending_help_reads.clear();
+            state.reminded_context_window_id = None;
             state.token_calibration.reset_pending();
         }
         EventKind::ContextReminder { window_id, hint } => {
@@ -3630,7 +3177,7 @@ fn apply_resume_event(state: &mut ResumeState, event: &SessionEvent) {
 fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
     struct ReportState {
         first_sequence: u64,
-        protocol: String,
+        source: String,
         label: String,
         status: TaskStatus,
         started_at: DateTime<Utc>,
@@ -3642,7 +3189,7 @@ fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
     for event in events {
         let EventKind::Task {
             id,
-            protocol,
+            source,
             label,
             status,
             output,
@@ -3652,14 +3199,14 @@ fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
         };
         let report = reports.entry(id.clone()).or_insert_with(|| ReportState {
             first_sequence: event.sequence,
-            protocol: protocol.clone(),
+            source: source.clone(),
             label: label.clone(),
             status: *status,
             started_at: event.at,
             updated_at: event.at,
             output: String::new(),
         });
-        report.protocol.clone_from(protocol);
+        report.source.clone_from(source);
         report.label.clone_from(label);
         report.status = *status;
         report.updated_at = event.at;
@@ -3675,7 +3222,7 @@ fn task_reports_from_events(events: &[SessionEvent]) -> Vec<TaskReport> {
                 report.first_sequence,
                 TaskReport {
                     id,
-                    protocol: report.protocol,
+                    source: report.source,
                     label: report.label,
                     status: if report.status.terminal() {
                         report.status
@@ -3740,11 +3287,6 @@ mod tests {
     fn context(label: &str) -> SessionContext {
         SessionContext {
             system_prompt: format!("system {label}"),
-            skills: vec![SkillSnapshot {
-                name: "Review".to_string(),
-                description: format!("description {label}"),
-                path: PathBuf::from(format!("/skills/{label}/SKILL.md")),
-            }],
         }
     }
 
@@ -4139,118 +3681,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn searchable_records_exclude_private_protocol_calls_and_cross_batch_results() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("sessions.db");
-        let opened = session(&path, Some("searchable-records")).await;
-        let first = opened
-            .append_batch(vec![
-                EventKind::User {
-                    text: "find public evidence".into(),
-                },
-                EventKind::ToolCall {
-                    call_id: "public".into(),
-                    name: "protocol".into(),
-                    arguments: serde_json::json!({"steps": [{"read": "file://README.md"}]}),
-                },
-                EventKind::ToolResult {
-                    call_id: "public".into(),
-                    name: "protocol".into(),
-                    output: "public result".into(),
-                    failed: false,
-                    protocol_help_required: false,
-                },
-                EventKind::ToolCall {
-                    call_id: "private-context".into(),
-                    name: "protocol".into(),
-                    arguments: serde_json::json!({
-                        "steps": [
-                            {"read": "context://history/search", "input": {"query": "secret"}}
-                        ]
-                    }),
-                },
-                EventKind::ToolCall {
-                    call_id: "mixed".into(),
-                    name: "protocol".into(),
-                    arguments: serde_json::json!({
-                        "steps": [
-                            {"exec": "context://notes/add",
-                             "input": {"title": "t", "content": "secret"}},
-                            {"read": "file://notes.md"}
-                        ]
-                    }),
-                },
-            ])
-            .await
-            .unwrap();
-        let second = opened
-            .append_batch(vec![
-                EventKind::ToolResult {
-                    call_id: "private-context".into(),
-                    name: "protocol".into(),
-                    output: "private context result".into(),
-                    failed: false,
-                    protocol_help_required: false,
-                },
-                EventKind::ToolResult {
-                    call_id: "mixed".into(),
-                    name: "protocol".into(),
-                    output: "mixed result".into(),
-                    failed: false,
-                    protocol_help_required: false,
-                },
-                EventKind::AssistantText {
-                    text: "public conclusion".into(),
-                },
-                // Arguments are stored before validation, so malformed step
-                // shapes must not break the query.
-                EventKind::ToolCall {
-                    call_id: "malformed-list".into(),
-                    name: "protocol".into(),
-                    arguments: serde_json::json!({"steps": ["*** Begin Request", 3]}),
-                },
-                EventKind::ToolCall {
-                    call_id: "malformed-string".into(),
-                    name: "protocol".into(),
-                    arguments: serde_json::json!({"steps": "context://notes"}),
-                },
-            ])
-            .await
-            .unwrap();
-        let archive = SessionArchive::at(path, Path::new("/work"));
-
-        let records = archive
-            .searchable_records(Some(Path::new("/work")))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            records,
-            [
-                first[0].sequence,
-                first[1].sequence,
-                first[2].sequence,
-                second[2].sequence,
-                second[3].sequence,
-                second[4].sequence,
-            ]
-            .into_iter()
-            .map(|sequence| SearchableSessionRecord {
-                session_id: "searchable-records".to_string(),
-                sequence,
-            })
-            .collect::<Vec<_>>()
-        );
-        assert!(
-            archive
-                .searchable_records(Some(Path::new("/other")))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn legacy_v5_session_database_is_never_opened_or_modified() {
         let temp = tempfile::tempdir().unwrap();
         let legacy = temp.path().join("sessions-v5.db");
@@ -4266,8 +3696,8 @@ mod tests {
         drop(connection);
         let before = std::fs::read(&legacy).unwrap();
 
-        assert_eq!(SESSION_DATABASE_FILE, "sessions-v6.db");
-        let opened = session(&temp.path().join(SESSION_DATABASE_FILE), Some("v6-fresh")).await;
+        assert_eq!(SESSION_DATABASE_FILE, "sessions-v7.db");
+        let opened = session(&temp.path().join(SESSION_DATABASE_FILE), Some("v7-fresh")).await;
         opened
             .append(EventKind::User {
                 text: "hello".into(),
@@ -4298,21 +3728,21 @@ mod tests {
             .append_batch(vec![
                 EventKind::Task {
                     id: "00a".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "completed command".into(),
                     status: TaskStatus::Running,
                     output: None,
                 },
                 EventKind::Task {
                     id: "00a".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "completed command".into(),
                     status: TaskStatus::Completed,
                     output: Some("complete output".into()),
                 },
                 EventKind::Task {
                     id: "00b".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "interrupted command".into(),
                     status: TaskStatus::Running,
                     output: None,
@@ -4344,14 +3774,14 @@ mod tests {
                 },
                 EventKind::Task {
                     id: "first".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "first task".into(),
                     status: TaskStatus::Completed,
                     output: Some("first output".into()),
                 },
                 EventKind::Task {
                     id: "second".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "second task".into(),
                     status: TaskStatus::Completed,
                     output: Some("second output".into()),
@@ -4495,7 +3925,7 @@ mod tests {
             .unwrap();
         assert!(opened.persist().await.is_err());
         opened
-            .initialize_context_with_protocols(context("prepared"), Vec::new())
+            .initialize_context(context("prepared"))
             .await
             .unwrap();
         opened.persist().await.unwrap();
@@ -4558,7 +3988,7 @@ mod tests {
         let event = serde_json::from_value::<EventKind>(serde_json::json!({
             "kind": "task",
             "id": "001",
-            "protocol": "bash",
+            "source": "bash",
             "label": "historical",
             "status": "completed"
         }))
@@ -4592,46 +4022,6 @@ mod tests {
         assert_eq!(state.context_hint_window_id, Some(3));
         assert_eq!(state.context_hints_sent, ContextHint::ALL);
         assert_eq!(state.reminded_context_window_id, Some(3));
-    }
-
-    #[test]
-    fn context_hint_mask_covers_skipped_lower_tiers_until_rollover() {
-        let mut state = ResumeState::default();
-        apply_resume_event(
-            &mut state,
-            &SessionEvent {
-                sequence: 1,
-                at: Utc::now(),
-                kind: EventKind::ContextReminder {
-                    window_id: 1,
-                    hint: Some(ContextHint::Rollover60),
-                },
-            },
-        );
-        assert_eq!(
-            state.context_hints_sent,
-            ContextHint::Rollover60.mask_through()
-        );
-        assert_ne!(state.context_hints_sent & ContextHint::Note50.bit(), 0);
-        assert_eq!(state.context_hints_sent & ContextHint::Rollover70.bit(), 0);
-
-        apply_resume_event(
-            &mut state,
-            &SessionEvent {
-                sequence: 2,
-                at: Utc::now(),
-                kind: EventKind::ContextRollover {
-                    window_id: 2,
-                    tokens_before: 1,
-                    replacement_history: Vec::new(),
-                    manual: false,
-                },
-            },
-        );
-        assert_eq!(state.context_hint_window_id, None);
-        assert_eq!(state.context_hints_sent, 0);
-        assert_eq!(state.reminded_context_window_id, None);
-        assert_eq!(state.latest_rollover_window_id, Some(2));
     }
 
     #[tokio::test]
@@ -4740,11 +4130,6 @@ mod tests {
         .unwrap();
         let frozen = resumed.context().await;
         assert_eq!(frozen.system_prompt, "system original");
-        assert_eq!(frozen.skills[0].description, "description original");
-        assert_eq!(
-            frozen.skills[0].path,
-            Path::new("/skills/original/SKILL.md")
-        );
     }
 
     #[tokio::test]
@@ -4780,7 +4165,7 @@ mod tests {
         assert!(error.to_string().contains("startup context is ready"));
 
         opened
-            .initialize_context_with_protocols(context("deferred"), Vec::new())
+            .initialize_context(context("deferred"))
             .await
             .unwrap();
         opened
@@ -4815,73 +4200,6 @@ mod tests {
         .unwrap();
         let frozen = resumed.context().await;
         assert_eq!(frozen.system_prompt, "system deferred");
-        assert_eq!(frozen.skills[0].description, "description deferred");
-    }
-
-    #[tokio::test]
-    async fn session_protocol_records_survive_resume_and_compaction() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("sessions.db");
-        let opened = Session::open_at_with_thinking(
-            path.clone(),
-            Some("frozen-protocols"),
-            Path::new("/work"),
-            "test",
-            "model",
-            ThinkingLevel::default(),
-            None,
-        )
-        .await
-        .unwrap();
-        let records = vec![SessionProtocolRecord {
-            owner: "mcp".to_string(),
-            identity: "GitHub".to_string(),
-            descriptor: crate::protocol::ProtocolDescriptor {
-                name: "github-mcp".to_string(),
-                description: "Frozen GitHub MCP description".to_string(),
-                can_read: true,
-                can_exec: true,
-            },
-            help_dependencies: vec!["mcp".to_string()],
-        }];
-        opened
-            .initialize_context_with_protocols(context("protocols"), records.clone())
-            .await
-            .unwrap();
-        opened
-            .append(EventKind::User {
-                text: "persist protocols".into(),
-            })
-            .await
-            .unwrap();
-        opened
-            .append_compaction_with_spec(
-                "summary".to_string(),
-                10,
-                Vec::new(),
-                false,
-                Some((opened.spec().await, context("compacted-protocols"))),
-            )
-            .await
-            .unwrap();
-        assert_eq!(opened.session_protocol_records().await, records);
-        drop(opened);
-
-        let resumed = Session::open_at(
-            path,
-            Some("frozen-protocols"),
-            Path::new("/work"),
-            "test",
-            "model",
-            context("changed"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resumed.session_protocol_records().await, records);
-        assert_eq!(
-            resumed.context().await.system_prompt,
-            "system compacted-protocols"
-        );
     }
 
     #[tokio::test]
@@ -4987,15 +4305,15 @@ mod tests {
             id: Some("assistant-provider-id".into()),
             content: vec![AssistantContent::ToolCall(ToolCall::new(
                 call_id.clone(),
-                ToolFunction::new("help".into(), serde_json::json!({"protocols": ["file"]})),
+                ToolFunction::new("read".into(), serde_json::json!({"path": "README.md"})),
             ))],
         };
         let tool_result = Message::User {
             content: vec![UserContent::ToolResult(ToolResult {
                 call: call_id,
                 provider: None,
-                name: "help".into(),
-                content: vec![ToolResultContent::text("help output")],
+                name: "read".into(),
+                content: vec![ToolResultContent::text("file output")],
             })],
         };
         opened
@@ -5163,54 +4481,52 @@ mod tests {
         opened
             .append_batch(vec![
                 EventKind::ToolCall {
-                    call_id: "help".into(),
-                    name: "help".into(),
-                    arguments: serde_json::json!({"protocols":["file"]}),
+                    call_id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"README.md"}),
                 },
                 EventKind::ToolResult {
-                    call_id: "help".into(),
-                    name: "help".into(),
+                    call_id: "read".into(),
+                    name: "read".into(),
                     output: "ok".into(),
                     failed: false,
-                    protocol_help_required: false,
                 },
                 EventKind::Task {
                     id: "task".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "work".into(),
                     status: TaskStatus::Completed,
                     output: Some("result".into()),
                 },
                 EventKind::Task {
                     id: "interrupted".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "partial".into(),
                     status: TaskStatus::Running,
                     output: Some("partial output".into()),
                 },
                 EventKind::Task {
                     id: "interrupted".into(),
-                    protocol: "bash".into(),
+                    source: "bash".into(),
                     label: "partial".into(),
                     status: TaskStatus::Running,
                     output: None,
                 },
                 EventKind::ToolCall {
-                    call_id: "failed-help".into(),
-                    name: "help".into(),
-                    arguments: serde_json::json!({"protocols":["search"]}),
+                    call_id: "failed-read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"missing.md"}),
                 },
                 EventKind::ToolResult {
-                    call_id: "failed-help".into(),
-                    name: "help".into(),
+                    call_id: "failed-read".into(),
+                    name: "read".into(),
                     output: "failed".into(),
                     failed: true,
-                    protocol_help_required: false,
                 },
                 EventKind::ToolCall {
                     call_id: "reused".into(),
-                    name: "help".into(),
-                    arguments: serde_json::json!({"protocols":["tasks"]}),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"src/lib.rs"}),
                 },
             ])
             .await
@@ -5411,19 +4727,6 @@ mod tests {
                 .unwrap();
             assert_eq!(interrupted.status, TaskStatus::Cancelled);
             assert_eq!(interrupted.content, b"partial output");
-            let help_reads = resumed.successful_protocol_help_reads().await;
-            assert!(help_reads.contains("file"));
-            assert!(!help_reads.contains("search"));
-            assert!(!help_reads.contains("tasks"));
-            assert!(
-                !resumed
-                    .state
-                    .lock()
-                    .await
-                    .derived
-                    .pending_help_reads
-                    .contains_key("reused")
-            );
             assert!(resumed.has_user_message().await);
             assert_eq!(
                 resumed.model_settings().await,
@@ -5480,7 +4783,6 @@ mod tests {
                     name: "read".into(),
                     output: "done".into(),
                     failed: false,
-                    protocol_help_required: false,
                 },
                 EventKind::TurnFinished,
             ])
@@ -5867,13 +5169,13 @@ mod tests {
     #[test]
     fn macos_session_database_uses_the_config_directory() {
         let path = session_database_path_from(
-            Some(PathBuf::from("/Users/ada/.config/uri-agent")),
+            Some(PathBuf::from("/Users/ada/.config/uat")),
             Some(Path::new("/Users/ada/Library/Application Support")),
             Path::new("/work"),
         );
         assert_eq!(
             path,
-            PathBuf::from("/Users/ada/.config/uri-agent").join(SESSION_DATABASE_FILE)
+            PathBuf::from("/Users/ada/.config/uat").join(SESSION_DATABASE_FILE)
         );
     }
 
@@ -5887,7 +5189,7 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from("/home/ada/.local/share")
-                .join("uri-agent")
+                .join("uat")
                 .join(SESSION_DATABASE_FILE)
         );
     }
@@ -6121,7 +5423,7 @@ mod tests {
         .await
         .unwrap();
         prepared
-            .initialize_context_with_protocols(context("prepared"), Vec::new())
+            .initialize_context(context("prepared"))
             .await
             .unwrap();
         prepared.persist().await.unwrap();
@@ -6235,28 +5537,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["root-agent"]
         );
-        let archive = SessionArchive::at(path, temp.path());
-        assert_eq!(
-            archive
-                .list_for_project()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            ["root-agent"]
-        );
-        assert_eq!(
-            archive
-                .list_all()
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            ["root-agent"]
-        );
-        assert!(archive.load("child-agent").await.unwrap().is_some());
         let stored: (i64, Option<String>) = child
             .connection
             .call(|db| {

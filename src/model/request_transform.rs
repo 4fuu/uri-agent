@@ -160,7 +160,7 @@ impl ModelRequestTransform {
             headers
                 .entry(http::header::USER_AGENT)
                 .or_insert(HeaderValue::from_static(concat!(
-                    "uri-agent/",
+                    "uat/",
                     env!("CARGO_PKG_VERSION")
                 )));
         }
@@ -1160,7 +1160,7 @@ impl ModelRequestTransform {
     /// Replaces each function declaration's lossy converted `parameters` with
     /// the tool's original schema as `parametersJsonSchema`. The legacy
     /// `Schema` conversion in rig-core 0.42 drops `additionalProperties`, so
-    /// the protocol tool's free-form `input` object would otherwise degrade
+    /// a free-form `input` object would otherwise degrade
     /// into a propertyless object. Declarations without a published original
     /// schema are left untouched. Only the `google-generative-ai` path calls
     /// this; Antigravity still sends rig's converted `parameters` after its

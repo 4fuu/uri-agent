@@ -6,7 +6,8 @@
 use crate::agent::{AgentHandle, AgentHost, AgentStatus, SubmitKind};
 use crate::config::Config;
 use crate::execute;
-use anyhow::{Context, Result};
+use crate::session::Session;
+use anyhow::{Context, Result, bail};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
@@ -67,6 +68,7 @@ pub async fn serve(host: AgentHost, config: Config, listen: &str) -> Result<()> 
     let token = std::env::var("UAT_HTTP_TOKEN")
         .ok()
         .filter(|token| !token.is_empty());
+    let token_configured = token.is_some();
     let state = AppState {
         host,
         config: Arc::new(config),
@@ -76,6 +78,7 @@ pub async fn serve(host: AgentHost, config: Config, listen: &str) -> Result<()> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/{id}", get(session_detail))
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/messages", post(messages))
         .layer(DefaultBodyLimit::max(1024 * 1024))
@@ -83,7 +86,13 @@ pub async fn serve(host: AgentHost, config: Config, listen: &str) -> Result<()> 
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
-    eprintln!("uat serve listening on http://{listen}");
+    let address = listener
+        .local_addr()
+        .context("cannot read server address")?;
+    if !address.ip().is_loopback() && !token_configured {
+        bail!("refusing to serve on non-loopback address {address} without UAT_HTTP_TOKEN");
+    }
+    eprintln!("uat serve listening on http://{address}");
     axum::serve(listener, app)
         .await
         .context("HTTP server failed")?;
@@ -123,6 +132,33 @@ async fn list_sessions(
         entries.push(SessionEntry { session, status });
     }
     Ok(Json(entries))
+}
+
+#[derive(Serialize)]
+struct SessionDetail {
+    session: String,
+    status: &'static str,
+    answer: Option<String>,
+}
+
+async fn session_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<SessionDetail>> {
+    authorize(&state, &headers)?;
+    let handle = resolve_session(&state, Some(&id)).await?;
+    let status = match handle.status().await {
+        AgentStatus::Idle => "idle",
+        AgentStatus::Running => "running",
+        AgentStatus::Closed => "closed",
+    };
+    let answer = handle.result().await;
+    Ok(Json(SessionDetail {
+        session: handle.session_id().to_string(),
+        status,
+        answer,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -222,10 +258,20 @@ async fn cancel(
 }
 
 async fn resolve_session(state: &AppState, id: Option<&str>) -> ApiResult<AgentHandle> {
-    if let Some(id) = id
-        && let Some(handle) = state.sessions.lock().await.get(id).cloned()
-    {
-        return Ok(handle);
+    if let Some(id) = id {
+        if let Some(handle) = state.sessions.lock().await.get(id).cloned() {
+            return Ok(handle);
+        }
+        if Session::persisted_spec(&state.config.cwd, id)
+            .await
+            .map_err(api_error)?
+            .is_none()
+        {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                format!("unknown session: {id}"),
+            ));
+        }
     }
     let initial = state.config.manager.current().await;
     let spec = execute::simple_spec(

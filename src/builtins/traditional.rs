@@ -1,17 +1,13 @@
-use super::atomic_write;
 use super::collaboration::{self, CollaborationState};
 use super::context::{self, ContextState};
-use super::file::resolve_path;
 use super::grep;
-use super::replace::replace_exact;
+use super::{EditableText, atomic_write, normalize_line_endings, resolve_path};
 use crate::config::display_path;
-use crate::output::OutputStore;
 use crate::plugin::{
     ModelTool, ModelToolDescriptor, ModelToolOutput, ModelToolRegistry, Plugin, PluginDownloads,
     PluginHost,
 };
 use crate::process::ProcessTree;
-use crate::protocol::ProtocolRegistry;
 use crate::retrieval::SearchMode;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -32,8 +28,7 @@ const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const MAX_BASH_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Traditional coding tools for the simple mode. These deliberately do not
-/// use URI addresses or the protocol registry; they operate on the same
+/// Traditional coding tools for the simple mode. They operate on the same
 /// working directory and process boundary as the rest of the session.
 pub(super) struct TraditionalToolsPlugin {
     cwd: PathBuf,
@@ -110,11 +105,7 @@ impl ModelTool for ReadTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: ReadArguments =
             serde_json::from_value(arguments.clone()).context("invalid read tool arguments")?;
         if arguments.path.trim().is_empty() {
@@ -201,11 +192,7 @@ impl ModelTool for WriteTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: WriteArguments =
             serde_json::from_value(arguments.clone()).context("invalid write tool arguments")?;
         if arguments.path.trim().is_empty() {
@@ -259,6 +246,44 @@ struct EditArguments {
     new_text: String,
 }
 
+async fn replace_exact(path: &Path, old_text: &str, new_text: &str) -> Result<()> {
+    if old_text.is_empty() {
+        bail!("old_text cannot be empty");
+    }
+    if fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "edit paths cannot be symbolic links: {}",
+            display_path(path)
+        );
+    }
+    let original = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("cannot read {}", display_path(path)))?;
+    let original = EditableText::new(&original);
+    let old_text = normalize_line_endings(old_text.strip_prefix('\u{feff}').unwrap_or(old_text));
+    let new_text = normalize_line_endings(new_text.strip_prefix('\u{feff}').unwrap_or(new_text));
+    if old_text.is_empty() {
+        bail!("old_text cannot be empty");
+    }
+    let content = original.normalized();
+    let first = content
+        .find(&old_text)
+        .ok_or_else(|| anyhow::anyhow!("old_text was not found in {}", display_path(path)))?;
+    let next_start = first + old_text.chars().next().map_or(0, char::len_utf8);
+    if content[next_start..].contains(&old_text) {
+        bail!("old_text appears more than once in {}", display_path(path));
+    }
+    let mut updated = String::with_capacity(content.len() - old_text.len() + new_text.len());
+    updated.push_str(&content[..first]);
+    updated.push_str(&new_text);
+    updated.push_str(&content[first + old_text.len()..]);
+    atomic_write(path, original.restore(&updated).as_bytes()).await
+}
+
 #[async_trait]
 impl ModelTool for EditTool {
     fn descriptor(&self) -> ModelToolDescriptor {
@@ -278,11 +303,7 @@ impl ModelTool for EditTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: EditArguments =
             serde_json::from_value(arguments.clone()).context("invalid edit tool arguments")?;
         if arguments.path.trim().is_empty() {
@@ -334,11 +355,7 @@ impl ModelTool for BashTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: BashArguments =
             serde_json::from_value(arguments.clone()).context("invalid bash tool arguments")?;
         if arguments.command.trim().is_empty() {
@@ -429,11 +446,7 @@ impl ModelTool for SearchTool {
         search_descriptor()
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: SearchArguments =
             serde_json::from_value(arguments.clone()).context("invalid search tool arguments")?;
         if arguments.query.trim().is_empty() {
@@ -513,11 +526,7 @@ impl ModelTool for NotesTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: NotesArguments =
             serde_json::from_value(arguments.clone()).context("invalid notes tool arguments")?;
         let result = match arguments.op.as_str() {
@@ -565,12 +574,19 @@ impl SteerTool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SteerArguments {
-    target: String,
-    message: String,
+    #[serde(default = "default_steer_op")]
+    op: String,
+    target: Option<String>,
+    message: Option<String>,
+    name: Option<String>,
     delivery: Option<String>,
     reply: Option<String>,
     scope: Option<String>,
     in_reply_to: Option<String>,
+}
+
+fn default_steer_op() -> String {
+    "send".to_string()
 }
 
 #[async_trait]
@@ -578,44 +594,67 @@ impl ModelTool for SteerTool {
     fn descriptor(&self) -> ModelToolDescriptor {
         ModelToolDescriptor {
             name: "steer".to_string(),
-            description: "Send a message to another active UAT session. `delivery: \"steer\"` targets the next model boundary; `queue` durably schedules a later turn. The target may be a live session name or session ID.".to_string(),
+            description: "Work with other active UAT sessions. `send` (default) delivers text to a session; `delivery: \"steer\"` targets the next model boundary and `queue` schedules a later turn. `list` shows active sessions. `name` assigns this session a stable name for other sessions to target.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "target": {"type": "string", "description": "Live session name or stable session ID."},
-                    "message": {"type": "string", "description": "Message body."},
+                    "op": {"type": "string", "enum": ["send", "list", "name"], "description": "Operation. Default send."},
+                    "target": {"type": "string", "description": "Live session name or stable session ID, for send."},
+                    "message": {"type": "string", "description": "Message body, for send."},
+                    "name": {"type": "string", "description": "New session name, for name."},
                     "delivery": {"type": "string", "enum": ["queue", "steer"], "description": "Delivery mode. Default queue."},
                     "reply": {"type": "string", "enum": ["none", "requested"], "description": "Whether to request a reply. Default none."},
                     "scope": {"type": "string", "enum": ["project", "all"], "description": "Target lookup scope. Default project."},
                     "in_reply_to": {"type": "string", "description": "Optional collaboration message ID being answered."}
                 },
-                "required": ["target", "message"],
+                "required": [],
                 "additionalProperties": false
             }),
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: SteerArguments =
             serde_json::from_value(arguments.clone()).context("invalid steer tool arguments")?;
-        if arguments.target.trim().is_empty() {
-            bail!("steer target cannot be empty");
+        match arguments.op.as_str() {
+            "list" => collaboration::list_participants(&self.state, arguments.scope.as_deref())
+                .await
+                .map(Into::into),
+            "name" => {
+                let name = arguments
+                    .name
+                    .ok_or_else(|| anyhow::anyhow!("steer op name requires `name`"))?;
+                if name.trim().is_empty() {
+                    bail!("steer name cannot be empty");
+                }
+                collaboration::name_session(&self.state, &name)
+                    .await
+                    .map(Into::into)
+            }
+            "send" => {
+                let target = arguments
+                    .target
+                    .ok_or_else(|| anyhow::anyhow!("steer op send requires `target`"))?;
+                let message = arguments
+                    .message
+                    .ok_or_else(|| anyhow::anyhow!("steer op send requires `message`"))?;
+                if target.trim().is_empty() {
+                    bail!("steer target cannot be empty");
+                }
+                collaboration::send_tool_message(
+                    &self.state,
+                    &target,
+                    &message,
+                    arguments.delivery.as_deref(),
+                    arguments.reply.as_deref(),
+                    arguments.scope.as_deref(),
+                    arguments.in_reply_to.as_deref(),
+                )
+                .await
+                .map(Into::into)
+            }
+            other => bail!("steer op must be send, list, or name; got {other:?}"),
         }
-        collaboration::send_tool_message(
-            &self.state,
-            &arguments.target,
-            &arguments.message,
-            arguments.delivery.as_deref(),
-            arguments.reply.as_deref(),
-            arguments.scope.as_deref(),
-            arguments.in_reply_to.as_deref(),
-        )
-        .await
-        .map(Into::into)
     }
 }
 
@@ -624,16 +663,12 @@ impl ModelTool for SteerTool {
 #[derive(Clone)]
 pub(crate) struct CodemodeTool {
     tools: Arc<OnceLock<Weak<ModelToolRegistry>>>,
-    protocols: Arc<ProtocolRegistry>,
-    output: Arc<OutputStore>,
 }
 
 impl CodemodeTool {
-    pub(crate) fn new(protocols: Arc<ProtocolRegistry>, output: Arc<OutputStore>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tools: Arc::new(OnceLock::new()),
-            protocols,
-            output,
         }
     }
 
@@ -665,11 +700,7 @@ impl ModelTool for CodemodeTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: CodemodeArguments =
             serde_json::from_value(arguments.clone()).context("invalid codemode tool arguments")?;
         if arguments.code.trim().is_empty() {
@@ -688,12 +719,7 @@ impl ModelTool for CodemodeTool {
         });
         let print_sink = sink.clone();
         engine.on_print(move |line| append(&print_sink, line));
-        register_codemode_functions(
-            &mut engine,
-            self.tools.clone(),
-            self.protocols.clone(),
-            sink.clone(),
-        );
+        register_codemode_functions(&mut engine, self.tools.clone(), sink.clone());
         let result = tokio::task::block_in_place(|| engine.eval::<Dynamic>(&arguments.code));
         let mut text = sink.lock().expect("codemode output lock poisoned").clone();
         match result {
@@ -717,17 +743,13 @@ impl ModelTool for CodemodeTool {
         if text.trim().is_empty() {
             return Ok("Script completed with no output.".into());
         }
-        self.output
-            .present(text.into_bytes(), "codemode")
-            .await
-            .map(Into::into)
+        Ok(truncate_output(text).into())
     }
 }
 
 fn register_codemode_functions(
     engine: &mut Engine,
     tools: Arc<OnceLock<Weak<ModelToolRegistry>>>,
-    protocols: Arc<ProtocolRegistry>,
     sink: Arc<Mutex<String>>,
 ) {
     let text_sink = sink.clone();
@@ -736,7 +758,6 @@ fn register_codemode_functions(
     });
 
     let tool_registry = tools.clone();
-    let tool_protocols = protocols.clone();
     engine.register_fn(
         "tool",
         move |name: ImmutableString,
@@ -744,43 +765,29 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             let args: Value = serde_json::from_str(args.as_str())
                 .map_err(|error| script_error(format!("tool arguments must be JSON: {error}")))?;
-            call_tool(&tool_registry, &tool_protocols, name.as_str(), args)
-                .map(ImmutableString::from)
+            call_tool(&tool_registry, name.as_str(), args).map(ImmutableString::from)
         },
     );
 
     let bash_tools = tools.clone();
-    let bash_protocols = protocols.clone();
     engine.register_fn(
         "bash",
         move |command: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
-            call_tool(
-                &bash_tools,
-                &bash_protocols,
-                "bash",
-                json!({"command": command.as_str()}),
-            )
-            .map(ImmutableString::from)
+            call_tool(&bash_tools, "bash", json!({"command": command.as_str()}))
+                .map(ImmutableString::from)
         },
     );
 
     let read_tools = tools.clone();
-    let read_protocols = protocols.clone();
     engine.register_fn(
         "read",
         move |path: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
-            call_tool(
-                &read_tools,
-                &read_protocols,
-                "read",
-                json!({"path": path.as_str()}),
-            )
-            .map(ImmutableString::from)
+            call_tool(&read_tools, "read", json!({"path": path.as_str()}))
+                .map(ImmutableString::from)
         },
     );
 
     let write_tools = tools.clone();
-    let write_protocols = protocols.clone();
     engine.register_fn(
         "write",
         move |path: ImmutableString,
@@ -788,7 +795,6 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &write_tools,
-                &write_protocols,
                 "write",
                 json!({"path": path.as_str(), "content": content.as_str()}),
             )
@@ -797,7 +803,6 @@ fn register_codemode_functions(
     );
 
     let edit_tools = tools.clone();
-    let edit_protocols = protocols.clone();
     engine.register_fn(
         "edit",
         move |path: ImmutableString,
@@ -806,7 +811,6 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &edit_tools,
-                &edit_protocols,
                 "edit",
                 json!({
                     "path": path.as_str(),
@@ -819,22 +823,15 @@ fn register_codemode_functions(
     );
 
     let search_tools = tools.clone();
-    let search_protocols = protocols.clone();
     engine.register_fn(
         "search",
         move |query: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
-            call_tool(
-                &search_tools,
-                &search_protocols,
-                "search",
-                json!({"query": query.as_str()}),
-            )
-            .map(ImmutableString::from)
+            call_tool(&search_tools, "search", json!({"query": query.as_str()}))
+                .map(ImmutableString::from)
         },
     );
 
     let search_mode_tools = tools.clone();
-    let search_mode_protocols = protocols.clone();
     engine.register_fn(
         "search_mode",
         move |query: ImmutableString,
@@ -842,7 +839,6 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &search_mode_tools,
-                &search_mode_protocols,
                 "search",
                 json!({"query": query.as_str(), "mode": mode.as_str()}),
             )
@@ -851,28 +847,19 @@ fn register_codemode_functions(
     );
 
     let notes_tools = tools.clone();
-    let notes_protocols = protocols.clone();
     engine.register_fn(
         "notes_list",
         move || -> Result<ImmutableString, Box<EvalAltResult>> {
-            call_tool(
-                &notes_tools,
-                &notes_protocols,
-                "notes",
-                json!({"op": "list"}),
-            )
-            .map(ImmutableString::from)
+            call_tool(&notes_tools, "notes", json!({"op": "list"})).map(ImmutableString::from)
         },
     );
 
     let notes_read_tools = tools.clone();
-    let notes_read_protocols = protocols.clone();
     engine.register_fn(
         "notes_read",
         move |id: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &notes_read_tools,
-                &notes_read_protocols,
                 "notes",
                 json!({"op": "read", "id": id.as_str()}),
             )
@@ -881,7 +868,6 @@ fn register_codemode_functions(
     );
 
     let notes_add_tools = tools.clone();
-    let notes_add_protocols = protocols.clone();
     engine.register_fn(
         "notes_add",
         move |title: ImmutableString,
@@ -889,7 +875,6 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &notes_add_tools,
-                &notes_add_protocols,
                 "notes",
                 json!({"op": "add", "title": title.as_str(), "content": content.as_str()}),
             )
@@ -898,7 +883,6 @@ fn register_codemode_functions(
     );
 
     let notes_replace_tools = tools.clone();
-    let notes_replace_protocols = protocols.clone();
     engine.register_fn(
         "notes_replace",
         move |id: ImmutableString,
@@ -907,7 +891,6 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &notes_replace_tools,
-                &notes_replace_protocols,
                 "notes",
                 json!({
                     "op": "replace",
@@ -921,13 +904,11 @@ fn register_codemode_functions(
     );
 
     let notes_delete_tools = tools.clone();
-    let notes_delete_protocols = protocols.clone();
     engine.register_fn(
         "notes_delete",
         move |id: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &notes_delete_tools,
-                &notes_delete_protocols,
                 "notes",
                 json!({"op": "delete", "id": id.as_str()}),
             )
@@ -936,7 +917,6 @@ fn register_codemode_functions(
     );
 
     let steer_tools = tools.clone();
-    let steer_protocols = protocols.clone();
     engine.register_fn(
         "steer",
         move |target: ImmutableString,
@@ -944,7 +924,6 @@ fn register_codemode_functions(
               -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &steer_tools,
-                &steer_protocols,
                 "steer",
                 json!({"target": target.as_str(), "message": message.as_str()}),
             )
@@ -953,7 +932,6 @@ fn register_codemode_functions(
     );
 
     let mcp_tools = tools.clone();
-    let mcp_protocols = protocols.clone();
     engine.register_fn(
         "mcp",
         move |server: ImmutableString,
@@ -965,7 +943,6 @@ fn register_codemode_functions(
             })?;
             call_tool(
                 &mcp_tools,
-                &mcp_protocols,
                 "mcp",
                 json!({
                     "server": server.as_str(),
@@ -978,13 +955,11 @@ fn register_codemode_functions(
     );
 
     let apply_patch_tools = tools;
-    let apply_patch_protocols = protocols;
     engine.register_fn(
         "apply_patch",
         move |patch: ImmutableString| -> Result<ImmutableString, Box<EvalAltResult>> {
             call_tool(
                 &apply_patch_tools,
-                &apply_patch_protocols,
                 "apply_patch",
                 json!({"patch": patch.as_str()}),
             )
@@ -1003,7 +978,6 @@ fn append(sink: &Arc<Mutex<String>>, text: &str) {
 
 fn call_tool(
     tools: &Arc<OnceLock<Weak<ModelToolRegistry>>>,
-    protocols: &Arc<ProtocolRegistry>,
     name: &str,
     args: Value,
 ) -> std::result::Result<String, Box<EvalAltResult>> {
@@ -1011,8 +985,8 @@ fn call_tool(
         .get()
         .and_then(Weak::upgrade)
         .ok_or_else(|| script_error("tool registry is not ready"))?;
-    let result = tokio::runtime::Handle::current()
-        .block_on(async { registry.dispatch(name, &args, protocols).await });
+    let result =
+        tokio::runtime::Handle::current().block_on(async { registry.dispatch(name, &args).await });
     match result {
         Ok(output) => Ok(output.text().to_string()),
         Err(error) => Err(script_error(format!("tool {name} failed: {error:#}"))),
@@ -1131,53 +1105,29 @@ fn truncate_output(mut output: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::OutputStore;
-    use crate::task::TaskManager;
     use std::sync::Arc;
-
-    async fn protocols() -> ProtocolRegistry {
-        let output = Arc::new(
-            OutputStore::new(
-                &format!("traditional-{}", uuid::Uuid::now_v7().simple()),
-                1024,
-            )
-            .await
-            .unwrap(),
-        );
-        ProtocolRegistry::new(output, TaskManager::new())
-    }
 
     #[tokio::test]
     async fn read_write_and_edit_round_trip() {
         let directory = tempfile::tempdir().unwrap();
-        let protocols = protocols().await;
         let write = WriteTool::new(directory.path());
         write
-            .execute(
-                &json!({"path": "notes/todo.txt", "content": "alpha\nbeta\n"}),
-                &protocols,
-            )
+            .execute(&json!({"path": "notes/todo.txt", "content": "alpha\nbeta\n"}))
             .await
             .unwrap();
 
         let read = ReadTool::new(directory.path());
         let output = read
-            .execute(
-                &json!({"path": "notes/todo.txt", "offset": 2, "limit": 1}),
-                &protocols,
-            )
+            .execute(&json!({"path": "notes/todo.txt", "offset": 2, "limit": 1}))
             .await
             .unwrap();
-        assert!(output.output().contains("beta"));
-        assert!(!output.output().contains("alpha"));
+        assert!(output.text().contains("beta"));
+        assert!(!output.text().contains("alpha"));
 
         let edit = EditTool::new(directory.path());
-        edit.execute(
-            &json!({"path": "notes/todo.txt", "old_text": "beta", "new_text": "gamma"}),
-            &protocols,
-        )
-        .await
-        .unwrap();
+        edit.execute(&json!({"path": "notes/todo.txt", "old_text": "beta", "new_text": "gamma"}))
+            .await
+            .unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("notes/todo.txt"))
                 .await
@@ -1190,14 +1140,13 @@ mod tests {
     #[tokio::test]
     async fn bash_returns_output_and_exit_code() {
         let directory = tempfile::tempdir().unwrap();
-        let protocols = protocols().await;
         let bash = BashTool::new(directory.path());
         let output = bash
-            .execute(&json!({"command": "printf 'hello\\n'; exit 3"}), &protocols)
+            .execute(&json!({"command": "printf 'hello\\n'; exit 3"}))
             .await
             .unwrap();
-        assert!(output.output().contains("exit_code: 3"));
-        assert!(output.output().contains("hello"));
+        assert!(output.text().contains("exit_code: 3"));
+        assert!(output.text().contains("hello"));
     }
 
     #[cfg(unix)]
@@ -1208,16 +1157,12 @@ mod tests {
         fs::write(directory.path().join("sub/marker.txt"), "found\n")
             .await
             .unwrap();
-        let protocols = protocols().await;
         let bash = BashTool::new(directory.path());
         let output = bash
-            .execute(
-                &json!({"command": "cat marker.txt", "cwd": "sub"}),
-                &protocols,
-            )
+            .execute(&json!({"command": "cat marker.txt", "cwd": "sub"}))
             .await
             .unwrap();
-        assert!(output.output().contains("found"));
+        assert!(output.text().contains("found"));
     }
 
     struct EchoTool;
@@ -1237,41 +1182,24 @@ mod tests {
             }
         }
 
-        async fn execute(
-            &self,
-            arguments: &Value,
-            _protocols: &ProtocolRegistry,
-        ) -> Result<ModelToolOutput> {
+        async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
             Ok(format!("echo:{}", arguments["text"].as_str().unwrap_or_default()).into())
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn codemode_runs_a_script_and_returns_only_script_output() {
-        let protocols = Arc::new(protocols().await);
-        let output = Arc::new(
-            OutputStore::new(
-                &format!("codemode-{}", uuid::Uuid::now_v7().simple()),
-                32768,
-            )
-            .await
-            .unwrap(),
-        );
         let mut registry = ModelToolRegistry::new();
         registry.register(EchoTool).unwrap();
         let registry = Arc::new(registry);
-        let tool = CodemodeTool::new(protocols.clone(), output.clone());
+        let tool = CodemodeTool::new();
         tool.bind(Arc::downgrade(&registry));
         let result = tool
-            .execute(
-                &json!({
-                    "code": r#"let out = tool("echo", "{\"text\":\"hi\"}"); text(out);"#
-                }),
-                &protocols,
-            )
+            .execute(&json!({
+                "code": r#"let out = tool("echo", "{\"text\":\"hi\"}"); text(out);"#
+            }))
             .await
             .unwrap();
         assert!(result.text().contains("echo:hi"));
-        let _ = fs::remove_dir_all(output.directory()).await;
     }
 }

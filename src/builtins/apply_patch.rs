@@ -1,8 +1,7 @@
-use super::file::resolve_path;
+use super::resolve_path;
 use super::{EditableText, atomic_write};
 use crate::config::display_path;
 use crate::plugin::{ModelTool, ModelToolDescriptor, ModelToolOutput, Plugin, PluginHost};
-use crate::protocol::ProtocolRegistry;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -51,7 +50,7 @@ Relative paths resolve from the startup working directory; absolute paths are ac
 
 Matching first tries exact lines, then tolerates surrounding whitespace and common Unicode variants of spaces, dashes, and quotes. CRLF and LF files both match; original line endings and BOM are preserved.
 
-Parsing and planning failures leave files unchanged. If writing fails after some changes, URI Agent attempts to roll them back and reports any rollback failure."#;
+Parsing and planning failures leave files unchanged. If writing fails after some changes, UAT attempts to roll them back and reports any rollback failure."#;
 
 #[derive(Clone)]
 pub(super) struct ApplyPatchTool {
@@ -102,11 +101,7 @@ impl ModelTool for ApplyPatchTool {
         }
     }
 
-    async fn execute(
-        &self,
-        arguments: &Value,
-        _protocols: &ProtocolRegistry,
-    ) -> Result<ModelToolOutput> {
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput> {
         let arguments: ApplyPatchArguments = serde_json::from_value(arguments.clone())
             .context("invalid apply_patch tool arguments")?;
         if arguments.patch.is_empty() {
@@ -784,36 +779,21 @@ fn normalize_for_match(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::OutputStore;
-    use crate::task::TaskManager;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn direct_tool_returns_the_completed_patch() {
         let directory = tempfile::tempdir().unwrap();
-        let output_store = Arc::new(
-            OutputStore::new(
-                &format!("apply-patch-{}", uuid::Uuid::now_v7().simple()),
-                1024,
-            )
-            .await
-            .unwrap(),
-        );
-        let protocols = ProtocolRegistry::new(output_store.clone(), TaskManager::new());
         let tool = ApplyPatchTool::new(directory.path());
         let patch = "*** Begin Patch\n*** Add File: added.txt\n+added\n*** End Patch";
 
         let output = tool
-            .execute(
-                &json!({
-                    "patch": patch
-                }),
-                &protocols,
-            )
+            .execute(&json!({
+                "patch": patch
+            }))
             .await
             .unwrap();
 
-        assert!(output.output().contains("A added.txt"));
+        assert!(output.text().contains("A added.txt"));
         assert_eq!(
             fs::read_to_string(directory.path().join("added.txt"))
                 .await
@@ -826,7 +806,6 @@ mod tests {
                 .unwrap()
                 .contains("*** Add File: <path>")
         );
-        let _ = fs::remove_dir_all(output_store.directory()).await;
     }
 
     #[tokio::test]

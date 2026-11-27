@@ -1,222 +1,182 @@
 <p align="center">
-  <img src="docs/assets/logo.svg" width="420" alt="URI Agent logo">
+  <strong>UAT</strong>
 </p>
 
-# URI Agent
+# UAT
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6ed2c2.svg)](LICENSE)
 
-URI Agent is an extensible terminal coding agent that keeps model context
-focused on the current task. Its tools use URI protocols to load their full
-contracts, instructions, and resources only when selected, much like Skills in
-other agents. At first, the model sees only each tool's compact name and
-description.
+UAT is a small, text-only coding agent designed to be composed by scripts. It
+provides ordinary tools, a Rhai codemode for combining them, MCP access, durable
+notes, code search, and an HTTP ingress. Inputs and outputs are plain text; UAT
+does not write final answers to files on its own.
 
 > [!NOTE]
-> The URI-protocol implementation described here is preserved on the
+> The previous URI/protocol implementation is preserved on the
 > [`legacy/uri-protocol`](https://github.com/4fuu/uri-agent/tree/legacy/uri-protocol)
-> branch. Its last version is `2026.1030.0`.
-
-Four built-in tools give the model a compact interface for loading, reading,
-executing, and editing:
-
-```text
-help(protocols: string[])
-protocol(steps: object[])
-replace(path: string, old_text: string, new_text: string)
-apply_patch(patch: string)
-```
-
-`help` loads protocol contracts on demand. The `protocol` tool takes one to
-eight step objects, each with a `read` or `exec` URI address and an optional
-`input` object, and routes them through URI protocols; later steps can
-reference earlier results. Typed tools handle structured or escape-heavy
-arguments.
-
-> [!WARNING]
-> URI Agent is not a sandbox. File and shell protocols run with the authority
-> of the `uri-agent` process. Use only projects, configuration, and plugins
-> you trust.
-
-URI Agent is an early release and may change between dated versions. Model
-requests and their context are sent to the provider you select. Unless offline
-mode is enabled, URI Agent also fetches model catalog metadata from pi.dev and
-supported providers.
-
-## Why URI Agent
-
-- **Progressive context:** load protocol contracts, Skill resources, embedded
-  documentation, and oversized output only when they are needed.
-- **Extensible tools:** add protocols or typed tools through linked Rust plugins
-  without changing runtime dispatch.
-- **Built-in MCP bridge:** connect stdio and Streamable HTTP servers with
-  `:mcp`. Each server becomes an on-demand `<name>-mcp://` protocol, with
-  tool arguments passed through as the step's `input` object unchanged.
-- **ACP editor integration:** use URI Agent from compatible editors through
-  stable ACP v1 over stdio. Each session can select its model, and its
-  conversation can later reopen in the normal TUI.
-- **Scriptable one-shot runs:** `uri-agent -x "<prompt>"` runs one
-  non-interactive turn and exits: the reply goes to stdout, one-line progress
-  to stderr, and the session is saved for later resume. `uri-agent models`
-  lists runnable `<provider>/<id>` values for `--model`.
-- **Broad model access:** choose from the pi.dev catalog, use provider-specific
-  sign-in, and discover account models without leaving the model selector.
-- **Durable work:** let long commands continue as managed tasks and resume work
-  across restarts. Append-only SQLite sessions preserve drafts, frozen startup
-  context, titled working notes, and rollover or summary checkpoints.
-- **Session collaboration:** send prompts or steering input from one running
-  session to another local URI Agent process by name.
-- **Local semantic retrieval:** run on-demand semantic and hybrid search across
-  project files and saved conversations with bundled zvec and Model2Vec assets.
-- **One terminal workflow:** use Queue and Steer, web access, keyboard and mouse
-  controls, image input, and `@` file or `@@` session references from one
-  conversation surface. Narrow terminals, such as a phone over SSH, switch to a
-  compact touch layout.
-
-## Model and provider coverage
-
-URI Agent targets broad compatibility with the pi.dev catalog rather than a
-fixed handful of models. As of 2026-09-17, the catalog coverage is:
-
-| Catalog measure | Supported |
-| --- | ---: |
-| API families | 5 of 9 |
-| Model entries | 1,161 of 1,405 (82.6%) |
-| Provider IDs | 35 of 39 |
-| Provider IDs with live discovery | 29 of 35 runnable |
-
-The current supported API families are OpenAI Responses, OpenAI Codex Responses,
-OpenAI Chat Completions, Anthropic Messages, Google Generative AI, and
-`pi-messages`. Live provider results are cached per credential and supplement
-the shared catalog, so newly available account models can appear before pi.dev
-adds them.
-
-Where generic catalog compatibility is not enough, URI Agent provides dedicated
-integrations for:
-
-- ChatGPT Codex subscription OAuth and WebSocket transport;
-- Cloudflare AI Gateway with credential-safe endpoint handling;
-- WorkBuddy China browser login and account model discovery;
-- Radius authenticated model discovery and native `pi-messages` transport;
-- Muse Code subscription login and account model discovery;
-- Abliteration.ai credential-scoped live discovery with static fallback
-  models; and
-- StepFun Step Plan API-key login with live discovery and static fallback
-  reasoning models.
-
-URI Agent also supports provider-specific login flows for GitHub Copilot, Kimi
-Coding, xAI, and OpenRouter.
-
-Catalog contents and account entitlements change; a listed model still requires
-the matching credentials, region, and subscription. See [Models and
-configuration](docs/configuration.md#model-catalog) for current provider,
-discovery, authentication, and compatibility details.
+> branch. Its last version is `2026.1030.0`. The current `main` branch has no
+> URI/protocol tool form.
 
 ## Quick start
 
-### Requirements
-
-- credentials for a supported model provider;
-- a terminal with standard keyboard input. Mouse support is optional.
-
-### Install
-
-With Homebrew on Apple Silicon macOS:
+Requirements: stable Rust, and a model provider credential. Search also uses a
+bundled or downloaded `rg`.
 
 ```bash
-brew tap 4fuu/uri-agent https://github.com/4fuu/uri-agent
-brew install 4fuu/uri-agent/uri-agent
+# Release archives bundle the native retrieval library. For a source build,
+# stage it first (see docs/development.md#native-retrieval-assets).
+cargo build --release --bin uat
+
+export DEEPSEEK_API_KEY=...
+./target/release/uat -x "summarize this repository"
 ```
 
-With Scoop on 64-bit Windows:
-
-```powershell
-scoop bucket add uri-agent https://github.com/4fuu/uri-agent
-scoop install uri-agent
-```
-
-On x86-64 or ARM64 Linux, the installer verifies the release checksum and
-installs the complete versioned bundle under `~/.local/bin`:
+`uat -x "<prompt>"` runs one turn, prints only the final assistant reply to
+stdout, writes progress to stderr, and exits. Piped stdin is appended to the
+prompt:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/4fuu/uri-agent/main/scripts/install.sh | sh
+cat error.log | uat -x "explain this failure"
 ```
 
-Every installation method above includes the matching zvec dynamic library,
-Jieba dictionaries, and embedding model. URI Agent does not download these
-semantic retrieval assets at runtime. Source builds must prepare the same
-assets as described in the [development
-guide](docs/development.md#native-retrieval-assets).
-
-### Start your first session
-
-Launch URI Agent with the project directory it should use:
+Run `uat` without a prompt for the line-oriented REPL, or resume a session:
 
 ```bash
-uri-agent --cwd /path/to/project
+uat --continue-session
+uat --session <session-id>
 ```
 
-`--cwd` selects the project and default working directory; it does not restrict
-filesystem access. If the project contains `AGENTS.md`, review it before
-launch: new sessions include those instructions in their frozen startup
-context.
+## Tools
 
-URI Agent does not choose a default model. In the TUI:
+UAT exposes a deliberately small model-facing surface:
 
-1. Run `:login` to save an API key or complete a supported OAuth flow.
-2. Run `:model` and select a runnable model.
-3. Press `Space`, enter a request, and press `Enter`.
-
-The first session is working when protocol activity appears and the assistant
-returns an answer based on the project. Press `F1` or run `:help` for the active
-commands and key bindings.
-
-See [Models and configuration](docs/configuration.md) for provider support,
-authentication, offline mode, environment variables, and custom endpoints.
-
-### Connect an ACP client
-
-After signing in to a model provider in the TUI, configure an ACP client to
-launch:
-
-```text
-uri-agent --acpv1
-```
-
-The client supplies an absolute project directory for each session, and one ACP
-process can host independent sessions for multiple projects. Compatible ACP
-clients can select an authenticated model and thinking level before the first
-prompt without changing URI Agent's defaults. The first prompt persists the
-session under its assigned ID; after the client releases it, the session can
-reopen in the TUI. See [ACP v1](docs/acp.md) for supported content, MCP servers,
-lifecycle operations, and ownership constraints.
-
-## Documentation
-
-| Goal | Guide |
+| Tool | Purpose |
 | --- | --- |
-| Connect an editor or other ACP client | [ACP v1](docs/acp.md) |
-| Choose providers, authenticate, or change settings | [Models and configuration](docs/configuration.md) |
-| Use the conversation, commands, keymap, terminal, or attachments | [Terminal interface](docs/interface.md) and [terminal features](docs/terminal.md) |
-| Understand tools, protocols, tasks, and complete output | [Protocols, tasks, and output](docs/protocols.md) |
-| Use project instructions or Skills | [Startup context and Skills](docs/context.md) |
-| Resume sessions or understand collaboration, notes, rollover, and persistence | [Sessions and context](docs/sessions.md) |
-| Report pane state to the Herdr terminal multiplexer | [Herdr reporting](docs/sessions.md#herdr-terminal-multiplexer-reporting) |
-| Notify the Moshi app of session lifecycle over moshi-hook | [Moshi reporting](docs/sessions.md#moshi-reporting) |
+| `read` | Read a text file with optional offset and line limit |
+| `write` | Write a file atomically |
+| `edit` | Replace one exact text occurrence |
+| `bash` | Run a shell command in the project; returns output and exit code |
+| `search` | Exact ripgrep search, or semantic/hybrid code search |
+| `notes` | List, read, add, replace, and delete durable session notes |
+| `steer` | List active sessions, name this session, or send another session a message |
+| `mcp` | List and call tools, prompts, and resources on configured MCP servers |
+| `apply_patch` | Apply one transactional multi-file Codex-style patch |
+| `codemode` | Run a Rhai script that calls the other tools |
 
-The [`docs/` index](docs/README.md) includes contributor and release guides. Run
-`uri-agent docs <topic>` to print any of these documents from the binary itself,
-or `uri-agent --help` for the complete CLI, environment, settings, and file
-reference. At runtime, a protocol's page loaded through the `help` tool is the
-authoritative reference for its accepted URIs and `input` fields; `F1` and
-`:help` show the active interface reference.
+`codemode` keeps intermediate tool output inside the script. Only values passed
+to `text(...)` or returned by the script enter the model conversation.
 
-## Development
+```rhai
+let files = bash("rg -n 'TODO' src");
+let notes = notes_list();
+text(files);
+text(notes);
+```
 
-The project builds on stable Rust. Read [`AGENTS.md`](AGENTS.md) before changing the repository; the [development guide](docs/development.md) defines module ownership, change rules, and required verification.
+## HTTP interface
 
-## License
+`uat serve` exposes the same runtime over HTTP so another process, language, or
+shell can compose it:
 
-[MIT](LICENSE) © 2026 4fuu
+```bash
+UAT_HTTP_TOKEN=change-me uat serve --listen 127.0.0.1:8737
+```
+
+```bash
+# Run a prompt and wait for the reply.
+curl -s http://127.0.0.1:8737/v1/messages \
+  -H 'Authorization: Bearer change-me' \
+  -H 'content-type: application/json' \
+  -d '{"text":"review the current diff"}'
+
+# Start work without waiting, then poll the session.
+curl -s http://127.0.0.1:8737/v1/messages \
+  -H 'Authorization: Bearer change-me' \
+  -H 'content-type: application/json' \
+  -d '{"text":"inspect the tests","wait":false}'
+
+curl -s http://127.0.0.1:8737/v1/sessions/<session-id> \
+  -H 'Authorization: Bearer change-me'
+
+# Inject steering input into an active turn.
+curl -s http://127.0.0.1:8737/v1/messages \
+  -H 'Authorization: Bearer change-me' \
+  -H 'content-type: application/json' \
+  -d '{"session":"<session-id>","text":"also check Windows paths","mode":"steer"}'
+```
+
+Endpoints: `GET /v1/health`, `GET /v1/sessions`,
+`GET /v1/sessions/{id}`, `POST /v1/messages`, and
+`POST /v1/sessions/{id}/cancel`. A non-loopback bind requires
+`UAT_HTTP_TOKEN`; protect a loopback server too if other local users are not
+trusted.
+
+## Sessions and context
+
+Sessions are append-only SQLite records. A session freezes its system prompt
+and project instructions at creation, preserves pending input across restarts,
+and checkpoints the context with summaries near the model's limit. `notes` is
+the durable working record; `search` covers the live workspace.
+
+`steer` coordinates already-running UAT processes. Use `delivery: "steer"` for
+the next model boundary or `delivery: "queue"` for a later turn. A successful
+send means the target accepted the message durably, not that it has finished
+the work.
+
+## MCP
+
+Configure servers in `<config>/mcp.json` globally or `.agents/mcp.json` per
+project. The file shape is:
+
+```json
+{
+  "servers": {
+    "github": {
+      "description": "GitHub tools for this repository",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "environment": {"GITHUB_TOKEN": "GITHUB_TOKEN"}
+    }
+  }
+}
+```
+
+The `mcp` tool then lists server tools and calls them. MCP content is marked as
+untrusted reference data.
+
+## Configuration
+
+UAT reads `<config>/settings.json`, project `.uat/settings.json`, environment
+variables, and command-line flags. The default config directory is
+`~/.config/uat` on Linux/macOS (use `UAT_CONFIG_DIR` to override). API keys may
+come from provider environment variables, `--api-key`, or `<config>/auth.json`.
+Without the URI protocol layer there is no in-app settings panel; these files
+and `uat --help` are the configuration surface.
+
+See [documentation](docs/README.md) for details:
+
+- [Tools and codemode](docs/tools.md)
+- [Configuration](docs/configuration.md)
+- [Sessions and HTTP](docs/sessions.md)
+- [Project context](docs/context.md)
+- [Development](docs/development.md)
+
+## Build notes
+
+Release archives include the zvec native library, embedding model, and
+dictionaries. A Cargo-installed binary cannot include them, so source builds
+must stage those assets and set the platform library path. See
+[development](docs/development.md#native-retrieval-assets).
+
+## Security
+
+UAT is not a sandbox. File, shell, and MCP tools run with the authority of the
+`uat` process. Only run it on projects and with MCP servers you trust. Peer
+messages and MCP content are untrusted data, not authorization.
+
+UAT is an early release and may change between dated versions. Model requests
+and their context are sent to the provider you select. Unless offline mode is
+enabled, UAT fetches model catalog metadata from pi.dev and supported providers.

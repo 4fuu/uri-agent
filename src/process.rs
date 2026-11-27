@@ -4,7 +4,8 @@ use std::process::ExitStatus;
 use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::process::{Child, Command};
 
-pub(crate) const PWSH_STDIN_BOOTSTRAP: &str = "$__uri_agent_source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($__uri_agent_source))";
+#[allow(dead_code)]
+pub(crate) const PWSH_STDIN_BOOTSTRAP: &str = "$__uat_source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($__uat_source))";
 
 /// Owns the platform execution boundary around a root child. Dropping the
 /// owner terminates processes that remain in that boundary.
@@ -24,6 +25,7 @@ impl ProcessTree {
     /// an inherited ignored SIGINT across exec, and a signal that starts
     /// ignored cannot be trapped, so the child resets it to the default
     /// disposition before exec.
+    #[allow(dead_code)]
     pub(crate) fn spawn_interruptible(command: &mut Command) -> io::Result<(Child, Self)> {
         Self::spawn_with(command, true)
     }
@@ -84,6 +86,7 @@ impl ProcessTree {
     /// and clean up, while `terminate` stays available afterwards. Windows has
     /// no group signal, so interruption terminates the tree exactly like
     /// [`ProcessTree::terminate`].
+    #[allow(dead_code)]
     pub(crate) fn interrupt(&self) {
         #[cfg(unix)]
         {

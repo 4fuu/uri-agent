@@ -25,17 +25,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub(crate) use crate::model::antigravity::{ensure_antigravity_version, generation_user_agent};
-pub(crate) use cloudflare::{
-    ACCOUNT_ID_METADATA as CLOUDFLARE_ACCOUNT_ID_METADATA,
-    DEFAULT_GATEWAY_ID as CLOUDFLARE_DEFAULT_GATEWAY_ID,
-    GATEWAY_ID_METADATA as CLOUDFLARE_GATEWAY_ID_METADATA, PROVIDER as CLOUDFLARE_PROVIDER,
-};
 pub(crate) use failure::{
     ModelFailure, ModelFailureKind, ModelFailurePhase, looks_like_cerebras_bodyless_overflow,
     looks_like_context_overflow,
 };
-#[cfg(test)]
-pub(crate) use retry::MAX_RETRY_AFTER;
 pub(crate) use retry::{model_retry_delay, model_retry_policy, model_retry_reason};
 
 #[derive(Clone, Debug)]

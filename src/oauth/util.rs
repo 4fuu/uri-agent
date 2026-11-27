@@ -117,7 +117,7 @@ pub fn form_body(fields: &[(&str, &str)]) -> String {
 pub fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("uri-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("uat/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }
 

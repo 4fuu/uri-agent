@@ -1,4 +1,5 @@
 /target/
 /.amp/
 /.uri-agent/
+/.uat/
 *.log

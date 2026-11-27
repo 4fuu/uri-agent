@@ -446,7 +446,7 @@ impl ModelCatalog {
             models_dev_path: models_dev::cache_path(directory),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(4))
-                .user_agent(concat!("uri-agent/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!("uat/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             providers_url: PROVIDERS_URL.to_string(),
             offline,

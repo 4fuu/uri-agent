@@ -973,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn response_output_is_normalized_to_uri_agent_history_replay() {
+    fn response_output_is_normalized_to_uat_history_replay() {
         let item = json!({
             "type": "message",
             "id": "msg_1",

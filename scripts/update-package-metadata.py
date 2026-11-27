@@ -17,7 +17,7 @@ TARGETS = {
 
 
 def asset_name(version: str, target: str, extension: str) -> str:
-    return f"uri-agent-{version}-{target}.{extension}"
+    return f"uat-{version}-{target}.{extension}"
 
 
 def read_checksums(version: str, path: Path) -> dict[str, str]:
@@ -55,7 +55,7 @@ def formula(version: str, checksums: dict[str, str]) -> str:
 
     mac_arm_url, mac_arm_sha = source("mac_arm")
     return f'''class UriAgent < Formula
-  desc "Protocol-oriented coding agent with a focused terminal interface"
+  desc "Text-only coding agent with traditional tools and codemode"
   homepage "{REPOSITORY}"
   version "{version}"
   license "MIT"
@@ -68,11 +68,11 @@ def formula(version: str, checksums: dict[str, str]) -> str:
 
   def install
     libexec.install Dir["*"]
-    bin.install_symlink libexec/"uri-agent"
+    bin.install_symlink libexec/"uat"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{{bin}}/uri-agent --version")
+    assert_match version.to_s, shell_output("#{{bin}}/uat --version")
   end
 end
 '''
@@ -83,7 +83,7 @@ def scoop_manifest(version: str, checksums: dict[str, str]) -> dict[str, object]
     asset = asset_name(version, target, extension)
     return {
         "version": version,
-        "description": "Protocol-oriented coding agent with a focused terminal interface",
+        "description": "Text-only coding agent with traditional tools and codemode",
         "homepage": REPOSITORY,
         "license": "MIT",
         "notes": "The native retrieval runtime, dictionaries, and embedding model are bundled in the installation directory.",
@@ -93,12 +93,12 @@ def scoop_manifest(version: str, checksums: dict[str, str]) -> dict[str, object]
                 "hash": checksums[asset],
             }
         },
-        "bin": "uri-agent.exe",
+        "bin": "uat.exe",
         "checkver": {"github": REPOSITORY},
         "autoupdate": {
             "architecture": {
                 "64bit": {
-                    "url": f"{REPOSITORY}/releases/download/v$version/uri-agent-$version-{target}.zip"
+                    "url": f"{REPOSITORY}/releases/download/v$version/uat-$version-{target}.zip"
                 }
             }
         },

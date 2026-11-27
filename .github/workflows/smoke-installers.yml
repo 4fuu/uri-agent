@@ -4,13 +4,13 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Released URI Agent version
+        description: Released UAT version
         required: true
         type: string
   workflow_dispatch:
     inputs:
       version:
-        description: Released URI Agent version
+        description: Released UAT version
         required: true
         type: string
 
@@ -41,9 +41,9 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          URI_AGENT_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh "$VERSION"
-          "$RUNNER_TEMP/bin/uri-agent" --version | grep -F "uri-agent $VERSION"
-          root="$RUNNER_TEMP/bin/uri-agent-$VERSION"
+          UAT_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh "$VERSION"
+          "$RUNNER_TEMP/bin/uat" --version | grep -F "uat $VERSION"
+          root="$RUNNER_TEMP/bin/uat-$VERSION"
           test -f "$root/libzvec_c_api.so"
           test -f "$root/retrieval/models/potion-code-16M-v2/model.safetensors"
           test -f "$root/retrieval/models/potion-code-16M-v2/tokenizer.json"
@@ -58,7 +58,7 @@ jobs:
           [[ "$(uname -m)" == arm64 ]]
           brew tap 4fuu/uri-agent "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
           brew install 4fuu/uri-agent/uri-agent
-          uri-agent --version | grep -F "uri-agent $VERSION"
+          uat --version | grep -F "uat $VERSION"
           root="$(brew --prefix uri-agent)/libexec"
           test -f "$root/libzvec_c_api.dylib"
           test -f "$root/retrieval/models/potion-code-16M-v2/model.safetensors"
@@ -77,8 +77,8 @@ jobs:
           if ($hash -ne $manifest.architecture.'64bit'.hash) { throw "Checksum mismatch" }
           $destination = Join-Path $env:RUNNER_TEMP "uri-agent"
           Expand-Archive $archive $destination
-          $output = & "$destination/uri-agent.exe" --version
-          if ($output -ne "uri-agent $env:VERSION") { throw "Unexpected version: $output" }
+          $output = & "$destination/uat.exe" --version
+          if ($output -ne "uat $env:VERSION") { throw "Unexpected version: $output" }
           @(
             "$destination/zvec_c_api.dll",
             "$destination/retrieval/models/potion-code-16M-v2/model.safetensors",

@@ -354,7 +354,7 @@ async fn openrouter_replays_encrypted_reasoning_across_tool_rounds() {
                 "delta": {
                     "tool_calls": [{
                         "index": 0,
-                        "function": {"arguments": "{\"uri\":\"file://README.md\",\"body\":\"\"}"}
+                        "function": {"arguments": "{\"path\":\"README.md\",\"body\":\"\"}"}
                     }]
                 },
                 "finish_reason": null
@@ -937,7 +937,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
                 "id": "fc_1",
                 "call_id": "call_1",
                 "name": "read",
-                "arguments": "{\"uri\":\"file://README.md\",\"body\":\"\"}",
+                "arguments": "{\"path\":\"README.md\",\"body\":\"\"}",
                 "status": "completed"
             }
         ],
@@ -987,7 +987,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
             "item_id": "fc_1",
             "output_index": 2,
             "sequence_number": 5,
-            "delta": "{\"uri\":\"file://README.md\",\"body\":\"\"}"
+            "delta": "{\"path\":\"README.md\",\"body\":\"\"}"
         }),
         json!({
             "type": "response.output_item.done",
@@ -999,7 +999,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
                 "id": "fc_1",
                 "call_id": "call_1",
                 "name": "read",
-                "arguments": "{\"uri\":\"file://README.md\",\"body\":\"\"}",
+                "arguments": "{\"path\":\"README.md\",\"body\":\"\"}",
                 "status": "completed"
             }
         }),
@@ -1067,7 +1067,7 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
     assert!(request_headers.contains("session-id: codex-sse-stream-session"));
     assert!(request_headers.contains("x-client-request-id: codex-sse-stream-session"));
     assert!(!request_headers.contains("session_id:"));
-    assert!(request_headers.contains("user-agent: uri-agent/"));
+    assert!(request_headers.contains("user-agent: uat/"));
     assert_eq!(request_body["model"], "gpt-5.4");
     assert_eq!(request_body["instructions"], "System instructions");
     assert_eq!(request_body["input"][0]["role"], "user");
@@ -1110,12 +1110,12 @@ async fn codex_backend_sends_oauth_request_and_streams_text_tools_and_usage() {
         tool_deltas.iter().filter(|delta| **delta == "read").count(),
         1
     );
-    assert!(tool_deltas.concat().contains("file://README.md"));
+    assert!(tool_deltas.concat().contains("README.md"));
     assert!(response.content.iter().any(|content| {
         matches!(content, AssistantContent::ToolCall(call)
         if call.function.name == "read"
             && call.function.arguments == json!({
-                "uri": "file://README.md",
+                "path": "README.md",
                 "body": ""
             }))
     }));
@@ -1328,8 +1328,8 @@ fn unparseable_streamed_tool_arguments_retry_instead_of_aborting_the_turn() {
     // parsed. Both observed shapes — an invalid escape and a self-truncated
     // array — must reach the retry policy instead of aborting the turn.
     for message in [
-        "ResponseError: tool call `protocol` arrived with malformed JSON input: invalid escape at line 1 column 176",
-        "ResponseError: tool call `protocol` arrived with malformed JSON input: expected , or ] at line 1 column 341",
+        "ResponseError: tool call `custom` arrived with malformed JSON input: invalid escape at line 1 column 176",
+        "ResponseError: tool call `custom` arrived with malformed JSON input: expected , or ] at line 1 column 341",
     ] {
         let failure = ModelFailure::from_completion_error(
             CompletionError::ResponseError(message.to_string()),
@@ -2076,7 +2076,7 @@ fn opencode_requests_use_stable_session_header_and_preserve_user_agent() {
     transform.transform_headers(&mut headers);
     assert_eq!(
         headers[http::header::USER_AGENT],
-        concat!("uri-agent/", env!("CARGO_PKG_VERSION"))
+        concat!("uat/", env!("CARGO_PKG_VERSION"))
     );
 
     let transform = ModelRequestTransform {
@@ -2445,7 +2445,7 @@ fn gemini_uses_level_for_v3_and_budget_for_v25() {
 
 #[test]
 fn google_declarations_carry_the_original_tool_schema_as_parameters_json_schema() {
-    // The protocol tool's real shape: fixed step fields plus one free-form
+    // The custom tool's real shape: fixed step fields plus one free-form
     // object and schema keywords the legacy rig `Schema` conversion drops.
     let original = json!({
         "type": "object",
@@ -2468,7 +2468,7 @@ fn google_declarations_carry_the_original_tool_schema_as_parameters_json_schema(
                     "exec": {"type": "string"},
                     "input": {
                         "type": "object",
-                        "description": "Protocol input; the protocol's help page defines the fields"
+                        "description": "Free-form input object"
                     },
                     "id": {"type": "string"},
                     "if": {"type": "string"},
@@ -2479,8 +2479,8 @@ fn google_declarations_carry_the_original_tool_schema_as_parameters_json_schema(
         }
     });
     let tools = vec![ToolDefinition {
-        name: "protocol".to_string(),
-        description: "Call registered protocols through ordered steps.".to_string(),
+        name: "custom".to_string(),
+        description: "Call a custom operation.".to_string(),
         parameters: original.clone(),
     }];
     let transform = ModelRequestTransform {
@@ -2497,7 +2497,7 @@ fn google_declarations_carry_the_original_tool_schema_as_parameters_json_schema(
         serde_json::to_vec(&json!({
             "contents": [{"role": "user", "parts": [{"text": "read the file"}]}],
             "tools": [{"functionDeclarations": [{
-                "name": "protocol",
+                "name": "custom",
                 "description": "Call registered protocols through ordered steps.",
                 "parameters": {"type": "object", "properties": {}}
             }]}]
@@ -2516,7 +2516,7 @@ fn google_declarations_carry_the_original_tool_schema_as_parameters_json_schema(
         schema["$defs"]["step"]["properties"]["input"],
         json!({
             "type": "object",
-            "description": "Protocol input; the protocol's help page defines the fields"
+            "description": "Free-form input object"
         })
     );
     assert_eq!(

@@ -43,7 +43,7 @@ impl Default for BinaryDownloader {
         Self {
             directory: dirs::cache_dir()
                 .unwrap_or_else(std::env::temp_dir)
-                .join("uri-agent")
+                .join("uat")
                 .join("tools"),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))

@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY=${URI_AGENT_REPOSITORY:-4fuu/uri-agent}
-INSTALL_DIR=${URI_AGENT_INSTALL_DIR:-"$HOME/.local/bin"}
+REPOSITORY=${UAT_REPOSITORY:-4fuu/uri-agent}
+INSTALL_DIR=${UAT_INSTALL_DIR:-"$HOME/.local/bin"}
 REQUESTED_VERSION=${1:-latest}
 
 fail() {
-    printf 'uri-agent installer: %s\n' "$*" >&2
+    printf 'uat installer: %s\n' "$*" >&2
     exit 1
 }
 
@@ -33,7 +33,7 @@ version=${tag#v}
 printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
     || fail "invalid release version: $tag"
 
-asset="uri-agent-$version-$target.tar.gz"
+asset="uat-$version-$target.tar.gz"
 download_url="https://github.com/$REPOSITORY/releases/download/$tag"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/uri-agent-install.XXXXXX")
 stage_dir=
@@ -68,7 +68,7 @@ fi
 
 mkdir "$tmp_dir/archive"
 tar -xzf "$tmp_dir/$asset" -C "$tmp_dir/archive"
-[ -f "$tmp_dir/archive/uri-agent" ] || fail "release archive does not contain uri-agent"
+[ -f "$tmp_dir/archive/uat" ] || fail "release archive does not contain uat"
 [ -f "$tmp_dir/archive/libzvec_c_api.so" ] || fail "release archive does not contain libzvec_c_api.so"
 [ -f "$tmp_dir/archive/retrieval/models/potion-code-16M-v2/model.safetensors" ] \
     || fail "release archive does not contain the embedding model"
@@ -76,12 +76,12 @@ tar -xzf "$tmp_dir/$asset" -C "$tmp_dir/archive"
     || fail "release archive does not contain the Jieba dictionary"
 
 mkdir -p "$INSTALL_DIR"
-version_dir="$INSTALL_DIR/uri-agent-$version"
-stage_dir=$(mktemp -d "$INSTALL_DIR/.uri-agent-$version.tmp.XXXXXX")
+version_dir="$INSTALL_DIR/uat-$version"
+stage_dir=$(mktemp -d "$INSTALL_DIR/.uat-$version.tmp.XXXXXX")
 cp -R "$tmp_dir/archive/." "$stage_dir/"
-chmod 0755 "$stage_dir/uri-agent"
+chmod 0755 "$stage_dir/uat"
 if [ -e "$version_dir" ] || [ -L "$version_dir" ]; then
-    old_dir="$INSTALL_DIR/.uri-agent-$version.old.$$"
+    old_dir="$INSTALL_DIR/.uat-$version.old.$$"
     mv "$version_dir" "$old_dir"
 fi
 if ! mv "$stage_dir" "$version_dir"; then
@@ -89,17 +89,17 @@ if ! mv "$stage_dir" "$version_dir"; then
     fail "could not activate $version_dir"
 fi
 stage_dir=
-link_tmp="$INSTALL_DIR/.uri-agent-link.$$"
-ln -s "uri-agent-$version/uri-agent" "$link_tmp"
-mv -f "$link_tmp" "$INSTALL_DIR/uri-agent"
+link_tmp="$INSTALL_DIR/.uat-link.$$"
+ln -s "uat-$version/uat" "$link_tmp"
+mv -f "$link_tmp" "$INSTALL_DIR/uat"
 link_tmp=
 if [ -n "$old_dir" ]; then
     rm -rf "$old_dir"
     old_dir=
 fi
 
-printf 'Installed uri-agent %s to %s (launcher: %s/uri-agent)\n' "$version" "$version_dir" "$INSTALL_DIR"
+printf 'Installed uat %s to %s (launcher: %s/uat)\n' "$version" "$version_dir" "$INSTALL_DIR"
 case :${PATH:-}: in
     *:"$INSTALL_DIR":*) ;;
-    *) printf 'Add %s to PATH to run uri-agent.\n' "$INSTALL_DIR" ;;
+    *) printf 'Add %s to PATH to run uat.\n' "$INSTALL_DIR" ;;
 esac

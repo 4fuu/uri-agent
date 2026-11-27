@@ -1,78 +1,80 @@
-# Startup context and Skills
+# Context
 
-URI Agent builds startup context for each new session from its core prompt, prompt-only plugins, configured protocol descriptors, and discovered Skills. Preparation begins in the background after the TUI opens; the first user message waits for the complete result. URI Agent then freezes the system prompt, session-scoped protocol records, and Skill selection so later filesystem or environment changes do not reinterpret an existing session.
+## Frozen startup context
 
-## Project instructions
+A new session builds its system prompt from:
 
-When the canonical project directory contains `AGENTS.md`, a prompt-only built-in plugin appends its content to the new session's system prompt:
+- the text-mode operating prompt;
+- the selected tool names and descriptions;
+- the project's `AGENTS.md`, when present.
 
-```text
-<project_rule_md>
-The following content is from the project's AGENTS.md. Follow these instructions.
+The complete prompt is frozen in the session's `session_context` event before
+the first model request. Resuming a session reuses that frozen prompt even if
+`AGENTS.md` or the tool registry changed later. A new session picks up current
+files.
 
-<AGENTS.md content>
-</project_rule_md>
-```
+`AGENTS.md` content is wrapped in `<project_rule_md>` and identified as project
+instructions. Files are read once at startup; UAT does not rescan during the
+session.
 
-A missing file contributes nothing; other read failures prevent the first message from starting. Changes to `AGENTS.md` apply only to new sessions.
+## Tools and prompt size
 
-The project-instruction plugin does not register a protocol, command, panel,
-status provider, key binding, or setting.
-
-## Skills
-
-### Discovery
-
-For a new session, URI Agent scans these roots once while preparing its startup context, from highest to lowest priority:
+The model sees only selected tools. The simple spec selects:
 
 ```text
-<project>/.agents/skills
-<project>/.claude/skills
-<project>/.codex/skills
-~/.agents/skills
-~/.claude/skills
-~/.codex/skills
+read, write, edit, bash, search, notes, steer, codemode, mcp, apply_patch
 ```
 
-Each root may contain `SKILL.md` directly or in one immediate child directory. Discovery does not recurse deeper.
+Tool definitions are part of every request and therefore part of the measured
+context. Adding tools is not free. Prefer extending `codemode` or an MCP server
+over adding another always-visible tool.
 
-A Skill begins with YAML frontmatter containing nonempty `name` and `description` values:
+## Notes
 
-```yaml
----
-name: Code Review
-description: Review a change for correctness and regressions.
----
-```
+`notes` is the durable working-state channel. Note events live in the session
+log independently of model history, so they remain readable after a summary
+checkpoint, a restart, or a connection from another session that reads the same
+session record.
 
-### Protocol name and resources
+Use notes for:
 
-URI Agent lowercases the name, replaces runs of non-ASCII-alphanumeric characters with `-`, and appends `-skill` when absent. The example registers a help page plus resource routes such as:
+- the current goal and constraints;
+- decisions and rejected alternatives;
+- exact file paths and commands that matter;
+- verified results and remaining work.
 
-```text
-help(["code-review-skill"])
+Do not use notes as a transcript copy. Keep entries short and replace stale
+entries instead of accumulating duplicates.
 
-{"read": "code-review-skill://scripts/check.py"}
-```
+The note budget is a percentage of the context available after the base prompt
+and current usage. A hard budget rejects writes that would exceed it; a warning
+budget appears in the note index first. Delete or consolidate stale notes when
+the warning appears.
 
-The first Skill for a normalized protocol name wins. Later duplicates and names that collide with an existing protocol are skipped with a notice.
+## Search and history
 
-A Skill protocol's help page is its `SKILL.md`, loaded through the `help` tool; read targets read files relative to the Skill directory. Absolute targets and paths that escape that directory, including through symlinks, are rejected.
+`search` reads the live workspace. It does not depend on session history and
+does not index previous conversations.
 
-### Frozen session behavior
+UAT does not expose a history-search tool. If a later session needs prior work,
+the earlier session's notes are the compact handoff; the caller can also pass
+relevant text into the prompt or write a file for the next session to read.
 
-A new session stores:
+## Context checkpoints
 
-- the complete generated system prompt;
-- each selected Skill's name and description;
-- each selected Skill's canonical `SKILL.md` path.
+When automatic compaction is enabled, UAT estimates the next request size. Near
+the model window it asks the model to summarize older history, then replaces
+that history with the summary and retains recent turns. The summary prompt treats
+the conversation as untrusted data and asks for goals, decisions, paths,
+verification, open questions, and next steps.
 
-Resume reuses this snapshot and does not scan current project instructions, `PATH`, or Skill roots. Resources continue to load from the frozen location, so removing it produces an explicit error; a same-named Skill elsewhere cannot replace it. A stored session without frozen context is invalid rather than being reinterpreted with current startup state.
+Project instructions, the selected tools, notes, and the session record remain
+outside the replaced history. Compaction does not delete session events; it
+changes the model-visible history.
 
-Linked plugins may also contribute session-scoped protocol records. The built-in
-MCP plugin records only each enabled server's stable configuration identity and
-the protocol name and description placed in the generated prompt; it does not
-snapshot commands, URLs, headers, environment values, or server metadata.
-Resume and context checkpoints retain those exact records and the already generated
-prompt. Calls resolve mutable MCP configuration when used, so a new server does
-not join an existing session and a removed recorded server fails directly.
+## Custom instructions
+
+Project instructions come from `<project>/AGENTS.md`. A session can also be
+created with an appended or replaced system prompt through the library API.
+There are no Skills, protocol help pages, or URI context routes in the current
+mode.

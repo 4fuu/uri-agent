@@ -75,22 +75,6 @@ impl ModelFailure {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        kind: ModelFailureKind,
-        retry_after: Option<Duration>,
-        message: &str,
-    ) -> Self {
-        Self {
-            kind,
-            phase: ModelFailurePhase::Request,
-            status: None,
-            retry_after,
-            provider_request_id: None,
-            message: message.to_string(),
-        }
-    }
-
     pub(crate) fn kind(&self) -> ModelFailureKind {
         self.kind
     }

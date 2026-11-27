@@ -1,247 +1,140 @@
-# Architecture and development
+# Development
 
-URI Agent is a stable-Rust terminal application organized around a fixed model
-interface, registered extensions, append-only sessions, and one generic TUI.
-This is the engineering reference linked from [`AGENTS.md`](../AGENTS.md).
+UAT is a stable-Rust application with one model-tool loop, one session store,
+and a small set of linked tools. The runtime does not special-case tool names;
+tools are registered by built-in plugins and the linked MCP provider.
 
-## System shape
-
-```text
-CLI + files + environment
-          |
-          v
-configuration + catalogs + startup discovery
-          |
-          +----> plugin and protocol descriptors
-          |                  |
-          |                  v
-          |          generated system prompt
-          |                  |
-          v                  v
-tool / protocol / command / TUI registries
-          |                  |
-          v                  v
-      runtime model loop <-> append-only SQLite session
-          |
-          v
-generic tool dispatch -> protocol or direct tool -> bounded output
-```
-
-New sessions freeze generated prompt, protocol, and Skill state. Resumed
-sessions restore that snapshot instead of reinterpreting current startup
-discovery.
-
-## Repository map
+## Module map
 
 | Path | Ownership |
 | --- | --- |
-| `src/main.rs` | Application assembly and runtime/TUI wiring |
-| `src/acp/` | ACP v1 transport, sessions, content mapping, and MCP handoff |
-| `src/catalog.rs`, `src/catalog/` | Pi, built-in, provider, and user model catalogs |
-| `src/config.rs` | CLI, settings, credentials, environment, and precedence |
-| `src/execute.rs` | Non-interactive execute mode: prompt assembly, the one-turn runner, and stderr progress |
-| `src/oauth/` | Provider login and refresh flows |
-| `src/model/` | Model contracts, request transforms, and provider adapters |
-| `src/agent.rs` | Process-wide Agent ownership, depth, and lifecycle |
-| `src/plugin.rs` | Linked plugin declarations and extension registries |
-| `src/protocol.rs` | Protocol contract, routing, dispatch, and output projection |
-| `src/prompts.rs` | Initial prompt, tool descriptions, and shared formatting |
-| `src/builtins/` | Linked protocols, direct tools, commands, and providers |
-| `src/retrieval/` | Model2Vec/zvec indexing and semantic or hybrid ranking |
-| `src/task.rs` | Managed work, waiting, cancellation, and notices |
-| `src/output.rs` | Inline limits, complete output, and diagnostics |
-| `src/skill.rs` | Skill discovery, naming, snapshots, and resource containment |
-| `src/session.rs` | SQLite schema, events, drafts, checkpoints, and replay |
-| `src/compaction.rs` | Rollover and summary checkpoint strategies |
-| `src/runtime.rs` | User turns, model/tool loop, retries, and checkpoint triggers |
-| `src/keymap.rs`, `src/terminal.rs` | Key bindings and embedded PTY behavior |
-| `src/tui.rs`, `src/tui/` | Conversation state, controllers, rendering, and UI tests |
-| `src/process.rs`, `src/atomic_file.rs` | Process-tree and atomic-file primitives |
-| `src/tool_download.rs` | Pinned fallback downloads for plugin-managed tools |
-
-Put behavior in the module that owns its state and contract. Add a helper or
-type only when it enforces a named invariant, removes real duplication, or
-matches an established reusable boundary.
-
-## Linked Rust extensions
-
-A [`Plugin`](../src/plugin.rs) declares prompt fragments, session
-records, protocols, typed model tools, commands, model roles, and generic TUI
-providers. `PluginRegistry` validates declarations against installed
-capabilities, rejects name collisions, and preserves prompt-fragment order
-before a new session is frozen.
-
-Simple string-input operations belong behind the `protocol` tool's `read` and
-`exec` request lines; structured or
-escape-heavy operations use typed direct tools. Commands join the shared
-registry, and extension UI returns semantic state for generic panels, status,
-composer completion, or submission effects. Keep operational behavior in those
-registered interfaces rather than prompt prose.
-
-Linked plugins are trusted first-party code: environment, credentials,
-downloads, and Agents are obtained directly from `PluginHost` during
-registration, with no permission declaration or approval flow. Sensitive
-access stays visible for source review in each plugin's `register`.
-
-URI Agent links one fixed native dynamic library for first-party zvec retrieval.
-It is not a general native plugin ABI; extension happens through the linked
-plugin declarations described here.
+| `src/main.rs` | CLI dispatch: docs, models, REPL, execute, serve |
+| `src/config.rs` | CLI, layered settings, credentials, Agent Environment, MCP paths |
+| `src/catalog.rs` | Model catalog, provider discovery, model limits |
+| `src/model/` | Provider HTTP/WebSocket transports and retry/failure rules |
+| `src/agent.rs` | `AgentHost`, services, tool selection, startup context |
+| `src/runtime.rs` | Turn loop, tool dispatch, steering queue, compaction |
+| `src/session.rs` | Append-only SQLite sessions, replay, usage, notes events |
+| `src/compaction.rs` | Context measurement and summary checkpoint planning |
+| `src/builtins/` | Tools, project instructions, MCP, notes, search, codemode |
+| `src/plugin.rs` | Model-tool registry and linked-plugin boundary |
+| `src/prompts.rs` | Generated text-mode system prompt |
+| `src/execute.rs` | Non-interactive `-x` mode and shared turn helper |
+| `src/repl.rs` | Line REPL |
+| `src/serve.rs` | HTTP ingress |
+| `src/retrieval/` | Local semantic code index |
+| `src/tool_download.rs` | Download and verify ripgrep and binary assets |
 
 ## Native retrieval assets
 
-Each release binds an exact zvec crate and native archive, Jieba dictionary,
-and Model2Vec revision. Checksums, targets, and staging layout live in
-[`scripts/prepare-retrieval-assets.py`](../scripts/prepare-retrieval-assets.py).
-The application crate is not published independently because a Cargo-installed
-binary would omit these matched assets.
-
-For a native Unix development build:
+Release archives bundle a fixed zvec native library, Jieba dictionaries, and a
+Model2Vec embedding model. A Cargo build does not copy them next to the
+executable. For a Unix development build:
 
 ```bash
 target=x86_64-unknown-linux-gnu # or aarch64-unknown-linux-gnu / aarch64-apple-darwin
 stage="target/retrieval-assets/$target"
 python3 scripts/prepare-retrieval-assets.py --target "$target" --output "$stage"
-ZVEC_LIB_DIR="$stage" cargo build --locked --package uri-agent
-cp target/debug/uri-agent "$stage/"
+ZVEC_LIB_DIR="$stage" cargo build --locked --package uat
+cp target/debug/uat "$stage/"
 LD_LIBRARY_PATH="$stage${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  "$stage/uri-agent" --version # use DYLD_LIBRARY_PATH="$stage" on macOS
+  "$stage/uat" --version
 ```
 
-Windows uses target `x86_64-pc-windows-msvc`, `uri-agent.exe`, and
-`zvec_c_api.dll`. To exercise the complete native retrieval path after staging
-host assets:
+Windows uses `x86_64-pc-windows-msvc`, `uat.exe`, and `zvec_c_api.dll`. To
+exercise the native retrieval path:
 
 ```bash
-URI_AGENT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
+UAT_TEST_RETRIEVAL_ASSETS="$stage" ZVEC_LIB_DIR="$stage" \
   LD_LIBRARY_PATH="$stage${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  cargo test --locked --package uri-agent --lib \
+  cargo test --locked --package uat --lib \
   retrieval::tests::bundled_assets_rebuild_and_search -- --ignored --exact
 ```
 
-## Architectural contracts
+## Model-facing interface
 
-### Registration and model interface
+The model sees exactly the selected tools. Built-ins register through
+`Plugin::register` into `ModelToolRegistry`; a plugin declares the same
+descriptors through `model_tool_descriptors`, and `PluginRegistry::install`
+rejects a mismatch. A model tool implements:
 
-- Runtime dispatch is generic over registered model tools and must not
-  special-case tool names.
-- Every tool is declared and installed by a plugin. Protocol names and tool
-  names are unique.
-- `protocol` calls are step arrays that are fully validated before anything
-  runs. The registry splits only the first `://` and passes the opaque
-  remainder plus the step's `input` object unchanged; protocols reject
-  unknown `input` fields.
-- Every protocol implements its mandatory help page. Exact protocol behavior
-  belongs to that page, loaded through the `help` tool; implementation, tests,
-  and help change together.
-- Protocol images remain typed model content while retaining a textual
-  transcript projection. Text-only models reject image content.
-- System-prompt fragments contain only context required before the first tool
-  call. Full operation instructions remain on demand.
+```rust
+#[async_trait]
+trait ModelTool {
+    fn descriptor(&self) -> ModelToolDescriptor;
+    async fn execute(&self, arguments: &Value) -> Result<ModelToolOutput>;
+}
+```
 
-### Execution and persistence
+Tool results are text. Binary or media content is summarized rather than added
+to model history. `codemode` calls the same registry through `dispatch`, so a
+tool cannot behave differently in a script.
 
-- Operations return final results directly unless they necessarily become long
-  running or the caller explicitly requests managed work.
-- Task acceptance is not completion. Terminal state and complete output remain
-  available after resume; processes themselves do not restart.
-- Cancellation owns and reaps process trees before work settles.
-- File edits are atomic. Patch application preflights all files and rolls back
-  a partial commit.
-- Oversized results preserve complete bytes and return a readable address.
-  Diagnostics never copy secrets, raw arguments, or successful tool output.
-- Session events are authoritative and append-only. Derived indexes may be
-  removed and rebuilt without changing replay.
-- A transcript/model message boundary commits in one transaction, including
-  correlated tool results and typed image content.
-- Rollover and summary add checkpoints rather than deleting history. Resumed
-  sessions use frozen startup state and preserve provider tool-call identity.
-- Recovery views share stable record anchors and exclude their own protocol
-  calls so searches do not recursively alter the indexed corpus.
-- Semantic caches bind source revisions and retrieval assets, verify freshness
-  before ranked reads, and never advertise partial updates as current.
+## Invariants
 
-### Configuration, providers, and UI
-
-- Catalog metadata drives generic provider behavior. Security-sensitive
-  endpoint or authentication exceptions live in dedicated provider modules,
-  not branches spread through generic construction.
-- Configuration and credential precedence must remain consistent with [Models
-  and configuration](configuration.md). Leading `!` values remain explicit
-  code execution and must never be logged with secret output.
-- Provider-independent tests use fake backends and require no live credentials
-  or network access.
-- The TUI remains one keyboard-complete conversation surface. Commands,
-  keymaps, completion, status, panels, and submission effects use their generic
-  registries rather than second routing paths.
-- Terminal restoration, selection, mouse input, and OSC52 copy remain correct
-  on normal and error exits.
-
-## Change rules
-
-### Scope and ownership
-
-- Make the smallest complete change and leave unrelated cleanup out.
-- Follow references when removing behavior and remove code that exists only for
-  it.
-- Do not commit credentials, generated sessions, complete outputs,
-  `.uri-agent/`, `.amp/`, or `target/` artifacts.
-
-### Contract changes
-
-When changing a protocol, update its implementation, descriptor, help, and
-focused tests. Also update shared protocol documentation only when the stable
-cross-protocol behavior changes.
-
-When changing a direct model tool, keep the schema strict, register it through
-the owning plugin, and test validation, dispatch, presentation, and failure
-paths. Do not add runtime branches for its name.
-
-For session, Agent, model, Skill, ACP, or TUI changes, preserve the applicable
-contracts above and read the owning focused document before editing. Test both
-fresh and restored state when persistence is involved, and keyboard plus mouse
-paths when an interaction is affected.
+- There is no URI, protocol address, help gate, command palette, or TUI layer.
+- `notes`, `steer`, `codemode`, and `mcp` are ordinary registered tools.
+- The model can only return text; the host does not write final answers to
+  files.
+- Sessions remain append-only. A turn boundary is durable before completion is
+  published.
+- A steer accepted while a turn is active is injected at a model boundary. If
+  the session is idle, it becomes a queued prompt.
+- Project instructions are frozen into the startup context and never
+  reinterpreted on resume.
+- Tool calls and results are recorded as paired session events.
+- Peer messages and MCP content are marked untrusted. Peer content never grants
+  authorization.
+- `uat serve` refuses a non-loopback bind without `UAT_HTTP_TOKEN`.
 
 ## Verification
 
-Use stable Rust. For code changes, run focused tests first, then:
+Use stable Rust:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
 cargo check
+cargo test --lib
 ```
 
-Tests must not require live credentials or network access.
+The full suite has one ignored test that needs staged retrieval assets:
 
-For documentation-only changes, verify instead:
+```bash
+cargo test --locked --package uat --lib \
+  retrieval::tests::bundled_assets_rebuild_and_search -- --ignored --exact
+```
 
-- relative links and referenced files exist;
-- examples match current protocol, CLI, command, configuration, and keymap
-  names;
-- defaults and precedence match source;
-- `README.md` and `README.zh-CN.md` remain equivalent;
-- detailed `docs/` content remains English-only;
-- protocol behavior changes are also reflected in the protocol's help page.
+For changes that affect the binary or HTTP surface, also run:
 
-## Documentation ownership
+```bash
+cargo build --bin uat
+./target/debug/uat --help
+./target/debug/uat docs tools.md
+```
 
-- Root READMEs own project fit, public coverage data, critical warnings, first
-  success, and navigation.
-- [`docs/acp.md`](acp.md) owns ACP transport and session lifecycle.
-- [`docs/protocols.md`](protocols.md) owns cross-protocol, task, and output
-  concepts; runtime help owns exact protocol syntax.
-- [`docs/context.md`](context.md) owns project instructions and Skills.
-- [`docs/configuration.md`](configuration.md) owns models, authentication,
-  settings, MCP configuration, and precedence; `uri-agent --help` owns exact
-  CLI syntax.
-- [`docs/interface.md`](interface.md) and [`docs/terminal.md`](terminal.md) own
-  interaction concepts; `F1` and `:help` own active commands and keys.
-- [`docs/sessions.md`](sessions.md) owns persistence, Agents, retries, and
-  checkpoints.
-- This document owns architecture, module boundaries, engineering invariants,
-  change rules, and verification.
-- [`docs/release.md`](release.md) owns release procedure.
+Start the HTTP server and exercise `GET /v1/health`, `POST /v1/messages`, and
+`GET /v1/sessions/{id}` against a local model or a stub provider. The HTTP
+server refuses a non-loopback address without `UAT_HTTP_TOKEN`.
 
-Use `URI Agent` in prose and `uri-agent` for the binary, crate, commands, and
-filesystem names.
+Tests must not require live credentials or network access. Unset provider API
+keys when the environment has them, because model-listing tests can otherwise
+see extra runnable providers.
+
+## Change rules
+
+- Put behavior in its owning module; do not add a wrapper when the existing
+  source of truth can change.
+- Keep the tool surface small. Prefer `codemode` composition or an MCP server
+  over a new always-visible tool.
+- Update the owning document for domain behavior and both root READMEs for
+  public setup or top-level behavior.
+- Do not commit credentials, session databases, generated run files, `.uat/`,
+  `.amp/`, or `target/` artifacts.
+- Preserve unrelated work in the tree. Remove temporary scripts and fixtures
+  after validation.
+
+## Release artifacts
+
+Release workflows build the `uat` binary with bundled retrieval assets. The
+`zvec-rust-sys` native library and model assets must match the pins in
+`scripts/prepare-retrieval-assets.py`. See [Release](release.md).

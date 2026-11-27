@@ -412,7 +412,7 @@ impl RigBackend {
                         // agent name.
                         .originator("pi")
                         .user_agent(format!(
-                            "uri-agent/{} ({} {}; pi)",
+                            "uat/{} ({} {}; pi)",
                             env!("CARGO_PKG_VERSION"),
                             std::env::consts::OS,
                             std::env::consts::ARCH

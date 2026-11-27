@@ -1,39 +1,29 @@
-# URI Agent documentation
+# UAT documentation
 
-The root [README](../README.md) explains what URI Agent is and provides the shortest path to a working session. This directory owns the detailed product and contributor documentation.
+The root [README](../README.md) explains what UAT is and the shortest path to a
+working session. This directory owns the detailed behavior.
 
-## Choose a document
-
-| Goal | Document |
+| Topic | Document |
 | --- | --- |
-| Connect an editor or other ACP client, manage ACP sessions, or supply session-scoped MCP servers | [ACP v1](acp.md) |
-| Understand the `protocol` tool, direct tools, protocol routing, MCP operations, built-ins, tasks, or output preservation | [Protocols, tasks, and output](protocols.md) |
-| Understand project instructions, or create and troubleshoot a Skill | [Startup context and Skills](context.md) |
-| Configure a model, credentials, MCP server, Agent environment variables, reasoning effort, output limits, offline mode, or a custom endpoint | [Models and configuration](configuration.md) |
-| Use the conversation, composer, commands, MCP manager, and navigation | [Terminal interface](interface.md) |
-| Customize keys, use the embedded terminal, copy text, or attach images | [Keymaps, terminal, and attachments](terminal.md) |
-| Resume a session or understand persistence, cross-process collaboration, the model/tool loop, retries, notes, rollover, and summary checkpoints | [Sessions and context](sessions.md) |
-| Change the codebase, find module ownership, preserve product contracts, or run verification | [Architecture and development](development.md) |
-| Prepare or configure a release | [Release process](release.md) |
+| Tools, codemode, search, notes, MCP, steering | [Tools](tools.md) |
+| Models, credentials, settings, environment variables, MCP config | [Configuration](configuration.md) |
+| Sessions, HTTP API, resume, compaction | [Sessions and HTTP](sessions.md) |
+| Project instructions and frozen startup context | [Context](context.md) |
+| Module ownership, change rules, verification | [Development](development.md) |
+| Versioning and release workflow | [Release](release.md) |
 
 ## Sources of truth
 
-These documents explain stable concepts and cross-cutting behavior. More specific references remain authoritative:
+- `uat --help` defines the command-line interface.
+- `uat docs [<topic>]` lists or prints the documents embedded in this binary.
+- The model-tool schemas in `src/builtins/` define exact tool arguments.
+- [README.md](README.md) is the index.
 
-- `uri-agent --help` defines the current command-line interface.
-- `uri-agent docs [<topic>]` lists the documents embedded in this binary, or
-  prints one to stdout, from a shell and without starting a session.
-- The active model-tool schemas define direct-tool arguments; a protocol's page loaded through the `help` tool defines its accepted addresses, `input` fields, execution behavior, result routes, and limits.
-- `uri-agent-docs://README.md` exposes this documentation embedded in the running binary, independent of its startup working directory.
-- `F1` and `:help` show the active command and keymap reference after global and project overrides are applied.
-- The [pi model catalog](https://github.com/earendil-works/pi) plus local `models.json` defines the available providers and models.
-- [`AGENTS.md`](../AGENTS.md) is the concise entry point for coding agents; the [development guide](development.md) contains the detailed repository rules it references.
+## Documentation rules
 
-## Documentation policy
-
-- Keep root `README.md` and `README.zh-CN.md` equivalent as adoption guides.
-- Keep their dated pi.dev model and provider coverage together and update both
-  from the live catalog when those public figures change.
-- Detailed documents in `docs/` are maintained in English only.
-- Put mutable detail in one authoritative document and link to it instead of copying it.
-- Keep protocol-specific model instructions in each protocol's help page; documentation here should explain how the protocol system fits together.
+- Describe only behavior that exists on the current branch.
+- Keep the root READMEs equivalent and focused on adoption and navigation.
+- Put mutable details in one owning document, then link to it instead of
+  copying them into other layers.
+- When a tool's model-facing operations change, update its descriptor and this
+  documentation together.

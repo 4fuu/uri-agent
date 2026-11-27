@@ -93,7 +93,7 @@ pub(super) fn provider_ids() -> impl Iterator<Item = &'static str> {
 
 pub(super) fn credential_fingerprint(provider: &str, credential: &CatalogCredential) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"uri-agent-model-discovery\0");
+    hash.update(b"uat-model-discovery\0");
     hash.update(provider.as_bytes());
     hash.update([u8::from(credential.oauth)]);
     if provider == antigravity::PROVIDER {

@@ -1,44 +1,47 @@
-# Release process
+# Release
 
-URI Agent versions use a calendar version in the form `YYYY.MDD.REVISION`,
-using the date in `Asia/Hong_Kong`. The month is not padded, the day is two
-digits, and the first release of a day uses revision zero. For example,
-`2026.823.0` is the first release on 2026-08-23.
+UAT versions use a calendar form `YYYY.MDD.REVISION`, for example
+`2026.1030.0`. The crate version, tag, release assets, Formula, and Scoop
+manifest must agree.
 
-## Prepare a release
+## Preconditions
 
-On `main`, set the version and run the full verification path:
+- `main` is green with `cargo fmt --check`, `cargo check`, and `cargo test`.
+- The version matches the Asia/Hong_Kong date prefix used by the release
+  workflow.
+- The tag points at the exact commit being released.
+- Retrieval assets are staged for every target by
+  `scripts/prepare-retrieval-assets.py`.
 
-```bash
-python3 scripts/set-version.py 2026.823.0
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo check
-```
+## Workflow
 
-Manually dispatch `release.yml` with the same version. Its date must match the
-current date in `Asia/Hong_Kong`.
+1. Set the version in `Cargo.toml` and update `Cargo.lock`.
+2. Update the Formula and Scoop manifest to the new version, asset URLs, and
+   hashes.
+3. Run the local verification commands from [Development](development.md).
+4. Commit the release metadata.
+5. Tag `v<version>` on that commit.
+6. Run the `Release` GitHub workflow from `main` with the tag in place.
+7. After artifacts publish, run the installer smoke tests.
 
-The workflow verifies again, builds Linux x86-64 and ARM64, Apple Silicon
-macOS, and 64-bit Windows archives, generates checksums, updates the Homebrew
-formula and Scoop manifest, commits package metadata to `main`, creates the
-GitHub release, and tests all installation paths. It aborts if `main` moves
-while the jobs run.
+Do not move a published tag. If a release is wrong, publish a new revision.
 
-The application crate has `publish = false` and no crate is published; release
-archives are the supported distribution unit because the executable requires
-matched native retrieval assets.
+## Assets
 
-## Bundled retrieval runtime
+Each archive contains:
 
-[`scripts/prepare-retrieval-assets.py`](../scripts/prepare-retrieval-assets.py)
-is the source of truth for pinned zvec archives, the Model2Vec model, Jieba
-dictionaries, licenses, revisions, checksums, supported targets, and staged
-layout. Update those values together with the Cargo dependency and any affected
-retrieval schema or extractor version.
+- the `uat` executable (or `uat.exe`);
+- `libzvec_c_api` for the platform;
+- the embedding model under `retrieval/models/potion-code-16M-v2/`;
+- the Jieba dictionary files under `retrieval/jieba/`.
 
-The release workflow verifies asset checksums, executable-relative dynamic
-library lookup, target glibc ceilings, staged versions, and installer layout.
-The x86-64 Linux job also creates a real collection and runs semantic and hybrid
-queries. URI Agent never downloads these assets at runtime.
+The Linux installer verifies SHA256SUMS and requires those files. The Homebrew
+and Scoop installers use the same archive contents. UAT never downloads these
+assets at runtime; semantic search reads them from the installation directory.
+
+## Compatibility
+
+Versions before the text-only migration used the URI/protocol interface. That
+implementation remains on `legacy/uri-protocol`; its last version is
+`2026.1030.0`. Current releases expose the `uat` binary and the traditional
+tool form only.

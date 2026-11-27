@@ -25,7 +25,7 @@ use zvec_rust::{
 };
 
 /// Semantic-index schema version; the cache lives under
-/// `<cache>/uri-agent/retrieval/v{SCHEMA_VERSION}/`. Shared by the store and
+/// `<cache>/uat/retrieval/v{SCHEMA_VERSION}/`. Shared by the store and
 /// the long `--help` reference.
 pub(crate) const SCHEMA_VERSION: u32 = 3;
 const ZVEC_VERSION: &str = "0.7.0";
@@ -37,9 +37,6 @@ const INITIAL_RECALL: usize = 200;
 const MAX_RECALL: usize = 2_000;
 const RRF_K: f32 = 60.0;
 const WRITE_BATCH: usize = 256;
-const CONVERSATION_EXTRACTOR_VERSION: &str = "conversation-records-v1";
-const CONVERSATION_FRAGMENT_CHARS: usize = 1_024;
-const CONVERSATION_FRAGMENT_OVERLAP: usize = 154;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SearchMode {
@@ -48,11 +45,11 @@ pub(crate) enum SearchMode {
 }
 
 impl SearchMode {
-    pub(crate) fn parse(value: &str, protocol: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str, mode_label: &str) -> Result<Self> {
         match value {
             "semantic" => Ok(Self::Semantic),
             "hybrid" => Ok(Self::Hybrid),
-            _ => bail!("{protocol} mode must be exact, semantic, or hybrid"),
+            _ => bail!("{mode_label} mode must be exact, semantic, or hybrid"),
         }
     }
 
@@ -119,6 +116,11 @@ impl CorpusCatalog {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn all_sources(&self) -> BTreeSet<String> {
+        self.sources.keys().cloned().collect()
+    }
+
     pub(crate) fn changed_sources(&self, checkpoint: &IndexCheckpoint) -> BTreeSet<String> {
         if !checkpoint.compatible {
             return self.sources.keys().cloned().collect();
@@ -128,10 +130,6 @@ impl CorpusCatalog {
             .filter(|(source, revision)| checkpoint.sources.get(*source) != Some(*revision))
             .map(|(source, _)| source.clone())
             .collect()
-    }
-
-    pub(crate) fn all_sources(&self) -> BTreeSet<String> {
-        self.sources.keys().cloned().collect()
     }
 }
 
@@ -172,114 +170,6 @@ impl CorpusSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ConversationDocument {
-    pub(crate) session_id: String,
-    pub(crate) cwd: String,
-    pub(crate) anchor: String,
-    pub(crate) header: String,
-    pub(crate) text: String,
-    pub(crate) record_type: String,
-    pub(crate) window_id: u64,
-}
-
-pub(crate) fn conversation_source_key(session_id: &str, anchor: &str) -> String {
-    format!("{session_id}/{anchor}")
-}
-
-pub(crate) fn conversation_catalog(documents: &[ConversationDocument]) -> CorpusCatalog {
-    CorpusCatalog::new(documents.iter().map(|document| {
-        let key = conversation_source_key(&document.session_id, &document.anchor);
-        let revision = Fragment::stable_id(&[
-            &document.cwd,
-            &document.header,
-            &document.text,
-            &document.record_type,
-            &document.window_id.to_string(),
-        ]);
-        (key, revision)
-    }))
-}
-
-pub(crate) fn conversation_snapshot(
-    catalog: CorpusCatalog,
-    sources: BTreeSet<String>,
-    documents: Vec<ConversationDocument>,
-) -> Result<CorpusSnapshot> {
-    let mut fragments = BTreeMap::<String, Vec<Fragment>>::new();
-    for document in documents {
-        let catalog_source = conversation_source_key(&document.session_id, &document.anchor);
-        ensure!(
-            sources.contains(&catalog_source),
-            "conversation snapshot contains an unrequested source: {catalog_source}"
-        );
-        let group_id = Fragment::stable_id(&[&document.session_id, &document.anchor]);
-        for (index, text) in conversation_chunks(&document.text).into_iter().enumerate() {
-            fragments
-                .entry(catalog_source.clone())
-                .or_default()
-                .push(Fragment {
-                    id: Fragment::stable_id(&[&group_id, &index.to_string(), &text]),
-                    group_id: group_id.clone(),
-                    catalog_source: catalog_source.clone(),
-                    source: document.session_id.clone(),
-                    anchor: document.anchor.clone(),
-                    label: document.header.clone(),
-                    embedding_text: format!(
-                        "session: {}\nworking directory: {}\n{}\n{}",
-                        document.session_id, document.cwd, document.header, text
-                    ),
-                    text,
-                    record_type: document.record_type.clone(),
-                    window_id: document.window_id,
-                });
-        }
-        fragments.entry(catalog_source).or_default();
-    }
-    for source in sources {
-        fragments.entry(source).or_default();
-    }
-    CorpusSnapshot::new(catalog, fragments)
-}
-
-pub(crate) fn conversation_spec(
-    namespace: &str,
-    identity: &str,
-    corpus: &str,
-    source: String,
-) -> Result<IndexSpec> {
-    IndexSpec::new(
-        namespace,
-        identity,
-        corpus,
-        source,
-        CONVERSATION_EXTRACTOR_VERSION,
-    )
-}
-
-fn conversation_chunks(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let boundaries = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(text.len()))
-        .collect::<Vec<_>>();
-    let count = boundaries.len() - 1;
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < count {
-        let end = (start + CONVERSATION_FRAGMENT_CHARS).min(count);
-        chunks.push(text[boundaries[start]..boundaries[end]].to_string());
-        if end == count {
-            break;
-        }
-        start = end.saturating_sub(CONVERSATION_FRAGMENT_OVERLAP);
-    }
-    chunks
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct IndexSpec {
     directory: PathBuf,
     corpus: String,
@@ -297,8 +187,8 @@ impl IndexSpec {
     ) -> Result<Self> {
         let key = Fragment::stable_id(&[identity]);
         let root = dirs::cache_dir()
-            .map(|directory| directory.join("uri-agent"))
-            .unwrap_or(std::env::current_dir()?.join(".uri-agent"))
+            .map(|directory| directory.join("uat"))
+            .unwrap_or(std::env::current_dir()?.join(".uat"))
             .join("retrieval")
             .join(format!("v{SCHEMA_VERSION}"))
             .join(namespace);
@@ -332,33 +222,15 @@ pub(crate) enum IndexState {
 pub(crate) struct IndexStatus {
     pub(crate) state: IndexState,
     pub(crate) indexed_fragments: usize,
-    pub(crate) current_sources: usize,
-}
-
-impl IndexStatus {
-    pub(crate) fn format(&self, corpus: &str) -> String {
-        match self.state {
-            IndexState::Missing => format!(
-                "{corpus} semantic index is missing · current_sources={}",
-                self.current_sources
-            ),
-            IndexState::Stale => format!(
-                "{corpus} semantic index is stale · indexed_fragments={} · current_sources={}",
-                self.indexed_fragments, self.current_sources
-            ),
-            IndexState::Current => format!(
-                "{corpus} semantic index is current · fragments={}",
-                self.indexed_fragments
-            ),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchHit {
+    #[allow(dead_code)]
     pub(crate) source: String,
     pub(crate) label: String,
     pub(crate) text: String,
+    #[allow(dead_code)]
     pub(crate) record_type: String,
 }
 
@@ -369,6 +241,7 @@ pub(crate) struct SearchFilter {
 }
 
 impl SearchFilter {
+    #[cfg(test)]
     pub(crate) fn conversation(
         record_types: impl IntoIterator<Item = String>,
         window_id: Option<u64>,
@@ -484,6 +357,7 @@ async fn index_checkpoint(spec: &IndexSpec) -> Result<IndexCheckpoint> {
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn index_status(spec: &IndexSpec, catalog: &CorpusCatalog) -> Result<IndexStatus> {
     let spec = spec.clone();
     let catalog = catalog.clone();
@@ -494,6 +368,7 @@ pub(crate) async fn index_status(spec: &IndexSpec, catalog: &CorpusCatalog) -> R
     .await
 }
 
+#[cfg(test)]
 async fn rebuild_index(
     spec: &IndexSpec,
     snapshot: CorpusSnapshot,
@@ -629,33 +504,7 @@ where
     bail!("{retry_message}")
 }
 
-/// Rebuilds the semantic index for a corpus rebuilt from its live source and
-/// returns its formatted status. The rebuild is redone while the corpus
-/// keeps changing; `corpus_label` names the index in the returned status.
-pub(crate) async fn rebuild_live_corpus<C, Rebuild, RebuildFuture>(
-    rebuild: Rebuild,
-    corpus_label: &str,
-    retry_message: &str,
-    cancellation: CancellationToken,
-) -> Result<Vec<u8>>
-where
-    C: LiveCorpus,
-    Rebuild: Fn() -> RebuildFuture + Send,
-    RebuildFuture: Future<Output = Result<C>> + Send,
-{
-    for _ in 0..MAX_INDEX_RETRIES {
-        let corpus = rebuild().await?;
-        let snapshot = corpus
-            .snapshot(corpus.catalog().all_sources(), cancellation.clone())
-            .await?;
-        let status = rebuild_index(corpus.spec(), snapshot, cancellation.clone()).await?;
-        if rebuild().await?.catalog() == corpus.catalog() {
-            return Ok(status.format(corpus_label).into_bytes());
-        }
-    }
-    bail!("{retry_message}")
-}
-
+#[cfg(test)]
 fn rebuild_index_blocking(
     spec: &IndexSpec,
     snapshot: CorpusSnapshot,
@@ -769,7 +618,6 @@ fn rebuild_index_locked(
     Ok(IndexStatus {
         state: IndexState::Current,
         indexed_fragments: expected.fragments,
-        current_sources: expected.sources.len(),
     })
 }
 
@@ -1152,7 +1000,7 @@ fn required_string(doc: &Doc, field: &str) -> Result<String> {
 fn collection_schema(jieba: &Path) -> Result<CollectionSchema> {
     let extra = serde_json::json!({ "jieba_dict_dir": jieba }).to_string();
     let text_index = IndexParams::fts(Some("jieba"), Some(&["lowercase"]), Some(&extra))?;
-    Ok(CollectionSchema::builder("uri_agent_retrieval")
+    Ok(CollectionSchema::builder("uat_retrieval")
         .add_field(FieldSchema::new("group_id", DataType::String, false, 0)?)
         .add_indexed_field(
             "catalog_source",
@@ -1184,13 +1032,13 @@ fn collection_schema(jieba: &Path) -> Result<CollectionSchema> {
 
 fn runtime_directory() -> Result<PathBuf> {
     #[cfg(test)]
-    if let Some(directory) = std::env::var_os("URI_AGENT_TEST_RETRIEVAL_ASSETS") {
+    if let Some(directory) = std::env::var_os("UAT_TEST_RETRIEVAL_ASSETS") {
         return Ok(PathBuf::from(directory));
     }
     std::env::current_exe()?
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("URI Agent executable has no parent directory"))
+        .ok_or_else(|| anyhow!("UAT executable has no parent directory"))
 }
 
 fn model_directory() -> Result<PathBuf> {
@@ -1267,7 +1115,6 @@ fn read_status(spec: &IndexSpec, catalog: &CorpusCatalog) -> IndexStatus {
                 IndexState::Missing
             },
             indexed_fragments: 0,
-            current_sources: catalog.sources.len(),
         };
     };
     let state = if manifest.compatible(spec)
@@ -1282,7 +1129,6 @@ fn read_status(spec: &IndexSpec, catalog: &CorpusCatalog) -> IndexStatus {
     IndexStatus {
         state,
         indexed_fragments: manifest.fragments,
-        current_sources: catalog.sources.len(),
     }
 }
 
@@ -1576,29 +1422,6 @@ mod tests {
     }
 
     #[test]
-    fn conversation_snapshots_keep_distinct_matching_fragments() {
-        let text = format!("{}matching tail{}", "a".repeat(1_050), "b".repeat(200));
-        let document = ConversationDocument {
-            session_id: "session".to_string(),
-            cwd: "/project".to_string(),
-            anchor: "r42".to_string(),
-            header: "[assistant id=r42 window=3]".to_string(),
-            text,
-            record_type: "assistant".to_string(),
-            window_id: 3,
-        };
-        let catalog = conversation_catalog(std::slice::from_ref(&document));
-        let sources = catalog.all_sources();
-        let snapshot = conversation_snapshot(catalog, sources, vec![document]).unwrap();
-        let fragments = &snapshot.fragments["session/r42"];
-
-        assert_eq!(fragments.len(), 2);
-        assert_ne!(fragments[0].text, fragments[1].text);
-        assert!(fragments[1].text.contains("matching tail"));
-        assert_eq!(fragments[1].label, "[assistant id=r42 window=3]");
-    }
-
-    #[test]
     fn search_filters_escape_scalar_values_and_combine_constraints() {
         assert_eq!(filter_string(r"a\b'c"), r"'a\\b\'c'");
         assert_eq!(
@@ -1692,8 +1515,8 @@ mod tests {
     #[ignore = "requires fixed release retrieval assets"]
     async fn bundled_assets_rebuild_and_search() {
         assert!(
-            std::env::var_os("URI_AGENT_TEST_RETRIEVAL_ASSETS").is_some(),
-            "set URI_AGENT_TEST_RETRIEVAL_ASSETS to the prepared asset directory"
+            std::env::var_os("UAT_TEST_RETRIEVAL_ASSETS").is_some(),
+            "set UAT_TEST_RETRIEVAL_ASSETS to the prepared asset directory"
         );
         let directory = tempfile::tempdir().unwrap();
         let spec = IndexSpec::at(

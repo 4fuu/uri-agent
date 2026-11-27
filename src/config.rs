@@ -4,7 +4,6 @@ use crate::catalog::{
     WorkBuddyCatalogCredential, api_key_environments, supports_live_discovery,
 };
 use crate::compaction;
-use crate::keymap::KeyDisplayStyle;
 use crate::oauth::{
     self, OauthToken, WORKBUDDY_AUTH_TOKEN_VARIABLE, WORKBUDDY_BASE_URL_VARIABLE,
     WORKBUDDY_ENVIRONMENT_VARIABLE, process_workbuddy_session, workbuddy_session_from_oauth,
@@ -33,54 +32,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-const DEFAULT_OUTPUT_LIMIT: usize = 32 * 1024;
 const CONFIG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Conversation layout. `Auto` switches to `Compact` on terminals at most
-/// [`COMPACT_LAYOUT_MAX_WIDTH`] columns wide, which covers phone SSH clients.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LayoutMode {
-    #[default]
-    Auto,
-    Wide,
-    Compact,
-}
-
-pub const COMPACT_LAYOUT_MAX_WIDTH: u16 = 64;
-
-impl LayoutMode {
-    pub fn compact_at(self, width: u16) -> bool {
-        match self {
-            Self::Auto => width <= COMPACT_LAYOUT_MAX_WIDTH,
-            Self::Wide => false,
-            Self::Compact => true,
-        }
-    }
-}
-
-impl std::fmt::Display for LayoutMode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Auto => "auto",
-            Self::Wide => "wide",
-            Self::Compact => "compact",
-        })
-    }
-}
-
-impl std::str::FromStr for LayoutMode {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "wide" => Ok(Self::Wide),
-            "compact" => Ok(Self::Compact),
-            _ => bail!("layout must be auto, wide, or compact"),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthKind {
@@ -88,23 +40,6 @@ pub enum AuthKind {
     None,
     ApiKey,
     Oauth,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelRole {
-    pub provider: String,
-    pub model: String,
-    pub thinking: ThinkingLevel,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelRoleInfo {
-    pub name: String,
-    pub role: Option<ModelRole>,
-    pub error: Option<String>,
-    pub source: Option<ValueSource>,
-    pub overrides_global: bool,
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -120,9 +55,9 @@ pub struct Cli {
     #[arg(
         long,
         long_help = "Provider ID from the pi model catalog, for example openai or anthropic. \
-Overrides the defaultProvider setting and URI_AGENT_PROVIDER for this invocation. Selecting a \
+Overrides the defaultProvider setting and UAT_PROVIDER for this invocation. Selecting a \
 provider other than the configured default also drops the saved defaultModel unless --model is \
-set; run `:model` in the interface to pick a runnable model."
+set; choose one with --model."
     )]
     pub provider: Option<String>,
 
@@ -130,7 +65,7 @@ set; run `:model` in the interface to pick a runnable model."
     #[arg(
         long,
         long_help = "Model ID from the selected provider. Overrides the defaultModel setting and \
-URI_AGENT_MODEL for this invocation. Without --provider, the `<provider>/<id>` form that \
+UAT_MODEL for this invocation. Without --provider, the `<provider>/<id>` form that \
 `uat models` prints selects both at once; IDs that themselves contain `/` still work."
     )]
     pub model: Option<String>,
@@ -140,19 +75,10 @@ URI_AGENT_MODEL for this invocation. Without --provider, the `<provider>/<id>` f
         long,
         hide_env_values = true,
         long_help = "Provider API key for this invocation only; the value is never written to \
-auth.json. Overrides auth.json, the provider environment variable, and URI_AGENT_API_KEY. Prefer \
+auth.json. Overrides auth.json, the provider environment variable, and UAT_API_KEY. Prefer \
 stored credentials or the provider environment variable in scripts and shells."
     )]
     pub api_key: Option<String>,
-
-    /// Override the number of bytes returned inline before UAT spills output to a file.
-    #[arg(
-        long,
-        long_help = "Number of bytes a tool result may return inline before the complete bytes \
-spill to a file under the cache directory and the transcript keeps a readable address. Minimum \
-1024. Default 32768; also set by the outputLimit setting and URI_AGENT_OUTPUT_LIMIT."
-    )]
-    pub output_limit: Option<usize>,
 
     /// Reasoning effort for capable models (off, minimal, low, medium, high, xhigh, or max).
     #[arg(
@@ -160,7 +86,7 @@ spill to a file under the cache directory and the transcript keeps a readable ad
         value_name = "LEVEL",
         long_help = "Reasoning effort for capable models: off, minimal, low, medium, high, \
 xhigh, or max. The selected model determines which values are selectable. Overrides the \
-defaultThinkingLevel and modelThinkingLevels settings and URI_AGENT_THINKING for this invocation."
+defaultThinkingLevel and modelThinkingLevels settings and UAT_THINKING for this invocation."
     )]
     pub thinking: Option<ThinkingLevel>,
 
@@ -168,7 +94,7 @@ defaultThinkingLevel and modelThinkingLevels settings and URI_AGENT_THINKING for
     #[arg(
         long,
         long_help = "Disable cloud and provider model-catalog requests and use cached catalog \
-data only; already-configured models keep working. Same as setting URI_AGENT_OFFLINE=1 (or the \
+data only; already-configured models keep working. Same as setting UAT_OFFLINE=1 (or the \
 compatibility alias PI_OFFLINE=1)."
     )]
     pub offline: bool,
@@ -187,8 +113,7 @@ compatibility alias PI_OFFLINE=1)."
         long,
         value_name = "ID",
         long_help = "Resume one session by its stable ID. The ID must belong to the current \
-project directory; `:resume` and `@@` completion inside the interface list candidates. Conflicts \
-with --continue-session."
+project directory. Conflicts with --continue-session."
     )]
     pub session: Option<String>,
 
@@ -196,21 +121,11 @@ with --continue-session."
     #[arg(
         long,
         value_name = "PATH",
-        long_help = "Canonical working directory exposed to file and shell plugins. Also the \
-project boundary for sessions, project settings, AGENTS.md instructions, Skills, and project \
-MCP servers. Defaults to the current directory; it does not restrict filesystem access."
+        long_help = "Canonical working directory for tools and sessions. Also the \
+project boundary for sessions, project settings, AGENTS.md instructions, and project MCP \
+servers. Defaults to the current directory; it does not restrict filesystem access."
     )]
     pub cwd: Option<PathBuf>,
-
-    /// Serve stable Agent Client Protocol v1 over stdin/stdout.
-    #[arg(
-        long,
-        conflicts_with_all = ["continue_session", "session", "cwd"],
-        long_help = "Serve stable Agent Client Protocol v1 over stdin/stdout for an editor or \
-other ACP client instead of opening the terminal interface. The client supplies each session's \
-absolute project directory and may carry its own MCP server profile."
-    )]
-    pub acpv1: bool,
 
     /// Run one non-interactive prompt turn and exit: print the final reply to
     /// stdout and one-line progress to stderr. Without a value, read the prompt
@@ -220,18 +135,9 @@ absolute project directory and may carry its own MCP server profile."
         long,
         value_name = "PROMPT",
         num_args = 0..=1,
-        default_missing_value = "",
-        conflicts_with = "acpv1"
+        default_missing_value = ""
     )]
     pub execute: Option<String>,
-
-    /// Use the legacy URI protocol tools with --execute instead of the simple tool set.
-    #[arg(long, hide = true)]
-    pub legacy: bool,
-
-    /// Open the legacy full-screen terminal interface instead of the line REPL.
-    #[arg(long, hide = true)]
-    pub legacy_tui: bool,
 
     #[command(subcommand)]
     pub command: Option<Subcommand>,
@@ -259,7 +165,7 @@ warning on stderr. Global flags such as --offline, --provider, and --cwd go befo
         #[arg(long)]
         all: bool,
     },
-    /// Serve the simple text API over HTTP instead of opening the interface.
+    /// Serve the text API over HTTP instead of opening the REPL.
     Serve {
         /// Address to bind, for example 127.0.0.1:8737.
         #[arg(long, default_value = "127.0.0.1:8737")]
@@ -268,16 +174,15 @@ warning on stderr. Global flags such as --offline, --provider, and --cwd go befo
 }
 
 /// Opening paragraph of `uat --help`; `-h` keeps the one-line `about`.
-const LONG_ABOUT: &str = "A terminal coding agent with traditional tools and codemode.
+const LONG_ABOUT: &str = "A text-only coding agent with traditional tools and codemode.
 
 UAT runs in three modes. Without mode flags it opens a line-oriented REPL in
 the current directory. In execute mode (-x, --execute [PROMPT]) it runs one
 prompt, taken from the argument or from standard input when the argument is
 omitted, with piped standard input appended when both are present, prints only
-the final assistant message, and exits non-zero when the run fails. With
---acpv1 it serves Agent Client Protocol v1 over stdin/stdout to an editor or
-other client instead of opening the terminal interface. Run `uat docs` to list
-the documentation embedded in this binary.";
+the final assistant message, and exits non-zero when the run fails. `uat serve`
+starts the HTTP text API instead. Run `uat docs` to list the documentation
+embedded in this binary.";
 
 /// Example commands rendered into the long `--help` reference. The execute
 /// mode entries describe `-x`/`--execute`.
@@ -310,8 +215,8 @@ const EXAMPLES: &[(&str, &str)] = &[
         "Execute one prompt with a model ID copied from `uat models`",
     ),
     (
-        "uat --acpv1",
-        "Serve ACP v1 over stdin/stdout to an editor or other client",
+        "uat serve --listen 127.0.0.1:8737",
+        "Serve the HTTP text API on localhost",
     ),
 ];
 
@@ -374,7 +279,7 @@ fn reference() -> String {
     );
     let _ = writeln!(
         output,
-        "settings.json, project .uri-agent/settings.json, environment variable, then"
+        "settings.json, project .uat/settings.json, environment variable, then"
     );
     let _ = writeln!(output, "command-line flag.");
     let _ = writeln!(output);
@@ -419,7 +324,7 @@ fn reference() -> String {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "The uri-agent-docs protocol serves the same documents to the model in a session."
+        "The same documents are available through `uat docs`."
     );
     output
 }
@@ -453,16 +358,15 @@ fn files_reference() -> String {
     let sessions = display_path(&crate::session::session_database_path(Path::new(
         "<project>",
     )));
-    let outputs = display_path(&crate::output::outputs_root());
     let retrieval = format!(
-        "{cache}/uri-agent/retrieval/v{}",
+        "{cache}/uat/retrieval/v{}",
         crate::retrieval::SCHEMA_VERSION
     );
 
     let rows = vec![
         (
             format!("{config}/"),
-            "Configuration directory; URI_AGENT_CONFIG_DIR replaces it".to_string(),
+            "Configuration directory; UAT_CONFIG_DIR replaces it".to_string(),
         ),
         (
             format!("{config}/settings.json"),
@@ -486,23 +390,15 @@ fn files_reference() -> String {
         ),
         (
             format!("{config}/models-dev.json"),
-            "Cached models.dev protocol hints for OpenCode discovery".to_string(),
-        ),
-        (
-            format!("{config}/keymap.rhai"),
-            "Global keymap overrides".to_string(),
+            "Cached models.dev API hints for OpenCode discovery".to_string(),
         ),
         (
             format!("{config}/{}", crate::builtins::MCP_GLOBAL_CONFIG),
             "User-scoped MCP servers".to_string(),
         ),
         (
-            "<project>/.uri-agent/settings.json".to_string(),
+            "<project>/.uat/settings.json".to_string(),
             "Project settings; fields override matching global values".to_string(),
-        ),
-        (
-            "<project>/.uri-agent/keymap.rhai".to_string(),
-            "Project keymap overrides".to_string(),
         ),
         (
             format!("<project>/{}", crate::builtins::MCP_PROJECT_CONFIG),
@@ -514,10 +410,6 @@ fn files_reference() -> String {
         ),
         (sessions, "Append-only session storage (SQLite)".to_string()),
         (
-            format!("{outputs}/<session-id>/"),
-            "Complete spilled tool output and diagnostics per session".to_string(),
-        ),
-        (
             format!("{retrieval}/"),
             "Disposable semantic indexes, rebuilt by ranked searches".to_string(),
         ),
@@ -525,14 +417,10 @@ fn files_reference() -> String {
     use std::fmt::Write as _;
     let mut output = render_rows(&rows);
     let _ = writeln!(output);
-    let _ = writeln!(output, "  Skill discovery roots, highest priority first:");
-    for root in crate::skill::discovery_roots(Path::new("<project>")) {
-        let _ = writeln!(output, "    {}", display_path(&root));
-    }
     output
 }
 
-/// Accept `--model <provider>/<id>`, the form `uri-agent models` prints, when
+/// Accept `--model <provider>/<id>`, the form `uat models` prints, when
 /// `--provider` is absent. The value splits at its first `/` only when that
 /// provider lists the remaining ID and no provider lists the whole value as
 /// an ID, so model IDs that contain `/` keep working unchanged.
@@ -591,7 +479,6 @@ impl Config {
                     provider,
                     model,
                     api_key: cli.api_key,
-                    output_limit: cli.output_limit,
                     thinking: cli.thinking,
                 },
             )
@@ -631,7 +518,7 @@ impl Config {
         }
     }
 
-    /// `uri-agent models`: one `<provider>/<id>` per line with its display
+    /// `uat models`: one `<provider>/<id>` per line with its display
     /// name, `*` marking the current default. `all` also lists providers
     /// without a configured credential.
     pub async fn model_listing(&self, all: bool) -> String {
@@ -722,7 +609,7 @@ impl ValueSource {
             Self::Default => "default".to_string(),
             Self::Session => "session".to_string(),
             Self::Global => "settings.json".to_string(),
-            Self::Project => ".uri-agent/settings.json".to_string(),
+            Self::Project => ".uat/settings.json".to_string(),
             Self::Environment(name) => name.clone(),
             Self::CommandLine => "command line".to_string(),
             Self::ModelsFile => "models.json".to_string(),
@@ -740,18 +627,12 @@ pub struct ActiveSettings {
     pub model: String,
     pub api_key: Option<String>,
     pub auth_kind: AuthKind,
-    pub output_limit: usize,
     pub thinking: ThinkingLevel,
-    pub terminal: Option<String>,
-    pub key_display: KeyDisplayStyle,
-    pub layout: LayoutMode,
     pub compaction: compaction::Settings,
     pub provider_source: ValueSource,
     pub model_source: ValueSource,
     pub api_key_source: ValueSource,
-    pub output_limit_source: ValueSource,
     pub thinking_source: ValueSource,
-    pub terminal_source: ValueSource,
     pub credential_environment: BTreeMap<String, String>,
 }
 
@@ -773,7 +654,6 @@ struct InvocationOverrides {
     provider: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
-    output_limit: Option<usize>,
     thinking: Option<ThinkingLevel>,
 }
 
@@ -785,32 +665,13 @@ struct SettingsFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output_limit: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     default_thinking_level: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_thinking_levels: BTreeMap<String, ThinkingLevel>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    model_roles: BTreeMap<String, ModelRoleConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    terminal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key_display: Option<KeyDisplayStyle>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    layout: Option<LayoutMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionFile>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ModelRoleConfig {
-    provider: String,
-    model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    thinking: Option<ThinkingLevel>,
 }
 
 #[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
@@ -818,8 +679,6 @@ struct ModelRoleConfig {
 struct CompactionFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    strategy: Option<compaction::Strategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reserve_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -841,11 +700,6 @@ const SETTINGS_REFERENCE: &[(&str, &str, &str)] = &[
     ),
     ("defaultModel", "Default model for that provider", "unset"),
     (
-        "outputLimit",
-        "Inline tool-result bytes before the complete bytes spill to a file",
-        "32768",
-    ),
-    (
         "defaultThinkingLevel",
         "Fallback reasoning effort for models without a stored choice",
         "off",
@@ -856,26 +710,9 @@ const SETTINGS_REFERENCE: &[(&str, &str, &str)] = &[
         "{}",
     ),
     (
-        "modelRoles",
-        "Named model routes declared by plugins, keyed by role name",
-        "{}",
-    ),
-    ("terminal", "Command opened by :terminal", "unset"),
-    ("keyDisplay", "Key-hint style: auto, macos, or text", "auto"),
-    (
-        "layout",
-        "Conversation layout: auto, wide, or compact",
-        "auto",
-    ),
-    (
         "compaction.enabled",
         "Create context checkpoints automatically",
         "true",
-    ),
-    (
-        "compaction.strategy",
-        "Checkpoint strategy: rollover or summary",
-        "rollover",
     ),
     (
         "compaction.reserveTokens",
@@ -894,25 +731,13 @@ const SETTINGS_REFERENCE: &[(&str, &str, &str)] = &[
 const EXAMPLE_SETTINGS_JSON: &str = r#"{
   "defaultProvider": "anthropic",
   "defaultModel": "claude-sonnet-4-5",
-  "outputLimit": 32768,
   "defaultThinkingLevel": "high",
   "modelThinkingLevels": {
     "openai/gpt-5.2": "medium"
   },
-  "modelRoles": {
-    "finder": {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-5",
-      "thinking": "high"
-    }
-  },
-  "terminal": "tmux new-window",
-  "keyDisplay": "auto",
-  "layout": "auto",
   "compaction": {
     "enabled": true,
-    "strategy": "rollover",
-    "reserveTokens": 16384,
+      "reserveTokens": 16384,
     "keepRecentTokens": 20000
   }
 }"#;
@@ -1103,9 +928,9 @@ impl ConfigManager {
         invocation: InvocationOverrides,
     ) -> Result<Self> {
         let global_path = directory.join("settings.json");
-        let project_path = cwd.join(".uri-agent/settings.json");
+        let project_path = cwd.join(".uat/settings.json");
         let auth_path = directory.join("auth.json");
-        let mut global: SettingsFile = read_json(&global_path).await?;
+        let global: SettingsFile = read_json(&global_path).await?;
         let project = read_json(&project_path).await?;
         let auth_write_path = resolve_write_path(&auth_path)
             .await
@@ -1113,7 +938,6 @@ impl ConfigManager {
         let auth_lock = lock_auth_file(&auth_write_path).await?;
         let auth = read_json(&auth_write_path).await?;
         if !global_path.exists() {
-            global.output_limit = Some(DEFAULT_OUTPUT_LIMIT);
             write_json(&global_path, &global, false).await?;
         }
         if !auth_write_path.exists() {
@@ -1142,96 +966,6 @@ impl ConfigManager {
 
     pub async fn current(&self) -> ActiveSettings {
         self.active.read().await.clone()
-    }
-
-    /// Resolve a configured model role for a linked plugin. Project
-    /// settings override a same-named global role. Role lookup is dynamic and
-    /// does not change the active conversation model.
-    pub async fn model_role(&self, name: &str) -> Result<Option<ModelRole>> {
-        validate_model_role_name(name)?;
-        let configured = {
-            let files = self.files.lock().await;
-            files
-                .project
-                .model_roles
-                .get(name)
-                .or_else(|| files.global.model_roles.get(name))
-                .cloned()
-        };
-        let Some(configured) = configured else {
-            return Ok(None);
-        };
-        if configured.provider.trim().is_empty() || configured.model.trim().is_empty() {
-            bail!("model role {name:?} requires nonempty provider and model values");
-        }
-        let thinking = if let Some(thinking) = configured.thinking {
-            thinking
-        } else {
-            let files = self.files.lock().await;
-            configured_thinking(&files, &configured.provider, &configured.model).0
-        };
-        let role = ModelRole {
-            provider: configured.provider,
-            model: configured.model,
-            thinking,
-        };
-        if self
-            .catalog
-            .model(&role.provider, &role.model)
-            .await
-            .is_none()
-        {
-            bail!(
-                "model role {name:?} selects unavailable model {}/{}",
-                role.provider,
-                role.model
-            );
-        }
-        Ok(Some(role))
-    }
-
-    /// List the model roles declared by plugins. Declared names are listed
-    /// even while unassigned; configured names that no plugin declares are
-    /// ignored.
-    pub async fn model_roles(&self, declared: &[String]) -> Result<Vec<ModelRoleInfo>> {
-        let sources = {
-            let files = self.files.lock().await;
-            let mut sources = BTreeMap::new();
-            for name in files.global.model_roles.keys() {
-                sources.insert(name.clone(), (ValueSource::Global, false));
-            }
-            for name in files.project.model_roles.keys() {
-                sources.insert(
-                    name.clone(),
-                    (
-                        ValueSource::Project,
-                        files.global.model_roles.contains_key(name),
-                    ),
-                );
-            }
-            sources
-        };
-        let mut roles = Vec::with_capacity(declared.len());
-        for name in declared {
-            let (role, error) = match self.model_role(name).await {
-                Ok(role) => (role, None),
-                Err(error) => (None, Some(error.to_string())),
-            };
-            let (source, overrides_global) = sources
-                .get(name)
-                .cloned()
-                .map_or((None, false), |(source, overrides)| {
-                    (Some(source), overrides)
-                });
-            roles.push(ModelRoleInfo {
-                role,
-                error,
-                name: name.clone(),
-                source,
-                overrides_global,
-            });
-        }
-        Ok(roles)
     }
 
     /// Return catalog providers that currently have a configured model
@@ -1298,7 +1032,7 @@ impl ConfigManager {
 
     /// Resolve a provider API key outside the active model selection.
     ///
-    /// This is used by provider-backed protocols such as web access. The
+    /// This is used by provider-backed transports such as web access. The
     /// provider-specific process environment variable takes precedence over a
     /// key saved in `auth.json`, matching active model credential resolution.
     pub async fn provider_api_key(&self, provider: &str) -> Result<Option<String>> {
@@ -1435,48 +1169,6 @@ impl ConfigManager {
         self.recalculate(&files).await
     }
 
-    pub async fn set_model_role(
-        &self,
-        name: &str,
-        provider: &str,
-        model: &str,
-        thinking: ThinkingLevel,
-    ) -> Result<()> {
-        validate_model_role_name(name)?;
-        let Some(catalog_model) = self.catalog.model(provider, model).await else {
-            bail!("model {provider}/{model} is not runnable in the current catalog");
-        };
-        if !catalog_model.supports_thinking_level(thinking) {
-            bail!("model {provider}/{model} does not support thinking effort {thinking}");
-        }
-        let mut files = self.files.lock().await;
-        let (settings, path) = self.writable_settings(&mut files);
-        settings.model_roles.insert(
-            name.to_string(),
-            ModelRoleConfig {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                thinking: Some(thinking),
-            },
-        );
-        write_json(&path, settings, false).await
-    }
-
-    pub async fn remove_model_role(&self, name: &str) -> Result<bool> {
-        validate_model_role_name(name)?;
-        let mut files = self.files.lock().await;
-        let (settings, path) = if files.project.model_roles.contains_key(name) {
-            (&mut files.project, self.project_path.clone())
-        } else if files.global.model_roles.contains_key(name) {
-            (&mut files.global, self.settings_path())
-        } else {
-            return Ok(false);
-        };
-        settings.model_roles.remove(name);
-        write_json(&path, settings, false).await?;
-        Ok(true)
-    }
-
     /// Remove persisted default model selections that resolve through
     /// `provider`. Per-model thinking preferences are retained for a future
     /// login. The caller owns any current session selection.
@@ -1529,17 +1221,6 @@ impl ConfigManager {
         Ok(true)
     }
 
-    pub async fn set_output_limit(&self, output_limit: usize) -> Result<ActiveSettings> {
-        if output_limit < 1024 {
-            bail!("output limit must be at least 1024 bytes");
-        }
-        let mut files = self.files.lock().await;
-        let (settings, path) = self.writable_settings(&mut files);
-        settings.output_limit = Some(output_limit);
-        write_json(&path, settings, false).await?;
-        self.recalculate(&files).await
-    }
-
     pub async fn set_model_thinking(
         &self,
         provider: &str,
@@ -1554,18 +1235,6 @@ impl ConfigManager {
         settings
             .model_thinking_levels
             .insert(model_setting_key(provider, model), thinking);
-        write_json(&path, settings, false).await?;
-        self.recalculate(&files).await
-    }
-
-    pub async fn set_terminal(&self, terminal: Option<String>) -> Result<ActiveSettings> {
-        let terminal = terminal.and_then(|value| {
-            let value = value.trim().to_string();
-            (!value.is_empty()).then_some(value)
-        });
-        let mut files = self.files.lock().await;
-        let (settings, path) = self.writable_settings(&mut files);
-        settings.terminal = terminal;
         write_json(&path, settings, false).await?;
         self.recalculate(&files).await
     }
@@ -1964,19 +1633,15 @@ async fn resolve_discovery_credentials(
     credentials
 }
 
-/// Process environment variables read by URI Agent. The loader reads each
+/// Process environment variables read by UAT. The loader reads each
 /// name through its constant, and the long `--help` reference renders
 /// [`ENVIRONMENT_REFERENCE`], so the two cannot drift.
-const ENV_PROVIDER: &str = "URI_AGENT_PROVIDER";
-const ENV_MODEL: &str = "URI_AGENT_MODEL";
-const ENV_API_KEY: &str = "URI_AGENT_API_KEY";
-const ENV_OUTPUT_LIMIT: &str = "URI_AGENT_OUTPUT_LIMIT";
-const ENV_THINKING: &str = "URI_AGENT_THINKING";
-const ENV_TERMINAL: &str = "URI_AGENT_TERMINAL";
-const ENV_KEY_DISPLAY: &str = "URI_AGENT_KEY_DISPLAY";
-const ENV_LAYOUT: &str = "URI_AGENT_LAYOUT";
-const ENV_CONFIG_DIR: &str = "URI_AGENT_CONFIG_DIR";
-const ENV_OFFLINE: &str = "URI_AGENT_OFFLINE";
+const ENV_PROVIDER: &str = "UAT_PROVIDER";
+const ENV_MODEL: &str = "UAT_MODEL";
+const ENV_API_KEY: &str = "UAT_API_KEY";
+const ENV_THINKING: &str = "UAT_THINKING";
+const ENV_CONFIG_DIR: &str = "UAT_CONFIG_DIR";
+const ENV_OFFLINE: &str = "UAT_OFFLINE";
 const ENV_PI_OFFLINE: &str = "PI_OFFLINE";
 const ENV_ANTHROPIC_AUTH_TOKEN: &str = "ANTHROPIC_AUTH_TOKEN";
 const ENV_CODEBUDDY_API_KEY: &str = "CODEBUDDY_API_KEY";
@@ -1998,16 +1663,9 @@ const ENVIRONMENT_REFERENCE: &[(&str, &str)] = &[
         "API key used for every provider; overrides stored and provider credentials",
     ),
     (
-        ENV_OUTPUT_LIMIT,
-        "Inline output limit in bytes (minimum 1024); overrides the outputLimit setting",
-    ),
-    (
         ENV_THINKING,
         "Reasoning effort: off, minimal, low, medium, high, xhigh, or max",
     ),
-    (ENV_TERMINAL, "Command opened by :terminal for this process"),
-    (ENV_KEY_DISPLAY, "Key-hint style: auto, macos, or text"),
-    (ENV_LAYOUT, "Conversation layout: auto, wide, or compact"),
     (
         ENV_CONFIG_DIR,
         "Replaces the default configuration directory for this process",
@@ -2016,7 +1674,11 @@ const ENVIRONMENT_REFERENCE: &[(&str, &str)] = &[
         ENV_OFFLINE,
         "Set to 1, true, or yes to disable catalog networking, like --offline",
     ),
-    (ENV_PI_OFFLINE, "Compatibility alias of URI_AGENT_OFFLINE"),
+    (
+        "UAT_HTTP_TOKEN",
+        "Bearer token required by `uat serve`; mandatory for a non-loopback bind",
+    ),
+    (ENV_PI_OFFLINE, "Compatibility alias of UAT_OFFLINE"),
     (
         ENV_ANTHROPIC_AUTH_TOKEN,
         "anthropic credential alternative to ANTHROPIC_API_KEY",
@@ -2028,10 +1690,6 @@ const ENVIRONMENT_REFERENCE: &[(&str, &str)] = &[
     (
         ENV_CODEBUDDY_AUTH_TOKEN,
         "workbuddy bearer-token credential above its API-key sources",
-    ),
-    (
-        crate::moshi::DISABLE_VARIABLE,
-        "Set to 0 to disable Moshi terminal-app reporting",
     ),
 ];
 
@@ -2077,28 +1735,6 @@ async fn calculate_active(
         invocation.model.as_deref(),
     );
 
-    let (mut output_limit, mut output_limit_source) = setting(
-        DEFAULT_OUTPUT_LIMIT,
-        files.global.output_limit,
-        files.project.output_limit,
-    );
-    // Unlike the string settings, an empty URI_AGENT_OUTPUT_LIMIT is a parse
-    // error rather than an ignored value, so this environment layer stays
-    // explicit.
-    if let Ok(value) = env::var(ENV_OUTPUT_LIMIT) {
-        output_limit = value
-            .parse()
-            .with_context(|| format!("{ENV_OUTPUT_LIMIT} must be a positive integer"))?;
-        output_limit_source = ValueSource::Environment(ENV_OUTPUT_LIMIT.to_string());
-    }
-    if let Some(value) = invocation.output_limit {
-        output_limit = value;
-        output_limit_source = ValueSource::CommandLine;
-    }
-    if output_limit < 1024 {
-        bail!("output limit must be at least 1024 bytes");
-    }
-
     let (mut thinking, mut thinking_source) = configured_thinking(files, &provider, &model);
     if let Some(value) = non_empty_var(ENV_THINKING) {
         thinking = value
@@ -2111,32 +1747,6 @@ async fn calculate_active(
         thinking_source = ValueSource::CommandLine;
     }
 
-    let (mut terminal, mut terminal_source) = setting(
-        String::new(),
-        files.global.terminal.clone(),
-        files.project.terminal.clone(),
-    );
-    override_string(&mut terminal, &mut terminal_source, ENV_TERMINAL, None);
-    let terminal = (!terminal.trim().is_empty()).then_some(terminal.trim().to_string());
-
-    let (mut key_display, _) = setting(
-        KeyDisplayStyle::Auto,
-        files.global.key_display,
-        files.project.key_display,
-    );
-    if let Some(value) = non_empty_var(ENV_KEY_DISPLAY) {
-        key_display = value
-            .parse()
-            .with_context(|| format!("invalid {ENV_KEY_DISPLAY}"))?;
-    }
-
-    let (mut layout, _) = setting(LayoutMode::Auto, files.global.layout, files.project.layout);
-    if let Some(value) = non_empty_var(ENV_LAYOUT) {
-        layout = value
-            .parse()
-            .with_context(|| format!("invalid {ENV_LAYOUT}"))?;
-    }
-
     let compaction = compaction_settings(&files.global, &files.project)?;
 
     let credential = resolve_model_credential(files, catalog, invocation, &provider, true).await;
@@ -2146,18 +1756,12 @@ async fn calculate_active(
         model,
         api_key: credential.api_key,
         auth_kind: credential.kind,
-        output_limit,
         thinking,
-        terminal,
-        key_display,
-        layout,
         compaction,
         provider_source,
         model_source,
         api_key_source: credential.source,
-        output_limit_source,
         thinking_source,
-        terminal_source,
         credential_environment: credential.environment,
     })
 }
@@ -2197,7 +1801,7 @@ async fn resolve_model_credential(
             source = ValueSource::Environment(ENV_CODEBUDDY_API_KEY.to_string());
             kind = AuthKind::ApiKey;
         }
-        // models.json supports `apiKey: "!command"`, which is URI Agent's
+        // models.json supports `apiKey: "!command"`, which is UAT's
         // equivalent of WorkBuddy's apiKeyHelper and has the same precedence.
         if let Some(value) = models_key {
             api_key = Some(value);
@@ -2226,7 +1830,7 @@ async fn resolve_model_credential(
             }
         }
     }
-    // URI_AGENT_API_KEY and --api-key apply above every provider-specific
+    // UAT_API_KEY and --api-key apply above every provider-specific
     // source, but only when resolving the active model's own credential.
     if !private_oauth && include_generic_overrides {
         if let Some(value) = non_empty_var(ENV_API_KEY) {
@@ -2346,10 +1950,6 @@ fn compaction_settings(
             .and_then(|settings| settings.enabled)
             .or_else(|| global.and_then(|settings| settings.enabled))
             .unwrap_or(true),
-        strategy: project
-            .and_then(|settings| settings.strategy)
-            .or_else(|| global.and_then(|settings| settings.strategy))
-            .unwrap_or_default(),
         reserve_tokens: project
             .and_then(|settings| settings.reserve_tokens)
             .or_else(|| global.and_then(|settings| settings.reserve_tokens))
@@ -2369,18 +1969,7 @@ fn model_setting_key(provider: &str, model: &str) -> String {
     format!("{provider}/{model}")
 }
 
-pub fn validate_model_role_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        bail!("invalid model role name {name:?}; use ASCII letters, digits, '-' or '_'");
-    }
-    Ok(())
-}
-
-static COMMAND_VALUE_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+pub static COMMAND_VALUE_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub(crate) async fn resolve_config_value(
     value: &str,
@@ -2571,7 +2160,7 @@ fn environment_truthy(name: &str) -> bool {
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
-const CONFIG_DIRECTORY_NAME: &str = "uri-agent";
+const CONFIG_DIRECTORY_NAME: &str = "uat";
 
 pub fn config_directory() -> Result<PathBuf> {
     if let Some(directory) = overridden_config_directory() {
@@ -2846,32 +2435,6 @@ mod tests {
     use super::*;
     use crate::test_http::{self, MockResponse};
 
-    #[test]
-    fn acpv1_cli_path_preserves_model_overrides_and_rejects_ui_session_modes() {
-        let cli = Cli::try_parse_from([
-            "uri-agent",
-            "--acpv1",
-            "--offline",
-            "--provider",
-            "example",
-            "--model",
-            "model",
-        ])
-        .unwrap();
-        assert!(cli.acpv1);
-        assert!(cli.offline);
-        assert_eq!(cli.provider.as_deref(), Some("example"));
-        assert_eq!(cli.model.as_deref(), Some("model"));
-
-        for conflicting in ["--continue-session", "--session", "--cwd"] {
-            let mut arguments = vec!["uri-agent", "--acpv1", conflicting];
-            if matches!(conflicting, "--session" | "--cwd") {
-                arguments.push("value");
-            }
-            assert!(Cli::try_parse_from(arguments).is_err(), "{conflicting}");
-        }
-    }
-
     #[tokio::test]
     async fn model_argument_accepts_the_listed_provider_slash_id_form() {
         let root = tempfile::tempdir().unwrap();
@@ -2961,42 +2524,32 @@ mod tests {
     }
 
     #[test]
-    fn execute_cli_takes_an_optional_value_and_rejects_acpv1() {
+    fn execute_cli_takes_an_optional_value() {
         assert_eq!(
-            Cli::try_parse_from(["uri-agent", "-x", "clean up"])
+            Cli::try_parse_from(["uat", "-x", "clean up"])
                 .unwrap()
                 .execute
                 .as_deref(),
             Some("clean up")
         );
         assert_eq!(
-            Cli::try_parse_from(["uri-agent", "--execute=clean up"])
+            Cli::try_parse_from(["uat", "--execute=clean up"])
                 .unwrap()
                 .execute
                 .as_deref(),
             Some("clean up")
         );
         assert_eq!(
-            Cli::try_parse_from(["uri-agent", "-x", "--offline"])
+            Cli::try_parse_from(["uat", "-x", "--offline"])
                 .unwrap()
                 .execute
                 .as_deref(),
             Some(""),
         );
-        assert_eq!(Cli::try_parse_from(["uri-agent"]).unwrap().execute, None);
-
-        for conflicting in [
-            vec!["uri-agent", "-x", "prompt", "--acpv1"],
-            vec!["uri-agent", "--acpv1", "-x"],
-        ] {
-            assert!(
-                Cli::try_parse_from(conflicting).is_err(),
-                "execute and acpv1 cannot combine"
-            );
-        }
+        assert_eq!(Cli::try_parse_from(["uat"]).unwrap().execute, None);
 
         let cli = Cli::try_parse_from([
-            "uri-agent",
+            "uat",
             "-x",
             "prompt",
             "--provider",
@@ -3010,14 +2563,12 @@ mod tests {
             "--offline",
             "--api-key",
             "key",
-            "--output-limit",
-            "4096",
         ])
         .unwrap();
         assert_eq!(cli.execute.as_deref(), Some("prompt"));
         for resumable in [
-            vec!["uri-agent", "-x", "prompt", "--continue-session"],
-            vec!["uri-agent", "-x", "prompt", "--session", "id"],
+            vec!["uat", "-x", "prompt", "--continue-session"],
+            vec!["uat", "-x", "prompt", "--session", "id"],
         ] {
             assert!(Cli::try_parse_from(resumable).is_ok());
         }
@@ -3107,10 +2658,10 @@ mod tests {
         let project = root.path().join("project");
         let managed = root.path().join("managed");
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::create_dir_all(project.join(".uri-agent")).unwrap();
+        std::fs::create_dir_all(project.join(".uat")).unwrap();
         std::fs::create_dir_all(&managed).unwrap();
         let auth_link = directory.join("auth.json");
-        let project_link = project.join(".uri-agent/settings.json");
+        let project_link = project.join(".uat/settings.json");
         symlink("../managed/auth.json", &auth_link).unwrap();
         symlink("../../managed/project-settings.json", &project_link).unwrap();
 
@@ -3121,7 +2672,6 @@ mod tests {
             .set_api_key("linked-provider", "linked-key".to_string())
             .await
             .unwrap();
-        manager.set_output_limit(4096).await.unwrap();
 
         assert!(std::fs::symlink_metadata(&auth_link).unwrap().is_symlink());
         assert!(
@@ -3131,10 +2681,6 @@ mod tests {
         );
         let auth: AuthFile = read_json(&managed.join("auth.json")).await.unwrap();
         assert_eq!(auth.0["linked-provider"].key.as_deref(), Some("linked-key"));
-        let project_settings: SettingsFile = read_json(&managed.join("project-settings.json"))
-            .await
-            .unwrap();
-        assert_eq!(project_settings.output_limit, Some(4096));
         assert!(managed.join("auth.json.lock").exists());
         assert!(!directory.join("auth.json.lock").exists());
     }
@@ -3228,7 +2774,7 @@ mod tests {
     async fn agent_environment_does_not_expose_unmanaged_process_variables() {
         let directory = tempfile::tempdir().unwrap();
         let environment = AgentEnvironment::load(directory.path()).await.unwrap();
-        let name = format!("URI_AGENT_UNMANAGED_ENV_TEST_{}", Uuid::now_v7().simple());
+        let name = format!("UAT_UNMANAGED_ENV_TEST_{}", Uuid::now_v7().simple());
         // SAFETY: the process-unique variable is removed before this test returns.
         unsafe { env::set_var(&name, "process-secret") };
 
@@ -3296,162 +2842,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_roles_are_project_overridable_and_resolve_model_thinking() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("config");
-        let project = root.path().join("project");
-        fs::create_dir_all(&directory).await.unwrap();
-        fs::create_dir_all(project.join(".uri-agent"))
-            .await
-            .unwrap();
-        fs::write(
-            directory.join("models.json"),
-            br#"{"providers":{"global-provider":{"baseUrl":"https://global.invalid/v1","api":"openai-responses","models":[{"id":"global-model","name":"Global"}]},"project-provider":{"baseUrl":"https://project.invalid/v1","api":"openai-responses","models":[{"id":"project-model","name":"Project"}]}}}"#,
-        )
-        .await
-        .unwrap();
-        fs::write(
-            directory.join("settings.json"),
-            br#"{"modelRoles":{"commit":{"provider":"global-provider","model":"global-model","thinking":"high"}}}"#,
-        )
-        .await
-        .unwrap();
-        fs::write(
-            project.join(".uri-agent/settings.json"),
-            br#"{"modelRoles":{"commit":{"provider":"project-provider","model":"project-model"}},"modelThinkingLevels":{"project-provider/project-model":"medium"}}"#,
-        )
-        .await
-        .unwrap();
-
-        let manager = ConfigManager::load_for_test(&directory, &project)
-            .await
-            .unwrap();
-        assert_eq!(
-            manager.model_role("commit").await.unwrap(),
-            Some(ModelRole {
-                provider: "project-provider".to_string(),
-                model: "project-model".to_string(),
-                thinking: ThinkingLevel::Medium,
-            })
-        );
-        assert_eq!(manager.model_role("missing").await.unwrap(), None);
-        assert!(manager.model_role("invalid role").await.is_err());
-        let roles = manager
-            .model_roles(&["commit".to_string(), "finder".to_string()])
-            .await
-            .unwrap();
-        // Only plugin-declared roles are listed, in declaration order; the
-        // declared `finder` role appears even while unassigned.
-        assert_eq!(
-            roles
-                .iter()
-                .map(|role| role.name.as_str())
-                .collect::<Vec<_>>(),
-            ["commit", "finder"]
-        );
-        let commit = roles.iter().find(|role| role.name == "commit").unwrap();
-        assert_eq!(commit.source, Some(ValueSource::Project));
-        assert!(commit.overrides_global);
-        let finder = roles.iter().find(|role| role.name == "finder").unwrap();
-        assert_eq!(finder.role, None);
-        assert_eq!(finder.source, None);
-    }
-
-    #[tokio::test]
-    async fn declared_roles_need_an_independent_model_assignment() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("config");
-        let project = root.path().join("project");
-        fs::create_dir_all(&directory).await.unwrap();
-        fs::create_dir_all(&project).await.unwrap();
-        fs::write(
-            directory.join("models.json"),
-            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"active-model","name":"Active"},{"id":"role-model","name":"Role"}]}}}"#,
-        )
-        .await
-        .unwrap();
-        fs::write(
-            directory.join("settings.json"),
-            br#"{"defaultProvider":"example","defaultModel":"active-model"}"#,
-        )
-        .await
-        .unwrap();
-
-        let manager = ConfigManager::load_for_test(&directory, &project)
-            .await
-            .unwrap();
-        // A declared role never falls back to the configured default model.
-        assert_eq!(manager.model_role("finder").await.unwrap(), None);
-
-        manager
-            .set_model_role("finder", "example", "role-model", ThinkingLevel::Off)
-            .await
-            .unwrap();
-        assert_eq!(
-            manager.model_role("finder").await.unwrap(),
-            Some(ModelRole {
-                provider: "example".to_string(),
-                model: "role-model".to_string(),
-                thinking: ThinkingLevel::Off,
-            })
-        );
-        let roles = manager.model_roles(&["finder".to_string()]).await.unwrap();
-        let finder = roles.iter().find(|role| role.name == "finder").unwrap();
-        assert_eq!(finder.source, Some(ValueSource::Global));
-        assert!(!finder.overrides_global);
-
-        assert!(manager.remove_model_role("finder").await.unwrap());
-        assert_eq!(manager.model_role("finder").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn declared_model_roles_are_listed_and_resolved_by_name() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("config");
-        let project = root.path().join("project");
-        fs::create_dir_all(&directory).await.unwrap();
-        fs::create_dir_all(project.join(".uri-agent"))
-            .await
-            .unwrap();
-        fs::write(
-            directory.join("models.json"),
-            br#"{"providers":{"example":{"baseUrl":"https://example.invalid/v1","api":"openai-responses","models":[{"id":"active-model","name":"Active"},{"id":"custom-model","name":"Custom"}]}}}"#,
-        )
-        .await
-        .unwrap();
-        fs::write(
-            directory.join("settings.json"),
-            br#"{"defaultProvider":"example","defaultModel":"active-model","modelRoles":{"review":{"provider":"example","model":"custom-model"}}}"#,
-        )
-        .await
-        .unwrap();
-
-        let manager = ConfigManager::load_for_test(&directory, &project)
-            .await
-            .unwrap();
-
-        manager
-            .set_model_role("title", "example", "custom-model", ThinkingLevel::Off)
-            .await
-            .unwrap();
-        assert_eq!(
-            manager
-                .model_roles(&["finder".to_string(), "title".to_string()])
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|role| role.name)
-                .collect::<Vec<_>>(),
-            ["finder", "title"]
-        );
-        // A configured name that no plugin declares stays resolvable by name
-        // but never appears in the listed roles.
-        assert!(manager.model_role("review").await.unwrap().is_some());
-        assert!(manager.remove_model_role("title").await.unwrap());
-        assert_eq!(manager.model_role("title").await.unwrap(), None);
-    }
-
-    #[tokio::test]
     async fn model_provider_filter_scopes_generic_keys_to_the_current_provider() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("config");
@@ -3509,9 +2899,7 @@ mod tests {
         let directory = root.path().join("config");
         let project = root.path().join("project");
         fs::create_dir_all(&directory).await.unwrap();
-        fs::create_dir_all(project.join(".uri-agent"))
-            .await
-            .unwrap();
+        fs::create_dir_all(project.join(".uat")).await.unwrap();
         fs::write(
             directory.join("settings.json"),
             br#"{"defaultProvider":"openai","defaultModel":"global-model","modelThinkingLevels":{"openai/project-model":"high"}}"#,
@@ -3519,7 +2907,7 @@ mod tests {
         .await
         .unwrap();
         fs::write(
-            project.join(".uri-agent/settings.json"),
+            project.join(".uat/settings.json"),
             br#"{"defaultModel":"project-model"}"#,
         )
         .await
@@ -3537,12 +2925,9 @@ mod tests {
         let global: Value =
             serde_json::from_slice(&fs::read(directory.join("settings.json")).await.unwrap())
                 .unwrap();
-        let project: Value = serde_json::from_slice(
-            &fs::read(project.join(".uri-agent/settings.json"))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let project: Value =
+            serde_json::from_slice(&fs::read(project.join(".uat/settings.json")).await.unwrap())
+                .unwrap();
         assert!(global.get("defaultProvider").is_none());
         assert!(global.get("defaultModel").is_none());
         assert!(project.get("defaultModel").is_none());
@@ -3653,18 +3038,12 @@ mod tests {
             model,
             api_key: None,
             auth_kind: AuthKind::None,
-            output_limit: DEFAULT_OUTPUT_LIMIT,
             thinking: ThinkingLevel::Off,
-            terminal: None,
-            key_display: KeyDisplayStyle::Auto,
-            layout: LayoutMode::Auto,
             compaction: compaction::Settings::default(),
             provider_source,
             model_source,
             api_key_source: ValueSource::Default,
-            output_limit_source: ValueSource::Default,
             thinking_source: ValueSource::Default,
-            terminal_source: ValueSource::Default,
             credential_environment: BTreeMap::new(),
         };
         assert!(!settings.model_configured());
@@ -3675,7 +3054,6 @@ mod tests {
         let global: SettingsFile = serde_json::from_value(serde_json::json!({
             "compaction": {
                 "enabled": false,
-                "strategy": "summary",
                 "reserveTokens": 12_000,
                 "keepRecentTokens": 18_000
             }
@@ -3693,7 +3071,6 @@ mod tests {
             compaction_settings(&global, &project).unwrap(),
             compaction::Settings {
                 enabled: true,
-                strategy: compaction::Strategy::Summary,
                 reserve_tokens: 12_000,
                 keep_recent_tokens: 9_000,
             }
@@ -3887,7 +3264,7 @@ mod tests {
         let manager = ConfigManager::load_for_test(root.path(), root.path())
             .await
             .unwrap();
-        let provider = "uri-agent-credential-test";
+        let provider = "uat-credential-test";
         let environment = crate::catalog::api_key_environment(provider);
         assert_eq!(
             crate::catalog::api_key_environment("parallel"),
@@ -4167,8 +3544,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_silently_skips_credentials_that_are_not_currently_usable() {
-        let unavailable_variable =
-            format!("URI_AGENT_DISCOVERY_MISSING_{}", Uuid::new_v4().simple());
+        let unavailable_variable = format!("UAT_DISCOVERY_MISSING_{}", Uuid::new_v4().simple());
         let candidate = |value: String| DiscoveryCredentialCandidate {
             provider: "zai".to_string(),
             value,
@@ -4212,7 +3588,7 @@ mod tests {
             &files,
             &catalog,
             &invocation,
-            "uri-agent-discovery-unselected",
+            "uat-discovery-unselected",
             false,
         )
         .await;
@@ -4255,10 +3631,10 @@ mod tests {
     #[test]
     fn config_values_expand_environment_and_dollar_escaping() {
         // SAFETY: this test uses a process-unique variable and no other test reads it.
-        unsafe { env::set_var("URI_AGENT_CONFIG_TEST_VALUE", "secret") };
+        unsafe { env::set_var("UAT_CONFIG_TEST_VALUE", "secret") };
         assert_eq!(
             interpolate_environment(
-                "Bearer ${URI_AGENT_CONFIG_TEST_VALUE} $$5 $!literal",
+                "Bearer ${UAT_CONFIG_TEST_VALUE} $$5 $!literal",
                 &BTreeMap::new(),
             )
             .unwrap(),
@@ -4266,17 +3642,14 @@ mod tests {
         );
         assert_eq!(
             interpolate_environment(
-                "$URI_AGENT_CONFIG_TEST_VALUE",
-                &BTreeMap::from([(
-                    "URI_AGENT_CONFIG_TEST_VALUE".to_string(),
-                    "explicit".to_string(),
-                )]),
+                "$UAT_CONFIG_TEST_VALUE",
+                &BTreeMap::from([("UAT_CONFIG_TEST_VALUE".to_string(), "explicit".to_string(),)]),
             )
             .unwrap(),
             "explicit"
         );
         // SAFETY: this process-unique variable is no longer used.
-        unsafe { env::remove_var("URI_AGENT_CONFIG_TEST_VALUE") };
+        unsafe { env::remove_var("UAT_CONFIG_TEST_VALUE") };
     }
 
     #[cfg(target_os = "linux")]
@@ -4414,7 +3787,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(directory, home.join(".config").join("uri-agent"));
+        assert_eq!(directory, home.join(".config").join("uat"));
     }
 
     #[test]
@@ -4425,10 +3798,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(
-            directory,
-            PathBuf::from("/home/ada/.config").join("uri-agent")
-        );
+        assert_eq!(directory, PathBuf::from("/home/ada/.config").join("uat"));
     }
 
     #[test]
@@ -4441,8 +3811,8 @@ mod tests {
     #[tokio::test]
     async fn macos_legacy_directory_moves_all_files_and_removes_the_source() {
         let root = tempfile::tempdir().unwrap();
-        let old = root.path().join("Application Support").join("uri-agent");
-        let new = root.path().join(".config").join("uri-agent");
+        let old = root.path().join("Application Support").join("uat");
+        let new = root.path().join(".config").join("uat");
         fs::create_dir_all(old.join("cache")).await.unwrap();
         fs::write(old.join("settings.json"), "{}\n").await.unwrap();
         fs::write(old.join("auth.json"), "{\"providers\":{}}\n")
@@ -4512,26 +3882,13 @@ mod tests {
         SettingsFile {
             default_provider: Some("openai".to_string()),
             default_model: Some("gpt-5.2".to_string()),
-            output_limit: Some(4_096),
             default_thinking_level: Some(ThinkingLevel::Medium),
             model_thinking_levels: BTreeMap::from([(
                 "openai/gpt-5.2".to_string(),
                 ThinkingLevel::High,
             )]),
-            model_roles: BTreeMap::from([(
-                "finder".to_string(),
-                ModelRoleConfig {
-                    provider: "openai".to_string(),
-                    model: "gpt-5.2".to_string(),
-                    thinking: Some(ThinkingLevel::High),
-                },
-            )]),
-            terminal: Some("tmux new-window".to_string()),
-            key_display: Some(KeyDisplayStyle::Text),
-            layout: Some(LayoutMode::Compact),
             compaction: Some(CompactionFile {
                 enabled: Some(false),
-                strategy: Some(compaction::Strategy::Summary),
                 reserve_tokens: Some(1_024),
                 keep_recent_tokens: Some(2_048),
                 extra: BTreeMap::new(),
@@ -4583,10 +3940,8 @@ mod tests {
         let compaction = compaction::Settings::default();
         for (key, _, default) in SETTINGS_REFERENCE {
             let expected = match *key {
-                "outputLimit" => DEFAULT_OUTPUT_LIMIT.to_string(),
                 "defaultThinkingLevel" => ThinkingLevel::default().to_string(),
                 "compaction.enabled" => compaction.enabled.to_string(),
-                "compaction.strategy" => compaction.strategy.to_string(),
                 "compaction.reserveTokens" => compaction.reserve_tokens.to_string(),
                 "compaction.keepRecentTokens" => compaction.keep_recent_tokens.to_string(),
                 _ => continue,

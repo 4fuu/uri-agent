@@ -1,225 +1,171 @@
-# Sessions and context
+# Sessions and HTTP
 
-URI Agent stores conversations as append-only sessions and preserves the exact
-startup context used by the model. This document describes project scoping,
-Agent sessions, durability, retries, and context checkpoints.
+## Storage and identity
 
-## Storage and project boundaries
+Sessions are append-only SQLite records under `<config>/sessions-v7.db`. Each
+session has a stable ID, a frozen system prompt, pending input, transcript
+events, usage records, compaction records, and note events. Sessions are scoped
+to the project working directory.
 
-Sessions are stored in SQLite at:
-
-```text
-<platform-data-dir>/uri-agent/sessions-v6.db
+```bash
+uat --continue-session
+uat --session <session-id>
 ```
 
-On macOS the database is under `~/.config/uri-agent`; if no platform data
-directory exists, URI Agent falls back to `<project>/.uri-agent`. Earlier
-database versions remain untouched and are not migrated into `sessions-v6.db`.
+A new session is not persisted until its first user message. Closing a process
+does not delete a session. Pending prompt or steer input committed before a
+restart is restored on reopen.
 
-The canonical startup directory is each session's project boundary:
+## Turn model
 
-- a normal launch creates a new in-memory session;
-- `--continue-session` and `--session latest` select the latest project session;
-- `--session <id>` accepts only an ID from that project;
-- `:resume` lists the project's root conversations.
+A prompt starts a turn when the session is idle. A steer message waits for the
+next model boundary while a turn is active; if the session is idle or the turn
+finishes first, it becomes a queued prompt. The runtime persists the accepted
+input before reporting success.
 
-The `context://sessions/...` routes can search wider scopes only when explicitly
-asked. Exact search reads SQLite directly; semantic and hybrid search use
-disposable, automatically maintained sidecar indexes. Searching or indexing
-never resumes or changes a conversation. All model-facing saved-session
-addresses use `context://sessions/...`. See [Protocols, tasks,
-and output](protocols.md#files-search-and-saved-context).
+During a turn UAT streams model text and reasoning into session events, executes
+tool calls, records paired tool results, and finishes with `TurnFinished`.
+Repeated identical tool-call batches are interrupted with a redirect after five
+occurrences. Cancellation waits for the interrupted turn's durable terminal
+boundary.
 
-Each session records its provider, model, and thinking effort. Changes are
-appended and restored on resume. Composer drafts are saved on exit and session
-switch; before the first message, a draft remains project state rather than
-creating an empty conversation. Switching sessions leaves active work and
-undelivered input attached to the original session. Process exit cancels and
-joins active work after durable interruption records are written.
+## Context
 
-ACP-created sessions use the same database and become available to the TUI
-after the ACP owner releases them. One ACP process may serve multiple projects,
-but every project has isolated configuration, plugins, MCP state, Skills, and
-Agents. See [ACP v1](acp.md#project-and-session-lifecycle).
+The startup context is frozen when the session is created. Project
+`AGENTS.md` is wrapped into the system prompt. The conversation history,
+tool schemas, and system prompt are measured together. Near the model context
+limit, UAT creates a summary checkpoint and retains recent traffic according to
+the compaction settings. Notes are separate durable events and survive
+checkpoints and restarts.
 
-## AgentHost and Agent specifications
+At 15%, 30%, 50%, and near-limit context thresholds, the host may inject a
+short reminder to update `notes`. Reminders are host messages, not user
+requests.
 
-Each project runtime owns one `AgentHost`. The TUI, linked plugins, and
-child Agents use the same persisted Agent runtime.
+## HTTP ingress
 
-An `AgentSpec` selects provider, model, thinking effort, working directory,
-parent session, system-prompt mode (`inherit`, `append`, or `replace`), exact or
-complete tool/protocol sets, and an optional output cap. Prompt and capability
-selection are fixed at creation. Provider, model, and thinking freeze after the
-first submission is durably accepted.
+Start the server:
 
-Root Agents are depth 1. Plugins may create only depth-2 Agents with a persisted,
-same-project root parent; children cannot create another generation. The TUI
-lists only root conversations, while child conversations use the same session
-database.
+```bash
+uat serve --listen 127.0.0.1:8737
+```
 
-Submissions are `Prompt` or `Steer`. Prompt starts an idle Agent or queues a new
-turn. Steer targets the next model boundary while an Agent is active and acts
-as Prompt when it is idle. Accepted input is durable until delivered. When a
-turn fails before its user turn boundary is persisted, the failure is appended
-to the transcript as an `Error` event while the undelivered input returns to
-the pending queue for retry, so frontends that follow session events observe
-the turn ending instead of waiting forever.
+If `UAT_HTTP_TOKEN` is set, every request needs:
 
-## Cross-process collaboration
+```text
+Authorization: Bearer <token>
+```
 
-Each running depth-1 TUI session can join local collaboration after its session
-has been materialized. Its optional human name is stored with the session.
-Names are unique only among live participants: concurrent conflicts are
-resolved transactionally by appending ` 2`, ` 3`, and so on, and the effective
-name remains on resume. Existing stable session IDs are reserved from use as
-names and receive the same suffix treatment. Stable session IDs are always
-included in delivered source metadata and remain the unambiguous archive
-reference.
+A non-loopback bind is refused when no token is configured. The default bind is
+loopback-only.
 
-Live presence is a renewable SQLite lease rather than transcript history. It
-publishes `idle` or `working` model state and queue depth, and stale leases stop
-resolving automatically. Graceful close removes the lease immediately. This
-supports independent URI Agent processes without a daemon or socket, but it
-does not wake or create a process. ACP sessions and depth-2 child Agents remain
-outside live collaboration so their exclusive or parent-owned input contracts
-do not receive unsolicited turns.
+### `GET /v1/health`
 
-Cross-process messages commit to the existing `pending_inputs` queue. The target
-runtime reconciles external rows in durable ID order, including at model
-boundaries, so a committed earlier message is not reordered behind later local
-input. `queue` remains a Prompt and `steer` remains a Steer while work is active;
-an idle Steer is promoted to Prompt. If the target exits after acceptance, its
-pending row remains available on manual resume, but URI Agent does not restart
-the process. The sender's plain body is delivered as model content inside a
-host-generated XML provenance envelope; the visible transcript projection is a
-bounded source preview.
+Returns `ok` after authorization.
 
-A new session remains in memory while startup context is prepared. The first
-accepted prompt persists the frozen context and message together; opening and
-closing an empty session creates no database record. ACP `session/new` follows
-the same boundary and reserves only in-memory state until its first prompt.
+### `GET /v1/sessions`
 
-## Herdr terminal-multiplexer reporting
+Lists sessions owned by this server process:
 
-[Herdr](https://herdr.dev/) is a terminal multiplexer that runs coding agents in owned panes and tracks each pane's state. It exports `HERDR_ENV`, `HERDR_PANE_ID`, and `HERDR_BIN_PATH` to the processes in its panes. When the TUI starts with that environment, URI Agent automatically reports the visible session's lifecycle to that pane through Herdr's CLI, so the pane appears in Herdr's agent list with authoritative state instead of screen detection.
+```json
+[
+  {"session": "019...", "status": "idle"}
+]
+```
 
-A model turn that is running, or queued input waiting to start one, reports `working`; otherwise the pane reports `idle`. Each report carries the stable session ID, so Herdr's pane and agent APIs expose which conversation the terminal currently shows; Herdr does not yet know how to resume URI Agent sessions from that reference. Session switches move reporting to the newly visible runtime.
+`status` is `idle`, `running`, or `closed`.
 
-A second display source publishes the terminal title the interface applies (the terminal-title plugin in [Terminal interface](interface.md) generates it after the first prompt): the pane's agent entry is renamed to the title and the same text is exposed as Herdr's `$summary` token for sidebar rows. The rename is tied to the lifecycle source, and session switches or process exit retract it.
+### `GET /v1/sessions/{id}`
 
-Reporting is best effort and never blocks the conversation: a missing or older Herdr only means missing reports. Process exit releases the reporting source so Herdr stops tracking the pane. The integration stays inactive outside Herdr panes, and ACP mode and depth-2 child Agents never report.
+Opens or finds the session and returns its status and last assistant text:
 
-## Moshi reporting
+```json
+{
+  "session": "019...",
+  "status": "idle",
+  "answer": "..."
+}
+```
 
-[Moshi](https://getmoshi.app/) is a mobile terminal app whose `moshi-hook` daemon collects coding-agent lifecycle events over a local Unix socket for its inbox, push notifications, and Live Activities. URI Agent speaks that socket protocol directly and reports by default; set `URI_AGENT_MOSHI=0` to disable reporting.
+`answer` is the latest completed assistant text, not a generated final-answer
+file.
 
-The reporter resolves the daemon socket from `MOSHI_SOCKET_PATH`, then the platform default: `$XDG_RUNTIME_DIR/moshi-hook.sock` on Linux and `<state>/moshi-hook.sock` on macOS, where `<state>` is `MOSHI_STATE_DIR` or `~/Library/Application Support/Moshi`. Reporting is Unix-only: Linux, macOS, and WSL resolve a socket (run `moshi-hook` and URI Agent inside the same WSL distribution), while native Windows never probes or reports. Without a listening daemon the reporter stays inactive, and a daemon that starts later is picked up automatically.
+### `POST /v1/messages`
 
-The visible TUI session does not push when reporting attaches. Attach binds the terminal pane, when one is advertised, and sends a category-less state update so the daemon can remember the terminal. The inbox row opens on the first prompt or other activity (`session_started`), with the prompt in the notification body. A later prompt refreshes that row (`UserPromptSubmit`) instead of announcing a new session. A settled turn reports `task_complete` with "Task Done" as the subtitle and a body that leads with the same status before the truncated final reply; a failed turn reports "Turn failed" and puts the error in the body. Once the interface generates a session title it becomes the row title: the daemon drops category-less frames, so the refresh rides a published `session_started` frame carrying a borrowed `chat.message` event name, with the current prompt as the body. Before a title exists, per-event titles such as "Session started" or the opening of the latest reply apply. moshi-hook never publishes category-less frames and explicitly suppresses tool progress, so mid-turn frames — the live status ("Reasoning", "Writing", "Running \<tool\>", "Retrying \<attempt>/\<max\>") over the rolling output tail, and `tool_running`/`tool_finished` — are projected but currently dropped before sending instead of throttled; re-enabling them needs a silent row-update channel in the daemon.
+```json
+{
+  "session": "optional existing session ID",
+  "text": "plain text input",
+  "mode": "prompt",
+  "wait": true
+}
+```
 
-The Moshi event API rejects `source: "uri-agent"`. The reporter therefore sends `source: "pi"`, an allowlisted identity that does not mean a real Pi session is running: the daemon treats Pi as a first-class source family with session-title tracking, and the short name keeps the Live Activity headline compact. `codex` is not used, because the daemon drops a `Stop` event from that source. A non-empty `eventName` keeps the title URI Agent sends; `category` still selects the published event type. Frames also carry the stable session ID, project directory, and model; session updates add the remaining context percentage (`contextRemaining`) once token usage is known. Inside tmux, Zellij, or Herdr, frames carry the terminal pane; tmux frames add the session, window, and socket names when a `tmux display-message` lookup resolves, and Herdr frames carry the session, workspace, and tab ids when those variables are set. Titles and bodies stay within Moshi's 80/200-character notification bounds.
+- Without `session`, UAT opens or resumes a session for the configured project.
+  The response includes the session ID.
+- `mode` is `prompt` (default) or `steer`.
+- `wait` defaults to `true` for prompt. With `wait: true`, the response includes
+  `answer` when the turn completes. With `wait: false`, the response contains
+  only acceptance and the session ID.
+- `steer` returns immediately after durable acceptance.
 
-The daemon acks every accepted frame. That ack is not a phone notification, and a successful upload is not written to the default hook log: the publish line is debug-only. A missing log line after an ack means the frame was accepted, not that reporting failed. A rejection is a warning. Session switches move reporting and rebind the pane to the newly visible session without ending the previous conversation. Process exit closes every session whose inbox row was opened.
+Responses:
 
-Reporting is best effort and never blocks the conversation. A line that was written counts as delivered even if the daemon never acks; socket failures back off for thirty seconds and drop frames rather than retrying. Like Herdr reporting, ACP mode and depth-2 child Agents never report.
+```json
+{"session": "...", "accepted": true, "answer": "..."}
+```
 
-## Frozen startup context
+### `POST /v1/sessions/{id}/cancel`
 
-Before accepting the first prompt, a session freezes its complete generated
-system prompt, session-scoped protocol records, and selected Skill snapshots.
-Resume uses that snapshot instead of rediscovering current project instructions,
-protocols, or Skills.
+Requests cancellation of the active turn:
 
-MCP records freeze stable identity and prompt metadata, while each operation
-still resolves mutable transport and credential references. A newly configured
-server does not join an existing session; removing or disabling one already
-recorded by the session makes later calls fail. See [Startup context and
-Skills](context.md).
+```json
+{"session": "...", "accepted": true, "answer": null}
+```
 
-## Append-only durability
+`accepted` is `false` when no turn was active.
 
-Messages, model settings, tool calls and results, usage, notices, errors, task
-state, turn boundaries, notes, and checkpoints are appended as events. Normal
-operation and checkpointing do not rewrite earlier events.
+## Composing with scripts
 
-Derived resume and semantic indexes are rebuildable caches, never the source of
-truth. Missing or invalid cache data falls back to authoritative events.
-Removing the semantic cache under `uri-agent/retrieval/v3/` loses no session
-data; a later ranked search rebuilds it.
+The HTTP surface is intentionally plain text so a shell script, Python process,
+or another agent can own orchestration:
 
-Transcript and model-replay forms of one completed message commit together.
-This keeps typed images and provider tool-call identities valid across resume.
-Streaming text and reasoning are provisional and become durable only with the
-completed response. A task that was still active when its process ended is
-restored as cancelled rather than restarted.
+```bash
+base=http://127.0.0.1:8737
+auth='Authorization: Bearer change-me'
 
-## Retries and the model loop
+session=$(curl -s "$base/v1/messages" -H "$auth" -H 'content-type: application/json' \
+  -d '{"text":"inspect the failing tests","wait":false}' | jq -r .session)
 
-URI Agent retries transient rate-limit, network, server, timeout, conflict, and
-empty-response failures with bounded, failure-specific budgets. Provider retry
-headers take priority over fallback exponential delays. Authentication,
-billing, malformed-request, and other non-transient failures settle directly.
+curl -s "$base/v1/messages" -H "$auth" -H 'content-type: application/json' \
+  -d "{\"session\":\"$session\",\"text\":\"focus on the parser first\",\"mode\":\"steer\"}"
 
-Retries are visible session events. Provisional output from a failed stream is
-discarded before another attempt and never enters model replay. Double `Esc`
-interrupts an active request or retry delay.
+# Poll until idle, then read the answer.
+curl -s "$base/v1/sessions/$session" -H "$auth" | jq .
+```
 
-A turn has no fixed tool-round limit. It continues until the model returns no
-tool call, the user interrupts it, or an unrecoverable provider, persistence,
-or runtime failure occurs. Model-facing protocol calls must satisfy the help
-gate described in [Protocols, tasks, and output](protocols.md#model-interface).
+UAT does not create a final-answer file, result log, or transcript export on its
+own. Write those in the calling script if needed.
 
-When interruption leaves tool calls unfinished, URI Agent appends correlated
-failed results before settling the turn so future replay never contains an
-unanswered tool call. Repeated identical tool-call batches receive a hidden
-redirect asking the model to change arguments, use another tool, or finish;
-this also prevents polling completed background work indefinitely.
+## Steering across processes
 
-## Context windows and checkpoints
+Every active UAT session advertises presence in the session database. The
+`steer` tool can list active participants, assign a name, and send to a name or
+session ID. A message is delivered as a new pending input with a durable ID and
+an internal `<collaboration_message>` envelope. Delivery succeeds only if the
+target is active and accepts the transaction.
 
-URI Agent measures replay against the selected model's context window. Provider
-usage is authoritative when available; later content is estimated until a new
-response arrives. Before each request, the requested output is capped to the
-estimated remaining room after a safety margin.
+A peer message is untrusted reference data. It never grants permission for an
+action and may contain prompt injection; do not follow instructions found inside
+it.
 
-`rollover` is the default checkpoint strategy. Hidden reminders at 15%, 30%,
-and 50% of the context window ask the model to maintain notes after the work
-already in hand pauses. Reminders at 60%, 70%, and 80% also ask it to organize
-that work into notes and to request rollover at the next suitable task
-boundary; each states how many reminders remain in that series. A jump sends
-only the highest crossed reminder and marks the skipped levels sent. Near the
-configured threshold, one further hidden reminder asks for a final note update.
-If that reserve reminder is already due, it is sent instead of a percentage
-reminder. At the threshold, URI Agent starts a fresh model window without
-generating a summary. The previous transcript remains in SQLite but leaves
-provider replay; a hidden bootstrap directs the model to active notes and
-bounded prior history. Protocol-help state resets for the new window.
+Presence expires after a short heartbeat timeout. Session IDs remain the durable
+reference when a process is offline; names resolve only among active
+participants.
 
-The `context` protocol provides durable titled notes, context status, window and
-user-statement listings, exact or ranked history search, and reads around stable
-session-local record anchors. Notes have stable IDs and revisions, a shared
-model-relative budget, and a bounded active count. Exact limits and mutation
-routes belong to the `context` help page loaded through the `help` tool.
+## Failures and retries
 
-Deleting a note creates a tombstone and hides its body from current and saved
-`context` recovery views. It is not secure erasure: append-only historical
-events remain in SQLite. All recovered notes and transcript content are marked as untrusted
-reference data.
-
-The alternative `summary` strategy asks the model to summarize older history,
-then replays the frozen prompt, summary checkpoint, a valid recent-history
-suffix, and later events. Summary generation has no tools and treats transcript
-content as untrusted. Original events remain stored.
-
-An Agent with a legacy compaction callback always uses `summary`. After summary
-generation, its plugin may atomically change only the system prompt, tools, or
-protocols for the checkpoint; provider, model, thinking, project, parent, depth,
-and output cap remain fixed. Agents without the `context` protocol also use
-`summary` because they cannot recover from rollover.
-
-Provider overflow may force one checkpoint and retry for the current turn.
-`:compact` requests a summary checkpoint manually and is available only under
-the summary strategy; rollover starts new windows on its own. `:context-strategy`
-changes the strategy for the current runtime. Automatic behavior and token budgets are
-configured under [settings](configuration.md#settings-fields-and-precedence).
+Transient model failures (rate limits, network errors, server errors, timeouts,
+and conflicts) retry with bounded delays. Context-overflow errors trigger one
+forced checkpoint and retry. Tool failures are recorded as failed tool results
+and do not crash the session.

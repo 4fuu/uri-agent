@@ -1,34 +1,18 @@
-mod agents;
 mod apply_patch;
 pub(crate) mod collaboration;
 pub(crate) mod context;
-mod file;
-pub(crate) mod finder;
 mod grep;
-mod history;
-mod https;
 mod mcp;
-pub(crate) mod model_tools;
-mod replace;
-mod sessions;
-mod shell;
-mod tasks;
-mod title;
+mod project;
 pub(crate) mod traditional;
-mod uri_agent_docs;
+mod uat_docs;
 
 pub(crate) use mcp::{GLOBAL_CONFIG as MCP_GLOBAL_CONFIG, PROJECT_CONFIG as MCP_PROJECT_CONFIG};
-pub use mcp::{
-    SessionMcpProfile, SessionMcpServer, SessionMcpTransport, session_profile_owner,
-    session_profile_record,
-};
-pub use uri_agent_docs::docs_output;
-pub(crate) const MCP_SESSION_PROFILE_OWNER: &str = mcp::SESSION_PROFILE_OWNER;
+pub use uat_docs::docs_output;
 
 use crate::config::display_path;
 use crate::plugin::PluginRegistry;
 use anyhow::{Context, Result, anyhow};
-use std::borrow::Cow;
 use std::path::Path;
 use tokio::fs;
 use uuid::Uuid;
@@ -108,56 +92,33 @@ pub(super) fn normalize_line_endings(text: &str) -> String {
     }
 }
 
-/// Return a normalized view without allocating when the input already uses
-/// LF line endings. Read-only file paths can keep the decoded source buffer
-/// alive while they build their bounded response.
-pub(super) fn normalized_line_view(text: &str) -> Cow<'_, str> {
-    if !text.contains('\r') {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(normalize_line_endings(text))
-    }
-}
-
 pub fn plugins(cwd: &Path, config_directory: &Path) -> PluginRegistry {
-    plugins_with_session_profile(cwd, config_directory, None)
-}
-
-pub(crate) fn plugins_with_session_profile(
-    cwd: &Path,
-    config_directory: &Path,
-    mcp_profile: Option<serde_json::Value>,
-) -> PluginRegistry {
     let mut plugins = PluginRegistry::new();
-    add_agent_plugins(&mut plugins, cwd, config_directory, mcp_profile);
-    plugins.add(title::TerminalTitlePlugin);
+    plugins.add(project::ProjectInstructions::new(cwd));
+    plugins.add(mcp::McpPlugin::new(cwd, config_directory));
+    plugins.add(apply_patch::ApplyPatchTool::new(cwd));
+    plugins.add(traditional::TraditionalToolsPlugin::new(cwd));
     plugins
 }
 
-fn add_agent_plugins(
-    plugins: &mut PluginRegistry,
-    cwd: &Path,
-    config_directory: &Path,
-    mcp_profile: Option<serde_json::Value>,
-) {
-    plugins.add(model_tools::ProtocolToolsPlugin);
-    plugins.add(finder::FinderRolePlugin);
-    plugins.add(agents::AgentsPlugin::new(cwd));
-    plugins.add(mcp::McpPlugin::with_session_profile(
-        cwd,
-        config_directory,
-        mcp_profile,
-    ));
-    plugins.add(uri_agent_docs::UriAgentDocsProtocol);
-    plugins.add(file::FileProtocol::new(cwd));
-    plugins.add(grep::GrepProtocol::new(cwd));
-    plugins.add(https::HttpsProtocol::new());
-    plugins.add(replace::ReplaceTool::new(cwd));
-    plugins.add(apply_patch::ApplyPatchTool::new(cwd));
-    plugins.add(traditional::TraditionalToolsPlugin::new(cwd));
-    plugins.add(sessions::SessionCompletionPlugin::new(cwd));
-    plugins.add(tasks::TasksProtocol);
-    shell::add_plugins(plugins, cwd);
+pub(super) fn resolve_path(cwd: &Path, target: &str) -> Result<std::path::PathBuf> {
+    #[cfg(unix)]
+    if target == "~" || target.starts_with("~/") {
+        let home = dirs::home_dir().context("cannot determine the home directory")?;
+        let relative = Path::new(target)
+            .strip_prefix("~")
+            .expect("home-relative path starts with a tilde component");
+        return Ok(home.join(relative));
+    }
+
+    let path = Path::new(target);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else if target.is_empty() {
+        Ok(cwd.to_path_buf())
+    } else {
+        Ok(cwd.join(path))
+    }
 }
 
 async fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
@@ -209,55 +170,5 @@ mod tests {
 
         let no_final_newline = EditableText::new("one\r\ntwo");
         assert_eq!(no_final_newline.restore("one\nTWO\n\n"), "one\r\nTWO");
-    }
-
-    #[test]
-    fn normalized_line_view_avoids_lf_copy_but_normalizes_crlf() {
-        let lf = "one\ntwo\n";
-        assert!(matches!(normalized_line_view(lf), Cow::Borrowed(_)));
-        assert_eq!(normalized_line_view("one\r\ntwo\r"), "one\ntwo\n");
-    }
-
-    #[test]
-    fn built_in_distribution_separates_protocols_from_direct_edit_tools() {
-        let directory = tempfile::tempdir().unwrap();
-        let plugins = plugins(directory.path(), directory.path());
-        let names = plugins
-            .protocol_descriptors()
-            .unwrap()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
-
-        assert!(names.iter().any(|name| name == "uri-agent-docs"));
-        assert!(names.iter().any(|name| name == "file"));
-        assert!(names.iter().any(|name| name == "search"));
-        assert!(!names.iter().any(|name| name == "grep"));
-        assert!(names.iter().any(|name| name == "https"));
-        assert!(names.iter().any(|name| name == "tasks"));
-        assert!(!names.iter().any(|name| name == "replace"));
-        assert!(!names.iter().any(|name| name == "apply_patch"));
-
-        let model_tools = plugins
-            .model_tool_descriptors()
-            .unwrap()
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            model_tools,
-            [
-                "apply_patch",
-                "bash",
-                "edit",
-                "help",
-                "mcp",
-                "protocol",
-                "read",
-                "replace",
-                "search",
-                "write"
-            ]
-        );
     }
 }
